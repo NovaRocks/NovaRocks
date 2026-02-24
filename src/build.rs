@@ -60,6 +60,38 @@ fn normalize_thirdparty_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
+fn find_cxx_runtime(lib_name: &str) -> Option<PathBuf> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(cxx) = env::var("CXX") {
+        if !cxx.trim().is_empty() {
+            candidates.push(cxx);
+        }
+    }
+    candidates.push("g++".to_string());
+    candidates.push("c++".to_string());
+
+    for compiler in candidates {
+        let output = std::process::Command::new(&compiler)
+            .arg(format!("-print-file-name={lib_name}"))
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() || path == lib_name {
+            continue;
+        }
+        let lib_path = PathBuf::from(path);
+        if lib_path.exists() {
+            return Some(lib_path);
+        }
+    }
+    None
+}
+
 fn resolve_thirdparty_root(manifest_dir: &Path) -> Result<PathBuf, String> {
     if let Ok(raw) = env::var("STARROCKS_THIRDPARTY") {
         if !raw.trim().is_empty() {
@@ -91,9 +123,9 @@ fn resolve_thirdparty_root(manifest_dir: &Path) -> Result<PathBuf, String> {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=cpp/compat.cpp");
-    println!("cargo:rerun-if-changed=cpp/compat.h");
-    println!("cargo:rerun-if-changed=cpp/brpc_server.cpp");
+    println!("cargo:rerun-if-changed=src/shim/compat.cpp");
+    println!("cargo:rerun-if-changed=src/shim/compat.h");
+    println!("cargo:rerun-if-changed=src/shim/brpc_server.cpp");
     println!("cargo:rerun-if-changed=idl/thrift/HeartbeatService.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/BackendService.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/InternalService.thrift");
@@ -125,6 +157,7 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/proto/staros/shard.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/worker.proto");
     println!("cargo:rerun-if-env-changed=STARROCKS_THIRDPARTY");
+    println!("cargo:rerun-if-env-changed=STARROCKS_GCC_HOME");
 
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let thrift_out = out_dir.join("thrift");
@@ -138,11 +171,6 @@ fn main() {
         eprintln!("  To build default thirdparty, run: ./thirdparty/build-thirdparty.sh");
         panic!("thirdparty directory not found");
     });
-    println!(
-        "cargo:warning=Using thirdparty root: {}",
-        project_thirdparty.display()
-    );
-
     let (tp_bin, tp_include, tp_lib, tp_lib64) = (
         project_thirdparty.join("bin"),
         project_thirdparty.join("include"),
@@ -244,8 +272,8 @@ fn main() {
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        .file("cpp/compat.cpp")
-        .file("cpp/brpc_server.cpp");
+        .file("src/shim/compat.cpp")
+        .file("src/shim/brpc_server.cpp");
 
     for entry in std::fs::read_dir(&thrift_out).expect("read thrift out dir") {
         let path = entry.expect("dir entry").path();
@@ -276,13 +304,21 @@ fn main() {
         .flag_if_supported("-w") // Suppress all warnings for C++ code
         .define("GLOG_USE_GLOG_EXPORT", None) // Required for glog 0.7.1 static linking
         .define("GLOG_STATIC_DEFINE", None) // Required for glog 0.7.1 static linking
-        .include("cpp")
+        .include("src/shim")
         .include(&thrift_out)
         .include(&proto_out);
 
     // Check target platform for platform-specific configurations
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_macos = target.contains("apple") || target.contains("darwin");
+    let is_linux = target.contains("linux");
+
+    // On Linux, never let cc crate emit C++ stdlib link directives.
+    // We manage runtime linkage explicitly to align with StarRocks BE behavior.
+    if is_linux {
+        build.cpp_link_stdlib(None);
+        build.cpp_link_stdlib_static(false);
+    }
 
     // Add thirdparty include
     build.include(&tp_include);
@@ -304,6 +340,49 @@ fn main() {
     // macOS-specific library search paths (for other libraries like gperftools)
     if is_macos {
         println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+    }
+
+    if is_linux {
+        // Align with StarRocks default: prefer static C++ runtime by default.
+        if let Some(libstdcpp_static) = find_cxx_runtime("libstdc++.a") {
+            if let Some(parent) = libstdcpp_static.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+            println!(
+                "cargo:warning=Using static libstdc++ archive: {}",
+                libstdcpp_static.display()
+            );
+            println!(
+                "cargo:warning=Linking C++ runtime statically (-static-libstdc++ -static-libgcc)"
+            );
+            println!("cargo:rustc-link-arg=-static-libstdc++");
+            println!("cargo:rustc-link-arg=-static-libgcc");
+            println!("cargo:rustc-link-lib=static=stdc++");
+            if let Some(libsupcxx_static) = find_cxx_runtime("libsupc++.a") {
+                if let Some(parent) = libsupcxx_static.parent() {
+                    println!("cargo:rustc-link-search=native={}", parent.display());
+                }
+                println!(
+                    "cargo:warning=Using static libsupc++ archive: {}",
+                    libsupcxx_static.display()
+                );
+                println!("cargo:rustc-link-lib=static=supc++");
+            }
+        } else {
+            let cxx = std::env::var("CXX").unwrap_or_else(|_| "g++".to_string());
+            panic!(
+                "libstdc++.a not found for compiler '{}'. \
+Install static libstdc++ package for your toolchain (for example libstdc++-static / gcc-toolset-*-libstdc++-static) \
+static C++ runtime is required.",
+                cxx
+            );
+        }
+
+        // Ensure runtime can resolve thirdparty shared libs (for example OpenSSL).
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tp_lib.display());
+        if tp_lib64.exists() {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tp_lib64.display());
+        }
     }
 
     // Link OpenSSL - use dynamic linking from thirdparty/installed

@@ -7,3 +7,6 @@
 /thirdparty/installed/
 /thirdparty/build/
 /.idea
+/dev
+/sql-tests/bootstrap
+/sql-tests/.sql_test_catalog
