@@ -1,0 +1,2 @@
+sp_neg1	sp_neg2	sp_empty_d1	sp_empty_d4	si_neg1	si_zero	rep2	rep_neg	sp_neg	space3_len	left2	left_neg	right2	right_neg	lpad_empty_shrink	lpad_neg	rpad_empty_shrink	rpad_neg
+c	b	a		c	NULL	abab		NULL	3	ab		bc		a	NULL	a	NULL

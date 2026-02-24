@@ -1,0 +1,2 @@
+hour_unix_v	hour_unix_neg_v	makedate_coerce_v	makedate_neg_v	micros_add_v	micros_sub_v	time_fmt_time_v	time_fmt_datetime_v	years_diff_v	years_diff_neg_v
+6	NULL	2024-02-29	NULL	2024-02-29 12:00:00.123456	2024-02-29 11:59:59.876544	00:00:00	NULL	1	-1

@@ -1,0 +1,2 @@
+months_diff_neg_boundary_v	months_diff_pos_boundary_v	months_diff_time_boundary_v	date_trunc_millisecond_v	date_trunc_microsecond_v
+0	0	0	2024-01-03 03:04:05.123000	2024-01-03 03:04:05.123456

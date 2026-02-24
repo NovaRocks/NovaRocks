@@ -1,0 +1,5 @@
+grp	ts	v	sum_follow	cnt_follow
+A	1	10	40	1
+A	2	20	40	1
+A	3	NULL	NULL	0
+A	4	40	NULL	0

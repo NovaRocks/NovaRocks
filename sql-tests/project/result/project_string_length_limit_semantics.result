@@ -1,0 +1,2 @@
+repeat_limit_len	repeat_over_limit_is_null	space_limit_len	space_over_limit_is_null	lpad_limit_len	lpad_over_limit_is_null	rpad_limit_len	rpad_over_limit_is_null	concat_limit_len	concat_over_limit_is_null	concat_ws_limit_len	concat_ws_over_limit_is_null
+1048576	1	1048576	1	1048576	1	1048576	1	1048576	1	1048576	1

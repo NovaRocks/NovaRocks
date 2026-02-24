@@ -1,0 +1,2 @@
+promotions	total	((CAST(promotions AS DECIMAL64(15,4))) / (CAST(total AS DECIMAL64(15,4)))) * 100
+2894229.70	5493575.41	52.6838986300

@@ -1,0 +1,2 @@
+re_no_match	re_null_input	field_null	field_hit	unhex_bad_hex	unhex_bad_is_null	unhex_odd_hex	unhex_odd_is_null
+	NULL	0	2		0		0

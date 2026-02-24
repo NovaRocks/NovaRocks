@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package novarocks;
+
+import "internal_service.proto";
+import "lake_service.proto";
+
+service NovaRocksGrpc {
+  rpc Exchange(stream ExchangeRequest) returns (stream ExchangeResponse);
+  rpc TransmitRuntimeFilter(starrocks.PTransmitRuntimeFilterParams)
+      returns (starrocks.PTransmitRuntimeFilterResult);
+  rpc Lookup(starrocks.PLookUpRequest) returns (starrocks.PLookUpResponse);
+}
+
+message ExchangeRequest {
+  int64 finst_id_hi = 1;
+  int64 finst_id_lo = 2;
+  int32 node_id = 3;
+  int32 sender_id = 4;
+  int32 be_number = 5;
+  bool eos = 6;
+  int64 sequence = 7;
+  bytes payload = 8;
+}
+
+message ExchangeResponse {
+  int64 ack_sequence = 1;
+}

@@ -1,0 +1,10 @@
+a	b
+NULL	NULL
+NULL	x
+NULL	y
+NULL	z
+1	NULL
+1	x
+1	y
+2	NULL
+2	z

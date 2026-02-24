@@ -1,0 +1,7 @@
+substr(r_reason_desc, 1, 20)	avg(ws_quantity)	avg(wr_refunded_cash)	avg(wr_fee)
+Gift exchange	76	464.36000000	8.62000000
+Not the product that	70	876.67000000	46.67000000
+Parts missing	7	129.42000000	38.65000000
+reason 23	47	734.61000000	6.17000000
+reason 25	5	48.94000000	53.14500000
+reason 28	8	306.20000000	37.06000000

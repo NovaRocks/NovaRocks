@@ -1,0 +1,9 @@
+/novarocks.log
+/novarocks.pid
+/novarocks.toml
+/sql-tests/target/
+/target
+/thirdparty/src
+/thirdparty/installed/
+/thirdparty/build/
+/.idea

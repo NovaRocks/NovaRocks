@@ -1,0 +1,13 @@
+[package]
+name = "starust-sql-tests"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "sql-tests"
+path = "rust/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.10"

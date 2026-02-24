@@ -1,0 +1,20 @@
+--- a/src/glog/logging.h
++++ b/src/glog/logging.h
+@@ -483,6 +483,7 @@ namespace google {
+ // Initialize google's logging library. You will see the program name
+ // specified by argv0 in log outputs.
+ GLOG_EXPORT void InitGoogleLogging(const char* argv0);
++class LogMessageFatal;  // Forward declaration for COMPACT_GOOGLE_LOG_FATAL macro
+ 
+ class LogMessage;
+ 
+@@ -707,8 +708,8 @@ std::unique_ptr<std::string> MakeCheckOpString(const T1& v1, const T2& v2,
+                                                const char* exprtext) {
+   CheckOpMessageBuilder comb(exprtext);
+   // Use fully qualified name to avoid namespace lookup issues
+-  ::logging::internal::MakeCheckOpValueString(comb.ForVar1(), v1);
+-  ::logging::internal::MakeCheckOpValueString(comb.ForVar2(), v2);
++  google::logging::internal::MakeCheckOpValueString(comb.ForVar1(), v1);
++  google::logging::internal::MakeCheckOpValueString(comb.ForVar2(), v2);
+   return comb.NewString();
+ }

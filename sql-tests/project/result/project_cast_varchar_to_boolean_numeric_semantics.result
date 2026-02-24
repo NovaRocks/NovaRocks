@@ -1,0 +1,2 @@
+cast_two	cast_minus_one	cast_plus_zero	cast_false	cast_true_upper	cast_t_is_null	cast_i32_overflow_is_null	cast_space_two	if_two	if_minus_one	if_plus_zero	if_t	if_space_two
+1	1	0	0	1	1	1	1	1	1	0	0	1

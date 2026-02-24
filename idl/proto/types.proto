@@ -1,0 +1,257 @@
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+// This file is based on code available under the Apache license here:
+//   https://github.com/apache/incubator-doris/blob/master/gensrc/proto/types.proto
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto2";
+
+package starrocks;
+option java_package = "com.starrocks.proto";
+
+message PScalarType {
+    // TPrimitiveType, use int32 to avoid redefine Enum
+    required int32 type = 1;
+    // Only set if type == CHAR or type == VARCHAR
+    optional int32 len = 2;
+    // Only set for DECIMAL
+    optional int32 precision = 3;
+    optional int32 scale = 4;
+};
+
+// Represents a field in a STRUCT type.
+// TODO: Model column stats for struct fields.
+message PStructField {
+    required string name = 1;
+    optional string comment = 2;
+};
+
+message PTypeNode {
+    // TTypeNodeType(SCALAR, ARRAY, MAP, STRUCT)
+    required int32 type = 1;
+    // only set for scalar types
+    optional PScalarType scalar_type = 2;
+    // only used for structs; has struct_fields.size() corresponding child types
+    repeated PStructField struct_fields = 3;
+};
+
+// A flattened representation of a tree of column types obtained by depth-first
+// traversal. Complex types such as map, array and struct have child types corresponding
+// to the map key/value, array item type, and struct fields, respectively.
+// For scalar types the list contains only a single node.
+// Note: We cannot rename this to TType because it conflicts with Thrift's internal TType
+// and the generated Python thrift files will not work.
+// Note: TTypeDesc in impala is TColumnType, but we already use TColumnType, so we name this
+// to TTypeDesc. In future, we merge these two to one
+message PTypeDesc {
+    repeated PTypeNode types = 1;
+};
+
+message PUniqueId {
+    required int64 hi = 1;
+    required int64 lo = 2;
+};
+
+enum CompressionTypePB {
+    UNKNOWN_COMPRESSION = 0;
+    DEFAULT_COMPRESSION = 1;
+    NO_COMPRESSION = 2;
+    SNAPPY = 3;
+    LZ4 = 4;
+    LZ4_FRAME = 5;
+    ZLIB = 6;
+    ZSTD = 7;
+    GZIP = 8;
+    DEFLATE = 9;
+    BZIP2 = 10;
+    LZO = 11; // Deprecated
+    BROTLI = 12;
+    LZ4_HADOOP = 13;
+}
+
+enum WriteQuorumTypePB {
+    ONE = 0;
+    MAJORITY = 1;
+    ALL = 2;
+}
+
+enum TxnTypePB {
+     TXN_NORMAL = 0;
+     TXN_REPLICATION = 1;
+     TXN_EMPTY = 2;
+     TXN_TABLET_RESHARD = 3;
+}
+
+enum ReplicationTxnStatePB {
+    TXN_PREPARED = 0;
+    TXN_SNAPSHOTED = 1;
+    TXN_REPLICATED = 2;
+    TXN_PUBLISHED = 3;
+}
+
+enum IndexType {
+    BITMAP = 0;
+    GIN = 1;
+    INDEX_UNKNOWN = 2;
+    NGRAMBF = 3;
+    VECTOR = 4;
+}
+
+ message ReplicationTxnMetaPB {
+     optional int64 txn_id = 1;
+     optional ReplicationTxnStatePB txn_state = 2;
+     optional int64 tablet_id = 3;
+     optional int64 visible_version = 4;
+     optional string src_backend_host = 5;
+     optional int32 src_backend_port = 6;
+     optional string src_snapshot_path = 7;
+     optional int64 snapshot_version = 8;
+     optional bool incremental_snapshot = 9;
+     optional int64 data_version = 10;
+ }
+
+// Used to store additional information about a txn when it is finished/visible
+// It will be serialized with TransactionState
+message TxnFinishStatePB {
+    // Currently, only involved replica's versions are stored, to save space, replica are stored in 2 lists
+    //
+    // a list of int64 to store `normal` replicas, in the following form:
+    //   replica1Id, replica2Id, ...
+    //
+    // a list of int64 to store `abnormal` replica's versions, in the following form:
+    //   replica1Id, replica1Version, replica2Id, replica2Version, ...
+    //
+    // For all the replicas involved in a txn, if the replica's version != partition's txn commit version
+    // it is considered abnormal, and put into abnormal list.
+    repeated int64 normal_replicas = 1;
+    repeated int64 abnormal_replicas_with_version = 2;
+}
+
+message DeletePredicatePB {
+    required int32 version = 1;
+    repeated string sub_predicates = 2;
+    repeated InPredicatePB in_predicates = 3;
+    // binary_predicates only set and used by a lake table now.
+    repeated BinaryPredicatePB binary_predicates = 4;
+    // is_null_predicates only set and used by a lake table now.
+    repeated IsNullPredicatePB is_null_predicates = 5;
+}
+
+message InPredicatePB {
+    optional string column_name = 1;
+    optional bool is_not_in = 2;
+    repeated string values = 3;
+}
+
+message BinaryPredicatePB {
+    optional string column_name = 1;
+    optional string op = 2;
+    optional string value = 3;
+}
+
+message IsNullPredicatePB {
+    optional string column_name = 1;
+    optional bool is_not_null = 2;
+}
+
+message RecordPredicatePB {
+    enum RecordPredicateTypePB {
+        UNKNOWN = 0;
+        COLUMN_HASH_IS_CONGRUENT = 1;
+    }
+
+    message ColumnHashIsCongruentPB {
+        optional int64 modulus = 1;
+        optional int64 remainder = 2;
+        repeated string column_names = 3;
+    }
+
+    optional RecordPredicateTypePB type = 1;
+    // set by some type of predicate (RecordPredicateTypePB is AND/OR/NOT...) which will be implemented in the future
+    repeated RecordPredicatePB children = 2;
+    // The following member should be set one of them by predicate type
+    optional ColumnHashIsCongruentPB column_hash_is_congruent = 3;
+}
+
+message PersistentIndexSstablePredicatePB {
+    optional RecordPredicatePB record_predicate = 1;
+}
+
+message IndexValueWithVerPB {
+    // will be set after mvcc support
+    optional int64 version = 1;
+    // rowset id & segment id
+    optional uint32 rssid = 2;
+    optional uint32 rowid = 3;
+}
+
+message IndexValuesWithVerPB {
+    repeated IndexValueWithVerPB values = 1;
+}
+
+enum TransactionStatusPB {
+    TRANS_UNKNOWN = 0;
+    TRANS_PREPARE = 1;
+    TRANS_COMMITTED = 2;
+    TRANS_VISIBLE = 3;
+    TRANS_ABORTED = 4;
+    TRANS_PREPARED = 5;
+}
+
+message TransactionStatePB {
+    optional int64 txn_id = 1;
+    optional TransactionStatusPB status = 2;
+    optional string reason = 3;
+}
+
+enum VariantTypePB {
+    NORMAL_VALUE = 0;
+    NULL_VALUE = 1;
+    MINIMUM = 2;
+    MAXIMUM = 3;
+}
+
+message VariantPB {
+    optional PTypeDesc type = 1;
+    optional string value = 2;
+    optional VariantTypePB variant_type = 3;
+}
+
+message TuplePB {
+    repeated VariantPB values = 1;
+}
+
+message TabletRangePB {
+    optional TuplePB lower_bound = 1;
+    optional TuplePB upper_bound = 2;
+    optional bool lower_bound_included = 3;
+    optional bool upper_bound_included = 4;
+}

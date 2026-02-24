@@ -1,0 +1,127 @@
+# Copy to `novarocks.toml` (git-ignored) or set `$NOVAROCKS_CONFIG` to your config path.
+# Source of truth for defaults: `src/common/app_config.rs`.
+
+# Base log level: trace, debug, info, warn, error.
+# Default: "info".
+log_level = "info"
+
+# Optional full EnvFilter expression. If set, it overrides `log_level`.
+# Default: unset (`None`).
+# Example: "info,novarocks=debug,h2=off,hyper=off,tonic=off"
+# log_filter = "info"
+
+[server]
+# Service bind host. Default: "0.0.0.0".
+host = "0.0.0.0"
+# FE heartbeat Thrift port. Default: 9050.
+heartbeat_port = 9050
+# StarRocks BE Thrift port. Default: 9060.
+be_port = 9060
+# brpc gateway port. Default: 8060.
+brpc_port = 8060
+# HTTP service port. Default: 8040.
+http_port = 8040
+# Starlet gRPC service port. Default: 9070.
+starlet_port = 9070
+
+[runtime]
+# Fragment exchange wait timeout in milliseconds. Default: 120000.
+exchange_wait_ms = 120000
+# Max bytes per exchange transmit batch. Default: 262144 (256KB).
+exchange_max_transmit_batched_bytes = 262144
+# Exchange I/O worker thread count. Default: 4.
+exchange_io_threads = 4
+# Max in-flight bytes per exchange stream. Default: 67108864 (64MB).
+exchange_io_max_inflight_bytes = 67108864
+
+# Local exchange memory cap per driver in bytes. Default: 134217728 (128MB).
+local_exchange_buffer_mem_limit_per_driver = 134217728
+# Local exchange max buffered rows across partitions. -1 means unlimited. Default: -1.
+local_exchange_max_buffered_rows = -1
+# Generic operator in-memory buffer size in chunks. Default: 8.
+operator_buffer_chunks = 8
+
+# OLAP sink write buffer size in bytes. Default: 104857600 (100MB).
+olap_sink_write_buffer_size_bytes = 104857600
+# Max bytes per tablet write chunk in OLAP sink. Default: 536870912 (512MB).
+olap_sink_max_tablet_write_chunk_bytes = 536870912
+
+# Scan thread pool size. 0 means auto(use CPU cores). Default: 0.
+pipeline_scan_thread_pool_thread_num = 0
+# Scan thread pool queue capacity. Default: 102400.
+pipeline_scan_thread_pool_queue_size = 102400
+# Pipeline execution thread pool size. 0 means auto(use CPU cores). Default: 0.
+pipeline_exec_thread_pool_thread_num = 0
+
+# Spill I/O thread count. 0 means follow effective exec thread count. Default: 0.
+spill_io_threads = 0
+# Spill I/O queue capacity. Default: 1024.
+spill_io_queue_size = 1024
+
+# Fail-fast threshold for scan task submit failures. Default: 128.
+scan_submit_fail_max = 128
+# Fail-fast timeout for scan submit pressure in milliseconds. Default: 2000.
+scan_submit_fail_timeout_ms = 2000
+
+# Profile reporting interval in seconds. Default: 30.
+profile_report_interval = 30
+
+# Optional overrides for FE runtime filter timeouts.
+# Defaults: unset (`None`), which means use FE-provided values.
+# runtime_filter_scan_wait_time_ms_override = 1000
+# runtime_filter_wait_timeout_ms_override = 1000
+
+[runtime.cache]
+# Generic page cache switch. Default: true.
+page_cache_enable = true
+# Generic page cache capacity(entry count). Default: 11000.
+page_cache_capacity = 11000
+# Page cache eviction probability percentage. Default: 100.
+page_cache_evict_probability = 100
+
+# Parquet metadata cache settings.
+parquet_meta_cache_enable = true
+parquet_meta_cache_capacity = 1000
+parquet_meta_cache_ttl_seconds = 3600
+
+# Parquet page cache settings.
+parquet_page_cache_enable = true
+parquet_page_cache_capacity = 10000
+parquet_page_cache_ttl_seconds = 1800
+# Cache decompressed page if uncompressed_size <= threshold * compressed_size. Default: 2.0.
+parquet_page_cache_decompress_threshold = 2.0
+
+# Disk-backed data cache settings.
+datacache_enable = false
+datacache_disk_path = "/tmp/novarocks_datacache"
+# 0 means disabled capacity. Default: 0.
+datacache_disk_size = 0
+datacache_block_size = 1048576
+datacache_checksum_enable = true
+datacache_direct_io_enable = false
+datacache_io_align_unit_size = 4096
+
+[debug]
+# Enable per-exec-node output logs. Default: false.
+exec_node_output = false
+# Dump RPC plan inputs as named JSON for fragment submission paths. Default: false.
+exec_batch_plan_json = false
+
+[spill]
+# Enable local spill subsystem. Default: true.
+enable = true
+# Spill directories. Default: [] (runtime helper falls back to system temp dir + "novarocks-spill").
+local_dirs = []
+# Per-directory spill quota in bytes. 0 means unlimited. Default: 0.
+dir_max_bytes = 0
+# Spill block size in bytes. Default: 134217728 (128MB).
+block_size_bytes = 134217728
+# IPC compression codec for spill files. Default: "lz4".
+ipc_compression = "lz4"
+
+[starrocks]
+# StarRocks metadata cache TTL in milliseconds. 0 means no cache. Default: 0.
+meta_cache_ttl_ms = 0
+# Write format for lake data files. Default: "native".
+# Note: non-native formats (for example "parquet") are experimental.
+lake_data_write_format = "native"

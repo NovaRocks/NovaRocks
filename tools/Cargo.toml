@@ -1,0 +1,20 @@
+[package]
+name = "starust-tools"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "starrocks_inspect"
+path = "src/bin/starrocks_inspect.rs"
+
+[[bin]]
+name = "oss_parquet_probe"
+path = "src/bin/oss_parquet_probe.rs"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+arrow = { version = "57.1.0", features = ["prettyprint", "ipc", "ipc_compression"] }
+opendal = { version = "0.52", features = ["services-oss", "services-fs", "services-s3"] }
+novarocks = { path = ".." }
+prost = "0.13.5"

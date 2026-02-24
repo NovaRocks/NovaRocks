@@ -1,0 +1,2 @@
+s_neg1	s_90061	s_cap_838	s_839	s_cap_839	t0	t_max	t_neg1	t_25h	t_date_prefix	t_datetime_literal	md_over	md_zero	md_y0	md_y_over	md_y_neg
+-00:00:01	25:01:01	838:59:59	839:00:00	839:59:59	0	86399	NULL	90000	NULL	NULL	NULL	NULL	0000-01-01	NULL	NULL

@@ -1,0 +1,5 @@
+grp	ord_key	v	range_sum
+A	1	10	10
+A	2	20	60
+A	2	30	60
+A	3	40	100

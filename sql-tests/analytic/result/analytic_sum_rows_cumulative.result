@@ -1,0 +1,6 @@
+grp	ts	v	running_sum
+A	1	2	2
+A	2	3	5
+A	3	5	10
+B	1	4	4
+B	2	6	10

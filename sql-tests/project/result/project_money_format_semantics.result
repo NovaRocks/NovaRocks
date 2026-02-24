@@ -1,0 +1,2 @@
+mf_decimal_literal	mf_bigint	mf_double_small	mf_double_negative_zero
+12,345.68	12,345.00	.02	-.00

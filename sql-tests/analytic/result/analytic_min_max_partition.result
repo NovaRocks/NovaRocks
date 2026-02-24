@@ -1,0 +1,6 @@
+grp	id	v	min_v	max_v
+A	1	9	3	9
+A	2	3	3	9
+A	3	7	3	9
+B	4	NULL	8	8
+B	5	8	8	8

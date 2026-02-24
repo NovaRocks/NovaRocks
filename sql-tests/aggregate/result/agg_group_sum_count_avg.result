@@ -1,0 +1,4 @@
+g	c_all	c_not_null	s_v	avg_v
+1	3	2	30	15
+2	2	2	20	10
+3	1	0	NULL	NULL

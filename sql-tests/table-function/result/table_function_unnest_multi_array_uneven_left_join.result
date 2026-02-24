@@ -1,0 +1,7 @@
+id	x	y
+1	1	a
+1	2	NULL
+1	3	NULL
+2	NULL	c
+2	4	b
+3	NULL	z

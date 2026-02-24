@@ -1,0 +1,2 @@
+abs_eq_zero	bool_eq_one	bool_lt_one	dbl_gt_int	dec_eq_int
+0	1	1	1	1
