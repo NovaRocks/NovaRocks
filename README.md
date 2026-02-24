@@ -40,7 +40,14 @@ If third-party dependencies are missing, build them first:
 ## Build
 
 ```bash
-cargo build
+./build.sh
+```
+
+Build with external StarRocks thirdparty:
+
+```bash
+export STARROCKS_THIRDPARTY=/path/to/starrocks/thirdparty
+./build.sh build
 ```
 
 ## Configuration
@@ -64,29 +71,35 @@ CLI usage:
 novarocks [run|start|stop|restart] [--config <path>]
 ```
 
-From source with Cargo:
+Run through build wrapper:
 
 ```bash
 # foreground (default)
-cargo run -- run --config ./novarocks.toml
+./build.sh run -- run --config ./novarocks.toml
 
 # daemon mode
-cargo run -- start --config ./novarocks.toml
+./build.sh run -- start --config ./novarocks.toml
 
 # stop daemon
-cargo run -- stop
+./build.sh run -- stop
 
 # restart daemon
-cargo run -- restart --config ./novarocks.toml
+./build.sh run -- restart --config ./novarocks.toml
+```
+
+Run built binary directly:
+
+```bash
+./target/debug/novarocks run --config ./novarocks.toml
 ```
 
 ## Development Workflow
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets --all-features
-cargo build
-cargo test
+./build.sh clippy --all-targets --all-features
+./build.sh build
+./build.sh test
 ```
 
 ## License
