@@ -22,12 +22,12 @@ use std::time::Instant;
 use crate::common::config::exchange_io_max_inflight_bytes;
 use crate::common::types::UniqueId;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::novarocks_logging::{debug, error};
 use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
 use crate::service::grpc_client;
-use crate::novarocks_logging::{debug, error};
 
 pub struct ExchangeSendTracker {
     inflight_tasks: AtomicUsize,

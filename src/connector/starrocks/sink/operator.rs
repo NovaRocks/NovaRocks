@@ -50,10 +50,10 @@ use crate::connector::starrocks::sink::routing::{RowRoutingPlan, route_chunk_row
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::novarocks_logging::{debug, info};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry;
 use crate::service::grpc_client::proto::starrocks::KeysType;
-use crate::novarocks_logging::{debug, info};
 use crate::types;
 
 const LOAD_OP_COLUMN: &str = "__op";
@@ -813,28 +813,35 @@ impl OlapTableSinkOperator {
                 )
             })?;
             let scheme = classify_scan_paths([tablet_root_path.as_str()])?;
-            let s3_config = if matches!(scheme, ScanPathScheme::Oss) {
-                let from_shard = shard_infos.get(&tablet_id).and_then(|info| info.s3.clone());
-                let from_runtime = if from_shard.is_none() {
-                    get_tablet_runtime(tablet_id)
-                        .ok()
-                        .and_then(|entry| entry.s3_config.clone())
-                } else {
-                    None
-                };
-                let inferred = if from_shard.is_none() && from_runtime.is_none() {
-                    starlet_shard_registry::infer_s3_config_for_path(tablet_root_path)
-                } else {
-                    None
-                };
-                Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
-                    format!(
-                        "OLAP_TABLE_SINK missing S3 config for runtime object-store tablet {} (path={})",
+            let s3_config = match scheme {
+                ScanPathScheme::Local => None,
+                ScanPathScheme::Oss => {
+                    let from_shard = shard_infos.get(&tablet_id).and_then(|info| info.s3.clone());
+                    let from_runtime = if from_shard.is_none() {
+                        get_tablet_runtime(tablet_id)
+                            .ok()
+                            .and_then(|entry| entry.s3_config.clone())
+                    } else {
+                        None
+                    };
+                    let inferred = if from_shard.is_none() && from_runtime.is_none() {
+                        starlet_shard_registry::infer_s3_config_for_path(tablet_root_path)
+                    } else {
+                        None
+                    };
+                    Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
+                        format!(
+                            "OLAP_TABLE_SINK missing S3 config for runtime object-store tablet {} (path={})",
+                            tablet_id, tablet_root_path
+                        )
+                    })?)
+                }
+                ScanPathScheme::Hdfs => {
+                    return Err(format!(
+                        "OLAP_TABLE_SINK does not support hdfs tablet path yet: tablet_id={} path={}",
                         tablet_id, tablet_root_path
-                    )
-                })?)
-            } else {
-                None
+                    ));
+                }
             };
 
             let mut context = template.clone();

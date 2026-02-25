@@ -24,7 +24,7 @@ arrow-buffer = { version = "57.1.0" }
 arrow-data = { version = "57.1.0" }
 parquet = { version = "57.1.0", features = ["arrow"] }
 orc-rust = { version = "0.7.1", default-features = false }
-opendal = { version = "0.52", features = ["services-oss", "services-fs", "services-s3"] }
+opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native"] }
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = "25"

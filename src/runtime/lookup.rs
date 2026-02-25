@@ -298,7 +298,8 @@ pub(crate) fn execute_lookup_request(
             }
         };
 
-        let scan = FileScanContext::build(vec![scan_range.clone()], None)?;
+        let scan =
+            FileScanContext::build(vec![scan_range.clone()], None, scan_cfg.oss_config.as_ref())?;
         let mut iter = build_format_iter(scan, format, None, None, None)?;
 
         let mut row_offset = 0i64;

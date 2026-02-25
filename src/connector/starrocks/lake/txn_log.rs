@@ -59,12 +59,12 @@ use crate::formats::starrocks::writer::{
     write_parquet_file,
 };
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
     ColumnPb, CombinedTxnLogPb, KeysType, PUniqueId, RowsetMetadataPb, TableSchemaKeyPb,
     TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
 };
-use crate::novarocks_logging::info;
 pub(crate) fn append_lake_txn_log_with_rowset(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
@@ -1737,6 +1737,9 @@ fn build_metadata_object_store_profile_for_partial(
             let profile = ObjectStoreProfile::from_s3_store_config(s3)?;
             Ok(Some(profile))
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "partial-update baseline metadata loader does not support hdfs path yet: {tablet_root_path}"
+        )),
     }
 }
 

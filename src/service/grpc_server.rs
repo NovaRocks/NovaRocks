@@ -25,12 +25,12 @@ use tonic::transport::Server;
 
 use crate::common::config::{http_port, starlet_port};
 use crate::common::ids::SlotId;
+use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
 use crate::runtime::starlet_shard_registry;
 use crate::service::stream_load_http;
-use crate::novarocks_logging::{error, info, warn};
 
 pub mod proto {
     pub mod novarocks {

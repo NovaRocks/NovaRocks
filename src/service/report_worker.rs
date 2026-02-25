@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use crate::common::app_config;
 use crate::common::types::UniqueId;
+use crate::novarocks_logging::debug;
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::service::fe_report;
-use crate::novarocks_logging::debug;
 
 static REPORT_WORKER_STARTED: OnceLock<()> = OnceLock::new();
 static REPORT_WORKER_STOP: AtomicBool = AtomicBool::new(false);

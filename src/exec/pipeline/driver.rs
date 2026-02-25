@@ -37,12 +37,12 @@ use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::metrics;
+use crate::novarocks_logging::{debug, error};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::profile::{CounterRef, OperatorProfiles, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::fe_report;
-use crate::novarocks_logging::{debug, error};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Runtime state for a single pipeline driver.

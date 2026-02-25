@@ -23,11 +23,11 @@ use crate::connector::starrocks::lake::{
     get_tablet_stats as lake_get_tablet_stats, publish_version as lake_publish_version,
     vacuum as lake_vacuum,
 };
+use crate::novarocks_logging::error;
 use crate::service::grpc_client::proto::starrocks::{
     AbortTxnRequest, DeleteDataRequest, DeleteTabletRequest, DropTableRequest,
     PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
-use crate::novarocks_logging::error;
 use crate::{FetchResult, UniqueId};
 use prost::Message;
 

@@ -429,9 +429,7 @@ fn lower_pre_agg_fallback_expr(
             .map(|f| f.name.function_name.to_ascii_lowercase())
             .unwrap_or_default();
         if fn_name == "count" {
-            return Ok(arena.push(ExprNode::Literal(
-                crate::exec::expr::LiteralValue::Int8(1),
-            )));
+            return Ok(arena.push(ExprNode::Literal(crate::exec::expr::LiteralValue::Int8(1))));
         }
         return Err(format!(
             "SORT_NODE node_id={} pre_agg_expr root has no children",

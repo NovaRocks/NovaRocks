@@ -25,8 +25,8 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, schema_for_layout};
 use crate::lower::node::Lowered;
-use crate::plan_nodes;
 use crate::novarocks_logging::warn;
+use crate::plan_nodes;
 
 /// Lower a SCHEMA_SCAN_NODE to an empty `ValuesNode`.
 ///

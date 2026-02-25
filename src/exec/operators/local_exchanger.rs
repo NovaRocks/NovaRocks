@@ -48,10 +48,10 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::spill::spill_channel::SpillChannelHandle;
 use crate::exec::spill::spiller::{SpillFile, Spiller};
 use crate::exec::spill::{SpillConfig, SpillMode, SpillProfile};
-use crate::runtime::mem_tracker::MemTracker;
-use crate::runtime::runtime_state::RuntimeState;
 use crate::novarocks_logging::debug;
 use crate::novarocks_logging::warn;
+use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::runtime_state::RuntimeState;
 
 static NEXT_EXCHANGE_ID: AtomicUsize = AtomicUsize::new(1);
 const LOCAL_EXCHANGE_NOTIFY_LOG_EVERY: u64 = 1024;

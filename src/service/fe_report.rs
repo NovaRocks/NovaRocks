@@ -33,12 +33,12 @@ use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChan
 
 use crate::cache::DataCacheManager;
 use crate::common::types::UniqueId;
+use crate::novarocks_logging::{debug, warn};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
 use crate::service::report_worker;
-use crate::novarocks_logging::{debug, warn};
 use crate::{
     data_cache, frontend_service, internal_service, metrics, runtime_profile, status, status_code,
     types,

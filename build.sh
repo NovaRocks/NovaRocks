@@ -29,17 +29,20 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 print_usage() {
     cat <<'EOF'
 Usage:
-  ./build.sh [cargo subcommand args...]
+  ./build.sh [--output <dir>] [--no-package] [cargo subcommand args...]
 
 Examples:
   ./build.sh
   ./build.sh build --release
+  ./build.sh --output ./output/novarocks build --release
+  ./build.sh --no-package test
   ./build.sh test
-  STARROCKS_THIRDPARTY=/path/to/starrocks/thirdparty ./build.sh build
+  STARROCKS_THIRDPARTY=./thirdparty ./build.sh build
 
 Description:
-  This wrapper resolves thirdparty root from STARROCKS_THIRDPARTY (or ./thirdparty by default)
-  and exports OPENSSL_* / PKG_CONFIG_PATH so openssl-sys can use StarRocks thirdparty libs.
+  This wrapper resolves thirdparty root from STARROCKS_THIRDPARTY (default: ./thirdparty)
+  and exports OPENSSL_* / PKG_CONFIG_PATH so openssl-sys can use bundled thirdparty libs.
+  When cargo subcommand is `build`, it also packages runtime files into output/novarocks by default.
 EOF
 }
 
@@ -98,6 +101,14 @@ append_path_var() {
         export "${var_name}=${value}:${!var_name}"
     else
         export "${var_name}=${value}"
+    fi
+}
+
+append_path_if_dir() {
+    local var_name="$1"
+    local dir="$2"
+    if [[ -d "${dir}" ]]; then
+        append_path_var "${var_name}" "${dir}"
     fi
 }
 
@@ -161,9 +172,415 @@ setup_starrocks_gcc_runtime() {
     fi
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    print_usage
+realpath_portable() {
+    local path="$1"
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f "${path}" 2>/dev/null && return 0
+    fi
+    python3 - <<'PY' "${path}" 2>/dev/null
+import os,sys
+print(os.path.realpath(sys.argv[1]))
+PY
+}
+
+copy_shared_lib() {
+    local src="$1"
+    local dst_dir="$2"
+    if [[ ! -e "${src}" ]]; then
+        return 0
+    fi
+    cp -a "${src}" "${dst_dir}/"
+    if [[ -L "${src}" ]]; then
+        local real
+        real="$(realpath_portable "${src}" || true)"
+        if [[ -n "${real}" && -f "${real}" ]]; then
+            cp -a "${real}" "${dst_dir}/"
+        fi
+    fi
+}
+
+copy_non_system_linked_libs() {
+    local binary="$1"
+    local dst_dir="$2"
+    if [[ ! -x "${binary}" ]]; then
+        return 0
+    fi
+
+    if [[ "${OS_NAME}" == "Linux" ]] && command -v ldd >/dev/null 2>&1; then
+        ldd "${binary}" 2>/dev/null | while IFS= read -r line; do
+            local lib_path
+            lib_path="$(echo "${line}" | awk '{for(i=1;i<=NF;i++){if($i=="=>"){print $(i+1); exit}}}')"
+            if [[ -z "${lib_path}" || ! -f "${lib_path}" ]]; then
+                continue
+            fi
+            case "${lib_path}" in
+                /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*)
+                    continue
+                    ;;
+            esac
+            copy_shared_lib "${lib_path}" "${dst_dir}"
+        done
+    fi
+}
+
+resolve_build_artifact_path() {
+    local profile="debug"
+    local target_triple="${CARGO_BUILD_TARGET:-}"
+    local args=("$@")
+    local i=1
+    while [[ ${i} -lt ${#args[@]} ]]; do
+        local arg="${args[$i]}"
+        case "${arg}" in
+            --release)
+                profile="release"
+                ;;
+            --profile)
+                ((i++))
+                profile="${args[$i]}"
+                ;;
+            --profile=*)
+                profile="${arg#--profile=}"
+                ;;
+            --target)
+                ((i++))
+                target_triple="${args[$i]}"
+                ;;
+            --target=*)
+                target_triple="${arg#--target=}"
+                ;;
+        esac
+        ((i++))
+    done
+
+    local target_root="${ROOT_DIR}/target"
+    if [[ -n "${target_triple}" ]]; then
+        target_root="${target_root}/${target_triple}"
+    fi
+    echo "${target_root}/${profile}/novarocks"
+}
+
+generate_output_scripts() {
+    local out_root="$1"
+
+    cat > "${out_root}/bin/novarocksctl" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(dirname "$0")
+SCRIPT_DIR=$(cd "${SCRIPT_DIR}" && pwd)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+NOVAROCKS_BIN="${ROOT_DIR}/bin/novarocks"
+CONFIG_PATH="${ROOT_DIR}/conf/novarocks.toml"
+LOG_DIR="${ROOT_DIR}/log"
+PID_FILE="${ROOT_DIR}/bin/novarocks.pid"
+LOG_FILE="${LOG_DIR}/novarocks.out"
+
+mkdir -p "${LOG_DIR}" "${ROOT_DIR}/bin"
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    LD_LIBRARY_PATH="${ROOT_DIR}/lib:${LD_LIBRARY_PATH}"
+else
+    LD_LIBRARY_PATH="${ROOT_DIR}/lib"
+fi
+export LD_LIBRARY_PATH
+
+print_usage() {
+    cat <<'USAGE'
+Usage:
+  ./bin/novarocksctl [start] [--daemon] [-- <extra args>...]
+  ./bin/novarocksctl stop [--timeout <seconds>]
+  ./bin/novarocksctl restart [--timeout <seconds>] [--daemon] [-- <extra args>...]
+
+Examples:
+  ./bin/novarocksctl --daemon
+  ./bin/novarocksctl start
+  ./bin/novarocksctl stop --timeout 30
+  ./bin/novarocksctl restart --timeout 30 --daemon
+USAGE
+}
+
+is_novarocks_process() {
+    pid="$1"
+    ps -p "${pid}" -o command= 2>/dev/null | grep -q "novarocks"
+}
+
+start_novarocks() {
+    RUN_DAEMON=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --daemon)
+                RUN_DAEMON=1
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ ! -x "${NOVAROCKS_BIN}" ]; then
+        echo "Error: executable not found: ${NOVAROCKS_BIN}" >&2
+        exit 1
+    fi
+
+    if [ -f "${PID_FILE}" ]; then
+        oldpid=$(cat "${PID_FILE}")
+        if is_novarocks_process "${oldpid}"; then
+            echo "NovaRocks already running as pid ${oldpid}" >&2
+            exit 1
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    if [ "${RUN_DAEMON}" -eq 1 ]; then
+        if [ $# -gt 0 ]; then
+            nohup "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" "$@" >> "${LOG_FILE}" 2>&1 < /dev/null &
+        else
+            nohup "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" >> "${LOG_FILE}" 2>&1 < /dev/null &
+        fi
+        echo $! > "${PID_FILE}"
+        echo "NovaRocks started in daemon mode, pid=$(cat "${PID_FILE}")"
+    else
+        if [ $# -gt 0 ]; then
+            exec "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" "$@"
+        else
+            exec "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}"
+        fi
+    fi
+}
+
+stop_novarocks() {
+    STOP_TIMEOUT=30
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout)
+                if [ $# -lt 2 ]; then
+                    echo "Error: --timeout requires seconds" >&2
+                    exit 1
+                fi
+                STOP_TIMEOUT="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                echo "Error: unknown stop option: $1" >&2
+                print_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ ! -f "${PID_FILE}" ]; then
+        echo "NovaRocks pid file not found: ${PID_FILE}"
+        exit 0
+    fi
+
+    pid=$(cat "${PID_FILE}")
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+        echo "Process ${pid} not found, removing stale pid file"
+        rm -f "${PID_FILE}"
+        exit 0
+    fi
+
+    if ! is_novarocks_process "${pid}"; then
+        echo "Refuse to stop pid ${pid}: command is not novarocks"
+        exit 1
+    fi
+
+    kill -15 "${pid}" >/dev/null 2>&1 || true
+    start_ts=$(date +%s)
+    while kill -0 "${pid}" >/dev/null 2>&1; do
+        if [ "${STOP_TIMEOUT}" -gt 0 ] && [ $(( $(date +%s) - start_ts )) -gt "${STOP_TIMEOUT}" ]; then
+            kill -9 "${pid}" >/dev/null 2>&1 || true
+            echo "Graceful stop timeout, process ${pid} killed with SIGKILL"
+            break
+        fi
+        sleep 1
+    done
+
+    rm -f "${PID_FILE}"
+    echo "NovaRocks stopped"
+}
+
+restart_novarocks() {
+    STOP_TIMEOUT=30
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout)
+                if [ $# -lt 2 ]; then
+                    echo "Error: --timeout requires seconds" >&2
+                    exit 1
+                fi
+                STOP_TIMEOUT="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    stop_novarocks --timeout "${STOP_TIMEOUT}"
+    start_novarocks "$@"
+}
+
+if [ $# -eq 0 ]; then
+    start_novarocks
     exit 0
+fi
+
+cmd="$1"
+case "${cmd}" in
+    -h|--help|help)
+        print_usage
+        ;;
+    start)
+        shift
+        start_novarocks "$@"
+        ;;
+    stop)
+        shift
+        stop_novarocks "$@"
+        ;;
+    restart)
+        shift
+        restart_novarocks "$@"
+        ;;
+    *)
+        start_novarocks "$@"
+        ;;
+esac
+EOF
+    chmod +x "${out_root}/bin/novarocksctl"
+
+    cat > "${out_root}/README.md" <<'EOF'
+# NovaRocks Runtime Package
+
+This directory is generated by `build.sh` in a StarRocks-like runtime layout:
+
+- `bin/`: executable and control script
+- `conf/`: runtime configs
+- `lib/`: runtime libraries
+- `log/`: runtime logs
+
+PID file: `bin/novarocks.pid`
+
+## Start
+
+```bash
+cd output/novarocks
+./bin/novarocksctl start
+```
+
+Daemon mode:
+
+```bash
+./bin/novarocksctl start --daemon
+```
+
+Stop:
+
+```bash
+./bin/novarocksctl stop
+```
+
+Restart:
+
+```bash
+./bin/novarocksctl restart
+```
+EOF
+}
+
+package_output() {
+    local binary_path="$1"
+    local out_root="$2"
+    local saved_config=""
+    local has_saved_config=0
+
+    if [[ ! -x "${binary_path}" ]]; then
+        echo "Error: build artifact not found: ${binary_path}" >&2
+        exit 1
+    fi
+
+    if [[ -f "${out_root}/conf/novarocks.toml" ]]; then
+        saved_config="$(mktemp "${TMPDIR:-/tmp}/novarocks.toml.XXXXXX")"
+        cp -a "${out_root}/conf/novarocks.toml" "${saved_config}"
+        has_saved_config=1
+    fi
+
+    echo "Packaging output directory: ${out_root}"
+    rm -rf "${out_root}"
+    mkdir -p "${out_root}/"{bin,conf,lib,log}
+
+    cp -a "${binary_path}" "${out_root}/bin/novarocks"
+    chmod +x "${out_root}/bin/novarocks"
+
+    if [[ -f "${ROOT_DIR}/novarocks.toml.example" ]]; then
+        cp -a "${ROOT_DIR}/novarocks.toml.example" "${out_root}/conf/novarocks.toml.example"
+    else
+        echo "Error: novarocks.toml.example not found" >&2
+        exit 1
+    fi
+
+    if [[ ${has_saved_config} -eq 1 ]]; then
+        cp -a "${saved_config}" "${out_root}/conf/novarocks.toml"
+        rm -f "${saved_config}"
+    fi
+
+    generate_output_scripts "${out_root}"
+
+    # Bundle runtime libs resolved from current binary linkage.
+    copy_non_system_linked_libs "${binary_path}" "${out_root}/lib"
+
+    : > "${out_root}/log/.gitkeep"
+}
+
+NOVAROCKS_OUTPUT="${NOVAROCKS_OUTPUT:-${ROOT_DIR}/output/novarocks}"
+AUTO_PACKAGE=1
+declare -a CARGO_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --output)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --output requires a directory path" >&2
+                exit 1
+            fi
+            NOVAROCKS_OUTPUT="$2"
+            shift 2
+            ;;
+        --no-package)
+            AUTO_PACKAGE=0
+            shift
+            ;;
+        *)
+            CARGO_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#CARGO_ARGS[@]} -eq 0 ]]; then
+    CARGO_ARGS=(build)
 fi
 
 THIRDPARTY_ROOT="$(resolve_thirdparty_root)"
@@ -184,6 +601,16 @@ export STARROCKS_THIRDPARTY="${THIRDPARTY_ROOT}"
 if [[ "${OS_NAME}" == "Linux" ]]; then
     detect_starrocks_gcc_home
     setup_starrocks_gcc_runtime
+fi
+
+append_path_if_dir LIBRARY_PATH "${THIRDPARTY_ROOT}/lib"
+append_path_if_dir LIBRARY_PATH "${THIRDPARTY_ROOT}/lib64"
+if [[ "${OS_NAME}" == "Linux" ]]; then
+    append_path_if_dir LD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib"
+    append_path_if_dir LD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib64"
+elif [[ "${OS_NAME}" == "Darwin" ]]; then
+    append_path_if_dir DYLD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib"
+    append_path_if_dir DYLD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib64"
 fi
 
 use_thirdparty_openssl=0
@@ -231,10 +658,6 @@ if [[ -n "${target}" ]]; then
     fi
 fi
 
-if [[ $# -eq 0 ]]; then
-    set -- build
-fi
-
 echo "Using thirdparty root: ${THIRDPARTY_ROOT}"
 if [[ "${use_thirdparty_openssl}" == "1" ]]; then
     echo "OPENSSL_DIR=${OPENSSL_DIR}"
@@ -249,4 +672,10 @@ if [[ -n "${cargo_linker_var:-}" ]]; then
     echo "${cargo_linker_var}=${!cargo_linker_var}"
 fi
 
-exec cargo "$@"
+cargo "${CARGO_ARGS[@]}"
+
+if [[ "${CARGO_ARGS[0]}" == "build" && "${AUTO_PACKAGE}" == "1" ]]; then
+    artifact_path="$(resolve_build_artifact_path "${CARGO_ARGS[@]}")"
+    package_output "${artifact_path}" "${NOVAROCKS_OUTPUT}"
+    echo "Packaged runtime output: ${NOVAROCKS_OUTPUT}"
+fi

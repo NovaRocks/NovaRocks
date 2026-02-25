@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -30,6 +30,14 @@ pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig
         return Ok(cfg);
     }
     let path = path.as_ref().to_path_buf();
+    if !path.exists() {
+        eprintln!(
+            "WARNING: config file '{}' not found, using built-in defaults",
+            path.display()
+        );
+        let _ = CONFIG.set(NovaRocksConfig::default());
+        return Ok(CONFIG.get().expect("CONFIG set"));
+    }
     let cfg = NovaRocksConfig::load_from_file(&path)?;
     let _ = CONFIG.set(cfg);
     Ok(CONFIG.get().expect("CONFIG set"))
@@ -39,33 +47,27 @@ pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
     }
-    let path = config_path_from_env_or_default()?;
-    let cfg = NovaRocksConfig::load_from_file(&path)?;
-    let _ = CONFIG.set(cfg);
+    if let Ok(p) = std::env::var("NOVAROCKS_CONFIG") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return init_from_path(PathBuf::from(p));
+        }
+    }
+
+    let default_path = PathBuf::from("novarocks.toml");
+    if default_path.exists() {
+        let cfg = NovaRocksConfig::load_from_file(&default_path)?;
+        let _ = CONFIG.set(cfg);
+        return Ok(CONFIG.get().expect("CONFIG set"));
+    }
+
+    eprintln!("WARNING: config file 'novarocks.toml' not found, using built-in defaults");
+    let _ = CONFIG.set(NovaRocksConfig::default());
     Ok(CONFIG.get().expect("CONFIG set"))
 }
 
 pub fn config() -> Result<&'static NovaRocksConfig> {
     init_from_env_or_default()
-}
-
-fn config_path_from_env_or_default() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("NOVAROCKS_CONFIG") {
-        if !p.trim().is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-
-    let candidates = [PathBuf::from("novarocks.toml")];
-    for p in candidates {
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-
-    Err(anyhow!(
-        "missing config file: set $NOVAROCKS_CONFIG or create ./novarocks.toml"
-    ))
 }
 
 #[derive(Clone, Deserialize)]

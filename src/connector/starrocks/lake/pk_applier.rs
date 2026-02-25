@@ -553,6 +553,9 @@ fn build_metadata_object_store_profile(
             let profile = ObjectStoreProfile::from_s3_store_config(s3)?;
             Ok(Some(profile))
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "primary key metadata loader does not support hdfs path yet: {tablet_root_path}"
+        )),
     }
 }
 

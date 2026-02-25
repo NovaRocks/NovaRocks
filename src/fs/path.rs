@@ -18,6 +18,7 @@
 pub enum ScanPathScheme {
     Local,
     Oss,
+    Hdfs,
 }
 
 fn normalize_local_scan_path(raw: &str) -> Result<String, String> {
@@ -52,6 +53,8 @@ where
         }
         let current = if path.starts_with("oss://") || path.starts_with("s3://") {
             ScanPathScheme::Oss
+        } else if path.starts_with("hdfs://") {
+            ScanPathScheme::Hdfs
         } else if path.starts_with("file:/")
             || path.starts_with("file://")
             || path.starts_with('/')
@@ -118,6 +121,20 @@ pub fn resolve_opendal_paths(
                 },
             ))
         }
+        ScanPathScheme::Hdfs => {
+            let resolved = crate::fs::hdfs::resolve_hdfs_scan_paths(paths)?;
+            let op =
+                crate::fs::hdfs::build_hdfs_operator(&resolved.name_node, resolved.user.as_deref())
+                    .map_err(|e| e.to_string())?;
+            Ok((
+                op,
+                ResolvedScanPaths {
+                    scheme,
+                    root: Some(resolved.name_node),
+                    paths: resolved.paths,
+                },
+            ))
+        }
     }
 }
 
@@ -155,5 +172,12 @@ mod tests {
         let scheme = classify_scan_paths(["file:/tmp/a.parquet"].into_iter())
             .expect("classify file URI path");
         assert_eq!(scheme, ScanPathScheme::Local);
+    }
+
+    #[test]
+    fn classify_scan_paths_accepts_hdfs_uri() {
+        let scheme = classify_scan_paths(["hdfs://nn-1:9000/user/hive/a.parquet"].into_iter())
+            .expect("classify hdfs URI path");
+        assert_eq!(scheme, ScanPathScheme::Hdfs);
     }
 }

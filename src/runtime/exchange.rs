@@ -25,8 +25,8 @@ use arrow::ipc::writer::StreamWriter;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::runtime::mem_tracker::MemTracker;
 use crate::novarocks_logging::debug;
+use crate::runtime::mem_tracker::MemTracker;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ExchangeKey {

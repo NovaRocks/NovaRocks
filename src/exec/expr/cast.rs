@@ -2237,8 +2237,7 @@ fn cast_decimal_to_decimal_relaxed(
         } else {
             target_precision
         };
-        if enforce_precision && !decimal_value_within_precision(value, effective_target_precision)
-        {
+        if enforce_precision && !decimal_value_within_precision(value, effective_target_precision) {
             values.push(None);
             continue;
         }

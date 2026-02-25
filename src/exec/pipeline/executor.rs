@@ -32,9 +32,9 @@ use std::time::Duration;
 
 use crate::common::app_config;
 use crate::exec::node::ExecPlan;
+use crate::novarocks_logging::info;
 use crate::runtime::query_context::query_context_manager;
 use crate::runtime::runtime_state::RuntimeState;
-use crate::novarocks_logging::info;
 
 use super::builder::build_pipeline_graph_for_exec_plan_with_dop;
 use super::dependency::DependencyManager;

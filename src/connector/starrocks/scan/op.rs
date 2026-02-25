@@ -28,8 +28,8 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::formats::parquet::MinMaxPredicate;
 use crate::metrics;
-use crate::runtime::profile::RuntimeProfile;
 use crate::novarocks_logging::{info, warn};
+use crate::runtime::profile::RuntimeProfile;
 use crate::types;
 
 use super::reader::StarRocksNativeReader;

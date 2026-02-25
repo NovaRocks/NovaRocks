@@ -43,8 +43,8 @@ use crate::exec::spill::{SpillConfig, SpillMode, SpillProfile};
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::runtime_state::RuntimeState;
 use crate::novarocks_logging::warn;
+use crate::runtime::runtime_state::RuntimeState;
 
 use arrow::array::ArrayRef;
 use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take};

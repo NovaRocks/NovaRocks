@@ -24,9 +24,9 @@ use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter};
 use crate::fs::scan_context::FileScanRange;
+use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::{RuntimeFilterHandle, RuntimeFilterSnapshot};
-use crate::novarocks_logging::warn;
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -189,6 +189,9 @@ pub struct RowPositionScanConfig {
     pub batch_size: Option<usize>,
     pub enable_file_metacache: bool,
     pub enable_file_pagecache: bool,
+    /// OSS credentials for re-scanning the source file during late-materialisation lookups.
+    /// `None` for local / HDFS paths; must be `Some` for `oss://` / `s3://` paths.
+    pub oss_config: Option<crate::fs::object_store::ObjectStoreConfig>,
 }
 
 #[derive(Clone)]
