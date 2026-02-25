@@ -23,12 +23,12 @@ use crate::exec::runtime_filter::{
     decode_starrocks_in_filter, decode_starrocks_membership_filter, encode_starrocks_bloom_filter,
     encode_starrocks_empty_filter, encode_starrocks_in_filter, peek_starrocks_filter_type,
 };
+use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime_filter;
 use crate::service::exchange_sender;
 use crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams;
-use crate::novarocks_logging::{debug, warn};
 
 pub(crate) struct RuntimeFilterWorker {
     query_id: QueryId,

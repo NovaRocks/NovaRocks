@@ -36,13 +36,13 @@ use crate::lower::layout::{
 };
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
 use crate::lower::type_lowering::arrow_type_from_desc;
-use crate::runtime::query_context::QueryId;
-use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
 use crate::novarocks_logging::{debug, info};
+use crate::runtime::query_context::QueryId;
+use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::{descriptors, internal_service, plan_nodes, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
@@ -542,53 +542,60 @@ pub(crate) fn build_lake_properties(
     );
 
     let scheme = classify_scan_paths(tablet_path_map.values().map(|v| v.as_str()))?;
-    if matches!(scheme, ScanPathScheme::Oss) {
-        let shard_infos = starlet_shard_registry::select_infos(&tablet_ids);
-        let mut selected_s3: Option<S3StoreConfig> = None;
-        for tablet_id in tablet_ids {
-            let tablet_path = tablet_path_map
-                .get(&tablet_id)
-                .map(String::as_str)
-                .unwrap_or("<unknown>");
-            let s3_cfg = shard_infos
-                .get(&tablet_id)
-                .and_then(|info| info.s3.clone())
-                .or_else(|| {
-                    get_tablet_runtime(tablet_id)
-                        .ok()
-                        .and_then(|runtime| runtime.s3_config.clone())
-                })
-                .or_else(|| starlet_shard_registry::infer_s3_config_for_path(tablet_path))
-                .ok_or_else(|| {
-                    format!(
-                        "missing S3 config for lake scan tablet_id={} (path={})",
-                        tablet_id, tablet_path
-                    )
-                })?;
+    match scheme {
+        ScanPathScheme::Local => {}
+        ScanPathScheme::Oss => {
+            let shard_infos = starlet_shard_registry::select_infos(&tablet_ids);
+            let mut selected_s3: Option<S3StoreConfig> = None;
+            for tablet_id in tablet_ids {
+                let tablet_path = tablet_path_map
+                    .get(&tablet_id)
+                    .map(String::as_str)
+                    .unwrap_or("<unknown>");
+                let s3_cfg = shard_infos
+                    .get(&tablet_id)
+                    .and_then(|info| info.s3.clone())
+                    .or_else(|| {
+                        get_tablet_runtime(tablet_id)
+                            .ok()
+                            .and_then(|runtime| runtime.s3_config.clone())
+                    })
+                    .or_else(|| starlet_shard_registry::infer_s3_config_for_path(tablet_path))
+                    .ok_or_else(|| {
+                        format!(
+                            "missing S3 config for lake scan tablet_id={} (path={})",
+                            tablet_id, tablet_path
+                        )
+                    })?;
 
-            match selected_s3.as_ref() {
-                None => selected_s3 = Some(s3_cfg),
-                Some(prev) if prev == &s3_cfg => {}
-                Some(prev) => {
-                    return Err(format!(
-                        "inconsistent S3 config across tablets in one lake scan; \
-                        tablet_id={} endpoint={} bucket={} root={} conflicts with endpoint={} bucket={} root={}",
-                        tablet_id,
-                        s3_cfg.endpoint,
-                        s3_cfg.bucket,
-                        s3_cfg.root,
-                        prev.endpoint,
-                        prev.bucket,
-                        prev.root
-                    ));
+                match selected_s3.as_ref() {
+                    None => selected_s3 = Some(s3_cfg),
+                    Some(prev) if prev == &s3_cfg => {}
+                    Some(prev) => {
+                        return Err(format!(
+                            "inconsistent S3 config across tablets in one lake scan; \
+                            tablet_id={} endpoint={} bucket={} root={} conflicts with endpoint={} bucket={} root={}",
+                            tablet_id,
+                            s3_cfg.endpoint,
+                            s3_cfg.bucket,
+                            s3_cfg.root,
+                            prev.endpoint,
+                            prev.bucket,
+                            prev.root
+                        ));
+                    }
                 }
             }
-        }
 
-        let s3 = selected_s3
-            .ok_or_else(|| "lake scan object-store path has no resolved S3 config".to_string())?;
-        for (k, v) in s3.to_aws_s3_properties() {
-            props.insert(k, v);
+            let s3 = selected_s3.ok_or_else(|| {
+                "lake scan object-store path has no resolved S3 config".to_string()
+            })?;
+            for (k, v) in s3.to_aws_s3_properties() {
+                props.insert(k, v);
+            }
+        }
+        ScanPathScheme::Hdfs => {
+            return Err("lake scan does not support hdfs tablet paths yet".to_string());
         }
     }
     Ok(props)

@@ -986,7 +986,10 @@ impl NlJoinProbeProcessorOperator {
         let mut residual_conjuncts = Vec::new();
         let mut reading_key = true;
         for expr in conjuncts {
-            let is_key = matches!(arena.node(expr), Some(ExprNode::Eq(_, _) | ExprNode::EqForNull(_, _)));
+            let is_key = matches!(
+                arena.node(expr),
+                Some(ExprNode::Eq(_, _) | ExprNode::EqForNull(_, _))
+            );
             if reading_key && is_key {
                 key_conjuncts.push(expr);
             } else {
@@ -1015,7 +1018,10 @@ impl NlJoinProbeProcessorOperator {
         Ok(out)
     }
 
-    fn eval_conjunct_row_state(masks: &[BooleanArray], row: usize) -> Result<ConjunctState, String> {
+    fn eval_conjunct_row_state(
+        masks: &[BooleanArray],
+        row: usize,
+    ) -> Result<ConjunctState, String> {
         if masks.is_empty() {
             return Ok(ConjunctState::True);
         }

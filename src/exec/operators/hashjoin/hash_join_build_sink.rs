@@ -46,11 +46,11 @@ use crate::exec::runtime_filter::{
     data_type_to_tprimitive, encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
 };
 use crate::metrics;
+use crate::novarocks_logging::{debug, warn};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::exchange_sender;
-use crate::novarocks_logging::{debug, warn};
 use std::collections::{HashMap, HashSet};
 
 /// Factory for hash-join build sinks that construct build-side hash structures.

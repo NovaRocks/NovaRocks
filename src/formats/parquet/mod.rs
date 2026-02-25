@@ -49,8 +49,8 @@ use crate::exec::variant::VariantValue;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::scan_context::FileScanRange;
 use crate::metrics;
-use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::novarocks_logging::debug;
+use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::types;
 
 #[derive(Clone, Debug)]

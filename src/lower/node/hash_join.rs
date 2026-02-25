@@ -82,9 +82,10 @@ fn common_join_key_type(left: &DataType, right: &DataType) -> Result<Option<Data
         return Ok(Some(left.clone()));
     }
     match (left, right) {
-        (DataType::Decimal128(_, _) | DataType::Decimal256(_, _), DataType::Decimal128(_, _) | DataType::Decimal256(_, _)) => {
-            Ok(Some(common_decimal_compare_type(left, right)?))
-        }
+        (
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _),
+        ) => Ok(Some(common_decimal_compare_type(left, right)?)),
         (DataType::List(left_field), DataType::List(right_field)) => {
             let Some(elem_type) =
                 common_join_key_type(left_field.data_type(), right_field.data_type())?

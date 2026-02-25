@@ -21,8 +21,8 @@ use crate::formats::parquet::{
     probe_parquet_bytes,
 };
 use crate::metrics;
-use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
 use crate::novarocks_logging::debug;
+use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -217,7 +217,7 @@ impl OpendalRangeReader {
         let len = meta.content_length();
         let mtime = meta
             .last_modified()
-            .map(|dt| dt.timestamp())
+            .map(|dt| dt.into_inner().as_second())
             .map(|ts| ts as i64);
         Ok(Self {
             op,
@@ -243,7 +243,7 @@ impl OpendalRangeReader {
         let path_str = path.into();
         let mtime = rt.block_on(op.stat(&path_str)).ok().and_then(|meta| {
             meta.last_modified()
-                .map(|dt| dt.timestamp())
+                .map(|dt| dt.into_inner().as_second())
                 .map(|ts| ts as i64)
         });
         Self {

@@ -30,6 +30,10 @@ pub struct HdfsScanConfig {
     pub limit: Option<usize>,
     pub profile_label: Option<String>,
     pub format: Option<FileFormatConfig>,
+    /// OSS credentials supplied by FE via `THdfsScanNode.cloud_configuration`.
+    /// Used as a fallback when the shard registry has no entry for the scanned path
+    /// (typical for Iceberg external tables whose files are not tracked as lake tablets).
+    pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +76,11 @@ impl ScanOp for HdfsScanOp {
             first_row_id,
             external_datacache: external_datacache.clone(),
         }];
-        let scan = FileScanContext::build(ranges, profile.clone())?;
+        let scan = FileScanContext::build(
+            ranges,
+            profile.clone(),
+            self.cfg.object_store_config.as_ref(),
+        )?;
         if let Some(profile) = profile.as_ref() {
             profile.add_info_string(
                 "OriginalRangeCount",

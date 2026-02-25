@@ -259,22 +259,6 @@ where
     Ok(rt.block_on(future))
 }
 
-pub fn resolve_oss_operator_and_path(full_path: &str) -> Result<(Operator, String), String> {
-    let cfg = resolve_oss_config_for_path(full_path)?;
-    resolve_oss_operator_and_path_with_config(full_path, &cfg)
-}
-
-pub fn resolve_oss_config_for_path(full_path: &str) -> Result<ObjectStoreConfig, String> {
-    crate::runtime::starlet_shard_registry::find_s3_config_for_path(full_path)
-        .ok_or_else(|| {
-            format!(
-                "missing object store config from FE for path={full_path}; \
-                expected AddShard or persisted tablet runtime to provide S3 credentials"
-            )
-        })
-        .map(|cfg| cfg.to_object_store_config())
-}
-
 pub fn resolve_oss_operator_and_path_with_config(
     full_path: &str,
     cfg: &ObjectStoreConfig,

@@ -34,8 +34,8 @@ use crate::exec::pipeline::schedule::observer::Observable;
 use std::sync::Arc;
 
 use crate::exec::operators::local_exchanger::LocalExchanger;
-use crate::runtime::runtime_state::RuntimeState;
 use crate::novarocks_logging::debug;
+use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for local-exchange sink operators that partition and enqueue chunks locally.
 pub struct LocalExchangeSinkFactory {

@@ -33,11 +33,16 @@ pub fn write_bytes(path: &str, bytes: Vec<u8>) -> Result<(), String> {
             fs::write(path_buf, bytes).map_err(|e| format!("write file failed: {}", e))
         }
         ScanPathScheme::Oss => {
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path(path)?;
+            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
+            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
             let write_result = crate::fs::oss::oss_block_on(op.write(&rel, bytes))?;
             write_result.map_err(|e| format!("write object failed: {}", e))?;
             Ok(())
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "write_bytes does not support hdfs path yet: {}",
+            path
+        )),
     }
 }
 
@@ -47,11 +52,16 @@ pub fn read_bytes(path: &str) -> Result<Vec<u8>, String> {
     match scheme {
         ScanPathScheme::Local => fs::read(path).map_err(|e| format!("read file failed: {}", e)),
         ScanPathScheme::Oss => {
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path(path)?;
+            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
+            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
             let read_result = crate::fs::oss::oss_block_on(op.read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read object failed: {}", e))?;
             Ok(bytes.to_vec())
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "read_bytes does not support hdfs path yet: {}",
+            path
+        )),
     }
 }
 
@@ -68,13 +78,18 @@ pub fn read_bytes_if_exists(path: &str) -> Result<Option<Vec<u8>>, String> {
                 .map_err(|e| format!("read file failed: {}", e))
         }
         ScanPathScheme::Oss => {
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path(path)?;
+            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
+            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
             match crate::fs::oss::oss_block_on(op.read(&rel))? {
                 Ok(bytes) => Ok(Some(bytes.to_vec())),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(format!("read object failed: {}", e)),
             }
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "read_bytes_if_exists does not support hdfs path yet: {}",
+            path
+        )),
     }
 }
 
@@ -89,12 +104,17 @@ pub fn delete_path_if_exists(path: &str) -> Result<(), String> {
             fs::remove_file(path_buf).map_err(|e| format!("delete file failed: {}", e))
         }
         ScanPathScheme::Oss => {
-            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path(path)?;
+            let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(path)?;
+            let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
             match crate::fs::oss::oss_block_on(op.delete(&rel))? {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(format!("delete object failed: {}", e)),
             }
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "delete_path_if_exists does not support hdfs path yet: {}",
+            path
+        )),
     }
 }

@@ -17,8 +17,8 @@
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
-use crate::runtime::profile::RuntimeProfile;
 use crate::novarocks_logging::debug;
+use crate::runtime::profile::RuntimeProfile;
 
 #[derive(Clone, Debug)]
 pub struct FileScanRange {
@@ -40,20 +40,33 @@ pub struct FileScanContext {
 }
 
 impl FileScanContext {
+    /// Build a scan context for the given ranges.
+    ///
+    /// `oss_config` must be `Some` when the paths use the `oss://` / `s3://` scheme; it is
+    /// unused for local and HDFS paths.  Callers are responsible for resolving the config from
+    /// whatever source is appropriate (e.g. `THdfsScanNode.cloud_configuration` for Iceberg
+    /// external tables, or the shard registry for native lake tablets).
     pub fn build(
         ranges: Vec<FileScanRange>,
         profile: Option<RuntimeProfile>,
+        oss_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
     ) -> Result<Self, String> {
         let paths = ranges.iter().map(|r| r.path.clone()).collect::<Vec<_>>();
         let scheme = classify_scan_paths(paths.iter().map(|s| s.as_str()))?;
         let object_store_cfg = match scheme {
             ScanPathScheme::Oss => {
-                let first = paths
-                    .first()
-                    .ok_or_else(|| "empty scan paths for object store scan context".to_string())?;
-                Some(crate::fs::oss::resolve_oss_config_for_path(first)?)
+                let cfg = oss_config.ok_or_else(|| {
+                    let first = paths.first().map(|s| s.as_str()).unwrap_or("<empty>");
+                    format!(
+                        "missing object store config for OSS path={first}; \
+                        provide credentials via THdfsScanNode.cloud_configuration \
+                        (Iceberg external tables) or ensure AddShard / tablet runtime \
+                        has been registered (native lake tablets)"
+                    )
+                })?;
+                Some(cfg.clone())
             }
-            ScanPathScheme::Local => None,
+            ScanPathScheme::Local | ScanPathScheme::Hdfs => None,
         };
 
         let (op, resolved) = resolve_opendal_paths(&paths, object_store_cfg.as_ref())?;
@@ -74,6 +87,17 @@ impl FileScanContext {
             }
             ScanPathScheme::Oss => {
                 debug!("file scan (oss): {} ranges", ranges.len());
+            }
+            ScanPathScheme::Hdfs => {
+                let root = resolved
+                    .root
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                debug!(
+                    "file scan (hdfs): {} ranges namenode={}",
+                    ranges.len(),
+                    root
+                );
             }
         }
 

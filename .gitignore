@@ -8,5 +8,6 @@
 /thirdparty/build/
 /.idea
 /dev
+/output
 /sql-tests/bootstrap
 /sql-tests/.sql_test_catalog

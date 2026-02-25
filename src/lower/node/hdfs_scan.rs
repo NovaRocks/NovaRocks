@@ -146,6 +146,83 @@ fn is_paimon_table(desc_tbl: &descriptors::TDescriptorTable, tuple_id: types::TT
     table_desc.paimon_table.is_some()
 }
 
+fn parse_true_false(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("true") || trimmed == "1" {
+        return Some(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") || trimmed == "0" {
+        return Some(false);
+    }
+    None
+}
+
+/// Extract an `ObjectStoreConfig` from the cloud properties map attached to
+/// `THdfsScanNode.cloud_configuration`.  Returns `None` when any required field is absent
+/// so the caller falls back to the shard registry (used by native lake tablets).
+fn resolve_cloud_object_store_config<S>(
+    cloud_props: Option<&std::collections::BTreeMap<S, S>>,
+    ranges: &[FileScanRange],
+) -> Option<crate::fs::object_store::ObjectStoreConfig>
+where
+    S: std::borrow::Borrow<str> + Ord,
+{
+    let props = cloud_props?;
+    let get = |key: &str| {
+        props
+            .get(key)
+            .map(|v| v.borrow().trim())
+            .filter(|v| !v.is_empty())
+    };
+
+    let endpoint = get("aws.s3.endpoint")
+        .or_else(|| get("aws.s3.endpoint_url"))?
+        .to_string();
+    let access_key_id = get("aws.s3.accessKeyId")
+        .or_else(|| get("aws.s3.access_key"))?
+        .to_string();
+    let access_key_secret = get("aws.s3.accessKeySecret")
+        .or_else(|| get("aws.s3.secret_key"))?
+        .to_string();
+    let region = get("aws.s3.region").map(|v| v.to_string());
+    let enable_path_style_access =
+        get("aws.s3.enable_path_style_access").and_then(parse_true_false);
+
+    // Derive bucket from the first OSS range path so that normalize_oss_path can
+    // validate bucket consistency and strip the correct prefix.
+    let bucket = ranges
+        .iter()
+        .find_map(|r| {
+            let p = r.path.trim();
+            for scheme in ["oss://", "s3://"] {
+                if let Some(rest) = p.strip_prefix(scheme) {
+                    let b = rest.split('/').next()?.trim();
+                    if !b.is_empty() {
+                        return Some(b.to_string());
+                    }
+                }
+            }
+            None
+        })
+        .unwrap_or_default();
+
+    Some(crate::fs::object_store::ObjectStoreConfig {
+        endpoint,
+        bucket,
+        root: String::new(),
+        access_key_id,
+        access_key_secret,
+        session_token: None,
+        enable_path_style_access,
+        region,
+        retry_max_times: None,
+        retry_min_delay_ms: None,
+        retry_max_delay_ms: None,
+        timeout_ms: None,
+        io_timeout_ms: None,
+    })
+}
+
 /// Lower a HDFS_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_hdfs_scan_node(
     node: &plan_nodes::TPlanNode,
@@ -707,6 +784,11 @@ pub(crate) fn lower_hdfs_scan_node(
         }
         None => None,
     };
+    let cloud_props = hdfs
+        .cloud_configuration
+        .as_ref()
+        .and_then(|c| c.cloud_properties.as_ref());
+    let object_store_config = resolve_cloud_object_store_config(cloud_props, &ranges);
     let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
     let cfg = HdfsScanConfig {
         ranges,
@@ -715,6 +797,7 @@ pub(crate) fn lower_hdfs_scan_node(
         limit,
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         format,
+        object_store_config: object_store_config.clone(),
     };
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(
@@ -724,6 +807,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 batch_size,
                 enable_file_metacache,
                 enable_file_pagecache,
+                oss_config: object_store_config.clone(),
             },
         )
     });

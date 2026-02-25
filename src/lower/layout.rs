@@ -22,8 +22,8 @@ use crate::common::ids::SlotId;
 use crate::descriptors;
 use crate::exec::chunk::field_with_slot_id;
 use crate::exprs;
-use crate::planner;
 use crate::novarocks_config::config as novarocks_app_config;
+use crate::planner;
 use crate::types;
 use crate::{data_sinks, partitions};
 

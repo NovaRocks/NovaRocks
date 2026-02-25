@@ -255,6 +255,25 @@ pub(crate) fn find_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
     best.map(|(_, cfg)| cfg)
 }
 
+/// Look up the OSS credentials for a native lake tablet path from the shard registry and
+/// return an [`ObjectStoreConfig`] ready for use with
+/// [`resolve_oss_operator_and_path_with_config`].
+///
+/// This is the entry point for the native lake write/read paths.  Iceberg external tables
+/// must not call this — they receive credentials from `THdfsScanNode.cloud_configuration`.
+pub(crate) fn oss_config_for_path(
+    path: &str,
+) -> Result<crate::fs::object_store::ObjectStoreConfig, String> {
+    find_s3_config_for_path(path)
+        .map(|cfg| cfg.to_object_store_config())
+        .ok_or_else(|| {
+            format!(
+                "missing shard registry config for path={path}; \
+                expected AddShard or persisted tablet runtime to provide S3 credentials"
+            )
+        })
+}
+
 pub(crate) fn infer_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
     if let Some(cfg) = find_s3_config_for_path(path) {
         return Some(cfg);

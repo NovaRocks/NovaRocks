@@ -233,7 +233,9 @@ fn main() {
 
             let cfg = match config_path.as_deref() {
                 Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
-                None => novarocks_config::init_from_env_or_default().expect("load novarocks config"),
+                None => {
+                    novarocks_config::init_from_env_or_default().expect("load novarocks config")
+                }
             };
             let ready_host = health_check_host(&cfg.server.host);
             let ready_port = cfg.server.heartbeat_port;
@@ -298,7 +300,9 @@ fn main() {
 
             let cfg = match config_path.as_deref() {
                 Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
-                None => novarocks_config::init_from_env_or_default().expect("load novarocks config"),
+                None => {
+                    novarocks_config::init_from_env_or_default().expect("load novarocks config")
+                }
             };
 
             // Build logging filter from config.
@@ -498,7 +502,9 @@ fn main() {
 
             let cfg = match config_path.as_deref() {
                 Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
-                None => novarocks_config::init_from_env_or_default().expect("load novarocks config"),
+                None => {
+                    novarocks_config::init_from_env_or_default().expect("load novarocks config")
+                }
             };
             let ready_host = health_check_host(&cfg.server.host);
             let ready_port = cfg.server.heartbeat_port;

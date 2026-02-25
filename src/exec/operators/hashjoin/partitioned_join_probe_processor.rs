@@ -41,8 +41,8 @@ use crate::exec::node::join::JoinType;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
-use crate::runtime::runtime_state::RuntimeState;
 use crate::novarocks_logging::debug;
+use crate::runtime::runtime_state::RuntimeState;
 
 /// Factory for partitioned hash-join probe operators over per-partition build artifacts.
 pub struct PartitionedJoinProbeProcessorFactory {

@@ -36,13 +36,15 @@ fn sum_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
             input_arg_type: None,
             count_all: false,
         }),
-        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => Ok(AggSpec {
-            kind: AggKind::SumLargeInt,
-            output_type: DataType::FixedSizeBinary(*width),
-            intermediate_type: DataType::FixedSizeBinary(*width),
-            input_arg_type: None,
-            count_all: false,
-        }),
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            Ok(AggSpec {
+                kind: AggKind::SumLargeInt,
+                output_type: DataType::FixedSizeBinary(*width),
+                intermediate_type: DataType::FixedSizeBinary(*width),
+                input_arg_type: None,
+                count_all: false,
+            })
+        }
         DataType::Boolean => Ok(AggSpec {
             kind: AggKind::SumInt,
             output_type: DataType::Int64,

@@ -37,9 +37,9 @@ use crate::common::thrift::thrift_named_json;
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::master_service;
+use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::starlet_shard_registry;
 use crate::service::{disk_report, stream_load};
-use crate::novarocks_config::config as novarocks_app_config;
 use crate::{
     agent_service,
     backend_service::{

@@ -22,8 +22,8 @@ use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::limit::LimitNode;
 use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::novarocks_logging::warn;
+use crate::runtime::query_context::{QueryId, query_context_manager};
 
 use crate::common::config::exchange_wait_ms;
 use crate::lower::expr::lower_t_expr;

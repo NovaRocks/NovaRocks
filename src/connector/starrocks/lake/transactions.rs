@@ -49,6 +49,7 @@ use crate::formats::starrocks::writer::layout::{
     DATA_DIR, LOG_DIR, META_DIR, bundle_meta_file_path, join_tablet_path, txn_log_file_path,
 };
 use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
+use crate::novarocks_logging::{info, warn};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
     AbortTxnRequest, AbortTxnResponse, CombinedTxnLogPb, DeleteDataRequest, DeleteDataResponse,
@@ -58,7 +59,6 @@ use crate::service::grpc_client::proto::starrocks::{
     TxnInfoPb, TxnLogPb, TxnTypePb, VacuumRequest, VacuumResponse, tablet_stat_response,
     txn_log_pb,
 };
-use crate::novarocks_logging::{info, warn};
 
 const MAX_PUBLISH_WORKERS: usize = 8;
 const STATUS_CODE_OK: i32 = 0;
@@ -1188,6 +1188,9 @@ fn list_directory_file_names(
                 Ok(names)
             })
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "txn log directory listing does not support hdfs path yet: {dir_path}"
+        )),
     }
 }
 
@@ -1372,11 +1375,20 @@ fn file_size_if_exists(
                 )),
             }
         }
+        ScanPathScheme::Hdfs => Err(format!(
+            "txn log file stat does not support hdfs path yet: {path}"
+        )),
     }
 }
 
 fn drop_table_path(path: &str, s3_config: Option<&S3StoreConfig>) -> Result<(), String> {
     let scheme = classify_scan_paths([path])?;
+    if matches!(scheme, ScanPathScheme::Hdfs) {
+        return Err(format!(
+            "drop_table does not support hdfs path yet: {}",
+            path
+        ));
+    }
     let input_paths = vec![path.to_string()];
 
     let object_store_cfg = if matches!(scheme, ScanPathScheme::Oss) {

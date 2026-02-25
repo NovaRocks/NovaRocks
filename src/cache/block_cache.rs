@@ -21,8 +21,6 @@ use crc32c::crc32c_append;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -738,7 +736,7 @@ impl BlockFile {
         if direct_io {
             #[cfg(target_os = "linux")]
             {
-                options.custom_flags(libc::O_DIRECT);
+                std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_DIRECT);
             }
         }
         let file = options

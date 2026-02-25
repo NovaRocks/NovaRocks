@@ -111,6 +111,7 @@ fn test_iceberg_connector_module() {
         limit: Some(10),
         profile_label: Some("connector_smoke".to_string()),
         format: Some(FileFormatConfig::Parquet(parquet_cfg)),
+        object_store_config: None,
     };
     let _scan = novarocks::novarocks_connector_iceberg::HdfsScanOp::new(config.clone());
     assert_eq!(config.ranges.len(), 1);

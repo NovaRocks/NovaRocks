@@ -255,6 +255,12 @@ pub(crate) fn register_tablet_runtime(ctx: &TabletWriteContext) -> Result<(), St
             })?;
             Some(normalize_s3_config(raw)?)
         }
+        ScanPathScheme::Hdfs => {
+            return Err(format!(
+                "tablet runtime does not support hdfs path yet: tablet_id={} path={}",
+                ctx.tablet_id, root_path
+            ));
+        }
     };
     let entry = TabletRuntimeEntry {
         root_path: root_path.clone(),
@@ -424,6 +430,12 @@ fn load_persisted_tablet_runtime(tablet_id: i64) -> Result<Option<TabletRuntimeE
                     file.display()
                 ));
             }
+        }
+        ScanPathScheme::Hdfs => {
+            return Err(format!(
+                "persisted tablet runtime does not support hdfs path yet: file={}",
+                file.display()
+            ));
         }
     }
     Ok(Some(TabletRuntimeEntry {
