@@ -30,7 +30,7 @@ pub(crate) struct S3StoreConfig {
 
 impl S3StoreConfig {
     pub(crate) fn to_object_store_config(&self) -> crate::fs::object_store::ObjectStoreConfig {
-        crate::fs::object_store::ObjectStoreConfig {
+        let mut cfg = crate::fs::object_store::ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
             bucket: self.bucket.clone(),
             root: self.root.clone(),
@@ -44,7 +44,9 @@ impl S3StoreConfig {
             retry_max_delay_ms: None,
             timeout_ms: None,
             io_timeout_ms: None,
-        }
+        };
+        crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
+        cfg
     }
 
     pub(crate) fn to_aws_s3_properties(&self) -> BTreeMap<String, String> {

@@ -218,9 +218,29 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub runtime_filter_wait_timeout_ms_override: Option<i64>,
     #[serde(default)]
+    pub object_storage: ObjectStorageConfig,
+    #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
     pub path_rewrite: PathRewriteConfig,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ObjectStorageConfig {
+    #[serde(default)]
+    pub retry_max_times: Option<usize>,
+    #[serde(default)]
+    pub retry_min_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub retry_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub io_timeout_ms: Option<u64>,
+    #[serde(default = "default_object_storage_retry_log_summary_interval_ms")]
+    pub retry_log_summary_interval_ms: u64,
+    #[serde(default = "default_object_storage_retry_log_first_n")]
+    pub retry_log_first_n: u32,
 }
 
 #[derive(Clone, Deserialize)]
@@ -380,6 +400,14 @@ fn default_profile_report_interval() -> i64 {
     30
 }
 
+fn default_object_storage_retry_log_summary_interval_ms() -> u64 {
+    30_000
+}
+
+fn default_object_storage_retry_log_first_n() -> u32 {
+    3
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
@@ -404,8 +432,23 @@ impl Default for RuntimeConfig {
             profile_report_interval: default_profile_report_interval(),
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
+            object_storage: ObjectStorageConfig::default(),
             cache: CacheConfig::default(),
             path_rewrite: PathRewriteConfig::default(),
+        }
+    }
+}
+
+impl Default for ObjectStorageConfig {
+    fn default() -> Self {
+        Self {
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+            retry_log_summary_interval_ms: default_object_storage_retry_log_summary_interval_ms(),
+            retry_log_first_n: default_object_storage_retry_log_first_n(),
         }
     }
 }

@@ -71,6 +71,21 @@ profile_report_interval = 30
 # runtime_filter_scan_wait_time_ms_override = 1000
 # runtime_filter_wait_timeout_ms_override = 1000
 
+[runtime.object_storage]
+# Object storage retry/timeout tuning. All fields are optional.
+# Defaults: unset (`None`) to keep library built-in behavior.
+# retry_max_times = 10
+# retry_min_delay_ms = 100
+# retry_max_delay_ms = 3000
+# timeout_ms = 3000
+# io_timeout_ms = 3000
+#
+# Retry warning aggregation controls.
+# Log first N retry warnings per (endpoint,stage,reason) in each summary window. Default: 3.
+retry_log_first_n = 3
+# Summary window in milliseconds for suppressed retry warnings. Default: 30000.
+retry_log_summary_interval_ms = 30000
+
 [runtime.cache]
 # Generic page cache switch. Default: true.
 page_cache_enable = true

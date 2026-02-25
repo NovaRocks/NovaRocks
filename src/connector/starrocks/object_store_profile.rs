@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::fs::object_store::ObjectStoreConfig;
+use crate::fs::object_store::{ObjectStoreConfig, ObjectStoreRetrySettings};
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
 const UNSUPPORTED_OBJECT_STORE_PREFIXES: [&str; 7] = [
@@ -38,6 +38,11 @@ pub struct ObjectStoreProfile {
     pub(crate) session_token: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) enable_path_style_access: Option<bool>,
+    pub(crate) retry_max_times: Option<usize>,
+    pub(crate) retry_min_delay_ms: Option<u64>,
+    pub(crate) retry_max_delay_ms: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
+    pub(crate) io_timeout_ms: Option<u64>,
 }
 
 impl ObjectStoreProfile {
@@ -95,11 +100,16 @@ impl ObjectStoreProfile {
                 .filter(|v| !v.is_empty())
                 .map(|v| v.to_string()),
             enable_path_style_access: config.enable_path_style_access,
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
         })
     }
 
     pub(crate) fn to_object_store_config(&self, bucket: &str, root: &str) -> ObjectStoreConfig {
-        ObjectStoreConfig {
+        let mut cfg = ObjectStoreConfig {
             endpoint: self.endpoint.clone(),
             bucket: bucket.to_string(),
             root: root.trim_matches('/').to_string(),
@@ -108,12 +118,14 @@ impl ObjectStoreProfile {
             session_token: self.session_token.clone(),
             enable_path_style_access: self.enable_path_style_access,
             region: self.region.clone(),
-            retry_max_times: None,
-            retry_min_delay_ms: None,
-            retry_max_delay_ms: None,
-            timeout_ms: None,
-            io_timeout_ms: None,
-        }
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+        };
+        crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
+        cfg
     }
 
     fn from_aws_s3_properties(props: &BTreeMap<String, String>) -> Result<Self, String> {
@@ -151,6 +163,7 @@ impl ObjectStoreProfile {
         let enable_path_style_access = props
             .get("aws.s3.enable_path_style_access")
             .map(|v| is_true_value(v));
+        let retry_settings = ObjectStoreRetrySettings::from_aws_s3_props(Some(props));
 
         Ok(Self {
             endpoint,
@@ -159,6 +172,11 @@ impl ObjectStoreProfile {
             session_token,
             region,
             enable_path_style_access,
+            retry_max_times: retry_settings.retry_max_times,
+            retry_min_delay_ms: retry_settings.retry_min_delay_ms,
+            retry_max_delay_ms: retry_settings.retry_max_delay_ms,
+            timeout_ms: retry_settings.timeout_ms,
+            io_timeout_ms: retry_settings.io_timeout_ms,
         })
     }
 }
@@ -256,5 +274,28 @@ mod tests {
         props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
         let profile = ObjectStoreProfile::from_properties_required(&props).expect("build profile");
         assert_eq!(profile.enable_path_style_access, None);
+    }
+
+    #[test]
+    fn retry_and_timeout_properties_are_parsed() {
+        let mut props = BTreeMap::new();
+        props.insert(
+            "aws.s3.endpoint".to_string(),
+            "https://oss-cn-zhangjiakou.aliyuncs.com".to_string(),
+        );
+        props.insert("aws.s3.accessKeyId".to_string(), "ak".to_string());
+        props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
+        props.insert("aws.s3.max_retries".to_string(), "8".to_string());
+        props.insert("aws.s3.retry_min_delay_ms".to_string(), "120".to_string());
+        props.insert("aws.s3.retry_max_delay_ms".to_string(), "2600".to_string());
+        props.insert("aws.s3.request_timeout_ms".to_string(), "3400".to_string());
+        props.insert("aws.s3.io_timeout_ms".to_string(), "4400".to_string());
+
+        let profile = ObjectStoreProfile::from_properties_required(&props).expect("build profile");
+        assert_eq!(profile.retry_max_times, Some(8));
+        assert_eq!(profile.retry_min_delay_ms, Some(120));
+        assert_eq!(profile.retry_max_delay_ms, Some(2600));
+        assert_eq!(profile.timeout_ms, Some(3400));
+        assert_eq!(profile.io_timeout_ms, Some(4400));
     }
 }
