@@ -696,11 +696,6 @@ impl Iterator for ParquetScanIter {
                             clamp_u128_to_i64(to_take as u128),
                         );
                         profile.counter_add(
-                            "RowsRead",
-                            metrics::TUnit::UNIT,
-                            clamp_u128_to_i64(to_take as u128),
-                        );
-                        profile.counter_add(
                             "RawRowsRead",
                             metrics::TUnit::UNIT,
                             clamp_u128_to_i64(to_take as u128),

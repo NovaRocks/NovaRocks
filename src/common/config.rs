@@ -104,6 +104,13 @@ pub(crate) fn pipeline_scan_thread_pool_thread_num() -> usize {
         })
 }
 
+pub(crate) fn connector_io_tasks_per_scan_operator_default() -> i32 {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.connector_io_tasks_per_scan_operator)
+        .unwrap_or(16)
+}
+
 pub(crate) fn pipeline_scan_thread_pool_queue_size() -> usize {
     novarocks_app_config()
         .ok()

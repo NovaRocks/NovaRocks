@@ -602,16 +602,28 @@ fn lower_node_with_children(
                 result
             };
 
-            lowered = Lowered {
-                node: ExecNode {
-                    kind: ExecNodeKind::Filter(FilterNode {
-                        input: Box::new(lowered.node),
-                        node_id: node.node_id,
-                        predicate,
-                    }),
-                },
-                layout: lowered.layout,
-            };
+            let mut pushed_to_scan = false;
+            if let ExecNodeKind::Scan(scan) = &mut lowered.node.kind {
+                let combined = if let Some(existing) = scan.conjunct_predicate() {
+                    arena.push(ExprNode::And(existing, predicate))
+                } else {
+                    predicate
+                };
+                scan.set_conjunct_predicate(Some(combined));
+                pushed_to_scan = true;
+            }
+            if !pushed_to_scan {
+                lowered = Lowered {
+                    node: ExecNode {
+                        kind: ExecNodeKind::Filter(FilterNode {
+                            input: Box::new(lowered.node),
+                            node_id: node.node_id,
+                            predicate,
+                        }),
+                    },
+                    layout: lowered.layout,
+                };
+            }
         }
     }
 

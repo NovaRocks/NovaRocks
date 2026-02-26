@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::cache::ExternalDataCacheRangeOptions;
 use crate::common::ids::SlotId;
 use crate::descriptors;
+use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter};
@@ -199,6 +200,7 @@ pub struct ScanNode {
     op: Arc<dyn ScanOp>,
     node_id: Option<i32>,
     runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
+    conjunct_predicate: Option<ExprId>,
     output_slots: Vec<SlotId>,
     connector_io_tasks_per_scan_operator: Option<i32>,
     /// Scan-level limit for early termination optimization.
@@ -217,6 +219,7 @@ impl ScanNode {
             op,
             node_id: None,
             runtime_filter_specs: Vec::new(),
+            conjunct_predicate: None,
             output_slots: Vec::new(),
             connector_io_tasks_per_scan_operator: None,
             limit: None,
@@ -296,6 +299,19 @@ impl ScanNode {
 
     pub fn output_slots(&self) -> &[SlotId] {
         &self.output_slots
+    }
+
+    pub fn conjunct_predicate(&self) -> Option<ExprId> {
+        self.conjunct_predicate
+    }
+
+    pub fn with_conjunct_predicate(mut self, predicate: Option<ExprId>) -> Self {
+        self.conjunct_predicate = predicate;
+        self
+    }
+
+    pub fn set_conjunct_predicate(&mut self, predicate: Option<ExprId>) {
+        self.conjunct_predicate = predicate;
     }
 
     pub fn connector_io_tasks_per_scan_operator(&self) -> Option<i32> {

@@ -199,6 +199,8 @@ pub struct RuntimeConfig {
     pub olap_sink_max_tablet_write_chunk_bytes: usize,
     #[serde(default = "default_pipeline_scan_thread_pool_thread_num")]
     pub pipeline_scan_thread_pool_thread_num: usize,
+    #[serde(default = "default_connector_io_tasks_per_scan_operator")]
+    pub connector_io_tasks_per_scan_operator: i32,
     #[serde(default = "default_pipeline_scan_thread_pool_queue_size")]
     pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
@@ -384,6 +386,10 @@ fn default_pipeline_scan_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores, aligned with StarRocks pipeline_scan_thread_pool_thread_num
 }
 
+fn default_connector_io_tasks_per_scan_operator() -> i32 {
+    16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
+}
+
 fn default_pipeline_scan_thread_pool_queue_size() -> usize {
     102_400 // Aligned with StarRocks pipeline_scan_thread_pool_queue_size
 }
@@ -423,6 +429,7 @@ impl Default for RuntimeConfig {
             olap_sink_max_tablet_write_chunk_bytes: default_olap_sink_max_tablet_write_chunk_bytes(
             ),
             pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
+            connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
             pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             spill_io_threads: default_spill_io_threads(),
