@@ -160,6 +160,8 @@ fn build_agg_scan_plan(
             schema_unique_id: key.schema_unique_id,
             schema_type: key.schema_type.clone(),
             schema: key.schema.clone(),
+            flat_json_projection: None,
+            source_column_missing: false,
         });
         index_by_unique.insert(key.schema_unique_id, output_index);
     }
@@ -1597,6 +1599,8 @@ mod tests {
                         scale: None,
                         children: Vec::new(),
                     },
+                    flat_json_projection: None,
+                    source_column_missing: false,
                 },
                 StarRocksNativeColumnPlan {
                     output_index: 1,
@@ -1613,6 +1617,8 @@ mod tests {
                         scale: None,
                         children: Vec::new(),
                     },
+                    flat_json_projection: None,
+                    source_column_missing: false,
                 },
             ],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
@@ -1699,6 +1705,8 @@ mod tests {
                     scale: None,
                     children: Vec::new(),
                 },
+                flat_json_projection: None,
+                source_column_missing: false,
             }],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
                 output_name: "k1".to_string(),
@@ -1764,6 +1772,8 @@ mod tests {
                     scale: None,
                     children: Vec::new(),
                 },
+                flat_json_projection: None,
+                source_column_missing: false,
             }],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
                 output_name: "c1".to_string(),
@@ -1847,6 +1857,8 @@ mod tests {
                         scale: None,
                         children: Vec::new(),
                     },
+                    flat_json_projection: None,
+                    source_column_missing: false,
                 },
                 StarRocksNativeColumnPlan {
                     output_index: 1,
@@ -1863,6 +1875,8 @@ mod tests {
                         scale: None,
                         children: Vec::new(),
                     },
+                    flat_json_projection: None,
+                    source_column_missing: false,
                 },
             ],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
@@ -1949,6 +1963,8 @@ mod tests {
                         scale: None,
                         children: Vec::new(),
                     },
+                    flat_json_projection: None,
+                    source_column_missing: false,
                 },
                 StarRocksNativeColumnPlan {
                     output_index: 1,
@@ -1965,6 +1981,8 @@ mod tests {
                         scale: None,
                         children: Vec::new(),
                     },
+                    flat_json_projection: None,
+                    source_column_missing: false,
                 },
             ],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
