@@ -181,8 +181,7 @@ impl RuntimeState {
             .unwrap_or("");
         debug!(
             target: "novarocks::sink_commit",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             file_path = %file_path,
             "add sink_commit_info"
         );
@@ -202,8 +201,7 @@ impl RuntimeState {
         }
         debug!(
             target: "novarocks::sink_commit",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             loaded_rows,
             loaded_bytes,
             "add sink load counters"
@@ -221,8 +219,7 @@ impl RuntimeState {
         };
         debug!(
             target: "novarocks::sink_commit",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             tablet_id = info.tablet_id,
             backend_id = info.backend_id,
             "add tablet_commit_info"
@@ -249,8 +246,7 @@ impl RuntimeState {
         };
         debug!(
             target: "novarocks::sink_commit",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             tablet_id = ?info.tablet_id,
             backend_id = ?info.backend_id,
             "add tablet_fail_info"

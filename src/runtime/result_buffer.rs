@@ -215,15 +215,15 @@ pub(crate) fn fetch(finst_id: UniqueId) -> Result<FetchResult, FetchError> {
         let mgr = query_context_manager();
         if let Some(query_timeout) = mgr.get_query_timeout_by_finst(finst_id) {
             debug!(
-                "fetch: using query_timeout from FE for finst={}:{}, timeout={:?}",
-                finst_id.hi, finst_id.lo, query_timeout
+                "fetch: using query_timeout from FE for finst={}, timeout={:?}",
+                finst_id, query_timeout
             );
             query_timeout
         } else {
             let fallback = Duration::from_secs(300);
             warn!(
-                "fetch: query_context not found for finst={}:{}, using fallback timeout={:?}",
-                finst_id.hi, finst_id.lo, fallback
+                "fetch: query_context not found for finst={}, using fallback timeout={:?}",
+                finst_id, fallback
             );
             fallback
         }
@@ -237,10 +237,7 @@ pub(crate) fn fetch(finst_id: UniqueId) -> Result<FetchResult, FetchError> {
         });
     };
 
-    debug!(
-        "fetch: waiting up to {:?} for finst={}:{}",
-        timeout, finst_id.hi, finst_id.lo
-    );
+    debug!("fetch: waiting up to {:?} for finst={}", timeout, finst_id);
 
     let start = std::time::Instant::now();
     loop {
@@ -276,8 +273,8 @@ pub(crate) fn fetch(finst_id: UniqueId) -> Result<FetchResult, FetchError> {
         let elapsed = start.elapsed();
         if elapsed >= timeout {
             warn!(
-                "fetch: TIMEOUT waiting for result finst={}:{} after {:?}",
-                finst_id.hi, finst_id.lo, elapsed
+                "fetch: TIMEOUT waiting for result finst={} after {:?}",
+                finst_id, elapsed
             );
             return Err(FetchError {
                 kind: FetchErrorKind::Timeout,

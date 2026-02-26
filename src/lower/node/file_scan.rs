@@ -25,6 +25,7 @@ use csv::{ReaderBuilder, Terminator, Trim};
 use serde_json::Value;
 
 use crate::common::ids::SlotId;
+use crate::common::types::format_uuid;
 use crate::exec::chunk::{Chunk, field_with_slot_id};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp};
@@ -434,8 +435,9 @@ pub(crate) fn lower_file_scan_node(
                     })?;
                     stream_load::resolve_stream_load_file_path(load_id).ok_or_else(|| {
                         format!(
-                            "FILE_SCAN_NODE node_id={} has no registered local file for load_id={}:{}",
-                            node.node_id, load_id.hi, load_id.lo
+                            "FILE_SCAN_NODE node_id={} has no registered local file for load_id={}",
+                            node.node_id,
+                            format_uuid(load_id.hi, load_id.lo)
                         )
                     })?
                 }

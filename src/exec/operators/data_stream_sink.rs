@@ -29,7 +29,7 @@
 
 use crate::common::config::exchange_max_transmit_batched_bytes;
 use crate::common::ids::SlotId;
-use crate::common::types::UniqueId;
+use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::lower::expr::lower_t_expr;
@@ -947,20 +947,17 @@ impl OperatorFactory for DataStreamSinkFactory {
                 .map(|v| {
                     v.iter()
                         .take(3)
-                        .map(|d| {
-                            format!(
-                                "{}:{}",
-                                d.fragment_instance_id.hi, d.fragment_instance_id.lo
-                            )
-                        })
+                        .map(|d| format_uuid(d.fragment_instance_id.hi, d.fragment_instance_id.lo))
                         .collect::<Vec<_>>()
                         .join(",")
                 })
                 .unwrap_or_default();
             debug!(
-                "DataStreamSink created: finst={}:{} plan_node_id={} dest_node_id={} part_type={} dop={} sender_id={} be_number={} destinations={} dest_preview=[{}]",
-                self.exec_params.fragment_instance_id.hi,
-                self.exec_params.fragment_instance_id.lo,
+                "DataStreamSink created: finst={} plan_node_id={} dest_node_id={} part_type={} dop={} sender_id={} be_number={} destinations={} dest_preview=[{}]",
+                format_uuid(
+                    self.exec_params.fragment_instance_id.hi,
+                    self.exec_params.fragment_instance_id.lo
+                ),
                 self.plan_node_id,
                 self.sink.dest_node_id,
                 part_type,
@@ -1155,9 +1152,11 @@ impl Operator for DataStreamSinkOperator {
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
         crate::novarocks_logging::debug!(
-            "DataStreamSink registered driver: finst={}:{} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
-            self.exec_params.fragment_instance_id.hi,
-            self.exec_params.fragment_instance_id.lo,
+            "DataStreamSink registered driver: finst={} driver_id={} dest_node_id={} sender_id={} remaining_drivers={}",
+            format_uuid(
+                self.exec_params.fragment_instance_id.hi,
+                self.exec_params.fragment_instance_id.lo
+            ),
             self.driver_id,
             self.sink.dest_node_id,
             self.sender_id,
@@ -1240,10 +1239,12 @@ impl DataStreamSinkOperator {
         let inflight_bytes = exchange_send_queue().inflight_bytes();
         let max_inflight_bytes = exchange_send_queue().max_inflight_bytes();
         debug!(
-            "DataStreamSink need_input blocked: reason={} finst={}:{} driver_id={} sender_id={} pending_chunk_bytes={} pending_payloads={} pending_payload_bytes={} reserve_bytes={} inflight_bytes={} max_inflight_bytes={} finishing={} send_idle={} send_inflight_bytes={}",
+            "DataStreamSink need_input blocked: reason={} finst={} driver_id={} sender_id={} pending_chunk_bytes={} pending_payloads={} pending_payload_bytes={} reserve_bytes={} inflight_bytes={} max_inflight_bytes={} finishing={} send_idle={} send_inflight_bytes={}",
             reason,
-            self.exec_params.fragment_instance_id.hi,
-            self.exec_params.fragment_instance_id.lo,
+            format_uuid(
+                self.exec_params.fragment_instance_id.hi,
+                self.exec_params.fragment_instance_id.lo
+            ),
             self.driver_id,
             self.sender_id,
             self.pending_chunk_bytes_total(),
@@ -1497,9 +1498,8 @@ impl DataStreamSinkOperator {
         let row_count: usize = chunks.iter().map(|c| c.len()).sum();
         let sequence = self.shared_sequence.fetch_add(1, Ordering::SeqCst);
         debug!(
-            "DataStreamSink::transmit_partition: dest_finst={}:{} node_id={} sender_id={} chunks={} rows={} eos={} seq={}",
-            dest_finst_id.hi,
-            dest_finst_id.lo,
+            "DataStreamSink::transmit_partition: dest_finst={} node_id={} sender_id={} chunks={} rows={} eos={} seq={}",
+            dest_finst_id,
             self.sink.dest_node_id,
             self.sender_id,
             chunks.len(),
@@ -1556,13 +1556,8 @@ impl DataStreamSinkOperator {
         match self.try_enqueue_payload(dest, payload, allow_overflow)? {
             PayloadEnqueue::Enqueued => {
                 debug!(
-                    "DataStreamSink::transmit_partition enqueued: dest_finst={}:{} node_id={} eos={} seq={} bytes={}",
-                    dest_finst_id.hi,
-                    dest_finst_id.lo,
-                    self.sink.dest_node_id,
-                    eos,
-                    sequence,
-                    payload_bytes
+                    "DataStreamSink::transmit_partition enqueued: dest_finst={} node_id={} eos={} seq={} bytes={}",
+                    dest_finst_id, self.sink.dest_node_id, eos, sequence, payload_bytes
                 );
                 Ok(PayloadEnqueue::Enqueued)
             }
@@ -1766,9 +1761,11 @@ impl ProcessorOperator for DataStreamSinkOperator {
         self.finishing.store(true, Ordering::Release);
 
         debug!(
-            "DataStreamSink set_finishing: finst={}:{} driver_id={} dest_node_id={} sender_id={} be_number={} destinations={} pending_dests={} pending_chunk_bytes_total={} pending_payload_bytes_total={}",
-            self.exec_params.fragment_instance_id.hi,
-            self.exec_params.fragment_instance_id.lo,
+            "DataStreamSink set_finishing: finst={} driver_id={} dest_node_id={} sender_id={} be_number={} destinations={} pending_dests={} pending_chunk_bytes_total={} pending_payload_bytes_total={}",
+            format_uuid(
+                self.exec_params.fragment_instance_id.hi,
+                self.exec_params.fragment_instance_id.lo
+            ),
             self.driver_id,
             self.sink.dest_node_id,
             self.sender_id,
@@ -1782,9 +1779,11 @@ impl ProcessorOperator for DataStreamSinkOperator {
         self.flush_pending(true, true)?;
         let is_last_driver = self.finish_state.driver_finished();
         debug!(
-            "DataStreamSink finishing progressed: finst={}:{} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
-            self.exec_params.fragment_instance_id.hi,
-            self.exec_params.fragment_instance_id.lo,
+            "DataStreamSink finishing progressed: finst={} driver_id={} dest_node_id={} sender_id={} last_driver={} (only last driver sends EOS)",
+            format_uuid(
+                self.exec_params.fragment_instance_id.hi,
+                self.exec_params.fragment_instance_id.lo
+            ),
             self.driver_id,
             self.sink.dest_node_id,
             self.sender_id,

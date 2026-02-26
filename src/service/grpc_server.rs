@@ -25,6 +25,7 @@ use tonic::transport::Server;
 
 use crate::common::config::{http_port, starlet_port};
 use crate::common::ids::SlotId;
+use crate::common::types::format_uuid;
 use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
@@ -120,9 +121,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     ack_sequence: req.sequence,
                 };
                 debug!(
-                    "exchange ack SEND: finst={}:{} node_id={} sender_id={} be_number={} eos={} seq={}",
-                    req.finst_id_hi,
-                    req.finst_id_lo,
+                    "exchange ack SEND: finst={} node_id={} sender_id={} be_number={} eos={} seq={}",
+                    format_uuid(req.finst_id_hi, req.finst_id_lo),
                     req.node_id,
                     req.sender_id,
                     req.be_number,
@@ -134,9 +134,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     break;
                 }
                 debug!(
-                    "exchange ack SENT: finst={}:{} node_id={} sender_id={} be_number={} eos={} seq={}",
-                    req.finst_id_hi,
-                    req.finst_id_lo,
+                    "exchange ack SENT: finst={} node_id={} sender_id={} be_number={} eos={} seq={}",
+                    format_uuid(req.finst_id_hi, req.finst_id_lo),
                     req.node_id,
                     req.sender_id,
                     req.be_number,
@@ -194,8 +193,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             if let Some(status) = response.status.as_mut() {
                 status.status_code = 1;
                 status.error_msgs.push(format!(
-                    "missing runtime filter payload: query_id={}:{} filter_id={}",
-                    query_id.hi, query_id.lo, filter_id
+                    "missing runtime filter payload: query_id={} filter_id={}",
+                    query_id, filter_id
                 ));
             }
             return Ok(tonic::Response::new(response));
@@ -205,8 +204,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             if let Some(status) = response.status.as_mut() {
                 status.status_code = 1;
                 status.error_msgs.push(format!(
-                    "runtime filter payload is empty: query_id={}:{} filter_id={}",
-                    query_id.hi, query_id.lo, filter_id
+                    "runtime filter payload is empty: query_id={} filter_id={}",
+                    query_id, filter_id
                 ));
             }
             return Ok(tonic::Response::new(response));
@@ -235,8 +234,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             let build_be_number = params.build_be_number.unwrap_or(0);
             if let Err(err) = worker.receive_partial(filter_id, payload, build_be_number) {
                 warn!(
-                    "receive_partial_runtime_filter failed: query_id={}:{} filter_id={} err={}",
-                    query_id.hi, query_id.lo, filter_id, err
+                    "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
+                    query_id, filter_id, err
                 );
                 if let Some(status) = response.status.as_mut() {
                     status.status_code = 1;
@@ -250,8 +249,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
             if let Some(status) = response.status.as_mut() {
                 status.status_code = 1;
                 status.error_msgs.push(format!(
-                    "runtime filter hub not found: query_id={}:{}",
-                    query_id.hi, query_id.lo
+                    "runtime filter hub not found: query_id={}",
+                    query_id
                 ));
             }
             return Ok(tonic::Response::new(response));
@@ -259,8 +258,8 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
 
         if let Err(err) = hub.receive_remote_filter(filter_id, payload) {
             warn!(
-                "receive_remote_filter failed: query_id={}:{} filter_id={} err={}",
-                query_id.hi, query_id.lo, filter_id, err
+                "receive_remote_filter failed: query_id={} filter_id={} err={}",
+                query_id, filter_id, err
             );
             if let Some(status) = response.status.as_mut() {
                 status.status_code = 1;

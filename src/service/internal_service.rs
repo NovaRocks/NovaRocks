@@ -944,7 +944,7 @@ fn spawn_exec_fragment(
     if has_result_sink {
         result_buffer::create_sender(finst_id);
         if let Some(root) = mem_tracker.as_ref() {
-            let label = format!("ResultBuffer: finst={}:{}", finst_id.hi, finst_id.lo);
+            let label = format!("ResultBuffer: finst={}", finst_id);
             let tracker = crate::runtime::mem_tracker::MemTracker::new_child(label, root);
             result_buffer::set_mem_tracker(finst_id, tracker);
         }
@@ -996,8 +996,7 @@ fn spawn_exec_fragment(
                 if let Some(json) = out.profile_json.as_deref() {
                     info!(
                         target: "novarocks::profile",
-                        finst_id_hi = finst_id.hi,
-                        finst_id_lo = finst_id.lo,
+                        finst_id = %finst_id,
                         profile_bytes = json.len(),
                         "fragment_profile"
                     );
@@ -1017,8 +1016,7 @@ fn spawn_exec_fragment(
                     report_error = Some(e.clone());
                     error!(
                         target: "novarocks::exec",
-                        finst_id_hi = finst_id.hi,
-                        finst_id_lo = finst_id.lo,
+                        finst_id = %finst_id,
                         error = %e,
                         "exec_plan_fragment failed"
                     );
@@ -1029,8 +1027,7 @@ fn spawn_exec_fragment(
             report_error = Some(e.clone());
             error!(
                 target: "novarocks::exec",
-                finst_id_hi = finst_id.hi,
-                finst_id_lo = finst_id.lo,
+                finst_id = %finst_id,
                 error = %e,
                 "exec_plan_fragment failed"
             );
@@ -1215,8 +1212,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         } else {
             warn!(
                 target: "novarocks::report",
-                finst_id_hi = finst_id.hi,
-                finst_id_lo = finst_id.lo,
+                finst_id = %finst_id,
                 "missing coord/backend_num for reportExecStatus"
             );
         }
@@ -1365,8 +1361,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     } else {
         warn!(
             target: "novarocks::report",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             "missing coord/backend_num for reportExecStatus"
         );
     }

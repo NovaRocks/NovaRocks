@@ -206,16 +206,8 @@ pub fn send_chunks(
     use crate::novarocks_logging::debug;
     let payload_size = payload.len();
     debug!(
-        "send_chunks START: dest={} finst={}:{} node_id={} sender_id={} be_number={} eos={} seq={} payload_bytes={}",
-        dest_host,
-        finst_id.hi,
-        finst_id.lo,
-        node_id,
-        sender_id,
-        be_number,
-        eos,
-        sequence,
-        payload_size
+        "send_chunks START: dest={} finst={} node_id={} sender_id={} be_number={} eos={} seq={} payload_bytes={}",
+        dest_host, finst_id, node_id, sender_id, be_number, eos, sequence, payload_size
     );
     let port = dest_port;
     let req = proto::novarocks::ExchangeRequest {

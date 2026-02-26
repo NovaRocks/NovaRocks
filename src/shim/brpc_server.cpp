@@ -21,9 +21,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -140,7 +142,16 @@ struct UniqueIdKey {
 };
 
 std::string format_unique_id(const UniqueIdKey& id) {
-    return std::to_string(id.hi) + ":" + std::to_string(id.lo);
+    const auto hi = static_cast<uint64_t>(id.hi);
+    const auto lo = static_cast<uint64_t>(id.lo);
+    std::ostringstream oss;
+    oss << std::hex << std::nouppercase << std::setfill('0')
+        << std::setw(8) << static_cast<uint32_t>(hi >> 32) << "-"
+        << std::setw(4) << static_cast<uint16_t>(hi >> 16) << "-"
+        << std::setw(4) << static_cast<uint16_t>(hi) << "-"
+        << std::setw(4) << static_cast<uint16_t>(lo >> 48) << "-"
+        << std::setw(12) << (lo & 0x0000FFFFFFFFFFFFULL);
+    return oss.str();
 }
 
 struct ResultPacket {

@@ -33,8 +33,11 @@ pub struct ExchangeScanOp {
 impl ExchangeScanOp {
     pub fn new(key: exchange::ExchangeKey, expected_senders: usize, timeout: Duration) -> Self {
         debug!(
-            "ExchangeScanOp::new: finst={}:{} node_id={} expected_senders={} timeout={:?}",
-            key.finst_id_hi, key.finst_id_lo, key.node_id, expected_senders, timeout
+            "ExchangeScanOp::new: finst={} node_id={} expected_senders={} timeout={:?}",
+            key.finst_uuid(),
+            key.node_id,
+            expected_senders,
+            timeout
         );
         Self {
             key,
@@ -122,9 +125,8 @@ impl Drop for ExchangeScanIter {
     fn drop(&mut self) {
         if self.completed {
             debug!(
-                "ExchangeScanIter completed: finst={}:{} node_id={} chunks={} rows={}",
-                self.key.finst_id_hi,
-                self.key.finst_id_lo,
+                "ExchangeScanIter completed: finst={} node_id={} chunks={} rows={}",
+                self.key.finst_uuid(),
                 self.key.node_id,
                 self.seen_chunks,
                 self.seen_rows
@@ -134,9 +136,8 @@ impl Drop for ExchangeScanIter {
 
         if !self.errored {
             debug!(
-                "ExchangeScanIter dropped early: finst={}:{} node_id={} seen_chunks={} seen_rows={}",
-                self.key.finst_id_hi,
-                self.key.finst_id_lo,
+                "ExchangeScanIter dropped early: finst={} node_id={} seen_chunks={} seen_rows={}",
+                self.key.finst_uuid(),
                 self.key.node_id,
                 self.seen_chunks,
                 self.seen_rows
@@ -156,8 +157,11 @@ impl ExchangeScanIter {
         profile: Option<RuntimeProfile>,
     ) -> Self {
         debug!(
-            "ExchangeScanIter::new: finst={}:{} node_id={} expected_senders={} timeout={:?}",
-            key.finst_id_hi, key.finst_id_lo, key.node_id, expected_senders, timeout
+            "ExchangeScanIter::new: finst={} node_id={} expected_senders={} timeout={:?}",
+            key.finst_uuid(),
+            key.node_id,
+            expected_senders,
+            timeout
         );
         Self {
             key,

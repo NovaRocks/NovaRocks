@@ -23,6 +23,34 @@ use thrift::transport::{TBufferChannel, TIoChannel};
 
 use crate::data;
 
+fn maybe_unique_id_uuid(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if map.len() != 2 || !map.contains_key("hi") || !map.contains_key("lo") {
+        return None;
+    }
+    let hi = map.get("hi")?.as_i64()?;
+    let lo = map.get("lo")?.as_i64()?;
+    Some(crate::common::types::format_uuid(hi, lo))
+}
+
+fn rewrite_unique_id_to_uuid(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                rewrite_unique_id_to_uuid(child);
+            }
+            if let Some(uuid) = maybe_unique_id_uuid(map) {
+                *v = serde_json::Value::String(uuid);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_unique_id_to_uuid(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(crate) fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> Result<T, String> {
     let mut channel = TBufferChannel::with_capacity(bytes.len(), 1024);
     channel.set_readable_bytes(bytes);
@@ -297,6 +325,31 @@ pub(crate) fn thrift_named_json<T: TSerializable>(v: &T) -> Result<String, Strin
     let mut prot = NamedJsonOutputProtocol::default();
     v.write_to_out_protocol(&mut prot)
         .map_err(|e| e.to_string())?;
-    let root = prot.root.unwrap_or(serde_json::Value::Null);
+    let mut root = prot.root.unwrap_or(serde_json::Value::Null);
+    rewrite_unique_id_to_uuid(&mut root);
     serde_json::to_string(&root).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_unique_id_to_uuid;
+
+    #[test]
+    fn rewrite_named_json_unique_id_objects_to_uuid() {
+        let mut value = serde_json::json!({
+            "query_id": {"hi": 116135542886790518_i64, "lo": -7531368976812794106_i64},
+            "fragment_instance_id": {"hi": 1, "lo": 2},
+            "other": {"hi": 1, "lo": 2, "extra": 3}
+        });
+        rewrite_unique_id_to_uuid(&mut value);
+        assert_eq!(
+            value["query_id"],
+            serde_json::Value::String("019c98a9-3390-7576-977b-33d188ad1f06".to_string())
+        );
+        assert_eq!(
+            value["fragment_instance_id"],
+            serde_json::Value::String("00000000-0000-0001-0000-000000000002".to_string())
+        );
+        assert_eq!(value["other"]["hi"], serde_json::Value::from(1));
+    }
 }

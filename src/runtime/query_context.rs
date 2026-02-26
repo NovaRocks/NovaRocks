@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -40,6 +41,13 @@ use crate::runtime_filter;
 pub(crate) struct QueryId {
     pub(crate) hi: i64,
     pub(crate) lo: i64,
+}
+
+impl fmt::Display for QueryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let uuid = crate::common::types::format_uuid(self.hi, self.lo);
+        f.write_str(&uuid)
+    }
 }
 
 pub(crate) struct QueryContext {

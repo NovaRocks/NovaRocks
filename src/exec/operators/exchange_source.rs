@@ -136,9 +136,8 @@ impl OperatorFactory for ExchangeSourceFactory {
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         if !self.local_rf_waiting_set.is_empty() {
             debug!(
-                "ExchangeSource local RF wait: finst={}:{} node_id={} driver_id={} waiting_set={:?}",
-                self.node.key.finst_id_hi,
-                self.node.key.finst_id_lo,
+                "ExchangeSource local RF wait: finst={} node_id={} driver_id={} waiting_set={:?}",
+                self.node.key.finst_uuid(),
                 self.node.key.node_id,
                 driver_id,
                 self.local_rf_waiting_set
@@ -250,9 +249,8 @@ impl Operator for ExchangeSourceOperator {
         self.receiver = Some(receiver);
         self.start = Some(Instant::now());
         debug!(
-            "ExchangeSource prepared: finst={}:{} node_id={} expected_senders={} timeout={:?}",
-            self.node.key.finst_id_hi,
-            self.node.key.finst_id_lo,
+            "ExchangeSource prepared: finst={} node_id={} expected_senders={} timeout={:?}",
+            self.node.key.finst_uuid(),
             self.node.key.node_id,
             self.node.expected_senders,
             self.node.timeout
@@ -286,9 +284,8 @@ impl ProcessorOperator for ExchangeSourceOperator {
             if start.elapsed() >= self.node.timeout {
                 if should_log_exchange_source_ready() {
                     debug!(
-                        "ExchangeSource has_output due to timeout: finst={}:{} node_id={} elapsed={:?} timeout={:?}",
-                        self.node.key.finst_id_hi,
-                        self.node.key.finst_id_lo,
+                        "ExchangeSource has_output due to timeout: finst={} node_id={} elapsed={:?} timeout={:?}",
+                        self.node.key.finst_uuid(),
                         self.node.key.node_id,
                         start.elapsed(),
                         self.node.timeout
@@ -303,9 +300,8 @@ impl ProcessorOperator for ExchangeSourceOperator {
         let ready = receiver.has_output_or_finished(self.node.expected_senders);
         if ready && should_log_exchange_source_ready() {
             debug!(
-                "ExchangeSource has_output due to receiver: finst={}:{} node_id={} expected_senders={}",
-                self.node.key.finst_id_hi,
-                self.node.key.finst_id_lo,
+                "ExchangeSource has_output due to receiver: finst={} node_id={} expected_senders={}",
+                self.node.key.finst_uuid(),
                 self.node.key.node_id,
                 self.node.expected_senders
             );
@@ -346,16 +342,16 @@ impl ProcessorOperator for ExchangeSourceOperator {
         let start = self.start.get_or_insert_with(Instant::now);
         if start.elapsed() >= self.node.timeout {
             debug!(
-                "ExchangeSource timeout waiting for senders: finst_id={}:{} node_id={} elapsed={:?} timeout={:?}",
-                self.node.key.finst_id_hi,
-                self.node.key.finst_id_lo,
+                "ExchangeSource timeout waiting for senders: finst_id={} node_id={} elapsed={:?} timeout={:?}",
+                self.node.key.finst_uuid(),
                 self.node.key.node_id,
                 start.elapsed(),
                 self.node.timeout
             );
             return Err(format!(
-                "exchange timeout waiting for senders: finst_id={}:{} node_id={}",
-                self.node.key.finst_id_hi, self.node.key.finst_id_lo, self.node.key.node_id
+                "exchange timeout waiting for senders: finst_id={} node_id={}",
+                self.node.key.finst_uuid(),
+                self.node.key.node_id
             ));
         }
 
@@ -396,9 +392,8 @@ impl ProcessorOperator for ExchangeSourceOperator {
                 }
                 Some(exchange::ExchangePopResult::Finished(stats)) => {
                     debug!(
-                        "ExchangeSource finished: finst={}:{} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
-                        self.node.key.finst_id_hi,
-                        self.node.key.finst_id_lo,
+                        "ExchangeSource finished: finst={} node_id={} driver_id={} request_received={} bytes_received={} deserialize_ns={} chunks_received={} rows_received={}",
+                        self.node.key.finst_uuid(),
                         self.node.key.node_id,
                         self.driver_id,
                         stats.request_received,

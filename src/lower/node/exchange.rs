@@ -60,8 +60,8 @@ pub(crate) fn lower_exchange_node(
                 .unwrap_or(0);
             if from_batch == 0 {
                 return Err(format!(
-                    "EXCHANGE_NODE missing sender count for node_id {} (query_id={}:{}).",
-                    node.node_id, query_id.hi, query_id.lo
+                    "EXCHANGE_NODE missing sender count for node_id {} (query_id={}).",
+                    node.node_id, query_id
                 ));
             }
             warn!(
