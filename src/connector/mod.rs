@@ -29,7 +29,7 @@ pub use crate::formats::parquet::{MinMaxPredicate, ParquetScanConfig};
 pub use crate::fs::scan_context::FileScanRange;
 pub use hdfs::HdfsScanConfig;
 pub use jdbc::JdbcScanConfig;
-pub use starrocks::{StarRocksScanConfig, StarRocksScanRange};
+pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
 
 #[derive(Clone, Debug)]
 pub enum ScanConfig {

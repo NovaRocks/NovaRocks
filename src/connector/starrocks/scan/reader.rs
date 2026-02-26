@@ -1,20 +1,25 @@
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::ObjectStoreProfile;
+use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
 use crate::exec::chunk::field_slot_id;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
-use crate::formats::starrocks::metadata::{load_bundle_segment_footers, load_tablet_snapshot};
-use crate::formats::starrocks::plan::build_native_read_plan;
+use crate::formats::starrocks::metadata::{
+    StarRocksTabletSnapshot, load_bundle_segment_footers, load_tablet_snapshot,
+};
+use crate::formats::starrocks::plan::{
+    FIELD_META_STARROCKS_COLUMN_ID, FIELD_META_STARROCKS_DEFAULT_VALUE, build_native_read_plan,
+};
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_if_any;
 use crate::novarocks_logging::{info, warn};
 use arrow::array::{Array, ArrayRef, Int32Builder, LargeStringArray, ListArray, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use super::op::QueryGlobalDictEncodeMap;
+use super::op::{LakeScanSchemaMeta, QueryGlobalDictEncodeMap};
 
 pub(super) struct StarRocksNativeReader {
     tablet_id: i64,
@@ -56,11 +61,12 @@ impl StarRocksNativeReader {
         tablet_id: i64,
         tablet_root_path: &str,
         version: i64,
-        _required_schema: SchemaRef,
+        required_schema: SchemaRef,
         output_schema: SchemaRef,
         query_global_dicts: QueryGlobalDictEncodeMap,
         min_max_predicates: Vec<crate::formats::parquet::MinMaxPredicate>,
         object_store_profile: &ObjectStoreProfile,
+        lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {
         let use_batch_cache = query_global_dicts.is_empty();
         let output_schema_sig = schema_signature(&output_schema);
@@ -78,9 +84,6 @@ impl StarRocksNativeReader {
                 });
             }
         }
-        let (scan_schema, has_dict_encoded_output) =
-            build_scan_schema_for_global_dict_encoding(&output_schema, &query_global_dicts)?;
-
         let snapshot = match load_tablet_snapshot(
             tablet_id,
             version,
@@ -107,6 +110,16 @@ impl StarRocksNativeReader {
             }
             Err(err) => return Err(err),
         };
+        let output_schema_for_plan = enrich_output_schema_with_lake_hints(
+            &snapshot,
+            &required_schema,
+            &output_schema,
+            lake_schema_meta,
+        )?;
+        let (scan_schema, has_dict_encoded_output) = build_scan_schema_for_global_dict_encoding(
+            &output_schema_for_plan,
+            &query_global_dicts,
+        )?;
         let cacheable_small_snapshot = snapshot.total_num_rows <= NATIVE_BATCH_CACHE_MAX_ROWS;
         if let Some(batch) = read_bundle_parquet_snapshot_if_any(&snapshot, scan_schema.clone())? {
             let batch = if has_dict_encoded_output {
@@ -211,6 +224,223 @@ impl StarRocksNativeReader {
         let _ = (self.tablet_id, self.version);
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LakeSchemaColumnHint {
+    unique_id: Option<u32>,
+    default_value: Option<String>,
+}
+
+fn normalize_column_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn build_required_schema_unique_id_map(
+    required_schema: &SchemaRef,
+) -> Result<HashMap<String, u32>, String> {
+    let mut out = HashMap::new();
+    for field in required_schema.fields() {
+        let Some(raw_unique_id) = field.metadata().get(FIELD_META_STARROCKS_COLUMN_ID) else {
+            continue;
+        };
+        let unique_id = raw_unique_id.parse::<u32>().map_err(|e| {
+            format!(
+                "invalid required_schema column unique_id metadata: field={} key={} value={} error={}",
+                field.name(),
+                FIELD_META_STARROCKS_COLUMN_ID,
+                raw_unique_id,
+                e
+            )
+        })?;
+        if unique_id == 0 {
+            return Err(format!(
+                "invalid required_schema column unique_id metadata (zero): field={} key={}",
+                field.name(),
+                FIELD_META_STARROCKS_COLUMN_ID
+            ));
+        }
+        out.insert(normalize_column_name(field.name()), unique_id);
+    }
+    Ok(out)
+}
+
+fn build_lake_schema_column_hints(
+    schema: &crate::agent_service::TTabletSchema,
+) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
+    let mut out = HashMap::new();
+    for column in &schema.columns {
+        let normalized_name = normalize_column_name(&column.column_name);
+        if normalized_name.is_empty() {
+            continue;
+        }
+        let unique_id = match column.col_unique_id {
+            Some(v) if v > 0 => Some(u32::try_from(v).map_err(|_| {
+                format!(
+                    "invalid FE table schema col_unique_id for column '{}': {}",
+                    column.column_name, v
+                )
+            })?),
+            _ => None,
+        };
+        let hint = LakeSchemaColumnHint {
+            unique_id,
+            default_value: column.default_value.clone(),
+        };
+        if let Some(existing) = out.get(&normalized_name)
+            && existing != &hint
+        {
+            return Err(format!(
+                "duplicated FE table schema column with mismatched metadata: column_name={}",
+                column.column_name
+            ));
+        }
+        out.insert(normalized_name, hint);
+    }
+    Ok(out)
+}
+
+fn enrich_output_schema_with_lake_hints(
+    snapshot: &StarRocksTabletSnapshot,
+    required_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    lake_schema_meta: Option<&LakeScanSchemaMeta>,
+) -> Result<SchemaRef, String> {
+    let required_unique_ids = build_required_schema_unique_id_map(required_schema)?;
+    let snapshot_schema_columns = snapshot
+        .tablet_schema
+        .column
+        .iter()
+        .filter_map(|column| {
+            let name = column.name.as_deref()?;
+            let normalized_name = normalize_column_name(name);
+            if normalized_name.is_empty() {
+                return None;
+            }
+            let unique_id = if column.unique_id > 0 {
+                u32::try_from(column.unique_id).ok()
+            } else {
+                None
+            };
+            Some((normalized_name, unique_id))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut missing_output_columns = HashSet::new();
+    for field in output_schema.fields() {
+        let normalized_name = normalize_column_name(field.name());
+        let Some(snapshot_unique_id) = snapshot_schema_columns.get(&normalized_name) else {
+            missing_output_columns.insert(normalized_name);
+            continue;
+        };
+        if let Some(required_unique_id) = required_unique_ids.get(&normalized_name).copied()
+            && snapshot_unique_id.is_none_or(|v| v != required_unique_id)
+        {
+            missing_output_columns.insert(normalized_name);
+        }
+    }
+    if missing_output_columns.is_empty() {
+        return Ok(output_schema.clone());
+    }
+    let lake_hints = if let Some(meta) = lake_schema_meta {
+        let fe_schema = fetch_table_schema_for_lake_scan(
+            meta.fe_addr.as_ref(),
+            meta.db_id,
+            meta.table_id,
+            meta.schema_id,
+            Some(snapshot.tablet_id),
+            meta.query_id.clone(),
+        )
+        .map_err(|e| {
+            format!(
+                "fetch FE table schema for lake scan failed: db_id={} table_id={} schema_id={} error={}",
+                meta.db_id, meta.table_id, meta.schema_id, e
+            )
+        })?;
+        build_lake_schema_column_hints(&fe_schema)?
+    } else {
+        HashMap::new()
+    };
+
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(output_schema.fields().len());
+    for field_ref in output_schema.fields() {
+        let field = field_ref.as_ref();
+        let normalized_name = normalize_column_name(field.name());
+        let is_missing_in_snapshot = missing_output_columns.contains(&normalized_name);
+
+        let mut metadata = field.metadata().clone();
+        let mut changed_this_field = false;
+        if !metadata.contains_key(FIELD_META_STARROCKS_COLUMN_ID) {
+            if let Some(unique_id) =
+                required_unique_ids
+                    .get(&normalized_name)
+                    .copied()
+                    .or_else(|| {
+                        lake_hints
+                            .get(&normalized_name)
+                            .and_then(|hint| hint.unique_id)
+                    })
+            {
+                metadata.insert(
+                    FIELD_META_STARROCKS_COLUMN_ID.to_string(),
+                    unique_id.to_string(),
+                );
+                changed_this_field = true;
+            }
+        }
+        if is_missing_in_snapshot
+            && !metadata.contains_key(FIELD_META_STARROCKS_DEFAULT_VALUE)
+            && let Some(default_value) = lake_hints
+                .get(&normalized_name)
+                .and_then(|hint| hint.default_value.clone())
+        {
+            metadata.insert(
+                FIELD_META_STARROCKS_DEFAULT_VALUE.to_string(),
+                default_value,
+            );
+            changed_this_field = true;
+        }
+
+        if is_missing_in_snapshot {
+            let has_unique_id = metadata
+                .get(FIELD_META_STARROCKS_COLUMN_ID)
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .is_some_and(|v| v > 0);
+            if !has_unique_id {
+                return Err(format!(
+                    "lake output column is missing unique_id metadata while tablet snapshot lacks this column: tablet_id={} version={} output_column={} metadata_key={}",
+                    snapshot.tablet_id,
+                    snapshot.version,
+                    field.name(),
+                    FIELD_META_STARROCKS_COLUMN_ID
+                ));
+            }
+            if !field.is_nullable() && !metadata.contains_key(FIELD_META_STARROCKS_DEFAULT_VALUE) {
+                return Err(format!(
+                    "lake output column is non-nullable without default value while tablet snapshot lacks this column: tablet_id={} version={} output_column={} metadata_key={}",
+                    snapshot.tablet_id,
+                    snapshot.version,
+                    field.name(),
+                    FIELD_META_STARROCKS_DEFAULT_VALUE
+                ));
+            }
+        }
+
+        if changed_this_field {
+            changed = true;
+            fields.push(Arc::new(field.clone().with_metadata(metadata)));
+        } else {
+            fields.push(field_ref.clone());
+        }
+    }
+
+    if !changed {
+        return Ok(output_schema.clone());
+    }
+    Ok(Arc::new(Schema::new_with_metadata(
+        fields,
+        output_schema.metadata().clone(),
+    )))
 }
 
 fn should_treat_missing_tablet_metadata_as_empty(

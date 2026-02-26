@@ -20,13 +20,15 @@ use crate::common::thrift::thrift_serialize_result_batch;
 use crate::connector::starrocks::lake::{
     abort_txn as lake_abort_txn, delete_data as lake_delete_data,
     delete_tablet as lake_delete_tablet, drop_table as lake_drop_table,
-    get_tablet_stats as lake_get_tablet_stats, publish_version as lake_publish_version,
-    vacuum as lake_vacuum,
+    get_tablet_stats as lake_get_tablet_stats, publish_log_version as lake_publish_log_version,
+    publish_log_version_batch as lake_publish_log_version_batch,
+    publish_version as lake_publish_version, vacuum as lake_vacuum,
 };
 use crate::novarocks_logging::error;
 use crate::service::grpc_client::proto::starrocks::{
     AbortTxnRequest, DeleteDataRequest, DeleteTabletRequest, DropTableRequest,
-    PublishVersionRequest, TabletStatRequest, VacuumRequest,
+    PublishLogVersionBatchRequest, PublishLogVersionRequest, PublishVersionRequest,
+    TabletStatRequest, VacuumRequest,
 };
 use crate::{FetchResult, UniqueId};
 use prost::Message;
@@ -220,6 +222,104 @@ pub extern "C" fn novarocks_rs_lake_publish_version(
         }
         Err(e) => {
             error!(target: "novarocks::ffi", error = %e, "lake publish_version failed");
+            write_string_buf(e, out_err);
+            1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_lake_publish_log_version(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    unsafe {
+        if !out_resp.is_null() {
+            (*out_resp).ptr = std::ptr::null_mut();
+            (*out_resp).len = 0;
+        }
+        if !out_err.is_null() {
+            (*out_err).ptr = std::ptr::null_mut();
+            (*out_err).len = 0;
+        }
+    }
+    if ptr.is_null() {
+        write_string_buf(
+            "lake publish_log_version request ptr is null".to_string(),
+            out_err,
+        );
+        return 2;
+    }
+
+    let req_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let request = match PublishLogVersionRequest::decode(req_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = format!("decode lake publish_log_version request failed: {e}");
+            write_string_buf(err.clone(), out_err);
+            error!(target: "novarocks::ffi", error = %err, "lake publish_log_version decode failed");
+            return 2;
+        }
+    };
+
+    match lake_publish_log_version(&request) {
+        Ok(response) => {
+            write_bytes_buf(response.encode_to_vec(), out_resp);
+            0
+        }
+        Err(e) => {
+            error!(target: "novarocks::ffi", error = %e, "lake publish_log_version failed");
+            write_string_buf(e, out_err);
+            1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_lake_publish_log_version_batch(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    unsafe {
+        if !out_resp.is_null() {
+            (*out_resp).ptr = std::ptr::null_mut();
+            (*out_resp).len = 0;
+        }
+        if !out_err.is_null() {
+            (*out_err).ptr = std::ptr::null_mut();
+            (*out_err).len = 0;
+        }
+    }
+    if ptr.is_null() {
+        write_string_buf(
+            "lake publish_log_version_batch request ptr is null".to_string(),
+            out_err,
+        );
+        return 2;
+    }
+
+    let req_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let request = match PublishLogVersionBatchRequest::decode(req_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = format!("decode lake publish_log_version_batch request failed: {e}");
+            write_string_buf(err.clone(), out_err);
+            error!(target: "novarocks::ffi", error = %err, "lake publish_log_version_batch decode failed");
+            return 2;
+        }
+    };
+
+    match lake_publish_log_version_batch(&request) {
+        Ok(response) => {
+            write_bytes_buf(response.encode_to_vec(), out_resp);
+            0
+        }
+        Err(e) => {
+            error!(target: "novarocks::ffi", error = %e, "lake publish_log_version_batch failed");
             write_string_buf(e, out_err);
             1
         }

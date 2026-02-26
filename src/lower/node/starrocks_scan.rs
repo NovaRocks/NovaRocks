@@ -201,6 +201,7 @@ pub(crate) fn lower_starrocks_scan_node(
         mem_limit,
         profile_label: Some(format!("starrocks_scan_node_id={}", node.node_id)),
         min_max_predicates,
+        lake_schema_meta: None,
     };
 
     let scan = connectors

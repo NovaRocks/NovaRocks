@@ -41,6 +41,12 @@ fn bundle_meta_write_locks() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> 
     BUNDLE_META_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+pub struct BundleMetaWriteEntry<'a> {
+    pub tablet_id: i64,
+    pub schema: &'a TabletSchemaPb,
+    pub tablet_meta: &'a TabletMetadataPb,
+}
+
 fn with_bundle_meta_write_lock<T>(
     tablet_root_path: &str,
     version: i64,
@@ -111,97 +117,141 @@ pub fn write_bundle_meta_file(
     schema: &TabletSchemaPb,
     tablet_meta: &TabletMetadataPb,
 ) -> Result<(), String> {
+    write_bundle_meta_file_batch(
+        tablet_root_path,
+        version,
+        &[BundleMetaWriteEntry {
+            tablet_id,
+            schema,
+            tablet_meta,
+        }],
+    )
+}
+
+pub fn write_bundle_meta_file_batch(
+    tablet_root_path: &str,
+    version: i64,
+    entries: &[BundleMetaWriteEntry<'_>],
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     with_bundle_meta_write_lock(tablet_root_path, version, || {
-        let schema_id = schema
-            .id
-            .filter(|v| *v > 0)
-            .ok_or_else(|| "bundle schema id is missing".to_string())?;
-
+        let (mut tablet_metas, mut tablet_to_schema, mut schemas) =
+            load_bundle_meta_write_state(tablet_root_path, version)?;
+        for entry in entries {
+            let schema_id = entry
+                .schema
+                .id
+                .filter(|v| *v > 0)
+                .ok_or_else(|| "bundle schema id is missing".to_string())?;
+            tablet_metas.insert(entry.tablet_id, entry.tablet_meta.clone());
+            tablet_to_schema.insert(entry.tablet_id, schema_id);
+            schemas.insert(schema_id, entry.schema.clone());
+        }
+        let file_bytes = encode_bundle_meta_file_bytes(tablet_metas, tablet_to_schema, schemas)?;
         let meta_path = bundle_meta_file_path(tablet_root_path, version)?;
-        let mut tablet_metas = HashMap::new();
-        let mut tablet_to_schema = HashMap::new();
-        let mut schemas = HashMap::new();
+        write_bytes(&meta_path, file_bytes)
+    })
+}
 
-        let mut merge_bundle_bytes = |bytes: &[u8],
-                                      source: &str,
-                                      bump_to_version: bool|
-         -> Result<(), String> {
-            let (existing_bundle, footer_offset) = decode_bundle_metadata_from_bytes(bytes)?;
-            tablet_to_schema.extend(existing_bundle.tablet_to_schema);
-            schemas.extend(existing_bundle.schemas);
-            for (existing_tablet_id, page) in existing_bundle.tablet_meta_pages {
-                let start = page.offset as usize;
-                let end = start.saturating_add(page.size as usize);
-                if end > footer_offset {
-                    return Err(format!(
-                        "existing bundle tablet page out of range: source={} tablet_id={} offset={} size={} file_size={}",
-                        source, existing_tablet_id, page.offset, page.size, footer_offset
-                    ));
-                }
-                let mut meta = TabletMetadataPb::decode(&bytes[start..end]).map_err(|e| {
+type BundleWriteState = (
+    HashMap<i64, TabletMetadataPb>,
+    HashMap<i64, i64>,
+    HashMap<i64, TabletSchemaPb>,
+);
+
+fn load_bundle_meta_write_state(
+    tablet_root_path: &str,
+    version: i64,
+) -> Result<BundleWriteState, String> {
+    let meta_path = bundle_meta_file_path(tablet_root_path, version)?;
+    let mut tablet_metas = HashMap::new();
+    let mut tablet_to_schema = HashMap::new();
+    let mut schemas = HashMap::new();
+
+    let mut merge_bundle_bytes = |bytes: &[u8],
+                                  source: &str,
+                                  bump_to_version: bool|
+     -> Result<(), String> {
+        let (existing_bundle, footer_offset) = decode_bundle_metadata_from_bytes(bytes)?;
+        tablet_to_schema.extend(existing_bundle.tablet_to_schema);
+        schemas.extend(existing_bundle.schemas);
+        for (existing_tablet_id, page) in existing_bundle.tablet_meta_pages {
+            let start = page.offset as usize;
+            let end = start.saturating_add(page.size as usize);
+            if end > footer_offset {
+                return Err(format!(
+                    "existing bundle tablet page out of range: source={} tablet_id={} offset={} size={} file_size={}",
+                    source, existing_tablet_id, page.offset, page.size, footer_offset
+                ));
+            }
+            let mut meta = TabletMetadataPb::decode(&bytes[start..end]).map_err(|e| {
                     format!(
                         "decode existing bundle tablet metadata failed: source={} tablet_id={} error={}",
                         source, existing_tablet_id, e
                     )
                 })?;
-                if bump_to_version {
-                    meta.version = Some(version);
-                }
-                tablet_metas.insert(existing_tablet_id, meta);
+            if bump_to_version {
+                meta.version = Some(version);
             }
-            Ok(())
-        };
-
-        // For shared partition-root layout, each new bundle version must remain readable by
-        // all tablets in the partition. Seed from previous version first, then overlay current.
-        if version > 1 {
-            let previous_meta_path = bundle_meta_file_path(tablet_root_path, version - 1)?;
-            if let Some(previous_bytes) = read_bytes_if_exists(&previous_meta_path)? {
-                merge_bundle_bytes(&previous_bytes, &previous_meta_path, true)?;
-            }
+            tablet_metas.insert(existing_tablet_id, meta);
         }
+        Ok(())
+    };
 
-        if let Some(existing_bytes) = read_bytes_if_exists(&meta_path)? {
-            merge_bundle_bytes(&existing_bytes, &meta_path, false)?;
+    // For shared partition-root layout, each new bundle version must remain readable by
+    // all tablets in the partition. Seed from previous version first, then overlay current.
+    if version > 1 {
+        let previous_meta_path = bundle_meta_file_path(tablet_root_path, version - 1)?;
+        if let Some(previous_bytes) = read_bytes_if_exists(&previous_meta_path)? {
+            merge_bundle_bytes(&previous_bytes, &previous_meta_path, true)?;
         }
+    }
 
-        tablet_metas.insert(tablet_id, tablet_meta.clone());
-        tablet_to_schema.insert(tablet_id, schema_id);
-        schemas.insert(schema_id, schema.clone());
+    if let Some(existing_bytes) = read_bytes_if_exists(&meta_path)? {
+        merge_bundle_bytes(&existing_bytes, &meta_path, false)?;
+    }
+    Ok((tablet_metas, tablet_to_schema, schemas))
+}
 
-        let mut ordered_tablet_ids = tablet_metas.keys().copied().collect::<Vec<_>>();
-        ordered_tablet_ids.sort_unstable();
+fn encode_bundle_meta_file_bytes(
+    mut tablet_metas: HashMap<i64, TabletMetadataPb>,
+    tablet_to_schema: HashMap<i64, i64>,
+    schemas: HashMap<i64, TabletSchemaPb>,
+) -> Result<Vec<u8>, String> {
+    let mut ordered_tablet_ids = tablet_metas.keys().copied().collect::<Vec<_>>();
+    ordered_tablet_ids.sort_unstable();
 
-        let mut tablet_meta_pages = HashMap::with_capacity(ordered_tablet_ids.len());
-        let mut file_bytes = Vec::new();
-        for tid in ordered_tablet_ids {
-            let meta = tablet_metas
-                .remove(&tid)
-                .ok_or_else(|| format!("bundle metadata map missing tablet_id={tid}"))?;
-            let tablet_meta_bytes = meta.encode_to_vec();
-            let offset = file_bytes.len() as u64;
-            file_bytes.extend_from_slice(&tablet_meta_bytes);
-            tablet_meta_pages.insert(
-                tid,
-                PagePointerPb {
-                    offset,
-                    size: tablet_meta_bytes.len() as u32,
-                },
-            );
-        }
+    let mut tablet_meta_pages = HashMap::with_capacity(ordered_tablet_ids.len());
+    let mut file_bytes = Vec::new();
+    for tid in ordered_tablet_ids {
+        let meta = tablet_metas
+            .remove(&tid)
+            .ok_or_else(|| format!("bundle metadata map missing tablet_id={tid}"))?;
+        let tablet_meta_bytes = meta.encode_to_vec();
+        let offset = file_bytes.len() as u64;
+        file_bytes.extend_from_slice(&tablet_meta_bytes);
+        tablet_meta_pages.insert(
+            tid,
+            PagePointerPb {
+                offset,
+                size: tablet_meta_bytes.len() as u32,
+            },
+        );
+    }
 
-        let bundle = BundleTabletMetadataPb {
-            tablet_to_schema,
-            schemas,
-            tablet_meta_pages,
-        };
-        let bundle_bytes = bundle.encode_to_vec();
-        let bundle_size = bundle_bytes.len() as u64;
+    let bundle = BundleTabletMetadataPb {
+        tablet_to_schema,
+        schemas,
+        tablet_meta_pages,
+    };
+    let bundle_bytes = bundle.encode_to_vec();
+    let bundle_size = bundle_bytes.len() as u64;
 
-        file_bytes.extend_from_slice(&bundle_bytes);
-        file_bytes.extend_from_slice(&bundle_size.to_le_bytes());
-        write_bytes(&meta_path, file_bytes)
-    })
+    file_bytes.extend_from_slice(&bundle_bytes);
+    file_bytes.extend_from_slice(&bundle_size.to_le_bytes());
+    Ok(file_bytes)
 }
 
 #[allow(dead_code)]

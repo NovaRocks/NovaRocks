@@ -1656,32 +1656,30 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
             );
         }
     };
-    let (db, table) = match parse_db_table_from_headers(headers) {
-        Ok(v) => v,
-        Err(e) => {
-            return txn_response(
-                "rollback", e.code, &e.message, "", "", &label, None, None, None, None,
-            );
-        }
-    };
+    let requested_db = get_header(headers, "db").map(ToString::to_string);
+    let requested_table = get_header(headers, "table").map(ToString::to_string);
     let result = with_txn_context_for_update(&label, |ctx| {
-        if ctx.db != db {
-            return Err(ApiError::new(
-                TStatusCode::INVALID_ARGUMENT,
-                format!(
-                    "request db `{db}` does not match transaction db `{}`",
-                    ctx.db
-                ),
-            ));
+        if let Some(db) = requested_db.as_deref() {
+            if ctx.db != db {
+                return Err(ApiError::new(
+                    TStatusCode::INVALID_ARGUMENT,
+                    format!(
+                        "request db `{db}` does not match transaction db `{}`",
+                        ctx.db
+                    ),
+                ));
+            }
         }
-        if ctx.table != table {
-            return Err(ApiError::new(
-                TStatusCode::INVALID_ARGUMENT,
-                format!(
-                    "request table `{table}` does not match transaction table `{}`",
-                    ctx.table
-                ),
-            ));
+        if let Some(table) = requested_table.as_deref() {
+            if ctx.table != table {
+                return Err(ApiError::new(
+                    TStatusCode::INVALID_ARGUMENT,
+                    format!(
+                        "request table `{table}` does not match transaction table `{}`",
+                        ctx.table
+                    ),
+                ));
+            }
         }
         let rollback_result = rollback_txn(
             &ctx.auth,
@@ -1697,17 +1695,17 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
     });
 
     match result {
-        Ok(txn_id) => {
+        Ok(_txn_id) => {
             let mut contexts = txn_contexts().lock().expect("txn context store lock");
             contexts.remove(&label);
             txn_response(
                 "rollback",
                 TStatusCode::OK,
-                "OK",
-                &db,
-                &table,
+                "",
+                "",
+                "",
                 &label,
-                Some(txn_id),
+                None,
                 None,
                 None,
                 None,
@@ -1717,8 +1715,8 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
             "rollback",
             err.code,
             &err.message,
-            &db,
-            &table,
+            requested_db.as_deref().unwrap_or(""),
+            requested_table.as_deref().unwrap_or(""),
             &label,
             None,
             None,
@@ -1930,6 +1928,20 @@ mod tests {
         let headers = test_headers(&[("skip_header", "x"), ("format", "csv")]);
         let err = parse_load_headers(&headers).expect_err("should reject number");
         assert_eq!(err.code, TStatusCode::INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn rollback_without_table_header_is_not_rejected() {
+        let _guard = test_guard();
+        clear_contexts();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("root:");
+        let headers = test_headers(&[
+            ("authorization", &format!("Basic {encoded}")),
+            ("db", "db1"),
+            ("label", "missing_txn"),
+        ]);
+        let response = handle_transaction_op("rollback".to_string(), headers);
+        assert_eq!(response["Status"], "TXN_NOT_EXISTS");
     }
 
     #[test]

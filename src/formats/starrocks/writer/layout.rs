@@ -175,6 +175,29 @@ pub fn combined_txn_log_file_path(tablet_root_path: &str, txn_id: i64) -> Result
     )
 }
 
+pub fn txn_vlog_file_path(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    version: i64,
+) -> Result<String, String> {
+    if tablet_id <= 0 {
+        return Err(format!(
+            "invalid tablet_id for txn vlog path: {}",
+            tablet_id
+        ));
+    }
+    if version <= 0 {
+        return Err(format!("invalid version for txn vlog path: {}", version));
+    }
+    join_tablet_path(
+        tablet_root_path,
+        &format!(
+            "{LOG_DIR}/{:016X}_{:016X}.vlog",
+            tablet_id as u64, version as u64
+        ),
+    )
+}
+
 pub fn join_tablet_path(tablet_root_path: &str, rel: &str) -> Result<String, String> {
     let root = tablet_root_path.trim().trim_end_matches('/');
     if root.is_empty() {
@@ -189,7 +212,10 @@ pub fn join_tablet_path(tablet_root_path: &str, rel: &str) -> Result<String, Str
 
 #[cfg(test)]
 mod tests {
-    use super::{StarRocksWriteFormat, build_txn_data_file_name, txn_log_file_path_with_load_id};
+    use super::{
+        StarRocksWriteFormat, build_txn_data_file_name, txn_log_file_path_with_load_id,
+        txn_vlog_file_path,
+    };
     use crate::service::grpc_client::proto::starrocks::PUniqueId;
 
     #[test]
@@ -264,6 +290,17 @@ mod tests {
         assert_ne!(
             without_load, with_load,
             "load_id should participate in deterministic uuid seed"
+        );
+    }
+
+    #[test]
+    fn txn_vlog_path_matches_starrocks_filename_pattern() {
+        let path = txn_vlog_file_path("/tmp/novarocks_lake_path_test", 0x2741, 0x44)
+            .expect("build vlog path");
+        assert!(
+            path.ends_with("log/0000000000002741_0000000000000044.vlog"),
+            "unexpected vlog path: {}",
+            path
         );
     }
 }

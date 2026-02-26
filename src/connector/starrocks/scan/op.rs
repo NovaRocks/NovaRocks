@@ -50,6 +50,15 @@ pub struct StarRocksScanRange {
 }
 
 #[derive(Clone, Debug)]
+pub struct LakeScanSchemaMeta {
+    pub db_id: i64,
+    pub table_id: i64,
+    pub schema_id: i64,
+    pub fe_addr: Option<types::TNetworkAddress>,
+    pub query_id: Option<types::TUniqueId>,
+}
+
+#[derive(Clone, Debug)]
 pub struct StarRocksScanConfig {
     pub db_name: Option<String>,
     pub table_name: Option<String>,
@@ -67,6 +76,7 @@ pub struct StarRocksScanConfig {
     pub mem_limit: Option<i64>,
     pub profile_label: Option<String>,
     pub min_max_predicates: Vec<MinMaxPredicate>,
+    pub lake_schema_meta: Option<LakeScanSchemaMeta>,
 }
 
 #[derive(Clone, Debug)]
@@ -375,6 +385,7 @@ impl StarRocksScanner {
             cfg.query_global_dicts.clone(),
             cfg.min_max_predicates.clone(),
             &options,
+            cfg.lake_schema_meta.as_ref(),
         )?;
 
         Ok(Self {
@@ -466,6 +477,7 @@ mod tests {
             mem_limit: None,
             profile_label,
             min_max_predicates: Vec::new(),
+            lake_schema_meta: None,
         }
     }
 

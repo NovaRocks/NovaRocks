@@ -22,6 +22,7 @@ use crate::connector::starrocks::lake::txn_log::{
 };
 use crate::formats::starrocks::writer::layout::{
     combined_txn_log_file_path, txn_log_file_path, txn_log_file_path_with_load_id,
+    txn_vlog_file_path,
 };
 use crate::service::grpc_client::proto::starrocks::{TxnInfoPb, TxnLogPb};
 
@@ -89,4 +90,19 @@ pub(crate) fn load_txn_logs_for_publish(
         return Ok(vec![LoadedTxnLog { log: txn_log }]);
     }
     Ok(Vec::new())
+}
+
+pub(crate) fn load_txn_vlog_for_publish(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    version: i64,
+) -> Result<Option<LoadedTxnLog>, String> {
+    if version <= 0 {
+        return Err(format!(
+            "publish_version requires positive vlog version, got {version}"
+        ));
+    }
+    let path = txn_vlog_file_path(tablet_root_path, tablet_id, version)?;
+    let maybe_log = read_txn_log_if_exists(&path)?;
+    Ok(maybe_log.map(|log| LoadedTxnLog { log }))
 }

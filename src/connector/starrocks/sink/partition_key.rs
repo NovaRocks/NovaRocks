@@ -151,11 +151,12 @@ pub(crate) fn resolve_slot_ids_by_names(
 pub(crate) fn build_partition_key_source(
     sink: &data_sinks::TOlapTableSink,
     slot_name_overrides: Option<&HashMap<String, SlotId>>,
+    slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
 ) -> Result<PartitionKeySource, String> {
     if let Some(exprs) = sink.partition.partition_exprs.as_ref()
         && !exprs.is_empty()
     {
-        let plan = lower_partition_expr_plan(exprs)?;
+        let plan = lower_partition_expr_plan(exprs, slot_id_overrides)?;
         return Ok(PartitionKeySource::Expr(Arc::new(plan)));
     }
 
@@ -192,7 +193,10 @@ pub(crate) fn build_partition_key_source(
     Ok(PartitionKeySource::SlotRefs(slot_refs))
 }
 
-fn lower_partition_expr_plan(exprs: &[exprs::TExpr]) -> Result<PartitionExprPlan, String> {
+fn lower_partition_expr_plan(
+    exprs: &[exprs::TExpr],
+    slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
+) -> Result<PartitionExprPlan, String> {
     let mut arena = ExprArena::default();
     let mut expr_ids = Vec::with_capacity(exprs.len());
     let empty_layout = Layout {
@@ -200,10 +204,48 @@ fn lower_partition_expr_plan(exprs: &[exprs::TExpr]) -> Result<PartitionExprPlan
         index: HashMap::new(),
     };
     for expr in exprs {
-        let expr_id = lower_t_expr(expr, &mut arena, &empty_layout, None, None)?;
+        let mut rewritten_expr = expr.clone();
+        if let Some(overrides) = slot_id_overrides {
+            remap_partition_expr_slot_ids(&mut rewritten_expr, overrides)?;
+        }
+        let expr_id = lower_t_expr(&rewritten_expr, &mut arena, &empty_layout, None, None)?;
         expr_ids.push(expr_id);
     }
     Ok(PartitionExprPlan { arena, expr_ids })
+}
+
+fn remap_partition_expr_slot_ids(
+    expr: &mut exprs::TExpr,
+    slot_id_overrides: &HashMap<SlotId, SlotId>,
+) -> Result<(), String> {
+    if slot_id_overrides.is_empty() {
+        return Ok(());
+    }
+    for (idx, node) in expr.nodes.iter_mut().enumerate() {
+        if node.node_type != exprs::TExprNodeType::SLOT_REF {
+            continue;
+        }
+        let Some(slot_ref) = node.slot_ref.as_mut() else {
+            continue;
+        };
+        let source_slot_id = SlotId::try_from(slot_ref.slot_id).map_err(|e| {
+            format!(
+                "invalid partition expr slot id {} at node {}: {}",
+                slot_ref.slot_id, idx, e
+            )
+        })?;
+        let Some(target_slot_id) = slot_id_overrides.get(&source_slot_id).copied() else {
+            continue;
+        };
+        let target_slot_i32 = i32::try_from(target_slot_id.as_u32()).map_err(|_| {
+            format!(
+                "partition expr remapped slot id {} exceeds i32 range",
+                target_slot_id
+            )
+        })?;
+        slot_ref.slot_id = target_slot_i32;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse_partition_boundary_key(

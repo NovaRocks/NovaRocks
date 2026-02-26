@@ -38,7 +38,7 @@ use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
-    ConnectorRegistry, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
+    ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
 use crate::novarocks_logging::{debug, info};
 use crate::runtime::query_context::QueryId;
@@ -379,6 +379,16 @@ pub(crate) fn lower_lake_scan_node(
         mem_limit,
         profile_label: Some(format!("lake_scan_node_id={}", node.node_id)),
         min_max_predicates,
+        lake_schema_meta: Some(LakeScanSchemaMeta {
+            db_id,
+            table_id,
+            schema_id,
+            fe_addr: fe_addr.cloned(),
+            query_id: Some(types::TUniqueId {
+                hi: exec_params.query_id.hi,
+                lo: exec_params.query_id.lo,
+            }),
+        }),
     };
 
     let scan = connectors

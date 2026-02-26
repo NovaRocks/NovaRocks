@@ -87,8 +87,20 @@ fn abort_one_txn_log(
         return Ok(());
     }
 
+    if let Some(op_schema_change) = txn_log.op_schema_change.as_ref() {
+        if !op_schema_change.linked_segment.unwrap_or(false) {
+            for rowset in &op_schema_change.rowsets {
+                for seg in &rowset.segments {
+                    let seg_path =
+                        join_tablet_path(tablet_root_path, &format!("{DATA_DIR}/{seg}"))?;
+                    delete_path_if_exists(&seg_path)?;
+                }
+            }
+        }
+        return Ok(());
+    }
+
     if txn_log.op_compaction.is_some()
-        || txn_log.op_schema_change.is_some()
         || txn_log.op_alter_metadata.is_some()
         || txn_log.op_replication.is_some()
     {

@@ -30,7 +30,7 @@ use arrow::array::{
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
@@ -40,11 +40,13 @@ use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
 use crate::connector::starrocks::lake::{TabletWriteContext, append_lake_txn_log_with_rowset};
 use crate::connector::starrocks::sink::factory::{
-    OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, create_automatic_partitions,
+    OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, SinkIndexWritePlan, TabletWriteTarget,
+    create_automatic_partitions,
 };
 use crate::connector::starrocks::sink::partition_key::{
-    PartitionKeySource, PartitionMode, PartitionRoutingEntry, PartitionSlotRef,
-    parse_partition_boundary_key, parse_partition_in_keys, validate_partition_key_length,
+    PartitionKeySource, PartitionMode, PartitionRoutingEntry, build_partition_key_arrays,
+    parse_partition_boundary_key, parse_partition_in_keys, partition_key_source_len,
+    validate_partition_key_length,
 };
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, route_chunk_rows};
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
@@ -69,10 +71,13 @@ pub(crate) struct OlapTableSinkOperator {
     pending_input_rows: usize,
     pending_input_bytes: usize,
     row_routing: RowRoutingPlan,
-    write_targets: HashMap<i64, crate::connector::starrocks::sink::factory::TabletWriteTarget>,
+    write_targets: HashMap<i64, TabletWriteTarget>,
+    all_write_targets: HashMap<i64, TabletWriteTarget>,
+    index_write_plans: Vec<SinkIndexWritePlan>,
     tablet_commit_infos: Vec<types::TTabletCommitInfo>,
     seen_partition_values: HashSet<Vec<String>>,
     auto_partition_initialized: bool,
+    auto_partition_debug_logged: bool,
     input_rows: i64,
     finished: bool,
     written_tablets: HashSet<i64>,
@@ -304,6 +309,39 @@ impl OlapTableSinkOperator {
     ) -> Self {
         let row_routing = plan.row_routing.clone();
         let write_targets = plan.write_targets.clone();
+        let mut index_write_plans = if plan.index_write_plans.is_empty() {
+            vec![SinkIndexWritePlan {
+                index_id: -1,
+                schema_id: -1,
+                row_routing: row_routing.clone(),
+                write_targets: write_targets.clone(),
+                schema_slot_bindings: plan.schema_slot_bindings.clone(),
+                op_slot_id: plan.op_slot_id,
+            }]
+        } else {
+            plan.index_write_plans.clone()
+        };
+        if index_write_plans.is_empty() {
+            index_write_plans.push(SinkIndexWritePlan {
+                index_id: -1,
+                schema_id: -1,
+                row_routing: row_routing.clone(),
+                write_targets: write_targets.clone(),
+                schema_slot_bindings: plan.schema_slot_bindings.clone(),
+                op_slot_id: plan.op_slot_id,
+            });
+        }
+        let mut all_write_targets = HashMap::new();
+        for index_plan in &index_write_plans {
+            for (tablet_id, target) in &index_plan.write_targets {
+                all_write_targets
+                    .entry(*tablet_id)
+                    .or_insert_with(|| target.clone());
+            }
+        }
+        if all_write_targets.is_empty() {
+            all_write_targets = write_targets.clone();
+        }
         let tablet_commit_infos = plan.tablet_commit_infos.clone();
         Self {
             name,
@@ -317,9 +355,12 @@ impl OlapTableSinkOperator {
             pending_input_bytes: 0,
             row_routing,
             write_targets,
+            all_write_targets,
+            index_write_plans,
             tablet_commit_infos,
             seen_partition_values: HashSet::new(),
             auto_partition_initialized: false,
+            auto_partition_debug_logged: false,
             input_rows: 0,
             finished: false,
             written_tablets: HashSet::new(),
@@ -470,7 +511,7 @@ impl OlapTableSinkOperator {
             return Ok(());
         }
         let mut empty_targets = Vec::new();
-        for target in self.write_targets.values() {
+        for target in self.all_write_targets.values() {
             if !dirty_partitions.contains(&target.partition_id) {
                 continue;
             }
@@ -555,8 +596,68 @@ impl OlapTableSinkOperator {
             if chunk.is_empty() {
                 continue;
             }
-            let chunk_values =
-                collect_partition_values_from_chunk(chunk, &auto_partition.partition_slot_ids)?;
+            let (source_kind, chunk_values) = match &auto_partition.partition_key_source {
+                PartitionKeySource::Expr(_) => {
+                    let arrays =
+                        build_partition_key_arrays(&auto_partition.partition_key_source, chunk)?;
+                    if arrays.len() != auto_partition.partition_column_names.len() {
+                        return Err(format!(
+                            "OLAP_TABLE_SINK automatic partition expression count mismatch: exprs={} partition_columns={}",
+                            arrays.len(),
+                            auto_partition.partition_column_names.len()
+                        ));
+                    }
+                    (
+                        "expr",
+                        collect_partition_values_from_arrays(&arrays, chunk.len())?,
+                    )
+                }
+                PartitionKeySource::SlotRefs(_) => (
+                    "slot_refs",
+                    collect_partition_values_from_chunk(
+                        chunk,
+                        &auto_partition.partition_slot_ids,
+                        &auto_partition.partition_column_names,
+                    )?,
+                ),
+                PartitionKeySource::None if !auto_partition.partition_slot_ids.is_empty() => (
+                    "slot_refs_fallback",
+                    collect_partition_values_from_chunk(
+                        chunk,
+                        &auto_partition.partition_slot_ids,
+                        &auto_partition.partition_column_names,
+                    )?,
+                ),
+                PartitionKeySource::None => ("none", BTreeSet::new()),
+            };
+            if !self.auto_partition_debug_logged {
+                let field_summary = chunk
+                    .batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, field)| {
+                        let slot_id = field_slot_id(field.as_ref())
+                            .ok()
+                            .flatten()
+                            .map(|slot| slot.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        format!("{idx}:{}(slot={slot_id})", field.name())
+                    })
+                    .collect::<Vec<_>>();
+                info!(
+                    target: "novarocks::starrocks::sink",
+                    table_id = self.plan.table_id,
+                    txn_id = self.plan.txn_id,
+                    partition_key_source = source_kind,
+                    partition_columns = ?auto_partition.partition_column_names,
+                    configured_partition_slot_ids = ?auto_partition.partition_slot_ids,
+                    chunk_fields = ?field_summary,
+                    "OLAP_TABLE_SINK auto partition chunk field layout"
+                );
+                self.auto_partition_debug_logged = true;
+            }
             for values in chunk_values {
                 if self.seen_partition_values.contains(&values) {
                     continue;
@@ -582,7 +683,8 @@ impl OlapTableSinkOperator {
                 auto_partition.table_id,
                 auto_partition.txn_id,
                 vec![partition_values.clone()],
-            )?;
+            )
+            .map_err(|e| format!("OLAP_TABLE_SINK runtime automatic partition failed: {e}"))?;
             self.ingest_auto_partition_response(&auto_partition, response)?;
             self.seen_partition_values.insert(partition_values);
         }
@@ -599,6 +701,7 @@ impl OlapTableSinkOperator {
 
         let mut new_partitions = Vec::<PartitionRoutingEntry>::new();
         let mut tablet_to_partition = HashMap::<i64, i64>::new();
+        let partition_key_len = partition_key_source_len(&auto_partition.partition_key_source);
         for partition in partitions {
             if partition.is_shadow_partition.unwrap_or(false) {
                 continue;
@@ -630,7 +733,7 @@ impl OlapTableSinkOperator {
             let in_keys = parse_partition_in_keys(partition.in_keys.as_deref())?;
             validate_partition_key_length(
                 partition.id,
-                auto_partition.partition_slot_ids.len(),
+                partition_key_len,
                 start_key.as_deref(),
                 end_key.as_deref(),
                 &in_keys,
@@ -671,18 +774,8 @@ impl OlapTableSinkOperator {
         }
 
         if self.auto_partition_initialized {
-            self.row_routing.partition_key_source = PartitionKeySource::SlotRefs(
-                auto_partition
-                    .partition_slot_ids
-                    .iter()
-                    .zip(auto_partition.partition_column_names.iter())
-                    .map(|(slot_id, column_name)| PartitionSlotRef {
-                        slot_id: *slot_id,
-                        column_name: column_name.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.row_routing.partition_key_len = auto_partition.partition_slot_ids.len();
+            self.row_routing.partition_key_source = auto_partition.partition_key_source.clone();
+            self.row_routing.partition_key_len = partition_key_len;
 
             let has_any_in_keys = self
                 .row_routing
@@ -851,14 +944,19 @@ impl OlapTableSinkOperator {
             context.tablet_root_path = tablet_root_path.clone();
             context.s3_config = s3_config;
 
-            self.write_targets.insert(
+            let target = TabletWriteTarget {
                 tablet_id,
-                crate::connector::starrocks::sink::factory::TabletWriteTarget {
-                    tablet_id,
-                    partition_id,
-                    context,
-                },
-            );
+                partition_id,
+                context,
+            };
+            self.write_targets.insert(tablet_id, target.clone());
+            self.all_write_targets.insert(tablet_id, target.clone());
+            if let Some(primary_index_plan) = self.index_write_plans.first_mut() {
+                primary_index_plan.write_targets.insert(tablet_id, target);
+            }
+        }
+        if let Some(primary_index_plan) = self.index_write_plans.first_mut() {
+            primary_index_plan.row_routing = self.row_routing.clone();
         }
         Ok(())
     }
@@ -914,8 +1012,14 @@ impl OlapTableSinkOperator {
     }
 
     fn flush_real_data(&mut self, state: &RuntimeState) -> Result<(), String> {
-        if self.row_routing.tablet_ids.is_empty() {
+        if self.index_write_plans.is_empty() || self.all_write_targets.is_empty() {
             return Err("OLAP_TABLE_SINK has empty write_targets".to_string());
+        }
+        if self.plan.auto_partition.is_some() && self.index_write_plans.len() > 1 {
+            return Err(
+                "OLAP_TABLE_SINK automatic partition with multi-index sink is not supported yet"
+                    .to_string(),
+            );
         }
 
         let request_rows_threshold = state.chunk_size().max(1);
@@ -932,137 +1036,162 @@ impl OlapTableSinkOperator {
         self.pending_input_bytes = 0;
         let flush_result: Result<(), String> = (|| {
             self.ensure_auto_partitions_for_chunks(&pending_chunks)?;
+            let index_write_plans = self.index_write_plans.clone();
             let mut buffered_by_tablet = BTreeMap::<i64, TabletBufferedState>::new();
             for chunk in &pending_chunks {
                 if chunk.is_empty() {
                     continue;
                 }
                 let sink_chunk = self.project_chunk_for_sink_output(chunk)?;
-                let routed =
-                    route_chunk_rows(&self.row_routing, &sink_chunk, &mut self.next_random_hash)?;
-                for (tablet_idx, row_indices) in routed.into_iter().enumerate() {
-                    if row_indices.is_empty() {
-                        continue;
+                let chunk_random_hash_seed = self.next_random_hash;
+                let mut first_plan_next_random_hash = chunk_random_hash_seed;
+                for (plan_idx, index_plan) in index_write_plans.iter().enumerate() {
+                    let mut plan_random_hash = chunk_random_hash_seed;
+                    let routed = route_chunk_rows(
+                        &index_plan.row_routing,
+                        &sink_chunk,
+                        &mut plan_random_hash,
+                    )?;
+                    if plan_idx == 0 {
+                        first_plan_next_random_hash = plan_random_hash;
                     }
-                    let tablet_id =
-                        *self.row_routing.tablet_ids.get(tablet_idx).ok_or_else(|| {
+                    for (tablet_idx, row_indices) in routed.into_iter().enumerate() {
+                        if row_indices.is_empty() {
+                            continue;
+                        }
+                        let tablet_id = *index_plan
+                            .row_routing
+                            .tablet_ids
+                            .get(tablet_idx)
+                            .ok_or_else(|| {
+                                format!(
+                                    "OLAP_TABLE_SINK routing produced invalid tablet index {} for index_id={}",
+                                    tablet_idx, index_plan.index_id
+                                )
+                            })?;
+                        let target =
+                            index_plan.write_targets.get(&tablet_id).ok_or_else(|| {
+                                format!(
+                                    "OLAP_TABLE_SINK routing resolved unknown tablet target {} for index_id={}",
+                                    tablet_id, index_plan.index_id
+                                )
+                            })?;
+                        let routed_batch = if row_indices.len() == sink_chunk.len() {
+                            sink_chunk.batch.clone()
+                        } else {
+                            take_batch_rows(&sink_chunk.batch, &row_indices)?
+                        };
+                        let is_primary_keys_table = target.context.tablet_schema.keys_type
+                            == Some(KeysType::PrimaryKeys as i32);
+                        let routed_batch = match align_batch_to_schema_slot_bindings(
+                            &routed_batch,
+                            &index_plan.schema_slot_bindings,
+                            index_plan.op_slot_id,
+                        ) {
+                            Ok(aligned_batch)
+                                if !is_primary_keys_table
+                                    && aligned_batch.num_columns() < routed_batch.num_columns() =>
+                            {
+                                let batch_fields = routed_batch
+                                    .schema()
+                                    .fields()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, field)| {
+                                        let slot_id = field_slot_id(field.as_ref())
+                                            .ok()
+                                            .flatten()
+                                            .map(|slot| slot.to_string())
+                                            .unwrap_or_else(|| "none".to_string());
+                                        format!("{idx}:{}(slot={slot_id})", field.name())
+                                    })
+                                    .collect::<Vec<_>>();
+                                info!(
+                                    target: "novarocks::sink",
+                                    table_id = self.plan.table_id,
+                                    index_id = index_plan.index_id,
+                                    schema_id = index_plan.schema_id,
+                                    tablet_id = target.tablet_id,
+                                    original_columns = routed_batch.num_columns(),
+                                    aligned_columns = aligned_batch.num_columns(),
+                                    batch_fields = ?batch_fields,
+                                    "OLAP_TABLE_SINK skip write-slot alignment for non-primary key batch because alignment dropped columns"
+                                );
+                                routed_batch
+                            }
+                            Ok(aligned_batch) => aligned_batch,
+                            Err(err) if !is_primary_keys_table => {
+                                let batch_fields = routed_batch
+                                    .schema()
+                                    .fields()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, field)| {
+                                        let slot_id = field_slot_id(field.as_ref())
+                                            .ok()
+                                            .flatten()
+                                            .map(|slot| slot.to_string())
+                                            .unwrap_or_else(|| "none".to_string());
+                                        format!("{idx}:{}(slot={slot_id})", field.name())
+                                    })
+                                    .collect::<Vec<_>>();
+                                info!(
+                                    target: "novarocks::sink",
+                                    table_id = self.plan.table_id,
+                                    index_id = index_plan.index_id,
+                                    schema_id = index_plan.schema_id,
+                                    tablet_id = target.tablet_id,
+                                    error = %err,
+                                    original_columns = routed_batch.num_columns(),
+                                    batch_fields = ?batch_fields,
+                                    "OLAP_TABLE_SINK skip write-slot alignment for non-primary key batch because alignment failed"
+                                );
+                                routed_batch
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        if !buffered_by_tablet.contains_key(&tablet_id) {
+                            buffered_by_tablet.insert(
+                                tablet_id,
+                                TabletBufferedState::new(
+                                    target.partition_id,
+                                    target.context.clone(),
+                                ),
+                            );
+                        }
+                        let buffer = buffered_by_tablet.get_mut(&tablet_id).ok_or_else(|| {
                             format!(
-                                "OLAP_TABLE_SINK routing produced invalid tablet index {}",
-                                tablet_idx
+                                "OLAP_TABLE_SINK tablet buffer missing after insert: tablet_id={}",
+                                tablet_id
                             )
                         })?;
-                    let target = self.write_targets.get(&tablet_id).ok_or_else(|| {
-                        format!(
-                            "OLAP_TABLE_SINK routing resolved unknown tablet target {}",
-                            tablet_id
-                        )
-                    })?;
-                    let routed_batch = if row_indices.len() == sink_chunk.len() {
-                        sink_chunk.batch.clone()
-                    } else {
-                        take_batch_rows(&sink_chunk.batch, &row_indices)?
-                    };
-                    let is_primary_keys_table = target.context.tablet_schema.keys_type
-                        == Some(KeysType::PrimaryKeys as i32);
-                    let routed_batch = match align_batch_to_schema_slot_bindings(
-                        &routed_batch,
-                        &self.plan.schema_slot_bindings,
-                        self.plan.op_slot_id,
-                    ) {
-                        Ok(aligned_batch)
-                            if !is_primary_keys_table
-                                && aligned_batch.num_columns() < routed_batch.num_columns() =>
+                        if buffer.partition_id != target.partition_id {
+                            return Err(format!(
+                                "OLAP_TABLE_SINK buffered partition mismatch for tablet {}: buffered_partition_id={} target_partition_id={}",
+                                tablet_id, buffer.partition_id, target.partition_id
+                            ));
+                        }
+                        buffer.push_request_batch(routed_batch);
+                        if buffer.should_seal_request_batch(
+                            request_rows_threshold,
+                            request_bytes_threshold,
+                        ) && let Some(request_batch) = buffer.take_request_batch()?
                         {
-                            let batch_fields = routed_batch
-                                .schema()
-                                .fields()
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, field)| {
-                                    let slot_id = field_slot_id(field.as_ref())
-                                        .ok()
-                                        .flatten()
-                                        .map(|slot| slot.to_string())
-                                        .unwrap_or_else(|| "none".to_string());
-                                    format!("{idx}:{}(slot={slot_id})", field.name())
-                                })
-                                .collect::<Vec<_>>();
-                            info!(
-                                target: "novarocks::sink",
-                                table_id = self.plan.table_id,
-                                tablet_id = target.tablet_id,
-                                original_columns = routed_batch.num_columns(),
-                                aligned_columns = aligned_batch.num_columns(),
-                                batch_fields = ?batch_fields,
-                                "OLAP_TABLE_SINK skip write-slot alignment for non-primary key batch because alignment dropped columns"
-                            );
-                            routed_batch
+                            buffer.push_memtable_batch(request_batch);
                         }
-                        Ok(aligned_batch) => aligned_batch,
-                        Err(err) if !is_primary_keys_table => {
-                            let batch_fields = routed_batch
-                                .schema()
-                                .fields()
-                                .iter()
-                                .enumerate()
-                                .map(|(idx, field)| {
-                                    let slot_id = field_slot_id(field.as_ref())
-                                        .ok()
-                                        .flatten()
-                                        .map(|slot| slot.to_string())
-                                        .unwrap_or_else(|| "none".to_string());
-                                    format!("{idx}:{}(slot={slot_id})", field.name())
-                                })
-                                .collect::<Vec<_>>();
-                            info!(
-                                target: "novarocks::sink",
-                                table_id = self.plan.table_id,
-                                tablet_id = target.tablet_id,
-                                error = %err,
-                                original_columns = routed_batch.num_columns(),
-                                batch_fields = ?batch_fields,
-                                "OLAP_TABLE_SINK skip write-slot alignment for non-primary key batch because alignment failed"
-                            );
-                            routed_batch
+                        if buffer.should_flush_memtable(write_buffer_size)
+                            && let Some(memtable_batch) = buffer.take_memtable_batch()?
+                        {
+                            self.append_tablet_rowset(
+                                tablet_id,
+                                buffer.partition_id,
+                                &buffer.context,
+                                &memtable_batch,
+                            )?;
                         }
-                        Err(err) => return Err(err),
-                    };
-                    if !buffered_by_tablet.contains_key(&tablet_id) {
-                        buffered_by_tablet.insert(
-                            tablet_id,
-                            TabletBufferedState::new(target.partition_id, target.context.clone()),
-                        );
-                    }
-                    let buffer = buffered_by_tablet.get_mut(&tablet_id).ok_or_else(|| {
-                        format!(
-                            "OLAP_TABLE_SINK tablet buffer missing after insert: tablet_id={}",
-                            tablet_id
-                        )
-                    })?;
-                    if buffer.partition_id != target.partition_id {
-                        return Err(format!(
-                            "OLAP_TABLE_SINK buffered partition mismatch for tablet {}: buffered_partition_id={} target_partition_id={}",
-                            tablet_id, buffer.partition_id, target.partition_id
-                        ));
-                    }
-                    buffer.push_request_batch(routed_batch);
-                    if buffer
-                        .should_seal_request_batch(request_rows_threshold, request_bytes_threshold)
-                        && let Some(request_batch) = buffer.take_request_batch()?
-                    {
-                        buffer.push_memtable_batch(request_batch);
-                    }
-                    if buffer.should_flush_memtable(write_buffer_size)
-                        && let Some(memtable_batch) = buffer.take_memtable_batch()?
-                    {
-                        self.append_tablet_rowset(
-                            tablet_id,
-                            buffer.partition_id,
-                            &buffer.context,
-                            &memtable_batch,
-                        )?;
                     }
                 }
+                self.next_random_hash = first_plan_next_random_hash;
             }
             for (tablet_id, buffer) in &mut buffered_by_tablet {
                 if let Some(request_batch) = buffer.take_request_batch()? {
@@ -1244,23 +1373,101 @@ impl ProcessorOperator for OlapTableSinkOperator {
 fn collect_partition_values_from_chunk(
     chunk: &Chunk,
     slot_ids: &[SlotId],
+    column_names: &[String],
 ) -> Result<BTreeSet<Vec<String>>, String> {
     if slot_ids.is_empty() {
         return Ok(BTreeSet::new());
     }
+    if slot_ids.len() != column_names.len() {
+        return Err(format!(
+            "OLAP_TABLE_SINK partition slot/name count mismatch: slot_ids={} column_names={}",
+            slot_ids.len(),
+            column_names.len()
+        ));
+    }
+
+    let mut slot_to_index = HashMap::<SlotId, usize>::new();
+    let mut name_to_index = HashMap::<String, usize>::new();
+    for (idx, field) in chunk.batch.schema().fields().iter().enumerate() {
+        if let Some(slot_id) = field_slot_id(field.as_ref())? {
+            slot_to_index.entry(slot_id).or_insert(idx);
+        }
+        let normalized_name = field.name().trim().to_ascii_lowercase();
+        if !normalized_name.is_empty() {
+            name_to_index.entry(normalized_name).or_insert(idx);
+        }
+    }
+
     let mut arrays = Vec::<ArrayRef>::with_capacity(slot_ids.len());
-    for slot_id in slot_ids {
-        arrays.push(chunk.column_by_slot_id(*slot_id).map_err(|e| {
-            format!(
-                "OLAP_TABLE_SINK partition slot {} is not available in chunk: {}",
-                slot_id, e
-            )
-        })?);
+    for (slot_id, column_name) in slot_ids.iter().zip(column_names.iter()) {
+        let normalized_name = column_name.trim().to_ascii_lowercase();
+        let by_slot = slot_to_index.get(slot_id).copied();
+        let by_name = name_to_index.get(&normalized_name).copied();
+        let selected_idx = match (by_slot, by_name) {
+            (Some(slot_idx), Some(name_idx)) => {
+                if slot_idx == name_idx {
+                    slot_idx
+                } else {
+                    name_idx
+                }
+            }
+            (Some(slot_idx), None) => slot_idx,
+            (None, Some(name_idx)) => name_idx,
+            (None, None) => {
+                return Err(format!(
+                    "OLAP_TABLE_SINK partition column '{}' is not available in chunk by slot_id={} or field name",
+                    column_name, slot_id
+                ));
+            }
+        };
+        arrays.push(
+            chunk
+                .batch
+                .columns()
+                .get(selected_idx)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "OLAP_TABLE_SINK partition column '{}' resolved invalid column index {}",
+                        column_name, selected_idx
+                    )
+                })?,
+        );
     }
     let mut out = BTreeSet::<Vec<String>>::new();
     for row in 0..chunk.len() {
         let mut values = Vec::with_capacity(arrays.len());
         for array in &arrays {
+            if array.is_null(row) {
+                values.push(STARROCKS_DEFAULT_PARTITION_VALUE.to_string());
+            } else {
+                values.push(partition_scalar_value_to_string(array.as_ref(), row)?);
+            }
+        }
+        out.insert(values);
+    }
+    Ok(out)
+}
+
+fn collect_partition_values_from_arrays(
+    arrays: &[ArrayRef],
+    row_count: usize,
+) -> Result<BTreeSet<Vec<String>>, String> {
+    if arrays.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    if arrays.iter().any(|array| array.len() < row_count) {
+        return Err(format!(
+            "OLAP_TABLE_SINK partition arrays are shorter than row_count: row_count={} min_array_len={}",
+            row_count,
+            arrays.iter().map(|array| array.len()).min().unwrap_or(0)
+        ));
+    }
+
+    let mut out = BTreeSet::<Vec<String>>::new();
+    for row in 0..row_count {
+        let mut values = Vec::with_capacity(arrays.len());
+        for array in arrays {
             if array.is_null(row) {
                 values.push(STARROCKS_DEFAULT_PARTITION_VALUE.to_string());
             } else {
@@ -1279,14 +1486,14 @@ fn partition_scalar_value_to_string(array: &dyn Array, row: usize) -> Result<Str
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| "downcast StringArray failed".to_string())?;
-            Ok(typed.value(row).to_string())
+            Ok(normalize_text_partition_value(typed.value(row)))
         }
         DataType::LargeUtf8 => {
             let typed = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| "downcast LargeStringArray failed".to_string())?;
-            Ok(typed.value(row).to_string())
+            Ok(normalize_text_partition_value(typed.value(row)))
         }
         DataType::Int8 => {
             let typed = array
@@ -1418,11 +1625,48 @@ fn format_timestamp_micros_for_partition_value(micros_since_epoch: i64) -> Resul
     if micros == 0 {
         return Ok(base);
     }
-    let mut frac = format!("{micros:06}");
-    while frac.ends_with('0') {
-        frac.pop();
+    // Keep fixed-width micros to avoid FE datetime format probe failures
+    // on values with short fractions (for example `...13.44`).
+    Ok(format!("{base}.{micros:06}"))
+}
+
+fn normalize_text_partition_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return value.to_string();
     }
-    Ok(format!("{base}.{frac}"))
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return format_naive_datetime_partition_value(dt.naive_utc());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return date.format("%Y-%m-%d").to_string();
+    }
+    value.to_string()
+}
+
+fn format_naive_datetime_partition_value(dt: NaiveDateTime) -> String {
+    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    let micros = dt.and_utc().timestamp_subsec_micros();
+    if micros == 0 {
+        base
+    } else {
+        // Keep a fixed-width fractional part to avoid FE datetime format probe failures
+        // on strings like `...13.44`.
+        format!("{base}.{micros:06}")
+    }
 }
 
 fn format_decimal_for_partition_value(value: i128, scale: i8) -> Result<String, String> {
@@ -1575,7 +1819,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int8Array, Int32Array, Int64Array};
+    use arrow::array::{
+        ArrayRef, Int8Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use tempfile::tempdir;
@@ -1835,6 +2081,7 @@ mod tests {
             row_routing,
             schema_slot_bindings: Vec::new(),
             op_slot_id: None,
+            index_write_plans: Vec::new(),
             output_projection: None,
             auto_partition: None,
         })
@@ -1926,6 +2173,7 @@ mod tests {
             row_routing,
             schema_slot_bindings: Vec::new(),
             op_slot_id: None,
+            index_write_plans: Vec::new(),
             output_projection: None,
             auto_partition: None,
         })
@@ -2364,5 +2612,77 @@ mod tests {
             .expect("c1 int64");
         assert_eq!(c0.value(0), 1);
         assert_eq!(c1.value(0), 1);
+    }
+
+    #[test]
+    fn partition_scalar_value_normalizes_utf8_datetime_fraction() {
+        let values = StringArray::from(vec![
+            "2024-08-30 19:02:13.44",
+            "2024-08-30 19:02:13",
+            "2024-08-30T19:02:13.44Z",
+            "not-a-datetime",
+        ]);
+
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 0).expect("normalize fraction"),
+            "2024-08-30 19:02:13.440000"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 1).expect("keep full seconds"),
+            "2024-08-30 19:02:13"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 2).expect("normalize rfc3339"),
+            "2024-08-30 19:02:13.440000"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 3).expect("keep plain text"),
+            "not-a-datetime"
+        );
+    }
+
+    #[test]
+    fn partition_scalar_value_formats_timestamp_with_fixed_micros() {
+        let micros =
+            chrono::NaiveDateTime::parse_from_str("2024-08-30 19:02:13.44", "%Y-%m-%d %H:%M:%S%.f")
+                .expect("parse datetime")
+                .and_utc()
+                .timestamp_micros();
+        let values = TimestampMicrosecondArray::from(vec![micros]);
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 0).expect("format timestamp"),
+            "2024-08-30 19:02:13.440000"
+        );
+    }
+
+    #[test]
+    fn collect_partition_values_prefers_column_name_when_slot_binding_mismatches() {
+        let schema = Arc::new(Schema::new(vec![
+            field_with_slot_id(Field::new("ts", DataType::Utf8, true), SlotId::new(9)),
+            field_with_slot_id(
+                Field::new("original_ts", DataType::Utf8, true),
+                SlotId::new(0),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["2024-08-30T19:02:13.44Z"])),
+                Arc::new(StringArray::from(vec!["2024-08-22 23:48:13.44"])),
+            ],
+        )
+        .expect("build partition value batch");
+        let chunk = Chunk::try_new(batch).expect("build chunk");
+
+        let values = super::collect_partition_values_from_chunk(
+            &chunk,
+            &[SlotId::new(0)],
+            &[String::from("ts")],
+        )
+        .expect("collect partition values");
+        assert_eq!(
+            values.into_iter().collect::<Vec<_>>(),
+            vec![vec!["2024-08-30 19:02:13.440000".to_string()]]
+        );
     }
 }

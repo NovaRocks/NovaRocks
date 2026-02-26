@@ -267,6 +267,7 @@ pub(crate) fn create_lake_tablet_from_req(
 
 fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
     error.contains("bundle metadata missing tablet page for tablet_id=")
+        || error.contains("bundle metadata does not contain tablet page:")
 }
 
 fn build_create_tablet_schema(
@@ -404,6 +405,153 @@ fn build_create_tablet_schema(
         .compression_level
         .or(schema.compression_level)
         .or(Some(-1));
+
+    Ok(TabletSchemaPb {
+        keys_type: Some(keys_type as i32),
+        column: columns,
+        num_short_key_columns: Some(num_short_key_columns),
+        num_rows_per_row_block: None,
+        bf_fpp: schema.bloom_filter_fpp.map(|v| v.0),
+        next_column_unique_id: Some(next_column_unique_id),
+        deprecated_is_in_memory: schema.is_in_memory,
+        deprecated_id: None,
+        compression_type: Some(compression_type),
+        sort_key_idxes,
+        schema_version: schema.schema_version,
+        sort_key_unique_ids,
+        table_indices: Vec::new(),
+        compression_level,
+        id: schema.id,
+    })
+}
+
+pub(crate) fn build_tablet_schema_pb_from_thrift(
+    schema: &crate::agent_service::TTabletSchema,
+) -> Result<TabletSchemaPb, String> {
+    if schema.columns.is_empty() {
+        return Err("schema_change base_tablet_read_schema.columns is empty".to_string());
+    }
+
+    let keys_type = map_create_tablet_keys_type(schema.keys_type)?;
+    let mut columns = Vec::with_capacity(schema.columns.len());
+    let mut max_unique_id = 0_i32;
+    let mut used_unique_ids = HashSet::with_capacity(schema.columns.len());
+    let mut unique_id_to_index = HashMap::with_capacity(schema.columns.len());
+
+    for (idx, col) in schema.columns.iter().enumerate() {
+        let name = col.column_name.trim().to_string();
+        if name.is_empty() {
+            return Err(format!(
+                "schema_change base_tablet_read_schema.columns[{}] has empty column_name",
+                idx
+            ));
+        }
+
+        let mut column_pb = resolve_create_tablet_column_pb(col, idx)?;
+
+        let unique_id = col.col_unique_id.unwrap_or(idx as i32);
+        let effective_unique_id = if unique_id < 0 { idx as i32 } else { unique_id };
+        if used_unique_ids.contains(&effective_unique_id) {
+            return Err(format!(
+                "schema_change base_tablet_read_schema has duplicate col_unique_id={}",
+                effective_unique_id
+            ));
+        }
+        used_unique_ids.insert(effective_unique_id);
+        unique_id_to_index.insert(effective_unique_id, idx);
+        max_unique_id = max_unique_id.max(effective_unique_id);
+
+        let is_key = col.is_key.unwrap_or(false);
+        let aggregation =
+            map_aggregation_type_to_schema_string(col.aggregation_type, is_key, keys_type, idx)?;
+        if let Some(index_len) = col.index_len {
+            column_pb.index_length = Some(index_len);
+        }
+        normalize_column_pb_type_attrs(&mut column_pb);
+        if column_pb.r#type == "VARCHAR" && column_pb.index_length.is_none() {
+            column_pb.index_length = Some(10);
+        }
+
+        column_pb.unique_id = effective_unique_id;
+        column_pb.name = Some(name);
+        column_pb.is_key = Some(is_key);
+        column_pb.aggregation = aggregation;
+        column_pb.is_nullable = Some(col.is_allow_null.unwrap_or(false));
+        column_pb.default_value = col.default_value.as_ref().map(|v| v.as_bytes().to_vec());
+        column_pb.is_bf_column = col.is_bloom_filter_column;
+        column_pb.has_bitmap_index = col.has_bitmap_index;
+        column_pb.is_auto_increment = Some(col.is_auto_increment.unwrap_or(false));
+
+        columns.push(column_pb);
+    }
+
+    let num_short_key_columns = i32::from(schema.short_key_column_count);
+    if num_short_key_columns < 0 {
+        return Err(format!(
+            "schema_change base_tablet_read_schema.short_key_column_count is negative: {}",
+            num_short_key_columns
+        ));
+    }
+    if num_short_key_columns as usize > columns.len() {
+        return Err(format!(
+            "schema_change base_tablet_read_schema short_key_column_count exceeds column count: short_key_column_count={} columns={}",
+            num_short_key_columns,
+            columns.len()
+        ));
+    }
+
+    let mut sort_key_idxes = Vec::new();
+    if let Some(raw_sort_key_idxes) = schema.sort_key_idxes.as_ref() {
+        sort_key_idxes.reserve(raw_sort_key_idxes.len());
+        for (idx, value) in raw_sort_key_idxes.iter().enumerate() {
+            if *value < 0 || (*value as usize) >= columns.len() {
+                return Err(format!(
+                    "schema_change base_tablet_read_schema.sort_key_idxes[{}] is out of range: {}",
+                    idx, value
+                ));
+            }
+            sort_key_idxes.push(*value as u32);
+        }
+    }
+
+    let mut sort_key_unique_ids = Vec::new();
+    if let Some(raw_sort_key_unique_ids) = schema.sort_key_unique_ids.as_ref() {
+        sort_key_unique_ids.reserve(raw_sort_key_unique_ids.len());
+        for (idx, unique_id) in raw_sort_key_unique_ids.iter().enumerate() {
+            if *unique_id < 0 {
+                return Err(format!(
+                    "schema_change base_tablet_read_schema.sort_key_unique_ids[{}] is negative: {}",
+                    idx, unique_id
+                ));
+            }
+            if !unique_id_to_index.contains_key(unique_id) {
+                return Err(format!(
+                    "schema_change base_tablet_read_schema.sort_key_unique_ids[{}]={} not found in columns",
+                    idx, unique_id
+                ));
+            }
+            sort_key_unique_ids.push(*unique_id as u32);
+        }
+    }
+
+    if sort_key_idxes.is_empty() && sort_key_unique_ids.is_empty() {
+        for (idx, col) in columns.iter().enumerate() {
+            if col.is_key == Some(true) {
+                sort_key_idxes.push(idx as u32);
+                sort_key_unique_ids.push(col.unique_id as u32);
+            }
+        }
+    }
+
+    let fallback_next_unique_id = columns.len() as u32;
+    let next_column_unique_id = max_unique_id
+        .saturating_add(1)
+        .max(fallback_next_unique_id as i32) as u32;
+    let compression = schema
+        .compression_type
+        .unwrap_or(crate::types::TCompressionType::LZ4_FRAME);
+    let compression_type = map_create_tablet_compression_type(compression)? as i32;
+    let compression_level = schema.compression_level.or(Some(-1));
 
     Ok(TabletSchemaPb {
         keys_type: Some(keys_type as i32),
@@ -928,7 +1076,7 @@ fn map_primitive_to_starrocks_type(
 
 #[cfg(test)]
 mod tests {
-    use super::map_primitive_to_starrocks_type;
+    use super::{is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type};
 
     #[test]
     fn create_tablet_map_supports_largeint() {
@@ -968,5 +1116,15 @@ mod tests {
             map_primitive_to_starrocks_type(crate::types::TPrimitiveType::DECIMAL256),
             Some("DECIMAL256")
         );
+    }
+
+    #[test]
+    fn create_tablet_missing_tablet_page_error_matches_both_forms() {
+        assert!(is_missing_tablet_page_in_bundle_error(
+            "bundle metadata missing tablet page for tablet_id=123"
+        ));
+        assert!(is_missing_tablet_page_in_bundle_error(
+            "bundle metadata does not contain tablet page: tablet_id=123, path=s3://bucket/meta"
+        ));
     }
 }

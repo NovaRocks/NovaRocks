@@ -33,8 +33,9 @@ use crate::connector::starrocks::fe_v2_meta::LakeTabletPartitionRef;
 use crate::connector::starrocks::sink::partition_key::{
     PartitionKeySource, PartitionKeyValue, PartitionMode, PartitionRoutingEntry,
     build_partition_key_arrays, build_partition_key_source, build_row_partition_key,
-    compare_partition_key_vectors, parse_partition_boundary_key, parse_partition_in_keys,
-    partition_key_source_len, resolve_slot_ids_by_names, validate_partition_key_length,
+    build_slot_name_map, compare_partition_key_vectors, parse_partition_boundary_key,
+    parse_partition_in_keys, partition_key_source_len, resolve_slot_ids_by_names,
+    validate_partition_key_length,
 };
 use crate::exec::chunk::Chunk;
 use crate::{data_sinks, descriptors, exprs, types};
@@ -62,6 +63,43 @@ pub(crate) struct SinkRouting {
 pub(crate) fn build_sink_routing(
     sink: &data_sinks::TOlapTableSink,
     schema_id: i64,
+    output_exprs: Option<&[exprs::TExpr]>,
+) -> Result<SinkRouting, String> {
+    let candidate_index_ids = sink
+        .schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
+        .map(|idx| idx.id)
+        .collect::<HashSet<_>>();
+    if candidate_index_ids.is_empty() {
+        return Err(format!(
+            "OLAP_TABLE_SINK cannot resolve routing index for schema_id={schema_id}"
+        ));
+    }
+    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs)
+}
+
+pub(crate) fn build_sink_routing_for_index_id(
+    sink: &data_sinks::TOlapTableSink,
+    index_id: i64,
+    schema_id: i64,
+    output_exprs: Option<&[exprs::TExpr]>,
+) -> Result<SinkRouting, String> {
+    if index_id <= 0 {
+        return Err(format!(
+            "OLAP_TABLE_SINK cannot build routing for non-positive index_id={index_id}"
+        ));
+    }
+    let mut candidate_index_ids = HashSet::new();
+    candidate_index_ids.insert(index_id);
+    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs)
+}
+
+fn build_sink_routing_with_candidates(
+    sink: &data_sinks::TOlapTableSink,
+    schema_id: i64,
+    candidate_index_ids: HashSet<i64>,
     output_exprs: Option<&[exprs::TExpr]>,
 ) -> Result<SinkRouting, String> {
     let table_name = sink
@@ -111,7 +149,7 @@ pub(crate) fn build_sink_routing(
     }
 
     let partition_map = collect_tablet_partition_map(&sink.partition, &sink.location)?;
-    let row_routing = build_row_routing_plan(sink, schema_id, output_exprs)?;
+    let row_routing = build_row_routing_plan(sink, schema_id, &candidate_index_ids, output_exprs)?;
 
     let mut commit_infos = Vec::with_capacity(row_routing.tablet_ids.len());
     let mut refs = Vec::with_capacity(row_routing.tablet_ids.len());
@@ -151,6 +189,7 @@ pub(crate) fn build_sink_routing(
 fn build_row_routing_plan(
     sink: &data_sinks::TOlapTableSink,
     schema_id: i64,
+    candidate_index_ids: &HashSet<i64>,
     output_exprs: Option<&[exprs::TExpr]>,
 ) -> Result<RowRoutingPlan, String> {
     let visible_partitions = sink
@@ -160,13 +199,6 @@ fn build_row_routing_plan(
         .filter(|part| !part.is_shadow_partition.unwrap_or(false))
         .collect::<Vec<_>>();
 
-    let candidate_index_ids = sink
-        .schema
-        .indexes
-        .iter()
-        .filter(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
-        .map(|idx| idx.id)
-        .collect::<HashSet<_>>();
     if candidate_index_ids.is_empty() {
         return Err(format!(
             "OLAP_TABLE_SINK cannot resolve routing index for schema_id={schema_id}"
@@ -179,13 +211,21 @@ fn build_row_routing_plan(
     } else {
         Some(&output_expr_slot_name_map)
     };
+    let output_expr_slot_id_overrides =
+        build_output_expr_slot_id_overrides(&sink.schema.slot_descs, slot_name_overrides)?;
+    let slot_id_overrides = if output_expr_slot_id_overrides.is_empty() {
+        None
+    } else {
+        Some(&output_expr_slot_id_overrides)
+    };
     let distributed_slot_ids = resolve_distributed_slot_ids(sink, slot_name_overrides)?;
     if visible_partitions.is_empty() {
         return build_location_only_row_routing(sink, distributed_slot_ids);
     }
     let routing_partitions = visible_partitions;
 
-    let mut partition_key_source = build_partition_key_source(sink, slot_name_overrides)?;
+    let mut partition_key_source =
+        build_partition_key_source(sink, slot_name_overrides, slot_id_overrides)?;
     let mut partition_key_len = partition_key_source_len(&partition_key_source);
 
     let has_any_in_keys = routing_partitions
@@ -529,6 +569,30 @@ fn build_output_expr_slot_name_map(
         slot_map.insert(column_name.clone(), slot_id);
     }
     Ok(slot_map)
+}
+
+fn build_output_expr_slot_id_overrides(
+    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_name_overrides: Option<&HashMap<String, SlotId>>,
+) -> Result<HashMap<SlotId, SlotId>, String> {
+    let Some(slot_name_overrides) = slot_name_overrides else {
+        return Ok(HashMap::new());
+    };
+    if slot_name_overrides.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let schema_slot_by_name = build_slot_name_map(slot_descs)?;
+    let mut slot_id_overrides = HashMap::new();
+    for (column_name, schema_slot_id) in schema_slot_by_name {
+        let Some(output_slot_id) = slot_name_overrides.get(&column_name).copied() else {
+            continue;
+        };
+        if output_slot_id != schema_slot_id {
+            slot_id_overrides.insert(schema_slot_id, output_slot_id);
+        }
+    }
+    Ok(slot_id_overrides)
 }
 
 pub(crate) fn route_chunk_rows(
@@ -1051,6 +1115,14 @@ mod tests {
         Chunk::try_new(batch).expect("build chunk")
     }
 
+    fn build_test_chunk_with_slot(slot_id: SlotId, values: Vec<i64>) -> Chunk {
+        let field = field_with_slot_id(Field::new("k", DataType::Int64, false), slot_id);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
+            .expect("build test batch");
+        Chunk::try_new(batch).expect("build chunk")
+    }
+
     fn create_dummy_type() -> types::TTypeDesc {
         types::TTypeDesc {
             types: Some(vec![types::TTypeNode {
@@ -1357,6 +1429,28 @@ mod tests {
                 std::mem::discriminant(other)
             ),
         }
+    }
+
+    #[test]
+    fn partition_expr_slot_refs_follow_output_expr_slot_ids() {
+        let partition = build_range_partition(11, None, 100, vec![1001, 1002]);
+        let mut sink = build_test_sink(vec![partition], None);
+        sink.schema.slot_descs = vec![slot_desc(0, Some("k"))];
+        sink.partition.partition_exprs = Some(vec![slot_ref_expr(0)]);
+
+        let output_exprs = vec![slot_ref_expr(7)];
+        let routing = build_sink_routing(&sink, 10, Some(&output_exprs))
+            .expect("build routing with remapped partition expr slot ids");
+        assert_eq!(
+            routing.row_routing.distributed_slot_ids,
+            vec![SlotId::new(7)]
+        );
+
+        let chunk = build_test_chunk_with_slot(SlotId::new(7), vec![42]);
+        let grouped = route_rows(&routing.row_routing, &chunk)
+            .expect("route rows with remapped partition expr slot ids");
+        let row_to_tablet = map_rows_to_tablets(&grouped, &routing.row_routing.tablet_ids);
+        assert_eq!(row_to_tablet.len(), 1);
     }
 
     #[test]

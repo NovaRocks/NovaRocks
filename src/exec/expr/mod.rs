@@ -27,6 +27,7 @@ mod in_pred;
 mod literal;
 mod slot;
 mod struct_expr;
+pub(crate) use cast::cast_with_special_rules;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;

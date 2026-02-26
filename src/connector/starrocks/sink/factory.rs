@@ -40,7 +40,7 @@ use thrift::transport::{
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
-    LakeTableIdentity, resolve_tablet_paths_for_olap_sink,
+    LakeTableIdentity, LakeTabletPartitionRef, resolve_tablet_paths_for_olap_sink,
 };
 use crate::connector::starrocks::lake::context::{
     AutoIncrementWritePolicy, PartialUpdateWriteMode, PartialUpdateWritePolicy, get_tablet_runtime,
@@ -50,9 +50,9 @@ use crate::connector::starrocks::sink::operator::{
     OlapSinkFinalizeSharedState, OlapTableSinkOperator,
 };
 use crate::connector::starrocks::sink::partition_key::{
-    build_slot_name_map, resolve_slot_ids_by_names,
+    PartitionKeySource, build_partition_key_source, build_slot_name_map, resolve_slot_ids_by_names,
 };
-use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing};
+use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing_for_index_id};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::{ExecNodeKind, ExecPlan};
 use crate::exec::pipeline::operator::Operator;
@@ -96,8 +96,25 @@ pub(crate) struct OlapTableSinkPlan {
     pub(crate) row_routing: RowRoutingPlan,
     pub(crate) schema_slot_bindings: Vec<Option<SlotId>>,
     pub(crate) op_slot_id: Option<SlotId>,
+    pub(crate) index_write_plans: Vec<SinkIndexWritePlan>,
     pub(crate) output_projection: Option<SinkOutputProjectionPlan>,
     pub(crate) auto_partition: Option<AutomaticPartitionPlan>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SinkIndexWritePlan {
+    pub(crate) index_id: i64,
+    pub(crate) schema_id: i64,
+    pub(crate) row_routing: RowRoutingPlan,
+    pub(crate) write_targets: HashMap<i64, TabletWriteTarget>,
+    pub(crate) schema_slot_bindings: Vec<Option<SlotId>>,
+    pub(crate) op_slot_id: Option<SlotId>,
+}
+
+#[derive(Clone, Copy)]
+struct SinkWriteIndexSelection {
+    index_id: i64,
+    schema_id: i64,
 }
 
 #[derive(Clone)]
@@ -122,6 +139,7 @@ pub(crate) struct AutomaticPartitionPlan {
     pub(crate) schema_id: i64,
     pub(crate) txn_id: i64,
     pub(crate) fe_addr: types::TNetworkAddress,
+    pub(crate) partition_key_source: PartitionKeySource,
     pub(crate) partition_column_names: Vec<String>,
     pub(crate) partition_slot_ids: Vec<SlotId>,
     pub(crate) candidate_index_ids: HashSet<i64>,
@@ -144,8 +162,12 @@ impl OlapTableSinkFactory {
             );
         }
         let keys_type = map_sink_keys_type(sink.keys_type)?;
-
-        let schema_id = resolve_schema_id(&sink.schema)?;
+        let write_indexes = resolve_sink_write_index_selections(&sink)?;
+        let primary_write_index = write_indexes.first().ok_or_else(|| {
+            "OLAP_TABLE_SINK cannot resolve any write index from sink schema/partition metadata"
+                .to_string()
+        })?;
+        let schema_id = primary_write_index.schema_id;
         maybe_create_automatic_partitions_for_literal_insert(
             &mut sink,
             schema_id,
@@ -163,30 +185,67 @@ impl OlapTableSinkFactory {
         } else {
             output_exprs
         };
-        let routing = build_sink_routing(&sink, schema_id, routing_exprs)?;
-        if routing.commit_infos.is_empty() {
-            return Err("OLAP_TABLE_SINK resolved empty tablet commit infos".to_string());
-        }
-        if sink.keys_type == Some(types::TKeysType::PRIMARY_KEYS) {
-            info!(
-                target: "novarocks::sink",
-                table_id = sink.table_id,
-                schema_id,
-                distributed_slot_ids = ?routing.row_routing.distributed_slot_ids,
-                partition_key_len = routing.row_routing.partition_key_len,
-                tablet_count = routing.row_routing.tablet_ids.len(),
-                "OLAP_TABLE_SINK built row routing for primary key table"
+        if sink.partition.enable_automatic_partition.unwrap_or(false) && write_indexes.len() > 1 {
+            return Err(
+                "OLAP_TABLE_SINK automatic partition with multi-index sink is not supported yet"
+                    .to_string(),
             );
         }
-        let table_identity = build_lake_table_identity(&sink)?;
+        let table_identity = build_lake_table_identity_with_schema_id(&sink, schema_id)?;
         let auto_partition = build_auto_partition_plan(&sink, schema_id, routing_exprs, fe_addr)?;
         let write_format = load_lake_data_write_format()?;
+
+        let mut index_routings = Vec::with_capacity(write_indexes.len());
+        let mut all_refs = Vec::new();
+        let mut all_tablets = BTreeSet::new();
+        let mut tablet_commit_infos = Vec::new();
+        let mut commit_info_keys = HashSet::<(i64, i64)>::new();
+        for index in &write_indexes {
+            let routing = build_sink_routing_for_index_id(
+                &sink,
+                index.index_id,
+                index.schema_id,
+                routing_exprs,
+            )?;
+            if routing.commit_infos.is_empty() {
+                return Err(format!(
+                    "OLAP_TABLE_SINK resolved empty tablet commit infos for index_id={} schema_id={}",
+                    index.index_id, index.schema_id
+                ));
+            }
+            if sink.keys_type == Some(types::TKeysType::PRIMARY_KEYS) {
+                info!(
+                    target: "novarocks::sink",
+                    table_id = sink.table_id,
+                    schema_id = index.schema_id,
+                    index_id = index.index_id,
+                    distributed_slot_ids = ?routing.row_routing.distributed_slot_ids,
+                    partition_key_len = routing.row_routing.partition_key_len,
+                    tablet_count = routing.row_routing.tablet_ids.len(),
+                    "OLAP_TABLE_SINK built row routing for primary key table"
+                );
+            }
+            for tablet_id in &routing.row_routing.tablet_ids {
+                all_tablets.insert(*tablet_id);
+                all_refs.push(LakeTabletPartitionRef {
+                    tablet_id: *tablet_id,
+                });
+            }
+            for commit in &routing.commit_infos {
+                if commit_info_keys.insert((commit.tablet_id, commit.backend_id)) {
+                    tablet_commit_infos.push(commit.clone());
+                }
+            }
+            index_routings.push((*index, routing));
+        }
+        if all_refs.is_empty() {
+            return Err("OLAP_TABLE_SINK resolved empty tablet refs for write targets".to_string());
+        }
         let path_map =
-            resolve_tablet_paths_for_olap_sink(None, fe_addr, &table_identity, &routing.refs)?;
-        let shard_infos = starlet_shard_registry::select_infos(&routing.row_routing.tablet_ids);
-        let tablet_schema = build_sink_tablet_schema(&sink.schema, schema_id, keys_type)?;
-        let (schema_slot_bindings, op_slot_id) =
-            resolve_write_slot_bindings(&sink, schema_id, routing_exprs, &tablet_schema)?;
+            resolve_tablet_paths_for_olap_sink(None, fe_addr, &table_identity, &all_refs)?;
+        let shard_infos =
+            starlet_shard_registry::select_infos(&all_tablets.into_iter().collect::<Vec<_>>());
+
         let partial_mode = PartialUpdateWriteMode::from_thrift(sink.partial_update_mode);
         let merge_condition = sink
             .merge_condition
@@ -194,82 +253,103 @@ impl OlapTableSinkFactory {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToString::to_string);
-        let column_to_expr_value = resolve_column_to_expr_value_for_write(&sink, schema_id)?;
-        let auto_increment = resolve_auto_increment_write_policy(&sink, &tablet_schema, fe_addr)?;
+        let mut index_write_plans = Vec::with_capacity(index_routings.len());
+        for (index, routing) in index_routings {
+            let tablet_schema = build_sink_tablet_schema(&sink.schema, index.schema_id, keys_type)?;
+            let (schema_slot_bindings, op_slot_id) =
+                resolve_write_slot_bindings(&sink, index.schema_id, routing_exprs, &tablet_schema)?;
+            let column_to_expr_value =
+                resolve_column_to_expr_value_for_write(&sink, index.schema_id)?;
+            let auto_increment =
+                resolve_auto_increment_write_policy(&sink, &tablet_schema, fe_addr)?;
 
-        let mut write_targets = HashMap::with_capacity(routing.row_routing.tablet_ids.len());
-        for tablet_id in &routing.row_routing.tablet_ids {
-            let tablet_root_path = path_map.get(tablet_id).ok_or_else(|| {
-                format!(
-                    "OLAP_TABLE_SINK missing resolved storage path for tablet {}",
-                    tablet_id
-                )
-            })?;
-            let target = TabletWriteTarget {
-                tablet_id: *tablet_id,
-                partition_id: *routing.tablet_to_partition.get(tablet_id).ok_or_else(|| {
+            let mut write_targets = HashMap::with_capacity(routing.row_routing.tablet_ids.len());
+            for tablet_id in &routing.row_routing.tablet_ids {
+                let tablet_root_path = path_map.get(tablet_id).ok_or_else(|| {
                     format!(
-                        "OLAP_TABLE_SINK missing partition mapping for tablet {}",
+                        "OLAP_TABLE_SINK missing resolved storage path for tablet {}",
                         tablet_id
                     )
-                })?,
-                context: {
-                    let scheme = classify_scan_paths([tablet_root_path.as_str()])?;
-                    let s3_config = match scheme {
-                        ScanPathScheme::Local => None,
-                        ScanPathScheme::Oss => {
-                            let from_shard =
-                                shard_infos.get(tablet_id).and_then(|info| info.s3.clone());
-                            let from_runtime = if from_shard.is_none() {
-                                get_tablet_runtime(*tablet_id)
-                                    .ok()
-                                    .and_then(|entry| entry.s3_config.clone())
-                            } else {
-                                None
-                            };
-                            let inferred = if from_shard.is_none() && from_runtime.is_none() {
-                                starlet_shard_registry::infer_s3_config_for_path(tablet_root_path)
-                            } else {
-                                None
-                            };
-                            Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
-                                format!(
-                                    "OLAP_TABLE_SINK missing S3 config for object-store tablet {} (path={})",
+                })?;
+                let target = TabletWriteTarget {
+                    tablet_id: *tablet_id,
+                    partition_id: *routing.tablet_to_partition.get(tablet_id).ok_or_else(|| {
+                        format!(
+                            "OLAP_TABLE_SINK missing partition mapping for tablet {}",
+                            tablet_id
+                        )
+                    })?,
+                    context: {
+                        let scheme = classify_scan_paths([tablet_root_path.as_str()])?;
+                        let s3_config = match scheme {
+                            ScanPathScheme::Local => None,
+                            ScanPathScheme::Oss => {
+                                let from_shard =
+                                    shard_infos.get(tablet_id).and_then(|info| info.s3.clone());
+                                let from_runtime = if from_shard.is_none() {
+                                    get_tablet_runtime(*tablet_id)
+                                        .ok()
+                                        .and_then(|entry| entry.s3_config.clone())
+                                } else {
+                                    None
+                                };
+                                let inferred = if from_shard.is_none() && from_runtime.is_none() {
+                                    starlet_shard_registry::infer_s3_config_for_path(
+                                        tablet_root_path,
+                                    )
+                                } else {
+                                    None
+                                };
+                                Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
+                                    format!(
+                                        "OLAP_TABLE_SINK missing S3 config for object-store tablet {} (path={})",
+                                        tablet_id, tablet_root_path
+                                    )
+                                })?)
+                            }
+                            ScanPathScheme::Hdfs => {
+                                return Err(format!(
+                                    "OLAP_TABLE_SINK does not support hdfs tablet path yet: tablet_id={} path={}",
                                     tablet_id, tablet_root_path
-                                )
-                            })?)
+                                ));
+                            }
+                        };
+                        TabletWriteContext {
+                            db_id: sink.db_id,
+                            table_id: sink.table_id,
+                            tablet_id: *tablet_id,
+                            tablet_root_path: tablet_root_path.clone(),
+                            tablet_schema: tablet_schema.clone(),
+                            s3_config,
+                            partial_update: PartialUpdateWritePolicy {
+                                mode: partial_mode.clone(),
+                                merge_condition: merge_condition.clone(),
+                                column_to_expr_value: column_to_expr_value.clone(),
+                                schema_slot_bindings: schema_slot_bindings.clone(),
+                                auto_increment: auto_increment.clone(),
+                            },
                         }
-                        ScanPathScheme::Hdfs => {
-                            return Err(format!(
-                                "OLAP_TABLE_SINK does not support hdfs tablet path yet: tablet_id={} path={}",
-                                tablet_id, tablet_root_path
-                            ));
-                        }
-                    };
-                    TabletWriteContext {
-                        db_id: sink.db_id,
-                        table_id: sink.table_id,
-                        tablet_id: *tablet_id,
-                        tablet_root_path: tablet_root_path.clone(),
-                        tablet_schema: tablet_schema.clone(),
-                        s3_config,
-                        partial_update: PartialUpdateWritePolicy {
-                            mode: partial_mode.clone(),
-                            merge_condition: merge_condition.clone(),
-                            column_to_expr_value: column_to_expr_value.clone(),
-                            schema_slot_bindings: schema_slot_bindings.clone(),
-                            auto_increment: auto_increment.clone(),
-                        },
-                    }
-                },
-            };
-            if write_targets.insert(*tablet_id, target).is_some() {
-                return Err(format!(
-                    "duplicate write target resolved for tablet {}",
-                    tablet_id
-                ));
+                    },
+                };
+                if write_targets.insert(*tablet_id, target).is_some() {
+                    return Err(format!(
+                        "duplicate write target resolved for tablet {} in index_id={}",
+                        tablet_id, index.index_id
+                    ));
+                }
             }
+            index_write_plans.push(SinkIndexWritePlan {
+                index_id: index.index_id,
+                schema_id: index.schema_id,
+                row_routing: routing.row_routing,
+                write_targets,
+                schema_slot_bindings,
+                op_slot_id,
+            });
         }
+        let primary_plan = index_write_plans.first().cloned().ok_or_else(|| {
+            "OLAP_TABLE_SINK resolved empty index write plans after routing".to_string()
+        })?;
 
         let plan = OlapTableSinkPlan {
             db_id: sink.db_id,
@@ -283,11 +363,12 @@ impl OlapTableSinkFactory {
                 lo: sink.load_id.lo,
             },
             write_format,
-            tablet_commit_infos: routing.commit_infos,
-            write_targets,
-            row_routing: routing.row_routing,
-            schema_slot_bindings,
-            op_slot_id,
+            tablet_commit_infos,
+            write_targets: primary_plan.write_targets.clone(),
+            row_routing: primary_plan.row_routing.clone(),
+            schema_slot_bindings: primary_plan.schema_slot_bindings.clone(),
+            op_slot_id: primary_plan.op_slot_id,
+            index_write_plans,
             output_projection,
             auto_partition,
         };
@@ -308,6 +389,16 @@ fn maybe_create_automatic_partitions_for_literal_insert(
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<(), String> {
     if !sink.partition.enable_automatic_partition.unwrap_or(false) {
+        return Ok(());
+    }
+    if sink
+        .partition
+        .partition_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+    {
+        // For expression partitions, runtime automatic partition discovery should use
+        // evaluated partition expr outputs from incoming chunks.
         return Ok(());
     }
 
@@ -364,7 +455,8 @@ fn maybe_create_automatic_partitions_for_literal_insert(
         sink.table_id,
         sink.txn_id,
         vec![partition_values],
-    )?;
+    )
+    .map_err(|e| format!("OLAP_TABLE_SINK precreate automatic partition failed: {e}"))?;
     info!(
         target: "novarocks::starrocks::sink",
         table_id = sink.table_id,
@@ -431,14 +523,9 @@ fn build_auto_partition_plan(
     if !has_shadow_partition {
         return Ok(None);
     }
-    let has_visible_partition = sink
-        .partition
-        .partitions
-        .iter()
-        .any(|part| !part.is_shadow_partition.unwrap_or(false));
-    if has_visible_partition {
-        return Ok(None);
-    }
+    // Automatic partition tables may carry both visible and shadow partitions.
+    // Keep runtime createPartition enabled as long as FE marks this table with
+    // shadow partition metadata.
 
     let partition_column_names = resolve_partition_columns_for_write(&sink.partition);
     if partition_column_names.is_empty() {
@@ -451,6 +538,17 @@ fn build_auto_partition_plan(
     } else {
         Some(&output_expr_slot_map)
     };
+    let output_expr_slot_id_overrides = build_output_expr_slot_id_overrides_for_write(
+        &sink.schema.slot_descs,
+        slot_name_overrides,
+    )?;
+    let slot_id_overrides = if output_expr_slot_id_overrides.is_empty() {
+        None
+    } else {
+        Some(&output_expr_slot_id_overrides)
+    };
+    let partition_key_source =
+        build_partition_key_source(sink, slot_name_overrides, slot_id_overrides)?;
     let partition_slot_ids = resolve_slot_ids_by_names(
         &sink.schema.slot_descs,
         &partition_column_names,
@@ -485,6 +583,7 @@ fn build_auto_partition_plan(
         schema_id,
         txn_id: sink.txn_id,
         fe_addr,
+        partition_key_source,
         partition_column_names,
         partition_slot_ids,
         candidate_index_ids,
@@ -1066,6 +1165,30 @@ fn build_output_expr_slot_name_map_for_write(
     Ok(slot_map)
 }
 
+fn build_output_expr_slot_id_overrides_for_write(
+    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_name_overrides: Option<&HashMap<String, SlotId>>,
+) -> Result<HashMap<SlotId, SlotId>, String> {
+    let Some(slot_name_overrides) = slot_name_overrides else {
+        return Ok(HashMap::new());
+    };
+    if slot_name_overrides.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let schema_slot_by_name = build_slot_name_map(slot_descs)?;
+    let mut slot_id_overrides = HashMap::new();
+    for (column_name, schema_slot_id) in schema_slot_by_name {
+        let Some(output_slot_id) = slot_name_overrides.get(&column_name).copied() else {
+            continue;
+        };
+        if output_slot_id != schema_slot_id {
+            slot_id_overrides.insert(schema_slot_id, output_slot_id);
+        }
+    }
+    Ok(slot_id_overrides)
+}
+
 fn resolve_output_expr_slot_ids_for_write(
     output_exprs: Option<&[exprs::TExpr]>,
 ) -> Result<Vec<Option<SlotId>>, String> {
@@ -1101,6 +1224,12 @@ fn build_output_projection_plan(
     let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
         return Ok(None);
     };
+    // Slot-ref-only output exprs do not need an extra projection stage.
+    // Keeping the original upstream slot ids avoids accidental remapping when
+    // FE expr order does not match sink slot descriptor order.
+    if output_exprs_are_plain_slot_refs(output_exprs) {
+        return Ok(None);
+    }
     let layout = layout.ok_or_else(|| {
         "OLAP_TABLE_SINK requires layout for output expression projection".to_string()
     })?;
@@ -1128,10 +1257,23 @@ fn build_output_projection_plan(
     }))
 }
 
+fn output_exprs_are_plain_slot_refs(output_exprs: &[exprs::TExpr]) -> bool {
+    output_exprs.iter().all(|expr| {
+        expr.nodes.len() == 1
+            && expr.nodes.first().is_some_and(|node| {
+                node.node_type == exprs::TExprNodeType::SLOT_REF && node.slot_ref.is_some()
+            })
+    })
+}
+
 fn resolve_output_projection_slots(
     sink: &data_sinks::TOlapTableSink,
     output_exprs: &[exprs::TExpr],
 ) -> Result<Vec<(SlotId, String)>, String> {
+    if let Some(mapped) = resolve_slots_from_expr_output_column(sink, output_exprs)? {
+        return Ok(mapped);
+    }
+
     let collect_named_slots = |skip_load_op: bool| -> Result<Vec<(SlotId, String)>, String> {
         let mut out = Vec::new();
         for (idx, slot_desc) in sink.schema.slot_descs.iter().enumerate() {
@@ -1247,6 +1389,60 @@ fn resolve_output_projection_slots(
     Ok(expr_slots)
 }
 
+fn resolve_slots_from_expr_output_column(
+    sink: &data_sinks::TOlapTableSink,
+    output_exprs: &[exprs::TExpr],
+) -> Result<Option<Vec<(SlotId, String)>>, String> {
+    if output_exprs.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut out = Vec::with_capacity(output_exprs.len());
+    for (expr_idx, expr) in output_exprs.iter().enumerate() {
+        let Some(root) = expr.nodes.first() else {
+            return Ok(None);
+        };
+        let Some(output_column) = root.output_column else {
+            return Ok(None);
+        };
+        if output_column < 0 {
+            return Ok(None);
+        }
+        let output_idx = usize::try_from(output_column).map_err(|_| {
+            format!(
+                "OLAP_TABLE_SINK output_exprs[{}] has invalid output_column={}",
+                expr_idx, output_column
+            )
+        })?;
+        let Some(slot_desc) = sink.schema.slot_descs.get(output_idx) else {
+            return Ok(None);
+        };
+        let Some(slot_id_i32) = slot_desc.id else {
+            return Ok(None);
+        };
+        if slot_id_i32 < 0 {
+            return Ok(None);
+        }
+        let slot_id = SlotId::try_from(slot_id_i32)?;
+        let name = slot_desc
+            .col_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|name| {
+                if name.eq_ignore_ascii_case(LOAD_OP_COLUMN) {
+                    LOAD_OP_COLUMN.to_string()
+                } else {
+                    name.to_string()
+                }
+            })
+            .unwrap_or_else(|| format!("col_{output_idx}"));
+        out.push((slot_id, name));
+    }
+
+    Ok(Some(out))
+}
+
 fn resolve_schema_slot_ids_by_ordinal(
     slot_descs: &[descriptors::TSlotDescriptor],
 ) -> Result<Vec<Option<SlotId>>, String> {
@@ -1298,6 +1494,175 @@ fn resolve_index_column_names_for_write(
     Ok(column_names)
 }
 
+fn resolve_index_column_names(index: &descriptors::TOlapTableIndexSchema) -> Vec<String> {
+    let mut column_names = if let Some(param) = index.column_param.as_ref() {
+        param
+            .columns
+            .iter()
+            .map(|c| c.column_name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if column_names.is_empty() {
+        column_names = index
+            .columns
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+    }
+    column_names
+}
+
+fn resolve_sink_write_index_selections(
+    sink: &data_sinks::TOlapTableSink,
+) -> Result<Vec<SinkWriteIndexSelection>, String> {
+    let mut schema_id_by_index_id = HashMap::<i64, i64>::new();
+    let mut index_by_id = HashMap::<i64, &descriptors::TOlapTableIndexSchema>::new();
+    for index in &sink.schema.indexes {
+        if index.id <= 0 {
+            continue;
+        }
+        let schema_id = index.schema_id.filter(|v| *v > 0).unwrap_or(index.id);
+        if schema_id <= 0 {
+            return Err(format!(
+                "OLAP_TABLE_SINK schema.indexes contains non-positive schema_id/index_id: index_id={} schema_id={}",
+                index.id, schema_id
+            ));
+        }
+        schema_id_by_index_id.insert(index.id, schema_id);
+        index_by_id.insert(index.id, index);
+    }
+    if schema_id_by_index_id.is_empty() {
+        return Err("OLAP_TABLE_SINK schema.indexes has no valid index_id/schema_id".to_string());
+    }
+
+    let mut candidate_index_ids = BTreeSet::<i64>::new();
+    for partition in sink
+        .partition
+        .partitions
+        .iter()
+        .filter(|part| !part.is_shadow_partition.unwrap_or(false))
+    {
+        for index in &partition.indexes {
+            if index.index_id > 0 {
+                candidate_index_ids.insert(index.index_id);
+            }
+        }
+    }
+    if candidate_index_ids.is_empty() {
+        let fallback_schema_id = resolve_schema_id(&sink.schema)?;
+        for index in &sink.schema.indexes {
+            let schema_id = index.schema_id.filter(|v| *v > 0).unwrap_or(index.id);
+            if schema_id == fallback_schema_id && index.id > 0 {
+                candidate_index_ids.insert(index.id);
+            }
+        }
+    }
+    if candidate_index_ids.is_empty() {
+        return Err(
+            "OLAP_TABLE_SINK cannot resolve candidate write index ids from partition/schema metadata"
+                .to_string(),
+        );
+    }
+
+    let slot_names = sink
+        .schema
+        .slot_descs
+        .iter()
+        .filter_map(|slot| {
+            slot.col_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| name.to_ascii_lowercase())
+        })
+        .filter(|name| name != LOAD_OP_COLUMN)
+        .collect::<HashSet<_>>();
+
+    let mut scored = Vec::<(i64, i64, bool, usize, usize)>::new();
+    for index_id in candidate_index_ids {
+        let schema_id = schema_id_by_index_id
+            .get(&index_id)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "OLAP_TABLE_SINK partition index_id={} is absent in schema.indexes",
+                    index_id
+                )
+            })?;
+        let index = index_by_id.get(&index_id).copied().ok_or_else(|| {
+            format!(
+                "OLAP_TABLE_SINK cannot resolve schema index for index_id={}",
+                index_id
+            )
+        })?;
+        let index_columns = resolve_index_column_names(index);
+        let overlap = if slot_names.is_empty() {
+            0
+        } else {
+            index_columns
+                .iter()
+                .filter(|name| slot_names.contains(*name))
+                .count()
+        };
+        scored.push((
+            index_id,
+            schema_id,
+            index.is_shadow.unwrap_or(false),
+            overlap,
+            index_columns.len(),
+        ));
+    }
+    if scored.is_empty() {
+        return Err("OLAP_TABLE_SINK candidate write indexes are empty".to_string());
+    }
+
+    scored.sort_by(|left, right| {
+        let left_shadow = if left.2 { 1 } else { 0 };
+        let right_shadow = if right.2 { 1 } else { 0 };
+        left_shadow
+            .cmp(&right_shadow)
+            .then(right.3.cmp(&left.3))
+            .then(right.4.cmp(&left.4))
+            .then(left.0.cmp(&right.0))
+    });
+    let primary_index_id = scored
+        .first()
+        .map(|item| item.0)
+        .ok_or_else(|| "OLAP_TABLE_SINK cannot select primary write index".to_string())?;
+
+    let mut out = Vec::with_capacity(scored.len());
+    out.push(SinkWriteIndexSelection {
+        index_id: primary_index_id,
+        schema_id: schema_id_by_index_id
+            .get(&primary_index_id)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "OLAP_TABLE_SINK missing schema_id for primary write index_id={}",
+                    primary_index_id
+                )
+            })?,
+    });
+
+    let mut rest = scored
+        .into_iter()
+        .filter(|item| item.0 != primary_index_id)
+        .map(|item| SinkWriteIndexSelection {
+            index_id: item.0,
+            schema_id: item.1,
+        })
+        .collect::<Vec<_>>();
+    rest.sort_by_key(|item| item.index_id);
+    out.extend(rest);
+    Ok(out)
+}
+
 impl OperatorFactory for OlapTableSinkFactory {
     fn name(&self) -> &str {
         &self.name
@@ -1321,6 +1686,14 @@ impl OperatorFactory for OlapTableSinkFactory {
 fn build_lake_table_identity(
     sink: &data_sinks::TOlapTableSink,
 ) -> Result<LakeTableIdentity, String> {
+    let schema_id = resolve_schema_id(&sink.schema)?;
+    build_lake_table_identity_with_schema_id(sink, schema_id)
+}
+
+fn build_lake_table_identity_with_schema_id(
+    sink: &data_sinks::TOlapTableSink,
+    schema_id: i64,
+) -> Result<LakeTableIdentity, String> {
     let db_name = sink
         .db_name
         .as_ref()
@@ -1335,7 +1708,12 @@ fn build_lake_table_identity(
         .filter(|v| !v.is_empty())
         .ok_or_else(|| "OLAP_TABLE_SINK missing table_name".to_string())?
         .to_string();
-    let schema_id = resolve_schema_id(&sink.schema)?;
+    if schema_id <= 0 {
+        return Err(format!(
+            "OLAP_TABLE_SINK has non-positive schema_id for lake table identity: {}",
+            schema_id
+        ));
+    }
     Ok(LakeTableIdentity {
         catalog: load_lake_catalog()?,
         db_name,

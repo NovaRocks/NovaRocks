@@ -527,29 +527,13 @@ public:
             return;
         }
 
-        starrocks::PublishVersionRequest publish_req;
-        for (auto tablet_id : request->tablet_ids()) {
-            publish_req.add_tablet_ids(tablet_id);
-        }
-        publish_req.set_base_version(request->version() - 1);
-        publish_req.set_new_version(request->version());
-        if (request->has_txn_info()) {
-            *publish_req.add_txn_infos() = request->txn_info();
-        } else {
-            publish_req.add_txn_ids(request->txn_id());
-        }
-
-        starrocks::PublishVersionResponse publish_resp;
         std::string err;
-        if (!invoke_publish_version(publish_req, &publish_resp, &err)) {
+        if (!invoke_publish_log_version(*request, response, &err)) {
             for (auto tablet_id : request->tablet_ids()) {
                 response->add_failed_tablets(tablet_id);
             }
             cntl->SetFailed(err);
             return;
-        }
-        for (auto tablet_id : publish_resp.failed_tablets()) {
-            response->add_failed_tablets(tablet_id);
         }
         std::cerr << "[DEBUG] lake publish_log_version, remote=" << cntl->remote_side()
                   << " tablets=" << request->tablet_ids_size() << " version=" << request->version()
@@ -581,68 +565,13 @@ public:
             cntl->SetFailed("publish_log_version_batch requires versions");
             return;
         }
-
-        std::vector<starrocks::TxnInfoPB> txn_infos;
-        txn_infos.reserve(version_cnt);
-        if (request->txn_infos_size() > 0) {
-            if (request->txn_infos_size() != version_cnt) {
-                cntl->SetFailed("publish_log_version_batch txn_infos size mismatches versions");
-                return;
-            }
-            for (const auto& info : request->txn_infos()) {
-                if (!info.has_txn_id() || info.txn_id() <= 0) {
-                    cntl->SetFailed("publish_log_version_batch txn_info has invalid txn_id");
-                    return;
-                }
-                txn_infos.push_back(info);
-            }
-        } else {
-            if (request->txn_ids_size() != version_cnt) {
-                cntl->SetFailed("publish_log_version_batch txn_ids size mismatches versions");
-                return;
-            }
-            for (int i = 0; i < request->txn_ids_size(); ++i) {
-                auto txn_id = request->txn_ids(i);
-                if (txn_id <= 0) {
-                    cntl->SetFailed("publish_log_version_batch has non-positive txn_id");
-                    return;
-                }
-                starrocks::TxnInfoPB info;
-                info.set_txn_id(txn_id);
-                txn_infos.push_back(std::move(info));
-            }
-        }
-
-        for (int i = 0; i < version_cnt; ++i) {
-            auto version = request->versions(i);
-            if (version <= 0) {
-                for (auto tablet_id : request->tablet_ids()) {
-                    response->add_failed_tablets(tablet_id);
-                }
-                cntl->SetFailed("publish_log_version_batch has non-positive version");
-                continue;
-            }
-
-            starrocks::PublishVersionRequest publish_req;
+        std::string err;
+        if (!invoke_publish_log_version_batch(*request, response, &err)) {
             for (auto tablet_id : request->tablet_ids()) {
-                publish_req.add_tablet_ids(tablet_id);
-            }
-            publish_req.set_base_version(version - 1);
-            publish_req.set_new_version(version);
-            *publish_req.add_txn_infos() = txn_infos[i];
-
-            starrocks::PublishVersionResponse publish_resp;
-            std::string err;
-            if (!invoke_publish_version(publish_req, &publish_resp, &err)) {
-                for (auto tablet_id : request->tablet_ids()) {
-                    response->add_failed_tablets(tablet_id);
-                }
-                cntl->SetFailed(err);
-                continue;
-            }
-            for (auto tablet_id : publish_resp.failed_tablets()) {
                 response->add_failed_tablets(tablet_id);
             }
+            cntl->SetFailed(err);
+            return;
         }
         std::cerr << "[DEBUG] lake publish_log_version_batch, remote=" << cntl->remote_side()
                   << " tablets=" << request->tablet_ids_size()
@@ -928,6 +857,98 @@ private:
         if (!ok) {
             if (err != nullptr) {
                 *err = "parse PublishVersionResponse from rust buffer failed";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    static bool invoke_publish_log_version(const starrocks::PublishLogVersionRequest& request,
+                                           starrocks::PublishLogVersionResponse* response,
+                                           std::string* err) {
+        if (response == nullptr) {
+            if (err != nullptr) {
+                *err = "publish_log_version response is null";
+            }
+            return false;
+        }
+
+        std::string request_bytes;
+        if (!request.SerializeToString(&request_bytes)) {
+            if (err != nullptr) {
+                *err = "serialize PublishLogVersionRequest failed";
+            }
+            return false;
+        }
+
+        NovaRocksRustBuf resp_buf{nullptr, 0};
+        NovaRocksRustBuf err_buf{nullptr, 0};
+        int32_t rc = novarocks_rs_lake_publish_log_version(
+                reinterpret_cast<const uint8_t*>(request_bytes.data()), request_bytes.size(), &resp_buf, &err_buf);
+        std::string rust_err = take_rust_buf_string(&err_buf);
+        if (rc != 0) {
+            take_rust_buf_string(&resp_buf);
+            if (err != nullptr) {
+                *err = rust_err.empty() ? "rust lake publish_log_version failed" : rust_err;
+            }
+            return false;
+        }
+        if (resp_buf.ptr == nullptr || resp_buf.len == 0) {
+            response->Clear();
+            take_rust_buf_string(&resp_buf);
+            return true;
+        }
+        bool ok = response->ParseFromArray(resp_buf.ptr, static_cast<int>(resp_buf.len));
+        take_rust_buf_string(&resp_buf);
+        if (!ok) {
+            if (err != nullptr) {
+                *err = "parse PublishLogVersionResponse from rust buffer failed";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    static bool invoke_publish_log_version_batch(const starrocks::PublishLogVersionBatchRequest& request,
+                                                 starrocks::PublishLogVersionResponse* response,
+                                                 std::string* err) {
+        if (response == nullptr) {
+            if (err != nullptr) {
+                *err = "publish_log_version_batch response is null";
+            }
+            return false;
+        }
+
+        std::string request_bytes;
+        if (!request.SerializeToString(&request_bytes)) {
+            if (err != nullptr) {
+                *err = "serialize PublishLogVersionBatchRequest failed";
+            }
+            return false;
+        }
+
+        NovaRocksRustBuf resp_buf{nullptr, 0};
+        NovaRocksRustBuf err_buf{nullptr, 0};
+        int32_t rc = novarocks_rs_lake_publish_log_version_batch(
+                reinterpret_cast<const uint8_t*>(request_bytes.data()), request_bytes.size(), &resp_buf, &err_buf);
+        std::string rust_err = take_rust_buf_string(&err_buf);
+        if (rc != 0) {
+            take_rust_buf_string(&resp_buf);
+            if (err != nullptr) {
+                *err = rust_err.empty() ? "rust lake publish_log_version_batch failed" : rust_err;
+            }
+            return false;
+        }
+        if (resp_buf.ptr == nullptr || resp_buf.len == 0) {
+            response->Clear();
+            take_rust_buf_string(&resp_buf);
+            return true;
+        }
+        bool ok = response->ParseFromArray(resp_buf.ptr, static_cast<int>(resp_buf.len));
+        take_rust_buf_string(&resp_buf);
+        if (!ok) {
+            if (err != nullptr) {
+                *err = "parse PublishLogVersionResponse from rust buffer failed";
             }
             return false;
         }

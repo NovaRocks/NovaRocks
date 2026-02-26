@@ -533,6 +533,79 @@ fn resolve_frontend_addr(
     fe_addr.cloned().or_else(disk_report::latest_fe_addr)
 }
 
+pub(crate) fn fetch_table_schema_for_lake_scan(
+    fe_addr: Option<&types::TNetworkAddress>,
+    db_id: i64,
+    table_id: i64,
+    schema_id: i64,
+    tablet_id: Option<i64>,
+    query_id: Option<types::TUniqueId>,
+) -> Result<crate::agent_service::TTabletSchema, String> {
+    if db_id <= 0 || table_id <= 0 || schema_id <= 0 {
+        return Err(format!(
+            "invalid table schema meta for FE getTableSchema: db_id={} table_id={} schema_id={}",
+            db_id, table_id, schema_id
+        ));
+    }
+    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
+        "missing FE address for getTableSchema (coord is absent and heartbeat cache is empty)"
+            .to_string()
+    })?;
+
+    let request = frontend_service::TBatchGetTableSchemaRequest {
+        requests: Some(vec![frontend_service::TGetTableSchemaRequest {
+            schema_meta: Some(crate::plan_nodes::TTableSchemaMeta {
+                db_id: Some(db_id),
+                table_id: Some(table_id),
+                schema_id: Some(schema_id),
+            }),
+            source: Some(frontend_service::TTableSchemaRequestSource::SCAN),
+            tablet_id,
+            query_id,
+            txn_id: None,
+        }]),
+    };
+
+    let response = with_frontend_client(&fe_addr, |client| {
+        client
+            .get_table_schema(request)
+            .map_err(|e| format!("FE getTableSchema rpc failed: {e}"))
+    })?;
+    let status = response
+        .status
+        .as_ref()
+        .ok_or_else(|| "FE getTableSchema returned empty top-level status".to_string())?;
+    if status.status_code != status_code::TStatusCode::OK {
+        return Err(format!(
+            "FE getTableSchema returned non-OK top-level status: {:?}",
+            status
+        ));
+    }
+
+    let mut responses = response.responses.unwrap_or_default();
+    if responses.len() != 1 {
+        return Err(format!(
+            "FE getTableSchema returned unexpected response count: expected=1 actual={}",
+            responses.len()
+        ));
+    }
+    let item = responses
+        .pop()
+        .ok_or_else(|| "FE getTableSchema returned empty responses".to_string())?;
+    let item_status = item
+        .status
+        .as_ref()
+        .ok_or_else(|| "FE getTableSchema response item missing status".to_string())?;
+    if item_status.status_code != status_code::TStatusCode::OK {
+        return Err(format!(
+            "FE getTableSchema response item returned non-OK: {:?}",
+            item_status
+        ));
+    }
+    item.schema
+        .ok_or_else(|| "FE getTableSchema response item missing schema".to_string())
+}
+
 fn fetch_tablet_partition_ids_from_fe(
     fe_addr: &types::TNetworkAddress,
     tablet_ids: &[i64],
