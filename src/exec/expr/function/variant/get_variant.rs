@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int64Builder, LargeBinaryArray,
-    LargeBinaryBuilder, StringArray, StringBuilder, TimestampMicrosecondBuilder,
+    Array, ArrayRef, BooleanBuilder, Date32Builder, Float64Builder, Int32Builder, Int64Builder,
+    LargeBinaryArray, LargeBinaryBuilder, StringArray, StringBuilder, TimestampMicrosecondBuilder,
 };
 use chrono::{Local, Offset};
 use serde_json::Value as JsonValue;
@@ -97,17 +97,21 @@ fn query_json_by_path<'a>(
 
 fn json_value_to_output_string(value: &JsonValue) -> Option<String> {
     if value.is_null() {
-        None
-    } else if let Some(s) = value.as_str() {
+        return None;
+    }
+    if let Some(s) = value.as_str() {
         Some(s.to_string())
     } else {
-        Some(value.to_string())
+        json_value_to_query_string(value)
     }
 }
 
 fn json_value_to_i64(value: &JsonValue) -> Option<i64> {
     if value.is_null() {
         return None;
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(if v { 1 } else { 0 });
     }
     if let Some(v) = value.as_i64() {
         return Some(v);
@@ -116,11 +120,8 @@ fn json_value_to_i64(value: &JsonValue) -> Option<i64> {
         return i64::try_from(v).ok();
     }
     if let Some(v) = value.as_f64() {
-        if v.is_finite() && v.fract() == 0.0 {
-            let as_i128 = v as i128;
-            if as_i128 >= i64::MIN as i128 && as_i128 <= i64::MAX as i128 {
-                return Some(as_i128 as i64);
-            }
+        if v.is_finite() {
+            return Some(v as i64);
         }
         return None;
     }
@@ -130,11 +131,94 @@ fn json_value_to_i64(value: &JsonValue) -> Option<i64> {
     None
 }
 
+fn json_value_to_bool(value: &JsonValue) -> Option<bool> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v != 0);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v != 0);
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v != 0.0);
+    }
+    if let Some(v) = value.as_str() {
+        return parse_bool_like_string(v);
+    }
+    None
+}
+
+fn json_value_to_f64(value: &JsonValue) -> Option<f64> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(if v { 1.0 } else { 0.0 });
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.as_str() {
+        return v.trim().parse::<f64>().ok();
+    }
+    None
+}
+
+fn parse_bool_like_string(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = trimmed.parse::<i32>() {
+        return Some(parsed != 0);
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Some(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Some(false);
+    }
+    None
+}
+
+fn format_json_number(value: &serde_json::Number) -> String {
+    if let Some(v) = value.as_i64() {
+        return v.to_string();
+    }
+    if let Some(v) = value.as_u64() {
+        return v.to_string();
+    }
+    if let Some(v) = value.as_f64() {
+        if v.is_finite() && v.fract() == 0.0 {
+            let as_i128 = v as i128;
+            if as_i128 >= i64::MIN as i128 && as_i128 <= i64::MAX as i128 {
+                return (as_i128 as i64).to_string();
+            }
+            if as_i128 >= 0 && as_i128 <= u64::MAX as i128 {
+                return (as_i128 as u64).to_string();
+            }
+        }
+        return v.to_string();
+    }
+    value.to_string()
+}
+
 fn format_json_query_value(value: &JsonValue, out: &mut String) -> Result<(), String> {
     match value {
         JsonValue::Null => out.push_str("null"),
         JsonValue::Bool(v) => out.push_str(if *v { "true" } else { "false" }),
-        JsonValue::Number(v) => out.push_str(&v.to_string()),
+        JsonValue::Number(v) => out.push_str(&format_json_number(v)),
         JsonValue::String(v) => {
             let escaped = serde_json::to_string(v).map_err(|e| e.to_string())?;
             out.push_str(&escaped);
@@ -172,17 +256,14 @@ fn format_json_query_value(value: &JsonValue, out: &mut String) -> Result<(), St
 }
 
 fn json_value_to_query_string(value: &JsonValue) -> Option<String> {
-    if value.is_null() {
-        return None;
-    }
     let mut out = String::new();
     format_json_query_value(value, &mut out).ok()?;
     Some(out)
 }
 
 fn variant_value_to_query_string(value: &VariantValue) -> Option<String> {
-    if is_variant_null(value).unwrap_or(true) {
-        return None;
+    if is_variant_null(value).unwrap_or(false) {
+        return Some("null".to_string());
     }
     let text = value.to_json_local().ok()?;
     let json = serde_json::from_str::<JsonValue>(&text).ok()?;
@@ -287,25 +368,61 @@ pub fn eval_get_variant_bool(
 ) -> Result<ArrayRef, String> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_bool")?;
-    let (variant_arr, path_arr) =
-        downcast_variant_path_args(&variant_array, &path_array, "get_variant_bool")?;
+    let path_arr = path_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "get_variant_bool expects Utf8 for path argument".to_string())?;
 
     let mut builder = BooleanBuilder::new();
+    if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
+        for row in 0..chunk.len() {
+            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+                Some(v) => v,
+                None => {
+                    builder.append_null();
+                    continue;
+                }
+            };
+            if is_variant_null(&value).unwrap_or(true) {
+                builder.append_null();
+                continue;
+            }
+            match variant_to_bool(&value) {
+                Ok(v) => builder.append_value(v),
+                Err(_) => builder.append_null(),
+            }
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
+
+    let json_arr = variant_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            "get_variant_bool expects VARIANT or JSON/VARCHAR as first argument".to_string()
+        })?;
     for row in 0..chunk.len() {
-        let value = match resolve_variant_value(variant_arr, path_arr, row) {
-            Some(v) => v,
-            None => {
+        if json_arr.is_null(row) || path_arr.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let path = match parse_variant_path(path_arr.value(row)) {
+            Ok(path) => path,
+            Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        if is_variant_null(&value).unwrap_or(true) {
-            builder.append_null();
-            continue;
-        }
-        match variant_to_bool(&value) {
-            Ok(v) => builder.append_value(v),
-            Err(_) => builder.append_null(),
+        let json = match serde_json::from_str::<JsonValue>(json_arr.value(row)) {
+            Ok(v) => v,
+            Err(_) => {
+                builder.append_null();
+                continue;
+            }
+        };
+        match query_json_by_path(&json, &path.segments).and_then(json_value_to_bool) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -387,25 +504,61 @@ pub fn eval_get_variant_double(
 ) -> Result<ArrayRef, String> {
     let (variant_array, path_array) =
         eval_variant_path_args(arena, args, chunk, "get_variant_double")?;
-    let (variant_arr, path_arr) =
-        downcast_variant_path_args(&variant_array, &path_array, "get_variant_double")?;
+    let path_arr = path_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "get_variant_double expects Utf8 for path argument".to_string())?;
 
     let mut builder = Float64Builder::new();
+    if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
+        for row in 0..chunk.len() {
+            let value = match resolve_variant_value(variant_arr, path_arr, row) {
+                Some(v) => v,
+                None => {
+                    builder.append_null();
+                    continue;
+                }
+            };
+            if is_variant_null(&value).unwrap_or(true) {
+                builder.append_null();
+                continue;
+            }
+            match variant_to_f64(&value) {
+                Ok(v) => builder.append_value(v),
+                Err(_) => builder.append_null(),
+            }
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
+
+    let json_arr = variant_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            "get_variant_double expects VARIANT or JSON/VARCHAR as first argument".to_string()
+        })?;
     for row in 0..chunk.len() {
-        let value = match resolve_variant_value(variant_arr, path_arr, row) {
-            Some(v) => v,
-            None => {
+        if json_arr.is_null(row) || path_arr.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let path = match parse_variant_path(path_arr.value(row)) {
+            Ok(path) => path,
+            Err(_) => {
                 builder.append_null();
                 continue;
             }
         };
-        if is_variant_null(&value).unwrap_or(true) {
-            builder.append_null();
-            continue;
-        }
-        match variant_to_f64(&value) {
-            Ok(v) => builder.append_value(v),
-            Err(_) => builder.append_null(),
+        let json = match serde_json::from_str::<JsonValue>(json_arr.value(row)) {
+            Ok(v) => v,
+            Err(_) => {
+                builder.append_null();
+                continue;
+            }
+        };
+        match query_json_by_path(&json, &path.segments).and_then(json_value_to_f64) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
         }
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
@@ -477,6 +630,171 @@ pub fn eval_get_variant_string(
             Some(v) => builder.append_value(v),
             None => builder.append_null(),
         }
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+fn json_length_of_value(value: &JsonValue) -> i32 {
+    match value {
+        JsonValue::Array(items) => i32::try_from(items.len()).unwrap_or(i32::MAX),
+        JsonValue::Object(map) => i32::try_from(map.len()).unwrap_or(i32::MAX),
+        _ => 1,
+    }
+}
+
+pub fn eval_json_exists(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    let (variant_array, path_array) = eval_variant_path_args(arena, args, chunk, "json_exists")?;
+    let path_arr = path_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "json_exists expects Utf8 for path argument".to_string())?;
+
+    let mut builder = BooleanBuilder::new();
+    if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
+        for row in 0..chunk.len() {
+            if variant_arr.is_null(row) || path_arr.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let path = match parse_variant_path(path_arr.value(row)) {
+                Ok(path) => path,
+                Err(_) => {
+                    builder.append_value(false);
+                    continue;
+                }
+            };
+            let value = match VariantValue::from_serialized(variant_arr.value(row)) {
+                Ok(value) => value,
+                Err(_) => {
+                    builder.append_value(false);
+                    continue;
+                }
+            };
+            builder.append_value(variant_query(&value, &path).is_ok());
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
+
+    let json_arr = variant_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            "json_exists expects VARIANT or JSON/VARCHAR as first argument".to_string()
+        })?;
+    for row in 0..chunk.len() {
+        if json_arr.is_null(row) || path_arr.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let path = match parse_variant_path(path_arr.value(row)) {
+            Ok(path) => path,
+            Err(_) => {
+                builder.append_value(false);
+                continue;
+            }
+        };
+        let json = match serde_json::from_str::<JsonValue>(json_arr.value(row)) {
+            Ok(value) => value,
+            Err(_) => {
+                builder.append_value(false);
+                continue;
+            }
+        };
+        builder.append_value(query_json_by_path(&json, &path.segments).is_some());
+    }
+    Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+pub fn eval_json_length(
+    arena: &ExprArena,
+    _expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> Result<ArrayRef, String> {
+    let (variant_array, path_array) = eval_variant_path_args(arena, args, chunk, "json_length")?;
+    let path_arr = path_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "json_length expects Utf8 for path argument".to_string())?;
+
+    let mut builder = Int32Builder::new();
+    if let Some(variant_arr) = variant_array.as_any().downcast_ref::<LargeBinaryArray>() {
+        for row in 0..chunk.len() {
+            if variant_arr.is_null(row) || path_arr.is_null(row) {
+                builder.append_null();
+                continue;
+            }
+            let path = match parse_variant_path(path_arr.value(row)) {
+                Ok(path) => path,
+                Err(_) => {
+                    builder.append_value(0);
+                    continue;
+                }
+            };
+            let value = match VariantValue::from_serialized(variant_arr.value(row)) {
+                Ok(value) => value,
+                Err(_) => {
+                    builder.append_value(0);
+                    continue;
+                }
+            };
+            let queried = match variant_query(&value, &path) {
+                Ok(value) => value,
+                Err(_) => {
+                    builder.append_value(0);
+                    continue;
+                }
+            };
+            let json = match queried
+                .to_json_local()
+                .ok()
+                .and_then(|text| serde_json::from_str::<JsonValue>(&text).ok())
+            {
+                Some(json) => json,
+                None => {
+                    builder.append_value(0);
+                    continue;
+                }
+            };
+            builder.append_value(json_length_of_value(&json));
+        }
+        return Ok(Arc::new(builder.finish()) as ArrayRef);
+    }
+
+    let json_arr = variant_array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            "json_length expects VARIANT or JSON/VARCHAR as first argument".to_string()
+        })?;
+    for row in 0..chunk.len() {
+        if json_arr.is_null(row) || path_arr.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let path = match parse_variant_path(path_arr.value(row)) {
+            Ok(path) => path,
+            Err(_) => {
+                builder.append_value(0);
+                continue;
+            }
+        };
+        let json = match serde_json::from_str::<JsonValue>(json_arr.value(row)) {
+            Ok(value) => value,
+            Err(_) => {
+                builder.append_value(0);
+                continue;
+            }
+        };
+        let length = query_json_by_path(&json, &path.segments)
+            .map(json_length_of_value)
+            .unwrap_or(0);
+        builder.append_value(length);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }

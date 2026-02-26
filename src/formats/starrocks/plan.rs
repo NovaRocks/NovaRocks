@@ -284,6 +284,13 @@ pub struct StarRocksNativeSchemaColumnPlan {
     pub children: Vec<StarRocksNativeSchemaColumnPlan>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Flat-JSON projection metadata for rewritten outputs like `json_col.key`.
+pub struct StarRocksFlatJsonProjectionPlan {
+    pub base_column_name: String,
+    pub path: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 /// Projection mapping from FE schema column to output schema slot.
 pub struct StarRocksNativeColumnPlan {
@@ -292,6 +299,8 @@ pub struct StarRocksNativeColumnPlan {
     pub schema_unique_id: u32,
     pub schema_type: String,
     pub schema: StarRocksNativeSchemaColumnPlan,
+    pub flat_json_projection: Option<StarRocksFlatJsonProjectionPlan>,
+    pub source_column_missing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -460,46 +469,156 @@ pub fn build_native_read_plan(
     let mut projected_columns = Vec::with_capacity(output_schema.fields().len());
     for (idx, field) in output_schema.fields().iter().enumerate() {
         let output_name = field.name().trim();
-        let schema_col = by_name
-            .get(&normalize_column_name(output_name))
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "output column not found in tablet schema: tablet_id={}, version={}, output_field={}, schema_columns={}",
+        let normalized_output_name = normalize_column_name(output_name);
+        let (schema_unique_id, schema, flat_json_projection, source_column_missing) = if let Some(
+            schema_col,
+        ) =
+            by_name.get(&normalized_output_name).copied()
+        {
+            let schema = build_schema_column_plan(
+                snapshot.tablet_id,
+                snapshot.version,
+                output_name,
+                schema_col,
+                field.data_type(),
+            )?;
+            let schema_unique_id = schema.unique_id.ok_or_else(|| {
+                    format!(
+                        "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
+                        snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
+                    )
+                })?;
+            (schema_unique_id, schema, None, false)
+        } else if let Some((schema_col, projection)) =
+            try_build_flat_json_projection(output_name, &by_name)
+        {
+            // Flat JSON rewritten slots are typed by FE (`BIGINT/DOUBLE/VARCHAR/...`) but
+            // physically sourced from one JSON column on disk.
+            let schema = build_schema_column_plan(
+                snapshot.tablet_id,
+                snapshot.version,
+                output_name,
+                schema_col,
+                &DataType::Binary,
+            )?;
+            let schema_unique_id = schema.unique_id.ok_or_else(|| {
+                    format!(
+                        "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
+                        snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
+                    )
+                })?;
+            (schema_unique_id, schema, Some(projection), false)
+        } else if let Some(projection) = parse_flat_json_projection(output_name) {
+            // Schema evolution may read old segments that do not contain newly added JSON
+            // base columns. For flat JSON rewritten slots, these rows should surface as NULL.
+            let normalized_base_name = normalize_column_name(&projection.base_column_name);
+            if let Some(schema_col) = by_name.get(&normalized_base_name).copied() {
+                return Err(format!(
+                    "flat json projection base column is not JSON: tablet_id={}, version={}, output_field={}, base_column={}, base_schema_type={}",
                     snapshot.tablet_id,
                     snapshot.version,
                     output_name,
-                    schema_columns
-                        .iter()
-                        .map(|c| c.name.as_deref().unwrap_or("<missing>"))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            })?;
-        let schema = build_schema_column_plan(
-            snapshot.tablet_id,
-            snapshot.version,
-            output_name,
-            schema_col,
-            field.data_type(),
-        )?;
-        let schema_unique_id = schema.unique_id.ok_or_else(|| {
-            format!(
-                "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
-                snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
-            )
-        })?;
+                    projection.base_column_name,
+                    schema_col.r#type
+                ));
+            }
+            let schema_type = infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {
+                    format!(
+                        "unsupported output field type for missing flat json source column: tablet_id={}, version={}, output_field={}, output_type={:?}, supported=[Boolean,Int8,Int16,Int32,Int64,Float32,Float64,Utf8,Binary]",
+                        snapshot.tablet_id,
+                        snapshot.version,
+                        output_name,
+                        field.data_type()
+                    )
+                })?;
+            let output_index_u32 = u32::try_from(idx).map_err(|_| {
+                    format!(
+                        "output index overflow for missing flat json source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
+            let schema_unique_id = u32::MAX.checked_sub(output_index_u32).ok_or_else(|| {
+                    format!(
+                        "failed to assign synthetic unique id for missing flat json source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
+            let schema = StarRocksNativeSchemaColumnPlan {
+                unique_id: None,
+                schema_type: schema_type.to_string(),
+                is_nullable: true,
+                is_key: false,
+                aggregation: None,
+                precision: None,
+                scale: None,
+                children: Vec::new(),
+            };
+            (schema_unique_id, schema, Some(projection), true)
+        } else if !output_name.contains('.')
+            && matches!(field.data_type(), DataType::Binary | DataType::Utf8)
+        {
+            // For schema-evolved JSON columns, older segment schemas may not contain the
+            // column. FE can still request the raw JSON slot (e.g. JSON_EXISTS(j3, ...)).
+            // These rows should return NULL for the missing source column.
+            let schema_type = infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {
+                    format!(
+                        "unsupported output field type for missing source column: tablet_id={}, version={}, output_field={}, output_type={:?}",
+                        snapshot.tablet_id,
+                        snapshot.version,
+                        output_name,
+                        field.data_type()
+                    )
+                })?;
+            let output_index_u32 = u32::try_from(idx).map_err(|_| {
+                    format!(
+                        "output index overflow for missing source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
+            let schema_unique_id = u32::MAX.checked_sub(output_index_u32).ok_or_else(|| {
+                    format!(
+                        "failed to assign synthetic unique id for missing source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
+            let schema = StarRocksNativeSchemaColumnPlan {
+                unique_id: None,
+                schema_type: schema_type.to_string(),
+                is_nullable: true,
+                is_key: false,
+                aggregation: None,
+                precision: None,
+                scale: None,
+                children: Vec::new(),
+            };
+            (schema_unique_id, schema, None, true)
+        } else {
+            return Err(format!(
+                "output column not found in tablet schema: tablet_id={}, version={}, output_field={}, schema_columns={}",
+                snapshot.tablet_id,
+                snapshot.version,
+                output_name,
+                schema_columns
+                    .iter()
+                    .map(|c| c.name.as_deref().unwrap_or("<missing>"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        };
         projected_columns.push(StarRocksNativeColumnPlan {
             output_index: idx,
             output_name: output_name.to_string(),
             schema_unique_id,
             schema_type: schema.schema_type.clone(),
             schema,
+            flat_json_projection,
+            source_column_missing,
         });
     }
 
     let projected_unique_ids = projected_columns
         .iter()
+        .filter(|v| !v.source_column_missing)
         .map(|v| v.schema_unique_id)
         .collect::<BTreeSet<_>>();
     let group_key_columns = build_group_key_columns_plan(
@@ -800,6 +919,64 @@ fn build_primary_delvec_plan(
 
 fn normalize_column_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn infer_missing_source_schema_type(output_arrow_type: &DataType) -> Option<&'static str> {
+    match output_arrow_type {
+        DataType::Boolean => Some("BOOLEAN"),
+        DataType::Int8 => Some("TINYINT"),
+        DataType::Int16 => Some("SMALLINT"),
+        DataType::Int32 => Some("INT"),
+        DataType::Int64 => Some("BIGINT"),
+        DataType::Float32 => Some("FLOAT"),
+        DataType::Float64 => Some("DOUBLE"),
+        DataType::Utf8 => Some("VARCHAR"),
+        DataType::Binary => Some("VARBINARY"),
+        _ => None,
+    }
+}
+
+fn parse_flat_json_projection(output_name: &str) -> Option<StarRocksFlatJsonProjectionPlan> {
+    let output_name = output_name.trim();
+    let first_dot = output_name.find('.')?;
+    if first_dot == 0 || first_dot + 1 >= output_name.len() {
+        return None;
+    }
+    let base_name = output_name[..first_dot].trim();
+    if base_name.is_empty() {
+        return None;
+    }
+    let path = output_name[first_dot + 1..]
+        .split('.')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if path.is_empty() {
+        return None;
+    }
+    Some(StarRocksFlatJsonProjectionPlan {
+        base_column_name: base_name.to_string(),
+        path,
+    })
+}
+
+fn try_build_flat_json_projection<'a>(
+    output_name: &str,
+    by_name: &'a HashMap<String, &'a ColumnPb>,
+) -> Option<(&'a ColumnPb, StarRocksFlatJsonProjectionPlan)> {
+    let projection = parse_flat_json_projection(output_name)?;
+    let schema_col = by_name
+        .get(&normalize_column_name(&projection.base_column_name))
+        .copied()?;
+    if !schema_col
+        .r#type
+        .trim()
+        .eq_ignore_ascii_case(STARROCKS_TYPE_JSON)
+    {
+        return None;
+    }
+    Some((schema_col, projection))
 }
 
 fn build_delete_predicates_plan(
@@ -1669,6 +1846,77 @@ mod tests {
         let err = build_native_read_plan(&snapshot, &footers, &output_schema)
             .expect_err("should reject unknown output column");
         assert!(err.contains("output column not found"), "err={}", err);
+    }
+
+    #[test]
+    fn build_read_plan_supports_flat_json_rewritten_output_column() {
+        let snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "id", "BIGINT"),
+            build_column(2, "j", "JSON"),
+        ]);
+        let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("j.a", DataType::Int64, true),
+        ]));
+
+        let plan =
+            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        assert_eq!(plan.projected_columns.len(), 2);
+        assert!(plan.projected_columns[0].flat_json_projection.is_none());
+        let flat = plan.projected_columns[1]
+            .flat_json_projection
+            .as_ref()
+            .expect("flat json projection should be present");
+        assert_eq!(flat.base_column_name, "j");
+        assert_eq!(flat.path, vec!["a".to_string()]);
+        assert_eq!(plan.projected_columns[1].schema_unique_id, 2);
+        assert!(!plan.projected_columns[1].source_column_missing);
+    }
+
+    #[test]
+    fn build_read_plan_supports_missing_flat_json_base_column() {
+        let snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "id", "BIGINT"),
+            build_column(2, "j", "JSON"),
+        ]);
+        let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "j3.key3",
+            DataType::Float64,
+            true,
+        )]));
+
+        let plan =
+            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        assert_eq!(plan.projected_columns.len(), 1);
+        let projected = &plan.projected_columns[0];
+        assert!(projected.source_column_missing);
+        assert_eq!(projected.schema_type, "DOUBLE");
+        let flat = projected
+            .flat_json_projection
+            .as_ref()
+            .expect("flat json projection should be present");
+        assert_eq!(flat.base_column_name, "j3");
+        assert_eq!(flat.path, vec!["key3".to_string()]);
+    }
+
+    #[test]
+    fn build_read_plan_supports_missing_json_output_column() {
+        let snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "id", "BIGINT"),
+            build_column(2, "j", "JSON"),
+        ]);
+        let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
+        let output_schema = Arc::new(Schema::new(vec![Field::new("j3", DataType::Binary, true)]));
+
+        let plan =
+            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        assert_eq!(plan.projected_columns.len(), 1);
+        let projected = &plan.projected_columns[0];
+        assert!(projected.source_column_missing);
+        assert!(projected.flat_json_projection.is_none());
+        assert_eq!(projected.schema_type, "VARBINARY");
     }
 
     #[test]

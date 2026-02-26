@@ -55,14 +55,18 @@ pub fn eval_variant_function(
         "json_query" => super::get_variant::eval_json_query(arena, expr, args, chunk),
         "variant_query" => super::get_variant::eval_variant_query(arena, expr, args, chunk),
         "get_variant_bool" => super::get_variant::eval_get_variant_bool(arena, expr, args, chunk),
+        "get_json_bool" => super::get_variant::eval_get_variant_bool(arena, expr, args, chunk),
         "get_variant_int" => super::get_variant::eval_get_variant_int(arena, expr, args, chunk),
         "get_variant_double" => {
             super::get_variant::eval_get_variant_double(arena, expr, args, chunk)
         }
+        "get_json_double" => super::get_variant::eval_get_variant_double(arena, expr, args, chunk),
         "get_variant_string" => {
             super::get_variant::eval_get_variant_string(arena, expr, args, chunk)
         }
         "get_json_string" => super::get_variant::eval_get_variant_string(arena, expr, args, chunk),
+        "json_exists" => super::get_variant::eval_json_exists(arena, expr, args, chunk),
+        "json_length" => super::get_variant::eval_json_length(arena, expr, args, chunk),
         "get_variant_date" => super::get_variant::eval_get_variant_date(arena, expr, args, chunk),
         "get_variant_datetime" => {
             super::get_variant::eval_get_variant_datetime(arena, expr, args, chunk)
@@ -79,12 +83,16 @@ static VARIANT_FUNCTIONS: &[(&str, &str)] = &[
     ("variant_query", "variant_query"),
     ("json_query", "json_query"),
     ("get_variant_bool", "get_variant_bool"),
+    ("get_json_bool", "get_json_bool"),
     ("get_variant_int", "get_variant_int"),
     ("get_json_int", "get_variant_int"),
     ("get_variant_double", "get_variant_double"),
+    ("get_json_double", "get_json_double"),
     ("get_variant_string", "get_variant_string"),
     ("get_json_string", "get_variant_string"),
     ("get_json_object", "get_variant_string"),
+    ("json_exists", "json_exists"),
+    ("json_length", "json_length"),
     ("get_variant_date", "get_variant_date"),
     ("get_variant_datetime", "get_variant_datetime"),
     ("get_variant_time", "get_variant_time"),
@@ -114,6 +122,11 @@ static VARIANT_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
     FunctionMeta {
+        name: "get_json_bool",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
         name: "get_variant_int",
         min_args: 2,
         max_args: 2,
@@ -129,12 +142,27 @@ static VARIANT_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
     FunctionMeta {
+        name: "get_json_double",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
         name: "get_variant_string",
         min_args: 2,
         max_args: 2,
     },
     FunctionMeta {
         name: "get_json_string",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "json_exists",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
+        name: "json_length",
         min_args: 2,
         max_args: 2,
     },

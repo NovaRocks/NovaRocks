@@ -30,24 +30,28 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::ops::Range;
+use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, UInt32Array, new_empty_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array,
+    Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array, Int8Builder, Int16Array,
+    Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
+    TimestampMicrosecondArray, UInt32Array, new_empty_array, new_null_array,
 };
 use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use roaring::RoaringBitmap;
+use serde_json::Value as JsonValue;
 
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::exec::expr::LiteralValue;
 use crate::formats::starrocks::plan::{
-    StarRocksDeletePredicateOpPlan, StarRocksNativeColumnPlan, StarRocksNativeReadPlan,
-    StarRocksNativeSchemaColumnPlan, StarRocksNativeSegmentPlan, StarRocksTableModelPlan,
+    StarRocksDeletePredicateOpPlan, StarRocksFlatJsonProjectionPlan, StarRocksNativeColumnPlan,
+    StarRocksNativeReadPlan, StarRocksNativeSchemaColumnPlan, StarRocksNativeSegmentPlan,
+    StarRocksTableModelPlan,
 };
 use crate::formats::starrocks::segment::{
     StarRocksSegmentColumnMeta, StarRocksSegmentFooter, StarRocksZoneMapMeta,
@@ -83,6 +87,56 @@ const BLOOM_BLOCK_BYTES: usize = 32;
 const BLOOM_SALTS: [u32; 8] = [
     0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31,
 ];
+
+enum FlatJsonSourceArray<'a> {
+    Binary(&'a BinaryArray),
+    Utf8(&'a StringArray),
+}
+
+impl<'a> FlatJsonSourceArray<'a> {
+    fn from_array(
+        array: &'a ArrayRef,
+        segment_path: &str,
+        output_name: &str,
+    ) -> Result<Self, String> {
+        if let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() {
+            return Ok(Self::Binary(binary));
+        }
+        if let Some(utf8) = array.as_any().downcast_ref::<StringArray>() {
+            return Ok(Self::Utf8(utf8));
+        }
+        Err(format!(
+            "flat json source type mismatch: segment={}, output_column={}, source_type={:?}, expected=Binary/Utf8",
+            segment_path,
+            output_name,
+            array.data_type()
+        ))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Binary(array) => array.len(),
+            Self::Utf8(array) => array.len(),
+        }
+    }
+
+    fn json_text(&self, row: usize) -> Option<&str> {
+        match self {
+            Self::Binary(array) => {
+                if array.is_null(row) {
+                    return None;
+                }
+                std::str::from_utf8(array.value(row)).ok()
+            }
+            Self::Utf8(array) => {
+                if array.is_null(row) {
+                    return None;
+                }
+                Some(array.value(row))
+            }
+        }
+    }
+}
 
 struct PredicateBinding<'a> {
     predicate: &'a MinMaxPredicate,
@@ -261,25 +315,44 @@ pub(super) fn build_dup_record_batch(
             .ok_or_else(|| "native output row count overflow".to_string())?;
 
         for projected in &plan.projected_columns {
-            let column_meta =
-                find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id).ok_or_else(|| {
-                    format!(
-                        "segment footer missing projected column unique_id: segment={}, unique_id={}, output_column={}",
-                        segment.path, projected.schema_unique_id, projected.output_name
-                    )
-                })?;
             let output_field = output_schema.field(projected.output_index);
-            let mut array = decode_column_array_for_selected_rows(
-                &segment.path,
-                &segment_bytes,
-                column_meta,
-                &projected.schema,
-                output_field.data_type(),
-                &projected.output_name,
-                &selected_ranges,
-                full_segment_selected,
-                segment_rows,
-            )?;
+            let mut array = if projected.source_column_missing {
+                new_null_array(output_field.data_type(), selected_rows_before_delete)
+            } else {
+                let column_meta = find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "segment footer missing projected column unique_id: segment={}, unique_id={}, output_column={}",
+                            segment.path, projected.schema_unique_id, projected.output_name
+                        )
+                    })?;
+                if let Some(flat_projection) = projected.flat_json_projection.as_ref() {
+                    decode_flat_json_projection_array_for_selected_rows(
+                        &segment.path,
+                        &segment_bytes,
+                        column_meta,
+                        &projected.schema,
+                        flat_projection,
+                        output_field.data_type(),
+                        &projected.output_name,
+                        &selected_ranges,
+                        full_segment_selected,
+                        segment_rows,
+                    )?
+                } else {
+                    decode_column_array_for_selected_rows(
+                        &segment.path,
+                        &segment_bytes,
+                        column_meta,
+                        &projected.schema,
+                        output_field.data_type(),
+                        &projected.output_name,
+                        &selected_ranges,
+                        full_segment_selected,
+                        segment_rows,
+                    )?
+                }
+            };
             if array.len() != selected_rows_before_delete {
                 return Err(format!(
                     "segment row count mismatch in output array before delete filtering: segment={}, expected_rows={}, actual_rows={}, output_column={}",
@@ -366,6 +439,14 @@ fn bind_predicates_for_segment<'a>(
         let Some(projected) = projected_by_output_index.get(&output_index).copied() else {
             continue;
         };
+        if projected.flat_json_projection.is_some() {
+            // Flat JSON rewritten slots are evaluated after JSON extraction, not from
+            // on-disk scalar zone map/indexes.
+            continue;
+        }
+        if projected.source_column_missing {
+            continue;
+        }
         let Some(column_meta) =
             find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id)
         else {
@@ -476,6 +557,339 @@ fn decode_column_array_for_selected_rows(
         segment_rows,
     )?;
     take_array_by_ranges(&full_array, selected_ranges, segment_path, output_name)
+}
+
+fn decode_flat_json_projection_array_for_selected_rows(
+    segment_path: &str,
+    segment_bytes: &[u8],
+    column_meta: &StarRocksSegmentColumnMeta,
+    schema: &StarRocksNativeSchemaColumnPlan,
+    projection: &StarRocksFlatJsonProjectionPlan,
+    output_data_type: &DataType,
+    output_name: &str,
+    selected_ranges: &[Range<usize>],
+    full_segment_selected: bool,
+    segment_rows: usize,
+) -> Result<ArrayRef, String> {
+    let source_array = decode_column_array_for_selected_rows(
+        segment_path,
+        segment_bytes,
+        column_meta,
+        schema,
+        &DataType::Binary,
+        output_name,
+        selected_ranges,
+        full_segment_selected,
+        segment_rows,
+    )?;
+    let source = FlatJsonSourceArray::from_array(&source_array, segment_path, output_name)?;
+    project_flat_json_array(
+        &source,
+        projection,
+        output_data_type,
+        segment_path,
+        output_name,
+    )
+}
+
+fn project_flat_json_array(
+    source: &FlatJsonSourceArray<'_>,
+    projection: &StarRocksFlatJsonProjectionPlan,
+    output_data_type: &DataType,
+    segment_path: &str,
+    output_name: &str,
+) -> Result<ArrayRef, String> {
+    match output_data_type {
+        DataType::Boolean => {
+            let mut builder = BooleanBuilder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_bool(&v))
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int8 => {
+            let mut builder = Int8Builder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_i64(&v))
+                    .and_then(|v| i8::try_from(v).ok())
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int16 => {
+            let mut builder = Int16Builder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_i64(&v))
+                    .and_then(|v| i16::try_from(v).ok())
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int32 => {
+            let mut builder = Int32Builder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_i64(&v))
+                    .and_then(|v| i32::try_from(v).ok())
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Int64 => {
+            let mut builder = Int64Builder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_i64(&v))
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Float32 => {
+            let mut builder = Float32Builder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_f64(&v))
+                    .map(|v| v as f32)
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Float64 => {
+            let mut builder = Float64Builder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_f64(&v))
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        DataType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for row in 0..source.len() {
+                match extract_flat_json_path_value(source, row, projection)
+                    .and_then(|v| json_value_to_flat_string(&v))
+                {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()) as ArrayRef)
+        }
+        other => Err(format!(
+            "unsupported output type for flat json projection: segment={}, output_column={}, output_type={:?}",
+            segment_path, output_name, other
+        )),
+    }
+}
+
+fn extract_flat_json_path_value(
+    source: &FlatJsonSourceArray<'_>,
+    row: usize,
+    projection: &StarRocksFlatJsonProjectionPlan,
+) -> Option<JsonValue> {
+    let raw = source.json_text(row)?;
+    let root = serde_json::from_str::<JsonValue>(raw).ok()?;
+    let mut current = &root;
+    for key in &projection.path {
+        current = match current {
+            JsonValue::Object(map) => map.get(key)?,
+            _ => return None,
+        };
+    }
+    Some(current.clone())
+}
+
+fn json_value_to_flat_bool(value: &JsonValue) -> Option<bool> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v != 0);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v != 0);
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v != 0.0);
+    }
+    if let Some(v) = value.as_str() {
+        return parse_bool_like_string(v);
+    }
+    None
+}
+
+fn json_value_to_flat_i64(value: &JsonValue) -> Option<i64> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(if v { 1 } else { 0 });
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_u64() {
+        return i64::try_from(v).ok();
+    }
+    if let Some(v) = value.as_f64() {
+        if v.is_finite() {
+            return Some(v as i64);
+        }
+        return None;
+    }
+    if let Some(v) = value.as_str() {
+        return v.trim().parse::<i64>().ok();
+    }
+    None
+}
+
+fn json_value_to_flat_f64(value: &JsonValue) -> Option<f64> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(v) = value.as_bool() {
+        return Some(if v { 1.0 } else { 0.0 });
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v as f64);
+    }
+    if let Some(v) = value.as_str() {
+        return v.trim().parse::<f64>().ok();
+    }
+    None
+}
+
+fn json_value_to_flat_string(value: &JsonValue) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(v) = value.as_str() {
+        return Some(v.to_string());
+    }
+    json_value_to_query_string(value)
+}
+
+fn parse_bool_like_string(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = trimmed.parse::<i32>() {
+        return Some(parsed != 0);
+    }
+    if trimmed.eq_ignore_ascii_case("true") {
+        return Some(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false") {
+        return Some(false);
+    }
+    None
+}
+
+fn format_json_number(value: &serde_json::Number) -> String {
+    if let Some(v) = value.as_i64() {
+        return v.to_string();
+    }
+    if let Some(v) = value.as_u64() {
+        return v.to_string();
+    }
+    if let Some(v) = value.as_f64() {
+        if v.is_finite() && v.fract() == 0.0 {
+            let as_i128 = v as i128;
+            if as_i128 >= i64::MIN as i128 && as_i128 <= i64::MAX as i128 {
+                return (as_i128 as i64).to_string();
+            }
+            if as_i128 >= 0 && as_i128 <= u64::MAX as i128 {
+                return (as_i128 as u64).to_string();
+            }
+        }
+        return v.to_string();
+    }
+    value.to_string()
+}
+
+fn format_json_query_value(value: &JsonValue, out: &mut String) -> Result<(), String> {
+    match value {
+        JsonValue::Null => out.push_str("null"),
+        JsonValue::Bool(v) => out.push_str(if *v { "true" } else { "false" }),
+        JsonValue::Number(v) => out.push_str(&format_json_number(v)),
+        JsonValue::String(v) => {
+            let escaped = serde_json::to_string(v).map_err(|e| e.to_string())?;
+            out.push_str(&escaped);
+        }
+        JsonValue::Array(items) => {
+            out.push('[');
+            for (idx, item) in items.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                format_json_query_value(item, out)?;
+            }
+            out.push(']');
+        }
+        JsonValue::Object(map) => {
+            out.push('{');
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (idx, key) in keys.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                let escaped_key = serde_json::to_string(key).map_err(|e| e.to_string())?;
+                out.push_str(&escaped_key);
+                out.push_str(": ");
+                let child = map
+                    .get(*key)
+                    .ok_or_else(|| "flat json formatter missing object key".to_string())?;
+                format_json_query_value(child, out)?;
+            }
+            out.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn json_value_to_query_string(value: &JsonValue) -> Option<String> {
+    if value.is_null() {
+        return None;
+    }
+    let mut out = String::new();
+    format_json_query_value(value, &mut out).ok()?;
+    Some(out)
 }
 
 fn build_primary_delvec_keep_mask_for_segment(
