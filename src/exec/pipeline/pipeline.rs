@@ -113,6 +113,7 @@ impl Pipeline {
                     operator_profiles.push(profiles);
                 }
                 op.prepare()?;
+                op.bind_runtime_state(ctx.runtime_state())?;
                 operators.push(op);
             }
             let source_idx =

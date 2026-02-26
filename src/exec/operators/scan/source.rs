@@ -186,6 +186,7 @@ impl OperatorFactory for ScanSourceFactory {
             submit_failures: AtomicUsize::new(0),
             first_submit_failure_at: Mutex::new(None),
             row_position_registered: false,
+            incremental_registered: false,
         })
     }
 
@@ -215,6 +216,7 @@ struct ScanSourceOperator {
     submit_failures: AtomicUsize,
     first_submit_failure_at: Mutex<Option<Instant>>,
     row_position_registered: bool,
+    incremental_registered: bool,
 }
 
 impl ScanSourceOperator {
@@ -256,6 +258,35 @@ impl ScanSourceOperator {
             ranges.to_vec(),
         )?;
         self.row_position_registered = true;
+        Ok(())
+    }
+
+    fn register_incremental_dispatch(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if self.incremental_registered {
+            return Ok(());
+        }
+        if !self.scan.supports_incremental_scan_ranges() {
+            self.incremental_registered = true;
+            return Ok(());
+        }
+        let Some(finst_id) = state.fragment_instance_id() else {
+            self.incremental_registered = true;
+            return Ok(());
+        };
+        let Some(node_id) = self.scan.node_id() else {
+            self.incremental_registered = true;
+            return Ok(());
+        };
+        let Some(dispatch) = self.dispatch.as_ref() else {
+            return Err("scan dispatch is not initialized for incremental ranges".to_string());
+        };
+        crate::runtime::query_context::query_context_manager().register_incremental_scan_node(
+            finst_id,
+            node_id,
+            self.scan.clone(),
+            Arc::clone(dispatch),
+        )?;
+        self.incremental_registered = true;
         Ok(())
     }
 
@@ -471,7 +502,7 @@ impl Operator for ScanSourceOperator {
             .dispatch
             .get_or_init(|| {
                 let morsels = scan.build_morsels()?;
-                if morsels.has_more {
+                if morsels.has_more && !scan.supports_incremental_scan_ranges() {
                     let node_id = scan.node_id().unwrap_or(-1);
                     return Err(format!(
                         "scan node_id={} has incremental morsels which are not supported",
@@ -530,6 +561,10 @@ impl Operator for ScanSourceOperator {
             }
             Err(err) => Err(err.clone()),
         }
+    }
+
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.register_incremental_dispatch(state)
     }
 
     fn cancel(&mut self) {
@@ -603,6 +638,7 @@ impl ProcessorOperator for ScanSourceOperator {
     }
 
     fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        self.register_incremental_dispatch(state)?;
         self.register_row_position(state)?;
         self.async_state.ensure_mem_tracker(state);
         let chunk = self.async_state.pop_chunk()?;

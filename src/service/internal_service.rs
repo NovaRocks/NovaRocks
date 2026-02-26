@@ -253,6 +253,24 @@ fn backfill_per_node_scan_ranges(exec_params: &mut internal_service::TPlanFragme
     }
 }
 
+fn append_incremental_scan_ranges(
+    exec_params: &mut internal_service::TPlanFragmentExecParams,
+) -> Result<(), String> {
+    backfill_per_node_scan_ranges(exec_params);
+    let finst_id = UniqueId {
+        hi: exec_params.fragment_instance_id.hi,
+        lo: exec_params.fragment_instance_id.lo,
+    };
+    let mgr = query_context_manager();
+    for (node_id, scan_ranges) in &exec_params.per_node_scan_ranges {
+        if scan_ranges.is_empty() {
+            continue;
+        }
+        mgr.append_incremental_scan_ranges(finst_id, *node_id, scan_ranges.clone())?;
+    }
+    Ok(())
+}
+
 fn add_exchange_sender_counts(counts: &mut HashMap<i32, usize>, fragment: &planner::TPlanFragment) {
     let Some(sink) = fragment.output_sink.as_ref() else {
         return;
@@ -1291,9 +1309,12 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let Some(params) = one.params.as_ref() else {
         return Err("missing params in TExecPlanFragmentParams".to_string());
     };
-    let Some(fragment) = one.fragment.as_ref() else {
-        return Err("missing fragment in TExecPlanFragmentParams".to_string());
-    };
+    if one.fragment.is_none() {
+        let mut params = params.clone();
+        append_incremental_scan_ranges(&mut params)?;
+        return Ok(());
+    }
+    let fragment = one.fragment.as_ref().expect("checked above");
     let coord = one.coord.as_ref();
     let backend_num = one.backend_num;
     let finst_id = UniqueId {

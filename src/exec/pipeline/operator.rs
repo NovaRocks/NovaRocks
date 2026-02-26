@@ -67,6 +67,10 @@ pub trait Operator: Send {
         Ok(())
     }
 
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        Ok(())
+    }
+
     fn close(&mut self) -> Result<(), String> {
         Ok(())
     }
