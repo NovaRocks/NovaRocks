@@ -192,6 +192,7 @@ struct TAlterTabletReqV2 {
     16: optional Descriptors.TDescriptorTable desc_tbl
     17: optional Exprs.TExpr where_expr
     18: optional list<string> base_table_column_names 
+    19: optional TTabletSchema base_tablet_read_schema
 }
 
 struct TClusterInfo {
@@ -578,4 +579,3 @@ struct TDeleteEtlFilesRequest {
     3: required string db_name
     4: required string label
 }
-

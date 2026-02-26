@@ -33,10 +33,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array,
-    Float32Array, Float32Builder, Float64Array, Float64Builder, Int8Array, Int8Builder, Int16Array,
-    Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
-    TimestampMicrosecondArray, UInt32Array, new_empty_array, new_null_array,
+    new_empty_array, new_null_array, Array, ArrayRef, BinaryArray, BooleanArray, BooleanBuilder,
+    Date32Array, Decimal128Array, Float32Array, Float32Builder, Float64Array, Float64Builder,
+    Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, Int8Array,
+    Int8Builder, StringArray, StringBuilder, TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
@@ -45,8 +45,9 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use roaring::RoaringBitmap;
 use serde_json::Value as JsonValue;
 
-use crate::connector::MinMaxPredicate;
+use crate::connector::starrocks::lake::txn_log::parse_default_literal_to_singleton_array;
 use crate::connector::starrocks::ObjectStoreProfile;
+use crate::connector::MinMaxPredicate;
 use crate::exec::expr::LiteralValue;
 use crate::formats::starrocks::plan::{
     StarRocksDeletePredicateOpPlan, StarRocksFlatJsonProjectionPlan, StarRocksNativeColumnPlan,
@@ -66,13 +67,13 @@ use super::column_state::{OutputColumnData, OutputColumnKind};
 use super::complex::decode_column_array_for_segment;
 use super::constants::{
     DATE_UNIX_EPOCH_JULIAN, LOGICAL_TYPE_BIGINT, LOGICAL_TYPE_BINARY, LOGICAL_TYPE_BOOLEAN,
-    LOGICAL_TYPE_CHAR, LOGICAL_TYPE_DATE, LOGICAL_TYPE_DATETIME, LOGICAL_TYPE_DECIMAL32,
-    LOGICAL_TYPE_DECIMAL64, LOGICAL_TYPE_DECIMAL128, LOGICAL_TYPE_DOUBLE, LOGICAL_TYPE_FLOAT,
+    LOGICAL_TYPE_CHAR, LOGICAL_TYPE_DATE, LOGICAL_TYPE_DATETIME, LOGICAL_TYPE_DECIMAL128,
+    LOGICAL_TYPE_DECIMAL32, LOGICAL_TYPE_DECIMAL64, LOGICAL_TYPE_DOUBLE, LOGICAL_TYPE_FLOAT,
     LOGICAL_TYPE_INT, LOGICAL_TYPE_SMALLINT, LOGICAL_TYPE_TINYINT, LOGICAL_TYPE_VARBINARY,
     LOGICAL_TYPE_VARCHAR, USECS_PER_DAY_I64,
 };
 use super::indexed_column::decode_indexed_binary_values;
-use super::io::{TabletRoot, build_operator, read_range_bytes};
+use super::io::{build_operator, read_range_bytes, TabletRoot};
 use super::page::{DecodedDataPageValues, DecodedPageValuePayload};
 use super::schema_map::{
     decimal_output_meta_from_arrow_type, expected_logical_type_from_schema_type,
@@ -317,39 +318,48 @@ pub(super) fn build_dup_record_batch(
         for projected in &plan.projected_columns {
             let output_field = output_schema.field(projected.output_index);
             let mut array = if projected.source_column_missing {
-                new_null_array(output_field.data_type(), selected_rows_before_delete)
+                build_missing_projected_array(
+                    projected,
+                    output_field.data_type(),
+                    selected_rows_before_delete,
+                    &segment.path,
+                )?
             } else {
-                let column_meta = find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "segment footer missing projected column unique_id: segment={}, unique_id={}, output_column={}",
-                            segment.path, projected.schema_unique_id, projected.output_name
-                        )
-                    })?;
-                if let Some(flat_projection) = projected.flat_json_projection.as_ref() {
-                    decode_flat_json_projection_array_for_selected_rows(
-                        &segment.path,
-                        &segment_bytes,
-                        column_meta,
-                        &projected.schema,
-                        flat_projection,
-                        output_field.data_type(),
-                        &projected.output_name,
-                        &selected_ranges,
-                        full_segment_selected,
-                        segment_rows,
-                    )?
+                if let Some(column_meta) =
+                    find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id)
+                {
+                    if let Some(flat_projection) = projected.flat_json_projection.as_ref() {
+                        decode_flat_json_projection_array_for_selected_rows(
+                            &segment.path,
+                            &segment_bytes,
+                            column_meta,
+                            &projected.schema,
+                            flat_projection,
+                            output_field.data_type(),
+                            &projected.output_name,
+                            &selected_ranges,
+                            full_segment_selected,
+                            segment_rows,
+                        )?
+                    } else {
+                        decode_column_array_for_selected_rows(
+                            &segment.path,
+                            &segment_bytes,
+                            column_meta,
+                            &projected.schema,
+                            output_field.data_type(),
+                            &projected.output_name,
+                            &selected_ranges,
+                            full_segment_selected,
+                            segment_rows,
+                        )?
+                    }
                 } else {
-                    decode_column_array_for_selected_rows(
-                        &segment.path,
-                        &segment_bytes,
-                        column_meta,
-                        &projected.schema,
+                    build_missing_projected_array(
+                        projected,
                         output_field.data_type(),
-                        &projected.output_name,
-                        &selected_ranges,
-                        full_segment_selected,
-                        segment_rows,
+                        selected_rows_before_delete,
+                        &segment.path,
                     )?
                 }
             };
@@ -423,6 +433,60 @@ pub(super) fn build_dup_record_batch(
 
     RecordBatch::try_new(output_schema.clone(), arrays)
         .map_err(|e| format!("build native starrocks record batch failed: {e}"))
+}
+
+fn build_missing_projected_array(
+    projected: &StarRocksNativeColumnPlan,
+    output_data_type: &DataType,
+    row_count: usize,
+    segment_path: &str,
+) -> Result<ArrayRef, String> {
+    if row_count == 0 {
+        return Ok(new_empty_array(output_data_type));
+    }
+    if let Some(default_literal) = projected.fallback_default_literal.as_deref() {
+        let singleton = parse_default_literal_to_singleton_array(output_data_type, default_literal)
+            .map_err(|e| {
+                format!(
+                    "parse missing projected-column default literal failed: segment={} output_column={} unique_id={} default_literal={} error={}",
+                    segment_path, projected.output_name, projected.schema_unique_id, default_literal, e
+                )
+            })?;
+        return repeat_singleton_array(&singleton, row_count, segment_path, &projected.output_name);
+    }
+    if projected.fallback_is_nullable {
+        return Ok(new_null_array(output_data_type, row_count));
+    }
+    Err(format!(
+        "segment footer missing projected column unique_id and no fallback value: segment={} output_column={} unique_id={} nullable={}",
+        segment_path,
+        projected.output_name,
+        projected.schema_unique_id,
+        projected.fallback_is_nullable
+    ))
+}
+
+fn repeat_singleton_array(
+    singleton: &ArrayRef,
+    row_count: usize,
+    segment_path: &str,
+    output_name: &str,
+) -> Result<ArrayRef, String> {
+    if singleton.len() != 1 {
+        return Err(format!(
+            "invalid singleton default array length while expanding missing projected column: segment={} output_column={} singleton_len={}",
+            segment_path,
+            output_name,
+            singleton.len()
+        ));
+    }
+    let indexes = UInt32Array::from(vec![0_u32; row_count]);
+    take(singleton.as_ref(), &indexes, None).map_err(|e| {
+        format!(
+            "repeat singleton default array failed while filling missing projected column: segment={} output_column={} rows={} error={}",
+            segment_path, output_name, row_count, e
+        )
+    })
 }
 
 fn bind_predicates_for_segment<'a>(
@@ -2876,7 +2940,8 @@ fn overlap_local_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int64Array;
+    use crate::formats::starrocks::plan::StarRocksNativeSchemaColumnPlan;
+    use arrow::array::{Int64Array, StringArray};
     use std::sync::Arc;
 
     #[test]
@@ -2938,6 +3003,99 @@ mod tests {
         .expect("merge keep masks")
         .expect("merged mask");
         assert_eq!(merged, vec![false, false, true]);
+    }
+
+    #[test]
+    fn build_missing_projected_array_uses_default_literal() {
+        let projected = StarRocksNativeColumnPlan {
+            output_index: 0,
+            output_name: "v2".to_string(),
+            schema_unique_id: 9,
+            schema_type: "VARCHAR".to_string(),
+            schema: StarRocksNativeSchemaColumnPlan {
+                unique_id: Some(9),
+                schema_type: "VARCHAR".to_string(),
+                is_nullable: false,
+                is_key: false,
+                aggregation: None,
+                precision: None,
+                scale: None,
+                children: Vec::new(),
+            },
+            flat_json_projection: None,
+            source_column_missing: false,
+            fallback_default_literal: Some("abc".to_string()),
+            fallback_is_nullable: false,
+        };
+        let array = build_missing_projected_array(&projected, &DataType::Utf8, 3, "segment.dat")
+            .expect("build default-filled array");
+        let utf8 = array
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("downcast to StringArray");
+        assert_eq!(utf8.len(), 3);
+        assert_eq!(utf8.value(0), "abc");
+        assert_eq!(utf8.value(1), "abc");
+        assert_eq!(utf8.value(2), "abc");
+    }
+
+    #[test]
+    fn build_missing_projected_array_uses_null_for_nullable_column() {
+        let projected = StarRocksNativeColumnPlan {
+            output_index: 0,
+            output_name: "v2".to_string(),
+            schema_unique_id: 10,
+            schema_type: "BIGINT".to_string(),
+            schema: StarRocksNativeSchemaColumnPlan {
+                unique_id: Some(10),
+                schema_type: "BIGINT".to_string(),
+                is_nullable: true,
+                is_key: false,
+                aggregation: None,
+                precision: None,
+                scale: None,
+                children: Vec::new(),
+            },
+            flat_json_projection: None,
+            source_column_missing: false,
+            fallback_default_literal: None,
+            fallback_is_nullable: true,
+        };
+        let array = build_missing_projected_array(&projected, &DataType::Int64, 2, "segment.dat")
+            .expect("build null-filled array");
+        let int64 = array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast to Int64Array");
+        assert!(int64.is_null(0));
+        assert!(int64.is_null(1));
+    }
+
+    #[test]
+    fn build_missing_projected_array_rejects_non_nullable_without_default() {
+        let projected = StarRocksNativeColumnPlan {
+            output_index: 0,
+            output_name: "v2".to_string(),
+            schema_unique_id: 11,
+            schema_type: "BIGINT".to_string(),
+            schema: StarRocksNativeSchemaColumnPlan {
+                unique_id: Some(11),
+                schema_type: "BIGINT".to_string(),
+                is_nullable: false,
+                is_key: false,
+                aggregation: None,
+                precision: None,
+                scale: None,
+                children: Vec::new(),
+            },
+            flat_json_projection: None,
+            source_column_missing: false,
+            fallback_default_literal: None,
+            fallback_is_nullable: false,
+        };
+        let err = build_missing_projected_array(&projected, &DataType::Int64, 1, "segment.dat")
+            .expect_err("non-nullable missing column without default should fail");
+        assert!(err.contains("no fallback value"), "err={err}");
     }
 
     #[test]

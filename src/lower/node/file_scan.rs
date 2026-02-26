@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
-use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use csv::{ReaderBuilder, Terminator, Trim};
@@ -27,7 +26,7 @@ use serde_json::Value;
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
 use crate::exec::chunk::{Chunk, field_with_slot_id};
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp};
 use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
 use crate::fs::scan_context::FileScanRange;
@@ -208,7 +207,7 @@ impl FileLoadScanOp {
                     format!("FILE_SCAN missing output field type for index={idx}")
                 })?;
             if array.data_type() != expected {
-                array = cast(array.as_ref(), expected).map_err(|e| {
+                array = cast_with_special_rules(&array, expected).map_err(|e| {
                     format!(
                         "FILE_SCAN cast projected column failed at index={idx}: from={:?} to={:?} error={e}",
                         array.data_type(),
@@ -574,6 +573,31 @@ pub(crate) fn lower_file_scan_node(
         .slot_descriptors
         .as_ref()
         .ok_or_else(|| "missing slot_descriptors in descriptor table".to_string())?;
+    let mut source_field_names = Vec::with_capacity(source_slot_ids.len());
+    for source_slot_id in &source_slot_ids {
+        let source_slot_id_i32 = i32::try_from(source_slot_id.as_u32()).map_err(|_| {
+            format!(
+                "FILE_SCAN_NODE node_id={} source slot_id={} overflows i32",
+                node.node_id, source_slot_id
+            )
+        })?;
+        let slot_desc = slot_descs
+            .iter()
+            .find(|slot_desc| {
+                slot_desc.parent == Some(params.src_tuple_id)
+                    && slot_desc.id == Some(source_slot_id_i32)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "FILE_SCAN_NODE node_id={} missing source slot descriptor for tuple_id={} slot_id={}",
+                    node.node_id, params.src_tuple_id, source_slot_id
+                )
+            })?;
+        let field_name = slot_name_from_desc(slot_desc)
+            .unwrap_or_else(|| format!("src_col_{}", source_slot_id.as_u32()));
+        source_field_names.push(field_name);
+    }
+
     let mut output_field_names = Vec::with_capacity(out_layout.order.len());
     let mut output_field_types = Vec::with_capacity(out_layout.order.len());
     for (tuple_id, slot_id) in &out_layout.order {
@@ -635,13 +659,17 @@ pub(crate) fn lower_file_scan_node(
                 node.node_id
             )
         })?;
-        let jsonpaths =
-            parse_jsonpaths(jsonpaths_raw.as_deref(), source_slot_ids.len()).map_err(|e| {
-                format!(
-                    "FILE_SCAN_NODE node_id={} invalid jsonpaths: {e}",
-                    node.node_id
-                )
-            })?;
+        let jsonpaths = parse_jsonpaths(
+            jsonpaths_raw.as_deref(),
+            source_slot_ids.len(),
+            &source_field_names,
+        )
+        .map_err(|e| {
+            format!(
+                "FILE_SCAN_NODE node_id={} invalid jsonpaths: {e}",
+                node.node_id
+            )
+        })?;
         (
             None,
             Some(JsonReadOptions {
@@ -696,8 +724,18 @@ fn single_byte_delimiter(value: &str, name: &str) -> Result<u8, String> {
 fn parse_jsonpaths(
     jsonpaths: Option<&str>,
     expected_columns: usize,
+    source_field_names: &[String],
 ) -> Result<Vec<String>, String> {
-    let raw = jsonpaths.ok_or_else(|| "jsonpaths is required for FORMAT_JSON".to_string())?;
+    if source_field_names.len() != expected_columns {
+        return Err(format!(
+            "source slot count mismatch while parsing jsonpaths: expected={} actual={}",
+            expected_columns,
+            source_field_names.len()
+        ));
+    }
+    let Some(raw) = jsonpaths else {
+        return default_jsonpaths_for_source_columns(source_field_names);
+    };
     let paths: Vec<String> =
         serde_json::from_str(raw).map_err(|e| format!("failed to parse jsonpaths array: {e}"))?;
     if paths.len() != expected_columns {
@@ -710,7 +748,83 @@ fn parse_jsonpaths(
     if paths.iter().any(|path| path.is_empty()) {
         return Err("jsonpaths cannot contain empty path".to_string());
     }
+    if let Some(reordered) = reorder_jsonpaths_by_source_column_names(&paths, source_field_names) {
+        return Ok(reordered);
+    }
     Ok(paths)
+}
+
+fn default_jsonpaths_for_source_columns(
+    source_field_names: &[String],
+) -> Result<Vec<String>, String> {
+    let mut paths = Vec::with_capacity(source_field_names.len());
+    for name in source_field_names {
+        if name.is_empty() {
+            return Err(
+                "source column name is empty; jsonpaths is required for FORMAT_JSON".to_string(),
+            );
+        }
+        if name.contains('.') || name.contains('[') {
+            return Err(format!(
+                "source column `{name}` is ambiguous for default jsonpath; provide explicit `jsonpaths`"
+            ));
+        }
+        paths.push(format!("$.{name}"));
+    }
+    Ok(paths)
+}
+
+fn reorder_jsonpaths_by_source_column_names(
+    paths: &[String],
+    source_field_names: &[String],
+) -> Option<Vec<String>> {
+    if paths.len() != source_field_names.len() {
+        return None;
+    }
+
+    let mut path_idx_by_key = HashMap::<String, usize>::new();
+    for (idx, path) in paths.iter().enumerate() {
+        let key = parse_top_level_jsonpath_key(path)?;
+        let normalized = key.to_ascii_lowercase();
+        if path_idx_by_key.insert(normalized, idx).is_some() {
+            return None;
+        }
+    }
+
+    let mut reordered = Vec::with_capacity(paths.len());
+    for source_name in source_field_names {
+        let normalized = source_name.trim().to_ascii_lowercase();
+        let idx = *path_idx_by_key.get(&normalized)?;
+        reordered.push(paths[idx].clone());
+    }
+    Some(reordered)
+}
+
+fn parse_top_level_jsonpath_key(path: &str) -> Option<&str> {
+    let path = path.trim();
+    if let Some(rest) = path.strip_prefix("$.") {
+        if rest.is_empty() || rest.contains('.') || rest.contains('[') || rest.contains(']') {
+            return None;
+        }
+        return Some(rest);
+    }
+    if let Some(rest) = path.strip_prefix("$['")
+        && let Some(key) = rest.strip_suffix("']")
+    {
+        if key.is_empty() || key.contains('\'') {
+            return None;
+        }
+        return Some(key);
+    }
+    if let Some(rest) = path.strip_prefix("$[\"")
+        && let Some(key) = rest.strip_suffix("\"]")
+    {
+        if key.is_empty() || key.contains('"') {
+            return None;
+        }
+        return Some(key);
+    }
+    None
 }
 
 fn parse_json_rows(payload: &str, strip_outer_array: bool) -> Result<Vec<Value>, String> {
@@ -786,5 +900,50 @@ fn json_value_to_field(value: Option<&Value>) -> Option<String> {
         Some(Value::Bool(v)) => Some(v.to_string()),
         Some(Value::Number(v)) => Some(v.to_string()),
         Some(other) => Some(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_jsonpaths;
+
+    #[test]
+    fn parse_jsonpaths_defaults_to_source_column_names() {
+        let names = vec!["k1".to_string(), "k2".to_string(), "k3".to_string()];
+        let paths = parse_jsonpaths(None, names.len(), &names).expect("default jsonpaths");
+        assert_eq!(
+            paths,
+            vec!["$.k1".to_string(), "$.k2".to_string(), "$.k3".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_jsonpaths_rejects_ambiguous_default_source_column_name() {
+        let names = vec!["root.key".to_string()];
+        let err = parse_jsonpaths(None, names.len(), &names).expect_err("should fail");
+        assert!(err.contains("provide explicit `jsonpaths`"));
+    }
+
+    #[test]
+    fn parse_jsonpaths_reorders_simple_paths_by_source_column_names() {
+        let names = vec!["ts".to_string(), "original_ts".to_string()];
+        let paths = parse_jsonpaths(Some(r#"["$.original_ts","$.ts"]"#), names.len(), &names)
+            .expect("reorder jsonpaths");
+        assert_eq!(paths, vec!["$.ts".to_string(), "$.original_ts".to_string()]);
+    }
+
+    #[test]
+    fn parse_jsonpaths_keeps_order_for_non_top_level_paths() {
+        let names = vec!["ts".to_string(), "original_ts".to_string()];
+        let paths = parse_jsonpaths(
+            Some(r#"["$.meta.original_ts","$.meta.ts"]"#),
+            names.len(),
+            &names,
+        )
+        .expect("keep jsonpaths");
+        assert_eq!(
+            paths,
+            vec!["$.meta.original_ts".to_string(), "$.meta.ts".to_string()]
+        );
     }
 }

@@ -34,7 +34,7 @@ use thrift::transport::{
 };
 
 use crate::common::thrift::thrift_named_json;
-use crate::connector::starrocks::lake::create_lake_tablet_from_req;
+use crate::connector::starrocks::lake::{create_lake_tablet_from_req, execute_alter_tablet_task};
 use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::master_service;
 use crate::novarocks_config::config as novarocks_app_config;
@@ -86,6 +86,7 @@ fn next_report_version() -> i64 {
 
 const CREATE_TABLET_ADD_SHARD_WAIT_MS: u64 = 1_500;
 const CREATE_TABLET_ADD_SHARD_POLL_MS: u64 = 25;
+const ALTER_FAILFAST_ERROR_REPORT_TIMES: usize = 3;
 
 fn submit_task_worker_pool() -> &'static ThreadPool {
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
@@ -218,6 +219,23 @@ fn execute_create_tablet_task(task: &agent_service::TAgentTaskRequest) -> Result
     create_lake_tablet_from_req(req, &shard_info.full_path, shard_info.s3)
 }
 
+fn execute_alter_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
+    let req = task
+        .alter_tablet_req_v2
+        .as_ref()
+        .ok_or_else(|| "alter task missing alter_tablet_req_v2".to_string())?;
+    execute_alter_tablet_task(req)
+}
+
+fn execute_update_tablet_meta_info_task(
+    task: &agent_service::TAgentTaskRequest,
+) -> Result<(), String> {
+    if task.update_tablet_meta_info_req.is_none() {
+        return Err("update_tablet_meta_info task missing update_tablet_meta_info_req".to_string());
+    }
+    Err("update_tablet_meta_info is unsupported in NovaRocks Lake SCHEMA_CHANGE V1".to_string())
+}
+
 fn wait_for_starlet_add_shard(tablet_id: i64) -> Option<starlet_shard_registry::StarletShardInfo> {
     let started_at = Instant::now();
     loop {
@@ -251,11 +269,7 @@ fn process_submit_task(peer: Option<std::net::SocketAddr>, task: agent_service::
         "BackendService.submit_tasks accepted task"
     );
 
-    let task_result = if task.create_tablet_req.is_some() {
-        execute_create_tablet_task(&task).map_err(|err| format!("create_tablet failed: {err}"))
-    } else {
-        Ok(())
-    };
+    let task_result = execute_backend_task(&task);
 
     if let Err(task_err) = &task_result {
         tracing::warn!(
@@ -267,18 +281,53 @@ fn process_submit_task(peer: Option<std::net::SocketAddr>, task: agent_service::
         );
     }
 
-    let task_status = match task_result {
-        Ok(()) => ok_status(),
-        Err(err) => internal_error_status(err),
-    };
-    if let Err(err) = send_finish_task(&task, task_status) {
-        tracing::warn!(
-            peer = ?peer,
-            signature = task.signature,
-            task_type = ?task.task_type,
-            error = %err,
-            "BackendService.submit_tasks failed to report finish_task"
-        );
+    let task_error = task_result.err();
+    let finish_report_times = task_error
+        .as_deref()
+        .map(|err| finish_task_report_times_for_error(task.task_type, err))
+        .unwrap_or(1);
+    for report_attempt in 0..finish_report_times {
+        let task_status = match task_error.as_ref() {
+            Some(err) => internal_error_status(err.clone()),
+            None => ok_status(),
+        };
+        if let Err(err) = send_finish_task(&task, task_status) {
+            tracing::warn!(
+                peer = ?peer,
+                signature = task.signature,
+                task_type = ?task.task_type,
+                report_attempt,
+                error = %err,
+                "BackendService.submit_tasks failed to report finish_task"
+            );
+            break;
+        }
+    }
+}
+
+fn finish_task_report_times_for_error(task_type: types::TTaskType, error: &str) -> usize {
+    if task_type != types::TTaskType::ALTER {
+        return 1;
+    }
+    if error.contains("unsupported") || error.contains("does not support") {
+        return ALTER_FAILFAST_ERROR_REPORT_TIMES;
+    }
+    1
+}
+
+fn execute_backend_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
+    match task.task_type {
+        types::TTaskType::CREATE => {
+            execute_create_tablet_task(&task).map_err(|err| format!("create_tablet failed: {err}"))
+        }
+        types::TTaskType::ALTER => {
+            execute_alter_task(&task).map_err(|err| format!("alter task failed: {err}"))
+        }
+        types::TTaskType::UPDATE_TABLET_META_INFO => execute_update_tablet_meta_info_task(&task)
+            .map_err(|err| format!("update_tablet_meta_info failed: {err}")),
+        other => Err(format!(
+            "unsupported backend task_type={other:?} in submit_tasks"
+        )),
     }
 }
 
@@ -679,4 +728,219 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
         .map_err(|e| format!("Failed to spawn backend service thread: {e}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol, TSerializable};
+    use thrift::transport::{TBufferChannel, TIoChannel};
+
+    use super::{execute_backend_task, finish_task_report_times_for_error};
+    use crate::{agent_service, descriptors, types};
+
+    fn test_task(task_type: types::TTaskType) -> agent_service::TAgentTaskRequest {
+        agent_service::TAgentTaskRequest {
+            protocol_version: agent_service::TAgentServiceVersion::V1,
+            task_type,
+            signature: 1,
+            priority: None,
+            create_tablet_req: None,
+            drop_tablet_req: None,
+            alter_tablet_req: None,
+            clone_req: None,
+            push_req: None,
+            cancel_delete_data_req: None,
+            resource_info: None,
+            storage_medium_migrate_req: None,
+            check_consistency_req: None,
+            upload_req: None,
+            download_req: None,
+            snapshot_req: None,
+            release_snapshot_req: None,
+            clear_remote_file_req: None,
+            publish_version_req: None,
+            clear_alter_task_req: None,
+            clear_transaction_task_req: None,
+            move_dir_req: None,
+            recover_tablet_req: None,
+            alter_tablet_req_v2: None,
+            recv_time: None,
+            update_tablet_meta_info_req: None,
+            drop_auto_increment_map_req: None,
+            compaction_req: None,
+            remote_snapshot_req: None,
+            replicate_snapshot_req: None,
+            update_schema_req: None,
+            compaction_control_req: None,
+        }
+    }
+
+    fn test_tablet_schema() -> agent_service::TTabletSchema {
+        agent_service::TTabletSchema {
+            short_key_column_count: 1,
+            schema_hash: 2001,
+            keys_type: types::TKeysType::DUP_KEYS,
+            storage_type: types::TStorageType::COLUMN,
+            columns: vec![descriptors::TColumn {
+                column_name: "c1".to_string(),
+                column_type: None,
+                aggregation_type: None,
+                is_key: Some(true),
+                is_allow_null: Some(false),
+                default_value: None,
+                is_bloom_filter_column: None,
+                define_expr: None,
+                is_auto_increment: Some(false),
+                col_unique_id: Some(1),
+                has_bitmap_index: None,
+                agg_state_desc: None,
+                index_len: None,
+                type_desc: None,
+            }],
+            bloom_filter_fpp: None,
+            indexes: None,
+            is_in_memory: None,
+            id: Some(7),
+            sort_key_idxes: Some(vec![0]),
+            sort_key_unique_ids: Some(vec![1]),
+            schema_version: Some(1),
+            compression_type: None,
+            compression_level: None,
+        }
+    }
+
+    fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Vec<u8> {
+        let channel = TBufferChannel::with_capacity(0, 1024);
+        let (_, w) = channel.split().expect("split TBufferChannel");
+        let mut protocol = TBinaryOutputProtocol::new(w, true);
+        value
+            .write_to_out_protocol(&mut protocol)
+            .expect("thrift binary serialize");
+        protocol.transport.write_bytes()
+    }
+
+    fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> T {
+        let mut channel = TBufferChannel::with_capacity(bytes.len(), 1024);
+        channel.set_readable_bytes(bytes);
+        let (r, _) = channel.split().expect("split TBufferChannel");
+        let mut protocol = TBinaryInputProtocol::new(r, true);
+        T::read_from_in_protocol(&mut protocol).expect("thrift binary deserialize")
+    }
+
+    #[test]
+    fn execute_backend_task_fails_fast_for_alter_without_request() {
+        let task = test_task(types::TTaskType::ALTER);
+        let err = execute_backend_task(&task).expect_err("alter without req must fail");
+        assert!(
+            err.contains("alter task failed"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_backend_task_fails_fast_for_update_meta_task() {
+        let mut task = test_task(types::TTaskType::UPDATE_TABLET_META_INFO);
+        task.update_tablet_meta_info_req = Some(agent_service::TUpdateTabletMetaInfoReq::new(
+            None::<Vec<agent_service::TTabletMetaInfo>>,
+            Some(agent_service::TTabletType::TABLET_TYPE_LAKE),
+            Some(99_i64),
+        ));
+        let err = execute_backend_task(&task).expect_err("update_meta must fail in V1");
+        assert!(
+            err.contains("update_tablet_meta_info failed"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_backend_task_fails_fast_for_unsupported_task_type() {
+        let task = test_task(types::TTaskType::PUSH);
+        let err = execute_backend_task(&task).expect_err("unsupported task must fail");
+        assert!(
+            err.contains("unsupported backend task_type"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn finish_task_report_times_for_error_retries_unsupported_alter() {
+        let reports = finish_task_report_times_for_error(
+            types::TTaskType::ALTER,
+            "alter task failed: alter task unsupported alter_job_type=TAlterJobType(0)",
+        );
+        assert_eq!(reports, 3);
+    }
+
+    #[test]
+    fn finish_task_report_times_for_error_keeps_single_report_for_non_alter() {
+        let reports = finish_task_report_times_for_error(
+            types::TTaskType::CREATE,
+            "create_tablet failed: something failed",
+        );
+        assert_eq!(reports, 1);
+    }
+
+    #[test]
+    fn alter_req_v2_roundtrip_with_base_tablet_read_schema() {
+        let schema = test_tablet_schema();
+        let req = agent_service::TAlterTabletReqV2::new(
+            11_i64,
+            22_i64,
+            101_i32,
+            202_i32,
+            Some(7_i64),
+            None::<Vec<agent_service::TAlterMaterializedViewParam>>,
+            Some(agent_service::TTabletType::TABLET_TYPE_LAKE),
+            Some(333_i64),
+            None::<agent_service::TAlterTabletMaterializedColumnReq>,
+            None::<i64>,
+            None::<crate::internal_service::TQueryGlobals>,
+            None::<crate::internal_service::TQueryOptions>,
+            None::<Vec<descriptors::TColumn>>,
+            Some(agent_service::TAlterJobType::SCHEMA_CHANGE),
+            None::<descriptors::TDescriptorTable>,
+            None::<crate::exprs::TExpr>,
+            None::<Vec<String>>,
+            Some(schema.clone()),
+        );
+
+        let bytes = thrift_binary_serialize(&req);
+        let decoded: agent_service::TAlterTabletReqV2 = thrift_binary_deserialize(&bytes);
+        let decoded_schema = decoded
+            .base_tablet_read_schema
+            .expect("base_tablet_read_schema should be preserved");
+        assert_eq!(decoded_schema.schema_hash, schema.schema_hash);
+        assert_eq!(decoded_schema.columns.len(), schema.columns.len());
+    }
+
+    #[test]
+    fn alter_req_v2_roundtrip_without_base_tablet_read_schema() {
+        let req = agent_service::TAlterTabletReqV2::new(
+            31_i64,
+            32_i64,
+            301_i32,
+            302_i32,
+            Some(9_i64),
+            None::<Vec<agent_service::TAlterMaterializedViewParam>>,
+            Some(agent_service::TTabletType::TABLET_TYPE_LAKE),
+            Some(444_i64),
+            None::<agent_service::TAlterTabletMaterializedColumnReq>,
+            None::<i64>,
+            None::<crate::internal_service::TQueryGlobals>,
+            None::<crate::internal_service::TQueryOptions>,
+            None::<Vec<descriptors::TColumn>>,
+            Some(agent_service::TAlterJobType::SCHEMA_CHANGE),
+            None::<descriptors::TDescriptorTable>,
+            None::<crate::exprs::TExpr>,
+            None::<Vec<String>>,
+            None::<agent_service::TTabletSchema>,
+        );
+
+        let bytes = thrift_binary_serialize(&req);
+        let decoded: agent_service::TAlterTabletReqV2 = thrift_binary_deserialize(&bytes);
+        assert!(
+            decoded.base_tablet_read_schema.is_none(),
+            "base_tablet_read_schema should stay None when not provided"
+        );
+    }
 }

@@ -30,7 +30,7 @@ use arrow::array::{
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
@@ -43,8 +43,9 @@ use crate::connector::starrocks::sink::factory::{
     OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, create_automatic_partitions,
 };
 use crate::connector::starrocks::sink::partition_key::{
-    PartitionKeySource, PartitionMode, PartitionRoutingEntry, PartitionSlotRef,
-    parse_partition_boundary_key, parse_partition_in_keys, validate_partition_key_length,
+    PartitionKeySource, PartitionMode, PartitionRoutingEntry, build_partition_key_arrays,
+    parse_partition_boundary_key, parse_partition_in_keys, partition_key_source_len,
+    validate_partition_key_length,
 };
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, route_chunk_rows};
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
@@ -73,6 +74,7 @@ pub(crate) struct OlapTableSinkOperator {
     tablet_commit_infos: Vec<types::TTabletCommitInfo>,
     seen_partition_values: HashSet<Vec<String>>,
     auto_partition_initialized: bool,
+    auto_partition_debug_logged: bool,
     input_rows: i64,
     finished: bool,
     written_tablets: HashSet<i64>,
@@ -320,6 +322,7 @@ impl OlapTableSinkOperator {
             tablet_commit_infos,
             seen_partition_values: HashSet::new(),
             auto_partition_initialized: false,
+            auto_partition_debug_logged: false,
             input_rows: 0,
             finished: false,
             written_tablets: HashSet::new(),
@@ -555,8 +558,68 @@ impl OlapTableSinkOperator {
             if chunk.is_empty() {
                 continue;
             }
-            let chunk_values =
-                collect_partition_values_from_chunk(chunk, &auto_partition.partition_slot_ids)?;
+            let (source_kind, chunk_values) = match &auto_partition.partition_key_source {
+                PartitionKeySource::Expr(_) => {
+                    let arrays =
+                        build_partition_key_arrays(&auto_partition.partition_key_source, chunk)?;
+                    if arrays.len() != auto_partition.partition_column_names.len() {
+                        return Err(format!(
+                            "OLAP_TABLE_SINK automatic partition expression count mismatch: exprs={} partition_columns={}",
+                            arrays.len(),
+                            auto_partition.partition_column_names.len()
+                        ));
+                    }
+                    (
+                        "expr",
+                        collect_partition_values_from_arrays(&arrays, chunk.len())?,
+                    )
+                }
+                PartitionKeySource::SlotRefs(_) => (
+                    "slot_refs",
+                    collect_partition_values_from_chunk(
+                        chunk,
+                        &auto_partition.partition_slot_ids,
+                        &auto_partition.partition_column_names,
+                    )?,
+                ),
+                PartitionKeySource::None if !auto_partition.partition_slot_ids.is_empty() => (
+                    "slot_refs_fallback",
+                    collect_partition_values_from_chunk(
+                        chunk,
+                        &auto_partition.partition_slot_ids,
+                        &auto_partition.partition_column_names,
+                    )?,
+                ),
+                PartitionKeySource::None => ("none", BTreeSet::new()),
+            };
+            if !self.auto_partition_debug_logged {
+                let field_summary = chunk
+                    .batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, field)| {
+                        let slot_id = field_slot_id(field.as_ref())
+                            .ok()
+                            .flatten()
+                            .map(|slot| slot.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        format!("{idx}:{}(slot={slot_id})", field.name())
+                    })
+                    .collect::<Vec<_>>();
+                info!(
+                    target: "novarocks::starrocks::sink",
+                    table_id = self.plan.table_id,
+                    txn_id = self.plan.txn_id,
+                    partition_key_source = source_kind,
+                    partition_columns = ?auto_partition.partition_column_names,
+                    configured_partition_slot_ids = ?auto_partition.partition_slot_ids,
+                    chunk_fields = ?field_summary,
+                    "OLAP_TABLE_SINK auto partition chunk field layout"
+                );
+                self.auto_partition_debug_logged = true;
+            }
             for values in chunk_values {
                 if self.seen_partition_values.contains(&values) {
                     continue;
@@ -582,7 +645,8 @@ impl OlapTableSinkOperator {
                 auto_partition.table_id,
                 auto_partition.txn_id,
                 vec![partition_values.clone()],
-            )?;
+            )
+            .map_err(|e| format!("OLAP_TABLE_SINK runtime automatic partition failed: {e}"))?;
             self.ingest_auto_partition_response(&auto_partition, response)?;
             self.seen_partition_values.insert(partition_values);
         }
@@ -599,6 +663,7 @@ impl OlapTableSinkOperator {
 
         let mut new_partitions = Vec::<PartitionRoutingEntry>::new();
         let mut tablet_to_partition = HashMap::<i64, i64>::new();
+        let partition_key_len = partition_key_source_len(&auto_partition.partition_key_source);
         for partition in partitions {
             if partition.is_shadow_partition.unwrap_or(false) {
                 continue;
@@ -630,7 +695,7 @@ impl OlapTableSinkOperator {
             let in_keys = parse_partition_in_keys(partition.in_keys.as_deref())?;
             validate_partition_key_length(
                 partition.id,
-                auto_partition.partition_slot_ids.len(),
+                partition_key_len,
                 start_key.as_deref(),
                 end_key.as_deref(),
                 &in_keys,
@@ -671,18 +736,8 @@ impl OlapTableSinkOperator {
         }
 
         if self.auto_partition_initialized {
-            self.row_routing.partition_key_source = PartitionKeySource::SlotRefs(
-                auto_partition
-                    .partition_slot_ids
-                    .iter()
-                    .zip(auto_partition.partition_column_names.iter())
-                    .map(|(slot_id, column_name)| PartitionSlotRef {
-                        slot_id: *slot_id,
-                        column_name: column_name.clone(),
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            self.row_routing.partition_key_len = auto_partition.partition_slot_ids.len();
+            self.row_routing.partition_key_source = auto_partition.partition_key_source.clone();
+            self.row_routing.partition_key_len = partition_key_len;
 
             let has_any_in_keys = self
                 .row_routing
@@ -1244,23 +1299,101 @@ impl ProcessorOperator for OlapTableSinkOperator {
 fn collect_partition_values_from_chunk(
     chunk: &Chunk,
     slot_ids: &[SlotId],
+    column_names: &[String],
 ) -> Result<BTreeSet<Vec<String>>, String> {
     if slot_ids.is_empty() {
         return Ok(BTreeSet::new());
     }
+    if slot_ids.len() != column_names.len() {
+        return Err(format!(
+            "OLAP_TABLE_SINK partition slot/name count mismatch: slot_ids={} column_names={}",
+            slot_ids.len(),
+            column_names.len()
+        ));
+    }
+
+    let mut slot_to_index = HashMap::<SlotId, usize>::new();
+    let mut name_to_index = HashMap::<String, usize>::new();
+    for (idx, field) in chunk.batch.schema().fields().iter().enumerate() {
+        if let Some(slot_id) = field_slot_id(field.as_ref())? {
+            slot_to_index.entry(slot_id).or_insert(idx);
+        }
+        let normalized_name = field.name().trim().to_ascii_lowercase();
+        if !normalized_name.is_empty() {
+            name_to_index.entry(normalized_name).or_insert(idx);
+        }
+    }
+
     let mut arrays = Vec::<ArrayRef>::with_capacity(slot_ids.len());
-    for slot_id in slot_ids {
-        arrays.push(chunk.column_by_slot_id(*slot_id).map_err(|e| {
-            format!(
-                "OLAP_TABLE_SINK partition slot {} is not available in chunk: {}",
-                slot_id, e
-            )
-        })?);
+    for (slot_id, column_name) in slot_ids.iter().zip(column_names.iter()) {
+        let normalized_name = column_name.trim().to_ascii_lowercase();
+        let by_slot = slot_to_index.get(slot_id).copied();
+        let by_name = name_to_index.get(&normalized_name).copied();
+        let selected_idx = match (by_slot, by_name) {
+            (Some(slot_idx), Some(name_idx)) => {
+                if slot_idx == name_idx {
+                    slot_idx
+                } else {
+                    name_idx
+                }
+            }
+            (Some(slot_idx), None) => slot_idx,
+            (None, Some(name_idx)) => name_idx,
+            (None, None) => {
+                return Err(format!(
+                    "OLAP_TABLE_SINK partition column '{}' is not available in chunk by slot_id={} or field name",
+                    column_name, slot_id
+                ));
+            }
+        };
+        arrays.push(
+            chunk
+                .batch
+                .columns()
+                .get(selected_idx)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "OLAP_TABLE_SINK partition column '{}' resolved invalid column index {}",
+                        column_name, selected_idx
+                    )
+                })?,
+        );
     }
     let mut out = BTreeSet::<Vec<String>>::new();
     for row in 0..chunk.len() {
         let mut values = Vec::with_capacity(arrays.len());
         for array in &arrays {
+            if array.is_null(row) {
+                values.push(STARROCKS_DEFAULT_PARTITION_VALUE.to_string());
+            } else {
+                values.push(partition_scalar_value_to_string(array.as_ref(), row)?);
+            }
+        }
+        out.insert(values);
+    }
+    Ok(out)
+}
+
+fn collect_partition_values_from_arrays(
+    arrays: &[ArrayRef],
+    row_count: usize,
+) -> Result<BTreeSet<Vec<String>>, String> {
+    if arrays.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    if arrays.iter().any(|array| array.len() < row_count) {
+        return Err(format!(
+            "OLAP_TABLE_SINK partition arrays are shorter than row_count: row_count={} min_array_len={}",
+            row_count,
+            arrays.iter().map(|array| array.len()).min().unwrap_or(0)
+        ));
+    }
+
+    let mut out = BTreeSet::<Vec<String>>::new();
+    for row in 0..row_count {
+        let mut values = Vec::with_capacity(arrays.len());
+        for array in arrays {
             if array.is_null(row) {
                 values.push(STARROCKS_DEFAULT_PARTITION_VALUE.to_string());
             } else {
@@ -1279,14 +1412,14 @@ fn partition_scalar_value_to_string(array: &dyn Array, row: usize) -> Result<Str
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| "downcast StringArray failed".to_string())?;
-            Ok(typed.value(row).to_string())
+            Ok(normalize_text_partition_value(typed.value(row)))
         }
         DataType::LargeUtf8 => {
             let typed = array
                 .as_any()
                 .downcast_ref::<LargeStringArray>()
                 .ok_or_else(|| "downcast LargeStringArray failed".to_string())?;
-            Ok(typed.value(row).to_string())
+            Ok(normalize_text_partition_value(typed.value(row)))
         }
         DataType::Int8 => {
             let typed = array
@@ -1418,11 +1551,48 @@ fn format_timestamp_micros_for_partition_value(micros_since_epoch: i64) -> Resul
     if micros == 0 {
         return Ok(base);
     }
-    let mut frac = format!("{micros:06}");
-    while frac.ends_with('0') {
-        frac.pop();
+    // Keep fixed-width micros to avoid FE datetime format probe failures
+    // on values with short fractions (for example `...13.44`).
+    Ok(format!("{base}.{micros:06}"))
+}
+
+fn normalize_text_partition_value(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return value.to_string();
     }
-    Ok(format!("{base}.{frac}"))
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return format_naive_datetime_partition_value(dt.naive_utc());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+        return format_naive_datetime_partition_value(dt);
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        return date.format("%Y-%m-%d").to_string();
+    }
+    value.to_string()
+}
+
+fn format_naive_datetime_partition_value(dt: NaiveDateTime) -> String {
+    let base = dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    let micros = dt.and_utc().timestamp_subsec_micros();
+    if micros == 0 {
+        base
+    } else {
+        // Keep a fixed-width fractional part to avoid FE datetime format probe failures
+        // on strings like `...13.44`.
+        format!("{base}.{micros:06}")
+    }
 }
 
 fn format_decimal_for_partition_value(value: i128, scale: i8) -> Result<String, String> {
@@ -1575,7 +1745,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int8Array, Int32Array, Int64Array};
+    use arrow::array::{
+        ArrayRef, Int8Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use tempfile::tempdir;
@@ -2364,5 +2536,77 @@ mod tests {
             .expect("c1 int64");
         assert_eq!(c0.value(0), 1);
         assert_eq!(c1.value(0), 1);
+    }
+
+    #[test]
+    fn partition_scalar_value_normalizes_utf8_datetime_fraction() {
+        let values = StringArray::from(vec![
+            "2024-08-30 19:02:13.44",
+            "2024-08-30 19:02:13",
+            "2024-08-30T19:02:13.44Z",
+            "not-a-datetime",
+        ]);
+
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 0).expect("normalize fraction"),
+            "2024-08-30 19:02:13.440000"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 1).expect("keep full seconds"),
+            "2024-08-30 19:02:13"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 2).expect("normalize rfc3339"),
+            "2024-08-30 19:02:13.440000"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 3).expect("keep plain text"),
+            "not-a-datetime"
+        );
+    }
+
+    #[test]
+    fn partition_scalar_value_formats_timestamp_with_fixed_micros() {
+        let micros =
+            chrono::NaiveDateTime::parse_from_str("2024-08-30 19:02:13.44", "%Y-%m-%d %H:%M:%S%.f")
+                .expect("parse datetime")
+                .and_utc()
+                .timestamp_micros();
+        let values = TimestampMicrosecondArray::from(vec![micros]);
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 0).expect("format timestamp"),
+            "2024-08-30 19:02:13.440000"
+        );
+    }
+
+    #[test]
+    fn collect_partition_values_prefers_column_name_when_slot_binding_mismatches() {
+        let schema = Arc::new(Schema::new(vec![
+            field_with_slot_id(Field::new("ts", DataType::Utf8, true), SlotId::new(9)),
+            field_with_slot_id(
+                Field::new("original_ts", DataType::Utf8, true),
+                SlotId::new(0),
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["2024-08-30T19:02:13.44Z"])),
+                Arc::new(StringArray::from(vec!["2024-08-22 23:48:13.44"])),
+            ],
+        )
+        .expect("build partition value batch");
+        let chunk = Chunk::try_new(batch).expect("build chunk");
+
+        let values = super::collect_partition_values_from_chunk(
+            &chunk,
+            &[SlotId::new(0)],
+            &[String::from("ts")],
+        )
+        .expect("collect partition values");
+        assert_eq!(
+            values.into_iter().collect::<Vec<_>>(),
+            vec![vec!["2024-08-30 19:02:13.440000".to_string()]]
+        );
     }
 }

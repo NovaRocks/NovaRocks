@@ -81,6 +81,26 @@ int32_t novarocks_rs_lake_publish_version(const uint8_t* ptr,
                                         NovaRocksRustBuf* out_resp,
                                         NovaRocksRustBuf* out_err);
 
+// lake_service.proto PublishLogVersionRequest -> PublishLogVersionResponse (protobuf bytes).
+// Returns:
+// - 0: OK
+// - 1: execution failed (out_err set)
+// - 2: invalid request/decode failure (out_err set)
+int32_t novarocks_rs_lake_publish_log_version(const uint8_t* ptr,
+                                              size_t len,
+                                              NovaRocksRustBuf* out_resp,
+                                              NovaRocksRustBuf* out_err);
+
+// lake_service.proto PublishLogVersionBatchRequest -> PublishLogVersionResponse (protobuf bytes).
+// Returns:
+// - 0: OK
+// - 1: execution failed (out_err set)
+// - 2: invalid request/decode failure (out_err set)
+int32_t novarocks_rs_lake_publish_log_version_batch(const uint8_t* ptr,
+                                                    size_t len,
+                                                    NovaRocksRustBuf* out_resp,
+                                                    NovaRocksRustBuf* out_err);
+
 // lake_service.proto AbortTxnRequest -> AbortTxnResponse (protobuf bytes).
 // Returns:
 // - 0: OK

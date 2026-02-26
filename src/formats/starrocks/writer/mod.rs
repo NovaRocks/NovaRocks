@@ -45,7 +45,7 @@ impl StarRocksWriteFormat {
 pub use layout::{
     build_data_file_name, build_txn_data_file_name, bundle_meta_file_path,
     combined_txn_log_file_path, join_tablet_path, txn_log_file_path,
-    txn_log_file_path_with_load_id,
+    txn_log_file_path_with_load_id, txn_vlog_file_path,
 };
 pub use parquet::{read_bundle_parquet_snapshot_if_any, write_parquet_file};
 pub use segment_data::build_starrocks_native_segment_bytes;

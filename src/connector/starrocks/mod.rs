@@ -6,4 +6,4 @@ pub mod sink;
 
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::build_native_object_store_profile_from_properties;
-pub use scan::{StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};
+pub use scan::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};

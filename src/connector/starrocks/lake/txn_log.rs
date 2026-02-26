@@ -1369,7 +1369,9 @@ fn normalize_identifier(raw: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn build_tablet_output_schema(tablet_schema: &TabletSchemaPb) -> Result<SchemaRef, String> {
+pub(crate) fn build_tablet_output_schema(
+    tablet_schema: &TabletSchemaPb,
+) -> Result<SchemaRef, String> {
     let mut fields = Vec::with_capacity(tablet_schema.column.len());
     for (idx, column) in tablet_schema.column.iter().enumerate() {
         let name = column
@@ -1631,7 +1633,7 @@ fn apply_existing_txn_log_overlay(
     Ok(())
 }
 
-fn load_rowset_batch_for_partial_update(
+pub(crate) fn load_rowset_batch_for_partial_update(
     ctx: &TabletWriteContext,
     rowset: &RowsetMetadataPb,
     output_schema: &SchemaRef,
@@ -2011,7 +2013,7 @@ fn resolve_default_literal_for_column(
         .map(|raw| String::from_utf8_lossy(raw).to_string())
 }
 
-fn parse_default_literal_to_singleton_array(
+pub(crate) fn parse_default_literal_to_singleton_array(
     data_type: &DataType,
     literal: &str,
 ) -> Result<ArrayRef, String> {

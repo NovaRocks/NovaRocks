@@ -50,7 +50,7 @@ use crate::connector::starrocks::sink::operator::{
     OlapSinkFinalizeSharedState, OlapTableSinkOperator,
 };
 use crate::connector::starrocks::sink::partition_key::{
-    build_slot_name_map, resolve_slot_ids_by_names,
+    PartitionKeySource, build_partition_key_source, build_slot_name_map, resolve_slot_ids_by_names,
 };
 use crate::connector::starrocks::sink::routing::{RowRoutingPlan, build_sink_routing};
 use crate::exec::expr::{ExprArena, ExprId};
@@ -122,6 +122,7 @@ pub(crate) struct AutomaticPartitionPlan {
     pub(crate) schema_id: i64,
     pub(crate) txn_id: i64,
     pub(crate) fe_addr: types::TNetworkAddress,
+    pub(crate) partition_key_source: PartitionKeySource,
     pub(crate) partition_column_names: Vec<String>,
     pub(crate) partition_slot_ids: Vec<SlotId>,
     pub(crate) candidate_index_ids: HashSet<i64>,
@@ -310,6 +311,16 @@ fn maybe_create_automatic_partitions_for_literal_insert(
     if !sink.partition.enable_automatic_partition.unwrap_or(false) {
         return Ok(());
     }
+    if sink
+        .partition
+        .partition_exprs
+        .as_ref()
+        .is_some_and(|exprs| !exprs.is_empty())
+    {
+        // For expression partitions, runtime automatic partition discovery should use
+        // evaluated partition expr outputs from incoming chunks.
+        return Ok(());
+    }
 
     let partition_columns = resolve_partition_columns_for_write(&sink.partition);
     if partition_columns.is_empty() {
@@ -364,7 +375,8 @@ fn maybe_create_automatic_partitions_for_literal_insert(
         sink.table_id,
         sink.txn_id,
         vec![partition_values],
-    )?;
+    )
+    .map_err(|e| format!("OLAP_TABLE_SINK precreate automatic partition failed: {e}"))?;
     info!(
         target: "novarocks::starrocks::sink",
         table_id = sink.table_id,
@@ -431,14 +443,9 @@ fn build_auto_partition_plan(
     if !has_shadow_partition {
         return Ok(None);
     }
-    let has_visible_partition = sink
-        .partition
-        .partitions
-        .iter()
-        .any(|part| !part.is_shadow_partition.unwrap_or(false));
-    if has_visible_partition {
-        return Ok(None);
-    }
+    // Automatic partition tables may carry both visible and shadow partitions.
+    // Keep runtime createPartition enabled as long as FE marks this table with
+    // shadow partition metadata.
 
     let partition_column_names = resolve_partition_columns_for_write(&sink.partition);
     if partition_column_names.is_empty() {
@@ -451,6 +458,17 @@ fn build_auto_partition_plan(
     } else {
         Some(&output_expr_slot_map)
     };
+    let output_expr_slot_id_overrides = build_output_expr_slot_id_overrides_for_write(
+        &sink.schema.slot_descs,
+        slot_name_overrides,
+    )?;
+    let slot_id_overrides = if output_expr_slot_id_overrides.is_empty() {
+        None
+    } else {
+        Some(&output_expr_slot_id_overrides)
+    };
+    let partition_key_source =
+        build_partition_key_source(sink, slot_name_overrides, slot_id_overrides)?;
     let partition_slot_ids = resolve_slot_ids_by_names(
         &sink.schema.slot_descs,
         &partition_column_names,
@@ -485,6 +503,7 @@ fn build_auto_partition_plan(
         schema_id,
         txn_id: sink.txn_id,
         fe_addr,
+        partition_key_source,
         partition_column_names,
         partition_slot_ids,
         candidate_index_ids,
@@ -1066,6 +1085,30 @@ fn build_output_expr_slot_name_map_for_write(
     Ok(slot_map)
 }
 
+fn build_output_expr_slot_id_overrides_for_write(
+    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_name_overrides: Option<&HashMap<String, SlotId>>,
+) -> Result<HashMap<SlotId, SlotId>, String> {
+    let Some(slot_name_overrides) = slot_name_overrides else {
+        return Ok(HashMap::new());
+    };
+    if slot_name_overrides.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let schema_slot_by_name = build_slot_name_map(slot_descs)?;
+    let mut slot_id_overrides = HashMap::new();
+    for (column_name, schema_slot_id) in schema_slot_by_name {
+        let Some(output_slot_id) = slot_name_overrides.get(&column_name).copied() else {
+            continue;
+        };
+        if output_slot_id != schema_slot_id {
+            slot_id_overrides.insert(schema_slot_id, output_slot_id);
+        }
+    }
+    Ok(slot_id_overrides)
+}
+
 fn resolve_output_expr_slot_ids_for_write(
     output_exprs: Option<&[exprs::TExpr]>,
 ) -> Result<Vec<Option<SlotId>>, String> {
@@ -1101,6 +1144,12 @@ fn build_output_projection_plan(
     let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
         return Ok(None);
     };
+    // Slot-ref-only output exprs do not need an extra projection stage.
+    // Keeping the original upstream slot ids avoids accidental remapping when
+    // FE expr order does not match sink slot descriptor order.
+    if output_exprs_are_plain_slot_refs(output_exprs) {
+        return Ok(None);
+    }
     let layout = layout.ok_or_else(|| {
         "OLAP_TABLE_SINK requires layout for output expression projection".to_string()
     })?;
@@ -1128,10 +1177,23 @@ fn build_output_projection_plan(
     }))
 }
 
+fn output_exprs_are_plain_slot_refs(output_exprs: &[exprs::TExpr]) -> bool {
+    output_exprs.iter().all(|expr| {
+        expr.nodes.len() == 1
+            && expr.nodes.first().is_some_and(|node| {
+                node.node_type == exprs::TExprNodeType::SLOT_REF && node.slot_ref.is_some()
+            })
+    })
+}
+
 fn resolve_output_projection_slots(
     sink: &data_sinks::TOlapTableSink,
     output_exprs: &[exprs::TExpr],
 ) -> Result<Vec<(SlotId, String)>, String> {
+    if let Some(mapped) = resolve_slots_from_expr_output_column(sink, output_exprs)? {
+        return Ok(mapped);
+    }
+
     let collect_named_slots = |skip_load_op: bool| -> Result<Vec<(SlotId, String)>, String> {
         let mut out = Vec::new();
         for (idx, slot_desc) in sink.schema.slot_descs.iter().enumerate() {
@@ -1245,6 +1307,60 @@ fn resolve_output_projection_slots(
         expr_slots.push((slot_id, name));
     }
     Ok(expr_slots)
+}
+
+fn resolve_slots_from_expr_output_column(
+    sink: &data_sinks::TOlapTableSink,
+    output_exprs: &[exprs::TExpr],
+) -> Result<Option<Vec<(SlotId, String)>>, String> {
+    if output_exprs.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut out = Vec::with_capacity(output_exprs.len());
+    for (expr_idx, expr) in output_exprs.iter().enumerate() {
+        let Some(root) = expr.nodes.first() else {
+            return Ok(None);
+        };
+        let Some(output_column) = root.output_column else {
+            return Ok(None);
+        };
+        if output_column < 0 {
+            return Ok(None);
+        }
+        let output_idx = usize::try_from(output_column).map_err(|_| {
+            format!(
+                "OLAP_TABLE_SINK output_exprs[{}] has invalid output_column={}",
+                expr_idx, output_column
+            )
+        })?;
+        let Some(slot_desc) = sink.schema.slot_descs.get(output_idx) else {
+            return Ok(None);
+        };
+        let Some(slot_id_i32) = slot_desc.id else {
+            return Ok(None);
+        };
+        if slot_id_i32 < 0 {
+            return Ok(None);
+        }
+        let slot_id = SlotId::try_from(slot_id_i32)?;
+        let name = slot_desc
+            .col_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|name| {
+                if name.eq_ignore_ascii_case(LOAD_OP_COLUMN) {
+                    LOAD_OP_COLUMN.to_string()
+                } else {
+                    name.to_string()
+                }
+            })
+            .unwrap_or_else(|| format!("col_{output_idx}"));
+        out.push((slot_id, name));
+    }
+
+    Ok(Some(out))
 }
 
 fn resolve_schema_slot_ids_by_ordinal(

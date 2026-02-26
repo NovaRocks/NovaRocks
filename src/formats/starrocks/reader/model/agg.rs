@@ -30,18 +30,18 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
-    Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder, Float64Array,
-    Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder,
-    Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampMicrosecondBuilder, new_empty_array,
+    new_empty_array, Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder,
+    Date32Array, Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder,
+    Float64Array, Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array,
+    Int64Builder, Int8Array, Int8Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
+    TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
 
-use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
+use crate::connector::MinMaxPredicate;
 use crate::formats::starrocks::plan::{
     StarRocksNativeColumnPlan, StarRocksNativeGroupKeyColumnPlan, StarRocksNativeReadPlan,
     StarRocksTableModelPlan,
@@ -162,6 +162,8 @@ fn build_agg_scan_plan(
             schema: key.schema.clone(),
             flat_json_projection: None,
             source_column_missing: false,
+            fallback_default_literal: None,
+            fallback_is_nullable: key.schema.is_nullable,
         });
         index_by_unique.insert(key.schema_unique_id, output_index);
     }
@@ -1601,6 +1603,8 @@ mod tests {
                     },
                     flat_json_projection: None,
                     source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
                 },
                 StarRocksNativeColumnPlan {
                     output_index: 1,
@@ -1619,6 +1623,8 @@ mod tests {
                     },
                     flat_json_projection: None,
                     source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
                 },
             ],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
@@ -1707,6 +1713,8 @@ mod tests {
                 },
                 flat_json_projection: None,
                 source_column_missing: false,
+                fallback_default_literal: None,
+                fallback_is_nullable: true,
             }],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
                 output_name: "k1".to_string(),
@@ -1774,6 +1782,8 @@ mod tests {
                 },
                 flat_json_projection: None,
                 source_column_missing: false,
+                fallback_default_literal: None,
+                fallback_is_nullable: true,
             }],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
                 output_name: "c1".to_string(),
@@ -1859,6 +1869,8 @@ mod tests {
                     },
                     flat_json_projection: None,
                     source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
                 },
                 StarRocksNativeColumnPlan {
                     output_index: 1,
@@ -1877,6 +1889,8 @@ mod tests {
                     },
                     flat_json_projection: None,
                     source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
                 },
             ],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
@@ -1965,6 +1979,8 @@ mod tests {
                     },
                     flat_json_projection: None,
                     source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
                 },
                 StarRocksNativeColumnPlan {
                     output_index: 1,
@@ -1983,6 +1999,8 @@ mod tests {
                     },
                     flat_json_projection: None,
                     source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
                 },
             ],
             group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
