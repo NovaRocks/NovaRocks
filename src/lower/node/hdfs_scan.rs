@@ -168,6 +168,8 @@ where
     S: std::borrow::Borrow<str> + Ord,
 {
     let props = cloud_props?;
+    let retry_settings =
+        crate::fs::object_store::ObjectStoreRetrySettings::from_aws_s3_props(cloud_props);
     let get = |key: &str| {
         props
             .get(key)
@@ -206,7 +208,7 @@ where
         })
         .unwrap_or_default();
 
-    Some(crate::fs::object_store::ObjectStoreConfig {
+    let mut cfg = crate::fs::object_store::ObjectStoreConfig {
         endpoint,
         bucket,
         root: String::new(),
@@ -215,12 +217,14 @@ where
         session_token: None,
         enable_path_style_access,
         region,
-        retry_max_times: None,
-        retry_min_delay_ms: None,
-        retry_max_delay_ms: None,
-        timeout_ms: None,
-        io_timeout_ms: None,
-    })
+        retry_max_times: retry_settings.retry_max_times,
+        retry_min_delay_ms: retry_settings.retry_min_delay_ms,
+        retry_max_delay_ms: retry_settings.retry_max_delay_ms,
+        timeout_ms: retry_settings.timeout_ms,
+        io_timeout_ms: retry_settings.io_timeout_ms,
+    };
+    crate::fs::object_store::apply_object_store_runtime_defaults(&mut cfg);
+    Some(cfg)
 }
 
 /// Lower a HDFS_SCAN_NODE plan node to a `Lowered` ExecNode.

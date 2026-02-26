@@ -1,0 +1,219 @@
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR=$(dirname "$0")
+SCRIPT_DIR=$(cd "${SCRIPT_DIR}" && pwd)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
+
+NOVAROCKS_BIN="${ROOT_DIR}/bin/novarocks"
+if [ ! -x "${NOVAROCKS_BIN}" ] && [ -x "${ROOT_DIR}/target/debug/novarocks" ]; then
+    NOVAROCKS_BIN="${ROOT_DIR}/target/debug/novarocks"
+elif [ ! -x "${NOVAROCKS_BIN}" ] && [ -x "${ROOT_DIR}/target/release/novarocks" ]; then
+    NOVAROCKS_BIN="${ROOT_DIR}/target/release/novarocks"
+fi
+
+CONFIG_PATH="${ROOT_DIR}/conf/novarocks.toml"
+if [ ! -f "${CONFIG_PATH}" ] && [ -f "${ROOT_DIR}/novarocks.toml" ]; then
+    CONFIG_PATH="${ROOT_DIR}/novarocks.toml"
+fi
+
+LOG_DIR="${ROOT_DIR}/log"
+PID_FILE="${ROOT_DIR}/bin/novarocks.pid"
+LOG_FILE="${LOG_DIR}/novarocks.out"
+
+mkdir -p "${LOG_DIR}" "${ROOT_DIR}/bin"
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    LD_LIBRARY_PATH="${ROOT_DIR}/lib:${LD_LIBRARY_PATH}"
+else
+    LD_LIBRARY_PATH="${ROOT_DIR}/lib"
+fi
+export LD_LIBRARY_PATH
+if [ -n "${DYLD_LIBRARY_PATH:-}" ]; then
+    DYLD_LIBRARY_PATH="${ROOT_DIR}/lib:${DYLD_LIBRARY_PATH}"
+else
+    DYLD_LIBRARY_PATH="${ROOT_DIR}/lib"
+fi
+export DYLD_LIBRARY_PATH
+
+print_usage() {
+    cat <<'USAGE'
+Usage:
+  ./bin/novarocksctl [start] [--daemon] [-- <extra args>...]
+  ./bin/novarocksctl stop [--timeout <seconds>]
+  ./bin/novarocksctl restart [--timeout <seconds>] [--daemon] [-- <extra args>...]
+
+Examples:
+  ./bin/novarocksctl --daemon
+  ./bin/novarocksctl start
+  ./bin/novarocksctl stop --timeout 30
+  ./bin/novarocksctl restart --timeout 30 --daemon
+USAGE
+}
+
+is_novarocks_process() {
+    pid="$1"
+    ps -p "${pid}" -o command= 2>/dev/null | grep -q "novarocks"
+}
+
+start_novarocks() {
+    RUN_DAEMON=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --daemon)
+                RUN_DAEMON=1
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -h|--help)
+                print_usage
+                exit 0
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ ! -x "${NOVAROCKS_BIN}" ]; then
+        echo "Error: executable not found: ${NOVAROCKS_BIN}" >&2
+        exit 1
+    fi
+
+    if [ -f "${PID_FILE}" ]; then
+        oldpid=$(cat "${PID_FILE}")
+        if is_novarocks_process "${oldpid}"; then
+            echo "NovaRocks already running as pid ${oldpid}" >&2
+            exit 1
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    if [ "${RUN_DAEMON}" -eq 1 ]; then
+        if [ $# -gt 0 ]; then
+            nohup "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" "$@" >> "${LOG_FILE}" 2>&1 < /dev/null &
+        else
+            nohup "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" >> "${LOG_FILE}" 2>&1 < /dev/null &
+        fi
+        echo $! > "${PID_FILE}"
+        echo "NovaRocks started in daemon mode, pid=$(cat "${PID_FILE}")"
+    else
+        if [ $# -gt 0 ]; then
+            exec "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" "$@"
+        else
+            exec "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}"
+        fi
+    fi
+}
+
+stop_novarocks() {
+    STOP_TIMEOUT=30
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout)
+                if [ $# -lt 2 ]; then
+                    echo "Error: --timeout requires seconds" >&2
+                    exit 1
+                fi
+                STOP_TIMEOUT="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                echo "Error: unknown stop option: $1" >&2
+                print_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ ! -f "${PID_FILE}" ]; then
+        echo "NovaRocks pid file not found: ${PID_FILE}"
+        exit 0
+    fi
+
+    pid=$(cat "${PID_FILE}")
+    if ! kill -0 "${pid}" >/dev/null 2>&1; then
+        echo "Process ${pid} not found, removing stale pid file"
+        rm -f "${PID_FILE}"
+        exit 0
+    fi
+
+    if ! is_novarocks_process "${pid}"; then
+        echo "Refuse to stop pid ${pid}: command is not novarocks"
+        exit 1
+    fi
+
+    kill -15 "${pid}" >/dev/null 2>&1 || true
+    start_ts=$(date +%s)
+    while kill -0 "${pid}" >/dev/null 2>&1; do
+        if [ "${STOP_TIMEOUT}" -gt 0 ] && [ $(( $(date +%s) - start_ts )) -gt "${STOP_TIMEOUT}" ]; then
+            kill -9 "${pid}" >/dev/null 2>&1 || true
+            echo "Graceful stop timeout, process ${pid} killed with SIGKILL"
+            break
+        fi
+        sleep 1
+    done
+
+    rm -f "${PID_FILE}"
+    echo "NovaRocks stopped"
+}
+
+restart_novarocks() {
+    STOP_TIMEOUT=30
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --timeout)
+                if [ $# -lt 2 ]; then
+                    echo "Error: --timeout requires seconds" >&2
+                    exit 1
+                fi
+                STOP_TIMEOUT="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    stop_novarocks --timeout "${STOP_TIMEOUT}"
+    start_novarocks "$@"
+}
+
+if [ $# -eq 0 ]; then
+    start_novarocks
+    exit 0
+fi
+
+cmd="$1"
+case "${cmd}" in
+    -h|--help|help)
+        print_usage
+        ;;
+    start)
+        shift
+        start_novarocks "$@"
+        ;;
+    stop)
+        shift
+        stop_novarocks "$@"
+        ;;
+    restart)
+        shift
+        restart_novarocks "$@"
+        ;;
+    *)
+        start_novarocks "$@"
+        ;;
+esac

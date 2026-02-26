@@ -27,9 +27,8 @@ Share-nothing mode is not supported; only share-data mode is supported.
 
 - Rust toolchain (edition 2024, `cargo`)
 - C/C++ build toolchain
-- Third-party dependencies under:
-  - `./thirdparty/installed`, or
-  - path provided by `STARROCKS_THIRDPARTY`
+- Third-party root directory: `./thirdparty`
+- If setting `STARROCKS_THIRDPARTY`, point it to the thirdparty root (for example `/path/to/starrocks/thirdparty`), not `.../installed`
 
 If third-party dependencies are missing, build them first:
 
@@ -71,20 +70,20 @@ CLI usage:
 novarocks [run|start|stop|restart] [--config <path>]
 ```
 
-Run through build wrapper:
+Run through control script:
 
 ```bash
 # foreground (default)
-./build.sh run -- run --config ./novarocks.toml
+./bin/novarocksctl start
 
 # daemon mode
-./build.sh run -- start --config ./novarocks.toml
+./bin/novarocksctl start --daemon
 
 # stop daemon
-./build.sh run -- stop
+./bin/novarocksctl stop
 
 # restart daemon
-./build.sh run -- restart --config ./novarocks.toml
+./bin/novarocksctl restart
 ```
 
 Run built binary directly:
@@ -97,9 +96,9 @@ Run built binary directly:
 
 ```bash
 cargo fmt --all
-./build.sh clippy --all-targets --all-features
-./build.sh build
-./build.sh test
+cargo clippy --all-targets --all-features
+./build.sh
+cargo test
 ```
 
 ## License
