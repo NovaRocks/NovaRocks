@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use super::operator::{BlockedReason, Operator};
-use crate::common::types::UniqueId;
+use crate::common::types::{UniqueId, format_uuid};
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -656,9 +656,8 @@ impl PipelineDriver {
             BlockedReason::Dependency(dep) => {
                 if let Some((hi, lo)) = self.fragment_instance_id {
                     debug!(
-                        "Driver blocked on dependency: finst={}:{} driver_id={} dep_name={}",
-                        hi,
-                        lo,
+                        "Driver blocked on dependency: finst={} driver_id={} dep_name={}",
+                        format_uuid(hi, lo),
                         self.driver_id,
                         dep.name()
                     );
@@ -706,8 +705,10 @@ impl PipelineDriver {
                     .unwrap_or("unknown");
                 if let Some((hi, lo)) = self.fragment_instance_id {
                     debug!(
-                        "Driver finished: finst={}:{} driver_id={} last_op={}",
-                        hi, lo, self.driver_id, last_op
+                        "Driver finished: finst={} driver_id={} last_op={}",
+                        format_uuid(hi, lo),
+                        self.driver_id,
+                        last_op
                     );
                 } else {
                     debug!(
@@ -719,8 +720,9 @@ impl PipelineDriver {
             DriverState::Canceled => {
                 if let Some((hi, lo)) = self.fragment_instance_id {
                     debug!(
-                        "Driver canceled: finst={}:{} driver_id={}",
-                        hi, lo, self.driver_id
+                        "Driver canceled: finst={} driver_id={}",
+                        format_uuid(hi, lo),
+                        self.driver_id
                     );
                 } else {
                     debug!("Driver canceled: driver_id={}", self.driver_id);
@@ -729,8 +731,10 @@ impl PipelineDriver {
             DriverState::Failed(err) => {
                 if let Some((hi, lo)) = self.fragment_instance_id {
                     error!(
-                        "Driver failed: finst={}:{} driver_id={} error={}",
-                        hi, lo, self.driver_id, err
+                        "Driver failed: finst={} driver_id={} error={}",
+                        format_uuid(hi, lo),
+                        self.driver_id,
+                        err
                     );
                 } else {
                     error!("Driver failed: driver_id={} error={}", self.driver_id, err);

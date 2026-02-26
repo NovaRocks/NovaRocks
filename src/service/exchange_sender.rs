@@ -302,21 +302,14 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
     if let Err(err) = result {
         task.error_state.set_error(err.clone());
         error!(
-            "exchange send failed: dest={} finst={}:{} node_id={} sender_id={} seq={} error={}",
-            task.dest_host,
-            task.finst_id.hi,
-            task.finst_id.lo,
-            task.node_id,
-            task.sender_id,
-            task.sequence,
-            err
+            "exchange send failed: dest={} finst={} node_id={} sender_id={} seq={} error={}",
+            task.dest_host, task.finst_id, task.node_id, task.sender_id, task.sequence, err
         );
     } else {
         debug!(
-            "exchange send completed: dest={} finst={}:{} node_id={} sender_id={} eos={} seq={} bytes={}",
+            "exchange send completed: dest={} finst={} node_id={} sender_id={} eos={} seq={} bytes={}",
             task.dest_host,
-            task.finst_id.hi,
-            task.finst_id.lo,
+            task.finst_id,
             task.node_id,
             task.sender_id,
             task.eos,

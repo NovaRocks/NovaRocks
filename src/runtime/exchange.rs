@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 
+use crate::common::types::format_uuid;
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::debug;
@@ -33,6 +34,13 @@ pub struct ExchangeKey {
     pub finst_id_hi: i64,
     pub finst_id_lo: i64,
     pub node_id: i32,
+}
+
+impl ExchangeKey {
+    #[inline]
+    pub(crate) fn finst_uuid(&self) -> String {
+        format_uuid(self.finst_id_hi, self.finst_id_lo)
+    }
 }
 
 const CANCELED_KEYS_TTL: Duration = Duration::from_secs(600);
@@ -124,8 +132,9 @@ fn get_or_create(key: ExchangeKey) -> Arc<Receiver> {
         .clone();
     if !existed {
         debug!(
-            "exchange receiver CREATED: finst={}:{} node_id={}",
-            key.finst_id_hi, key.finst_id_lo, key.node_id
+            "exchange receiver CREATED: finst={} node_id={}",
+            key.finst_uuid(),
+            key.node_id
         );
     }
     receiver
@@ -181,8 +190,11 @@ pub fn set_expected_senders(key: ExchangeKey, expected_senders: usize) {
     st.expected_senders = st.expected_senders.max(expected_senders);
     if st.expected_senders != before {
         debug!(
-            "exchange expected_senders UPDATED: finst={}:{} node_id={} before={} after={}",
-            key.finst_id_hi, key.finst_id_lo, key.node_id, before, st.expected_senders
+            "exchange expected_senders UPDATED: finst={} node_id={} before={} after={}",
+            key.finst_uuid(),
+            key.node_id,
+            before,
+            st.expected_senders
         );
     }
     r.cv.notify_all();
@@ -201,8 +213,9 @@ pub fn ensure_receiver_mem_tracker(
         return Ok(Arc::clone(existing));
     }
     let label = format!(
-        "exchange receiver queue: finst={}:{} node_id={}",
-        key.finst_id_hi, key.finst_id_lo, key.node_id
+        "exchange receiver queue: finst={} node_id={}",
+        key.finst_uuid(),
+        key.node_id
     );
     let tracker = MemTracker::new_child(label, root);
     for chunk in st.chunks.iter_mut() {
@@ -240,9 +253,8 @@ pub fn push_chunks_with_stats(
     let should_notify = chunks_len != 0 || eos;
 
     debug!(
-        "push_chunks: finst={}:{} node_id={} sender_id={} be_number={} chunks={} rows={} eos={}",
-        key.finst_id_hi,
-        key.finst_id_lo,
+        "push_chunks: finst={} node_id={} sender_id={} be_number={} chunks={} rows={} eos={}",
+        key.finst_uuid(),
         key.node_id,
         sender_id,
         be_number,
@@ -258,9 +270,8 @@ pub fn push_chunks_with_stats(
     let lock_wait = lock_start.elapsed();
     if lock_wait >= EXCHANGE_LOCK_WAIT_WARN {
         debug!(
-            "exchange receiver lock WAIT: finst={}:{} node_id={} wait_ms={}",
-            key.finst_id_hi,
-            key.finst_id_lo,
+            "exchange receiver lock WAIT: finst={} node_id={} wait_ms={}",
+            key.finst_uuid(),
             key.node_id,
             lock_wait.as_millis()
         );
@@ -300,9 +311,8 @@ pub fn push_chunks_with_stats(
     let hold_time = hold_start.elapsed();
     if hold_time >= EXCHANGE_LOCK_HOLD_WARN {
         debug!(
-            "exchange receiver lock HOLD: finst={}:{} node_id={} chunks={} rows={} eos={} hold_ms={}",
-            key.finst_id_hi,
-            key.finst_id_lo,
+            "exchange receiver lock HOLD: finst={} node_id={} chunks={} rows={} eos={} hold_ms={}",
+            key.finst_uuid(),
             key.node_id,
             chunks_len,
             row_count,
@@ -345,8 +355,11 @@ pub fn take_all_chunks_with_stats_blocking(
     }
 
     debug!(
-        "take_all_chunks_blocking START: finst={}:{} node_id={} expected_senders={} timeout={:?}",
-        key.finst_id_hi, key.finst_id_lo, key.node_id, expected_senders, timeout
+        "take_all_chunks_blocking START: finst={} node_id={} expected_senders={} timeout={:?}",
+        key.finst_uuid(),
+        key.node_id,
+        expected_senders,
+        timeout
     );
 
     set_expected_senders(key, expected_senders);
@@ -357,9 +370,8 @@ pub fn take_all_chunks_with_stats_blocking(
     loop {
         if st.canceled {
             debug!(
-                "take_all_chunks_blocking CANCELED: finst={}:{} node_id={} elapsed={:?}",
-                key.finst_id_hi,
-                key.finst_id_lo,
+                "take_all_chunks_blocking CANCELED: finst={} node_id={} elapsed={:?}",
+                key.finst_uuid(),
                 key.node_id,
                 start.elapsed()
             );
@@ -369,9 +381,8 @@ pub fn take_all_chunks_with_stats_blocking(
         if expected == 0 || st.finished.len() >= expected {
             let row_count: usize = st.chunks.iter().map(|c| c.len()).sum();
             debug!(
-                "take_all_chunks_blocking COMPLETE: finst={}:{} node_id={} expected={} finished={} chunks={} rows={} elapsed={:?}",
-                key.finst_id_hi,
-                key.finst_id_lo,
+                "take_all_chunks_blocking COMPLETE: finst={} node_id={} expected={} finished={} chunks={} rows={} elapsed={:?}",
+                key.finst_uuid(),
                 key.node_id,
                 expected,
                 st.finished.len(),
@@ -384,9 +395,8 @@ pub fn take_all_chunks_with_stats_blocking(
         let elapsed = start.elapsed();
         if elapsed >= timeout {
             debug!(
-                "take_all_chunks_blocking TIMEOUT: finst={}:{} node_id={} expected={} finished={} elapsed={:?} timeout={:?}",
-                key.finst_id_hi,
-                key.finst_id_lo,
+                "take_all_chunks_blocking TIMEOUT: finst={} node_id={} expected={} finished={} elapsed={:?} timeout={:?}",
+                key.finst_uuid(),
                 key.node_id,
                 expected,
                 st.finished.len(),
@@ -394,9 +404,8 @@ pub fn take_all_chunks_with_stats_blocking(
                 timeout
             );
             return Err(format!(
-                "exchange timeout waiting for senders: finst_id={}:{} node_id={} expected={} finished={}",
-                key.finst_id_hi,
-                key.finst_id_lo,
+                "exchange timeout waiting for senders: finst_id={} node_id={} expected={} finished={}",
+                key.finst_uuid(),
                 key.node_id,
                 expected,
                 st.finished.len()
@@ -413,9 +422,8 @@ pub fn take_all_chunks_with_stats_blocking(
             let elapsed_after = start.elapsed();
             let remain_after = timeout.saturating_sub(elapsed_after);
             debug!(
-                "take_all_chunks_blocking WAITING: finst={}:{} node_id={} expected={} finished={} elapsed={:?} remain={:?}",
-                key.finst_id_hi,
-                key.finst_id_lo,
+                "take_all_chunks_blocking WAITING: finst={} node_id={} expected={} finished={} elapsed={:?} remain={:?}",
+                key.finst_uuid(),
                 key.node_id,
                 expected,
                 st.finished.len(),
@@ -461,8 +469,9 @@ impl ExchangeReceiverHandle {
         let mut st = r.mu.lock().expect("exchange receiver lock");
         if st.canceled {
             debug!(
-                "exchange try_pop_next CANCELED: finst={}:{} node_id={}",
-                self.key.finst_id_hi, self.key.finst_id_lo, self.key.node_id
+                "exchange try_pop_next CANCELED: finst={} node_id={}",
+                self.key.finst_uuid(),
+                self.key.node_id
             );
             return Err("exchange canceled".to_string());
         }
@@ -508,9 +517,8 @@ impl ExchangeReceiverHandle {
         if res && should_log_exchange_ready() {
             let queued_rows: usize = st.chunks.iter().map(|c| c.len()).sum();
             debug!(
-                "exchange ready: finst={}:{} node_id={} expected_param={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={} ready_chunks={} ready_finished={}",
-                self.key.finst_id_hi,
-                self.key.finst_id_lo,
+                "exchange ready: finst={} node_id={} expected_param={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={} ready_chunks={} ready_finished={}",
+                self.key.finst_uuid(),
                 self.key.node_id,
                 expected_senders,
                 expected,
@@ -524,9 +532,8 @@ impl ExchangeReceiverHandle {
         } else if !res && should_log_exchange_not_ready() {
             let queued_rows: usize = st.chunks.iter().map(|c| c.len()).sum();
             debug!(
-                "exchange not ready: finst={}:{} node_id={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={}",
-                self.key.finst_id_hi,
-                self.key.finst_id_lo,
+                "exchange not ready: finst={} node_id={} expected_senders={} finished_senders={} queued_chunks={} queued_rows={} canceled={}",
+                self.key.finst_uuid(),
                 self.key.node_id,
                 expected,
                 finished,
@@ -551,8 +558,9 @@ impl ExchangeReceiverHandle {
         loop {
             if st.canceled {
                 debug!(
-                    "exchange pop_next CANCELED: finst={}:{} node_id={}",
-                    self.key.finst_id_hi, self.key.finst_id_lo, self.key.node_id
+                    "exchange pop_next CANCELED: finst={} node_id={}",
+                    self.key.finst_uuid(),
+                    self.key.node_id
                 );
                 return Err("exchange canceled".to_string());
             }
@@ -579,9 +587,8 @@ impl ExchangeReceiverHandle {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
                 debug!(
-                    "exchange pop_next TIMEOUT: finst={}:{} node_id={} expected={} finished={} elapsed={:?} timeout={:?}",
-                    self.key.finst_id_hi,
-                    self.key.finst_id_lo,
+                    "exchange pop_next TIMEOUT: finst={} node_id={} expected={} finished={} elapsed={:?} timeout={:?}",
+                    self.key.finst_uuid(),
                     self.key.node_id,
                     expected,
                     st.finished.len(),
@@ -589,9 +596,8 @@ impl ExchangeReceiverHandle {
                     timeout
                 );
                 return Err(format!(
-                    "exchange timeout waiting for senders: finst_id={}:{} node_id={} expected={} finished={}",
-                    self.key.finst_id_hi,
-                    self.key.finst_id_lo,
+                    "exchange timeout waiting for senders: finst_id={} node_id={} expected={} finished={}",
+                    self.key.finst_uuid(),
                     self.key.node_id,
                     expected,
                     st.finished.len()
@@ -607,9 +613,8 @@ impl ExchangeReceiverHandle {
                 let elapsed_after = start.elapsed();
                 let remain_after = timeout.saturating_sub(elapsed_after);
                 debug!(
-                    "exchange pop_next WAITING: finst={}:{} node_id={} expected={} finished={} elapsed={:?} remain={:?}",
-                    self.key.finst_id_hi,
-                    self.key.finst_id_lo,
+                    "exchange pop_next WAITING: finst={} node_id={} expected={} finished={} elapsed={:?} remain={:?}",
+                    self.key.finst_uuid(),
                     self.key.node_id,
                     expected,
                     st.finished.len(),
@@ -637,8 +642,11 @@ pub fn get_receiver_handle(
         st.expected_senders = st.expected_senders.max(expected_senders);
         if st.expected_senders != before {
             debug!(
-                "exchange get_receiver_handle UPDATED expected_senders: finst={}:{} node_id={} before={} after={}",
-                key.finst_id_hi, key.finst_id_lo, key.node_id, before, st.expected_senders
+                "exchange get_receiver_handle UPDATED expected_senders: finst={} node_id={} before={} after={}",
+                key.finst_uuid(),
+                key.node_id,
+                before,
+                st.expected_senders
             );
         }
         receiver.cv.notify_all();

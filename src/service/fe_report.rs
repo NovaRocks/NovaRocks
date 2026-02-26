@@ -145,8 +145,7 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
     let Some(instance) = instance else {
         debug!(
             target: "novarocks::report",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             "report instance missing"
         );
         return;
@@ -176,8 +175,7 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
     if let Err(e) = send_report(&instance.coord, params) {
         warn!(
             target: "novarocks::report",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             error = %e,
             "reportExecStatus failed"
         );
@@ -193,8 +191,7 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
     let Some(instance) = instance else {
         debug!(
             target: "novarocks::report",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             "report instance missing"
         );
         return;
@@ -219,8 +216,7 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
     if let Err(e) = send_report(&instance.coord, params) {
         warn!(
             target: "novarocks::report",
-            finst_id_hi = finst_id.hi,
-            finst_id_lo = finst_id.lo,
+            finst_id = %finst_id,
             error = %e,
             "reportExecStatus failed"
         );
@@ -360,11 +356,9 @@ fn build_report_params(
     };
     debug!(
         target: "novarocks::sink_commit",
-        finst_id_hi = finst_id.hi,
-        finst_id_lo = finst_id.lo,
+        finst_id = %finst_id,
         backend_num = instance.backend_num,
-        query_id_hi = instance.query_id.hi,
-        query_id_lo = instance.query_id.lo,
+        query_id = %instance.query_id,
         tablet_commit_info_len = tablet_commit_infos.len(),
         tablet_fail_info_len = tablet_fail_infos.len(),
         commit_info_len = sink_commit_infos.len(),
