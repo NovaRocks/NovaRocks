@@ -49,7 +49,7 @@ impl SharedScanState {
 }
 
 /// Scan dispatch metadata tracking pending, in-flight, and completed scan morsels.
-pub(super) struct ScanDispatchState {
+pub(crate) struct ScanDispatchState {
     queue: MorselQueueRef,
     queue_observable: Arc<Observable>,
     inflight_observable: Arc<Observable>,
@@ -146,5 +146,20 @@ impl ScanDispatchState {
 
     pub(super) fn num_original_morsels(&self) -> usize {
         self.queue.num_original_morsels()
+    }
+
+    pub(crate) fn append_morsels(
+        &self,
+        morsels: Vec<ScanMorsel>,
+        has_more: bool,
+    ) -> Result<(), String> {
+        self.queue.append_morsels(morsels)?;
+        self.queue.set_has_more(has_more);
+        if !self.queue.empty() {
+            self.logged_queue_empty.store(false, Ordering::Release);
+        }
+        let notify = self.queue_observable.defer_notify();
+        notify.arm();
+        Ok(())
     }
 }

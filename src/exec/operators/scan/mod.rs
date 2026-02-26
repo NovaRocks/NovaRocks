@@ -24,7 +24,7 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-mod dispatch;
+pub(crate) mod dispatch;
 mod runner;
 mod source;
 mod types;

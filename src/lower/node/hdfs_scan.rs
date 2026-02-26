@@ -700,13 +700,6 @@ pub(crate) fn lower_hdfs_scan_node(
             });
         }
     }
-    if has_more {
-        return Err(format!(
-            "HDFS_SCAN_NODE node_id={} has incremental scan ranges which are not supported",
-            node.node_id
-        ));
-    }
-
     let original_range_count = ranges.len();
     apply_path_rewrite(&mut ranges)?;
 
@@ -803,6 +796,10 @@ pub(crate) fn lower_hdfs_scan_node(
         .as_ref()
         .and_then(|c| c.cloud_properties.as_ref());
     let object_store_config = resolve_cloud_object_store_config(cloud_props, &ranges);
+    let iceberg_table_locations = iceberg_table_locations()
+        .lock()
+        .expect("iceberg_table_locations lock")
+        .clone();
     let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
     let cfg = HdfsScanConfig {
         ranges,
@@ -812,6 +809,7 @@ pub(crate) fn lower_hdfs_scan_node(
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         format,
         object_store_config: object_store_config.clone(),
+        iceberg_table_locations,
     };
     let row_position_scan = row_position_spec.as_ref().and_then(|_| {
         scan_format.map(

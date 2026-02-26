@@ -46,7 +46,7 @@ mod noop_sink;
 mod project_processor;
 mod repeat_processor;
 mod result_sink;
-mod scan;
+pub(crate) mod scan;
 mod setop;
 mod sort;
 mod split_data_stream_sink;

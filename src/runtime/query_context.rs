@@ -26,6 +26,8 @@ use crate::common::ids::SlotId;
 use crate::common::types::UniqueId;
 use crate::descriptors;
 use crate::exec::node::scan::RowPositionScanConfig;
+use crate::exec::node::scan::ScanNode;
+use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
 use crate::exec::row_position::RowPositionDescriptor;
@@ -285,12 +287,41 @@ impl QueryContext {
     }
 }
 
+struct IncrementalScanNodeHandle {
+    scan: ScanNode,
+    dispatch: Arc<ScanDispatchState>,
+    update_mu: Mutex<()>,
+}
+
+impl IncrementalScanNodeHandle {
+    fn new(scan: ScanNode, dispatch: Arc<ScanDispatchState>) -> Self {
+        Self {
+            scan,
+            dispatch,
+            update_mu: Mutex::new(()),
+        }
+    }
+
+    fn append_scan_ranges(
+        &self,
+        scan_ranges: &[internal_service::TScanRangeParams],
+    ) -> Result<(), String> {
+        let _guard = self.update_mu.lock().expect("incremental scan handle lock");
+        let morsels = self.scan.build_incremental_morsels(scan_ranges)?;
+        self.dispatch
+            .append_morsels(morsels.morsels, morsels.has_more)
+    }
+}
+
 #[derive(Default)]
 struct QueryContextManagerInner {
     active: HashMap<QueryId, QueryContext>,
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryId>,
     fragment_completions: HashMap<UniqueId, Weak<FragmentCompletion>>,
+    incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
+    pending_incremental_scan_ranges:
+        HashMap<UniqueId, HashMap<i32, Vec<internal_service::TScanRangeParams>>>,
 }
 
 pub(crate) struct QueryContextManager {
@@ -686,6 +717,77 @@ impl QueryContextManager {
         })
     }
 
+    pub(crate) fn register_incremental_scan_node(
+        &self,
+        finst_id: UniqueId,
+        node_id: i32,
+        scan: ScanNode,
+        dispatch: Arc<ScanDispatchState>,
+    ) -> Result<(), String> {
+        let handle = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if !guard.finst_to_query.contains_key(&finst_id) {
+                return Ok(());
+            }
+            let node_map = guard.incremental_scan_nodes.entry(finst_id).or_default();
+            if let Some(existing) = node_map.get(&node_id) {
+                Arc::clone(existing)
+            } else {
+                let handle = Arc::new(IncrementalScanNodeHandle::new(scan, dispatch));
+                node_map.insert(node_id, Arc::clone(&handle));
+                handle
+            }
+        };
+
+        let pending = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            guard
+                .pending_incremental_scan_ranges
+                .get_mut(&finst_id)
+                .and_then(|node_map| node_map.remove(&node_id))
+        };
+        if let Some(scan_ranges) = pending {
+            handle.append_scan_ranges(&scan_ranges)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn append_incremental_scan_ranges(
+        &self,
+        finst_id: UniqueId,
+        node_id: i32,
+        mut scan_ranges: Vec<internal_service::TScanRangeParams>,
+    ) -> Result<(), String> {
+        if scan_ranges.is_empty() {
+            return Ok(());
+        }
+        let handle = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            if let Some(handle) = guard
+                .incremental_scan_nodes
+                .get(&finst_id)
+                .and_then(|node_map| node_map.get(&node_id))
+            {
+                Some(Arc::clone(handle))
+            } else if guard.finst_to_query.contains_key(&finst_id) {
+                guard
+                    .pending_incremental_scan_ranges
+                    .entry(finst_id)
+                    .or_default()
+                    .entry(node_id)
+                    .or_default()
+                    .append(&mut scan_ranges);
+                None
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = handle {
+            handle.append_scan_ranges(&scan_ranges)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn register_finst(&self, finst_id: UniqueId, query_id: QueryId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.insert(finst_id, query_id);
@@ -700,6 +802,8 @@ impl QueryContextManager {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
         guard.fragment_completions.remove(&finst_id);
+        guard.incremental_scan_nodes.remove(&finst_id);
+        guard.pending_incremental_scan_ranges.remove(&finst_id);
     }
 
     pub(crate) fn register_fragment_completion(

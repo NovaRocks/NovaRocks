@@ -25,6 +25,7 @@ use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter};
 use crate::fs::scan_context::FileScanRange;
+use crate::internal_service;
 use crate::novarocks_logging::warn;
 use crate::runtime::profile::RuntimeProfile;
 use crate::runtime::runtime_filter_hub::{RuntimeFilterHandle, RuntimeFilterSnapshot};
@@ -171,6 +172,17 @@ pub trait ScanOp: Send + Sync {
 
     fn profile_name(&self) -> Option<String> {
         None
+    }
+
+    fn supports_incremental_scan_ranges(&self) -> bool {
+        false
+    }
+
+    fn build_incremental_morsels(
+        &self,
+        _scan_ranges: &[internal_service::TScanRangeParams],
+    ) -> Result<ScanMorsels, String> {
+        Err("incremental scan ranges are not supported for this scan node".to_string())
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
@@ -360,6 +372,17 @@ impl ScanNode {
 
     pub fn profile_name(&self) -> Option<String> {
         self.op.profile_name()
+    }
+
+    pub fn supports_incremental_scan_ranges(&self) -> bool {
+        self.op.supports_incremental_scan_ranges()
+    }
+
+    pub fn build_incremental_morsels(
+        &self,
+        scan_ranges: &[internal_service::TScanRangeParams],
+    ) -> Result<ScanMorsels, String> {
+        self.op.build_incremental_morsels(scan_ranges)
     }
 
     pub fn execute_iter(
