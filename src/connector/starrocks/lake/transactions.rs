@@ -70,6 +70,7 @@ use crate::service::grpc_client::proto::starrocks::{
 const MAX_PUBLISH_WORKERS: usize = 8;
 const STATUS_CODE_OK: i32 = 0;
 const DEFAULT_GET_TABLET_STATS_TIMEOUT_MS: i64 = 5 * 60 * 1000;
+const EMPTY_TXNLOG_TXN_ID: i64 = -1;
 
 pub(crate) fn publish_version(
     request: &PublishVersionRequest,
@@ -1859,10 +1860,21 @@ fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInf
     if !request.txn_infos.is_empty() {
         let mut txn_infos = Vec::with_capacity(request.txn_infos.len());
         let mut seen_txn_ids = HashSet::with_capacity(request.txn_infos.len());
+        let allow_empty_txnlog_txn = request.txn_infos.len() == 1;
         for info in &request.txn_infos {
             let txn_id = info.txn_id.ok_or_else(|| {
                 "publish_version txn_infos contains entry without txn_id".to_string()
             })?;
+            if txn_id == EMPTY_TXNLOG_TXN_ID {
+                if !allow_empty_txnlog_txn {
+                    return Err(
+                        "publish_version txn_infos allows txn_id=-1 only when txn_infos size is 1"
+                            .to_string(),
+                    );
+                }
+                txn_infos.push(info.clone());
+                continue;
+            }
             if txn_id <= 0 {
                 return Err(format!(
                     "publish_version txn_infos has non-positive txn_id={txn_id}"
@@ -1881,7 +1893,27 @@ fn build_publish_txn_infos(request: &PublishVersionRequest) -> Result<Vec<TxnInf
     if !request.txn_ids.is_empty() {
         let mut txn_infos = Vec::with_capacity(request.txn_ids.len());
         let mut seen_txn_ids = HashSet::with_capacity(request.txn_ids.len());
+        let allow_empty_txnlog_txn = request.txn_ids.len() == 1;
         for txn_id in &request.txn_ids {
+            if *txn_id == EMPTY_TXNLOG_TXN_ID {
+                if !allow_empty_txnlog_txn {
+                    return Err(
+                        "publish_version txn_ids allows txn_id=-1 only when txn_ids size is 1"
+                            .to_string(),
+                    );
+                }
+                txn_infos.push(TxnInfoPb {
+                    txn_id: Some(*txn_id),
+                    commit_time: request.commit_time,
+                    combined_txn_log: Some(false),
+                    txn_type: Some(TxnTypePb::TxnNormal as i32),
+                    force_publish: Some(false),
+                    rebuild_pindex: Some(false),
+                    gtid: Some(0),
+                    load_ids: Vec::new(),
+                });
+                continue;
+            }
             if *txn_id <= 0 {
                 return Err(format!(
                     "publish_version txn_ids has non-positive txn_id={txn_id}"
@@ -2007,6 +2039,64 @@ fn already_published_output(
     }
 }
 
+fn is_empty_txnlog_publish(txn_infos: &[TxnInfoPb]) -> bool {
+    txn_infos.len() == 1 && txn_infos[0].txn_id == Some(EMPTY_TXNLOG_TXN_ID)
+}
+
+fn publish_empty_txnlog_one_tablet(
+    tablet_id: i64,
+    base_version: i64,
+    new_version: i64,
+    runtime: &TabletRuntimeEntry,
+    txn_info: &TxnInfoPb,
+) -> Result<PublishOneTabletOutput, String> {
+    let expected_new_version = base_version.saturating_add(1);
+    if new_version != expected_new_version {
+        return Err(format!(
+            "publish_version empty-txnlog version mismatch: tablet_id={} base_version={} expected_new_version={} actual_new_version={}",
+            tablet_id, base_version, expected_new_version, new_version
+        ));
+    }
+
+    let mut metadata = if base_version == 0 {
+        empty_tablet_metadata(tablet_id)
+    } else {
+        match load_tablet_metadata_with_missing_page_policy(
+            &runtime.root_path,
+            tablet_id,
+            base_version,
+            true,
+        )? {
+            Some(meta) => meta,
+            None => {
+                if base_version == 1 || is_internal_statistics_tablet_root(&runtime.root_path) {
+                    empty_tablet_metadata(tablet_id)
+                } else {
+                    return Err(format!(
+                        "publish_version empty-txnlog base metadata not found: tablet_id={} base_version={}",
+                        tablet_id, base_version
+                    ));
+                }
+            }
+        }
+    };
+
+    metadata.id = Some(tablet_id);
+    metadata.version = Some(new_version);
+    metadata.gtid = Some(txn_info.gtid.unwrap_or(0));
+    if metadata.next_rowset_id.is_none() {
+        metadata.next_rowset_id = Some(next_rowset_id(&metadata.rowsets));
+    }
+
+    Ok(PublishOneTabletOutput {
+        root_path: runtime.root_path.clone(),
+        schema: runtime.schema.clone(),
+        metadata,
+        needs_persist: true,
+        cleanup_txn_log_path: None,
+    })
+}
+
 fn publish_one_tablet(
     tablet_id: i64,
     base_version: i64,
@@ -2019,6 +2109,15 @@ fn publish_one_tablet(
         ));
     }
     let runtime = get_tablet_runtime(tablet_id)?;
+    if is_empty_txnlog_publish(txn_infos) {
+        return publish_empty_txnlog_one_tablet(
+            tablet_id,
+            base_version,
+            new_version,
+            &runtime,
+            &txn_infos[0],
+        );
+    }
     let mut state = match initialize_publish_state(
         tablet_id,
         base_version,
@@ -3265,6 +3364,70 @@ mod tests {
             resp.failed_tablets.is_empty(),
             "unexpected failed tablets: {:?}",
             resp.failed_tablets
+        );
+    }
+
+    #[test]
+    fn publish_version_supports_empty_txnlog_txn_id() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let tablet_id = 88004;
+        let ctx = test_context(&root, 7004, tablet_id, 4004);
+        register_tablet_runtime(&ctx).expect("register tablet runtime");
+
+        let mut base_meta =
+            crate::formats::starrocks::writer::bundle_meta::empty_tablet_metadata(tablet_id);
+        base_meta.version = Some(1);
+        write_bundle_meta_file(&root, tablet_id, 1, &ctx.tablet_schema, &base_meta)
+            .expect("write base metadata");
+
+        let req = PublishVersionRequest {
+            tablet_ids: vec![tablet_id],
+            txn_ids: Vec::new(),
+            base_version: Some(1),
+            new_version: Some(2),
+            commit_time: Some(321),
+            timeout_ms: None,
+            txn_infos: vec![default_txn_info(super::EMPTY_TXNLOG_TXN_ID)],
+            rebuild_pindex_tablet_ids: Vec::new(),
+            enable_aggregate_publish: None,
+            resharding_tablet_infos: Vec::new(),
+        };
+
+        let resp = publish_version(&req).expect("publish empty txnlog version should succeed");
+        assert!(
+            resp.failed_tablets.is_empty(),
+            "unexpected failed tablets: {:?}",
+            resp.failed_tablets
+        );
+        let meta = load_tablet_metadata_at_version(&root, tablet_id, 2)
+            .expect("load v2 metadata")
+            .expect("v2 metadata exists");
+        assert_eq!(meta.version, Some(2));
+    }
+
+    #[test]
+    fn publish_version_rejects_empty_txnlog_txn_id_in_batch() {
+        let req = PublishVersionRequest {
+            tablet_ids: vec![12345],
+            txn_ids: Vec::new(),
+            base_version: Some(1),
+            new_version: Some(3),
+            commit_time: Some(0),
+            timeout_ms: None,
+            txn_infos: vec![
+                default_txn_info(100),
+                default_txn_info(super::EMPTY_TXNLOG_TXN_ID),
+            ],
+            rebuild_pindex_tablet_ids: Vec::new(),
+            enable_aggregate_publish: None,
+            resharding_tablet_infos: Vec::new(),
+        };
+        let err = publish_version(&req).expect_err("batch with txn_id=-1 should fail");
+        assert!(
+            err.contains("txn_infos allows txn_id=-1 only when txn_infos size is 1"),
+            "unexpected error: {}",
+            err
         );
     }
 
