@@ -65,6 +65,43 @@ pub(crate) fn build_sink_routing(
     schema_id: i64,
     output_exprs: Option<&[exprs::TExpr]>,
 ) -> Result<SinkRouting, String> {
+    let candidate_index_ids = sink
+        .schema
+        .indexes
+        .iter()
+        .filter(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
+        .map(|idx| idx.id)
+        .collect::<HashSet<_>>();
+    if candidate_index_ids.is_empty() {
+        return Err(format!(
+            "OLAP_TABLE_SINK cannot resolve routing index for schema_id={schema_id}"
+        ));
+    }
+    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs)
+}
+
+pub(crate) fn build_sink_routing_for_index_id(
+    sink: &data_sinks::TOlapTableSink,
+    index_id: i64,
+    schema_id: i64,
+    output_exprs: Option<&[exprs::TExpr]>,
+) -> Result<SinkRouting, String> {
+    if index_id <= 0 {
+        return Err(format!(
+            "OLAP_TABLE_SINK cannot build routing for non-positive index_id={index_id}"
+        ));
+    }
+    let mut candidate_index_ids = HashSet::new();
+    candidate_index_ids.insert(index_id);
+    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs)
+}
+
+fn build_sink_routing_with_candidates(
+    sink: &data_sinks::TOlapTableSink,
+    schema_id: i64,
+    candidate_index_ids: HashSet<i64>,
+    output_exprs: Option<&[exprs::TExpr]>,
+) -> Result<SinkRouting, String> {
     let table_name = sink
         .table_name
         .as_deref()
@@ -112,7 +149,7 @@ pub(crate) fn build_sink_routing(
     }
 
     let partition_map = collect_tablet_partition_map(&sink.partition, &sink.location)?;
-    let row_routing = build_row_routing_plan(sink, schema_id, output_exprs)?;
+    let row_routing = build_row_routing_plan(sink, schema_id, &candidate_index_ids, output_exprs)?;
 
     let mut commit_infos = Vec::with_capacity(row_routing.tablet_ids.len());
     let mut refs = Vec::with_capacity(row_routing.tablet_ids.len());
@@ -152,6 +189,7 @@ pub(crate) fn build_sink_routing(
 fn build_row_routing_plan(
     sink: &data_sinks::TOlapTableSink,
     schema_id: i64,
+    candidate_index_ids: &HashSet<i64>,
     output_exprs: Option<&[exprs::TExpr]>,
 ) -> Result<RowRoutingPlan, String> {
     let visible_partitions = sink
@@ -161,13 +199,6 @@ fn build_row_routing_plan(
         .filter(|part| !part.is_shadow_partition.unwrap_or(false))
         .collect::<Vec<_>>();
 
-    let candidate_index_ids = sink
-        .schema
-        .indexes
-        .iter()
-        .filter(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
-        .map(|idx| idx.id)
-        .collect::<HashSet<_>>();
     if candidate_index_ids.is_empty() {
         return Err(format!(
             "OLAP_TABLE_SINK cannot resolve routing index for schema_id={schema_id}"

@@ -17,6 +17,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -549,15 +550,11 @@ fn resolve_lake_batch_write_routing(
                 LOAD_OP_COLUMN
             ));
         }
-        if batch.num_columns() != ctx.tablet_schema.column.len() {
-            return Err(format!(
-                "non-primary key write requires full schema columns: input_columns={} schema_columns={}",
-                batch.num_columns(),
-                ctx.tablet_schema.column.len()
-            ));
-        }
         let data_batch = materialize_non_primary_auto_increment_batch(ctx, batch)?;
-        return Ok(LakeBatchWriteRouting::Upsert { data_batch });
+        let full_schema_batch = materialize_non_primary_full_schema_batch(ctx, &data_batch)?;
+        return Ok(LakeBatchWriteRouting::Upsert {
+            data_batch: full_schema_batch,
+        });
     }
 
     let full_schema_col_count = ctx.tablet_schema.column.len();
@@ -931,6 +928,52 @@ fn materialize_non_primary_auto_increment_batch(
             e
         )
     })
+}
+
+fn materialize_non_primary_full_schema_batch(
+    ctx: &TabletWriteContext,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, String> {
+    let schema_col_count = ctx.tablet_schema.column.len();
+    if schema_col_count == 0 {
+        return Ok(batch.clone());
+    }
+    if batch.num_columns() < schema_col_count {
+        return Err(format!(
+            "non-primary key write requires full schema columns: input_columns={} schema_columns={}",
+            batch.num_columns(),
+            schema_col_count
+        ));
+    }
+
+    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch)?;
+    let mut projected_batch_indexes = Vec::with_capacity(schema_col_count);
+    let mut used_batch_indexes = HashSet::with_capacity(schema_col_count);
+    for (schema_idx, schema_col) in ctx.tablet_schema.column.iter().enumerate() {
+        let Some(batch_idx) = schema_to_batch.get(schema_idx).and_then(|v| *v) else {
+            let schema_name = schema_col.name.as_deref().unwrap_or("<unnamed>");
+            return Err(format!(
+                "non-primary key write missing schema column in input batch: tablet_id={} schema_index={} schema_column='{}' input_columns={}",
+                ctx.tablet_id,
+                schema_idx,
+                schema_name,
+                batch.num_columns()
+            ));
+        };
+        if !used_batch_indexes.insert(batch_idx) {
+            let schema_name = schema_col.name.as_deref().unwrap_or("<unnamed>");
+            return Err(format!(
+                "non-primary key write has duplicate source column mapping: tablet_id={} schema_index={} schema_column='{}' batch_index={}",
+                ctx.tablet_id, schema_idx, schema_name, batch_idx
+            ));
+        }
+        projected_batch_indexes.push(batch_idx);
+    }
+    project_batch_by_columns(
+        batch,
+        &projected_batch_indexes,
+        "non-primary key full-schema write",
+    )
 }
 
 fn fill_auto_increment_column_nulls(
@@ -1697,9 +1740,12 @@ fn build_rowset_snapshot_for_partial_update(
             segment_size: rowset.segment_size.get(idx).copied(),
         });
     }
+    // Synthetic rowset snapshots are not metadata versions. Use a stable negative key to avoid
+    // colliding with real metadata-version cache entries in segment footer cache.
+    let snapshot_version = synthetic_rowset_snapshot_version(rowset);
     Ok(StarRocksTabletSnapshot {
         tablet_id: ctx.tablet_id,
-        version: 0,
+        version: snapshot_version,
         metadata_path: String::new(),
         tablet_schema: ctx.tablet_schema.clone(),
         total_num_rows: rowset.num_rows.unwrap_or(0).max(0) as u64,
@@ -1708,6 +1754,20 @@ fn build_rowset_snapshot_for_partial_update(
         delete_predicates: Vec::new(),
         delvec_meta: Default::default(),
     })
+}
+
+fn synthetic_rowset_snapshot_version(rowset: &RowsetMetadataPb) -> i64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    rowset.id.hash(&mut hasher);
+    rowset.version.hash(&mut hasher);
+    rowset.num_rows.hash(&mut hasher);
+    rowset.num_dels.hash(&mut hasher);
+    rowset.segments.hash(&mut hasher);
+    rowset.segment_size.hash(&mut hasher);
+    rowset.bundle_file_offsets.hash(&mut hasher);
+    let bucket = (i64::MAX as u64).saturating_sub(1);
+    let positive = (hasher.finish() % bucket).saturating_add(1);
+    -(positive as i64)
 }
 
 fn is_missing_tablet_metadata_error(error: &str) -> bool {
@@ -3085,7 +3145,7 @@ mod tests {
         txn_log_file_path, txn_log_file_path_with_load_id,
     };
     use crate::service::grpc_client::proto::starrocks::{
-        ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
+        ColumnPb, KeysType, PUniqueId, RowsetMetadataPb, TabletSchemaPb,
     };
 
     fn test_tablet_schema(schema_id: i64) -> TabletSchemaPb {
@@ -3226,6 +3286,86 @@ mod tests {
         ctx.partial_update.auto_increment.auto_increment_column_idx = Some(1);
         ctx.partial_update.auto_increment.auto_increment_column_name = Some("id".to_string());
         ctx
+    }
+
+    fn test_rollup_like_tablet_schema(schema_id: i64) -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("k1".to_string()),
+                    r#type: "INT".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("v1".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(3),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(schema_id),
+        }
+    }
+
+    fn test_rollup_like_context(
+        root: &str,
+        table_id: i64,
+        tablet_id: i64,
+        schema_id: i64,
+    ) -> TabletWriteContext {
+        TabletWriteContext {
+            db_id: 6001,
+            table_id,
+            tablet_id,
+            tablet_root_path: root.to_string(),
+            tablet_schema: test_rollup_like_tablet_schema(schema_id),
+            s3_config: None,
+            partial_update: Default::default(),
+        }
     }
 
     fn test_primary_key_tablet_schema(schema_id: i64) -> TabletSchemaPb {
@@ -3492,6 +3632,45 @@ mod tests {
             ],
         )
         .expect("build auto-increment duplicate-key batch")
+    }
+
+    fn rollup_source_batch(
+        k1_values: Vec<i32>,
+        k2_values: Vec<i32>,
+        v1_values: Vec<i64>,
+    ) -> RecordBatch {
+        assert_eq!(k1_values.len(), k2_values.len());
+        assert_eq!(k1_values.len(), v1_values.len());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+            Field::new("v1", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1_values)),
+                Arc::new(Int32Array::from(k2_values)),
+                Arc::new(Int64Array::from(v1_values)),
+            ],
+        )
+        .expect("build rollup source batch")
+    }
+
+    fn rollup_source_batch_missing_value(k1_values: Vec<i32>, k2_values: Vec<i32>) -> RecordBatch {
+        assert_eq!(k1_values.len(), k2_values.len());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("k2", DataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1_values)),
+                Arc::new(Int32Array::from(k2_values)),
+            ],
+        )
+        .expect("build rollup source batch without value column")
     }
 
     fn pk_key_only_batch(keys: Vec<i32>) -> RecordBatch {
@@ -3816,6 +3995,56 @@ mod tests {
         assert_eq!(typed.null_count(), 0);
         assert_eq!(typed.value(0), 100);
         assert_eq!(typed.value(1), 200);
+    }
+
+    #[test]
+    fn non_primary_write_allows_extra_input_columns_when_schema_columns_are_covered() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let ctx = test_rollup_like_context(&root, 7020, 88111, 4020);
+        let batch = rollup_source_batch(vec![1, 2], vec![10, 20], vec![100, 200]);
+
+        let routing = super::resolve_lake_batch_write_routing(&ctx, &batch, None)
+            .expect("resolve non-primary routing with extra source columns");
+        let super::LakeBatchWriteRouting::Upsert { data_batch } = routing else {
+            panic!("expected upsert routing for non-primary write");
+        };
+        assert_eq!(data_batch.num_columns(), 2);
+        assert_eq!(data_batch.schema().field(0).name(), "k1");
+        assert_eq!(data_batch.schema().field(1).name(), "v1");
+        let key_col = data_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("downcast k1 column");
+        assert_eq!(key_col.value(0), 1);
+        assert_eq!(key_col.value(1), 2);
+        let value_col = data_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast v1 column");
+        assert_eq!(value_col.value(0), 100);
+        assert_eq!(value_col.value(1), 200);
+    }
+
+    #[test]
+    fn non_primary_write_rejects_missing_schema_column_even_with_extra_columns() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let ctx = test_rollup_like_context(&root, 7021, 88112, 4021);
+        let batch = rollup_source_batch_missing_value(vec![1, 2], vec![10, 20]);
+
+        let err = match super::resolve_lake_batch_write_routing(&ctx, &batch, None) {
+            Ok(_) => panic!("missing value column should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("missing schema column in input batch")
+                && err.contains("schema_column='v1'"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -4212,6 +4441,58 @@ mod tests {
             err.contains("to be the last column"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn rowset_partial_snapshot_version_is_negative_and_stable() {
+        let rowset = RowsetMetadataPb {
+            id: Some(42),
+            version: Some(7),
+            segments: vec!["segment_a.dat".to_string()],
+            num_rows: Some(3),
+            num_dels: Some(0),
+            segment_size: vec![128],
+            bundle_file_offsets: vec![0],
+            ..Default::default()
+        };
+        let first = super::synthetic_rowset_snapshot_version(&rowset);
+        let second = super::synthetic_rowset_snapshot_version(&rowset);
+        assert!(first < 0, "synthetic snapshot version must be negative");
+        assert_eq!(
+            first, second,
+            "synthetic snapshot version must be stable for identical rowset metadata"
+        );
+    }
+
+    #[test]
+    fn rowset_partial_snapshot_version_changes_with_rowset_content() {
+        let rowset_a = RowsetMetadataPb {
+            id: Some(42),
+            version: Some(7),
+            segments: vec!["segment_a.dat".to_string()],
+            num_rows: Some(3),
+            num_dels: Some(0),
+            segment_size: vec![128],
+            bundle_file_offsets: vec![0],
+            ..Default::default()
+        };
+        let rowset_b = RowsetMetadataPb {
+            id: Some(43),
+            version: Some(7),
+            segments: vec!["segment_b.dat".to_string()],
+            num_rows: Some(3),
+            num_dels: Some(0),
+            segment_size: vec![256],
+            bundle_file_offsets: vec![16],
+            ..Default::default()
+        };
+        let version_a = super::synthetic_rowset_snapshot_version(&rowset_a);
+        let version_b = super::synthetic_rowset_snapshot_version(&rowset_b);
+        assert!(version_a < 0 && version_b < 0);
+        assert_ne!(
+            version_a, version_b,
+            "distinct rowsets should not share synthetic snapshot cache key"
         );
     }
 }

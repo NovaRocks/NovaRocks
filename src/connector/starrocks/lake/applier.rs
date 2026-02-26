@@ -239,10 +239,25 @@ fn apply_tablet_schema_update(
                 .or_insert_with(|| existing_schema.clone());
         }
     } else if !metadata.rowsets.is_empty() {
-        return Err(format!(
-            "tablet metadata schema is missing while rowsets exist: reason={reason} rowset_count={}",
-            metadata.rowsets.len()
-        ));
+        // Recover from malformed metadata produced by historical schema-change/rollup paths:
+        // rowsets exist but schema is absent. Bind existing rowsets to the incoming schema id.
+        let existing_rowset_ids = metadata
+            .rowsets
+            .iter()
+            .map(|rowset| {
+                rowset.id.ok_or_else(|| {
+                    format!(
+                        "tablet rowset id is missing when recovering schema-less metadata: reason={reason}"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for rowset_id in existing_rowset_ids {
+            metadata
+                .rowset_to_schema
+                .entry(rowset_id)
+                .or_insert(new_schema_id);
+        }
     }
 
     metadata
@@ -773,5 +788,65 @@ mod tests {
             meta.compaction_strategy,
             Some(CompactionStrategyPb::Default as i32)
         );
+    }
+
+    #[test]
+    fn apply_txn_log_recovers_schema_when_metadata_schema_is_missing() {
+        let runtime_schema = test_tablet_schema_v2(7, 1);
+        let mut existing_rowset = test_rowset("seg_missing_schema.dat", 3, 21);
+        existing_rowset.id = Some(12);
+        let mut meta = TabletMetadataPb {
+            id: Some(6),
+            version: Some(2),
+            schema: None,
+            rowsets: vec![existing_rowset],
+            next_rowset_id: Some(13),
+            cumulative_point: Some(0),
+            delvec_meta: None,
+            compaction_inputs: Vec::new(),
+            prev_garbage_version: None,
+            orphan_files: Vec::new(),
+            enable_persistent_index: None,
+            persistent_index_type: None,
+            commit_time: None,
+            source_schema: None,
+            sstable_meta: None,
+            dcg_meta: None,
+            historical_schemas: std::collections::HashMap::new(),
+            rowset_to_schema: std::collections::HashMap::new(),
+            gtid: Some(0),
+            compaction_strategy: None,
+            flat_json_config: None,
+        };
+        let txn_log = TxnLogPb {
+            tablet_id: Some(6),
+            txn_id: Some(60),
+            op_write: Some(txn_log_pb::OpWrite {
+                rowset: None,
+                txn_meta: None,
+                dels: Vec::new(),
+                rewrite_segments: Vec::new(),
+                del_encryption_metas: Vec::new(),
+                ssts: Vec::new(),
+                schema_key: Some(TableSchemaKeyPb {
+                    db_id: Some(1),
+                    table_id: Some(2),
+                    schema_id: Some(7),
+                }),
+            }),
+            op_compaction: None,
+            op_schema_change: None,
+            op_alter_metadata: None,
+            op_replication: None,
+            partition_id: Some(1),
+            load_id: None,
+        };
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        apply_txn_log_to_metadata(&mut meta, &txn_log, 7, &runtime_schema, &root, None, 3)
+            .expect("recover schema-less metadata");
+        assert_eq!(meta.schema.as_ref().and_then(|s| s.id), Some(7));
+        assert_eq!(meta.rowset_to_schema.get(&12), Some(&7));
+        assert!(meta.historical_schemas.contains_key(&7));
     }
 }

@@ -169,6 +169,10 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         s3_config: new_s3,
         partial_update: PartialUpdateWritePolicy::default(),
     };
+    // Some rollup/sc tablets may not have been pre-registered in runtime registry (for example
+    // metadata is lazily visible via shard path). Register both base/new tablet runtimes to keep
+    // later publish_version lookup consistent.
+    register_tablet_runtime(&base_ctx)?;
     register_tablet_runtime(&new_ctx)?;
     if !schemas_equivalent(&new_metadata_schema, &new_schema) {
         let mut patched_meta = new_metadata.clone();
