@@ -49,15 +49,15 @@ fn has_thirdparty_layout(path: &Path) -> bool {
     path.join("include").exists() && (path.join("lib").exists() || path.join("lib64").exists())
 }
 
-fn normalize_thirdparty_root(path: &Path) -> Option<PathBuf> {
-    if has_thirdparty_layout(path) {
-        return Some(path.to_path_buf());
-    }
-    let installed = path.join("installed");
+fn resolve_thirdparty_install_root(root: &Path) -> Result<PathBuf, String> {
+    let installed = root.join("installed");
     if has_thirdparty_layout(&installed) {
-        return Some(installed);
+        return Ok(installed);
     }
-    None
+    Err(format!(
+        "thirdparty artifacts not found under '{}'. expected '<thirdparty-root>/installed/{{include,lib|lib64}}'. set STARROCKS_THIRDPARTY to thirdparty root",
+        root.display()
+    ))
 }
 
 fn find_cxx_runtime(lib_name: &str) -> Option<PathBuf> {
@@ -101,23 +101,23 @@ fn resolve_thirdparty_root(manifest_dir: &Path) -> Result<PathBuf, String> {
             } else {
                 manifest_dir.join(configured)
             };
-            if let Some(root) = normalize_thirdparty_root(&resolved) {
-                return Ok(root);
+            if resolved.is_dir() {
+                return Ok(resolved);
             }
             return Err(format!(
-                "invalid STARROCKS_THIRDPARTY: '{}' (expected a thirdparty root or installed dir with include/ and lib|lib64/)",
+                "invalid STARROCKS_THIRDPARTY: '{}' (expected a thirdparty root directory)",
                 resolved.display()
             ));
         }
     }
 
     let default_root = manifest_dir.join("thirdparty");
-    if let Some(root) = normalize_thirdparty_root(&default_root) {
-        return Ok(root);
+    if default_root.is_dir() {
+        return Ok(default_root);
     }
 
     Err(format!(
-        "thirdparty directory not found. expected default '{}' (or its installed subdir), or set STARROCKS_THIRDPARTY",
+        "thirdparty directory not found. expected default '{}', or set STARROCKS_THIRDPARTY",
         default_root.display()
     ))
 }
@@ -166,11 +166,17 @@ fn main() {
 
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let project_thirdparty = resolve_thirdparty_root(&manifest_dir).unwrap_or_else(|e| {
+    let project_thirdparty_root = resolve_thirdparty_root(&manifest_dir).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         eprintln!("  To build default thirdparty, run: ./thirdparty/build-thirdparty.sh");
-        panic!("thirdparty directory not found");
+        panic!("thirdparty root not found");
     });
+    let project_thirdparty = resolve_thirdparty_install_root(&project_thirdparty_root)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            eprintln!("  To build default thirdparty, run: ./thirdparty/build-thirdparty.sh");
+            panic!("thirdparty artifacts not found");
+        });
     let (tp_bin, tp_include, tp_lib, tp_lib64) = (
         project_thirdparty.join("bin"),
         project_thirdparty.join("include"),
@@ -348,13 +354,11 @@ fn main() {
             if let Some(parent) = libstdcpp_static.parent() {
                 println!("cargo:rustc-link-search=native={}", parent.display());
             }
-            println!(
-                "cargo:warning=Using static libstdc++ archive: {}",
+            eprintln!(
+                "info: using static libstdc++ archive: {}",
                 libstdcpp_static.display()
             );
-            println!(
-                "cargo:warning=Linking C++ runtime statically (-static-libstdc++ -static-libgcc)"
-            );
+            eprintln!("info: linking C++ runtime statically (-static-libstdc++ -static-libgcc)");
             println!("cargo:rustc-link-arg=-static-libstdc++");
             println!("cargo:rustc-link-arg=-static-libgcc");
             println!("cargo:rustc-link-lib=static=stdc++");
@@ -362,8 +366,8 @@ fn main() {
                 if let Some(parent) = libsupcxx_static.parent() {
                     println!("cargo:rustc-link-search=native={}", parent.display());
                 }
-                println!(
-                    "cargo:warning=Using static libsupc++ archive: {}",
+                eprintln!(
+                    "info: using static libsupc++ archive: {}",
                     libsupcxx_static.display()
                 );
                 println!("cargo:rustc-link-lib=static=supc++");
@@ -385,9 +389,7 @@ static C++ runtime is required.",
         }
     }
 
-    // Link OpenSSL - use dynamic linking from thirdparty/installed
-    // build_openssl() has copied system OpenSSL to thirdparty/installed/lib
-    // Both macOS and Linux use the same OpenSSL from thirdparty/installed
+    // Link OpenSSL dynamically from resolved thirdparty install root.
     println!("cargo:rustc-link-lib=ssl");
     println!("cargo:rustc-link-lib=crypto");
     println!("cargo:rustc-link-lib=static=brpc");

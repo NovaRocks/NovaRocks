@@ -29,38 +29,30 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 print_usage() {
     cat <<'EOF'
 Usage:
-  ./build.sh [--output <dir>] [--no-package] [cargo subcommand args...]
+  ./build.sh [--output <dir>] [--no-package] [build args...]
 
 Examples:
   ./build.sh
-  ./build.sh build --release
-  ./build.sh --output ./output/novarocks build --release
-  ./build.sh --no-package test
-  ./build.sh test
-  STARROCKS_THIRDPARTY=./thirdparty ./build.sh build
+  ./build.sh --release
+  ./build.sh --output ./output/novarocks --release
+  ./build.sh --no-package --release
+  STARROCKS_THIRDPARTY=./thirdparty ./build.sh --release
 
 Description:
   This wrapper resolves thirdparty root from STARROCKS_THIRDPARTY (default: ./thirdparty)
   and exports OPENSSL_* / PKG_CONFIG_PATH so openssl-sys can use bundled thirdparty libs.
-  When cargo subcommand is `build`, it also packages runtime files into output/novarocks by default.
+  It only runs `cargo build` and packages runtime files into output/novarocks by default.
 EOF
 }
 
-has_thirdparty_layout() {
-    local dir="$1"
-    [[ -d "${dir}/include" && ( -d "${dir}/lib" || -d "${dir}/lib64" ) ]]
-}
-
-normalize_thirdparty_root() {
-    local input="$1"
-    if has_thirdparty_layout "$input"; then
-        echo "$input"
+resolve_thirdparty_install_root() {
+    local root="$1"
+    local installed="${root}/installed"
+    if [[ -d "${installed}/include" && ( -d "${installed}/lib" || -d "${installed}/lib64" ) ]]; then
+        echo "${installed}"
         return 0
     fi
-    if has_thirdparty_layout "${input}/installed"; then
-        echo "${input}/installed"
-        return 0
-    fi
+    echo "Error: thirdparty artifacts not found under '${root}'. Expected '<thirdparty-root>/installed/{include,lib|lib64}'. Set STARROCKS_THIRDPARTY to thirdparty root." >&2
     return 1
 }
 
@@ -73,21 +65,21 @@ resolve_thirdparty_root() {
         else
             candidate="${ROOT_DIR}/${configured}"
         fi
-        if root="$(normalize_thirdparty_root "${candidate}")"; then
-            echo "${root}"
+        if [[ -d "${candidate}" ]]; then
+            echo "${candidate}"
             return 0
         fi
-        echo "Error: invalid STARROCKS_THIRDPARTY='${configured}', expected thirdparty root or installed dir with include/ and lib|lib64/" >&2
+        echo "Error: invalid STARROCKS_THIRDPARTY='${configured}', expected thirdparty root directory" >&2
         return 1
     fi
 
     local fallback="${ROOT_DIR}/thirdparty"
-    if root="$(normalize_thirdparty_root "${fallback}")"; then
-        echo "${root}"
+    if [[ -d "${fallback}" ]]; then
+        echo "${fallback}"
         return 0
     fi
 
-    echo "Error: thirdparty directory not found, expected '${fallback}' (or its installed subdir), or set STARROCKS_THIRDPARTY" >&2
+    echo "Error: thirdparty directory not found, expected '${fallback}', or set STARROCKS_THIRDPARTY" >&2
     return 1
 }
 
@@ -172,6 +164,26 @@ setup_starrocks_gcc_runtime() {
     fi
 }
 
+print_linux_static_cxx_runtime_info() {
+    local cxx_cmd="${CXX:-g++}"
+    if [[ ! -x "${cxx_cmd}" ]] && ! command -v "${cxx_cmd}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local libstdcpp_static
+    libstdcpp_static="$("${cxx_cmd}" -print-file-name=libstdc++.a 2>/dev/null || true)"
+    if [[ -n "${libstdcpp_static}" && "${libstdcpp_static}" != "libstdc++.a" && -f "${libstdcpp_static}" ]]; then
+        echo "info: using static libstdc++ archive: ${libstdcpp_static}"
+        echo "info: linking C++ runtime statically (-static-libstdc++ -static-libgcc)"
+    fi
+
+    local libsupcxx_static
+    libsupcxx_static="$("${cxx_cmd}" -print-file-name=libsupc++.a 2>/dev/null || true)"
+    if [[ -n "${libsupcxx_static}" && "${libsupcxx_static}" != "libsupc++.a" && -f "${libsupcxx_static}" ]]; then
+        echo "info: using static libsupc++ archive: ${libsupcxx_static}"
+    fi
+}
+
 realpath_portable() {
     local path="$1"
     if command -v readlink >/dev/null 2>&1; then
@@ -213,6 +225,14 @@ copy_non_system_linked_libs() {
             if [[ -z "${lib_path}" || ! -f "${lib_path}" ]]; then
                 continue
             fi
+            local lib_name
+            lib_name="$(basename "${lib_path}")"
+            case "${lib_name}" in
+                # libgcc is linked statically for Linux builds; do not bundle toolchain libgcc_s into output.
+                libgcc_s.so.1|libgcc_s-*.so.*)
+                    continue
+                    ;;
+            esac
             case "${lib_path}" in
                 /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*)
                     continue
@@ -227,7 +247,7 @@ resolve_build_artifact_path() {
     local profile="debug"
     local target_triple="${CARGO_BUILD_TARGET:-}"
     local args=("$@")
-    local i=1
+    local i=0
     while [[ ${i} -lt ${#args[@]} ]]; do
         local arg="${args[$i]}"
         case "${arg}" in
@@ -261,211 +281,12 @@ resolve_build_artifact_path() {
 
 generate_output_scripts() {
     local out_root="$1"
-
-    cat > "${out_root}/bin/novarocksctl" <<'EOF'
-#!/usr/bin/env sh
-set -eu
-
-SCRIPT_DIR=$(dirname "$0")
-SCRIPT_DIR=$(cd "${SCRIPT_DIR}" && pwd)
-ROOT_DIR=$(cd "${SCRIPT_DIR}/.." && pwd)
-NOVAROCKS_BIN="${ROOT_DIR}/bin/novarocks"
-CONFIG_PATH="${ROOT_DIR}/conf/novarocks.toml"
-LOG_DIR="${ROOT_DIR}/log"
-PID_FILE="${ROOT_DIR}/bin/novarocks.pid"
-LOG_FILE="${LOG_DIR}/novarocks.out"
-
-mkdir -p "${LOG_DIR}" "${ROOT_DIR}/bin"
-if [ -n "${LD_LIBRARY_PATH:-}" ]; then
-    LD_LIBRARY_PATH="${ROOT_DIR}/lib:${LD_LIBRARY_PATH}"
-else
-    LD_LIBRARY_PATH="${ROOT_DIR}/lib"
-fi
-export LD_LIBRARY_PATH
-
-print_usage() {
-    cat <<'USAGE'
-Usage:
-  ./bin/novarocksctl [start] [--daemon] [-- <extra args>...]
-  ./bin/novarocksctl stop [--timeout <seconds>]
-  ./bin/novarocksctl restart [--timeout <seconds>] [--daemon] [-- <extra args>...]
-
-Examples:
-  ./bin/novarocksctl --daemon
-  ./bin/novarocksctl start
-  ./bin/novarocksctl stop --timeout 30
-  ./bin/novarocksctl restart --timeout 30 --daemon
-USAGE
-}
-
-is_novarocks_process() {
-    pid="$1"
-    ps -p "${pid}" -o command= 2>/dev/null | grep -q "novarocks"
-}
-
-start_novarocks() {
-    RUN_DAEMON=0
-
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --daemon)
-                RUN_DAEMON=1
-                shift
-                ;;
-            --)
-                shift
-                break
-                ;;
-            -h|--help)
-                print_usage
-                exit 0
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-
-    if [ ! -x "${NOVAROCKS_BIN}" ]; then
-        echo "Error: executable not found: ${NOVAROCKS_BIN}" >&2
+    local ctl_src="${ROOT_DIR}/bin/novarocksctl"
+    if [[ ! -f "${ctl_src}" ]]; then
+        echo "Error: novarocksctl script not found: ${ctl_src}" >&2
         exit 1
     fi
-
-    if [ -f "${PID_FILE}" ]; then
-        oldpid=$(cat "${PID_FILE}")
-        if is_novarocks_process "${oldpid}"; then
-            echo "NovaRocks already running as pid ${oldpid}" >&2
-            exit 1
-        fi
-        rm -f "${PID_FILE}"
-    fi
-
-    if [ "${RUN_DAEMON}" -eq 1 ]; then
-        if [ $# -gt 0 ]; then
-            nohup "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" "$@" >> "${LOG_FILE}" 2>&1 < /dev/null &
-        else
-            nohup "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" >> "${LOG_FILE}" 2>&1 < /dev/null &
-        fi
-        echo $! > "${PID_FILE}"
-        echo "NovaRocks started in daemon mode, pid=$(cat "${PID_FILE}")"
-    else
-        if [ $# -gt 0 ]; then
-            exec "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}" "$@"
-        else
-            exec "${NOVAROCKS_BIN}" run --config "${CONFIG_PATH}"
-        fi
-    fi
-}
-
-stop_novarocks() {
-    STOP_TIMEOUT=30
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --timeout)
-                if [ $# -lt 2 ]; then
-                    echo "Error: --timeout requires seconds" >&2
-                    exit 1
-                fi
-                STOP_TIMEOUT="$2"
-                shift 2
-                ;;
-            --)
-                shift
-                break
-                ;;
-            *)
-                echo "Error: unknown stop option: $1" >&2
-                print_usage
-                exit 1
-                ;;
-        esac
-    done
-
-    if [ ! -f "${PID_FILE}" ]; then
-        echo "NovaRocks pid file not found: ${PID_FILE}"
-        exit 0
-    fi
-
-    pid=$(cat "${PID_FILE}")
-    if ! kill -0 "${pid}" >/dev/null 2>&1; then
-        echo "Process ${pid} not found, removing stale pid file"
-        rm -f "${PID_FILE}"
-        exit 0
-    fi
-
-    if ! is_novarocks_process "${pid}"; then
-        echo "Refuse to stop pid ${pid}: command is not novarocks"
-        exit 1
-    fi
-
-    kill -15 "${pid}" >/dev/null 2>&1 || true
-    start_ts=$(date +%s)
-    while kill -0 "${pid}" >/dev/null 2>&1; do
-        if [ "${STOP_TIMEOUT}" -gt 0 ] && [ $(( $(date +%s) - start_ts )) -gt "${STOP_TIMEOUT}" ]; then
-            kill -9 "${pid}" >/dev/null 2>&1 || true
-            echo "Graceful stop timeout, process ${pid} killed with SIGKILL"
-            break
-        fi
-        sleep 1
-    done
-
-    rm -f "${PID_FILE}"
-    echo "NovaRocks stopped"
-}
-
-restart_novarocks() {
-    STOP_TIMEOUT=30
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --timeout)
-                if [ $# -lt 2 ]; then
-                    echo "Error: --timeout requires seconds" >&2
-                    exit 1
-                fi
-                STOP_TIMEOUT="$2"
-                shift 2
-                ;;
-            --)
-                shift
-                break
-                ;;
-            *)
-                break
-                ;;
-        esac
-    done
-
-    stop_novarocks --timeout "${STOP_TIMEOUT}"
-    start_novarocks "$@"
-}
-
-if [ $# -eq 0 ]; then
-    start_novarocks
-    exit 0
-fi
-
-cmd="$1"
-case "${cmd}" in
-    -h|--help|help)
-        print_usage
-        ;;
-    start)
-        shift
-        start_novarocks "$@"
-        ;;
-    stop)
-        shift
-        stop_novarocks "$@"
-        ;;
-    restart)
-        shift
-        restart_novarocks "$@"
-        ;;
-    *)
-        start_novarocks "$@"
-        ;;
-esac
-EOF
+    cp -a "${ctl_src}" "${out_root}/bin/novarocksctl"
     chmod +x "${out_root}/bin/novarocksctl"
 
     cat > "${out_root}/README.md" <<'EOF'
@@ -553,7 +374,7 @@ package_output() {
 
 NOVAROCKS_OUTPUT="${NOVAROCKS_OUTPUT:-${ROOT_DIR}/output/novarocks}"
 AUTO_PACKAGE=1
-declare -a CARGO_ARGS=()
+declare -a BUILD_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
@@ -573,20 +394,31 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         *)
-            CARGO_ARGS+=("$1")
+            BUILD_ARGS+=("$1")
             shift
             ;;
     esac
 done
 
-if [[ ${#CARGO_ARGS[@]} -eq 0 ]]; then
-    CARGO_ARGS=(build)
+if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+    if [[ "${BUILD_ARGS[0]}" == "build" ]]; then
+        if [[ ${#BUILD_ARGS[@]} -gt 1 ]]; then
+            BUILD_ARGS=("${BUILD_ARGS[@]:1}")
+        else
+            BUILD_ARGS=()
+        fi
+    elif [[ "${BUILD_ARGS[0]}" != -* ]]; then
+        echo "Error: build.sh only supports cargo build, got subcommand '${BUILD_ARGS[0]}'" >&2
+        echo "Use 'cargo ${BUILD_ARGS[*]}' directly, and use './bin/novarocksctl' for runtime control." >&2
+        exit 1
+    fi
 fi
 
 THIRDPARTY_ROOT="$(resolve_thirdparty_root)"
+THIRDPARTY_INSTALL_ROOT="$(resolve_thirdparty_install_root "${THIRDPARTY_ROOT}")"
 
 OPENSSL_LIB_ROOT=""
-for lib_dir in "${THIRDPARTY_ROOT}/lib" "${THIRDPARTY_ROOT}/lib64"; do
+for lib_dir in "${THIRDPARTY_INSTALL_ROOT}/lib" "${THIRDPARTY_INSTALL_ROOT}/lib64"; do
     if [[ ! -d "${lib_dir}" ]]; then
         continue
     fi
@@ -601,23 +433,24 @@ export STARROCKS_THIRDPARTY="${THIRDPARTY_ROOT}"
 if [[ "${OS_NAME}" == "Linux" ]]; then
     detect_starrocks_gcc_home
     setup_starrocks_gcc_runtime
+    print_linux_static_cxx_runtime_info
 fi
 
-append_path_if_dir LIBRARY_PATH "${THIRDPARTY_ROOT}/lib"
-append_path_if_dir LIBRARY_PATH "${THIRDPARTY_ROOT}/lib64"
+append_path_if_dir LIBRARY_PATH "${THIRDPARTY_INSTALL_ROOT}/lib"
+append_path_if_dir LIBRARY_PATH "${THIRDPARTY_INSTALL_ROOT}/lib64"
 if [[ "${OS_NAME}" == "Linux" ]]; then
-    append_path_if_dir LD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib"
-    append_path_if_dir LD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib64"
+    append_path_if_dir LD_LIBRARY_PATH "${THIRDPARTY_INSTALL_ROOT}/lib"
+    append_path_if_dir LD_LIBRARY_PATH "${THIRDPARTY_INSTALL_ROOT}/lib64"
 elif [[ "${OS_NAME}" == "Darwin" ]]; then
-    append_path_if_dir DYLD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib"
-    append_path_if_dir DYLD_LIBRARY_PATH "${THIRDPARTY_ROOT}/lib64"
+    append_path_if_dir DYLD_LIBRARY_PATH "${THIRDPARTY_INSTALL_ROOT}/lib"
+    append_path_if_dir DYLD_LIBRARY_PATH "${THIRDPARTY_INSTALL_ROOT}/lib64"
 fi
 
 use_thirdparty_openssl=0
-if [[ -n "${OPENSSL_LIB_ROOT}" && -f "${THIRDPARTY_ROOT}/include/openssl/opensslv.h" ]]; then
+if [[ -n "${OPENSSL_LIB_ROOT}" && -f "${THIRDPARTY_INSTALL_ROOT}/include/openssl/opensslv.h" ]]; then
     use_thirdparty_openssl=1
-    export OPENSSL_DIR="${THIRDPARTY_ROOT}"
-    export OPENSSL_INCLUDE_DIR="${THIRDPARTY_ROOT}/include"
+    export OPENSSL_DIR="${THIRDPARTY_INSTALL_ROOT}"
+    export OPENSSL_INCLUDE_DIR="${THIRDPARTY_INSTALL_ROOT}/include"
     export OPENSSL_LIB_DIR="${OPENSSL_LIB_ROOT}"
 
     if [[ -d "${OPENSSL_LIB_ROOT}/pkgconfig" ]]; then
@@ -632,7 +465,7 @@ if [[ -n "${OPENSSL_LIB_ROOT}" && -f "${THIRDPARTY_ROOT}/include/openssl/openssl
     fi
 else
     if [[ "${OS_NAME}" == "Linux" ]]; then
-        echo "Error: OpenSSL headers/libs not found under '${THIRDPARTY_ROOT}' (Linux requires thirdparty OpenSSL)" >&2
+        echo "Error: OpenSSL headers/libs not found under '${THIRDPARTY_INSTALL_ROOT}' (Linux requires thirdparty OpenSSL)" >&2
         exit 1
     fi
     unset_var_if_set OPENSSL_DIR
@@ -659,6 +492,7 @@ if [[ -n "${target}" ]]; then
 fi
 
 echo "Using thirdparty root: ${THIRDPARTY_ROOT}"
+echo "Using thirdparty install root: ${THIRDPARTY_INSTALL_ROOT}"
 if [[ "${use_thirdparty_openssl}" == "1" ]]; then
     echo "OPENSSL_DIR=${OPENSSL_DIR}"
     echo "OPENSSL_LIB_DIR=${OPENSSL_LIB_DIR}"
@@ -672,10 +506,18 @@ if [[ -n "${cargo_linker_var:-}" ]]; then
     echo "${cargo_linker_var}=${!cargo_linker_var}"
 fi
 
-cargo "${CARGO_ARGS[@]}"
+if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+    cargo build "${BUILD_ARGS[@]}"
+else
+    cargo build
+fi
 
-if [[ "${CARGO_ARGS[0]}" == "build" && "${AUTO_PACKAGE}" == "1" ]]; then
-    artifact_path="$(resolve_build_artifact_path "${CARGO_ARGS[@]}")"
+if [[ "${AUTO_PACKAGE}" == "1" ]]; then
+    if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+        artifact_path="$(resolve_build_artifact_path "${BUILD_ARGS[@]}")"
+    else
+        artifact_path="$(resolve_build_artifact_path)"
+    fi
     package_output "${artifact_path}" "${NOVAROCKS_OUTPUT}"
     echo "Packaged runtime output: ${NOVAROCKS_OUTPUT}"
 fi

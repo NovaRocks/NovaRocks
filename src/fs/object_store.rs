@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use opendal::Operator;
-use opendal::layers::{RetryInterceptor, RetryLayer, TimeoutLayer};
+use opendal::layers::{HttpClientLayer, RetryInterceptor, RetryLayer, TimeoutLayer};
 
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
@@ -492,13 +492,6 @@ fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> 
     if let Some(token) = cfg.session_token.as_deref() {
         builder = builder.session_token(token);
     }
-    if local_endpoint {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .context("build reqwest client without proxy for local object endpoint")?;
-        builder = builder.http_client(opendal::raw::HttpClient::with(client));
-    }
     if !cfg.root.is_empty() {
         builder = builder.root(&cfg.root);
     }
@@ -508,6 +501,13 @@ fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> 
         "init opendal s3 operator for virtual-host endpoint"
     };
     let mut op = Operator::new(builder).context(init_context)?.finish();
+    if local_endpoint {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .context("build reqwest client without proxy for local object endpoint")?;
+        op = op.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(client)));
+    }
 
     if let Some(timeout_layer) = build_timeout_layer(cfg) {
         op = op.layer(timeout_layer);
