@@ -30,6 +30,7 @@ use prost::Message;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_cache_put};
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
+use crate::runtime::global_async_runtime::data_runtime;
 use crate::service::grpc_client::proto::starrocks::{
     BundleTabletMetadataPb, DelvecPagePb, KeysType, PagePointerPb, TabletMetadataPb, TabletSchemaPb,
 };
@@ -135,10 +136,8 @@ pub fn load_tablet_snapshot(
 
     let root = TabletRoot::parse(tablet_root_path)?;
     let op = build_operator(&root, object_store_profile)?;
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("create tokio runtime for starrocks metadata loader failed: {e}"))?;
-
-    load_tablet_snapshot_from_root(tablet_id, version, &root, &rt, &op)
+    let rt = data_runtime()?;
+    load_tablet_snapshot_from_root(tablet_id, version, &root, rt.as_ref(), &op)
 }
 
 fn load_tablet_snapshot_from_root(
@@ -234,8 +233,7 @@ pub fn load_bundle_segment_footers(
 
     let root = TabletRoot::parse(tablet_root_path)?;
     let op = build_operator(&root, object_store_profile)?;
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("create tokio runtime for starrocks segment loader failed: {e}"))?;
+    let rt = data_runtime()?;
 
     let mut footers = Vec::with_capacity(snapshot.segment_files.len());
     for segment in &snapshot.segment_files {
@@ -258,9 +256,9 @@ pub fn load_bundle_segment_footers(
                     segment.path, bundle_offset, segment_size
                 )
             })?;
-            read_range_bytes(&rt, &op, &segment.relative_path, start, end)?
+            read_range_bytes(rt.as_ref(), &op, &segment.relative_path, start, end)?
         } else {
-            read_all_bytes(&rt, &op, &segment.relative_path)?
+            read_all_bytes(rt.as_ref(), &op, &segment.relative_path)?
         };
         footers.push(decode_segment_footer(&segment.path, &segment_bytes)?);
     }

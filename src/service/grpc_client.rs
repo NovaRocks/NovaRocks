@@ -24,6 +24,7 @@ use tracing::debug;
 
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
+use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 
 pub mod proto {
     pub mod novarocks {
@@ -62,17 +63,6 @@ static STREAMS: OnceLock<StreamCache> = OnceLock::new();
 fn streams() -> &'static StreamCache {
     STREAMS.get_or_init(|| StreamCache {
         mu: Mutex::new(HashMap::new()),
-    })
-}
-
-fn client_runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .worker_threads(8)
-            .build()
-            .expect("build tokio runtime")
     })
 }
 
@@ -130,7 +120,8 @@ fn get_or_create_exchange_stream(dest_host: &str, port: u16) -> Result<StreamCon
     let (tx, rx) = tokio::sync::mpsc::channel::<proto::novarocks::ExchangeRequest>(4096);
     let dest_host = dest_host.to_string();
     let port = port;
-    client_runtime().handle().spawn(async move {
+    let runtime_handle = data_runtime_handle()?;
+    runtime_handle.spawn(async move {
         let ch = match get_channel(&dest_host, port).await {
             Ok(v) => v,
             Err(e) => {
@@ -240,7 +231,8 @@ pub fn transmit_runtime_filter(
 ) -> Result<(), String> {
     let dest_host = dest_host.to_string();
     let port = dest_port;
-    client_runtime().handle().spawn(async move {
+    let runtime_handle = data_runtime_handle()?;
+    runtime_handle.spawn(async move {
         let ch = match get_channel(&dest_host, port).await {
             Ok(v) => v,
             Err(e) => {
@@ -283,7 +275,7 @@ pub fn lookup(
 ) -> Result<proto::starrocks::PLookUpResponse, String> {
     let dest_host = dest_host.to_string();
     let port = dest_port;
-    client_runtime().block_on(async move {
+    data_block_on(async move {
         let ch = get_channel(&dest_host, port)
             .await
             .map_err(|e| format!("lookup connect failed: dest={dest_host}:{port} error={e}"))?;
@@ -296,4 +288,5 @@ pub fn lookup(
             .map_err(|e| format!("lookup request failed: dest={dest_host}:{port} error={e}"))?;
         Ok(resp.into_inner())
     })
+    .map_err(|e| format!("lookup runtime execution failed: {e}"))?
 }

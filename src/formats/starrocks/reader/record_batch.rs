@@ -58,6 +58,7 @@ use crate::formats::starrocks::segment::{
     StarRocksSegmentColumnMeta, StarRocksSegmentFooter, StarRocksZoneMapMeta,
 };
 use crate::novarocks_logging::debug;
+use crate::runtime::global_async_runtime::data_runtime;
 
 use super::column_decode::{
     build_column_decode_spec, decode_all_data_page_refs, decode_one_data_page,
@@ -207,8 +208,7 @@ pub(super) fn build_dup_record_batch(
     let mut total_output_rows = 0usize;
     let root = TabletRoot::parse(tablet_root_path)?;
     let op = build_operator(&root, object_store_profile)?;
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("create tokio runtime for native starrocks reader failed: {e}"))?;
+    let rt = data_runtime()?;
 
     for (segment_index, segment) in plan.segments.iter().enumerate() {
         let footer = segment_footers.get(segment_index).ok_or_else(|| {
@@ -249,7 +249,7 @@ pub(super) fn build_dup_record_batch(
                 segment.path, segment.bundle_file_offset, segment.segment_size
             )
         })?;
-        let segment_bytes = read_range_bytes(&rt, &op, &segment.relative_path, start, end)?;
+        let segment_bytes = read_range_bytes(rt.as_ref(), &op, &segment.relative_path, start, end)?;
 
         let selected_ranges = selected_ranges_for_segment(
             &predicate_bindings,
@@ -280,7 +280,7 @@ pub(super) fn build_dup_record_batch(
         let primary_keep_mask = build_primary_delvec_keep_mask_for_segment(
             plan,
             segment,
-            &rt,
+            rt.as_ref(),
             &op,
             &segment.path,
             &selected_ranges,

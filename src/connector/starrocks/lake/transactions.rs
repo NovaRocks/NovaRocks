@@ -23,7 +23,6 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use tokio::runtime::Runtime;
 
 use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
@@ -56,6 +55,7 @@ use crate::formats::starrocks::writer::layout::{
 };
 use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
 use crate::novarocks_logging::{info, warn};
+use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
     AbortTxnRequest, AbortTxnResponse, CombinedTxnLogPb, DeleteDataRequest, DeleteDataResponse,
@@ -1555,8 +1555,7 @@ fn list_directory_file_names(
                 format!("{}/", rel_path.trim_end_matches('/'))
             };
 
-            let rt = Runtime::new().map_err(|e| format!("init tokio runtime failed: {e}"))?;
-            rt.block_on(async move {
+            data_block_on(async move {
                 let mut names = Vec::new();
                 let mut lister = op
                     .lister_with(&list_prefix)
@@ -1586,6 +1585,7 @@ fn list_directory_file_names(
                 }
                 Ok(names)
             })
+            .map_err(|e| format!("list object-store directory runtime execution failed: {e}"))?
         }
         ScanPathScheme::Hdfs => Err(format!(
             "txn log directory listing does not support hdfs path yet: {dir_path}"
@@ -1831,10 +1831,11 @@ fn drop_table_path(path: &str, s3_config: Option<&S3StoreConfig>) -> Result<(), 
         ));
     }
 
-    let rt = Runtime::new().map_err(|e| format!("init tokio runtime failed: {e}"))?;
     let max_attempts = 3usize;
     for attempt in 1..=max_attempts {
-        match rt.block_on(op.remove_all(rel_path)) {
+        let remove_result = data_block_on(op.remove_all(rel_path))
+            .map_err(|e| format!("drop_table runtime execution failed: {e}"))?;
+        match remove_result {
             Ok(()) => return Ok(()),
             Err(e) if e.is_temporary() && attempt < max_attempts => {
                 warn!(
