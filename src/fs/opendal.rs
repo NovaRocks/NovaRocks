@@ -22,8 +22,9 @@ use crate::formats::parquet::{
 };
 use crate::metrics;
 use crate::novarocks_logging::debug;
+use crate::runtime::global_async_runtime::data_runtime;
 use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::Operator;
@@ -135,10 +136,14 @@ pub struct OpendalRangeReaderFactory {
 
 impl OpendalRangeReaderFactory {
     pub fn from_operator(op: Operator) -> Result<Self> {
-        let rt = Runtime::new().context("init tokio runtime for opendal range reader")?;
+        let rt = Arc::clone(
+            data_runtime()
+                .map_err(|e| anyhow!("{e}"))
+                .context("init shared tokio runtime for opendal range reader")?,
+        );
         Ok(Self {
             op,
-            rt: Arc::new(rt),
+            rt,
             block_size: DEFAULT_OPENDAL_READ_SIZE,
             datacache: None,
             parquet_cache_policy: None,

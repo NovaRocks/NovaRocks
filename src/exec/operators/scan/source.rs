@@ -28,7 +28,8 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use crate::common::config::{
-    operator_buffer_chunks, scan_submit_fail_max, scan_submit_fail_timeout_ms,
+    connector_io_tasks_per_scan_operator_default, operator_buffer_chunks, scan_submit_fail_max,
+    scan_submit_fail_timeout_ms,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -490,7 +491,7 @@ impl Operator for ScanSourceOperator {
                     let tasks = self
                         .scan
                         .connector_io_tasks_per_scan_operator()
-                        .unwrap_or(1);
+                        .unwrap_or_else(connector_io_tasks_per_scan_operator_default);
                     if tasks <= 0 {
                         return Err(format!(
                             "invalid connector_io_tasks_per_scan_operator={} for scan node id={}",

@@ -44,7 +44,8 @@ use crate::exec::runtime_filter::{
 };
 use crate::metrics;
 use crate::novarocks_logging::debug;
-use arrow::array::{ArrayRef, Int32Array, Int64Array};
+use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::Schema;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,6 +106,7 @@ pub(super) struct ScanAsyncRunner {
     runtime_filters_expected: usize,
     runtime_filter_ctx: Option<Arc<RuntimeFilterContext>>,
     runtime_filters_loaded: bool,
+    conjunct_predicate: Option<ExprId>,
     rf_debug_counter: u64,
     rf_debug_last_version: u64,
     arena: Arc<ExprArena>,
@@ -136,6 +138,7 @@ impl ScanAsyncRunner {
         driver_id: i32,
     ) -> Self {
         Self {
+            conjunct_predicate: scan.conjunct_predicate(),
             name,
             scan,
             dispatch,
@@ -147,9 +150,9 @@ impl ScanAsyncRunner {
             runtime_filters_expected,
             runtime_filter_ctx: None,
             runtime_filters_loaded: false,
+            arena,
             rf_debug_counter: 0,
             rf_debug_last_version: 0,
-            arena,
             profiles,
             last_progress: Instant::now(),
             last_log: Instant::now(),
@@ -289,6 +292,9 @@ impl ScanAsyncRunner {
                 Some(Ok(chunk)) => {
                     self.last_progress = Instant::now();
                     let chunk = self.append_row_position_columns(chunk)?;
+                    let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
+                        continue;
+                    };
                     if let Some(filtered) = self.apply_runtime_filters(chunk)? {
                         if !filtered.is_empty() {
                             // Check scan-level limit before returning chunk
@@ -311,6 +317,12 @@ impl ScanAsyncRunner {
                                     // Still return this chunk (will be truncated by LimitOperator)
                                 }
                             }
+                            if let Some(profile) = self.profiles.as_ref() {
+                                let rows = i64::try_from(filtered.len()).unwrap_or(i64::MAX);
+                                profile
+                                    .unique
+                                    .counter_add("RowsRead", metrics::TUnit::UNIT, rows);
+                            }
                             return Ok(Some(filtered));
                         }
                     }
@@ -330,6 +342,30 @@ impl ScanAsyncRunner {
                 }
             }
         }
+    }
+
+    fn apply_conjunct_predicate(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+        let Some(predicate) = self.conjunct_predicate else {
+            return Ok(Some(chunk));
+        };
+        if chunk.is_empty() {
+            return Ok(Some(chunk));
+        }
+
+        let predicate_array = self
+            .arena
+            .eval(predicate, &chunk)
+            .map_err(|e| e.to_string())?;
+        let filter_mask = predicate_array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| "scan conjunct predicate must return boolean array".to_string())?;
+        let filtered_batch = filter_record_batch(&chunk.batch, filter_mask)
+            .map_err(|e| format!("scan conjunct filter failed: {}", e))?;
+        if filtered_batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Chunk::new(filtered_batch)))
     }
 
     fn build_row_position_state(
@@ -722,7 +758,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, field_with_slot_id};
-    use crate::exec::expr::ExprArena;
+    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::scan::{
         RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
@@ -749,6 +785,43 @@ mod tests {
 
         fn build_morsels(&self) -> Result<ScanMorsels, String> {
             Ok(ScanMorsels::new(Vec::new(), false))
+        }
+    }
+
+    #[derive(Clone)]
+    struct ValuesScanOp {
+        values: Vec<i32>,
+    }
+
+    impl ScanOp for ValuesScanOp {
+        fn execute_iter(
+            &self,
+            _morsel: ScanMorsel,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+            _runtime_filters: Option<&RuntimeFilterContext>,
+        ) -> Result<BoxedExecIter, String> {
+            let schema = Arc::new(Schema::new(vec![field_with_slot_id(
+                Field::new("v", DataType::Int32, false),
+                SlotId::new(1),
+            )]));
+            let array = Arc::new(Int32Array::from(self.values.clone())) as arrow::array::ArrayRef;
+            let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| e.to_string())?;
+            Ok(Box::new(std::iter::once(Ok(Chunk::new(batch)))))
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            Ok(ScanMorsels::new(
+                vec![ScanMorsel::FileRange {
+                    path: "test".to_string(),
+                    file_len: 0,
+                    offset: 0,
+                    length: 0,
+                    scan_range_id: -1,
+                    first_row_id: None,
+                    external_datacache: None,
+                }],
+                false,
+            ))
         }
     }
 
@@ -820,6 +893,59 @@ mod tests {
         assert!(
             guard[0].pending_chunk.is_some(),
             "pending runner work should remain in the pool"
+        );
+    }
+
+    #[test]
+    fn applies_scan_conjunct_predicate_before_emitting_chunk() {
+        let mut arena = ExprArena::default();
+        let slot = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let literal = arena.push_typed(ExprNode::Literal(LiteralValue::Int32(3)), DataType::Int32);
+        let predicate = arena.push_typed(ExprNode::Lt(slot, literal), DataType::Boolean);
+        let arena = Arc::new(arena);
+
+        let scan = ScanNode::new(Arc::new(ValuesScanOp {
+            values: vec![1, 3, 2, 4],
+        }))
+        .with_node_id(1)
+        .with_output_slots(vec![SlotId::new(1)])
+        .with_conjunct_predicate(Some(predicate));
+        let morsels = scan.build_morsels().expect("build morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            None,
+            HashMap::new(),
+            0,
+            arena,
+            None,
+            0,
+        );
+
+        let chunk = runner
+            .next_chunk()
+            .expect("scan next chunk")
+            .expect("scan chunk");
+        let values = chunk
+            .columns()
+            .first()
+            .expect("first column")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 values");
+        let actual = (0..values.len())
+            .map(|idx| values.value(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![1, 2]);
+        assert!(
+            runner.next_chunk().expect("scan eof").is_none(),
+            "runner should reach EOF after single morsel"
         );
     }
 }

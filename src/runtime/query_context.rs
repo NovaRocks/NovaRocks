@@ -691,6 +691,11 @@ impl QueryContextManager {
         guard.finst_to_query.insert(finst_id, query_id);
     }
 
+    pub(crate) fn query_id_by_finst(&self, finst_id: UniqueId) -> Option<QueryId> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard.finst_to_query.get(&finst_id).copied()
+    }
+
     pub(crate) fn unregister_finst(&self, finst_id: UniqueId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);

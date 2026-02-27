@@ -44,7 +44,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use tokio::runtime::Runtime;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -53,6 +52,7 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
 use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::{data_sinks, descriptors, exprs, types};
@@ -848,8 +848,8 @@ fn write_parquet_file(
             &object_store_cfg.bucket,
             &object_store_cfg.root,
         )?;
-        let rt = Runtime::new().map_err(|e| format!("init tokio runtime failed: {e}"))?;
-        rt.block_on(op.write(&rel, data))
+        data_block_on(op.write(&rel, data))
+            .map_err(|e| format!("run object-store write on data runtime failed: {e}"))?
             .map_err(|e| format!("opendal write failed: {e}"))?;
         return Ok(size);
     }

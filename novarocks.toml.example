@@ -53,6 +53,11 @@ pipeline_scan_thread_pool_queue_size = 102400
 # Pipeline execution thread pool size. 0 means auto(use CPU cores). Default: 0.
 pipeline_exec_thread_pool_thread_num = 0
 
+# Global data runtime worker thread count. 0 means auto(use CPU cores). Default: 0.
+data_runtime_worker_threads = 0
+# Global data runtime max blocking thread count. Default: 64.
+data_runtime_max_blocking_threads = 64
+
 # Spill I/O thread count. 0 means follow effective exec thread count. Default: 0.
 spill_io_threads = 0
 # Spill I/O queue capacity. Default: 1024.

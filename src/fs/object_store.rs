@@ -27,6 +27,7 @@ use opendal::layers::{HttpClientLayer, RetryInterceptor, RetryLayer, TimeoutLaye
 
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
+use crate::runtime::global_async_runtime::data_block_on;
 
 const DEFAULT_OSS_RETRY_MAX_TIMES: usize = 6;
 const DEFAULT_OSS_RETRY_MIN_DELAY_MS: u64 = 100;
@@ -218,7 +219,6 @@ impl OssOperatorCacheKey {
 
 static OSS_OPERATOR_CACHE: OnceLock<Mutex<HashMap<OssOperatorCacheKey, Operator>>> =
     OnceLock::new();
-static OSS_RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
 static RETRY_WARNING_STATE: OnceLock<Mutex<HashMap<RetryWarningKey, RetryWarningWindow>>> =
     OnceLock::new();
 static RETRY_LOG_CONTROL: OnceLock<RetryLogControl> = OnceLock::new();
@@ -608,21 +608,11 @@ pub fn build_oss_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
     Ok(cached.clone())
 }
 
-fn oss_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
-    match OSS_RUNTIME.get_or_init(|| {
-        tokio::runtime::Runtime::new().map_err(|e| format!("init tokio runtime failed: {e}"))
-    }) {
-        Ok(rt) => Ok(rt),
-        Err(err) => Err(err.clone()),
-    }
-}
-
 pub fn oss_block_on<F>(future: F) -> Result<F::Output, String>
 where
     F: Future,
 {
-    let rt = oss_runtime()?;
-    Ok(rt.block_on(future))
+    data_block_on(future)
 }
 
 pub fn resolve_oss_operator_and_path_with_config(

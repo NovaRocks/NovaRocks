@@ -18,6 +18,7 @@ pub mod backend_id;
 pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;
+pub mod global_async_runtime;
 pub mod io;
 pub mod lookup;
 pub mod mem_tracker;

@@ -30,18 +30,18 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow::array::{
-    new_empty_array, Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder,
-    Date32Array, Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder,
-    Float64Array, Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array,
-    Int64Builder, Int8Array, Int8Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampMicrosecondBuilder,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
+    Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder, Float64Array,
+    Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder,
+    Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
+    TimestampMicrosecondBuilder, new_empty_array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
 
-use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::MinMaxPredicate;
+use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::plan::{
     StarRocksNativeColumnPlan, StarRocksNativeGroupKeyColumnPlan, StarRocksNativeReadPlan,
     StarRocksTableModelPlan,

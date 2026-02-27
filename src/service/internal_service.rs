@@ -1488,7 +1488,31 @@ fn resolve_pipeline_dop(request: &internal_service::TExecPlanFragmentParams) -> 
 }
 
 pub fn cancel(finst_id: UniqueId) {
-    result_buffer::cancel(finst_id);
-    query_context_manager().unregister_finst(finst_id);
-    exchange::cancel_fragment(finst_id.hi, finst_id.lo);
+    let mgr = query_context_manager();
+    let query_id = mgr.query_id_by_finst(finst_id);
+    let cancel_reason = format!("query canceled by FE: finst={}", finst_id);
+    let mut target_finsts = query_id
+        .map(|qid| mgr.cancel_query(qid, cancel_reason.clone()))
+        .unwrap_or_default();
+    if target_finsts.is_empty() {
+        target_finsts.push(finst_id);
+    }
+
+    info!(
+        target: "novarocks::exec",
+        finst_id = %finst_id,
+        query_id = ?query_id,
+        canceled_fragments = target_finsts.len(),
+        "cancel request received"
+    );
+
+    for id in &target_finsts {
+        result_buffer::cancel(*id);
+        exchange::cancel_fragment(id.hi, id.lo);
+    }
+
+    // Fallback cleanup for detached/unknown finst that cannot be mapped to a query context.
+    if query_id.is_none() {
+        mgr.unregister_finst(finst_id);
+    }
 }

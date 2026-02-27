@@ -199,10 +199,16 @@ pub struct RuntimeConfig {
     pub olap_sink_max_tablet_write_chunk_bytes: usize,
     #[serde(default = "default_pipeline_scan_thread_pool_thread_num")]
     pub pipeline_scan_thread_pool_thread_num: usize,
+    #[serde(default = "default_connector_io_tasks_per_scan_operator")]
+    pub connector_io_tasks_per_scan_operator: i32,
     #[serde(default = "default_pipeline_scan_thread_pool_queue_size")]
     pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
+    #[serde(default = "default_data_runtime_worker_threads")]
+    pub data_runtime_worker_threads: usize,
+    #[serde(default = "default_data_runtime_max_blocking_threads")]
+    pub data_runtime_max_blocking_threads: usize,
     #[serde(default = "default_spill_io_threads")]
     pub spill_io_threads: usize,
     #[serde(default = "default_spill_io_queue_size")]
@@ -372,6 +378,14 @@ fn default_pipeline_exec_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores
 }
 
+fn default_data_runtime_worker_threads() -> usize {
+    0 // 0 means use CPU cores for global data runtime
+}
+
+fn default_data_runtime_max_blocking_threads() -> usize {
+    64
+}
+
 fn default_spill_io_threads() -> usize {
     0 // 0 means use actual exec thread count
 }
@@ -382,6 +396,10 @@ fn default_spill_io_queue_size() -> usize {
 
 fn default_pipeline_scan_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores, aligned with StarRocks pipeline_scan_thread_pool_thread_num
+}
+
+fn default_connector_io_tasks_per_scan_operator() -> i32 {
+    16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
 }
 
 fn default_pipeline_scan_thread_pool_queue_size() -> usize {
@@ -423,8 +441,11 @@ impl Default for RuntimeConfig {
             olap_sink_max_tablet_write_chunk_bytes: default_olap_sink_max_tablet_write_chunk_bytes(
             ),
             pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
+            connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
             pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
+            data_runtime_worker_threads: default_data_runtime_worker_threads(),
+            data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             spill_io_threads: default_spill_io_threads(),
             spill_io_queue_size: default_spill_io_queue_size(),
             scan_submit_fail_max: default_scan_submit_fail_max(),
@@ -491,6 +512,18 @@ impl RuntimeConfig {
     pub fn actual_scan_threads(&self) -> usize {
         if self.pipeline_scan_thread_pool_thread_num > 0 {
             self.pipeline_scan_thread_pool_thread_num
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        }
+    }
+
+    /// Get the actual number of data-runtime worker threads.
+    /// Returns CPU cores if configured as 0.
+    pub fn actual_data_runtime_threads(&self) -> usize {
+        if self.data_runtime_worker_threads > 0 {
+            self.data_runtime_worker_threads
         } else {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -664,7 +697,7 @@ impl std::fmt::Debug for JdbcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::NovaRocksConfig;
+    use super::{NovaRocksConfig, RuntimeConfig};
 
     #[test]
     fn test_server_starlet_port_default_is_9070() {
@@ -721,5 +754,43 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
             cfg.runtime.olap_sink_max_tablet_write_chunk_bytes,
             67_108_864
         );
+    }
+
+    #[test]
+    fn test_runtime_data_runtime_defaults() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.data_runtime_worker_threads, 0);
+        assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
+    }
+
+    #[test]
+    fn test_runtime_data_runtime_can_be_overridden() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+data_runtime_worker_threads = 6
+data_runtime_max_blocking_threads = 99
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.data_runtime_worker_threads, 6);
+        assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
+    }
+
+    #[test]
+    fn test_actual_data_runtime_threads_behavior() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.data_runtime_worker_threads = 0;
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(runtime.actual_data_runtime_threads(), expected);
+        runtime.data_runtime_worker_threads = 3;
+        assert_eq!(runtime.actual_data_runtime_threads(), 3);
     }
 }
