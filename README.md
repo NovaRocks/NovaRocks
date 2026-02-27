@@ -27,27 +27,46 @@ Share-nothing mode is not supported; only share-data mode is supported.
 
 - Rust toolchain (edition 2024, `cargo`)
 - C/C++ build toolchain
-- Third-party root directory: `./thirdparty`
-- If setting `STARROCKS_THIRDPARTY`, point it to the thirdparty root (for example `/path/to/starrocks/thirdparty`), not `.../installed`
+- Minimum toolchain versions:
+  - `rustc`/`cargo`: **1.92.0** (from `rust-toolchain.toml`)
+  - `gcc`/`g++`: **12+** (Linux)
+  - `cmake`: **3.20+** (recommend 3.27+)
 
-If third-party dependencies are missing, build them first:
+### Linux
 
-```bash
-./thirdparty/build-thirdparty.sh
-```
+Environment variables:
+
+- `STARROCKS_GCC_HOME`: GCC toolchain root (must contain `bin/gcc` and `bin/g++`)
+- `STARROCKS_THIRDPARTY`: thirdparty root
+
+Environment modes:
+
+1. **StarRocks official Docker (recommended)**  
+   Both variables are preconfigured; use default values directly.  
+   Reference: [Build in Docker](https://docs.starrocks.io/docs/developers/build-starrocks/Build_in_docker/)
+2. **Non-official Docker / bare-metal Linux**  
+   Configure both variables manually, and build/use NovaRocks local thirdparty: `./thirdparty/build-thirdparty.sh`
+
+### macOS
+
+Environment variables:
+
+- `STARROCKS_THIRDPARTY`: thirdparty root
+
+Prepare thirdparty:
+
+- Follow StarRocks macOS guide to build thirdparty first:  
+  [Build, run, and test StarRocks on macOS](https://github.com/StarRocks/starrocks/blob/main/docs/en/developers/mac-compile-run-test.md)
 
 ## Build
+
+Use the same build command on Linux and macOS:
 
 ```bash
 ./build.sh
 ```
 
-Build with external StarRocks thirdparty:
-
-```bash
-export STARROCKS_THIRDPARTY=/path/to/starrocks/thirdparty
-./build.sh build
-```
+If you use custom thirdparty (for example, StarRocks thirdparty), complete the corresponding setup in `Prerequisites` first, then run the same command above.
 
 ## Configuration
 

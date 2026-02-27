@@ -11,11 +11,13 @@ This directory contains scripts to download and build third-party dependencies f
 
 2. **Build thirdparty libraries:**
    ```bash
+   export STARROCKS_GCC_HOME=/opt/rh/devtoolset-12/root/usr
    ./thirdparty/build-thirdparty.sh
    ```
 
    Or with parallel jobs:
    ```bash
+   export STARROCKS_GCC_HOME=/opt/rh/devtoolset-12/root/usr
    ./thirdparty/build-thirdparty.sh -j8
    ```
 
@@ -103,6 +105,10 @@ The build script will **fail immediately** if any required system library is mis
 - `openssl` - `sudo apt-get install libssl-dev` (Ubuntu/Debian) or `sudo yum install openssl-devel` (CentOS/RHEL)
   - **Note**: Some distributions only provide shared libraries. You may need to build openssl from source separately.
 - `boost` - `sudo apt-get install libboost-dev` (Ubuntu/Debian) or `sudo yum install boost-devel` (CentOS/RHEL)
+- `STARROCKS_GCC_HOME` is required and must point to your GCC toolchain root (must contain `bin/gcc` and `bin/g++`), for example:
+  ```bash
+  export STARROCKS_GCC_HOME=/opt/rh/devtoolset-12/root/usr
+  ```
 
 ## Notes
 
