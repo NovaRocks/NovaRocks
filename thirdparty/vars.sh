@@ -93,5 +93,17 @@ BRPC_NAME=brpc-1.9.0.tar.gz
 BRPC_SOURCE=brpc-1.9.0
 BRPC_MD5SUM="a2b626d96a5b017f2a6701ffa594530c"
 
+# zlib
+ZLIB_DOWNLOAD="https://zlib.net/fossils/zlib-1.2.11.tar.gz"
+ZLIB_NAME=zlib-1.2.11.tar.gz
+ZLIB_SOURCE=zlib-1.2.11
+ZLIB_MD5SUM="0095d2d2d1f3442ce1318336637b695f"
+
+# openssl
+OPENSSL_DOWNLOAD="https://github.com/openssl/openssl/archive/OpenSSL_1_1_1m.tar.gz"
+OPENSSL_NAME=openssl-OpenSSL_1_1_1m.tar.gz
+OPENSSL_SOURCE=openssl-OpenSSL_1_1_1m
+OPENSSL_MD5SUM="710c2368d28f1a25ab92e25b5b9b11ec"
+
 # Libraries to download and build from source
-TP_ARCHIVES="GFLAGS GLOG THRIFT PROTOBUF LEVELDB BRPC"
+TP_ARCHIVES="GFLAGS GLOG ZLIB OPENSSL THRIFT PROTOBUF LEVELDB BRPC"

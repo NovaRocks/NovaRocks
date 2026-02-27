@@ -109,47 +109,32 @@ unset_var_if_set() {
     unset "${var_name}" 2>/dev/null || true
 }
 
-detect_starrocks_gcc_home() {
-    if [[ -n "${STARROCKS_GCC_HOME:-}" ]]; then
-        return 0
-    fi
-
-    local candidates=(
-        "/opt/rh/gcc-toolset-14/root/usr"
-        "/opt/rh/gcc-toolset-13/root/usr"
-        "/opt/rh/gcc-toolset-12/root/usr"
-        "/opt/rh/gcc-toolset-11/root/usr"
-        "/opt/rh/gcc-toolset-10/root/usr"
-        "/opt/rh/devtoolset-11/root/usr"
-        "/opt/rh/devtoolset-10/root/usr"
-    )
-
-    for candidate in "${candidates[@]}"; do
-        if [[ -x "${candidate}/bin/g++" ]]; then
-            export STARROCKS_GCC_HOME="${candidate}"
-            echo "Detected STARROCKS_GCC_HOME=${STARROCKS_GCC_HOME}"
-            return 0
-        fi
-    done
-}
-
 setup_starrocks_gcc_runtime() {
     local gcc_home="${STARROCKS_GCC_HOME:-}"
     if [[ -z "${gcc_home}" ]]; then
-        return 0
+        echo "Error: STARROCKS_GCC_HOME is required on Linux, e.g. /opt/rh/devtoolset-12/root/usr" >&2
+        exit 1
     fi
 
     local gcc_bin="${gcc_home}/bin"
     local gcc_cmd="${gcc_bin}/gcc"
     local gxx_cmd="${gcc_bin}/g++"
     if [[ ! -x "${gcc_cmd}" || ! -x "${gxx_cmd}" ]]; then
-        echo "Warning: STARROCKS_GCC_HOME is set but compiler not found under '${gcc_bin}'" >&2
-        return 0
+        echo "Error: STARROCKS_GCC_HOME is set but compiler not found under '${gcc_bin}'" >&2
+        exit 1
     fi
 
-    export CC="${CC:-${gcc_cmd}}"
-    export CXX="${CXX:-${gxx_cmd}}"
+    local previous_cc="${CC:-}"
+    local previous_cxx="${CXX:-}"
+    export CC="${gcc_cmd}"
+    export CXX="${gxx_cmd}"
     append_path_var PATH "${gcc_bin}"
+    if [[ -n "${previous_cc}" && "${previous_cc}" != "${CC}" ]]; then
+        echo "Info: override CC='${previous_cc}' with STARROCKS_GCC_HOME compiler '${CC}'"
+    fi
+    if [[ -n "${previous_cxx}" && "${previous_cxx}" != "${CXX}" ]]; then
+        echo "Info: override CXX='${previous_cxx}' with STARROCKS_GCC_HOME compiler '${CXX}'"
+    fi
 
     local libstdcxx_path
     libstdcxx_path="$("${CXX}" -print-file-name=libstdc++.so 2>/dev/null || true)"
@@ -431,7 +416,6 @@ done
 export STARROCKS_THIRDPARTY="${THIRDPARTY_ROOT}"
 
 if [[ "${OS_NAME}" == "Linux" ]]; then
-    detect_starrocks_gcc_home
     setup_starrocks_gcc_runtime
     print_linux_static_cxx_runtime_info
 fi
@@ -501,6 +485,12 @@ elif [[ "${OS_NAME}" == "Darwin" ]]; then
 fi
 if [[ -n "${LIBSTDCXX_PATH:-}" ]]; then
     echo "LIBSTDCXX_PATH=${LIBSTDCXX_PATH}"
+fi
+if [[ -n "${CC:-}" ]]; then
+    echo "CC=${CC}"
+fi
+if [[ -n "${CXX:-}" ]]; then
+    echo "CXX=${CXX}"
 fi
 if [[ -n "${cargo_linker_var:-}" ]]; then
     echo "${cargo_linker_var}=${!cargo_linker_var}"

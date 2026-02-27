@@ -30,6 +30,7 @@ set -eo pipefail
 
 curdir=`dirname "$0"`
 curdir=`cd "$curdir"; pwd`
+OS_NAME="$(uname -s)"
 
 export STARUST_HOME=${STARUST_HOME:-$curdir/..}
 export TP_DIR=$curdir
@@ -86,6 +87,49 @@ if [[ $(uname) == "Darwin" ]]; then
         export PATH="$HOMEBREW_PREFIX/opt/gnu-getopt/bin:$PATH"
     fi
 fi
+
+append_path_var() {
+    local var_name="$1"
+    local value="$2"
+    if [[ -z "${value}" ]]; then
+        return 0
+    fi
+    if [[ -n "${!var_name:-}" ]]; then
+        export "${var_name}=${value}:${!var_name}"
+    else
+        export "${var_name}=${value}"
+    fi
+}
+
+setup_starrocks_gcc_compiler() {
+    local gcc_home="${STARROCKS_GCC_HOME:-}"
+    if [[ -z "${gcc_home}" ]]; then
+        echo "Error: STARROCKS_GCC_HOME is required on Linux, e.g. /opt/rh/devtoolset-12/root/usr" >&2
+        exit 1
+    fi
+
+    local gcc_bin="${gcc_home}/bin"
+    local gcc_cmd="${gcc_bin}/gcc"
+    local gxx_cmd="${gcc_bin}/g++"
+    if [[ ! -x "${gcc_cmd}" || ! -x "${gxx_cmd}" ]]; then
+        echo "Error: STARROCKS_GCC_HOME is set but compiler not found under '${gcc_bin}'" >&2
+        exit 1
+    fi
+
+    local previous_cc="${CC:-}"
+    local previous_cxx="${CXX:-}"
+    export CC="${gcc_cmd}"
+    export CXX="${gxx_cmd}"
+    append_path_var PATH "${gcc_bin}"
+
+    if [[ -n "${previous_cc}" && "${previous_cc}" != "${CC}" ]]; then
+        echo "Info: override CC='${previous_cc}' with STARROCKS_GCC_HOME compiler '${CC}'"
+    fi
+    if [[ -n "${previous_cxx}" && "${previous_cxx}" != "${CXX}" ]]; then
+        echo "Info: override CXX='${previous_cxx}' with STARROCKS_GCC_HOME compiler '${CXX}'"
+    fi
+    echo "Using STARROCKS_GCC_HOME=${STARROCKS_GCC_HOME}"
+}
 
 # Check args
 usage() {
@@ -146,6 +190,10 @@ echo "Get params:
 "
 
 cd $TP_DIR
+
+if [[ "${OS_NAME}" == "Linux" ]]; then
+    setup_starrocks_gcc_compiler
+fi
 
 if [[ "${CLEAN}" -eq 1 ]]; then
     echo "Cleaning source directories..."
@@ -234,7 +282,7 @@ check_if_source_exist() {
 
 build_zlib() {
     local HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
-    
+
     if [[ $(uname) == "Darwin" ]]; then
         local zlib_prefix=""
         if command -v brew >/dev/null 2>&1; then
@@ -243,20 +291,20 @@ build_zlib() {
         if [[ -z "$zlib_prefix" ]]; then
             zlib_prefix="$HOMEBREW_PREFIX/opt/zlib"
         fi
-        
+
         if [[ ! -d "$zlib_prefix" ]]; then
             echo "Error: Homebrew zlib not found at $zlib_prefix"
             echo "Please install with: brew install zlib"
             exit 1
         fi
-        
+
         local zlib_lib="$zlib_prefix/lib/libz.a"
         if [[ ! -f "$zlib_lib" ]]; then
             echo "Error: zlib static library not found at $zlib_lib"
             echo "Please install zlib with: brew install zlib"
             exit 1
         fi
-        
+
         echo "Using Homebrew zlib on macOS: $zlib_prefix"
         mkdir -p $TP_INSTALL_DIR/{lib,include}
         cp "$zlib_lib" "$TP_INSTALL_DIR/lib/" || {
@@ -278,28 +326,14 @@ build_zlib() {
         fi
         return 0
     else
-        if [[ -f "/usr/lib/x86_64-linux-gnu/libz.a" ]] || [[ -f "/usr/lib64/libz.a" ]] || [[ -f "/usr/lib/libz.a" ]]; then
-            echo "Using system zlib on Linux"
-            mkdir -p $TP_INSTALL_DIR/{lib,include}
-            for lib_path in "/usr/lib/x86_64-linux-gnu/libz.a" "/usr/lib64/libz.a" "/usr/lib/libz.a"; do
-                if [[ -f "$lib_path" ]]; then
-                    cp "$lib_path" "$TP_INSTALL_DIR/lib/"
-                    break
-                fi
-            done
-            if [[ -f "/usr/include/zlib.h" ]]; then
-                cp "/usr/include/zlib.h" "$TP_INSTALL_DIR/include/" 2>/dev/null || true
-            fi
-            if [[ -f "/usr/include/zconf.h" ]]; then
-                cp "/usr/include/zconf.h" "$TP_INSTALL_DIR/include/" 2>/dev/null || true
-            fi
-            return 0
-        else
-            echo "Error: zlib not found. Please install zlib development package:"
-            echo "  Ubuntu/Debian: sudo apt-get install zlib1g-dev"
-            echo "  CentOS/RHEL: sudo yum install zlib-devel"
-            exit 1
-        fi
+        check_if_source_exist $ZLIB_SOURCE
+        cd $TP_SOURCE_DIR/$ZLIB_SOURCE
+
+        make distclean >/dev/null 2>&1 || true
+        CFLAGS="${CFLAGS:-} -fPIC" ./configure --prefix=$TP_INSTALL_DIR --static
+        make -j$PARALLEL
+        make install
+        return 0
     fi
 }
 
@@ -384,14 +418,31 @@ build_openssl() {
         done
         
         if [[ -z "$found_ssl" ]] || [[ -z "$found_crypto" ]]; then
-            echo "Error: openssl static libraries not found."
-            echo "Please install openssl development package:"
-            echo "  Ubuntu/Debian: sudo apt-get install libssl-dev"
-            echo "  CentOS/RHEL: sudo yum install openssl-devel"
-            echo ""
-            echo "Note: Some distributions only provide shared libraries."
-            echo "You may need to build openssl from source or use a different package."
-            exit 1
+            echo "System openssl static libraries not found on Linux, fallback to source build"
+            local OPENSSL_PLATFORM="linux-x86_64"
+            if [[ "${MACHINE_TYPE}" == "aarch64" ]]; then
+                OPENSSL_PLATFORM="linux-aarch64"
+            fi
+            check_if_source_exist $OPENSSL_SOURCE
+            cd $TP_SOURCE_DIR/$OPENSSL_SOURCE
+
+            local old_cflags="${CFLAGS:-}"
+            local old_cxxflags="${CXXFLAGS:-}"
+            local old_cppflags="${CPPFLAGS:-}"
+
+            unset CXXFLAGS
+            unset CPPFLAGS
+            export CFLAGS="-O3 -fno-omit-frame-pointer -fPIC"
+
+            make clean >/dev/null 2>&1 || true
+            LDFLAGS="-L${TP_LIB_DIR}" LIBDIR="lib" ./Configure --prefix=$TP_INSTALL_DIR -lz -no-shared ${OPENSSL_PLATFORM} --libdir=lib
+            make -j$PARALLEL
+            make install_sw
+
+            export CFLAGS="$old_cflags"
+            export CXXFLAGS="$old_cxxflags"
+            export CPPFLAGS="$old_cppflags"
+            return 0
         fi
         
         echo "Using system openssl on Linux"
@@ -591,18 +642,20 @@ build_thrift() {
 
     # Set boost include path for thrift (thrift requires boost headers)
     local BOOST_INCLUDE=""
-    if [[ $(uname) == "Darwin" ]]; then
+    if [[ -d "$TP_INSTALL_DIR/include/boost" ]]; then
+        BOOST_INCLUDE="$TP_INSTALL_DIR/include"
+    elif [[ $(uname) == "Darwin" ]]; then
         HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
         if [[ -d "$HOMEBREW_PREFIX/include/boost" ]]; then
             BOOST_INCLUDE="$HOMEBREW_PREFIX/include"
         fi
     else
-        # On Linux, boost headers are usually in /usr/include
         if [[ -d "/usr/include/boost" ]]; then
             BOOST_INCLUDE="/usr/include"
+        elif [[ -d "/usr/local/include/boost" ]]; then
+            BOOST_INCLUDE="/usr/local/include"
         fi
     fi
-    
     if [[ -z "$BOOST_INCLUDE" ]]; then
         echo "Error: boost headers not found. Please install boost:"
         if [[ $(uname) == "Darwin" ]]; then
@@ -621,6 +674,8 @@ build_thrift() {
     local clean_cppflags="${CPPFLAGS:-}"
     clean_cppflags=$(echo "$clean_cppflags" | tr ':' '\n' | grep -v "/opt/homebrew/include/thrift" | tr '\n' ' ' | sed 's/  */ /g')
     export CPPFLAGS="-DTHRIFT_STATIC_DEFINE -I${BOOST_INCLUDE} $clean_cppflags"
+    export CFLAGS="${CFLAGS:-} -fPIC"
+    export CXXFLAGS="${CXXFLAGS:-} -fPIC"
     export LDFLAGS="-L${TP_LIB_DIR}"
     export LIBS="-lssl -lcrypto -ldl -lz"
     ./configure \
