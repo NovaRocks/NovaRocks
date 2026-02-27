@@ -566,13 +566,13 @@ pub fn build_native_read_plan(
                 let normalized_base_name = normalize_column_name(&projection.base_column_name);
                 if let Some(schema_col) = by_name.get(&normalized_base_name).copied() {
                     return Err(format!(
-                            "flat json projection base column is not JSON: tablet_id={}, version={}, output_field={}, base_column={}, base_schema_type={}",
-                            snapshot.tablet_id,
-                            snapshot.version,
-                            output_name,
-                            projection.base_column_name,
-                            schema_col.r#type
-                        ));
+                        "flat json projection base column is not JSON: tablet_id={}, version={}, output_field={}, base_column={}, base_schema_type={}",
+                        snapshot.tablet_id,
+                        snapshot.version,
+                        output_name,
+                        projection.base_column_name,
+                        schema_col.r#type
+                    ));
                 }
                 let schema_type =
                         infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {

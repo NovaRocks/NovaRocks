@@ -46,10 +46,6 @@ fn should_sample_log(counter: &AtomicU64) -> bool {
     counter.fetch_add(1, Ordering::Relaxed) % EVENT_SCHEDULER_LOG_EVERY == 0
 }
 
-fn is_parquet_scan(source_name: &str) -> bool {
-    source_name.contains("HDFS_SCAN") || source_name.contains("PARQUET_SCAN")
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 /// Stable key that identifies a driver in event-scheduler maps and queues.
 pub(crate) struct DriverKey {
@@ -205,8 +201,8 @@ impl EventScheduler {
                     }
                     return Err(task);
                 };
-                let is_scan = is_parquet_scan(task.source_name());
-                if is_scan || should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT) {
+                let should_log = should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT);
+                if should_log {
                     debug!(
                         "EventScheduler add_blocked: reason=InputEmpty finst={:?} driver_id={} source={} sink={} source_ready={} sink_ready={} observers_before={}",
                         task.fragment_instance_id(),
@@ -234,8 +230,8 @@ impl EventScheduler {
                     }
                     return Err(task);
                 };
-                let is_scan = is_parquet_scan(task.source_name());
-                if is_scan || should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT) {
+                let should_log = should_sample_log(&EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT);
+                if should_log {
                     debug!(
                         "EventScheduler add_blocked: reason=OutputFull finst={:?} driver_id={} source={} sink={} source_ready={} sink_ready={} observers_before={}",
                         task.fragment_instance_id(),
