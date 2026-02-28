@@ -244,20 +244,16 @@ impl OpendalRangeReader {
     }
 
     pub fn from_len(op: Operator, rt: Arc<Runtime>, path: impl Into<String>, len: u64) -> Self {
-        // Try to get modification time, but don't fail if unavailable
         let path_str = path.into();
-        let mtime = rt.block_on(op.stat(&path_str)).ok().and_then(|meta| {
-            meta.last_modified()
-                .map(|dt| dt.into_inner().as_second())
-                .map(|ts| ts as i64)
-        });
         Self {
             op,
             rt,
             path: path_str,
             len,
             block_size: DEFAULT_OPENDAL_READ_SIZE,
-            modification_time: mtime,
+            // Avoid blocking metadata RPC when upper layer already provides file length.
+            // The caller can still supply modification time via with_modification_time_override.
+            modification_time: None,
             datacache: None,
             parquet_cache_policy: None,
             profile: None,
@@ -643,6 +639,9 @@ fn read_remote_range(
     end: u64,
     length: usize,
 ) -> ParquetResult<Bytes> {
+    if length == 0 {
+        return Ok(Bytes::new());
+    }
     let io_start = Instant::now();
     let data = reader
         .rt
@@ -653,7 +652,12 @@ fn read_remote_range(
                 .range(start..end)
                 .into_future(),
         )
-        .map_err(|e| ParquetError::General(e.to_string()))?;
+        .map_err(|e| {
+            ParquetError::General(format!(
+                "opendal read failed: path={} range={}..{} len={} err={}",
+                reader.path, start, end, length, e
+            ))
+        })?;
     let io_ns = io_start.elapsed().as_nanos();
     if let Some(counters) = reader.counters.as_ref() {
         counters.record_remote_read(length, io_ns);

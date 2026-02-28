@@ -23,7 +23,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use opendal::Operator;
-use opendal::layers::{HttpClientLayer, RetryInterceptor, RetryLayer, TimeoutLayer};
+use opendal::layers::{
+    ConcurrentLimitLayer, HttpClientLayer, RetryInterceptor, RetryLayer, TimeoutLayer,
+};
 
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
@@ -32,6 +34,10 @@ use crate::runtime::global_async_runtime::data_block_on;
 const DEFAULT_OSS_RETRY_MAX_TIMES: usize = 6;
 const DEFAULT_OSS_RETRY_MIN_DELAY_MS: u64 = 100;
 const DEFAULT_OSS_RETRY_MAX_DELAY_MS: u64 = 2_000;
+const DEFAULT_OSS_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_OSS_IO_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_OSS_CONCURRENT_LIMIT: usize = 16;
+const DEFAULT_OSS_HTTP_CONCURRENT_LIMIT: usize = 16;
 const DEFAULT_RETRY_LOG_SUMMARY_INTERVAL_MS: u64 = 30_000;
 const DEFAULT_RETRY_LOG_FIRST_N: u32 = 3;
 const DEFAULT_RETRY_LOG_MIN_INTERVAL_MS: u64 = 1_000;
@@ -219,6 +225,7 @@ impl OssOperatorCacheKey {
 
 static OSS_OPERATOR_CACHE: OnceLock<Mutex<HashMap<OssOperatorCacheKey, Operator>>> =
     OnceLock::new();
+static OSS_CONCURRENT_LIMIT_LAYER: OnceLock<ConcurrentLimitLayer> = OnceLock::new();
 static RETRY_WARNING_STATE: OnceLock<Mutex<HashMap<RetryWarningKey, RetryWarningWindow>>> =
     OnceLock::new();
 static RETRY_LOG_CONTROL: OnceLock<RetryLogControl> = OnceLock::new();
@@ -461,18 +468,41 @@ fn build_retry_layer(cfg: &ObjectStoreConfig) -> RetryLayer<ObjectStoreRetryInte
         .with_max_times(max_times)
 }
 
+fn effective_timeout_ms(cfg: &ObjectStoreConfig) -> Option<u64> {
+    cfg.timeout_ms
+        .or(Some(DEFAULT_OSS_TIMEOUT_MS))
+        .filter(|v| *v > 0)
+}
+
+fn effective_io_timeout_ms(cfg: &ObjectStoreConfig) -> Option<u64> {
+    cfg.io_timeout_ms
+        .or(Some(DEFAULT_OSS_IO_TIMEOUT_MS))
+        .filter(|v| *v > 0)
+}
+
 fn build_timeout_layer(cfg: &ObjectStoreConfig) -> Option<TimeoutLayer> {
-    if cfg.timeout_ms.is_none() && cfg.io_timeout_ms.is_none() {
+    let timeout_ms = effective_timeout_ms(cfg);
+    let io_timeout_ms = effective_io_timeout_ms(cfg);
+    if timeout_ms.is_none() && io_timeout_ms.is_none() {
         return None;
     }
     let mut layer = TimeoutLayer::new();
-    if let Some(timeout_ms) = cfg.timeout_ms.filter(|v| *v > 0) {
+    if let Some(timeout_ms) = timeout_ms {
         layer = layer.with_timeout(Duration::from_millis(timeout_ms));
     }
-    if let Some(io_timeout_ms) = cfg.io_timeout_ms.filter(|v| *v > 0) {
+    if let Some(io_timeout_ms) = io_timeout_ms {
         layer = layer.with_io_timeout(Duration::from_millis(io_timeout_ms));
     }
     Some(layer)
+}
+
+fn build_concurrent_limit_layer() -> ConcurrentLimitLayer {
+    OSS_CONCURRENT_LIMIT_LAYER
+        .get_or_init(|| {
+            ConcurrentLimitLayer::new(DEFAULT_OSS_CONCURRENT_LIMIT)
+                .with_http_concurrent_limit(DEFAULT_OSS_HTTP_CONCURRENT_LIMIT)
+        })
+        .clone()
 }
 
 fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
@@ -512,6 +542,7 @@ fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> 
     if let Some(timeout_layer) = build_timeout_layer(cfg) {
         op = op.layer(timeout_layer);
     }
+    op = op.layer(build_concurrent_limit_layer());
     op = op.layer(build_retry_layer(cfg));
     Ok(op)
 }
@@ -581,12 +612,10 @@ pub fn build_oss_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
     let mut effective_cfg = cfg.clone();
     apply_object_store_runtime_defaults(&mut effective_cfg);
     let key = OssOperatorCacheKey::from_config(&effective_cfg);
-    if let Some(op) = {
-        let guard = oss_operator_cache()
-            .lock()
-            .map_err(|_| anyhow!("lock oss operator cache failed"))?;
-        guard.get(&key).cloned()
-    } {
+    let mut guard = oss_operator_cache()
+        .lock()
+        .map_err(|_| anyhow!("lock oss operator cache failed"))?;
+    if let Some(op) = guard.get(&key).cloned() {
         return Ok(op);
     }
 
@@ -597,15 +626,12 @@ pub fn build_oss_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
         effective_cfg.retry_max_times,
         effective_cfg.retry_min_delay_ms,
         effective_cfg.retry_max_delay_ms,
-        effective_cfg.timeout_ms,
-        effective_cfg.io_timeout_ms
+        effective_timeout_ms(&effective_cfg),
+        effective_io_timeout_ms(&effective_cfg)
     );
     let op = build_raw_object_store_operator(&effective_cfg)?;
-    let mut guard = oss_operator_cache()
-        .lock()
-        .map_err(|_| anyhow!("lock oss operator cache failed"))?;
-    let cached = guard.entry(key).or_insert_with(|| op.clone());
-    Ok(cached.clone())
+    guard.insert(key, op.clone());
+    Ok(op)
 }
 
 pub fn oss_block_on<F>(future: F) -> Result<F::Output, String>
@@ -665,8 +691,9 @@ pub fn normalize_oss_path(full: &str, bucket: &str, root: &str) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::{
-        ObjectStoreRetrySettings, normalize_oss_path, normalize_s3_endpoint,
-        prefer_virtual_host_style, should_use_path_style,
+        DEFAULT_OSS_IO_TIMEOUT_MS, DEFAULT_OSS_TIMEOUT_MS, ObjectStoreRetrySettings,
+        build_timeout_layer, effective_io_timeout_ms, effective_timeout_ms, normalize_oss_path,
+        normalize_s3_endpoint, prefer_virtual_host_style, should_use_path_style,
     };
     use crate::fs::object_store::ObjectStoreConfig;
     use std::collections::BTreeMap;
@@ -767,5 +794,52 @@ mod tests {
         let settings = ObjectStoreRetrySettings::from_aws_s3_props(Some(&props));
         assert_eq!(settings.retry_max_times, None);
         assert_eq!(settings.retry_min_delay_ms, None);
+    }
+
+    #[test]
+    fn timeout_defaults_apply_when_unset() {
+        let cfg = ObjectStoreConfig {
+            endpoint: "https://oss-cn-zhangjiakou.aliyuncs.com".to_string(),
+            bucket: "bucket".to_string(),
+            root: String::new(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: None,
+            region: None,
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        };
+        assert_eq!(effective_timeout_ms(&cfg), Some(DEFAULT_OSS_TIMEOUT_MS));
+        assert_eq!(
+            effective_io_timeout_ms(&cfg),
+            Some(DEFAULT_OSS_IO_TIMEOUT_MS)
+        );
+        assert!(build_timeout_layer(&cfg).is_some());
+    }
+
+    #[test]
+    fn explicit_zero_timeout_disables_timeout_layer() {
+        let cfg = ObjectStoreConfig {
+            endpoint: "https://oss-cn-zhangjiakou.aliyuncs.com".to_string(),
+            bucket: "bucket".to_string(),
+            root: String::new(),
+            access_key_id: "ak".to_string(),
+            access_key_secret: "sk".to_string(),
+            session_token: None,
+            enable_path_style_access: None,
+            region: None,
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: Some(0),
+            io_timeout_ms: Some(0),
+        };
+        assert_eq!(effective_timeout_ms(&cfg), None);
+        assert_eq!(effective_io_timeout_ms(&cfg), None);
+        assert!(build_timeout_layer(&cfg).is_none());
     }
 }
