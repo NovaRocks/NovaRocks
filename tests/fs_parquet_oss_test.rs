@@ -78,7 +78,7 @@ async fn fs_operator_can_read_and_parse_parquet() -> Result<()> {
     let fs = opendal::services::Fs::default().root(dir.path().to_string_lossy().as_ref());
     let op = Operator::new(fs)?.finish();
 
-    let probe = novarocks::fs::opendal::probe_parquet(&op, "test.parquet").await?;
+    let probe = novarocks::formats::parquet::probe_parquet(&op, "test.parquet").await?;
     assert_eq!(probe.num_rows, 3);
     assert_eq!(probe.num_row_groups, 1);
     Ok(())

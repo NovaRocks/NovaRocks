@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cache::block_cache::{BlockCache, CacheKey};
+use crate::common::file_identity::FileIdentity;
 
 pub struct CacheInputStream {
     cache: Arc<BlockCache>,
@@ -40,14 +41,12 @@ pub struct CacheBlockRead {
 impl CacheInputStream {
     pub fn new(
         cache: Arc<BlockCache>,
-        path: String,
-        modification_time: Option<i64>,
-        file_size: u64,
+        identity: FileIdentity,
         enable_cache: bool,
         enable_populate: bool,
         async_populate: bool,
     ) -> Self {
-        let cache_key = CacheKey::from_path(&path, modification_time, file_size);
+        let cache_key = CacheKey::from_identity(&identity);
         Self {
             cache,
             cache_key,

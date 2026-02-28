@@ -23,7 +23,7 @@ use orc_rust::arrow_reader::ArrowReaderBuilder;
 use orc_rust::projection::ProjectionMask;
 use orc_rust::schema::RootDataType;
 
-use crate::cache::DataCacheContext;
+use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
 use crate::exec::node::BoxedExecIter;
@@ -56,8 +56,7 @@ pub fn build_orc_iter(
     if scan.ranges.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
-    let factory = scan.factory.with_datacache_context(cfg.datacache.clone());
-    let iter = OrcScanIter::new(cfg, scan.ranges, factory, limit, profile);
+    let iter = OrcScanIter::new(cfg, scan.ranges, scan.factory, limit, profile);
     Ok(Box::new(iter))
 }
 
@@ -72,7 +71,7 @@ struct OrcScanIter {
     ranges: Vec<FileScanRange>,
     factory: OpendalRangeReaderFactory,
     range_idx: usize,
-    reader: Option<orc_rust::arrow_reader::ArrowReader<crate::fs::opendal::OpendalRangeReader>>,
+    reader: Option<orc_rust::arrow_reader::ArrowReader<CachedRangeReader>>,
     output_columns: Option<Vec<OutputColumn>>,
     remaining: usize,
     profile: Option<RuntimeProfile>,
@@ -125,6 +124,7 @@ impl OrcScanIter {
                 )
             })
             .map_err(|e| e.to_string())?;
+        let reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
 
         let mut builder = ArrowReaderBuilder::try_new(reader).map_err(|e| e.to_string())?;
         let root = builder.file_metadata().root_data_type();
@@ -426,4 +426,61 @@ fn attach_slot_ids_to_batch(
     ));
     RecordBatch::try_new(new_schema, batch.columns().to_vec())
         .map_err(|e: arrow::error::ArrowError| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use orc_rust::{ArrowReaderBuilder, ArrowWriterBuilder};
+
+    use crate::cache::CachedRangeReader;
+    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
+
+    #[test]
+    fn cached_range_reader_smoke_test_for_orc() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sample.orc");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("record batch");
+
+        let file = File::create(&file_path).expect("create orc file");
+        let mut writer = ArrowWriterBuilder::new(file, Arc::clone(&schema))
+            .try_build()
+            .expect("orc writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let file_len = std::fs::metadata(&file_path).expect("file metadata").len();
+        let op = build_fs_operator(temp_dir.path().to_str().expect("temp dir path"))
+            .expect("build fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
+        let reader = factory
+            .open_with_len("sample.orc", Some(file_len))
+            .expect("open with len");
+        let reader = CachedRangeReader::new(reader, None);
+        let mut batches = ArrowReaderBuilder::try_new(reader)
+            .expect("orc builder")
+            .build();
+
+        let batch = batches.next().expect("first batch").expect("decode batch");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        assert_eq!(values.values(), &[1, 2, 3]);
+    }
 }

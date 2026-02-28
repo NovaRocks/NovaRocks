@@ -21,6 +21,7 @@ use bytes::Bytes;
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::cache::{DataCacheManager, DataCachePageKey};
+use crate::common::file_identity::FileIdentity;
 
 const PARQUET_CACHE_NAMESPACE: &str = "formats.parquet";
 const META_KEY_PREFIX: &[u8; 2] = b"ft";
@@ -77,15 +78,13 @@ fn page_cache_enabled(enabled: bool) -> bool {
 
 pub fn parquet_meta_cache_get(
     enabled: bool,
-    path: &str,
-    modification_time: Option<i64>,
-    file_size: u64,
+    identity: &FileIdentity,
 ) -> Option<Arc<ParquetMetaData>> {
     if !meta_cache_enabled(enabled) {
         return None;
     }
     let cache = datacache_page_cache()?;
-    let key = meta_cache_key(path, modification_time, file_size);
+    let key = meta_cache_key(identity);
     let cached = cache.lookup::<TimedMetaData>(&key)?;
     if cached.expire_at <= Instant::now() {
         return None;
@@ -93,39 +92,39 @@ pub fn parquet_meta_cache_get(
     Some(Arc::clone(&cached.metadata))
 }
 
+pub fn parquet_meta_cache_available(enabled: bool) -> bool {
+    meta_cache_enabled(enabled) && datacache_page_cache().is_some()
+}
+
 pub fn parquet_meta_cache_put(
     enabled: bool,
-    path: &str,
-    modification_time: Option<i64>,
-    file_size: u64,
+    identity: &FileIdentity,
     metadata: Arc<ParquetMetaData>,
     evict_probability: Option<u32>,
-) {
+) -> bool {
     if !meta_cache_enabled(enabled) {
-        return;
+        return false;
     }
     let Some(cache) = datacache_page_cache() else {
-        return;
+        return false;
     };
     let ttl = parquet_cache_options().metadata_ttl;
     let value = TimedMetaData {
         metadata,
         expire_at: Instant::now().checked_add(ttl).unwrap_or_else(Instant::now),
     };
-    let key = meta_cache_key(path, modification_time, file_size);
-    let _ = cache.insert(
+    let key = meta_cache_key(identity);
+    cache.insert(
         key,
         Arc::new(value),
         DEFAULT_META_CHARGE,
         evict_probability.map(|v| v.min(100)),
-    );
+    )
 }
 
 pub fn parquet_page_cache_get(
     enabled: bool,
-    path: &str,
-    modification_time: Option<i64>,
-    file_size: u64,
+    identity: &FileIdentity,
     offset: u64,
     length: usize,
 ) -> Option<Bytes> {
@@ -133,15 +132,13 @@ pub fn parquet_page_cache_get(
         return None;
     }
     let cache = datacache_page_cache()?;
-    let key = page_cache_key(path, modification_time, file_size, offset, length);
+    let key = page_cache_key(identity, offset, length);
     cache.lookup_bytes(&key)
 }
 
 pub fn parquet_page_cache_put(
     enabled: bool,
-    path: &str,
-    modification_time: Option<i64>,
-    file_size: u64,
+    identity: &FileIdentity,
     offset: u64,
     length: usize,
     data: Bytes,
@@ -153,7 +150,7 @@ pub fn parquet_page_cache_put(
     let Some(cache) = datacache_page_cache() else {
         return;
     };
-    let key = page_cache_key(path, modification_time, file_size, offset, length);
+    let key = page_cache_key(identity, offset, length);
     let _ = cache.insert_bytes(
         key,
         data,
@@ -162,50 +159,26 @@ pub fn parquet_page_cache_put(
     );
 }
 
-fn meta_cache_key(path: &str, modification_time: Option<i64>, file_size: u64) -> DataCachePageKey {
-    let key = file_cache_key(META_KEY_PREFIX, path, modification_time, file_size);
+fn meta_cache_key(identity: &FileIdentity) -> DataCachePageKey {
+    let key = file_cache_key(META_KEY_PREFIX, identity);
     DataCachePageKey::new(PARQUET_CACHE_NAMESPACE, key.to_vec())
 }
 
-fn page_cache_key(
-    path: &str,
-    modification_time: Option<i64>,
-    file_size: u64,
-    offset: u64,
-    length: usize,
-) -> DataCachePageKey {
+fn page_cache_key(identity: &FileIdentity, offset: u64, length: usize) -> DataCachePageKey {
     let mut key = [0u8; PAGE_CACHE_KEY_SIZE];
-    key[..FILE_CACHE_KEY_SIZE].copy_from_slice(&file_cache_key(
-        PAGE_KEY_PREFIX,
-        path,
-        modification_time,
-        file_size,
-    ));
+    key[..FILE_CACHE_KEY_SIZE].copy_from_slice(&file_cache_key(PAGE_KEY_PREFIX, identity));
     key[FILE_CACHE_KEY_SIZE..FILE_CACHE_KEY_SIZE + 8].copy_from_slice(&offset.to_le_bytes());
     let length = u64::try_from(length).unwrap_or(u64::MAX);
     key[FILE_CACHE_KEY_SIZE + 8..PAGE_CACHE_KEY_SIZE].copy_from_slice(&length.to_le_bytes());
     DataCachePageKey::new(PARQUET_CACHE_NAMESPACE, key.to_vec())
 }
 
-fn file_cache_key(
-    prefix: &[u8; 2],
-    path: &str,
-    modification_time: Option<i64>,
-    file_size: u64,
-) -> [u8; FILE_CACHE_KEY_SIZE] {
+fn file_cache_key(prefix: &[u8; 2], identity: &FileIdentity) -> [u8; FILE_CACHE_KEY_SIZE] {
     let mut key = [0u8; FILE_CACHE_KEY_SIZE];
-    let hash_value = hash64(path.as_bytes(), 0);
+    let hash_value = hash64(identity.path().as_bytes(), 0);
     key[..8].copy_from_slice(&hash_value.to_le_bytes());
     key[8..10].copy_from_slice(prefix);
-
-    // Follow StarRocks behavior: use mtime when available, fallback to file size.
-    let tail = if modification_time.unwrap_or(0) > 0 {
-        let mtime = modification_time.unwrap_or(0);
-        ((mtime >> 9) & 0x0000_0000_FFFF_FFFF) as u32
-    } else {
-        file_size as u32
-    };
-    key[10..14].copy_from_slice(&tail.to_le_bytes());
+    key[10..14].copy_from_slice(&identity.starrocks_cache_tail().to_le_bytes());
     key
 }
 
@@ -272,4 +245,26 @@ fn fmix64(mut k: u64) -> u64 {
     k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     k ^= k >> 33;
     k
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::common::file_identity::FileIdentity;
+
+    use super::{meta_cache_key, page_cache_key};
+
+    #[test]
+    fn page_cache_key_keeps_offset_and_length() {
+        let identity = FileIdentity::new("sample.parquet", 128, Some(10 << 9));
+        let first = page_cache_key(&identity, 0, 128);
+        let second = page_cache_key(&identity, 128, 128);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn metadata_cache_key_falls_back_to_file_size_without_positive_mtime() {
+        let none_mtime = FileIdentity::new("sample.parquet", 128, None);
+        let zero_mtime = FileIdentity::new("sample.parquet", 128, Some(0));
+        assert_eq!(meta_cache_key(&none_mtime), meta_cache_key(&zero_mtime));
+    }
 }

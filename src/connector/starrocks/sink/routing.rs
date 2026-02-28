@@ -29,7 +29,6 @@ use arrow::datatypes::TimeUnit;
 use chrono::NaiveDate;
 
 use crate::common::ids::SlotId;
-use crate::connector::starrocks::fe_v2_meta::LakeTabletPartitionRef;
 use crate::connector::starrocks::sink::partition_key::{
     PartitionKeySource, PartitionKeyValue, PartitionMode, PartitionRoutingEntry,
     build_partition_key_arrays, build_partition_key_source, build_row_partition_key,
@@ -55,11 +54,11 @@ pub(crate) struct RowRoutingPlan {
 
 pub(crate) struct SinkRouting {
     pub(crate) commit_infos: Vec<types::TTabletCommitInfo>,
-    pub(crate) refs: Vec<LakeTabletPartitionRef>,
     pub(crate) tablet_to_partition: BTreeMap<i64, i64>,
     pub(crate) row_routing: RowRoutingPlan,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_sink_routing(
     sink: &data_sinks::TOlapTableSink,
     schema_id: i64,
@@ -152,7 +151,6 @@ fn build_sink_routing_with_candidates(
     let row_routing = build_row_routing_plan(sink, schema_id, &candidate_index_ids, output_exprs)?;
 
     let mut commit_infos = Vec::with_capacity(row_routing.tablet_ids.len());
-    let mut refs = Vec::with_capacity(row_routing.tablet_ids.len());
     for tablet_id in &row_routing.tablet_ids {
         let backend_id = *tablet_to_backend.get(tablet_id).ok_or_else(|| {
             format!(
@@ -173,14 +171,10 @@ fn build_sink_routing_with_candidates(
                 tablet_id
             ));
         }
-        refs.push(LakeTabletPartitionRef {
-            tablet_id: *tablet_id,
-        });
     }
 
     Ok(SinkRouting {
         commit_infos,
-        refs,
         tablet_to_partition: partition_map,
         row_routing,
     })

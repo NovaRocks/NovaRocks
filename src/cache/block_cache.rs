@@ -25,6 +25,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::common::file_identity::FileIdentity;
 use crate::runtime::io::io_executor;
 
 const BLOCK_FILE_PREFIX: &str = "blockfile";
@@ -37,18 +38,11 @@ const DEFAULT_IO_ALIGN_UNIT_SIZE: u64 = 4096;
 pub struct CacheKey([u8; 12]);
 
 impl CacheKey {
-    pub fn from_path(path: &str, modification_time: Option<i64>, file_size: u64) -> Self {
-        let hash_value = hash64(path.as_bytes(), 0);
+    pub fn from_identity(identity: &FileIdentity) -> Self {
+        let hash_value = hash64(identity.path().as_bytes(), 0);
         let mut data = [0u8; 12];
         data[..8].copy_from_slice(&hash_value.to_le_bytes());
-
-        let tail = if modification_time.unwrap_or(0) > 0 {
-            let mtime = modification_time.unwrap_or(0);
-            ((mtime >> 9) & 0x0000_0000_FFFF_FFFF) as u32
-        } else {
-            file_size as u32
-        };
-        data[8..12].copy_from_slice(&tail.to_le_bytes());
+        data[8..12].copy_from_slice(&identity.starrocks_cache_tail().to_le_bytes());
         Self(data)
     }
 
@@ -1060,4 +1054,31 @@ pub fn init_block_cache(root: &str, options: BlockCacheOptions) -> Result<(), St
 
 pub fn get_block_cache() -> Option<Arc<BlockCache>> {
     BLOCK_CACHE.get().cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::common::file_identity::FileIdentity;
+
+    use super::CacheKey;
+
+    #[test]
+    fn cache_key_distinguishes_positive_mtime() {
+        let first = FileIdentity::new("a.parquet", 128, Some(1 << 9));
+        let second = FileIdentity::new("a.parquet", 128, Some(2 << 9));
+        assert_ne!(
+            CacheKey::from_identity(&first),
+            CacheKey::from_identity(&second)
+        );
+    }
+
+    #[test]
+    fn cache_key_falls_back_to_file_size_for_missing_or_zero_mtime() {
+        let none_mtime = FileIdentity::new("a.parquet", 128, None);
+        let zero_mtime = FileIdentity::new("a.parquet", 128, Some(0));
+        assert_eq!(
+            CacheKey::from_identity(&none_mtime),
+            CacheKey::from_identity(&zero_mtime)
+        );
+    }
 }

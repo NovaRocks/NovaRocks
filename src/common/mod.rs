@@ -16,6 +16,7 @@
 // under the License.
 pub mod app_config;
 pub mod config;
+pub mod file_identity;
 pub mod ids;
 pub mod largeint;
 pub mod logging;

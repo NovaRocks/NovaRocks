@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 mod cache;
+mod reader;
 
 pub use cache::{
     ParquetCacheOptions, init_datacache_parquet_cache, parquet_meta_cache_get,
@@ -27,6 +28,8 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use bytes::Bytes;
+use futures::TryStreamExt;
+use opendal::Operator;
 use parquet::arrow::arrow_reader::{
     ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
 };
@@ -39,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::cache::DataCacheContext;
+use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
 use crate::exec::expr::LiteralValue;
@@ -52,6 +55,7 @@ use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::types;
+use reader::ParquetCachedReader;
 
 #[derive(Clone, Debug)]
 pub struct ParquetProbe {
@@ -101,6 +105,45 @@ pub fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
         arrow_schema_error,
         arrow_schema_skip_meta_error,
     })
+}
+
+pub async fn list_parquet_files(
+    op: &Operator,
+    prefix: &str,
+    max_files: usize,
+) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+
+    let mut list_prefix = prefix.trim().to_string();
+    if !list_prefix.is_empty() && !list_prefix.ends_with('/') {
+        list_prefix.push('/');
+    }
+
+    let mut lister = op
+        .lister_with(&list_prefix)
+        .recursive(true)
+        .await
+        .context("opendal lister")?;
+    while let Some(entry) = lister.try_next().await.context("opendal list next")? {
+        let path = entry.path().to_string();
+        if path.ends_with(".parquet") {
+            out.push(path);
+            if out.len() >= max_files {
+                break;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+pub async fn probe_parquet(op: &Operator, path: &str) -> Result<ParquetProbe> {
+    let data = op
+        .read(path)
+        .await
+        .with_context(|| format!("opendal read: {path}"))?;
+    let bytes = data.to_bytes();
+    probe_parquet_bytes(path, bytes)
 }
 
 #[derive(Clone, Debug)]
@@ -253,11 +296,14 @@ pub fn build_parquet_iter(
     if scan.ranges.is_empty() {
         return Ok(Box::new(std::iter::empty()));
     }
-    let factory = scan
-        .factory
-        .with_datacache_context(cfg.datacache.clone())
-        .with_parquet_cache_policy(Some(cfg.cache_policy.clone()));
-    let iter = ParquetScanIter::new(cfg, scan.ranges, factory, limit, profile, runtime_filters);
+    let iter = ParquetScanIter::new(
+        cfg,
+        scan.ranges,
+        scan.factory,
+        limit,
+        profile,
+        runtime_filters,
+    );
     Ok(Box::new(iter))
 }
 
@@ -348,15 +394,12 @@ impl ParquetScanIter {
                     profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
                 }
 
-                // Get file metadata for cache key
-                let temp_reader = self
+                let reader = self
                     .factory
                     .open_with_len(&path, len)
                     .map(|r| r.with_modification_time_override(range_modification_time))
                     .map_err(|e| e.to_string())?;
-                let (actual_file_len, mtime) = temp_reader
-                    .get_file_meta()
-                    .map_err(|e| format!("failed to get file metadata for cache key: {}", e))?;
+                let identity = reader.file_identity().clone();
                 let meta_cache_evict_probability = u32::try_from(
                     self.cfg
                         .datacache
@@ -365,19 +408,14 @@ impl ParquetScanIter {
                 )
                 .ok();
 
-                // Try to get metadata from cache
-                let cached_metadata = cache::parquet_meta_cache_get(
-                    self.cfg.cache_policy.enable_metacache,
-                    &path,
-                    mtime,
-                    actual_file_len,
-                );
-
-                let reader = self
-                    .factory
-                    .open_with_len(&path, len)
-                    .map(|r| r.with_modification_time_override(range_modification_time))
-                    .map_err(|e| e.to_string())?;
+                let meta_cache_available =
+                    cache::parquet_meta_cache_available(self.cfg.cache_policy.enable_metacache);
+                // Try to get metadata from cache when cache is actually available.
+                let cached_metadata = if meta_cache_available {
+                    cache::parquet_meta_cache_get(self.cfg.cache_policy.enable_metacache, &identity)
+                } else {
+                    None
+                };
 
                 // Build reader - parquet crate will still read footer, but we can use cached metadata
                 // for row group filtering to avoid re-parsing
@@ -385,6 +423,10 @@ impl ParquetScanIter {
                 if self.cfg.enable_page_index {
                     opts = opts.with_page_index(true);
                 }
+                let reader = ParquetCachedReader::new(
+                    CachedRangeReader::new(reader, Some(self.cfg.datacache.clone())),
+                    self.cfg.cache_policy.clone(),
+                );
                 let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, opts)
                     .map_err(|e| e.to_string())?;
 
@@ -407,29 +449,26 @@ impl ParquetScanIter {
                         // Cache is stale, update it
                         // builder.metadata() returns Arc<ParquetMetaData>, clone it
                         let metadata = current_meta.clone();
-                        cache::parquet_meta_cache_put(
+                        let _ = cache::parquet_meta_cache_put(
                             self.cfg.cache_policy.enable_metacache,
-                            &path,
-                            mtime,
-                            actual_file_len,
+                            &identity,
                             metadata,
                             meta_cache_evict_probability,
                         );
                     }
-                } else if self.cfg.cache_policy.enable_metacache {
+                } else if meta_cache_available {
                     debug!("parquet metadata cache MISS for file: {}", path);
                     // Cache the metadata for future use
                     // builder.metadata() returns Arc<ParquetMetaData>, clone it
                     let metadata = builder.metadata().clone();
-                    cache::parquet_meta_cache_put(
+                    if cache::parquet_meta_cache_put(
                         self.cfg.cache_policy.enable_metacache,
-                        &path,
-                        mtime,
-                        actual_file_len,
+                        &identity,
                         metadata,
                         meta_cache_evict_probability,
-                    );
-                    debug!("parquet metadata cached for file: {}", path);
+                    ) {
+                        debug!("parquet metadata cached for file: {}", path);
+                    }
                 }
 
                 let metadata = builder.metadata().clone();
@@ -581,6 +620,10 @@ impl ParquetScanIter {
             if self.cfg.enable_page_index {
                 opts = opts.with_page_index(true);
             }
+            let reader = ParquetCachedReader::new(
+                CachedRangeReader::new(reader, Some(self.cfg.datacache.clone())),
+                self.cfg.cache_policy.clone(),
+            );
             let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, opts)
                 .map_err(|e| e.to_string())?;
 
@@ -1613,5 +1656,75 @@ fn page_satisfies_predicate_f64(min: f64, max: f64, v: f64, pred: &MinMaxPredica
         MinMaxPredicate::Lt { .. } => min < v,
         MinMaxPredicate::Gt { .. } => max > v,
         MinMaxPredicate::Eq { .. } => min <= v && max >= v,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+
+    use crate::cache::{CachedRangeReader, DataCacheManager, DataCachePageCacheOptions};
+    use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
+
+    use super::{ParquetReadCachePolicy, reader::ParquetCachedReader};
+
+    #[test]
+    fn parquet_cached_reader_smoke_test() {
+        let _ = DataCacheManager::instance().init_page_cache(DataCachePageCacheOptions {
+            capacity: 64,
+            evict_probability: 100,
+        });
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("sample.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("record batch");
+
+        let file = File::create(&file_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let file_len = fs::metadata(&file_path).expect("file metadata").len();
+        let op = build_fs_operator(temp_dir.path().to_str().expect("temp dir path"))
+            .expect("build fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
+        let reader = factory
+            .open_with_len("sample.parquet", Some(file_len))
+            .expect("open with len");
+        let reader = ParquetCachedReader::new(
+            CachedRangeReader::new(reader, None),
+            ParquetReadCachePolicy::with_flags(true, true, Some(100)),
+        );
+        let mut batches = ParquetRecordBatchReaderBuilder::try_new(reader)
+            .expect("parquet builder")
+            .with_batch_size(8)
+            .build()
+            .expect("build batch reader");
+
+        let batch = batches
+            .next()
+            .expect("first batch")
+            .expect("decode first batch");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 column");
+        assert_eq!(values.values(), &[1, 2, 3]);
     }
 }

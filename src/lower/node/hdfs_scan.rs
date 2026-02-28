@@ -157,6 +157,20 @@ fn parse_true_false(value: &str) -> Option<bool> {
     None
 }
 
+fn file_cache_flags_from_query_options(
+    query_opts: Option<&internal_service::TQueryOptions>,
+) -> (bool, bool) {
+    // Align with StarRocks BE semantics: cache flags are only effective when
+    // FE explicitly carries the corresponding query option.
+    let enable_file_metacache = query_opts
+        .and_then(|opts| opts.enable_file_metacache)
+        .unwrap_or(false);
+    let enable_file_pagecache = query_opts
+        .and_then(|opts| opts.enable_file_pagecache)
+        .unwrap_or(false);
+    (enable_file_metacache, enable_file_pagecache)
+}
+
 /// Extract an `ObjectStoreConfig` from the cloud properties map attached to
 /// `THdfsScanNode.cloud_configuration`.  Returns `None` when any required field is absent
 /// so the caller falls back to the shard registry (used by native lake tablets).
@@ -745,13 +759,8 @@ pub(crate) fn lower_hdfs_scan_node(
 
     let output_slots = slot_ids.clone();
     let external_datacache = DataCacheManager::instance().external_context(cache_options.clone());
-    // Align with FE session defaults when these flags are absent in request query options.
-    let enable_file_metacache = query_opts
-        .and_then(|opts| opts.enable_file_metacache)
-        .unwrap_or(true);
-    let enable_file_pagecache = query_opts
-        .and_then(|opts| opts.enable_file_pagecache)
-        .unwrap_or(true);
+    let (enable_file_metacache, enable_file_pagecache) =
+        file_cache_flags_from_query_options(query_opts);
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
         slot_ids: data_slot_ids,
@@ -833,4 +842,30 @@ pub(crate) fn lower_hdfs_scan_node(
         },
         layout: out_layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::internal_service::TQueryOptions;
+
+    use super::file_cache_flags_from_query_options;
+
+    #[test]
+    fn file_cache_flags_default_to_disabled_when_query_options_missing() {
+        let (meta, page) = file_cache_flags_from_query_options(None);
+        assert!(!meta);
+        assert!(!page);
+    }
+
+    #[test]
+    fn file_cache_flags_follow_explicit_query_options() {
+        let query_opts = TQueryOptions {
+            enable_file_metacache: Some(true),
+            enable_file_pagecache: Some(true),
+            ..Default::default()
+        };
+        let (meta, page) = file_cache_flags_from_query_options(Some(&query_opts));
+        assert!(meta);
+        assert!(page);
+    }
 }
