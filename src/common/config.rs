@@ -129,6 +129,34 @@ pub(crate) fn connector_io_tasks_per_scan_operator_default() -> i32 {
         .unwrap_or(16)
 }
 
+pub(crate) fn io_coalesce_read_enable() -> bool {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.io_coalesce_read_enable)
+        .unwrap_or(true)
+}
+
+pub(crate) fn io_coalesce_read_max_buffer_size() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.io_coalesce_read_max_buffer_size)
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+pub(crate) fn io_coalesce_read_max_distance_size() -> u64 {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.io_coalesce_read_max_distance_size)
+        .unwrap_or(1024 * 1024)
+}
+
+pub(crate) fn io_coalesce_adaptive_lazy_active() -> bool {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.io_coalesce_adaptive_lazy_active)
+        .unwrap_or(true)
+}
+
 pub(crate) fn pipeline_scan_thread_pool_queue_size() -> usize {
     novarocks_app_config()
         .ok()

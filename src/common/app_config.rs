@@ -201,6 +201,14 @@ pub struct RuntimeConfig {
     pub pipeline_scan_thread_pool_thread_num: usize,
     #[serde(default = "default_connector_io_tasks_per_scan_operator")]
     pub connector_io_tasks_per_scan_operator: i32,
+    #[serde(default = "default_io_coalesce_read_enable")]
+    pub io_coalesce_read_enable: bool,
+    #[serde(default = "default_io_coalesce_read_max_buffer_size")]
+    pub io_coalesce_read_max_buffer_size: u64,
+    #[serde(default = "default_io_coalesce_read_max_distance_size")]
+    pub io_coalesce_read_max_distance_size: u64,
+    #[serde(default = "default_io_coalesce_adaptive_lazy_active")]
+    pub io_coalesce_adaptive_lazy_active: bool,
     #[serde(default = "default_pipeline_scan_thread_pool_queue_size")]
     pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
@@ -402,6 +410,22 @@ fn default_connector_io_tasks_per_scan_operator() -> i32 {
     16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
 }
 
+fn default_io_coalesce_read_enable() -> bool {
+    true
+}
+
+fn default_io_coalesce_read_max_buffer_size() -> u64 {
+    8 * 1024 * 1024 // aligned with StarRocks io_coalesce_read_max_buffer_size
+}
+
+fn default_io_coalesce_read_max_distance_size() -> u64 {
+    1024 * 1024 // aligned with StarRocks io_coalesce_read_max_distance_size
+}
+
+fn default_io_coalesce_adaptive_lazy_active() -> bool {
+    true // aligned with StarRocks io_coalesce_adaptive_lazy_active
+}
+
 fn default_pipeline_scan_thread_pool_queue_size() -> usize {
     102_400 // Aligned with StarRocks pipeline_scan_thread_pool_queue_size
 }
@@ -442,6 +466,10 @@ impl Default for RuntimeConfig {
             ),
             pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
             connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
+            io_coalesce_read_enable: default_io_coalesce_read_enable(),
+            io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
+            io_coalesce_read_max_distance_size: default_io_coalesce_read_max_distance_size(),
+            io_coalesce_adaptive_lazy_active: default_io_coalesce_adaptive_lazy_active(),
             pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),

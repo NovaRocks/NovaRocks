@@ -43,19 +43,24 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
+use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
 use crate::exec::expr::LiteralValue;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::exec::variant::VariantValue;
+use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
+use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::FileScanRange;
 use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::types;
 use reader::ParquetCachedReader;
+
+static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
 
 #[derive(Clone, Debug)]
 pub struct ParquetProbe {
@@ -348,6 +353,78 @@ impl ParquetScanIter {
             .unwrap_or(0)
     }
 
+    fn build_parquet_reader(
+        &self,
+        mut builder: ParquetRecordBatchReaderBuilder<ParquetCachedReader>,
+        metadata: &Arc<ParquetMetaData>,
+        row_groups: &[usize],
+        predicates: &[MinMaxPredicate],
+    ) -> Result<Option<ParquetRecordBatchReader>, String> {
+        // Set batch size if configured
+        if let Some(batch_size) = self.cfg.batch_size {
+            builder = builder.with_batch_size(batch_size);
+            debug!("parquet reader: batch_size={}", batch_size);
+        }
+
+        if !self.cfg.columns.is_empty() {
+            let mask = {
+                let arrow_schema = builder.schema();
+                let parquet_schema = builder.parquet_schema();
+                let mut indices = Vec::new();
+                for col_name in &self.cfg.columns {
+                    // Skip ___count___ column - it's a special optimization column for count(*)
+                    // that doesn't exist in the parquet file
+                    if col_name == "___count___" {
+                        continue;
+                    }
+
+                    let idx = if self.cfg.case_sensitive {
+                        arrow_schema.index_of(col_name).ok()
+                    } else {
+                        arrow_schema
+                            .fields()
+                            .iter()
+                            .position(|f| f.name().eq_ignore_ascii_case(col_name))
+                    };
+
+                    if let Some(i) = idx {
+                        indices.push(i);
+                    } else {
+                        return Err(format!("Column {} not found in parquet file", col_name));
+                    }
+                }
+                parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
+            };
+            builder = builder.with_projection(mask);
+        }
+
+        if self.limit.is_some() {
+            builder = builder.with_limit(self.remaining);
+        }
+
+        if self.cfg.enable_page_index && !predicates.is_empty() {
+            let selection = build_row_selection_for_row_groups(
+                metadata,
+                row_groups,
+                predicates,
+                &self.cfg.columns,
+                self.cfg.case_sensitive,
+            );
+
+            if selection.rows_selected == 0 {
+                return Ok(None);
+            }
+
+            if let Some(sel) = selection.selection {
+                builder = builder.with_row_selection(sel);
+            }
+        }
+
+        builder = builder.with_row_groups(row_groups.to_vec());
+        let reader = builder.build().map_err(|e| e.to_string())?;
+        Ok(Some(reader))
+    }
+
     fn new(
         cfg: ParquetScanConfig,
         ranges: Vec<FileScanRange>,
@@ -423,12 +500,13 @@ impl ParquetScanIter {
                 if self.cfg.enable_page_index {
                     opts = opts.with_page_index(true);
                 }
-                let reader = ParquetCachedReader::new(
-                    CachedRangeReader::new(reader, Some(self.cfg.datacache.clone())),
-                    self.cfg.cache_policy.clone(),
-                );
-                let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, opts)
-                    .map_err(|e| e.to_string())?;
+                let cached_reader =
+                    CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
+                let parquet_reader =
+                    ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
+                        .map_err(|e| e.to_string())?;
 
                 // If we have cached metadata, verify it matches and use it for optimization
                 if let Some(cached_meta) = cached_metadata {
@@ -557,55 +635,89 @@ impl ParquetScanIter {
                     );
                 }
 
-                self.current_range = Some(RangeState {
+                let mut state = RangeState {
                     range,
                     metadata,
                     row_groups,
                     cursor: 0,
                     read: HashSet::new(),
                     last_filter_version: self.current_filter_version(),
-                });
+                };
+
+                let rg_idx = state.row_groups[state.cursor];
+                state.cursor += 1;
+                state.read.insert(rg_idx);
+                let active_projection_columns = build_active_projection_columns(
+                    &predicates,
+                    &self.cfg.columns,
+                    self.cfg.case_sensitive,
+                );
+
+                let io_ranges = collect_parquet_coalesce_io_ranges(
+                    &state.metadata,
+                    &[rg_idx],
+                    &self.cfg.columns,
+                    self.cfg.case_sensitive,
+                    &active_projection_columns,
+                );
+                let coalesce_together = PARQUET_COALESCE_CONTROLLER.decide_and_record(
+                    config::io_coalesce_adaptive_lazy_active(),
+                    !io_ranges.lazy.is_empty(),
+                );
+                cached_reader.set_coalesce_io_ranges(io_ranges, coalesce_together);
+
+                if let Some(reader) =
+                    self.build_parquet_reader(builder, &state.metadata, &[rg_idx], &predicates)?
+                {
+                    self.current_range = Some(state);
+                    self.reader = Some(reader);
+                    return Ok(true);
+                }
+
+                self.current_range = Some(state);
                 continue;
             }
 
             let version = self.current_filter_version();
             let predicates = self.current_predicates();
             let limit_rows = self.limit.map(|_| self.remaining);
-            let state = self.current_range.as_mut().expect("range state is missing");
-            if version != state.last_filter_version {
-                let selected_row_groups = select_row_groups_for_range(
-                    &state.metadata,
-                    &state.range,
-                    limit_rows,
-                    &predicates,
-                    &self.cfg.columns,
-                    self.cfg.case_sensitive,
-                );
-                let mut row_groups = if let Some(row_groups) = selected_row_groups {
-                    row_groups
-                } else {
-                    (0..state.metadata.num_row_groups()).collect()
-                };
-                row_groups.retain(|rg| !state.read.contains(rg));
-                state.row_groups = row_groups;
-                state.cursor = 0;
-                state.last_filter_version = version;
-            }
+            let (rg_idx, range, metadata) = {
+                let state = self.current_range.as_mut().expect("range state is missing");
+                if version != state.last_filter_version {
+                    let selected_row_groups = select_row_groups_for_range(
+                        &state.metadata,
+                        &state.range,
+                        limit_rows,
+                        &predicates,
+                        &self.cfg.columns,
+                        self.cfg.case_sensitive,
+                    );
+                    let mut row_groups = if let Some(row_groups) = selected_row_groups {
+                        row_groups
+                    } else {
+                        (0..state.metadata.num_row_groups()).collect()
+                    };
+                    row_groups.retain(|rg| !state.read.contains(rg));
+                    state.row_groups = row_groups;
+                    state.cursor = 0;
+                    state.last_filter_version = version;
+                }
 
-            if state.cursor >= state.row_groups.len() {
-                self.current_range = None;
-                continue;
-            }
+                if state.cursor >= state.row_groups.len() {
+                    self.current_range = None;
+                    continue;
+                }
 
-            let rg_idx = state.row_groups[state.cursor];
-            state.cursor += 1;
-            state.read.insert(rg_idx);
+                let rg_idx = state.row_groups[state.cursor];
+                state.cursor += 1;
+                state.read.insert(rg_idx);
+                (rg_idx, state.range.clone(), Arc::clone(&state.metadata))
+            };
 
-            let path = state.range.path.clone();
-            let file_len = state.range.file_len;
+            let path = range.path.clone();
+            let file_len = range.file_len;
             let len = (file_len > 0).then_some(file_len);
-            let range_modification_time = state
-                .range
+            let range_modification_time = range
                 .external_datacache
                 .as_ref()
                 .and_then(|opts| opts.modification_time);
@@ -620,77 +732,35 @@ impl ParquetScanIter {
             if self.cfg.enable_page_index {
                 opts = opts.with_page_index(true);
             }
-            let reader = ParquetCachedReader::new(
-                CachedRangeReader::new(reader, Some(self.cfg.datacache.clone())),
-                self.cfg.cache_policy.clone(),
+            let cached_reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
+            let active_projection_columns = build_active_projection_columns(
+                &predicates,
+                &self.cfg.columns,
+                self.cfg.case_sensitive,
             );
-            let mut builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, opts)
+            let io_ranges = collect_parquet_coalesce_io_ranges(
+                &metadata,
+                &[rg_idx],
+                &self.cfg.columns,
+                self.cfg.case_sensitive,
+                &active_projection_columns,
+            );
+            let coalesce_together = PARQUET_COALESCE_CONTROLLER.decide_and_record(
+                config::io_coalesce_adaptive_lazy_active(),
+                !io_ranges.lazy.is_empty(),
+            );
+            cached_reader.set_coalesce_io_ranges(io_ranges, coalesce_together);
+            let reader = ParquetCachedReader::new(cached_reader, self.cfg.cache_policy.clone());
+            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, opts)
                 .map_err(|e| e.to_string())?;
 
-            // Set batch size if configured
-            if let Some(batch_size) = self.cfg.batch_size {
-                builder = builder.with_batch_size(batch_size);
-                debug!("parquet reader: batch_size={}", batch_size);
+            if let Some(reader) =
+                self.build_parquet_reader(builder, &metadata, &[rg_idx], &predicates)?
+            {
+                self.reader = Some(reader);
+                return Ok(true);
             }
-
-            if !self.cfg.columns.is_empty() {
-                let mask = {
-                    let arrow_schema = builder.schema();
-                    let parquet_schema = builder.parquet_schema();
-                    let mut indices = Vec::new();
-                    for col_name in &self.cfg.columns {
-                        // Skip ___count___ column - it's a special optimization column for count(*)
-                        // that doesn't exist in the parquet file
-                        if col_name == "___count___" {
-                            continue;
-                        }
-
-                        let idx = if self.cfg.case_sensitive {
-                            arrow_schema.index_of(col_name).ok()
-                        } else {
-                            arrow_schema
-                                .fields()
-                                .iter()
-                                .position(|f| f.name().eq_ignore_ascii_case(col_name))
-                        };
-
-                        if let Some(i) = idx {
-                            indices.push(i);
-                        } else {
-                            return Err(format!("Column {} not found in parquet file", col_name));
-                        }
-                    }
-                    parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
-                };
-                builder = builder.with_projection(mask);
-            }
-
-            if self.limit.is_some() {
-                builder = builder.with_limit(self.remaining);
-            }
-
-            if self.cfg.enable_page_index && !predicates.is_empty() {
-                let selection = build_row_selection_for_row_groups(
-                    &state.metadata,
-                    &[rg_idx],
-                    &predicates,
-                    &self.cfg.columns,
-                    self.cfg.case_sensitive,
-                );
-
-                if selection.rows_selected == 0 {
-                    continue;
-                }
-
-                if let Some(sel) = selection.selection {
-                    builder = builder.with_row_selection(sel);
-                }
-            }
-
-            builder = builder.with_row_groups(vec![rg_idx]);
-            let reader = builder.build().map_err(|e| e.to_string())?;
-            self.reader = Some(reader);
-            return Ok(true);
+            continue;
         }
     }
 }
@@ -1398,6 +1468,95 @@ fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
     start
 }
 
+fn collect_parquet_coalesce_io_ranges(
+    metadata: &ParquetMetaData,
+    row_groups: &[usize],
+    projected_columns: &[String],
+    case_sensitive: bool,
+    active_projection_columns: &HashSet<String>,
+) -> PlannedIoRanges {
+    let include_all_columns = projected_columns.is_empty();
+    let selected_columns: Vec<&str> = projected_columns
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != "___count___")
+        .collect();
+    if !include_all_columns && selected_columns.is_empty() {
+        return PlannedIoRanges::default();
+    }
+
+    let mut ranges = PlannedIoRanges::default();
+    for &row_group_idx in row_groups {
+        let Some(row_group) = metadata.row_groups().get(row_group_idx) else {
+            continue;
+        };
+        for column in row_group.columns() {
+            if !include_all_columns {
+                let path = column.column_path().string();
+                let matched = selected_columns.iter().any(|name| {
+                    if case_sensitive {
+                        path == *name
+                    } else {
+                        path.eq_ignore_ascii_case(name)
+                    }
+                });
+                if !matched {
+                    continue;
+                }
+            }
+            let (offset, size) = column.byte_range();
+            if size > 0 {
+                let path = column.column_path().string();
+                if active_projection_columns.is_empty()
+                    || is_active_projection_column(&path, active_projection_columns, case_sensitive)
+                {
+                    ranges.push_active(offset, size);
+                } else {
+                    ranges.push_lazy(offset, size);
+                }
+            }
+        }
+    }
+    ranges
+}
+
+fn build_active_projection_columns(
+    predicates: &[MinMaxPredicate],
+    projected_columns: &[String],
+    case_sensitive: bool,
+) -> HashSet<String> {
+    let mut active_projection_columns = HashSet::new();
+    for pred in predicates {
+        let Ok(col_idx) = pred.column().parse::<usize>() else {
+            continue;
+        };
+        let Some(col_name) = projected_columns.get(col_idx) else {
+            continue;
+        };
+        if col_name == "___count___" {
+            continue;
+        }
+        if case_sensitive {
+            active_projection_columns.insert(col_name.clone());
+        } else {
+            active_projection_columns.insert(col_name.to_ascii_lowercase());
+        }
+    }
+    active_projection_columns
+}
+
+fn is_active_projection_column(
+    path: &str,
+    active_projection_columns: &HashSet<String>,
+    case_sensitive: bool,
+) -> bool {
+    if case_sensitive {
+        active_projection_columns.contains(path)
+    } else {
+        active_projection_columns.contains(&path.to_ascii_lowercase())
+    }
+}
+
 fn should_read_row_group(
     row_group: &RowGroupMetaData,
     _metadata: &ParquetMetaData,
@@ -1661,17 +1820,22 @@ fn page_satisfies_predicate_f64(min: f64, max: f64, v: f64, pred: &MinMaxPredica
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::fs::{self, File};
     use std::sync::Arc;
 
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use crate::cache::{CachedRangeReader, DataCacheManager, DataCachePageCacheOptions};
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
 
-    use super::{ParquetReadCachePolicy, reader::ParquetCachedReader};
+    use super::{
+        ParquetReadCachePolicy, build_active_projection_columns,
+        collect_parquet_coalesce_io_ranges, reader::ParquetCachedReader,
+    };
 
     #[test]
     fn parquet_cached_reader_smoke_test() {
@@ -1726,5 +1890,105 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int32 column");
         assert_eq!(values.values(), &[1, 2, 3]);
+    }
+
+    #[test]
+    fn collect_parquet_coalesce_io_ranges_respects_projection() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("projection.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value_a", DataType::Int32, false),
+            Field::new("value_b", DataType::Int32, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .expect("record batch");
+
+        let file = File::create(&file_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let file = File::open(&file_path).expect("open parquet");
+        let reader = SerializedFileReader::new(file).expect("metadata reader");
+        let metadata = reader.metadata();
+        let row_groups = vec![0usize];
+
+        let all_ranges =
+            collect_parquet_coalesce_io_ranges(metadata, &row_groups, &[], true, &HashSet::new());
+        assert!(!all_ranges.active.is_empty());
+
+        let projected_ranges = collect_parquet_coalesce_io_ranges(
+            metadata,
+            &row_groups,
+            &["value_a".to_string()],
+            true,
+            &HashSet::new(),
+        );
+        assert!(!projected_ranges.active.is_empty());
+        assert!(projected_ranges.active.len() <= all_ranges.active.len());
+
+        let count_only_ranges = collect_parquet_coalesce_io_ranges(
+            metadata,
+            &row_groups,
+            &["___count___".to_string()],
+            true,
+            &HashSet::new(),
+        );
+        assert!(count_only_ranges.active.is_empty());
+        assert!(count_only_ranges.lazy.is_empty());
+    }
+
+    #[test]
+    fn collect_parquet_coalesce_io_ranges_splits_active_and_lazy_by_predicates() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("active_lazy.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value_a", DataType::Int32, false),
+            Field::new("value_b", DataType::Int32, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(Int32Array::from(vec![10, 20, 30])),
+            ],
+        )
+        .expect("record batch");
+
+        let file = File::create(&file_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("parquet writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let file = File::open(&file_path).expect("open parquet");
+        let reader = SerializedFileReader::new(file).expect("metadata reader");
+        let metadata = reader.metadata();
+        let row_groups = vec![0usize];
+
+        let active_projection_columns = build_active_projection_columns(
+            &[super::MinMaxPredicate::Ge {
+                column: "0".to_string(),
+                value: crate::exec::expr::LiteralValue::Int32(1),
+            }],
+            &["value_a".to_string(), "value_b".to_string()],
+            true,
+        );
+        let io_ranges = collect_parquet_coalesce_io_ranges(
+            metadata,
+            &row_groups,
+            &["value_a".to_string(), "value_b".to_string()],
+            true,
+            &active_projection_columns,
+        );
+        assert!(!io_ranges.active.is_empty());
+        assert!(!io_ranges.lazy.is_empty());
     }
 }

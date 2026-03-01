@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, RecordBatch};
@@ -24,16 +25,20 @@ use orc_rust::projection::ProjectionMask;
 use orc_rust::schema::RootDataType;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
+use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
+use crate::fs::coalesce_policy::AdaptiveCoalesceController;
 use crate::fs::opendal::OpendalRangeReaderFactory;
+use crate::fs::range_plan::PlannedIoRanges;
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
 use crate::metrics;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 
 const VIRTUAL_COUNT_COLUMN: &str = "___count___";
+static ORC_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
 
 #[derive(Clone, Debug)]
 pub struct OrcScanConfig {
@@ -125,8 +130,7 @@ impl OrcScanIter {
             })
             .map_err(|e| e.to_string())?;
         let reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
-
-        let mut builder = ArrowReaderBuilder::try_new(reader).map_err(|e| e.to_string())?;
+        let mut builder = ArrowReaderBuilder::try_new(reader.clone()).map_err(|e| e.to_string())?;
         let root = builder.file_metadata().root_data_type();
         let (projection, output_columns) = resolve_projection(&self.cfg, root)?;
         builder = builder.with_projection(projection);
@@ -134,6 +138,7 @@ impl OrcScanIter {
             builder = builder.with_batch_size(bs);
         }
 
+        let mut file_byte_range: Option<Range<usize>> = None;
         if range.length > 0 {
             let mut end = range
                 .offset
@@ -148,7 +153,22 @@ impl OrcScanIter {
             let start = range.offset as usize;
             let end = end as usize;
             if end > start {
-                builder = builder.with_file_byte_range(start..end);
+                file_byte_range = Some(start..end);
+            }
+        }
+        if let Some(scan_range) = file_byte_range.clone() {
+            builder = builder.with_file_byte_range(scan_range);
+        }
+
+        if config::io_coalesce_read_enable() {
+            let io_ranges =
+                collect_orc_coalesce_io_ranges(builder.file_metadata(), file_byte_range.as_ref());
+            if !io_ranges.is_empty() {
+                let coalesce_together = ORC_COALESCE_CONTROLLER.decide_and_record(
+                    config::io_coalesce_adaptive_lazy_active(),
+                    !io_ranges.lazy.is_empty(),
+                );
+                reader.set_coalesce_io_ranges(io_ranges, coalesce_together);
             }
         }
 
@@ -299,6 +319,41 @@ fn resolve_projection(
     }
 
     Ok((ProjectionMask::roots(root, column_indices), output_columns))
+}
+
+fn collect_orc_coalesce_io_ranges(
+    file_metadata: &orc_rust::reader::metadata::FileMetadata,
+    file_byte_range: Option<&Range<usize>>,
+) -> PlannedIoRanges {
+    let segment_size = config::io_coalesce_read_max_buffer_size().max(1);
+    let mut ranges = PlannedIoRanges::default();
+    let stripe_metadatas = file_metadata.stripe_metadatas();
+    for stripe in stripe_metadatas {
+        if let Some(scan_range) = file_byte_range {
+            let stripe_offset = stripe.offset() as usize;
+            if !scan_range.contains(&stripe_offset) {
+                continue;
+            }
+        }
+
+        let mut offset = stripe.offset();
+        let mut index_remaining = stripe.index_length();
+        while index_remaining > 0 {
+            let size = index_remaining.min(segment_size);
+            ranges.push_active(offset, size);
+            offset = offset.saturating_add(size);
+            index_remaining = index_remaining.saturating_sub(size);
+        }
+
+        let mut data_remaining = stripe.data_length();
+        while data_remaining > 0 {
+            let size = data_remaining.min(segment_size);
+            ranges.push_lazy(offset, size);
+            offset = offset.saturating_add(size);
+            data_remaining = data_remaining.saturating_sub(size);
+        }
+    }
+    ranges
 }
 
 fn find_root_pos_by_name(

@@ -24,8 +24,11 @@ use parquet::file::reader::{ChunkReader, Length};
 
 use crate::cache::cache_input_stream::CacheInputStream;
 use crate::cache::{BlockCache, CacheBlockRead, DataCacheContext, DataCacheMetricsRecorder};
+use crate::common::config;
 use crate::common::file_identity::FileIdentity;
+use crate::fs::coalesced_reader::{CoalescedRangeReader, CoalescedReadOptions};
 use crate::fs::opendal::OpendalRangeReader;
+use crate::fs::range_plan::PlannedIoRanges;
 use crate::metrics;
 use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
 
@@ -89,6 +92,7 @@ pub struct CachedRangeReader {
     counters: Option<CacheIoCounters>,
     datacache: Option<DataCacheContext>,
     block_cache: Option<Arc<BlockCache>>,
+    coalesced_remote_reader: CoalescedRangeReader<OpendalRangeReader>,
     enable_datacache: bool,
     enable_populate_datacache: bool,
     enable_async_datacache: bool,
@@ -110,6 +114,14 @@ impl CachedRangeReader {
             };
         Self {
             counters: inner.profile().as_ref().map(CacheIoCounters::new),
+            coalesced_remote_reader: CoalescedRangeReader::new(
+                inner.clone(),
+                CoalescedReadOptions {
+                    enable: config::io_coalesce_read_enable(),
+                    max_distance: config::io_coalesce_read_max_distance_size(),
+                    max_buffer_size: config::io_coalesce_read_max_buffer_size(),
+                },
+            ),
             inner,
             datacache,
             block_cache,
@@ -125,6 +137,15 @@ impl CachedRangeReader {
 
     pub fn datacache(&self) -> Option<&DataCacheContext> {
         self.datacache.as_ref()
+    }
+
+    pub fn set_coalesce_io_ranges(
+        &self,
+        ranges: PlannedIoRanges,
+        coalesce_active_lazy_together: bool,
+    ) {
+        self.coalesced_remote_reader
+            .set_io_ranges(ranges, coalesce_active_lazy_together);
     }
 
     pub fn file_len(&self) -> u64 {
@@ -161,7 +182,7 @@ impl CachedRangeReader {
             ));
         }
         if !self.enable_datacache {
-            return self.inner.read_remote_bytes(start, length);
+            return self.coalesced_remote_reader.read_bytes(start, length);
         }
         let Some(cache_stream) = self.cache_stream() else {
             return self.inner.read_remote_bytes(start, length);
