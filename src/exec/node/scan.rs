@@ -139,13 +139,6 @@ impl RuntimeFilterContext {
         }
     }
 
-    pub(crate) fn version(&self) -> u64 {
-        match &self.inner {
-            RuntimeFilterContextInner::Static { .. } => 0,
-            RuntimeFilterContextInner::Handle { handle } => handle.version(),
-        }
-    }
-
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.snapshot().is_empty()

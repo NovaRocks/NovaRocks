@@ -312,15 +312,6 @@ pub fn build_parquet_iter(
     Ok(Box::new(iter))
 }
 
-struct RangeState {
-    range: FileScanRange,
-    metadata: Arc<ParquetMetaData>,
-    row_groups: Vec<usize>,
-    cursor: usize,
-    read: HashSet<usize>,
-    last_filter_version: u64,
-}
-
 struct ParquetScanIter {
     cfg: ParquetScanConfig,
     ranges: Vec<FileScanRange>,
@@ -331,7 +322,6 @@ struct ParquetScanIter {
     limit: Option<usize>,
     profile: Option<RuntimeProfile>,
     runtime_filters: Option<RuntimeFilterContext>,
-    current_range: Option<RangeState>,
 }
 
 impl ParquetScanIter {
@@ -344,13 +334,6 @@ impl ParquetScanIter {
             }
         }
         predicates
-    }
-
-    fn current_filter_version(&self) -> u64 {
-        self.runtime_filters
-            .as_ref()
-            .map(|f| f.version())
-            .unwrap_or(0)
     }
 
     fn build_parquet_reader(
@@ -444,275 +427,19 @@ impl ParquetScanIter {
             limit,
             profile,
             runtime_filters,
-            current_range: None,
         }
     }
 
     fn open_next_reader(&mut self) -> Result<bool, String> {
         loop {
-            if self.current_range.is_none() {
-                if self.range_idx >= self.ranges.len() {
-                    return Ok(false);
-                }
-                let prep_start = std::time::Instant::now();
-                let idx = self.range_idx;
-                let range = self.ranges[idx].clone();
-                self.range_idx += 1;
-
-                let path = range.path.clone();
-                let file_len = range.file_len;
-                let len = (file_len > 0).then_some(file_len);
-                let range_modification_time = range
-                    .external_datacache
-                    .as_ref()
-                    .and_then(|opts| opts.modification_time);
-
-                if let Some(profile) = self.profile.as_ref() {
-                    profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
-                }
-
-                let reader = self
-                    .factory
-                    .open_with_len(&path, len)
-                    .map(|r| r.with_modification_time_override(range_modification_time))
-                    .map_err(|e| e.to_string())?;
-                let identity = reader.file_identity().clone();
-                let meta_cache_evict_probability = u32::try_from(
-                    self.cfg
-                        .datacache
-                        .cache_options()
-                        .datacache_evict_probability,
-                )
-                .ok();
-
-                let meta_cache_available =
-                    cache::parquet_meta_cache_available(self.cfg.cache_policy.enable_metacache);
-                // Try to get metadata from cache when cache is actually available.
-                let cached_metadata = if meta_cache_available {
-                    cache::parquet_meta_cache_get(self.cfg.cache_policy.enable_metacache, &identity)
-                } else {
-                    None
-                };
-
-                // Build reader - parquet crate will still read footer, but we can use cached metadata
-                // for row group filtering to avoid re-parsing
-                let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
-                if self.cfg.enable_page_index {
-                    opts = opts.with_page_index(true);
-                }
-                let cached_reader =
-                    CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
-                let parquet_reader =
-                    ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
-                let builder =
-                    ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
-                        .map_err(|e| e.to_string())?;
-
-                // If we have cached metadata, verify it matches and use it for optimization
-                if let Some(cached_meta) = cached_metadata {
-                    let current_meta = builder.metadata();
-                    // Verify cached metadata matches (same num_row_groups and file_size)
-                    if cached_meta.num_row_groups() == current_meta.num_row_groups()
-                        && cached_meta.file_metadata().num_rows()
-                            == current_meta.file_metadata().num_rows()
-                    {
-                        debug!("parquet metadata cache HIT for file: {} (verified)", path);
-                        // Metadata matches, we can use cached one for row group selection
-                        // Note: builder still uses its own metadata, but we've verified cache is valid
-                    } else {
-                        debug!(
-                            "parquet metadata cache STALE for file: {} (re-caching)",
-                            path
-                        );
-                        // Cache is stale, update it
-                        // builder.metadata() returns Arc<ParquetMetaData>, clone it
-                        let metadata = current_meta.clone();
-                        let _ = cache::parquet_meta_cache_put(
-                            self.cfg.cache_policy.enable_metacache,
-                            &identity,
-                            metadata,
-                            meta_cache_evict_probability,
-                        );
-                    }
-                } else if meta_cache_available {
-                    debug!("parquet metadata cache MISS for file: {}", path);
-                    // Cache the metadata for future use
-                    // builder.metadata() returns Arc<ParquetMetaData>, clone it
-                    let metadata = builder.metadata().clone();
-                    if cache::parquet_meta_cache_put(
-                        self.cfg.cache_policy.enable_metacache,
-                        &identity,
-                        metadata,
-                        meta_cache_evict_probability,
-                    ) {
-                        debug!("parquet metadata cached for file: {}", path);
-                    }
-                }
-
-                let metadata = builder.metadata().clone();
-                let predicates = self.current_predicates();
-                let limit_rows = self.limit.map(|_| self.remaining);
-                let selected_row_groups = select_row_groups_for_range(
-                    &metadata,
-                    &range,
-                    limit_rows,
-                    &predicates,
-                    &self.cfg.columns,
-                    self.cfg.case_sensitive,
-                );
-
-                let row_groups = if let Some(row_groups) = selected_row_groups {
-                    let rg_total = metadata.num_row_groups() as u128;
-                    let mut bytes_total: u128 = 0;
-                    for rg in metadata.row_groups() {
-                        bytes_total += rg.total_byte_size().max(0) as u128;
-                    }
-
-                    let mut bytes_selected: u128 = 0;
-                    for &rg_idx in &row_groups {
-                        if let Some(rg) = metadata.row_groups().get(rg_idx) {
-                            bytes_selected += rg.total_byte_size().max(0) as u128;
-                        }
-                    }
-                    let rg_selected = row_groups.len() as u128;
-                    let rg_pruned = rg_total.saturating_sub(rg_selected);
-                    let bytes_pruned = bytes_total.saturating_sub(bytes_selected);
-
-                    if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add(
-                            "ParquetRowGroupsTotal",
-                            metrics::TUnit::UNIT,
-                            clamp_u128_to_i64(rg_total),
-                        );
-                        profile.counter_add(
-                            "ParquetRowGroupsSelected",
-                            metrics::TUnit::UNIT,
-                            clamp_u128_to_i64(rg_selected),
-                        );
-                        profile.counter_add(
-                            "ParquetRowGroupsPruned",
-                            metrics::TUnit::UNIT,
-                            clamp_u128_to_i64(rg_pruned),
-                        );
-                        profile.counter_add(
-                            "ParquetRowGroupBytesTotal",
-                            metrics::TUnit::BYTES,
-                            clamp_u128_to_i64(bytes_total),
-                        );
-                        profile.counter_add(
-                            "ParquetRowGroupBytesSelected",
-                            metrics::TUnit::BYTES,
-                            clamp_u128_to_i64(bytes_selected),
-                        );
-                        profile.counter_add(
-                            "ParquetRowGroupBytesPruned",
-                            metrics::TUnit::BYTES,
-                            clamp_u128_to_i64(bytes_pruned),
-                        );
-                    }
-
-                    if row_groups.is_empty() {
-                        debug!("all row groups filtered out for file: {}", path);
-                        continue;
-                    }
-                    debug!(
-                        "selected {}/{} row groups for file: {}",
-                        row_groups.len(),
-                        metadata.num_row_groups(),
-                        path
-                    );
-                    row_groups
-                } else {
-                    (0..metadata.num_row_groups()).collect()
-                };
-
-                let prep_ns = prep_start.elapsed().as_nanos() as u128;
-                if let Some(profile) = self.profile.as_ref() {
-                    profile.counter_add(
-                        "PrepareChunkSourceTime",
-                        metrics::TUnit::TIME_NS,
-                        clamp_u128_to_i64(prep_ns),
-                    );
-                }
-
-                let mut state = RangeState {
-                    range,
-                    metadata,
-                    row_groups,
-                    cursor: 0,
-                    read: HashSet::new(),
-                    last_filter_version: self.current_filter_version(),
-                };
-
-                let rg_idx = state.row_groups[state.cursor];
-                state.cursor += 1;
-                state.read.insert(rg_idx);
-                let active_projection_columns = build_active_projection_columns(
-                    &predicates,
-                    &self.cfg.columns,
-                    self.cfg.case_sensitive,
-                );
-
-                let io_ranges = collect_parquet_coalesce_io_ranges(
-                    &state.metadata,
-                    &[rg_idx],
-                    &self.cfg.columns,
-                    self.cfg.case_sensitive,
-                    &active_projection_columns,
-                );
-                let coalesce_together = PARQUET_COALESCE_CONTROLLER.decide_and_record(
-                    config::io_coalesce_adaptive_lazy_active(),
-                    !io_ranges.lazy.is_empty(),
-                );
-                cached_reader.set_coalesce_io_ranges(io_ranges, coalesce_together);
-
-                if let Some(reader) =
-                    self.build_parquet_reader(builder, &state.metadata, &[rg_idx], &predicates)?
-                {
-                    self.current_range = Some(state);
-                    self.reader = Some(reader);
-                    return Ok(true);
-                }
-
-                self.current_range = Some(state);
-                continue;
+            if self.range_idx >= self.ranges.len() {
+                return Ok(false);
             }
 
-            let version = self.current_filter_version();
-            let predicates = self.current_predicates();
-            let limit_rows = self.limit.map(|_| self.remaining);
-            let (rg_idx, range, metadata) = {
-                let state = self.current_range.as_mut().expect("range state is missing");
-                if version != state.last_filter_version {
-                    let selected_row_groups = select_row_groups_for_range(
-                        &state.metadata,
-                        &state.range,
-                        limit_rows,
-                        &predicates,
-                        &self.cfg.columns,
-                        self.cfg.case_sensitive,
-                    );
-                    let mut row_groups = if let Some(row_groups) = selected_row_groups {
-                        row_groups
-                    } else {
-                        (0..state.metadata.num_row_groups()).collect()
-                    };
-                    row_groups.retain(|rg| !state.read.contains(rg));
-                    state.row_groups = row_groups;
-                    state.cursor = 0;
-                    state.last_filter_version = version;
-                }
-
-                if state.cursor >= state.row_groups.len() {
-                    self.current_range = None;
-                    continue;
-                }
-
-                let rg_idx = state.row_groups[state.cursor];
-                state.cursor += 1;
-                state.read.insert(rg_idx);
-                (rg_idx, state.range.clone(), Arc::clone(&state.metadata))
-            };
+            let prep_start = std::time::Instant::now();
+            let idx = self.range_idx;
+            let range = self.ranges[idx].clone();
+            self.range_idx += 1;
 
             let path = range.path.clone();
             let file_len = range.file_len;
@@ -722,17 +449,167 @@ impl ParquetScanIter {
                 .as_ref()
                 .and_then(|opts| opts.modification_time);
 
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
+            }
+
             let reader = self
                 .factory
                 .open_with_len(&path, len)
                 .map(|r| r.with_modification_time_override(range_modification_time))
                 .map_err(|e| e.to_string())?;
+            let identity = reader.file_identity().clone();
+            let meta_cache_evict_probability = u32::try_from(
+                self.cfg
+                    .datacache
+                    .cache_options()
+                    .datacache_evict_probability,
+            )
+            .ok();
 
+            let meta_cache_available =
+                cache::parquet_meta_cache_available(self.cfg.cache_policy.enable_metacache);
+            // Try to get metadata from cache when cache is actually available.
+            let cached_metadata = if meta_cache_available {
+                cache::parquet_meta_cache_get(self.cfg.cache_policy.enable_metacache, &identity)
+            } else {
+                None
+            };
+
+            // Build reader - parquet crate will still read footer, but we can use cached metadata
+            // for row group filtering to avoid re-parsing
             let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
             if self.cfg.enable_page_index {
                 opts = opts.with_page_index(true);
             }
             let cached_reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
+            let parquet_reader =
+                ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
+            let builder =
+                ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
+                    .map_err(|e| e.to_string())?;
+
+            // If we have cached metadata, verify it matches and use it for optimization
+            if let Some(cached_meta) = cached_metadata {
+                let current_meta = builder.metadata();
+                // Verify cached metadata matches (same num_row_groups and file_size)
+                if cached_meta.num_row_groups() == current_meta.num_row_groups()
+                    && cached_meta.file_metadata().num_rows()
+                        == current_meta.file_metadata().num_rows()
+                {
+                    debug!("parquet metadata cache HIT for file: {} (verified)", path);
+                    // Metadata matches, we can use cached one for row group selection
+                    // Note: builder still uses its own metadata, but we've verified cache is valid
+                } else {
+                    debug!(
+                        "parquet metadata cache STALE for file: {} (re-caching)",
+                        path
+                    );
+                    // Cache is stale, update it
+                    // builder.metadata() returns Arc<ParquetMetaData>, clone it
+                    let metadata = current_meta.clone();
+                    let _ = cache::parquet_meta_cache_put(
+                        self.cfg.cache_policy.enable_metacache,
+                        &identity,
+                        metadata,
+                        meta_cache_evict_probability,
+                    );
+                }
+            } else if meta_cache_available {
+                debug!("parquet metadata cache MISS for file: {}", path);
+                // Cache the metadata for future use
+                // builder.metadata() returns Arc<ParquetMetaData>, clone it
+                let metadata = builder.metadata().clone();
+                if cache::parquet_meta_cache_put(
+                    self.cfg.cache_policy.enable_metacache,
+                    &identity,
+                    metadata,
+                    meta_cache_evict_probability,
+                ) {
+                    debug!("parquet metadata cached for file: {}", path);
+                }
+            }
+
+            let metadata = builder.metadata().clone();
+            let predicates = self.current_predicates();
+            let limit_rows = self.limit.map(|_| self.remaining);
+            let selected_row_groups = select_row_groups_for_range(
+                &metadata,
+                &range,
+                limit_rows,
+                &predicates,
+                &self.cfg.columns,
+                self.cfg.case_sensitive,
+            );
+
+            let row_groups = if let Some(row_groups) = selected_row_groups {
+                let rg_total = metadata.num_row_groups() as u128;
+                let mut bytes_total: u128 = 0;
+                for rg in metadata.row_groups() {
+                    bytes_total += rg.total_byte_size().max(0) as u128;
+                }
+
+                let mut bytes_selected: u128 = 0;
+                for &rg_idx in &row_groups {
+                    if let Some(rg) = metadata.row_groups().get(rg_idx) {
+                        bytes_selected += rg.total_byte_size().max(0) as u128;
+                    }
+                }
+                let rg_selected = row_groups.len() as u128;
+                let rg_pruned = rg_total.saturating_sub(rg_selected);
+                let bytes_pruned = bytes_total.saturating_sub(bytes_selected);
+
+                if let Some(profile) = self.profile.as_ref() {
+                    profile.counter_add(
+                        "ParquetRowGroupsTotal",
+                        metrics::TUnit::UNIT,
+                        clamp_u128_to_i64(rg_total),
+                    );
+                    profile.counter_add(
+                        "ParquetRowGroupsSelected",
+                        metrics::TUnit::UNIT,
+                        clamp_u128_to_i64(rg_selected),
+                    );
+                    profile.counter_add(
+                        "ParquetRowGroupsPruned",
+                        metrics::TUnit::UNIT,
+                        clamp_u128_to_i64(rg_pruned),
+                    );
+                    profile.counter_add(
+                        "ParquetRowGroupBytesTotal",
+                        metrics::TUnit::BYTES,
+                        clamp_u128_to_i64(bytes_total),
+                    );
+                    profile.counter_add(
+                        "ParquetRowGroupBytesSelected",
+                        metrics::TUnit::BYTES,
+                        clamp_u128_to_i64(bytes_selected),
+                    );
+                    profile.counter_add(
+                        "ParquetRowGroupBytesPruned",
+                        metrics::TUnit::BYTES,
+                        clamp_u128_to_i64(bytes_pruned),
+                    );
+                }
+
+                if row_groups.is_empty() {
+                    debug!("all row groups filtered out for file: {}", path);
+                    continue;
+                }
+                debug!(
+                    "selected {}/{} row groups for file: {}",
+                    row_groups.len(),
+                    metadata.num_row_groups(),
+                    path
+                );
+                row_groups
+            } else {
+                (0..metadata.num_row_groups()).collect()
+            };
+
+            if row_groups.is_empty() {
+                continue;
+            }
             let active_projection_columns = build_active_projection_columns(
                 &predicates,
                 &self.cfg.columns,
@@ -740,7 +617,7 @@ impl ParquetScanIter {
             );
             let io_ranges = collect_parquet_coalesce_io_ranges(
                 &metadata,
-                &[rg_idx],
+                &row_groups,
                 &self.cfg.columns,
                 self.cfg.case_sensitive,
                 &active_projection_columns,
@@ -750,17 +627,24 @@ impl ParquetScanIter {
                 !io_ranges.lazy.is_empty(),
             );
             cached_reader.set_coalesce_io_ranges(io_ranges, coalesce_together);
-            let reader = ParquetCachedReader::new(cached_reader, self.cfg.cache_policy.clone());
-            let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(reader, opts)
-                .map_err(|e| e.to_string())?;
 
+            // TODO: Unlike StarRocks, this implementation fixes the row-group set when opening
+            // the range-level reader. Late-arriving runtime filters cannot re-prune row groups
+            // within the same range and may reduce pruning efficiency.
             if let Some(reader) =
-                self.build_parquet_reader(builder, &metadata, &[rg_idx], &predicates)?
+                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?
             {
+                let prep_ns = prep_start.elapsed().as_nanos() as u128;
+                if let Some(profile) = self.profile.as_ref() {
+                    profile.counter_add(
+                        "PrepareChunkSourceTime",
+                        metrics::TUnit::TIME_NS,
+                        clamp_u128_to_i64(prep_ns),
+                    );
+                }
                 self.reader = Some(reader);
                 return Ok(true);
             }
-            continue;
         }
     }
 }
