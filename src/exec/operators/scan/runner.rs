@@ -44,6 +44,7 @@ use crate::exec::runtime_filter::{
 };
 use crate::metrics;
 use crate::novarocks_logging::debug;
+use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::Schema;
@@ -63,6 +64,48 @@ const RUNTIME_FILTER_NUM: &str = "RuntimeFilterNum";
 const RUNTIME_IN_FILTER_NUM: &str = "RuntimeInFilterNum";
 const RUNTIME_FILTER_DEBUG_EVERY: u64 = 256;
 const SCAN_ASYNC_WAIT_INTERVAL: Duration = Duration::from_millis(10);
+const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
+const SCAN_TIME: &str = "ScanTime";
+
+struct IoExecScope {
+    state: Arc<ScanAsyncState>,
+    profiles: Option<OperatorProfiles>,
+}
+
+impl IoExecScope {
+    fn new(state: Arc<ScanAsyncState>, profiles: Option<OperatorProfiles>) -> Self {
+        let idle_ns = state.begin_io_task_exec();
+        if idle_ns > 0 {
+            if let Some(p) = profiles.as_ref() {
+                p.unique.counter_add(
+                    "IOTaskWaitTime",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(idle_ns),
+                );
+            }
+        }
+        Self { state, profiles }
+    }
+}
+
+impl Drop for IoExecScope {
+    fn drop(&mut self) {
+        let elapsed_ns = self.state.end_io_task_exec();
+        if elapsed_ns == 0 {
+            return;
+        }
+        let Some(profiles) = self.profiles.as_ref() else {
+            return;
+        };
+        let elapsed_ns = clamp_u128_to_i64(elapsed_ns);
+        profiles
+            .unique
+            .counter_add(IO_TASK_EXEC_TIME, metrics::TUnit::TIME_NS, elapsed_ns);
+        profiles
+            .unique
+            .counter_add(SCAN_TIME, metrics::TUnit::TIME_NS, elapsed_ns);
+    }
+}
 
 fn wait_for_dependency(state: &ScanAsyncState, dep: &DependencyHandle) -> bool {
     if dep.is_ready() {
@@ -694,6 +737,8 @@ pub(super) fn run_scan_worker(
         notify.arm();
         return;
     }
+
+    let _io_exec_scope = IoExecScope::new(Arc::clone(&state), runner.profiles.clone());
 
     let mut keep_runner = false;
     loop {

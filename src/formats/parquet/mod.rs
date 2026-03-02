@@ -339,11 +339,21 @@ impl ParquetScanIter {
                 profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
             }
 
+            let open_file_start = std::time::Instant::now();
             let reader = self
                 .factory
                 .open_with_len(&path, len)
                 .map(|r| r.with_modification_time_override(range_modification_time))
                 .map_err(|e| e.to_string())?;
+            let open_file_ns = open_file_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "OpenFile",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(open_file_ns),
+                );
+            }
+            let reader_init_start = std::time::Instant::now();
             let identity = reader.file_identity().clone();
             let meta_cache_evict_probability = u32::try_from(
                 self.cfg
@@ -371,9 +381,18 @@ impl ParquetScanIter {
             let cached_reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
             let parquet_reader =
                 ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
+            let footer_read_start = std::time::Instant::now();
             let builder =
                 ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
                     .map_err(|e| e.to_string())?;
+            let footer_read_ns = footer_read_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ReaderInitFooterRead",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(footer_read_ns),
+                );
+            }
 
             // If we have cached metadata, verify it matches and use it for optimization
             if let Some(cached_meta) = cached_metadata {
@@ -480,6 +499,14 @@ impl ParquetScanIter {
 
                 if row_groups.is_empty() {
                     debug!("all row groups filtered out for file: {}", path);
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    if let Some(profile) = self.profile.as_ref() {
+                        profile.counter_add(
+                            "ReaderInit",
+                            metrics::TUnit::TIME_NS,
+                            clamp_u128_to_i64(reader_init_ns),
+                        );
+                    }
                     continue;
                 }
                 debug!(
@@ -494,6 +521,14 @@ impl ParquetScanIter {
             };
 
             if row_groups.is_empty() {
+                let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                if let Some(profile) = self.profile.as_ref() {
+                    profile.counter_add(
+                        "ReaderInit",
+                        metrics::TUnit::TIME_NS,
+                        clamp_u128_to_i64(reader_init_ns),
+                    );
+                }
                 continue;
             }
             let active_projection_columns = build_active_projection_columns(
@@ -517,9 +552,17 @@ impl ParquetScanIter {
             // TODO: Unlike StarRocks, this implementation fixes the row-group set when opening
             // the range-level reader. Late-arriving runtime filters cannot re-prune row groups
             // within the same range and may reduce pruning efficiency.
-            if let Some(reader) =
-                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?
-            {
+            let maybe_reader =
+                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?;
+            let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ReaderInit",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(reader_init_ns),
+                );
+            }
+            if let Some(reader) = maybe_reader {
                 let prep_ns = prep_start.elapsed().as_nanos() as u128;
                 if let Some(profile) = self.profile.as_ref() {
                     profile.counter_add(
@@ -552,7 +595,17 @@ impl Iterator for ParquetScanIter {
             }
 
             let reader = self.reader.as_mut().expect("reader");
-            match reader.next() {
+            let column_read_start = std::time::Instant::now();
+            let next_batch = reader.next();
+            let column_read_ns = column_read_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ColumnReadTime",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(column_read_ns),
+                );
+            }
+            match next_batch {
                 Some(Ok(batch)) => {
                     if batch.num_rows() == 0 {
                         continue;
