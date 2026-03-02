@@ -15,6 +15,9 @@ path = "src/bin/oss_parquet_probe.rs"
 anyhow = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 arrow = { version = "57.1.0", features = ["prettyprint", "ipc", "ipc_compression"] }
+bytes = "1"
+futures = "0.3"
 opendal = { version = "0.52", features = ["services-oss", "services-fs", "services-s3"] }
+parquet = { version = "57.1.0", features = ["arrow"] }
 novarocks = { path = ".." }
 prost = "0.13.5"

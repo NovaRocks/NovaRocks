@@ -22,6 +22,7 @@ use parquet::basic::Compression;
 use parquet::column::writer::ColumnWriter;
 use parquet::data_type::ByteArray;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use std::fs::File;
@@ -78,8 +79,13 @@ async fn fs_operator_can_read_and_parse_parquet() -> Result<()> {
     let fs = opendal::services::Fs::default().root(dir.path().to_string_lossy().as_ref());
     let op = Operator::new(fs)?.finish();
 
-    let probe = novarocks::formats::parquet::probe_parquet(&op, "test.parquet").await?;
-    assert_eq!(probe.num_rows, 3);
-    assert_eq!(probe.num_row_groups, 1);
+    let data = op
+        .read("test.parquet")
+        .await
+        .context("read parquet bytes")?;
+    let reader = SerializedFileReader::new(data.to_bytes()).context("open parquet from bytes")?;
+    let metadata = reader.metadata();
+    assert_eq!(metadata.file_metadata().num_rows(), 3);
+    assert_eq!(metadata.num_row_groups(), 1);
     Ok(())
 }

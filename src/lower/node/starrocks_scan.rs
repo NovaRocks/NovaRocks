@@ -163,15 +163,8 @@ pub(crate) fn lower_starrocks_scan_node(
     let mut min_max_predicates = Vec::new();
     if let Some(conjuncts) = node.conjuncts.as_ref() {
         for conj in conjuncts {
-            match parse_min_max_conjunct(conj, &out_layout) {
-                Ok(Some(pred)) => min_max_predicates.push(pred),
-                Ok(None) => {}
-                Err(err) => {
-                    debug!(
-                        "STARROCKS_SCAN_NODE node_id={} skip unsupported min/max conjunct for native pruning: {}",
-                        node.node_id, err
-                    );
-                }
+            if let Some(pred) = parse_min_max_conjunct(conj, &out_layout)? {
+                min_max_predicates.push(pred);
             }
         }
     }

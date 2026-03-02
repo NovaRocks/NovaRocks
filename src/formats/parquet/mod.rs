@@ -15,38 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 mod cache;
+mod page_selection;
 mod reader;
+mod row_group_selector;
 
+pub use crate::common::min_max_predicate::{
+    MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
+};
 pub use cache::{
     ParquetCacheOptions, init_datacache_parquet_cache, parquet_meta_cache_get,
     parquet_meta_cache_put, parquet_page_cache_get, parquet_page_cache_put,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeBinaryBuilder, RecordBatch, StructArray,
 };
 use arrow::datatypes::DataType;
-use bytes::Bytes;
-use futures::TryStreamExt;
-use opendal::Operator;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
+    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
 };
-use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
-use parquet::file::page_index::column_index::ColumnIndexMetaData;
-use parquet::file::page_index::offset_index::OffsetIndexMetaData;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::file::statistics::Statistics;
+use parquet::file::metadata::ParquetMetaData;
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::Arc;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
-use crate::exec::expr::LiteralValue;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::exec::variant::VariantValue;
@@ -58,119 +54,23 @@ use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::types;
+use page_selection::build_row_selection_for_row_groups;
 use reader::ParquetCachedReader;
+use row_group_selector::select_row_groups_for_range;
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
-
-#[derive(Clone, Debug)]
-pub struct ParquetProbe {
-    pub path: String,
-    pub num_rows: i64,
-    pub num_row_groups: usize,
-    pub created_by: Option<String>,
-    pub schema: String,
-    pub arrow_schema: Option<String>,
-    pub arrow_schema_skip_meta: Option<String>,
-    pub arrow_schema_error: Option<String>,
-    pub arrow_schema_skip_meta_error: Option<String>,
-}
-
-pub fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
-    let reader = SerializedFileReader::new(bytes.clone())
-        .with_context(|| format!("parquet open: {path}"))?;
-    let metadata = reader.metadata();
-    let file_meta = metadata.file_metadata();
-    let arrow_schema = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-        .ok()
-        .map(|builder| format!("{:?}", builder.schema()));
-    let arrow_schema_error = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
-        .err()
-        .map(|e| e.to_string());
-    let arrow_schema_skip_meta = ParquetRecordBatchReaderBuilder::try_new_with_options(
-        bytes.clone(),
-        ArrowReaderOptions::new().with_skip_arrow_metadata(true),
-    )
-    .ok()
-    .map(|builder| format!("{:?}", builder.schema()));
-    let arrow_schema_skip_meta_error = ParquetRecordBatchReaderBuilder::try_new_with_options(
-        bytes,
-        ArrowReaderOptions::new().with_skip_arrow_metadata(true),
-    )
-    .err()
-    .map(|e| e.to_string());
-
-    Ok(ParquetProbe {
-        path: path.to_string(),
-        num_rows: file_meta.num_rows(),
-        num_row_groups: metadata.num_row_groups(),
-        created_by: file_meta.created_by().map(|s: &str| s.to_string()),
-        schema: format!("{:?}", file_meta.schema()),
-        arrow_schema,
-        arrow_schema_skip_meta,
-        arrow_schema_error,
-        arrow_schema_skip_meta_error,
-    })
-}
-
-pub async fn list_parquet_files(
-    op: &Operator,
-    prefix: &str,
-    max_files: usize,
-) -> Result<Vec<String>> {
-    let mut out = Vec::new();
-
-    let mut list_prefix = prefix.trim().to_string();
-    if !list_prefix.is_empty() && !list_prefix.ends_with('/') {
-        list_prefix.push('/');
-    }
-
-    let mut lister = op
-        .lister_with(&list_prefix)
-        .recursive(true)
-        .await
-        .context("opendal lister")?;
-    while let Some(entry) = lister.try_next().await.context("opendal list next")? {
-        let path = entry.path().to_string();
-        if path.ends_with(".parquet") {
-            out.push(path);
-            if out.len() >= max_files {
-                break;
-            }
-        }
-    }
-
-    Ok(out)
-}
-
-pub async fn probe_parquet(op: &Operator, path: &str) -> Result<ParquetProbe> {
-    let data = op
-        .read(path)
-        .await
-        .with_context(|| format!("opendal read: {path}"))?;
-    let bytes = data.to_bytes();
-    probe_parquet_bytes(path, bytes)
-}
-
-#[derive(Clone, Debug)]
-pub enum MinMaxPredicate {
-    Le { column: String, value: LiteralValue }, // <=
-    Ge { column: String, value: LiteralValue }, // >=
-    Lt { column: String, value: LiteralValue }, // <
-    Gt { column: String, value: LiteralValue }, // >
-    Eq { column: String, value: LiteralValue }, // =
-}
 
 fn runtime_filters_to_min_max_predicates(
     cfg: &ParquetScanConfig,
     runtime_filters: &RuntimeFilterContext,
-) -> Vec<MinMaxPredicate> {
+) -> Result<Vec<MinMaxPredicate>, String> {
     let snapshot = runtime_filters.snapshot();
     if snapshot.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if cfg.slot_ids.is_empty() || cfg.columns.is_empty() || cfg.slot_ids.len() != cfg.columns.len()
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut slot_to_index = HashMap::new();
@@ -183,7 +83,14 @@ fn runtime_filters_to_min_max_predicates(
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
             continue;
         };
-        let Some((min_value, max_value)) = rf.min_max_literal() else {
+        let Some((min_value, max_value)) = rf.min_max_predicate_values().map_err(|e| {
+            format!(
+                "parquet runtime in-filter min/max conversion failed (slot_id={}): {}",
+                rf.slot_id(),
+                e
+            )
+        })?
+        else {
             continue;
         };
         preds.push(MinMaxPredicate::Ge {
@@ -199,7 +106,15 @@ fn runtime_filters_to_min_max_predicates(
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
             continue;
         };
-        let Some((min_value, max_value)) = rf.min_max().min_max_literal() else {
+        let Some((min_value, max_value)) =
+            rf.min_max().min_max_predicate_values().map_err(|e| {
+                format!(
+                    "parquet runtime membership-filter min/max conversion failed (slot_id={}): {}",
+                    rf.slot_id(),
+                    e
+                )
+            })?
+        else {
             continue;
         };
         preds.push(MinMaxPredicate::Ge {
@@ -211,36 +126,7 @@ fn runtime_filters_to_min_max_predicates(
             value: max_value,
         });
     }
-    preds
-}
-
-fn literal_int64(value: &LiteralValue) -> Option<i64> {
-    match value {
-        LiteralValue::Int8(v) => Some(*v as i64),
-        LiteralValue::Int16(v) => Some(*v as i64),
-        LiteralValue::Int32(v) => Some(*v as i64),
-        LiteralValue::Int64(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn literal_int32(value: &LiteralValue) -> Option<i32> {
-    match value {
-        LiteralValue::Int8(v) => Some(*v as i32),
-        LiteralValue::Int16(v) => Some(*v as i32),
-        LiteralValue::Int32(v) => Some(*v),
-        LiteralValue::Int64(v) => i32::try_from(*v).ok(),
-        LiteralValue::Date32(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn literal_float64(value: &LiteralValue) -> Option<f64> {
-    match value {
-        LiteralValue::Float32(v) => Some(*v as f64),
-        LiteralValue::Float64(v) => Some(*v),
-        _ => None,
-    }
+    Ok(preds)
 }
 
 #[derive(Clone, Debug)]
@@ -325,15 +211,15 @@ struct ParquetScanIter {
 }
 
 impl ParquetScanIter {
-    fn current_predicates(&self) -> Vec<MinMaxPredicate> {
+    fn current_predicates(&self) -> Result<Vec<MinMaxPredicate>, String> {
         let mut predicates = self.cfg.min_max_predicates.clone();
         if let Some(filters) = self.runtime_filters.as_ref() {
-            let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters);
+            let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters)?;
             if !runtime_preds.is_empty() {
                 predicates.append(&mut runtime_preds);
             }
         }
-        predicates
+        Ok(predicates)
     }
 
     fn build_parquet_reader(
@@ -531,7 +417,7 @@ impl ParquetScanIter {
             }
 
             let metadata = builder.metadata().clone();
-            let predicates = self.current_predicates();
+            let predicates = self.current_predicates()?;
             let limit_rows = self.limit.map(|_| self.remaining);
             let selected_row_groups = select_row_groups_for_range(
                 &metadata,
@@ -951,407 +837,6 @@ fn binary_value_at(array: &ArrayRef, row: usize) -> Result<Option<&[u8]>, String
     Err("expected binary array".to_string())
 }
 
-fn select_row_groups_for_range(
-    metadata: &ParquetMetaData,
-    range: &FileScanRange,
-    mut remaining_rows: Option<usize>,
-    min_max_predicates: &[MinMaxPredicate],
-    columns: &[String],
-    case_sensitive: bool,
-) -> Option<Vec<usize>> {
-    if range.length == 0 && remaining_rows.is_none() && min_max_predicates.is_empty() {
-        return None;
-    }
-    let split_start = range.offset;
-    let mut split_end = split_start.saturating_add(range.length);
-    if range.file_len > 0 && split_end > range.file_len {
-        split_end = range.file_len;
-    }
-    if range.length == 0 && range.file_len == 0 {
-        split_end = u64::MAX;
-    }
-
-    let mut row_groups = Vec::new();
-    let mut filtered_count = 0;
-
-    for (idx, row_group) in metadata.row_groups().iter().enumerate() {
-        let rg_start = row_group_start_offset(row_group)?;
-        if rg_start >= split_start && rg_start < split_end {
-            // Check min-max predicates.
-            if !min_max_predicates.is_empty() {
-                match should_read_row_group(
-                    row_group,
-                    metadata,
-                    min_max_predicates,
-                    columns,
-                    case_sensitive,
-                ) {
-                    Ok(true) => {
-                        // Passed pruning.
-                    }
-                    Ok(false) => {
-                        // Pruned out.
-                        filtered_count += 1;
-                        continue;
-                    }
-                    Err(e) => {
-                        // On error, conservatively keep the row group.
-                        debug!("error checking row group predicates: {}", e);
-                    }
-                }
-            }
-
-            row_groups.push(idx);
-            if let Some(rows_left) = remaining_rows.as_mut() {
-                let rg_rows = row_group.num_rows().max(0) as usize;
-                if rg_rows >= *rows_left {
-                    break;
-                }
-                *rows_left = rows_left.saturating_sub(rg_rows);
-                if *rows_left == 0 {
-                    break;
-                }
-            }
-        }
-    }
-
-    if filtered_count > 0 {
-        debug!(
-            "min_max filter: filtered {} row groups, kept {}",
-            filtered_count,
-            row_groups.len()
-        );
-    }
-
-    Some(row_groups)
-}
-
-struct PageSelectionResult {
-    selection: Option<RowSelection>,
-    rows_total: usize,
-    rows_selected: usize,
-    ranges: usize,
-    pages_total: u128,
-    pages_selected: u128,
-    pages_pruned: u128,
-    page_index_missing: u128,
-    offset_index_missing: u128,
-    predicates_unsupported: u128,
-}
-
-struct PageRangeResult {
-    ranges: Vec<Range<usize>>,
-    pages_total: usize,
-    pages_selected: usize,
-}
-
-fn build_row_selection_for_row_groups(
-    metadata: &ParquetMetaData,
-    row_groups: &[usize],
-    min_max_predicates: &[MinMaxPredicate],
-    columns: &[String],
-    case_sensitive: bool,
-) -> PageSelectionResult {
-    let mut result = PageSelectionResult {
-        selection: None,
-        rows_total: 0,
-        rows_selected: 0,
-        ranges: 0,
-        pages_total: 0,
-        pages_selected: 0,
-        pages_pruned: 0,
-        page_index_missing: 0,
-        offset_index_missing: 0,
-        predicates_unsupported: 0,
-    };
-
-    if min_max_predicates.is_empty() {
-        return result;
-    }
-
-    let Some(column_index) = metadata.column_index() else {
-        let total_rows = row_groups
-            .iter()
-            .map(|&rg_idx| metadata.row_group(rg_idx).num_rows().max(0) as usize)
-            .sum::<usize>();
-        result.rows_total = total_rows;
-        result.rows_selected = total_rows;
-        result.page_index_missing = row_groups.len() as u128;
-        return result;
-    };
-    let Some(offset_index) = metadata.offset_index() else {
-        let total_rows = row_groups
-            .iter()
-            .map(|&rg_idx| metadata.row_group(rg_idx).num_rows().max(0) as usize)
-            .sum::<usize>();
-        result.rows_total = total_rows;
-        result.rows_selected = total_rows;
-        result.offset_index_missing = row_groups.len() as u128;
-        return result;
-    };
-
-    let mut global_ranges: Vec<Range<usize>> = Vec::new();
-    let mut row_offset = 0usize;
-    let mut any_pruned = false;
-
-    for &rg_idx in row_groups {
-        let row_group = metadata.row_group(rg_idx);
-        let rg_rows = row_group.num_rows().max(0) as usize;
-        result.rows_total += rg_rows;
-
-        let mut ranges: Vec<Range<usize>> = vec![0..rg_rows];
-        let mut any_supported = false;
-
-        for pred in min_max_predicates {
-            let col_idx_str = pred.column();
-            let Ok(col_idx) = col_idx_str.parse::<usize>() else {
-                result.predicates_unsupported += 1;
-                continue;
-            };
-            if col_idx >= columns.len() {
-                result.predicates_unsupported += 1;
-                continue;
-            }
-            let col_name = &columns[col_idx];
-
-            let col_chunk_idx = row_group.columns().iter().position(|c| {
-                let path_str = c.column_path().string();
-                if case_sensitive {
-                    path_str == *col_name
-                } else {
-                    path_str.eq_ignore_ascii_case(col_name)
-                }
-            });
-
-            let Some(col_chunk_idx) = col_chunk_idx else {
-                result.predicates_unsupported += 1;
-                continue;
-            };
-
-            let Some(rg_col_index) = column_index.get(rg_idx).and_then(|v| v.get(col_chunk_idx))
-            else {
-                result.page_index_missing += 1;
-                continue;
-            };
-            let Some(rg_offset_index) = offset_index.get(rg_idx).and_then(|v| v.get(col_chunk_idx))
-            else {
-                result.offset_index_missing += 1;
-                continue;
-            };
-
-            let page_ranges =
-                match page_ranges_for_predicate(rg_col_index, rg_offset_index, rg_rows, pred) {
-                    Some(r) => r,
-                    None => {
-                        result.predicates_unsupported += 1;
-                        continue;
-                    }
-                };
-
-            let pages_total = page_ranges.pages_total as u128;
-            let pages_selected = page_ranges.pages_selected as u128;
-            result.pages_total += pages_total;
-            result.pages_selected += pages_selected;
-            if pages_total >= pages_selected {
-                result.pages_pruned += pages_total - pages_selected;
-            }
-
-            any_supported = true;
-            ranges = intersect_ranges(&ranges, &page_ranges.ranges);
-            if ranges.is_empty() {
-                any_pruned = true;
-                break;
-            }
-        }
-
-        if any_supported {
-            any_pruned = true;
-        }
-
-        if !ranges.is_empty() {
-            let merged = merge_ranges(ranges);
-            for r in &merged {
-                result.rows_selected += r.end.saturating_sub(r.start);
-                result.ranges += 1;
-                global_ranges.push((r.start + row_offset)..(r.end + row_offset));
-            }
-        } else {
-            // No rows selected in this row group.
-        }
-        row_offset = row_offset.saturating_add(rg_rows);
-    }
-
-    if result.rows_total == 0 {
-        return result;
-    }
-
-    if !any_pruned || result.rows_selected == result.rows_total {
-        return result;
-    }
-
-    let selection = RowSelection::from_consecutive_ranges(global_ranges.into_iter(), row_offset);
-    result.selection = Some(selection);
-    result
-}
-
-fn page_ranges_for_predicate(
-    column_index: &ColumnIndexMetaData,
-    offset_index: &OffsetIndexMetaData,
-    total_rows: usize,
-    predicate: &MinMaxPredicate,
-) -> Option<PageRangeResult> {
-    if matches!(column_index, ColumnIndexMetaData::NONE) {
-        return None;
-    }
-
-    let page_locations = offset_index.page_locations();
-    let num_pages = page_locations.len();
-    if num_pages == 0 {
-        return None;
-    }
-
-    let mut ranges: Vec<Range<usize>> = Vec::new();
-    let mut pages_selected = 0usize;
-
-    let mut push_page_range = |page_idx: usize| {
-        let start = page_locations[page_idx].first_row_index.max(0) as usize;
-        let end = if page_idx + 1 < num_pages {
-            page_locations[page_idx + 1].first_row_index.max(0) as usize
-        } else {
-            total_rows
-        };
-        if start < end {
-            ranges.push(start..end);
-            pages_selected += 1;
-        }
-    };
-
-    match column_index {
-        ColumnIndexMetaData::INT32(index) => {
-            let v = literal_int32(predicate.value())?;
-            for page_idx in 0..num_pages {
-                if index.is_null_page(page_idx) {
-                    continue;
-                }
-                let min = index.min_values()[page_idx];
-                let max = index.max_values()[page_idx];
-                if page_satisfies_predicate_i32(min, max, v, predicate) {
-                    push_page_range(page_idx);
-                }
-            }
-        }
-        ColumnIndexMetaData::INT64(index) => {
-            let v = literal_int64(predicate.value())?;
-            for page_idx in 0..num_pages {
-                if index.is_null_page(page_idx) {
-                    continue;
-                }
-                let min = index.min_values()[page_idx];
-                let max = index.max_values()[page_idx];
-                if page_satisfies_predicate_i64(min, max, v, predicate) {
-                    push_page_range(page_idx);
-                }
-            }
-        }
-        ColumnIndexMetaData::FLOAT(index) => {
-            let v = literal_float64(predicate.value())? as f32;
-            for page_idx in 0..num_pages {
-                if index.is_null_page(page_idx) {
-                    continue;
-                }
-                let min = index.min_values()[page_idx];
-                let max = index.max_values()[page_idx];
-                if min.is_nan() || max.is_nan() {
-                    push_page_range(page_idx);
-                    continue;
-                }
-                if page_satisfies_predicate_f32(min, max, v, predicate) {
-                    push_page_range(page_idx);
-                }
-            }
-        }
-        ColumnIndexMetaData::DOUBLE(index) => {
-            let v = literal_float64(predicate.value())?;
-            for page_idx in 0..num_pages {
-                if index.is_null_page(page_idx) {
-                    continue;
-                }
-                let min = index.min_values()[page_idx];
-                let max = index.max_values()[page_idx];
-                if min.is_nan() || max.is_nan() {
-                    push_page_range(page_idx);
-                    continue;
-                }
-                if page_satisfies_predicate_f64(min, max, v, predicate) {
-                    push_page_range(page_idx);
-                }
-            }
-        }
-        _ => return None,
-    }
-
-    Some(PageRangeResult {
-        ranges: merge_ranges(ranges),
-        pages_total: num_pages,
-        pages_selected,
-    })
-}
-
-fn merge_ranges(ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    if ranges.is_empty() {
-        return ranges;
-    }
-    let mut merged = Vec::with_capacity(ranges.len());
-    let mut current = ranges[0].clone();
-    for r in ranges.into_iter().skip(1) {
-        if r.start <= current.end {
-            if r.end > current.end {
-                current.end = r.end;
-            }
-        } else {
-            merged.push(current);
-            current = r;
-        }
-    }
-    merged.push(current);
-    merged
-}
-
-fn intersect_ranges(a: &[Range<usize>], b: &[Range<usize>]) -> Vec<Range<usize>> {
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut j = 0usize;
-    while i < a.len() && j < b.len() {
-        let start = a[i].start.max(b[j].start);
-        let end = a[i].end.min(b[j].end);
-        if start < end {
-            out.push(start..end);
-        }
-        if a[i].end < b[j].end {
-            i += 1;
-        } else {
-            j += 1;
-        }
-    }
-    out
-}
-
-fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
-    let mut start: Option<u64> = None;
-    for column in row_group.columns() {
-        let col_start = column.data_page_offset();
-        if col_start < 0 {
-            continue;
-        }
-        let col_start = col_start as u64;
-        start = Some(match start {
-            Some(v) => v.min(col_start),
-            None => col_start,
-        });
-    }
-    start
-}
-
 fn collect_parquet_coalesce_io_ranges(
     metadata: &ParquetMetaData,
     row_groups: &[usize],
@@ -1438,267 +923,6 @@ fn is_active_projection_column(
         active_projection_columns.contains(path)
     } else {
         active_projection_columns.contains(&path.to_ascii_lowercase())
-    }
-}
-
-fn should_read_row_group(
-    row_group: &RowGroupMetaData,
-    _metadata: &ParquetMetaData,
-    predicates: &[MinMaxPredicate],
-    columns: &[String],
-    case_sensitive: bool,
-) -> Result<bool, String> {
-    for pred in predicates {
-        // pred.column() currently stores the index into `columns` as a string
-        let col_idx_str = pred.column();
-        let Ok(col_idx) = col_idx_str.parse::<usize>() else {
-            continue;
-        };
-
-        if col_idx >= columns.len() {
-            continue;
-        }
-        let col_name = &columns[col_idx];
-
-        // Find the column chunk
-        let chunk = row_group.columns().iter().find(|c| {
-            let path_str = c.column_path().string();
-            if case_sensitive {
-                path_str == *col_name
-            } else {
-                path_str.eq_ignore_ascii_case(col_name)
-            }
-        });
-
-        if let Some(chunk) = chunk {
-            if let Some(stats) = chunk.statistics() {
-                let satisfies = match pred {
-                    MinMaxPredicate::Le { value, .. } => check_min_satisfies_le(stats, value)?,
-                    MinMaxPredicate::Ge { value, .. } => check_max_satisfies_ge(stats, value)?,
-                    MinMaxPredicate::Lt { value, .. } => check_min_satisfies_lt(stats, value)?,
-                    MinMaxPredicate::Gt { value, .. } => check_max_satisfies_gt(stats, value)?,
-                    MinMaxPredicate::Eq { value, .. } => {
-                        check_max_satisfies_ge(stats, value)?
-                            && check_min_satisfies_le(stats, value)?
-                    }
-                };
-
-                if !satisfies {
-                    return Ok(false);
-                }
-            }
-        }
-    }
-    Ok(true)
-}
-
-impl MinMaxPredicate {
-    fn column(&self) -> &str {
-        match self {
-            MinMaxPredicate::Le { column, .. }
-            | MinMaxPredicate::Ge { column, .. }
-            | MinMaxPredicate::Lt { column, .. }
-            | MinMaxPredicate::Gt { column, .. }
-            | MinMaxPredicate::Eq { column, .. } => column,
-        }
-    }
-
-    fn value(&self) -> &LiteralValue {
-        match self {
-            MinMaxPredicate::Le { value, .. }
-            | MinMaxPredicate::Ge { value, .. }
-            | MinMaxPredicate::Lt { value, .. }
-            | MinMaxPredicate::Gt { value, .. }
-            | MinMaxPredicate::Eq { value, .. } => value,
-        }
-    }
-}
-
-// Check whether max satisfies >=.
-fn check_max_satisfies_ge(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
-    match stats {
-        Statistics::Int64(s) => {
-            let Some(v) = literal_int64(value) else {
-                return Ok(true);
-            };
-            if let Some(max) = s.max_opt() {
-                Ok(*max >= v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Int32(s) => {
-            let Some(v) = literal_int32(value) else {
-                return Ok(true);
-            };
-            if let Some(max) = s.max_opt() {
-                Ok(*max >= v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Double(s) => {
-            let Some(v) = literal_float64(value) else {
-                return Ok(true);
-            };
-            if let Some(max) = s.max_opt() {
-                Ok(*max >= v)
-            } else {
-                Ok(true)
-            }
-        }
-        _ => Ok(true),
-    }
-}
-
-// Check whether min satisfies <=.
-fn check_min_satisfies_le(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
-    match stats {
-        Statistics::Int64(s) => {
-            let Some(v) = literal_int64(value) else {
-                return Ok(true);
-            };
-            if let Some(min) = s.min_opt() {
-                Ok(*min <= v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Int32(s) => {
-            let Some(v) = literal_int32(value) else {
-                return Ok(true);
-            };
-            if let Some(min) = s.min_opt() {
-                Ok(*min <= v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Double(s) => {
-            let Some(v) = literal_float64(value) else {
-                return Ok(true);
-            };
-            if let Some(min) = s.min_opt() {
-                Ok(*min <= v)
-            } else {
-                Ok(true)
-            }
-        }
-        _ => Ok(true),
-    }
-}
-
-// Check whether max satisfies >.
-fn check_max_satisfies_gt(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
-    match stats {
-        Statistics::Int64(s) => {
-            let Some(v) = literal_int64(value) else {
-                return Ok(true);
-            };
-            if let Some(max) = s.max_opt() {
-                Ok(*max > v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Int32(s) => {
-            let Some(v) = literal_int32(value) else {
-                return Ok(true);
-            };
-            if let Some(max) = s.max_opt() {
-                Ok(*max > v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Double(s) => {
-            let Some(v) = literal_float64(value) else {
-                return Ok(true);
-            };
-            if let Some(max) = s.max_opt() {
-                Ok(*max > v)
-            } else {
-                Ok(true)
-            }
-        }
-        _ => Ok(true),
-    }
-}
-
-// Check whether min satisfies <.
-fn check_min_satisfies_lt(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
-    match stats {
-        Statistics::Int64(s) => {
-            let Some(v) = literal_int64(value) else {
-                return Ok(true);
-            };
-            if let Some(min) = s.min_opt() {
-                Ok(*min < v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Int32(s) => {
-            let Some(v) = literal_int32(value) else {
-                return Ok(true);
-            };
-            if let Some(min) = s.min_opt() {
-                Ok(*min < v)
-            } else {
-                Ok(true)
-            }
-        }
-        Statistics::Double(s) => {
-            let Some(v) = literal_float64(value) else {
-                return Ok(true);
-            };
-            if let Some(min) = s.min_opt() {
-                Ok(*min < v)
-            } else {
-                Ok(true)
-            }
-        }
-        _ => Ok(true),
-    }
-}
-
-fn page_satisfies_predicate_i32(min: i32, max: i32, v: i32, pred: &MinMaxPredicate) -> bool {
-    match pred {
-        MinMaxPredicate::Le { .. } => min <= v,
-        MinMaxPredicate::Ge { .. } => max >= v,
-        MinMaxPredicate::Lt { .. } => min < v,
-        MinMaxPredicate::Gt { .. } => max > v,
-        MinMaxPredicate::Eq { .. } => min <= v && max >= v,
-    }
-}
-
-fn page_satisfies_predicate_i64(min: i64, max: i64, v: i64, pred: &MinMaxPredicate) -> bool {
-    match pred {
-        MinMaxPredicate::Le { .. } => min <= v,
-        MinMaxPredicate::Ge { .. } => max >= v,
-        MinMaxPredicate::Lt { .. } => min < v,
-        MinMaxPredicate::Gt { .. } => max > v,
-        MinMaxPredicate::Eq { .. } => min <= v && max >= v,
-    }
-}
-
-fn page_satisfies_predicate_f32(min: f32, max: f32, v: f32, pred: &MinMaxPredicate) -> bool {
-    match pred {
-        MinMaxPredicate::Le { .. } => min <= v,
-        MinMaxPredicate::Ge { .. } => max >= v,
-        MinMaxPredicate::Lt { .. } => min < v,
-        MinMaxPredicate::Gt { .. } => max > v,
-        MinMaxPredicate::Eq { .. } => min <= v && max >= v,
-    }
-}
-
-fn page_satisfies_predicate_f64(min: f64, max: f64, v: f64, pred: &MinMaxPredicate) -> bool {
-    match pred {
-        MinMaxPredicate::Le { .. } => min <= v,
-        MinMaxPredicate::Ge { .. } => max >= v,
-        MinMaxPredicate::Lt { .. } => min < v,
-        MinMaxPredicate::Gt { .. } => max > v,
-        MinMaxPredicate::Eq { .. } => min <= v && max >= v,
     }
 }
 
@@ -1860,7 +1084,7 @@ mod tests {
         let active_projection_columns = build_active_projection_columns(
             &[super::MinMaxPredicate::Ge {
                 column: "0".to_string(),
-                value: crate::exec::expr::LiteralValue::Int32(1),
+                value: super::MinMaxPredicateValue::Int32(1),
             }],
             &["value_a".to_string(), "value_b".to_string()],
             true,

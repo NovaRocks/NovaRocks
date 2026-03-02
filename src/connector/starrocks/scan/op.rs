@@ -22,11 +22,11 @@ use arrow::datatypes::SchemaRef;
 use serde_json::Value;
 
 use crate::common::ids::SlotId;
+use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
-use crate::formats::parquet::MinMaxPredicate;
 use crate::metrics;
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::profile::RuntimeProfile;

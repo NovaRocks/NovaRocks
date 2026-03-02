@@ -1,8 +1,61 @@
 use anyhow::{Context, Result};
+use bytes::Bytes;
+use futures::TryStreamExt;
+use parquet::arrow::arrow_reader::{ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
+use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use novarocks::novarocks_config::{init_from_env_or_default, init_from_path};
-use novarocks::novarocks_fs_opendal::{list_parquet_files, probe_parquet};
 use novarocks::novarocks_fs_oss::build_oss_operator;
+
+#[derive(Clone, Debug)]
+struct ParquetProbe {
+    path: String,
+    num_rows: i64,
+    num_row_groups: usize,
+    created_by: Option<String>,
+    schema: String,
+    arrow_schema: Option<String>,
+    arrow_schema_skip_meta: Option<String>,
+    arrow_schema_error: Option<String>,
+    arrow_schema_skip_meta_error: Option<String>,
+}
+
+fn probe_parquet_bytes(path: &str, bytes: Bytes) -> Result<ParquetProbe> {
+    let reader = SerializedFileReader::new(bytes.clone())
+        .with_context(|| format!("parquet open: {path}"))?;
+    let metadata = reader.metadata();
+    let file_meta = metadata.file_metadata();
+    let arrow_schema = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+        .ok()
+        .map(|builder| format!("{:?}", builder.schema()));
+    let arrow_schema_error = ParquetRecordBatchReaderBuilder::try_new(bytes.clone())
+        .err()
+        .map(|e| e.to_string());
+    let arrow_schema_skip_meta = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        bytes.clone(),
+        ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+    )
+    .ok()
+    .map(|builder| format!("{:?}", builder.schema()));
+    let arrow_schema_skip_meta_error = ParquetRecordBatchReaderBuilder::try_new_with_options(
+        bytes,
+        ArrowReaderOptions::new().with_skip_arrow_metadata(true),
+    )
+    .err()
+    .map(|e| e.to_string());
+
+    Ok(ParquetProbe {
+        path: path.to_string(),
+        num_rows: file_meta.num_rows(),
+        num_row_groups: metadata.num_row_groups(),
+        created_by: file_meta.created_by().map(|s: &str| s.to_string()),
+        schema: format!("{:?}", file_meta.schema()),
+        arrow_schema,
+        arrow_schema_skip_meta,
+        arrow_schema_error,
+        arrow_schema_skip_meta_error,
+    })
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -49,15 +102,35 @@ async fn main() -> Result<()> {
         oss_cfg.endpoint, oss_cfg.bucket, oss_cfg.root, prefix, max_files
     );
 
-    let files = list_parquet_files(&op, &prefix, max_files)
+    let mut files = Vec::new();
+    let mut list_prefix = prefix.trim().to_string();
+    if !list_prefix.is_empty() && !list_prefix.ends_with('/') {
+        list_prefix.push('/');
+    }
+    let mut lister = op
+        .lister_with(&list_prefix)
+        .recursive(true)
         .await
-        .context("list parquet files")?;
+        .context("opendal lister")?;
+    while let Some(entry) = lister.try_next().await.context("opendal list next")? {
+        let path = entry.path().to_string();
+        if path.ends_with(".parquet") {
+            files.push(path);
+            if files.len() >= max_files {
+                break;
+            }
+        }
+    }
     if files.is_empty() {
         anyhow::bail!("no .parquet found under prefix={}", prefix);
     }
 
     for path in files {
-        let probe = probe_parquet(&op, &path).await?;
+        let data = op
+            .read(&path)
+            .await
+            .with_context(|| format!("opendal read: {path}"))?;
+        let probe = probe_parquet_bytes(&path, data.to_bytes())?;
         eprintln!(
             "[parquet] path={} rows={} row_groups={} created_by={}",
             probe.path,

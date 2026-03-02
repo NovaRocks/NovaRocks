@@ -1,3 +1,4 @@
+/log
 /novarocks.log
 /novarocks.pid
 /novarocks.toml
@@ -11,3 +12,4 @@
 /output
 /sql-tests/bootstrap
 /sql-tests/.sql_test_catalog
+/tools/target

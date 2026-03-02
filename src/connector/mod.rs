@@ -21,11 +21,12 @@ pub mod starrocks;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::exec::node::scan::ScanNode;
 
 pub use crate::formats::FileFormatConfig;
 pub use crate::formats::orc::OrcScanConfig;
-pub use crate::formats::parquet::{MinMaxPredicate, ParquetScanConfig};
+pub use crate::formats::parquet::ParquetScanConfig;
 pub use crate::fs::scan_context::FileScanRange;
 pub use hdfs::HdfsScanConfig;
 pub use jdbc::JdbcScanConfig;

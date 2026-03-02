@@ -45,10 +45,10 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use roaring::RoaringBitmap;
 use serde_json::Value as JsonValue;
 
-use crate::connector::MinMaxPredicate;
+use crate::common::min_max_predicate::MinMaxPredicateOp;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::txn_log::parse_default_literal_to_singleton_array;
-use crate::exec::expr::LiteralValue;
+use crate::connector::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::formats::starrocks::plan::{
     StarRocksDeletePredicateOpPlan, StarRocksFlatJsonProjectionPlan, StarRocksNativeColumnPlan,
     StarRocksNativeReadPlan, StarRocksNativeSchemaColumnPlan, StarRocksNativeSegmentPlan,
@@ -71,7 +71,7 @@ use super::constants::{
     LOGICAL_TYPE_CHAR, LOGICAL_TYPE_DATE, LOGICAL_TYPE_DATETIME, LOGICAL_TYPE_DECIMAL32,
     LOGICAL_TYPE_DECIMAL64, LOGICAL_TYPE_DECIMAL128, LOGICAL_TYPE_DOUBLE, LOGICAL_TYPE_FLOAT,
     LOGICAL_TYPE_INT, LOGICAL_TYPE_SMALLINT, LOGICAL_TYPE_TINYINT, LOGICAL_TYPE_VARBINARY,
-    LOGICAL_TYPE_VARCHAR, USECS_PER_DAY_I64,
+    LOGICAL_TYPE_VARCHAR,
 };
 use super::indexed_column::decode_indexed_binary_values;
 use super::io::{TabletRoot, build_operator, read_range_bytes};
@@ -2226,33 +2226,20 @@ fn take_array_by_keep_mask(
 }
 
 fn predicate_column_index(predicate: &MinMaxPredicate) -> Option<usize> {
-    let column = match predicate {
-        MinMaxPredicate::Le { column, .. }
-        | MinMaxPredicate::Ge { column, .. }
-        | MinMaxPredicate::Lt { column, .. }
-        | MinMaxPredicate::Gt { column, .. }
-        | MinMaxPredicate::Eq { column, .. } => column,
-    };
-    column.parse::<usize>().ok()
+    predicate.column().parse::<usize>().ok()
 }
 
-fn predicate_literal(predicate: &MinMaxPredicate) -> &LiteralValue {
-    match predicate {
-        MinMaxPredicate::Le { value, .. }
-        | MinMaxPredicate::Ge { value, .. }
-        | MinMaxPredicate::Lt { value, .. }
-        | MinMaxPredicate::Gt { value, .. }
-        | MinMaxPredicate::Eq { value, .. } => value,
-    }
+fn predicate_literal(predicate: &MinMaxPredicate) -> &MinMaxPredicateValue {
+    predicate.value()
 }
 
 fn predicate_op(predicate: &MinMaxPredicate) -> PredicateOp {
-    match predicate {
-        MinMaxPredicate::Le { .. } => PredicateOp::Le,
-        MinMaxPredicate::Ge { .. } => PredicateOp::Ge,
-        MinMaxPredicate::Lt { .. } => PredicateOp::Lt,
-        MinMaxPredicate::Gt { .. } => PredicateOp::Gt,
-        MinMaxPredicate::Eq { .. } => PredicateOp::Eq,
+    match predicate.op() {
+        MinMaxPredicateOp::Le => PredicateOp::Le,
+        MinMaxPredicateOp::Ge => PredicateOp::Ge,
+        MinMaxPredicateOp::Lt => PredicateOp::Lt,
+        MinMaxPredicateOp::Gt => PredicateOp::Gt,
+        MinMaxPredicateOp::Eq => PredicateOp::Eq,
     }
 }
 
@@ -2503,68 +2490,36 @@ fn trim_char_zero_padding(value: &[u8]) -> Vec<u8> {
     value[..end].to_vec()
 }
 
-fn literal_to_i64(literal: &LiteralValue) -> Option<i64> {
-    match literal {
-        LiteralValue::Int8(v) => Some(i64::from(*v)),
-        LiteralValue::Int16(v) => Some(i64::from(*v)),
-        LiteralValue::Int32(v) => Some(i64::from(*v)),
-        LiteralValue::Int64(v) => Some(*v),
-        _ => None,
-    }
+fn literal_to_i64(literal: &MinMaxPredicateValue) -> Option<i64> {
+    literal.as_i64()
 }
 
-fn literal_to_f64(literal: &LiteralValue) -> Option<f64> {
-    match literal {
-        LiteralValue::Float32(v) => Some(f64::from(*v)),
-        LiteralValue::Float64(v) => Some(*v),
-        _ => None,
-    }
+fn literal_to_f64(literal: &MinMaxPredicateValue) -> Option<f64> {
+    literal.as_f64()
 }
 
-fn literal_to_bool(literal: &LiteralValue) -> Option<bool> {
-    match literal {
-        LiteralValue::Bool(v) => Some(*v),
-        _ => None,
-    }
+fn literal_to_bool(literal: &MinMaxPredicateValue) -> Option<bool> {
+    literal.as_bool()
 }
 
-fn literal_to_bytes(literal: &LiteralValue) -> Option<Vec<u8>> {
-    match literal {
-        LiteralValue::Utf8(v) => Some(v.as_bytes().to_vec()),
-        _ => None,
-    }
+fn literal_to_bytes(literal: &MinMaxPredicateValue) -> Option<Vec<u8>> {
+    literal.as_bytes().map(|v| v.to_vec())
 }
 
-fn literal_to_date_days(literal: &LiteralValue) -> Option<i32> {
-    match literal {
-        LiteralValue::Date32(v) => Some(*v),
-        LiteralValue::Utf8(v) => parse_date_days(v.as_bytes()),
-        _ => None,
-    }
+fn literal_to_date_days(literal: &MinMaxPredicateValue) -> Option<i32> {
+    literal
+        .as_date32()
+        .or_else(|| literal.as_bytes().and_then(parse_date_days))
 }
 
-fn literal_to_datetime_micros(literal: &LiteralValue) -> Option<i64> {
-    match literal {
-        LiteralValue::Utf8(v) => parse_datetime_micros(v.as_bytes()),
-        LiteralValue::Date32(v) => {
-            let days = i64::from(*v);
-            days.checked_mul(USECS_PER_DAY_I64)
-        }
-        _ => None,
-    }
+fn literal_to_datetime_micros(literal: &MinMaxPredicateValue) -> Option<i64> {
+    literal
+        .as_datetime_micros()
+        .or_else(|| literal.as_bytes().and_then(parse_datetime_micros))
 }
 
-fn literal_to_decimal_scaled(literal: &LiteralValue, target_scale: i8) -> Option<i128> {
-    match literal {
-        LiteralValue::Decimal128 { value, scale, .. } => {
-            align_decimal_scale(*value, *scale, target_scale)
-        }
-        LiteralValue::Int8(v) => scale_integer(i128::from(*v), target_scale),
-        LiteralValue::Int16(v) => scale_integer(i128::from(*v), target_scale),
-        LiteralValue::Int32(v) => scale_integer(i128::from(*v), target_scale),
-        LiteralValue::Int64(v) => scale_integer(i128::from(*v), target_scale),
-        _ => None,
-    }
+fn literal_to_decimal_scaled(literal: &MinMaxPredicateValue, target_scale: i8) -> Option<i128> {
+    literal.as_decimal128_scaled(target_scale)
 }
 
 fn decimal_precision_scale(schema: &StarRocksNativeSchemaColumnPlan) -> Option<(u8, i8)> {
@@ -2710,44 +2665,6 @@ fn parse_decimal_scaled(value: &str, precision: u8, scale: i8) -> Result<i128, S
         .parse::<i128>()
         .map_err(|_| format!("parse decimal '{}' failed", value))?;
     Ok(unsigned.saturating_mul(sign))
-}
-
-fn align_decimal_scale(value: i128, from_scale: i8, to_scale: i8) -> Option<i128> {
-    if from_scale == to_scale {
-        return Some(value);
-    }
-    if from_scale < 0 || to_scale < 0 {
-        return None;
-    }
-
-    let from_scale_u = u32::try_from(from_scale).ok()?;
-    let to_scale_u = u32::try_from(to_scale).ok()?;
-    if to_scale_u > from_scale_u {
-        let factor = pow10_i128(to_scale_u - from_scale_u)?;
-        value.checked_mul(factor)
-    } else {
-        let factor = pow10_i128(from_scale_u - to_scale_u)?;
-        if factor == 0 || value % factor != 0 {
-            return None;
-        }
-        Some(value / factor)
-    }
-}
-
-fn scale_integer(value: i128, scale: i8) -> Option<i128> {
-    if scale < 0 {
-        return None;
-    }
-    let factor = pow10_i128(u32::try_from(scale).ok()?)?;
-    value.checked_mul(factor)
-}
-
-fn pow10_i128(exp: u32) -> Option<i128> {
-    let mut out = 1_i128;
-    for _ in 0..exp {
-        out = out.checked_mul(10)?;
-    }
-    Some(out)
 }
 
 fn block_split_bloom_test(bloom: &[u8], key: &[u8]) -> Option<bool> {
