@@ -14,49 +14,173 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::cache::cache_input_stream::CacheInputStream;
-use crate::cache::{DataCacheContext, DataCacheMetricsRecorder};
-use crate::formats::parquet::{
-    ParquetProbe, ParquetReadCachePolicy, parquet_page_cache_get, parquet_page_cache_put,
-    probe_parquet_bytes,
-};
+use crate::common::file_identity::FileIdentity;
 use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::global_async_runtime::data_runtime;
 use crate::runtime::profile::{CounterRef, RuntimeProfile, clamp_u128_to_i64};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
-use futures::TryStreamExt;
 use opendal::Operator;
-use orc_rust::reader::ChunkReader as OrcChunkReader;
-use parquet::errors::{ParquetError, Result as ParquetResult};
-use parquet::file::reader::{ChunkReader, Length};
 use std::future::IntoFuture;
 use std::io::{self, Read};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::runtime::Runtime;
 
 pub const DEFAULT_OPENDAL_READ_SIZE: usize = 8 * 1024 * 1024;
+const REMOTE_READ_CONCURRENCY_LOG_INTERVAL_MS: u64 = 30_000;
+
+#[derive(Debug)]
+struct RemoteReadConcurrencyWindow {
+    window_start: Instant,
+    started: u64,
+    succeeded: u64,
+    failed: u64,
+    requested_bytes_total: u64,
+    requested_bytes_succeeded: u64,
+    io_ns: u128,
+    peak: usize,
+}
+
+impl RemoteReadConcurrencyWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_start: now,
+            started: 0,
+            succeeded: 0,
+            failed: 0,
+            requested_bytes_total: 0,
+            requested_bytes_succeeded: 0,
+            io_ns: 0,
+            peak: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RemoteReadConcurrencySummary {
+    started: u64,
+    succeeded: u64,
+    failed: u64,
+    requested_bytes_total: u64,
+    requested_bytes_succeeded: u64,
+    avg_latency_ms: u64,
+    peak_in_flight: usize,
+    current_in_flight: usize,
+    global_peak_in_flight: usize,
+    window_ms: u64,
+}
+
+#[derive(Debug)]
+struct RemoteReadConcurrencyTracker {
+    in_flight: AtomicUsize,
+    global_peak: AtomicUsize,
+    window: Mutex<RemoteReadConcurrencyWindow>,
+}
+
+impl RemoteReadConcurrencyTracker {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            global_peak: AtomicUsize::new(0),
+            window: Mutex::new(RemoteReadConcurrencyWindow::new(Instant::now())),
+        }
+    }
+
+    fn on_start(&self) -> usize {
+        let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        update_peak_atomic(&self.global_peak, current);
+        if let Ok(mut window) = self.window.lock() {
+            window.started = window.started.saturating_add(1);
+            if current > window.peak {
+                window.peak = current;
+            }
+        }
+        current
+    }
+
+    fn on_finish(
+        &self,
+        requested_len: usize,
+        io_ns: u128,
+        success: bool,
+    ) -> Option<RemoteReadConcurrencySummary> {
+        let current = self
+            .in_flight
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        let now = Instant::now();
+        let mut window = self.window.lock().ok()?;
+        window.requested_bytes_total = window
+            .requested_bytes_total
+            .saturating_add(u64::try_from(requested_len).unwrap_or(u64::MAX));
+        if success {
+            window.succeeded = window.succeeded.saturating_add(1);
+            window.requested_bytes_succeeded = window
+                .requested_bytes_succeeded
+                .saturating_add(u64::try_from(requested_len).unwrap_or(u64::MAX));
+        } else {
+            window.failed = window.failed.saturating_add(1);
+        }
+        window.io_ns = window.io_ns.saturating_add(io_ns);
+        let elapsed_ms =
+            u64::try_from(now.duration_since(window.window_start).as_millis()).unwrap_or(u64::MAX);
+        if elapsed_ms < REMOTE_READ_CONCURRENCY_LOG_INTERVAL_MS {
+            return None;
+        }
+        let finished = window.succeeded.saturating_add(window.failed);
+        let avg_latency_ms = if finished > 0 {
+            let avg_ns = window.io_ns / u128::from(finished);
+            u64::try_from(avg_ns / 1_000_000).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        let summary = RemoteReadConcurrencySummary {
+            started: window.started,
+            succeeded: window.succeeded,
+            failed: window.failed,
+            requested_bytes_total: window.requested_bytes_total,
+            requested_bytes_succeeded: window.requested_bytes_succeeded,
+            avg_latency_ms,
+            peak_in_flight: window.peak,
+            current_in_flight: current,
+            global_peak_in_flight: self.global_peak.load(Ordering::Relaxed),
+            window_ms: elapsed_ms,
+        };
+        *window = RemoteReadConcurrencyWindow::new(now);
+        Some(summary)
+    }
+}
+
+fn update_peak_atomic(peak: &AtomicUsize, current: usize) {
+    let mut observed = peak.load(Ordering::Relaxed);
+    while current > observed {
+        match peak.compare_exchange_weak(observed, current, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
+fn remote_read_concurrency_tracker() -> &'static RemoteReadConcurrencyTracker {
+    static TRACKER: OnceLock<RemoteReadConcurrencyTracker> = OnceLock::new();
+    TRACKER.get_or_init(RemoteReadConcurrencyTracker::new)
+}
 
 #[derive(Clone, Debug)]
-struct OpendalIoCounters {
+pub(crate) struct OpendalRemoteIoCounters {
     read_requests: CounterRef,
     bytes_read: CounterRef,
     io_timer: CounterRef,
     io_task_exec_time: CounterRef,
     scan_time: CounterRef,
-    cache_read_requests: CounterRef,
-    bytes_read_from_cache: CounterRef,
-    datacache_read_counter: CounterRef,
-    datacache_read_bytes: CounterRef,
-    datacache_read_timer: CounterRef,
-    datacache_write_counter: CounterRef,
-    datacache_write_bytes: CounterRef,
-    datacache_write_timer: CounterRef,
+    remote_read_in_flight_peak: CounterRef,
+    observed_remote_read_peak: Arc<AtomicI64>,
 }
 
-impl OpendalIoCounters {
+impl OpendalRemoteIoCounters {
     fn new(profile: &RuntimeProfile) -> Self {
         Self {
             read_requests: profile.add_counter("ReadRequests", metrics::TUnit::UNIT),
@@ -64,63 +188,38 @@ impl OpendalIoCounters {
             io_timer: profile.add_counter("IOTimer", metrics::TUnit::TIME_NS),
             io_task_exec_time: profile.add_counter("IOTaskExecTime", metrics::TUnit::TIME_NS),
             scan_time: profile.add_counter("ScanTime", metrics::TUnit::TIME_NS),
-            cache_read_requests: profile.add_counter("CacheReadRequests", metrics::TUnit::UNIT),
-            bytes_read_from_cache: profile.add_counter("BytesReadFromCache", metrics::TUnit::BYTES),
-            datacache_read_counter: profile
-                .add_counter("DataCacheReadCounter", metrics::TUnit::UNIT),
-            datacache_read_bytes: profile.add_counter("DataCacheReadBytes", metrics::TUnit::BYTES),
-            datacache_read_timer: profile
-                .add_counter("DataCacheReadTimer", metrics::TUnit::TIME_NS),
-            datacache_write_counter: profile
-                .add_counter("DataCacheWriteCounter", metrics::TUnit::UNIT),
-            datacache_write_bytes: profile
-                .add_counter("DataCacheWriteBytes", metrics::TUnit::BYTES),
-            datacache_write_timer: profile
-                .add_counter("DataCacheWriteTimer", metrics::TUnit::TIME_NS),
+            remote_read_in_flight_peak: profile
+                .add_counter("RemoteReadInFlightPeak", metrics::TUnit::UNIT),
+            observed_remote_read_peak: Arc::new(AtomicI64::new(0)),
         }
     }
 
-    fn record_cache_hit(&self, length: usize) {
-        self.cache_read_requests.add(1);
-        self.bytes_read_from_cache
-            .add(clamp_u128_to_i64(length as u128));
+    pub(crate) fn record_remote_in_flight_peak(&self, in_flight: usize) {
+        let target = i64::try_from(in_flight).unwrap_or(i64::MAX);
+        let mut observed = self.observed_remote_read_peak.load(Ordering::Relaxed);
+        while target > observed {
+            match self.observed_remote_read_peak.compare_exchange_weak(
+                observed,
+                target,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.remote_read_in_flight_peak.add(target - observed);
+                    break;
+                }
+                Err(actual) => observed = actual,
+            }
+        }
     }
 
-    fn record_remote_read(&self, length: usize, io_ns: u128) {
+    pub(crate) fn record_remote_read(&self, length: usize, io_ns: u128) {
         self.read_requests.add(1);
         self.bytes_read.add(clamp_u128_to_i64(length as u128));
         let io_ns = clamp_u128_to_i64(io_ns);
         self.io_timer.add(io_ns);
         self.io_task_exec_time.add(io_ns);
         self.scan_time.add(io_ns);
-    }
-
-    fn record_datacache_read(&self, length: usize, io_ns: u128) {
-        self.datacache_read_counter.add(1);
-        self.datacache_read_bytes
-            .add(clamp_u128_to_i64(length as u128));
-        self.datacache_read_timer.add(clamp_u128_to_i64(io_ns));
-    }
-
-    fn record_datacache_write(&self, length: usize, io_ns: u128) {
-        self.datacache_write_counter.add(1);
-        self.datacache_write_bytes
-            .add(clamp_u128_to_i64(length as u128));
-        self.datacache_write_timer.add(clamp_u128_to_i64(io_ns));
-    }
-}
-
-impl DataCacheMetricsRecorder for OpendalIoCounters {
-    fn record_cache_hit(&self, length: usize) {
-        OpendalIoCounters::record_cache_hit(self, length);
-    }
-
-    fn record_datacache_read(&self, length: usize, io_ns: u128) {
-        OpendalIoCounters::record_datacache_read(self, length, io_ns);
-    }
-
-    fn record_datacache_write(&self, length: usize, io_ns: u128) {
-        OpendalIoCounters::record_datacache_write(self, length, io_ns);
     }
 }
 
@@ -129,8 +228,6 @@ pub struct OpendalRangeReaderFactory {
     op: Operator,
     rt: Arc<Runtime>,
     block_size: usize,
-    datacache: Option<DataCacheContext>,
-    parquet_cache_policy: Option<ParquetReadCachePolicy>,
     profile: Option<RuntimeProfile>,
 }
 
@@ -145,8 +242,6 @@ impl OpendalRangeReaderFactory {
             op,
             rt,
             block_size: DEFAULT_OPENDAL_READ_SIZE,
-            datacache: None,
-            parquet_cache_policy: None,
             profile: None,
         })
     }
@@ -163,25 +258,10 @@ impl OpendalRangeReaderFactory {
         self
     }
 
-    pub fn with_datacache_context(mut self, datacache: DataCacheContext) -> Self {
-        self.datacache = Some(datacache);
-        self
-    }
-
-    pub fn with_parquet_cache_policy(
-        mut self,
-        parquet_cache_policy: Option<ParquetReadCachePolicy>,
-    ) -> Self {
-        self.parquet_cache_policy = parquet_cache_policy;
-        self
-    }
-
     pub fn open(&self, path: &str) -> Result<OpendalRangeReader> {
         let reader = OpendalRangeReader::try_new(self.op.clone(), Arc::clone(&self.rt), path)?;
         Ok(reader
             .with_block_size(self.block_size)
-            .with_datacache_context(self.datacache.clone())
-            .with_parquet_cache_policy(self.parquet_cache_policy.clone())
             .with_profile(self.profile.clone()))
     }
 
@@ -193,8 +273,6 @@ impl OpendalRangeReaderFactory {
         };
         Ok(reader
             .with_block_size(self.block_size)
-            .with_datacache_context(self.datacache.clone())
-            .with_parquet_cache_policy(self.parquet_cache_policy.clone())
             .with_profile(self.profile.clone()))
     }
 }
@@ -203,14 +281,10 @@ impl OpendalRangeReaderFactory {
 pub struct OpendalRangeReader {
     op: Operator,
     rt: Arc<Runtime>,
-    path: String,
-    len: u64,
+    identity: FileIdentity,
     block_size: usize,
-    modification_time: Option<i64>,
-    datacache: Option<DataCacheContext>,
-    parquet_cache_policy: Option<ParquetReadCachePolicy>,
     profile: Option<RuntimeProfile>,
-    counters: Option<OpendalIoCounters>,
+    counters: Option<OpendalRemoteIoCounters>,
 }
 
 impl OpendalRangeReader {
@@ -227,63 +301,35 @@ impl OpendalRangeReader {
         Ok(Self {
             op,
             rt,
-            path,
-            len,
+            identity: FileIdentity::new(path, len, mtime),
             block_size: DEFAULT_OPENDAL_READ_SIZE,
-            modification_time: mtime,
-            datacache: None,
-            parquet_cache_policy: None,
             profile: None,
             counters: None,
         })
     }
 
-    /// Get file metadata (for cache key)
-    pub fn get_file_meta(&self) -> Result<(u64, Option<i64>), String> {
-        Ok((self.len, self.modification_time))
-    }
-
     pub fn from_len(op: Operator, rt: Arc<Runtime>, path: impl Into<String>, len: u64) -> Self {
-        let path_str = path.into();
         Self {
             op,
             rt,
-            path: path_str,
-            len,
+            identity: FileIdentity::new(path, len, None),
             block_size: DEFAULT_OPENDAL_READ_SIZE,
-            // Avoid blocking metadata RPC when upper layer already provides file length.
-            // The caller can still supply modification time via with_modification_time_override.
-            modification_time: None,
-            datacache: None,
-            parquet_cache_policy: None,
             profile: None,
             counters: None,
         }
     }
 
     pub fn with_profile(mut self, profile: Option<RuntimeProfile>) -> Self {
-        self.counters = profile.as_ref().map(OpendalIoCounters::new);
+        self.counters = profile.as_ref().map(OpendalRemoteIoCounters::new);
         self.profile = profile;
         self
     }
 
-    pub fn with_datacache_context(mut self, datacache: Option<DataCacheContext>) -> Self {
-        self.datacache = datacache;
-        self
-    }
-
-    pub fn with_parquet_cache_policy(
-        mut self,
-        parquet_cache_policy: Option<ParquetReadCachePolicy>,
-    ) -> Self {
-        self.parquet_cache_policy = parquet_cache_policy;
-        self
-    }
-
     pub fn with_modification_time_override(mut self, modification_time: Option<i64>) -> Self {
-        if modification_time.is_some() {
-            self.modification_time = modification_time;
-        }
+        self.identity = self
+            .identity
+            .clone()
+            .with_modification_time_override(modification_time);
         self
     }
 
@@ -294,160 +340,133 @@ impl OpendalRangeReader {
         self
     }
 
-    fn datacache_io_flags(&self) -> (bool, bool, bool) {
-        if let Some(ctx) = self.datacache.as_ref() {
-            let io = ctx.io_options();
-            (
-                io.enable_datacache,
-                io.enable_populate_datacache,
-                io.enable_datacache_async_populate_mode,
-            )
-        } else {
-            (false, false, false)
+    pub fn file_identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
+    pub fn get_read(&self, start: u64) -> io::Result<OpendalRead> {
+        if start > self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "expected to read at offset {}, while file has length {}",
+                    start,
+                    self.len()
+                ),
+            ));
         }
+        Ok(OpendalRead::new(self.clone(), start))
     }
 
-    fn block_cache_for_read(&self) -> Option<Arc<crate::cache::BlockCache>> {
-        self.datacache.as_ref().and_then(|ctx| ctx.block_cache())
+    pub(crate) fn block_size(&self) -> usize {
+        self.block_size
     }
 
-    fn parquet_page_cache_enabled(&self) -> bool {
-        self.parquet_cache_policy
-            .as_ref()
-            .is_some_and(|p| p.enable_pagecache)
+    pub(crate) fn len(&self) -> u64 {
+        self.identity.file_size()
     }
 
-    fn page_cache_evict_probability(&self) -> Option<u32> {
-        self.parquet_cache_policy
-            .as_ref()
-            .and_then(|p| p.page_cache_evict_probability)
+    pub(crate) fn profile(&self) -> Option<RuntimeProfile> {
+        self.profile.clone()
     }
 
-    fn should_cache_parquet_page_read(&self, length: usize) -> bool {
-        self.parquet_cache_policy
-            .as_ref()
-            .is_some_and(|p| p.should_cache_page_read(length))
+    pub(crate) fn read_remote_bytes(&self, start: u64, length: usize) -> io::Result<Bytes> {
+        let end = start
+            .checked_add(length as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "range overflow"))?;
+        if start > self.len() || end > self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "expected to read {} bytes at offset {}, while file has length {}",
+                    length,
+                    start,
+                    self.len()
+                ),
+            ));
+        }
+        self.read_remote_range(start, end)
+    }
+
+    pub(crate) fn read_remote_range(&self, start: u64, end: u64) -> io::Result<Bytes> {
+        let length = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX);
+        if length == 0 {
+            return Ok(Bytes::new());
+        }
+        let tracker = remote_read_concurrency_tracker();
+        let in_flight = tracker.on_start();
+        if let Some(counters) = self.counters.as_ref() {
+            counters.record_remote_in_flight_peak(in_flight);
+        }
+        let io_start = Instant::now();
+        let data_result = self.rt.block_on(
+            self.op
+                .read_with(self.identity.path())
+                .range(start..end)
+                .into_future(),
+        );
+        let io_ns = io_start.elapsed().as_nanos();
+        if let Some(summary) = tracker.on_finish(length, io_ns, data_result.is_ok()) {
+            debug!(
+                "opendal read concurrency summary: window_ms={} started={} succeeded={} failed={} requested_bytes_total={} requested_bytes_succeeded={} avg_latency_ms={} peak_in_flight={} current_in_flight={} global_peak_in_flight={}",
+                summary.window_ms,
+                summary.started,
+                summary.succeeded,
+                summary.failed,
+                summary.requested_bytes_total,
+                summary.requested_bytes_succeeded,
+                summary.avg_latency_ms,
+                summary.peak_in_flight,
+                summary.current_in_flight,
+                summary.global_peak_in_flight
+            );
+        }
+        let data = data_result.map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "opendal read failed: path={} range={}..{} len={} err={}",
+                    self.identity.path(),
+                    start,
+                    end,
+                    length,
+                    e
+                ),
+            )
+        })?;
+        if let Some(counters) = self.counters.as_ref() {
+            counters.record_remote_read(length, io_ns);
+        }
+        Ok(data.to_bytes())
     }
 }
 
 pub struct OpendalRead {
-    op: Operator,
-    rt: Arc<Runtime>,
-    path: String,
+    reader: OpendalRangeReader,
     pos: u64,
-    len: u64,
-    block_size: usize,
-    modification_time: Option<i64>,
-    block_cache: Option<std::sync::Arc<crate::cache::block_cache::BlockCache>>,
-    datacache: Option<DataCacheContext>,
-    enable_datacache: bool,
-    enable_populate_datacache: bool,
-    enable_async_datacache: bool,
     buf: Bytes,
     buf_pos: usize,
-    counters: Option<OpendalIoCounters>,
 }
 
 impl OpendalRead {
-    fn new(
-        op: Operator,
-        rt: Arc<Runtime>,
-        path: String,
-        start: u64,
-        len: u64,
-        block_size: usize,
-        modification_time: Option<i64>,
-        block_cache: Option<std::sync::Arc<crate::cache::block_cache::BlockCache>>,
-        datacache: Option<DataCacheContext>,
-        enable_datacache: bool,
-        enable_populate_datacache: bool,
-        enable_async_datacache: bool,
-        counters: Option<OpendalIoCounters>,
-    ) -> Self {
+    fn new(reader: OpendalRangeReader, start: u64) -> Self {
         Self {
-            op,
-            rt,
-            path,
+            reader,
             pos: start,
-            len,
-            block_size,
-            modification_time,
-            block_cache,
-            datacache,
-            enable_datacache,
-            enable_populate_datacache,
-            enable_async_datacache,
             buf: Bytes::new(),
             buf_pos: 0,
-            counters,
         }
     }
 
     fn refill(&mut self) -> io::Result<()> {
-        if self.pos >= self.len {
+        if self.pos >= self.reader.len() {
             self.buf = Bytes::new();
             self.buf_pos = 0;
             return Ok(());
         }
-
-        if self.enable_datacache {
-            if let Some(cache) = self.block_cache.as_ref() {
-                let cache_stream = CacheInputStream::new(
-                    Arc::clone(cache),
-                    self.path.clone(),
-                    self.modification_time,
-                    self.len,
-                    self.enable_datacache,
-                    self.enable_populate_datacache,
-                    self.enable_async_datacache,
-                );
-                let block_size = cache_stream.block_size();
-                let block_id = self.pos / block_size;
-                let block_start = block_id * block_size;
-                let block_end = std::cmp::min(block_start + block_size, self.len);
-                let block_len = (block_end - block_start) as usize;
-                let op = self.op.clone();
-                let rt = Arc::clone(&self.rt);
-                let path = self.path.clone();
-                let counters = self.counters.clone();
-                let read = cache_stream.read_block(block_id, block_len, || {
-                    let io_start = Instant::now();
-                    let data = rt
-                        .block_on(
-                            op.read_with(&path)
-                                .range(block_start..block_end)
-                                .into_future(),
-                        )
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                    let io_ns = io_start.elapsed().as_nanos();
-                    if let Some(counters) = counters.as_ref() {
-                        counters.record_remote_read(block_len, io_ns);
-                    }
-                    Ok(data.to_bytes())
-                })?;
-                if let Some(datacache) = self.datacache.as_ref() {
-                    datacache.record_block_cache_result(self.counters.as_ref(), block_len, &read);
-                }
-                self.buf = read.bytes;
-                self.buf_pos = (self.pos - block_start) as usize;
-                return Ok(());
-            }
-        }
-
-        let remaining = self.len - self.pos;
-        let fetch_len = std::cmp::min(self.block_size as u64, remaining) as usize;
-        let end = self.pos + fetch_len as u64;
-        let range = self.pos..end;
-        let io_start = Instant::now();
-        let data = self
-            .rt
-            .block_on(self.op.read_with(&self.path).range(range).into_future())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        let io_ns = io_start.elapsed().as_nanos();
-        if let Some(counters) = self.counters.as_ref() {
-            counters.record_remote_read(fetch_len, io_ns);
-        }
-        self.buf = data.to_bytes();
+        let remaining = self.reader.len() - self.pos;
+        let fetch_len = std::cmp::min(self.reader.block_size() as u64, remaining) as usize;
+        self.buf = self.reader.read_remote_bytes(self.pos, fetch_len)?;
         self.buf_pos = 0;
         Ok(())
     }
@@ -455,10 +474,9 @@ impl OpendalRead {
 
 impl Read for OpendalRead {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.pos >= self.len {
+        if self.pos >= self.reader.len() {
             return Ok(0);
         }
-
         if self.buf_pos >= self.buf.len() {
             self.refill()?;
             if self.buf.is_empty() {
@@ -475,234 +493,6 @@ impl Read for OpendalRead {
     }
 }
 
-impl Length for OpendalRangeReader {
-    fn len(&self) -> u64 {
-        self.len
-    }
-}
-
-impl ChunkReader for OpendalRangeReader {
-    type T = OpendalRead;
-
-    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
-        if start > self.len {
-            return Err(ParquetError::EOF(format!(
-                "Expected to read at offset {start}, while file has length {}",
-                self.len
-            )));
-        }
-        let (enable_datacache, enable_populate_datacache, enable_async_datacache) =
-            self.datacache_io_flags();
-        let block_cache = self.block_cache_for_read();
-        Ok(OpendalRead::new(
-            self.op.clone(),
-            Arc::clone(&self.rt),
-            self.path.clone(),
-            start,
-            self.len,
-            self.block_size,
-            self.modification_time,
-            block_cache,
-            self.datacache.clone(),
-            enable_datacache,
-            enable_populate_datacache,
-            enable_async_datacache,
-            self.counters.clone(),
-        ))
-    }
-
-    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
-        let end = start
-            .checked_add(length as u64)
-            .ok_or_else(|| ParquetError::General("range overflow".to_string()))?;
-        if start > self.len || end > self.len {
-            return Err(ParquetError::EOF(format!(
-                "Expected to read {} bytes at offset {}, while file has length {}",
-                length, start, self.len
-            )));
-        }
-        let (enable_datacache, enable_populate_datacache, enable_async_datacache) =
-            self.datacache_io_flags();
-
-        // Try to get from page cache
-        if let Some(cached_data) = parquet_page_cache_get(
-            self.parquet_page_cache_enabled(),
-            &self.path,
-            self.modification_time,
-            self.len,
-            start,
-            length,
-        ) {
-            debug!(
-                "parquet page cache HIT: path={}, offset={}, length={}",
-                self.path, start, length
-            );
-            if let Some(datacache) = self.datacache.as_ref() {
-                datacache.record_page_cache_hit(self.counters.as_ref(), length);
-            }
-            return Ok(cached_data);
-        }
-
-        // Cache miss, read from opendal
-        let bytes = if enable_datacache {
-            if let Some(cache) = self.block_cache_for_read() {
-                let cache_stream = CacheInputStream::new(
-                    cache,
-                    self.path.clone(),
-                    self.modification_time,
-                    self.len,
-                    enable_datacache,
-                    enable_populate_datacache,
-                    enable_async_datacache,
-                );
-                let block_size = cache_stream.block_size();
-                let start_block = start / block_size;
-                let end_block = (end.saturating_sub(1)) / block_size;
-                let mut out = Vec::with_capacity(length);
-                for block_id in start_block..=end_block {
-                    let block_start = block_id * block_size;
-                    let block_end = std::cmp::min(block_start + block_size, self.len);
-                    let block_len = (block_end - block_start) as usize;
-                    let counters = self.counters.clone();
-                    let op = self.op.clone();
-                    let rt = Arc::clone(&self.rt);
-                    let path = self.path.clone();
-                    let read = cache_stream
-                        .read_block(block_id, block_len, || {
-                            let io_start = Instant::now();
-                            let data = rt
-                                .block_on(
-                                    op.read_with(&path)
-                                        .range(block_start..block_end)
-                                        .into_future(),
-                                )
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-                            let io_ns = io_start.elapsed().as_nanos();
-                            if let Some(counters) = counters.as_ref() {
-                                counters.record_remote_read(block_len, io_ns);
-                            }
-                            Ok(data.to_bytes())
-                        })
-                        .map_err(|e| ParquetError::General(e.to_string()))?;
-                    if let Some(datacache) = self.datacache.as_ref() {
-                        datacache.record_block_cache_result(
-                            self.counters.as_ref(),
-                            block_len,
-                            &read,
-                        );
-                    }
-                    let slice_start = if block_id == start_block {
-                        (start - block_start) as usize
-                    } else {
-                        0
-                    };
-                    let slice_end = if block_id == end_block {
-                        (end - block_start) as usize
-                    } else {
-                        read.bytes.len()
-                    };
-                    out.extend_from_slice(&read.bytes[slice_start..slice_end]);
-                }
-                Bytes::from(out)
-            } else {
-                read_remote_range(self, start, end, length)?
-            }
-        } else {
-            read_remote_range(self, start, end, length)?
-        };
-
-        // Insert into cache if enabled
-        if self.should_cache_parquet_page_read(length) {
-            parquet_page_cache_put(
-                self.parquet_page_cache_enabled(),
-                &self.path,
-                self.modification_time,
-                self.len,
-                start,
-                length,
-                bytes.clone(),
-                self.page_cache_evict_probability(),
-            );
-            debug!(
-                "parquet page cached: path={}, offset={}, length={}",
-                self.path, start, length
-            );
-        }
-
-        Ok(bytes)
-    }
-}
-
-fn read_remote_range(
-    reader: &OpendalRangeReader,
-    start: u64,
-    end: u64,
-    length: usize,
-) -> ParquetResult<Bytes> {
-    if length == 0 {
-        return Ok(Bytes::new());
-    }
-    let io_start = Instant::now();
-    let data = reader
-        .rt
-        .block_on(
-            reader
-                .op
-                .read_with(&reader.path)
-                .range(start..end)
-                .into_future(),
-        )
-        .map_err(|e| {
-            ParquetError::General(format!(
-                "opendal read failed: path={} range={}..{} len={} err={}",
-                reader.path, start, end, length, e
-            ))
-        })?;
-    let io_ns = io_start.elapsed().as_nanos();
-    if let Some(counters) = reader.counters.as_ref() {
-        counters.record_remote_read(length, io_ns);
-    }
-    Ok(data.to_bytes())
-}
-
-impl OrcChunkReader for OpendalRangeReader {
-    type T = OpendalRead;
-
-    fn len(&self) -> u64 {
-        self.len
-    }
-
-    fn get_read(&self, offset_from_start: u64) -> io::Result<Self::T> {
-        if offset_from_start > self.len {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "expected to read at offset {}, while file has length {}",
-                    offset_from_start, self.len
-                ),
-            ));
-        }
-        let (enable_datacache, enable_populate_datacache, enable_async_datacache) =
-            self.datacache_io_flags();
-        let block_cache = self.block_cache_for_read();
-        Ok(OpendalRead::new(
-            self.op.clone(),
-            Arc::clone(&self.rt),
-            self.path.clone(),
-            offset_from_start,
-            self.len,
-            self.block_size,
-            self.modification_time,
-            block_cache,
-            self.datacache.clone(),
-            enable_datacache,
-            enable_populate_datacache,
-            enable_async_datacache,
-            self.counters.clone(),
-        ))
-    }
-}
-
 pub fn build_fs_operator(root: &str) -> Result<Operator> {
     let builder = opendal::services::Fs::default().root(root);
     let op = Operator::new(builder)
@@ -711,41 +501,51 @@ pub fn build_fs_operator(root: &str) -> Result<Operator> {
     Ok(op)
 }
 
-pub async fn list_parquet_files(
-    op: &Operator,
-    prefix: &str,
-    max_files: usize,
-) -> Result<Vec<String>> {
-    let mut out = Vec::new();
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Read;
 
-    let mut list_prefix = prefix.trim().to_string();
-    if !list_prefix.is_empty() && !list_prefix.ends_with('/') {
-        list_prefix.push('/');
+    use super::{OpendalRangeReaderFactory, build_fs_operator};
+
+    #[test]
+    fn open_with_len_keeps_mtime_empty_until_override() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(temp_dir.path().join("sample.bin"), b"hello world").expect("write fixture");
+
+        let op = build_fs_operator(temp_dir.path().to_str().expect("temp dir path"))
+            .expect("build fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
+        let reader = factory
+            .open_with_len("sample.bin", Some(11))
+            .expect("open with len");
+        assert_eq!(reader.file_identity().modification_time(), None);
+
+        let zero_override = reader.clone().with_modification_time_override(Some(0));
+        assert_eq!(zero_override.file_identity().modification_time(), Some(0));
+
+        let positive_override = reader.with_modification_time_override(Some(123));
+        assert_eq!(
+            positive_override.file_identity().modification_time(),
+            Some(123)
+        );
     }
 
-    let mut lister = op
-        .lister_with(&list_prefix)
-        .recursive(true)
-        .await
-        .context("opendal lister")?;
-    while let Some(entry) = lister.try_next().await.context("opendal list next")? {
-        let path = entry.path().to_string();
-        if path.ends_with(".parquet") {
-            out.push(path);
-            if out.len() >= max_files {
-                break;
-            }
-        }
+    #[test]
+    fn get_read_uses_raw_remote_reads() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(temp_dir.path().join("sample.bin"), b"abcdefghij").expect("write fixture");
+
+        let op = build_fs_operator(temp_dir.path().to_str().expect("temp dir path"))
+            .expect("build fs operator");
+        let factory = OpendalRangeReaderFactory::from_operator(op).expect("reader factory");
+        let reader = factory
+            .open_with_len("sample.bin", Some(10))
+            .expect("open with len");
+        let mut read = reader.get_read(2).expect("get read");
+
+        let mut buf = Vec::new();
+        read.read_to_end(&mut buf).expect("read remaining bytes");
+        assert_eq!(buf, b"cdefghij");
     }
-
-    Ok(out)
-}
-
-pub async fn probe_parquet(op: &Operator, path: &str) -> Result<ParquetProbe> {
-    let data = op
-        .read(path)
-        .await
-        .with_context(|| format!("opendal read: {path}"))?;
-    let bytes = data.to_bytes();
-    probe_parquet_bytes(path, bytes)
 }

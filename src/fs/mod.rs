@@ -14,11 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+pub mod coalesce_policy;
+pub mod coalesced_reader;
 pub mod hdfs;
 pub mod local;
 pub mod object_store;
 pub mod opendal;
 pub mod path;
+pub mod range_plan;
 pub mod scan_context;
 
 // Compatibility shim during module migration. New code should use

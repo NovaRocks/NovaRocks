@@ -16,6 +16,7 @@
 // under the License.
 pub mod block_cache;
 pub mod cache_input_stream;
+pub mod cached_reader;
 pub mod data_cache;
 pub mod page_cache;
 
@@ -23,6 +24,7 @@ use crate::internal_service;
 
 pub use block_cache::{BlockCache, BlockCacheOptions, CacheKey};
 pub use cache_input_stream::{CacheBlockRead, CacheInputStream};
+pub use cached_reader::{CachedRangeReader, CachedRead};
 pub use data_cache::{
     DataCacheContext, DataCacheManager, DataCacheMetricsRecorder, DataCachePageCache,
     DataCachePageCacheOptions, DataCachePageKey,
@@ -74,20 +76,20 @@ impl CacheOptions {
     pub fn from_query_options(
         query_opts: Option<&internal_service::TQueryOptions>,
     ) -> Result<Self, String> {
-        // FE does not always populate every cache-related query option (notably stream load).
-        // Fall back to FE session defaults so execution can proceed with StarRocks-compatible behavior.
+        // Align with StarRocks BE semantics: only honor cache switches when FE explicitly
+        // carries the corresponding query option field.
         let opts = query_opts;
         Ok(Self {
-            enable_scan_datacache: opts.and_then(|v| v.enable_scan_datacache).unwrap_or(true),
+            enable_scan_datacache: opts.and_then(|v| v.enable_scan_datacache).unwrap_or(false),
             enable_populate_datacache: opts
                 .and_then(|v| v.enable_populate_datacache)
-                .unwrap_or(true),
+                .unwrap_or(false),
             enable_datacache_async_populate_mode: opts
                 .and_then(|v| v.enable_datacache_async_populate_mode)
-                .unwrap_or(true),
+                .unwrap_or(false),
             enable_datacache_io_adaptor: opts
                 .and_then(|v| v.enable_datacache_io_adaptor)
-                .unwrap_or(true),
+                .unwrap_or(false),
             enable_cache_select: opts.and_then(|v| v.enable_cache_select).unwrap_or(false),
             datacache_evict_probability: require_evict_probability(
                 "datacache_evict_probability",
@@ -178,4 +180,39 @@ fn parse_non_negative_i64(name: &str, value: i64) -> Result<i64, String> {
         ));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CacheOptions;
+    use crate::internal_service::TQueryOptions;
+
+    #[test]
+    fn cache_switches_are_disabled_when_query_options_missing() {
+        let opts = CacheOptions::from_query_options(None).expect("parse cache options");
+        assert!(!opts.enable_scan_datacache);
+        assert!(!opts.enable_populate_datacache);
+        assert!(!opts.enable_datacache_async_populate_mode);
+        assert!(!opts.enable_datacache_io_adaptor);
+        assert!(!opts.enable_cache_select);
+    }
+
+    #[test]
+    fn cache_switches_follow_explicit_query_options() {
+        let query_opts = TQueryOptions {
+            enable_scan_datacache: Some(true),
+            enable_populate_datacache: Some(true),
+            enable_datacache_async_populate_mode: Some(true),
+            enable_datacache_io_adaptor: Some(true),
+            enable_cache_select: Some(true),
+            ..Default::default()
+        };
+        let opts =
+            CacheOptions::from_query_options(Some(&query_opts)).expect("parse cache options");
+        assert!(opts.enable_scan_datacache);
+        assert!(opts.enable_populate_datacache);
+        assert!(opts.enable_datacache_async_populate_mode);
+        assert!(opts.enable_datacache_io_adaptor);
+        assert!(opts.enable_cache_select);
+    }
 }

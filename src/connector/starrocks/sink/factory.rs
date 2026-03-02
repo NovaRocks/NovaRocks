@@ -1683,13 +1683,6 @@ impl OperatorFactory for OlapTableSinkFactory {
     }
 }
 
-fn build_lake_table_identity(
-    sink: &data_sinks::TOlapTableSink,
-) -> Result<LakeTableIdentity, String> {
-    let schema_id = resolve_schema_id(&sink.schema)?;
-    build_lake_table_identity_with_schema_id(sink, schema_id)
-}
-
 fn build_lake_table_identity_with_schema_id(
     sink: &data_sinks::TOlapTableSink,
     schema_id: i64,

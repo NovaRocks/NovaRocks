@@ -211,7 +211,6 @@ pub(crate) fn encode_bitmap_single(value: u64) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::eval_to_bitmap;
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, field_with_slot_id};
     use crate::exec::expr::{ExprArena, ExprNode};

@@ -370,27 +370,8 @@ fn main() {
             }
 
             if cfg.runtime.cache.datacache_enable {
-                let options = novarocks::cache::block_cache::BlockCacheOptions {
-                    capacity: cfg.runtime.cache.datacache_disk_size,
-                    block_size: cfg.runtime.cache.datacache_block_size,
-                    enable_checksum: cfg.runtime.cache.datacache_checksum_enable,
-                    direct_io: cfg.runtime.cache.datacache_direct_io_enable,
-                    io_align_unit_size: cfg.runtime.cache.datacache_io_align_unit_size,
-                    ..Default::default()
-                };
-                novarocks::cache::block_cache::init_block_cache(
-                    &cfg.runtime.cache.datacache_disk_path,
-                    options,
-                )
-                .expect("initialize block cache");
                 eprintln!(
-                    "Block cache initialized: path={}, capacity={}, block_size={}, checksum={}, direct_io={}, align_unit={}",
-                    cfg.runtime.cache.datacache_disk_path,
-                    cfg.runtime.cache.datacache_disk_size,
-                    cfg.runtime.cache.datacache_block_size,
-                    cfg.runtime.cache.datacache_checksum_enable,
-                    cfg.runtime.cache.datacache_direct_io_enable,
-                    cfg.runtime.cache.datacache_io_align_unit_size
+                    "Block cache is configured but currently disabled; skip disk datacache initialization and use memory cache only"
                 );
             }
 
