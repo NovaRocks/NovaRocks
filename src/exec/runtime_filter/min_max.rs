@@ -38,7 +38,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::common::largeint;
-use crate::exec::expr::LiteralValue;
+use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::types::TPrimitiveType;
 
 use super::codec::{read_i8, read_i16_le, read_i32_le, read_i64_le, read_u8, read_u64_le};
@@ -123,34 +123,58 @@ impl RuntimeMinMaxFilter {
         &self.max
     }
 
-    pub(crate) fn min_max_literal(&self) -> Option<(LiteralValue, LiteralValue)> {
+    pub(crate) fn min_max_predicate_values(
+        &self,
+    ) -> Result<Option<(MinMaxPredicateValue, MinMaxPredicateValue)>, String> {
         if !self.has_min_max {
-            return None;
+            return Ok(None);
         }
-        let to_literal = |ltype: TPrimitiveType, value: &MinMaxValue| -> Option<LiteralValue> {
+        let to_value = |ltype: TPrimitiveType,
+                        value: &MinMaxValue|
+         -> Result<MinMaxPredicateValue, String> {
             match (ltype, value) {
-                (TPrimitiveType::BOOLEAN, MinMaxValue::Bool(v)) => Some(LiteralValue::Bool(*v)),
-                (TPrimitiveType::TINYINT, MinMaxValue::Int8(v)) => Some(LiteralValue::Int8(*v)),
-                (TPrimitiveType::SMALLINT, MinMaxValue::Int16(v)) => Some(LiteralValue::Int16(*v)),
-                (TPrimitiveType::INT, MinMaxValue::Int32(v)) => Some(LiteralValue::Int32(*v)),
-                (TPrimitiveType::BIGINT, MinMaxValue::Int64(v)) => Some(LiteralValue::Int64(*v)),
+                (TPrimitiveType::BOOLEAN, MinMaxValue::Bool(v)) => {
+                    Ok(MinMaxPredicateValue::Boolean(*v))
+                }
+                (TPrimitiveType::TINYINT, MinMaxValue::Int8(v)) => {
+                    Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
+                }
+                (TPrimitiveType::SMALLINT, MinMaxValue::Int16(v)) => {
+                    Ok(MinMaxPredicateValue::Int32(i32::from(*v)))
+                }
+                (TPrimitiveType::INT, MinMaxValue::Int32(v)) => Ok(MinMaxPredicateValue::Int32(*v)),
+                (TPrimitiveType::BIGINT, MinMaxValue::Int64(v)) => {
+                    Ok(MinMaxPredicateValue::Int64(*v))
+                }
                 (TPrimitiveType::LARGEINT, MinMaxValue::LargeInt(v)) => {
-                    Some(LiteralValue::LargeInt(*v))
+                    Ok(MinMaxPredicateValue::LargeInt(*v))
                 }
-                (TPrimitiveType::FLOAT, MinMaxValue::Float32(v)) => Some(LiteralValue::Float32(*v)),
+                (TPrimitiveType::FLOAT, MinMaxValue::Float32(v)) => {
+                    Ok(MinMaxPredicateValue::Float(*v))
+                }
                 (TPrimitiveType::DOUBLE, MinMaxValue::Float64(v)) => {
-                    Some(LiteralValue::Float64(*v))
+                    Ok(MinMaxPredicateValue::Double(*v))
                 }
-                (TPrimitiveType::DATE, MinMaxValue::Date32(v)) => Some(LiteralValue::Date32(*v)),
+                (TPrimitiveType::DATE, MinMaxValue::Date32(v)) => {
+                    Ok(MinMaxPredicateValue::Date32(*v))
+                }
+                (TPrimitiveType::DATETIME, MinMaxValue::Timestamp(v))
+                | (TPrimitiveType::TIME, MinMaxValue::Timestamp(v)) => {
+                    Ok(MinMaxPredicateValue::DateTimeMicros(*v))
+                }
                 (t, MinMaxValue::Utf8(v)) if is_utf8_type(&t) => {
-                    Some(LiteralValue::Utf8(v.clone()))
+                    Ok(MinMaxPredicateValue::ByteArray(v.as_bytes().to_vec()))
                 }
-                _ => None,
+                (t, MinMaxValue::Decimal128(_)) if is_decimal_type(&t) => Err(format!(
+                    "runtime min/max conversion for decimal type {:?} is unsupported because precision/scale metadata is missing",
+                    t
+                )),
+                _ => Err("runtime min/max predicate value type mismatch".to_string()),
             }
         };
-        let min = to_literal(self.ltype, &self.min)?;
-        let max = to_literal(self.ltype, &self.max)?;
-        Some((min, max))
+        let min = to_value(self.ltype, &self.min)?;
+        let max = to_value(self.ltype, &self.max)?;
+        Ok(Some((min, max)))
     }
 
     pub(crate) fn full_range(ltype: TPrimitiveType) -> Result<Self, String> {
@@ -1042,7 +1066,7 @@ mod tests {
 
     use super::{MinMaxValue, RuntimeMinMaxFilter};
     use crate::common::largeint;
-    use crate::exec::expr::LiteralValue;
+    use crate::common::min_max_predicate::MinMaxPredicateValue;
     use crate::types::TPrimitiveType;
 
     #[test]
@@ -1079,8 +1103,8 @@ mod tests {
         let decoded =
             RuntimeMinMaxFilter::decode(TPrimitiveType::LARGEINT, &encoded, &mut offset).unwrap();
         assert_eq!(offset, encoded.len());
-        match decoded.min_max_literal() {
-            Some((LiteralValue::LargeInt(min), LiteralValue::LargeInt(max))) => {
+        match decoded.min_max_predicate_values().unwrap() {
+            Some((MinMaxPredicateValue::LargeInt(min), MinMaxPredicateValue::LargeInt(max))) => {
                 assert_eq!(min, i128::MIN + 123);
                 assert_eq!(max, i128::MAX - 456);
             }

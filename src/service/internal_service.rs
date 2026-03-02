@@ -213,18 +213,22 @@ fn normalize_internal_addresses(
 // `node_to_per_driver_seq_scan_ranges` through scan lowering and morsel scheduling directly.
 // Current implementation is a compatibility shim:
 // FE may send scan ranges only via `node_to_per_driver_seq_scan_ranges` in pipeline mode.
-// We fill missing/empty `per_node_scan_ranges[node_id]` by flattening per-driver ranges so
+// We fill missing/no-concrete `per_node_scan_ranges[node_id]` by flattening per-driver ranges so
 // existing lowering paths can consume scan ranges deterministically.
+// "no-concrete" means all entries are `empty=true` placeholders.
 fn backfill_per_node_scan_ranges(exec_params: &mut internal_service::TPlanFragmentExecParams) {
+    fn has_concrete_scan_range(ranges: &[internal_service::TScanRangeParams]) -> bool {
+        ranges.iter().any(|range| !range.empty.unwrap_or(false))
+    }
+
     let Some(node_to_per_driver) = exec_params.node_to_per_driver_seq_scan_ranges.as_ref() else {
         return;
     };
     let mut to_insert = Vec::new();
     for (node_id, per_driver) in node_to_per_driver {
-        let need_backfill = exec_params
-            .per_node_scan_ranges
-            .get(node_id)
-            .map(|ranges| ranges.is_empty())
+        let existing = exec_params.per_node_scan_ranges.get(node_id);
+        let need_backfill = existing
+            .map(|ranges| !has_concrete_scan_range(ranges))
             .unwrap_or(true);
         if !need_backfill {
             continue;
@@ -234,6 +238,9 @@ fn backfill_per_node_scan_ranges(exec_params: &mut internal_service::TPlanFragme
             .flat_map(|ranges| ranges.iter().cloned())
             .collect::<Vec<_>>();
         if flattened.is_empty() {
+            if existing.is_none() {
+                to_insert.push((*node_id, Vec::new()));
+            }
             continue;
         }
         to_insert.push((*node_id, flattened));

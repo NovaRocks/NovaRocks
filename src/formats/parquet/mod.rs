@@ -19,6 +19,9 @@ mod page_selection;
 mod reader;
 mod row_group_selector;
 
+pub use crate::common::min_max_predicate::{
+    MinMaxPredicate, MinMaxPredicateOp, MinMaxPredicateValue,
+};
 pub use cache::{
     ParquetCacheOptions, init_datacache_parquet_cache, parquet_meta_cache_get,
     parquet_meta_cache_put, parquet_page_cache_get, parquet_page_cache_put,
@@ -40,7 +43,6 @@ use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
-use crate::exec::expr::LiteralValue;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::exec::variant::VariantValue;
@@ -58,26 +60,17 @@ use row_group_selector::select_row_groups_for_range;
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
 
-#[derive(Clone, Debug)]
-pub enum MinMaxPredicate {
-    Le { column: String, value: LiteralValue }, // <=
-    Ge { column: String, value: LiteralValue }, // >=
-    Lt { column: String, value: LiteralValue }, // <
-    Gt { column: String, value: LiteralValue }, // >
-    Eq { column: String, value: LiteralValue }, // =
-}
-
 fn runtime_filters_to_min_max_predicates(
     cfg: &ParquetScanConfig,
     runtime_filters: &RuntimeFilterContext,
-) -> Vec<MinMaxPredicate> {
+) -> Result<Vec<MinMaxPredicate>, String> {
     let snapshot = runtime_filters.snapshot();
     if snapshot.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if cfg.slot_ids.is_empty() || cfg.columns.is_empty() || cfg.slot_ids.len() != cfg.columns.len()
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let mut slot_to_index = HashMap::new();
@@ -90,7 +83,14 @@ fn runtime_filters_to_min_max_predicates(
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
             continue;
         };
-        let Some((min_value, max_value)) = rf.min_max_literal() else {
+        let Some((min_value, max_value)) = rf.min_max_predicate_values().map_err(|e| {
+            format!(
+                "parquet runtime in-filter min/max conversion failed (slot_id={}): {}",
+                rf.slot_id(),
+                e
+            )
+        })?
+        else {
             continue;
         };
         preds.push(MinMaxPredicate::Ge {
@@ -106,7 +106,15 @@ fn runtime_filters_to_min_max_predicates(
         let Some(column) = slot_to_index.get(&rf.slot_id()) else {
             continue;
         };
-        let Some((min_value, max_value)) = rf.min_max().min_max_literal() else {
+        let Some((min_value, max_value)) =
+            rf.min_max().min_max_predicate_values().map_err(|e| {
+                format!(
+                    "parquet runtime membership-filter min/max conversion failed (slot_id={}): {}",
+                    rf.slot_id(),
+                    e
+                )
+            })?
+        else {
             continue;
         };
         preds.push(MinMaxPredicate::Ge {
@@ -118,36 +126,7 @@ fn runtime_filters_to_min_max_predicates(
             value: max_value,
         });
     }
-    preds
-}
-
-fn literal_int64(value: &LiteralValue) -> Option<i64> {
-    match value {
-        LiteralValue::Int8(v) => Some(*v as i64),
-        LiteralValue::Int16(v) => Some(*v as i64),
-        LiteralValue::Int32(v) => Some(*v as i64),
-        LiteralValue::Int64(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn literal_int32(value: &LiteralValue) -> Option<i32> {
-    match value {
-        LiteralValue::Int8(v) => Some(*v as i32),
-        LiteralValue::Int16(v) => Some(*v as i32),
-        LiteralValue::Int32(v) => Some(*v),
-        LiteralValue::Int64(v) => i32::try_from(*v).ok(),
-        LiteralValue::Date32(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn literal_float64(value: &LiteralValue) -> Option<f64> {
-    match value {
-        LiteralValue::Float32(v) => Some(*v as f64),
-        LiteralValue::Float64(v) => Some(*v),
-        _ => None,
-    }
+    Ok(preds)
 }
 
 #[derive(Clone, Debug)]
@@ -232,15 +211,15 @@ struct ParquetScanIter {
 }
 
 impl ParquetScanIter {
-    fn current_predicates(&self) -> Vec<MinMaxPredicate> {
+    fn current_predicates(&self) -> Result<Vec<MinMaxPredicate>, String> {
         let mut predicates = self.cfg.min_max_predicates.clone();
         if let Some(filters) = self.runtime_filters.as_ref() {
-            let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters);
+            let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters)?;
             if !runtime_preds.is_empty() {
                 predicates.append(&mut runtime_preds);
             }
         }
-        predicates
+        Ok(predicates)
     }
 
     fn build_parquet_reader(
@@ -438,7 +417,7 @@ impl ParquetScanIter {
             }
 
             let metadata = builder.metadata().clone();
-            let predicates = self.current_predicates();
+            let predicates = self.current_predicates()?;
             let limit_rows = self.limit.map(|_| self.remaining);
             let selected_row_groups = select_row_groups_for_range(
                 &metadata,
@@ -947,28 +926,6 @@ fn is_active_projection_column(
     }
 }
 
-impl MinMaxPredicate {
-    fn column(&self) -> &str {
-        match self {
-            MinMaxPredicate::Le { column, .. }
-            | MinMaxPredicate::Ge { column, .. }
-            | MinMaxPredicate::Lt { column, .. }
-            | MinMaxPredicate::Gt { column, .. }
-            | MinMaxPredicate::Eq { column, .. } => column,
-        }
-    }
-
-    fn value(&self) -> &LiteralValue {
-        match self {
-            MinMaxPredicate::Le { value, .. }
-            | MinMaxPredicate::Ge { value, .. }
-            | MinMaxPredicate::Lt { value, .. }
-            | MinMaxPredicate::Gt { value, .. }
-            | MinMaxPredicate::Eq { value, .. } => value,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1127,7 +1084,7 @@ mod tests {
         let active_projection_columns = build_active_projection_columns(
             &[super::MinMaxPredicate::Ge {
                 column: "0".to_string(),
-                value: crate::exec::expr::LiteralValue::Int32(1),
+                value: super::MinMaxPredicateValue::Int32(1),
             }],
             &["value_a".to_string(), "value_b".to_string()],
             true,

@@ -18,11 +18,10 @@
 use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 
-use crate::exec::expr::LiteralValue;
 use crate::fs::scan_context::FileScanRange;
 use crate::novarocks_logging::debug;
 
-use super::MinMaxPredicate;
+use super::{MinMaxPredicate, MinMaxPredicateValue};
 
 pub(crate) fn select_row_groups_for_range(
     metadata: &ParquetMetaData,
@@ -148,10 +147,13 @@ fn should_read_row_group(
     Ok(true)
 }
 
-fn check_max_satisfies_ge(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
+fn check_max_satisfies_ge(
+    stats: &Statistics,
+    value: &MinMaxPredicateValue,
+) -> Result<bool, String> {
     match stats {
         Statistics::Int64(s) => {
-            let Some(v) = super::literal_int64(value) else {
+            let Some(v) = value.as_i64() else {
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
@@ -161,7 +163,17 @@ fn check_max_satisfies_ge(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Int32(s) => {
-            let Some(v) = super::literal_int32(value) else {
+            let Some(v) = value.as_i32() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(*max >= v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::Float(s) => {
+            let Some(v) = value.as_f32() else {
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
@@ -171,7 +183,7 @@ fn check_max_satisfies_ge(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Double(s) => {
-            let Some(v) = super::literal_float64(value) else {
+            let Some(v) = value.as_f64() else {
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
@@ -180,14 +192,47 @@ fn check_max_satisfies_ge(stats: &Statistics, value: &LiteralValue) -> Result<bo
                 Ok(true)
             }
         }
+        Statistics::Boolean(s) => {
+            let Some(v) = value.as_bool() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(*max >= v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::ByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(max.data() >= v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::FixedLenByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(max.data() >= v)
+            } else {
+                Ok(true)
+            }
+        }
         _ => Ok(true),
     }
 }
 
-fn check_min_satisfies_le(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
+fn check_min_satisfies_le(
+    stats: &Statistics,
+    value: &MinMaxPredicateValue,
+) -> Result<bool, String> {
     match stats {
         Statistics::Int64(s) => {
-            let Some(v) = super::literal_int64(value) else {
+            let Some(v) = value.as_i64() else {
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
@@ -197,7 +242,17 @@ fn check_min_satisfies_le(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Int32(s) => {
-            let Some(v) = super::literal_int32(value) else {
+            let Some(v) = value.as_i32() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(*min <= v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::Float(s) => {
+            let Some(v) = value.as_f32() else {
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
@@ -207,7 +262,7 @@ fn check_min_satisfies_le(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Double(s) => {
-            let Some(v) = super::literal_float64(value) else {
+            let Some(v) = value.as_f64() else {
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
@@ -216,14 +271,47 @@ fn check_min_satisfies_le(stats: &Statistics, value: &LiteralValue) -> Result<bo
                 Ok(true)
             }
         }
+        Statistics::Boolean(s) => {
+            let Some(v) = value.as_bool() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(*min <= v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::ByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(min.data() <= v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::FixedLenByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(min.data() <= v)
+            } else {
+                Ok(true)
+            }
+        }
         _ => Ok(true),
     }
 }
 
-fn check_max_satisfies_gt(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
+fn check_max_satisfies_gt(
+    stats: &Statistics,
+    value: &MinMaxPredicateValue,
+) -> Result<bool, String> {
     match stats {
         Statistics::Int64(s) => {
-            let Some(v) = super::literal_int64(value) else {
+            let Some(v) = value.as_i64() else {
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
@@ -233,7 +321,17 @@ fn check_max_satisfies_gt(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Int32(s) => {
-            let Some(v) = super::literal_int32(value) else {
+            let Some(v) = value.as_i32() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(*max > v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::Float(s) => {
+            let Some(v) = value.as_f32() else {
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
@@ -243,7 +341,7 @@ fn check_max_satisfies_gt(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Double(s) => {
-            let Some(v) = super::literal_float64(value) else {
+            let Some(v) = value.as_f64() else {
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
@@ -252,14 +350,47 @@ fn check_max_satisfies_gt(stats: &Statistics, value: &LiteralValue) -> Result<bo
                 Ok(true)
             }
         }
+        Statistics::Boolean(s) => {
+            let Some(v) = value.as_bool() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(*max > v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::ByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(max.data() > v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::FixedLenByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(max) = s.max_opt() {
+                Ok(max.data() > v)
+            } else {
+                Ok(true)
+            }
+        }
         _ => Ok(true),
     }
 }
 
-fn check_min_satisfies_lt(stats: &Statistics, value: &LiteralValue) -> Result<bool, String> {
+fn check_min_satisfies_lt(
+    stats: &Statistics,
+    value: &MinMaxPredicateValue,
+) -> Result<bool, String> {
     match stats {
         Statistics::Int64(s) => {
-            let Some(v) = super::literal_int64(value) else {
+            let Some(v) = value.as_i64() else {
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
@@ -269,7 +400,17 @@ fn check_min_satisfies_lt(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Int32(s) => {
-            let Some(v) = super::literal_int32(value) else {
+            let Some(v) = value.as_i32() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(*min < v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::Float(s) => {
+            let Some(v) = value.as_f32() else {
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
@@ -279,11 +420,41 @@ fn check_min_satisfies_lt(stats: &Statistics, value: &LiteralValue) -> Result<bo
             }
         }
         Statistics::Double(s) => {
-            let Some(v) = super::literal_float64(value) else {
+            let Some(v) = value.as_f64() else {
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
                 Ok(*min < v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::Boolean(s) => {
+            let Some(v) = value.as_bool() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(*min < v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::ByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(min.data() < v)
+            } else {
+                Ok(true)
+            }
+        }
+        Statistics::FixedLenByteArray(s) => {
+            let Some(v) = value.as_bytes() else {
+                return Ok(true);
+            };
+            if let Some(min) = s.min_opt() {
+                Ok(min.data() < v)
             } else {
                 Ok(true)
             }

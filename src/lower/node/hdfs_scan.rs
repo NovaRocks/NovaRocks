@@ -706,6 +706,7 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id
         ));
     }
+
     let original_range_count = ranges.len();
     apply_path_rewrite(&mut ranges)?;
 

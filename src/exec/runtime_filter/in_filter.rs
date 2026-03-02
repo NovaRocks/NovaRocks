@@ -39,8 +39,8 @@ use hashbrown::HashSet;
 
 use crate::common::ids::SlotId;
 use crate::common::largeint;
+use crate::common::min_max_predicate::MinMaxPredicateValue;
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::LiteralValue;
 use crate::exec::node::join::JoinRuntimeFilterSpec;
 
 #[derive(Clone, Debug)]
@@ -623,40 +623,176 @@ impl RuntimeInFilterValues {
         }
     }
 
-    fn min_max_literal(&self) -> Option<(LiteralValue, LiteralValue)> {
+    fn min_max_predicate_values(
+        &self,
+    ) -> Result<Option<(MinMaxPredicateValue, MinMaxPredicateValue)>, String> {
         match self {
-            RuntimeInFilterValues::Int8(values) => min_max_i64(values.iter().map(|v| *v as i64))
-                .map(|(min, max)| (LiteralValue::Int64(min), LiteralValue::Int64(max))),
-            RuntimeInFilterValues::Int16(values) => min_max_i64(values.iter().map(|v| *v as i64))
-                .map(|(min, max)| (LiteralValue::Int64(min), LiteralValue::Int64(max))),
-            RuntimeInFilterValues::Int32(values) => min_max_i64(values.iter().map(|v| *v as i64))
-                .map(|(min, max)| (LiteralValue::Int64(min), LiteralValue::Int64(max))),
-            RuntimeInFilterValues::Int64(values) => min_max_i64(values.iter().map(|v| *v))
-                .map(|(min, max)| (LiteralValue::Int64(min), LiteralValue::Int64(max))),
-            RuntimeInFilterValues::LargeInt(values) => min_max_i128(values.iter().copied())
-                .map(|(min, max)| (LiteralValue::LargeInt(min), LiteralValue::LargeInt(max))),
-            RuntimeInFilterValues::Date32(values) => min_max_i64(values.iter().map(|v| *v as i64))
-                .map(|(min, max)| (LiteralValue::Int64(min), LiteralValue::Int64(max))),
+            RuntimeInFilterValues::Int8(values) => Ok(min_max_i32(
+                values.iter().map(|v| i32::from(*v)),
+            )
+            .map(|(min, max)| {
+                (
+                    MinMaxPredicateValue::Int32(min),
+                    MinMaxPredicateValue::Int32(max),
+                )
+            })),
+            RuntimeInFilterValues::Int16(values) => Ok(min_max_i32(
+                values.iter().map(|v| i32::from(*v)),
+            )
+            .map(|(min, max)| {
+                (
+                    MinMaxPredicateValue::Int32(min),
+                    MinMaxPredicateValue::Int32(max),
+                )
+            })),
+            RuntimeInFilterValues::Int32(values) => {
+                Ok(min_max_i32(values.iter().copied()).map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::Int32(min),
+                        MinMaxPredicateValue::Int32(max),
+                    )
+                }))
+            }
+            RuntimeInFilterValues::Int64(values) => {
+                Ok(min_max_i64(values.iter().copied()).map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::Int64(min),
+                        MinMaxPredicateValue::Int64(max),
+                    )
+                }))
+            }
+            RuntimeInFilterValues::LargeInt(values) => Ok(min_max_i128(values.iter().copied())
+                .map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::LargeInt(min),
+                        MinMaxPredicateValue::LargeInt(max),
+                    )
+                })),
+            RuntimeInFilterValues::Date32(values) => {
+                Ok(min_max_i32(values.iter().copied()).map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::Date32(min),
+                        MinMaxPredicateValue::Date32(max),
+                    )
+                }))
+            }
             RuntimeInFilterValues::TimestampSecond(values)
             | RuntimeInFilterValues::TimestampMillisecond(values)
             | RuntimeInFilterValues::TimestampMicrosecond(values)
             | RuntimeInFilterValues::TimestampNanosecond(values) => {
-                min_max_i64(values.iter().map(|v| *v))
-                    .map(|(min, max)| (LiteralValue::Int64(min), LiteralValue::Int64(max)))
+                let map_unit = |v: &i64| -> Result<i64, String> {
+                    timestamp_to_microseconds(*v, self.timestamp_unit()).ok_or_else(|| {
+                        "runtime in-filter timestamp conversion overflow".to_string()
+                    })
+                };
+                let mut converted = Vec::with_capacity(values.len());
+                for v in values {
+                    converted.push(map_unit(v)?);
+                }
+                Ok(min_max_i64(converted.into_iter()).map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::DateTimeMicros(min),
+                        MinMaxPredicateValue::DateTimeMicros(max),
+                    )
+                }))
             }
-            RuntimeInFilterValues::Float32(values) => {
-                min_max_f64(values.iter().map(|v| f32::from_bits(*v) as f64))
-                    .map(|(min, max)| (LiteralValue::Float64(min), LiteralValue::Float64(max)))
+            RuntimeInFilterValues::Float32(values) => Ok(min_max_f32(
+                values.iter().map(|v| f32::from_bits(*v)),
+            )
+            .map(|(min, max)| {
+                (
+                    MinMaxPredicateValue::Float(min),
+                    MinMaxPredicateValue::Float(max),
+                )
+            })),
+            RuntimeInFilterValues::Float64(values) => Ok(min_max_f64(
+                values.iter().map(|v| f64::from_bits(*v)),
+            )
+            .map(|(min, max)| {
+                (
+                    MinMaxPredicateValue::Double(min),
+                    MinMaxPredicateValue::Double(max),
+                )
+            })),
+            RuntimeInFilterValues::Bool(values) => {
+                Ok(min_max_bool(values.iter().copied()).map(|(min, max)| {
+                    (
+                        MinMaxPredicateValue::Boolean(min),
+                        MinMaxPredicateValue::Boolean(max),
+                    )
+                }))
             }
-            RuntimeInFilterValues::Float64(values) => {
-                min_max_f64(values.iter().map(|v| f64::from_bits(*v)))
-                    .map(|(min, max)| (LiteralValue::Float64(min), LiteralValue::Float64(max)))
-            }
-            RuntimeInFilterValues::Bool(_) => None,
-            RuntimeInFilterValues::Utf8(_) => None,
-            RuntimeInFilterValues::Decimal128 { .. } => None,
+            RuntimeInFilterValues::Utf8(values) => Ok(min_max_bytes(
+                values.iter().map(|v| v.as_bytes()),
+            )
+            .map(|(min, max)| {
+                (
+                    MinMaxPredicateValue::ByteArray(min),
+                    MinMaxPredicateValue::ByteArray(max),
+                )
+            })),
+            RuntimeInFilterValues::Decimal128 {
+                values,
+                precision,
+                scale,
+            } => Ok(min_max_i128(values.iter().copied()).map(|(min, max)| {
+                (
+                    MinMaxPredicateValue::Decimal128 {
+                        value: min,
+                        precision: *precision,
+                        scale: *scale,
+                    },
+                    MinMaxPredicateValue::Decimal128 {
+                        value: max,
+                        precision: *precision,
+                        scale: *scale,
+                    },
+                )
+            })),
         }
     }
+
+    fn timestamp_unit(&self) -> arrow::datatypes::TimeUnit {
+        match self {
+            RuntimeInFilterValues::TimestampSecond(_) => arrow::datatypes::TimeUnit::Second,
+            RuntimeInFilterValues::TimestampMillisecond(_) => {
+                arrow::datatypes::TimeUnit::Millisecond
+            }
+            RuntimeInFilterValues::TimestampMicrosecond(_) => {
+                arrow::datatypes::TimeUnit::Microsecond
+            }
+            RuntimeInFilterValues::TimestampNanosecond(_) => arrow::datatypes::TimeUnit::Nanosecond,
+            _ => arrow::datatypes::TimeUnit::Microsecond,
+        }
+    }
+}
+
+fn timestamp_to_microseconds(value: i64, unit: arrow::datatypes::TimeUnit) -> Option<i64> {
+    match unit {
+        arrow::datatypes::TimeUnit::Second => value.checked_mul(1_000_000),
+        arrow::datatypes::TimeUnit::Millisecond => value.checked_mul(1_000),
+        arrow::datatypes::TimeUnit::Microsecond => Some(value),
+        arrow::datatypes::TimeUnit::Nanosecond => Some(value / 1_000),
+    }
+}
+
+fn min_max_i32<I>(iter: I) -> Option<(i32, i32)>
+where
+    I: IntoIterator<Item = i32>,
+{
+    let mut it = iter.into_iter();
+    let first = it.next()?;
+    let mut min = first;
+    let mut max = first;
+    for v in it {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    Some((min, max))
 }
 
 fn min_max_i64<I>(iter: I) -> Option<(i64, i64)>
@@ -722,6 +858,69 @@ where
     }
 }
 
+fn min_max_f32<I>(iter: I) -> Option<(f32, f32)>
+where
+    I: IntoIterator<Item = f32>,
+{
+    let mut min: Option<f32> = None;
+    let mut max: Option<f32> = None;
+    for v in iter {
+        if v.is_nan() {
+            continue;
+        }
+        min = Some(match min {
+            Some(cur) => cur.min(v),
+            None => v,
+        });
+        max = Some(match max {
+            Some(cur) => cur.max(v),
+            None => v,
+        });
+    }
+    match (min, max) {
+        (Some(min), Some(max)) => Some((min, max)),
+        _ => None,
+    }
+}
+
+fn min_max_bool<I>(iter: I) -> Option<(bool, bool)>
+where
+    I: IntoIterator<Item = bool>,
+{
+    let mut it = iter.into_iter();
+    let first = it.next()?;
+    let mut min = first;
+    let mut max = first;
+    for v in it {
+        if !v {
+            min = false;
+        }
+        if v {
+            max = true;
+        }
+    }
+    Some((min, max))
+}
+
+fn min_max_bytes<'a, I>(iter: I) -> Option<(Vec<u8>, Vec<u8>)>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut it = iter.into_iter();
+    let first = it.next()?;
+    let mut min = first;
+    let mut max = first;
+    for v in it {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    Some((min.to_vec(), max.to_vec()))
+}
+
 impl RuntimeInFilter {
     pub(in crate::exec::runtime_filter) fn new(
         filter_id: i32,
@@ -760,8 +959,10 @@ impl RuntimeInFilter {
         self.values.is_empty()
     }
 
-    pub(crate) fn min_max_literal(&self) -> Option<(LiteralValue, LiteralValue)> {
-        self.values.min_max_literal()
+    pub(crate) fn min_max_predicate_values(
+        &self,
+    ) -> Result<Option<(MinMaxPredicateValue, MinMaxPredicateValue)>, String> {
+        self.values.min_max_predicate_values()
     }
 
     pub(in crate::exec::runtime_filter) fn values(&self) -> &RuntimeInFilterValues {

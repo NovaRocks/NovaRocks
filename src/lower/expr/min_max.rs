@@ -14,12 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::connector::MinMaxPredicate;
+use arrow::datatypes::DataType;
+use chrono::{NaiveDate, NaiveDateTime};
+
+use crate::connector::{MinMaxPredicate, MinMaxPredicateValue};
+use crate::exec::expr::LiteralValue;
 use crate::exprs;
 use crate::lower::expr::literals::{
-    build_date_literal, build_decimal_literal, build_float_literal, build_int_literal,
+    build_decimal_literal, parse_date_literal, parse_decimal_literal,
 };
 use crate::lower::layout::Layout;
+use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_node};
+use crate::types;
 
 /// Parse a min/max conjunct TExpr into MinMaxPredicate used for row group pruning.
 pub(crate) fn parse_min_max_conjunct(
@@ -31,7 +37,6 @@ pub(crate) fn parse_min_max_conjunct(
     }
 
     let root = &expr.nodes[0];
-
     if root.node_type != exprs::TExprNodeType::BINARY_PRED {
         return Ok(None);
     }
@@ -96,11 +101,7 @@ fn get_column_name_from_slot(
     Ok(idx.to_string())
 }
 
-fn extract_literal_value(
-    node: &exprs::TExprNode,
-) -> Result<crate::exec::expr::LiteralValue, String> {
-    use crate::exec::expr::LiteralValue;
-
+fn extract_literal_value(node: &exprs::TExprNode) -> Result<MinMaxPredicateValue, String> {
     match node.node_type {
         t if t == exprs::TExprNodeType::INT_LITERAL => {
             let v = node
@@ -108,24 +109,55 @@ fn extract_literal_value(
                 .as_ref()
                 .ok_or_else(|| "INT_LITERAL missing value".to_string())?
                 .value;
-            build_int_literal(node, v)
+            extract_int_literal(node, v)
+        }
+        t if t == exprs::TExprNodeType::LARGE_INT_LITERAL => {
+            let raw = node
+                .large_int_literal
+                .as_ref()
+                .ok_or_else(|| "LARGE_INT_LITERAL missing value".to_string())?
+                .value
+                .trim()
+                .to_string();
+            let v = raw
+                .parse::<i128>()
+                .map_err(|_| format!("failed to parse LARGE_INT_LITERAL '{}'", raw))?;
+            extract_large_int_literal(node, v)
         }
         t if t == exprs::TExprNodeType::DECIMAL_LITERAL => {
-            let v = node
+            let raw = node
                 .decimal_literal
                 .as_ref()
                 .ok_or_else(|| "DECIMAL_LITERAL missing value".to_string())?
                 .value
                 .clone();
-            build_decimal_literal(node, &v)
+            match build_decimal_literal(node, &raw)? {
+                LiteralValue::Decimal128 {
+                    value,
+                    precision,
+                    scale,
+                } => Ok(MinMaxPredicateValue::Decimal128 {
+                    value,
+                    precision,
+                    scale,
+                }),
+                LiteralValue::Decimal256 { .. } => {
+                    Err("min/max predicate does not support DECIMAL256 literal".to_string())
+                }
+                other => Err(format!(
+                    "DECIMAL_LITERAL lowered to unexpected value for min/max predicate: {:?}",
+                    other
+                )),
+            }
         }
         t if t == exprs::TExprNodeType::FLOAT_LITERAL => {
             let v = node
                 .float_literal
                 .as_ref()
                 .ok_or_else(|| "FLOAT_LITERAL missing value".to_string())?
-                .value;
-            Ok(build_float_literal(node, v.0))
+                .value
+                .0;
+            extract_float_literal(node, v)
         }
         t if t == exprs::TExprNodeType::BOOL_LITERAL => {
             let v = node
@@ -133,7 +165,7 @@ fn extract_literal_value(
                 .as_ref()
                 .ok_or_else(|| "BOOL_LITERAL missing value".to_string())?
                 .value;
-            Ok(LiteralValue::Bool(v))
+            Ok(MinMaxPredicateValue::Boolean(v))
         }
         t if t == exprs::TExprNodeType::STRING_LITERAL => {
             let v = node
@@ -142,7 +174,23 @@ fn extract_literal_value(
                 .ok_or_else(|| "STRING_LITERAL missing value".to_string())?
                 .value
                 .clone();
-            Ok(LiteralValue::Utf8(v))
+            extract_string_literal(node, &v)
+        }
+        t if t == exprs::TExprNodeType::BINARY_LITERAL => {
+            let v = node
+                .binary_literal
+                .as_ref()
+                .ok_or_else(|| "BINARY_LITERAL missing value".to_string())?
+                .value
+                .clone();
+            if matches!(
+                arrow_type_from_desc(&node.type_),
+                Some(DataType::FixedSizeBinary(_))
+            ) {
+                Ok(MinMaxPredicateValue::FixedLenByteArray(v))
+            } else {
+                Ok(MinMaxPredicateValue::ByteArray(v))
+            }
         }
         t if t == exprs::TExprNodeType::DATE_LITERAL => {
             let v = node
@@ -151,9 +199,322 @@ fn extract_literal_value(
                 .ok_or_else(|| "DATE_LITERAL missing value".to_string())?
                 .value
                 .clone();
-            build_date_literal(node, &v)
+            extract_date_literal(node, &v)
         }
-        t if t == exprs::TExprNodeType::NULL_LITERAL => Ok(LiteralValue::Null),
-        _ => Err(format!("unsupported literal type: {:?}", node.node_type)),
+        t if t == exprs::TExprNodeType::NULL_LITERAL => {
+            Err("min/max predicate does not support NULL literal".to_string())
+        }
+        _ => Err(format!(
+            "unsupported literal type in min/max predicate: {:?}",
+            node.node_type
+        )),
     }
+}
+
+fn extract_int_literal(
+    node: &exprs::TExprNode,
+    value: i64,
+) -> Result<MinMaxPredicateValue, String> {
+    match primitive_type_from_node(node) {
+        Some(t)
+            if t == types::TPrimitiveType::TINYINT
+                || t == types::TPrimitiveType::SMALLINT
+                || t == types::TPrimitiveType::INT =>
+        {
+            let v = i32::try_from(value).map_err(|_| {
+                format!("INT_LITERAL out of range for INT32-compatible type: {value}")
+            })?;
+            Ok(MinMaxPredicateValue::Int32(v))
+        }
+        Some(t) if t == types::TPrimitiveType::BIGINT => Ok(MinMaxPredicateValue::Int64(value)),
+        Some(t) if t == types::TPrimitiveType::LARGEINT => {
+            Ok(MinMaxPredicateValue::LargeInt(i128::from(value)))
+        }
+        Some(t) if t == types::TPrimitiveType::DATE => {
+            let v = i32::try_from(value)
+                .map_err(|_| format!("INT_LITERAL out of range for DATE: {value}"))?;
+            Ok(MinMaxPredicateValue::Date32(v))
+        }
+        Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
+            Ok(MinMaxPredicateValue::DateTimeMicros(value))
+        }
+        Some(t) if is_decimal_type(&t) => {
+            let (precision, scale) = decimal_params_from_node(node)?;
+            let scaled = scale_integer(i128::from(value), scale).ok_or_else(|| {
+                format!(
+                    "INT_LITERAL cannot be represented as DECIMAL({}, {})",
+                    precision, scale
+                )
+            })?;
+            if !fits_decimal_precision(scaled, precision) {
+                return Err(format!(
+                    "INT_LITERAL {} exceeds DECIMAL precision {}",
+                    value, precision
+                ));
+            }
+            Ok(MinMaxPredicateValue::Decimal128 {
+                value: scaled,
+                precision,
+                scale,
+            })
+        }
+        Some(other) => Err(format!(
+            "unsupported INT_LITERAL primitive type for min/max predicate: {:?}",
+            other
+        )),
+        None => Ok(MinMaxPredicateValue::Int64(value)),
+    }
+}
+
+fn extract_large_int_literal(
+    node: &exprs::TExprNode,
+    value: i128,
+) -> Result<MinMaxPredicateValue, String> {
+    match primitive_type_from_node(node) {
+        Some(t)
+            if t == types::TPrimitiveType::TINYINT
+                || t == types::TPrimitiveType::SMALLINT
+                || t == types::TPrimitiveType::INT =>
+        {
+            let v = i32::try_from(value).map_err(|_| {
+                format!(
+                    "LARGE_INT_LITERAL out of range for INT32-compatible type: {}",
+                    value
+                )
+            })?;
+            Ok(MinMaxPredicateValue::Int32(v))
+        }
+        Some(t) if t == types::TPrimitiveType::BIGINT => {
+            let v = i64::try_from(value)
+                .map_err(|_| format!("LARGE_INT_LITERAL out of range for BIGINT: {}", value))?;
+            Ok(MinMaxPredicateValue::Int64(v))
+        }
+        Some(t) if t == types::TPrimitiveType::LARGEINT => {
+            Ok(MinMaxPredicateValue::LargeInt(value))
+        }
+        Some(t) if t == types::TPrimitiveType::DATE => {
+            let v = i32::try_from(value)
+                .map_err(|_| format!("LARGE_INT_LITERAL out of range for DATE: {}", value))?;
+            Ok(MinMaxPredicateValue::Date32(v))
+        }
+        Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
+            let v = i64::try_from(value)
+                .map_err(|_| format!("LARGE_INT_LITERAL out of range for DATETIME: {}", value))?;
+            Ok(MinMaxPredicateValue::DateTimeMicros(v))
+        }
+        Some(t) if is_decimal_type(&t) => {
+            let (precision, scale) = decimal_params_from_node(node)?;
+            let scaled = scale_integer(value, scale).ok_or_else(|| {
+                format!(
+                    "LARGE_INT_LITERAL cannot be represented as DECIMAL({}, {})",
+                    precision, scale
+                )
+            })?;
+            if !fits_decimal_precision(scaled, precision) {
+                return Err(format!(
+                    "LARGE_INT_LITERAL {} exceeds DECIMAL precision {}",
+                    value, precision
+                ));
+            }
+            Ok(MinMaxPredicateValue::Decimal128 {
+                value: scaled,
+                precision,
+                scale,
+            })
+        }
+        Some(other) => Err(format!(
+            "unsupported LARGE_INT_LITERAL primitive type for min/max predicate: {:?}",
+            other
+        )),
+        None => Ok(MinMaxPredicateValue::LargeInt(value)),
+    }
+}
+
+fn extract_float_literal(
+    node: &exprs::TExprNode,
+    value: f64,
+) -> Result<MinMaxPredicateValue, String> {
+    match primitive_type_from_node(node) {
+        Some(t) if t == types::TPrimitiveType::FLOAT => {
+            Ok(MinMaxPredicateValue::Float(value as f32))
+        }
+        Some(t) if t == types::TPrimitiveType::DOUBLE => Ok(MinMaxPredicateValue::Double(value)),
+        Some(other) => Err(format!(
+            "unsupported FLOAT_LITERAL primitive type for min/max predicate: {:?}",
+            other
+        )),
+        None => Ok(MinMaxPredicateValue::Double(value)),
+    }
+}
+
+fn extract_string_literal(
+    node: &exprs::TExprNode,
+    value: &str,
+) -> Result<MinMaxPredicateValue, String> {
+    match primitive_type_from_node(node) {
+        Some(t) if t == types::TPrimitiveType::DATE => {
+            Ok(MinMaxPredicateValue::Date32(parse_date_literal(value)?))
+        }
+        Some(t) if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => Ok(
+            MinMaxPredicateValue::DateTimeMicros(parse_datetime_literal_micros(value)?),
+        ),
+        Some(t) if t == types::TPrimitiveType::BOOLEAN => parse_bool_literal(value)
+            .map(MinMaxPredicateValue::Boolean)
+            .ok_or_else(|| {
+                format!(
+                    "failed to parse BOOLEAN literal '{}' for min/max predicate",
+                    value
+                )
+            }),
+        Some(t)
+            if t == types::TPrimitiveType::TINYINT
+                || t == types::TPrimitiveType::SMALLINT
+                || t == types::TPrimitiveType::INT =>
+        {
+            let parsed = value
+                .trim()
+                .parse::<i32>()
+                .map_err(|e| format!("failed to parse INT literal '{}': {}", value, e))?;
+            Ok(MinMaxPredicateValue::Int32(parsed))
+        }
+        Some(t) if t == types::TPrimitiveType::BIGINT => {
+            let parsed = value
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| format!("failed to parse BIGINT literal '{}': {}", value, e))?;
+            Ok(MinMaxPredicateValue::Int64(parsed))
+        }
+        Some(t) if t == types::TPrimitiveType::LARGEINT => {
+            let parsed = value
+                .trim()
+                .parse::<i128>()
+                .map_err(|e| format!("failed to parse LARGEINT literal '{}': {}", value, e))?;
+            Ok(MinMaxPredicateValue::LargeInt(parsed))
+        }
+        Some(t) if t == types::TPrimitiveType::FLOAT => {
+            let parsed = value
+                .trim()
+                .parse::<f32>()
+                .map_err(|e| format!("failed to parse FLOAT literal '{}': {}", value, e))?;
+            Ok(MinMaxPredicateValue::Float(parsed))
+        }
+        Some(t) if t == types::TPrimitiveType::DOUBLE => {
+            let parsed = value
+                .trim()
+                .parse::<f64>()
+                .map_err(|e| format!("failed to parse DOUBLE literal '{}': {}", value, e))?;
+            Ok(MinMaxPredicateValue::Double(parsed))
+        }
+        Some(t) if is_decimal_type(&t) => {
+            let (precision, scale) = decimal_params_from_node(node)?;
+            let parsed = parse_decimal_literal(value, precision, scale)?;
+            Ok(MinMaxPredicateValue::Decimal128 {
+                value: parsed,
+                precision,
+                scale,
+            })
+        }
+        Some(_) | None => Ok(MinMaxPredicateValue::ByteArray(value.as_bytes().to_vec())),
+    }
+}
+
+fn extract_date_literal(
+    node: &exprs::TExprNode,
+    value: &str,
+) -> Result<MinMaxPredicateValue, String> {
+    match primitive_type_from_node(node) {
+        Some(t)
+            if t == types::TPrimitiveType::DATE
+                || t == types::TPrimitiveType::DATETIME
+                || t == types::TPrimitiveType::TIME =>
+        {
+            if t == types::TPrimitiveType::DATE {
+                Ok(MinMaxPredicateValue::Date32(parse_date_literal(value)?))
+            } else {
+                Ok(MinMaxPredicateValue::DateTimeMicros(
+                    parse_datetime_literal_micros(value)?,
+                ))
+            }
+        }
+        Some(_) => Ok(MinMaxPredicateValue::ByteArray(value.as_bytes().to_vec())),
+        None => Ok(MinMaxPredicateValue::Date32(parse_date_literal(value)?)),
+    }
+}
+
+fn decimal_params_from_node(node: &exprs::TExprNode) -> Result<(u8, i8), String> {
+    match arrow_type_from_desc(&node.type_) {
+        Some(DataType::Decimal128(precision, scale)) => Ok((precision, scale)),
+        Some(DataType::Decimal256(_, _)) => {
+            Err("min/max predicate does not support DECIMAL256 literal".to_string())
+        }
+        Some(other) => Err(format!(
+            "min/max predicate decimal literal type mismatch: {:?}",
+            other
+        )),
+        None => Err("min/max predicate decimal literal missing decimal type metadata".to_string()),
+    }
+}
+
+fn parse_datetime_literal_micros(value: &str) -> Result<i64, String> {
+    let text = value.trim();
+    if text.is_empty() {
+        return Err("empty DATETIME literal".to_string());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S") {
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| format!("invalid DATETIME literal '{}'", value))?;
+        return Ok(dt.and_utc().timestamp_micros());
+    }
+    Err(format!("invalid DATETIME literal '{}'", value))
+}
+
+fn parse_bool_literal(value: &str) -> Option<bool> {
+    match value.trim() {
+        "0" | "false" | "FALSE" => Some(false),
+        "1" | "true" | "TRUE" => Some(true),
+        _ => None,
+    }
+}
+
+fn is_decimal_type(ltype: &types::TPrimitiveType) -> bool {
+    matches!(
+        *ltype,
+        types::TPrimitiveType::DECIMAL
+            | types::TPrimitiveType::DECIMALV2
+            | types::TPrimitiveType::DECIMAL32
+            | types::TPrimitiveType::DECIMAL64
+            | types::TPrimitiveType::DECIMAL128
+            | types::TPrimitiveType::DECIMAL256
+    )
+}
+
+fn scale_integer(value: i128, target_scale: i8) -> Option<i128> {
+    if target_scale < 0 {
+        return None;
+    }
+    let mut factor = 1i128;
+    for _ in 0..u32::try_from(target_scale).ok()? {
+        factor = factor.checked_mul(10)?;
+    }
+    value.checked_mul(factor)
+}
+
+fn fits_decimal_precision(value: i128, precision: u8) -> bool {
+    if precision == 0 {
+        return false;
+    }
+    let mut n = value.unsigned_abs();
+    let mut digits = 1usize;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits <= usize::from(precision)
 }

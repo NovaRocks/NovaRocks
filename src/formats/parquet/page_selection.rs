@@ -223,7 +223,7 @@ fn page_ranges_for_predicate(
 
     match column_index {
         ColumnIndexMetaData::INT32(index) => {
-            let v = super::literal_int32(predicate.value())?;
+            let v = predicate.value().as_i32()?;
             for page_idx in 0..num_pages {
                 if index.is_null_page(page_idx) {
                     continue;
@@ -236,7 +236,7 @@ fn page_ranges_for_predicate(
             }
         }
         ColumnIndexMetaData::INT64(index) => {
-            let v = super::literal_int64(predicate.value())?;
+            let v = predicate.value().as_i64()?;
             for page_idx in 0..num_pages {
                 if index.is_null_page(page_idx) {
                     continue;
@@ -249,7 +249,7 @@ fn page_ranges_for_predicate(
             }
         }
         ColumnIndexMetaData::FLOAT(index) => {
-            let v = super::literal_float64(predicate.value())? as f32;
+            let v = predicate.value().as_f32()?;
             for page_idx in 0..num_pages {
                 if index.is_null_page(page_idx) {
                     continue;
@@ -266,7 +266,7 @@ fn page_ranges_for_predicate(
             }
         }
         ColumnIndexMetaData::DOUBLE(index) => {
-            let v = super::literal_float64(predicate.value())?;
+            let v = predicate.value().as_f64()?;
             for page_idx in 0..num_pages {
                 if index.is_null_page(page_idx) {
                     continue;

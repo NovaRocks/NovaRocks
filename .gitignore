@@ -1,3 +1,4 @@
+/log
 /novarocks.log
 /novarocks.pid
 /novarocks.toml

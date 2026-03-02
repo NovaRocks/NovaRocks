@@ -1,4 +1,5 @@
 use crate::common::ids::SlotId;
+use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
 use crate::exec::chunk::field_slot_id;
@@ -64,7 +65,7 @@ impl StarRocksNativeReader {
         required_schema: SchemaRef,
         output_schema: SchemaRef,
         query_global_dicts: QueryGlobalDictEncodeMap,
-        min_max_predicates: Vec<crate::formats::parquet::MinMaxPredicate>,
+        min_max_predicates: Vec<MinMaxPredicate>,
         object_store_profile: &ObjectStoreProfile,
         lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {

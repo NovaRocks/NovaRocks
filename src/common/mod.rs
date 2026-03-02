@@ -20,6 +20,7 @@ pub mod file_identity;
 pub mod ids;
 pub mod largeint;
 pub mod logging;
+pub mod min_max_predicate;
 pub mod thrift;
 pub mod types;
 pub mod util;
