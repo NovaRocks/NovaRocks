@@ -44,18 +44,18 @@ mod min_max;
 pub(crate) use apply::{
     filter_chunk_by_in_filters_with_exprs, filter_chunk_by_membership_filters_with_exprs,
 };
-pub(crate) use bitset::RuntimeBitsetFilter;
+pub(crate) use bitset::{RuntimeBitsetFilter, maybe_build_runtime_bitset_filter};
 pub(crate) use bloom::RuntimeBloomFilter;
 pub(crate) use codec::{
     StarrocksRuntimeFilterType, decode_starrocks_in_filter, decode_starrocks_membership_filter,
-    encode_starrocks_bloom_filter, encode_starrocks_empty_filter, encode_starrocks_in_filter,
-    peek_starrocks_filter_type,
+    encode_starrocks_bitset_filter, encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
+    encode_starrocks_in_filter, peek_starrocks_filter_type,
 };
 pub(crate) use in_filter::{LocalRuntimeInFilterSet, RuntimeInFilter};
 pub(crate) use local::{LocalRuntimeFilterSet, RuntimeFilterMembership};
 pub(crate) use membership::{RuntimeEmptyFilter, RuntimeMembershipFilter};
 pub(crate) use merger::{
-    MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger,
+    MAX_RUNTIME_IN_FILTER_CONDITIONS, PartialRuntimeInFilterMerger, RuntimeMembershipBuildOptions,
     RuntimeMembershipFilterBuildParam,
 };
 pub(crate) use min_max::RuntimeMinMaxFilter;

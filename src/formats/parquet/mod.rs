@@ -519,7 +519,9 @@ impl ParquetScanIter {
             profile.counter_add(
                 "ParquetDelayedRowsPruned",
                 metrics::TUnit::UNIT,
-                clamp_u128_to_i64(selection.rows_total.saturating_sub(selection.rows_selected) as u128),
+                clamp_u128_to_i64(
+                    selection.rows_total.saturating_sub(selection.rows_selected) as u128
+                ),
             );
         }
 
@@ -1056,7 +1058,7 @@ fn evaluate_batch_predicate_mask(
 #[cfg(test)]
 fn evaluate_min_max_predicate_mask(
     array: &ArrayRef,
-        predicate: &MinMaxPredicate,
+    predicate: &MinMaxPredicate,
 ) -> Result<Option<Vec<bool>>, String> {
     match array.data_type() {
         DataType::Int8 => {

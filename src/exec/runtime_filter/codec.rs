@@ -482,6 +482,30 @@ pub(crate) fn encode_starrocks_bloom_filter(
     Ok(buf)
 }
 
+/// Encode a runtime bitset filter into StarRocks-compatible wire payload.
+pub(crate) fn encode_starrocks_bitset_filter(
+    filter: &RuntimeBitsetFilter,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    buf.push(RF_VERSION_V3);
+    buf.push(RF_TYPE_BITSET_FILTER);
+    buf.extend_from_slice(&filter.ltype().0.to_le_bytes());
+    buf.push(if filter.has_null() { 1 } else { 0 });
+    buf.extend_from_slice(&filter.size().to_le_bytes());
+    buf.push(filter.join_mode() as u8);
+    write_min_max_i64(
+        &filter.ltype(),
+        filter.min_value(),
+        filter.max_value(),
+        &mut buf,
+    )?;
+    let bitset = filter.bitset();
+    buf.extend_from_slice(&(bitset.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bitset);
+    filter.min_max().encode_into(&mut buf)?;
+    Ok(buf)
+}
+
 /// Encode an always-empty runtime filter payload in StarRocks wire format.
 pub(crate) fn encode_starrocks_empty_filter(
     filter: &RuntimeEmptyFilter,
@@ -583,6 +607,76 @@ fn read_i128_le(data: &[u8], offset: &mut usize) -> Result<i128, String> {
 /// Read one little-endian u64 value from codec payload and advance the decode offset.
 pub(super) fn read_u64_le(data: &[u8], offset: &mut usize) -> Result<u64, String> {
     Ok(read_i64_le(data, offset)? as u64)
+}
+
+fn write_min_max_i64(
+    ltype: &crate::types::TPrimitiveType,
+    min_value: i64,
+    max_value: i64,
+    buf: &mut Vec<u8>,
+) -> Result<(), String> {
+    use crate::types;
+    if *ltype == types::TPrimitiveType::BOOLEAN {
+        if !(0..=1).contains(&min_value) || !(0..=1).contains(&max_value) {
+            return Err("runtime bitset filter boolean min/max out of range".to_string());
+        }
+        buf.push(min_value as u8);
+        buf.push(max_value as u8);
+        return Ok(());
+    }
+    if *ltype == types::TPrimitiveType::TINYINT {
+        let min = i8::try_from(min_value)
+            .map_err(|_| "runtime bitset filter tinyint min out of range".to_string())?;
+        let max = i8::try_from(max_value)
+            .map_err(|_| "runtime bitset filter tinyint max out of range".to_string())?;
+        buf.push(min as u8);
+        buf.push(max as u8);
+        return Ok(());
+    }
+    if *ltype == types::TPrimitiveType::SMALLINT {
+        let min = i16::try_from(min_value)
+            .map_err(|_| "runtime bitset filter smallint min out of range".to_string())?;
+        let max = i16::try_from(max_value)
+            .map_err(|_| "runtime bitset filter smallint max out of range".to_string())?;
+        buf.extend_from_slice(&min.to_le_bytes());
+        buf.extend_from_slice(&max.to_le_bytes());
+        return Ok(());
+    }
+    if *ltype == types::TPrimitiveType::INT {
+        let min = i32::try_from(min_value)
+            .map_err(|_| "runtime bitset filter int min out of range".to_string())?;
+        let max = i32::try_from(max_value)
+            .map_err(|_| "runtime bitset filter int max out of range".to_string())?;
+        buf.extend_from_slice(&min.to_le_bytes());
+        buf.extend_from_slice(&max.to_le_bytes());
+        return Ok(());
+    }
+    if *ltype == types::TPrimitiveType::BIGINT {
+        buf.extend_from_slice(&min_value.to_le_bytes());
+        buf.extend_from_slice(&max_value.to_le_bytes());
+        return Ok(());
+    }
+    if *ltype == types::TPrimitiveType::LARGEINT {
+        return Err("runtime bitset filter does not support LARGEINT".to_string());
+    }
+    if *ltype == types::TPrimitiveType::DATE {
+        let min = i32::try_from(min_value)
+            .map_err(|_| "runtime bitset filter date min out of range".to_string())?;
+        let max = i32::try_from(max_value)
+            .map_err(|_| "runtime bitset filter date max out of range".to_string())?;
+        buf.extend_from_slice(&min.to_le_bytes());
+        buf.extend_from_slice(&max.to_le_bytes());
+        return Ok(());
+    }
+    if *ltype == types::TPrimitiveType::DATETIME || *ltype == types::TPrimitiveType::TIME {
+        buf.extend_from_slice(&min_value.to_le_bytes());
+        buf.extend_from_slice(&max_value.to_le_bytes());
+        return Ok(());
+    }
+    Err(format!(
+        "unsupported runtime bitset filter primitive type: {:?}",
+        ltype
+    ))
 }
 
 fn read_min_max_i64(

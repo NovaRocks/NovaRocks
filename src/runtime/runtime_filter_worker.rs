@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use crate::common::ids::SlotId;
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, StarrocksRuntimeFilterType,
-    decode_starrocks_in_filter, decode_starrocks_membership_filter, encode_starrocks_bloom_filter,
-    encode_starrocks_empty_filter, encode_starrocks_in_filter, peek_starrocks_filter_type,
+    decode_starrocks_in_filter, decode_starrocks_membership_filter, encode_starrocks_bitset_filter,
+    encode_starrocks_bloom_filter, encode_starrocks_empty_filter, encode_starrocks_in_filter,
+    peek_starrocks_filter_type,
 };
 use crate::novarocks_logging::{debug, warn};
 use crate::runtime::query_context::QueryId;
@@ -292,8 +293,6 @@ fn encode_membership_filter(filter: &RuntimeMembershipFilter) -> Result<Vec<u8>,
     match filter {
         RuntimeMembershipFilter::Bloom(bloom) => encode_starrocks_bloom_filter(bloom),
         RuntimeMembershipFilter::Empty(empty) => encode_starrocks_empty_filter(empty),
-        RuntimeMembershipFilter::Bitset(_) => {
-            Err("runtime bitset filter encode not supported".to_string())
-        }
+        RuntimeMembershipFilter::Bitset(bitset) => encode_starrocks_bitset_filter(bitset),
     }
 }

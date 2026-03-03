@@ -33,6 +33,7 @@ use crate::common::ids::SlotId;
 
 use super::bloom::RuntimeBloomFilter;
 use super::in_filter::RuntimeInFilter;
+use super::maybe_build_runtime_bitset_filter;
 use super::membership::{RuntimeEmptyFilter, RuntimeMembershipFilter};
 use super::min_max::RuntimeMinMaxFilter;
 
@@ -84,6 +85,21 @@ impl RuntimeMembershipFilterBuildParam {
 
     pub(crate) fn arrays(&self) -> &[ArrayRef] {
         &self.arrays
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RuntimeMembershipBuildOptions {
+    pub enable_join_runtime_bitset_filter: bool,
+    pub global_runtime_filter_build_max_size: u64,
+}
+
+impl Default for RuntimeMembershipBuildOptions {
+    fn default() -> Self {
+        Self {
+            enable_join_runtime_bitset_filter: true,
+            global_runtime_filter_build_max_size: u64::MAX,
+        }
     }
 }
 
@@ -185,6 +201,7 @@ impl PartialRuntimeInFilterMerger {
         &self,
         partition: usize,
         params: Vec<RuntimeMembershipFilterBuildParam>,
+        options: RuntimeMembershipBuildOptions,
     ) -> Result<Option<Vec<RuntimeMembershipFilter>>, String> {
         if partition >= self.expected_partitions {
             return Err("runtime membership filter partition out of bounds".to_string());
@@ -223,6 +240,10 @@ impl PartialRuntimeInFilterMerger {
         }
 
         let total_rows: u64 = guard.ht_row_counts.iter().copied().sum::<usize>() as u64;
+        let maybe_use_bitset_base = options.enable_join_runtime_bitset_filter
+            && total_rows > 0
+            && total_rows <= options.global_runtime_filter_build_max_size
+            && parts.len() == 1;
         let mut merged = Vec::with_capacity(expected_len);
         for idx in 0..expected_len {
             let meta = &parts[0][idx];
@@ -253,6 +274,22 @@ impl PartialRuntimeInFilterMerger {
                     min_max,
                 )));
                 continue;
+            }
+            let can_try_bitset = maybe_use_bitset_base && meta.join_mode() == 1;
+            if can_try_bitset {
+                let part = &parts[0][idx];
+                if let Some(bitset) = maybe_build_runtime_bitset_filter(
+                    meta.filter_id(),
+                    meta.slot_id(),
+                    meta.ltype(),
+                    meta.join_mode(),
+                    total_rows,
+                    part.arrays(),
+                    min_max.clone(),
+                )? {
+                    merged.push(RuntimeMembershipFilter::Bitset(bitset));
+                    continue;
+                }
             }
             let mut bloom = RuntimeBloomFilter::with_capacity(
                 meta.filter_id(),
