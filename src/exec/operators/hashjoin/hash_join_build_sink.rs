@@ -42,8 +42,10 @@ use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::runtime_filter::{
     LocalRuntimeFilterSet, LocalRuntimeInFilterSet, MAX_RUNTIME_IN_FILTER_CONDITIONS,
     PartialRuntimeInFilterMerger, RuntimeBloomFilter, RuntimeEmptyFilter, RuntimeInFilter,
-    RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam, RuntimeMinMaxFilter,
-    data_type_to_tprimitive, encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
+    RuntimeMembershipBuildOptions, RuntimeMembershipFilter, RuntimeMembershipFilterBuildParam,
+    RuntimeMinMaxFilter, data_type_to_tprimitive, encode_starrocks_bitset_filter,
+    encode_starrocks_bloom_filter, encode_starrocks_empty_filter,
+    maybe_build_runtime_bitset_filter,
 };
 use crate::metrics;
 use crate::novarocks_logging::{debug, warn};
@@ -482,11 +484,15 @@ impl HashJoinBuildSinkOperator {
         }
 
         let membership_params = self.build_membership_filter_params()?;
+        let membership_build_options = self.membership_build_options(state);
 
         if let Some(merger) = self.runtime_in_filter_merger.as_ref() {
             let merged_in = merger.add_partial(self.partition, self.build_row_count, in_filters)?;
-            let merged_membership =
-                merger.add_partial_membership(self.partition, membership_params)?;
+            let merged_membership = merger.add_partial_membership(
+                self.partition,
+                membership_params,
+                membership_build_options,
+            )?;
             if let (Some(in_filters), Some(membership_filters)) = (merged_in, merged_membership) {
                 self.log_in_filters("publish", &in_filters);
                 self.log_membership_filters("publish", &membership_filters);
@@ -514,6 +520,7 @@ impl HashJoinBuildSinkOperator {
             let membership_filters = self.build_membership_filters_from_params(
                 self.build_row_count as u64,
                 &membership_params,
+                membership_build_options,
             )?;
             self.log_in_filters("publish", &in_filters);
             self.log_membership_filters("publish", &membership_filters);
@@ -623,12 +630,18 @@ impl HashJoinBuildSinkOperator {
                         }
                     }
                 }
-                RuntimeMembershipFilter::Bitset(_) => {
-                    warn!(
-                        "skip remote runtime filter encode: filter_id={} err=bitset not supported",
-                        filter.filter_id()
-                    );
-                    continue;
+                RuntimeMembershipFilter::Bitset(bitset) => {
+                    match encode_starrocks_bitset_filter(bitset) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                "skip remote runtime filter encode: filter_id={} err={}",
+                                filter.filter_id(),
+                                e
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
             encoded_bytes = encoded_bytes.saturating_add(data.len() as i64);
@@ -867,6 +880,7 @@ impl HashJoinBuildSinkOperator {
         &self,
         total_rows: u64,
         params: &[RuntimeMembershipFilterBuildParam],
+        options: RuntimeMembershipBuildOptions,
     ) -> Result<Vec<RuntimeMembershipFilter>, String> {
         if params.is_empty() {
             return Ok(Vec::new());
@@ -886,6 +900,23 @@ impl HashJoinBuildSinkOperator {
                 )));
                 continue;
             }
+            let can_try_bitset = options.enable_join_runtime_bitset_filter
+                && total_rows <= options.global_runtime_filter_build_max_size
+                && param.join_mode() == 1;
+            if can_try_bitset {
+                if let Some(bitset) = maybe_build_runtime_bitset_filter(
+                    param.filter_id(),
+                    param.slot_id(),
+                    param.ltype(),
+                    param.join_mode(),
+                    total_rows,
+                    param.arrays(),
+                    min_max.clone(),
+                )? {
+                    filters.push(RuntimeMembershipFilter::Bitset(bitset));
+                    continue;
+                }
+            }
             let mut bloom = RuntimeBloomFilter::with_capacity(
                 param.filter_id(),
                 param.slot_id(),
@@ -900,6 +931,22 @@ impl HashJoinBuildSinkOperator {
             filters.push(RuntimeMembershipFilter::Bloom(bloom));
         }
         Ok(filters)
+    }
+
+    fn membership_build_options(&self, state: &RuntimeState) -> RuntimeMembershipBuildOptions {
+        let opts = state.query_options();
+        let enabled = opts
+            .and_then(|o| o.enable_join_runtime_bitset_filter)
+            .unwrap_or(true)
+            && self.distribution_mode == JoinDistributionMode::Broadcast;
+        let global_limit = opts
+            .and_then(|o| o.global_runtime_filter_build_max_size)
+            .and_then(|v| (v > 0).then_some(v as u64))
+            .unwrap_or(u64::MAX);
+        RuntimeMembershipBuildOptions {
+            enable_join_runtime_bitset_filter: enabled,
+            global_runtime_filter_build_max_size: global_limit,
+        }
     }
 
     fn build_local_filters(&self, filters: &[RuntimeInFilter]) -> Vec<RuntimeInFilter> {

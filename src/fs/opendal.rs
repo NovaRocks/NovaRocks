@@ -174,8 +174,8 @@ pub(crate) struct OpendalRemoteIoCounters {
     read_requests: CounterRef,
     bytes_read: CounterRef,
     io_timer: CounterRef,
-    io_task_exec_time: CounterRef,
-    scan_time: CounterRef,
+    app_io_time: CounterRef,
+    fs_io_time: CounterRef,
     remote_read_in_flight_peak: CounterRef,
     observed_remote_read_peak: Arc<AtomicI64>,
 }
@@ -186,8 +186,8 @@ impl OpendalRemoteIoCounters {
             read_requests: profile.add_counter("ReadRequests", metrics::TUnit::UNIT),
             bytes_read: profile.add_counter("BytesRead", metrics::TUnit::BYTES),
             io_timer: profile.add_counter("IOTimer", metrics::TUnit::TIME_NS),
-            io_task_exec_time: profile.add_counter("IOTaskExecTime", metrics::TUnit::TIME_NS),
-            scan_time: profile.add_counter("ScanTime", metrics::TUnit::TIME_NS),
+            app_io_time: profile.add_counter("AppIOTime", metrics::TUnit::TIME_NS),
+            fs_io_time: profile.add_counter("FSIOTime", metrics::TUnit::TIME_NS),
             remote_read_in_flight_peak: profile
                 .add_counter("RemoteReadInFlightPeak", metrics::TUnit::UNIT),
             observed_remote_read_peak: Arc::new(AtomicI64::new(0)),
@@ -218,8 +218,8 @@ impl OpendalRemoteIoCounters {
         self.bytes_read.add(clamp_u128_to_i64(length as u128));
         let io_ns = clamp_u128_to_i64(io_ns);
         self.io_timer.add(io_ns);
-        self.io_task_exec_time.add(io_ns);
-        self.scan_time.add(io_ns);
+        self.app_io_time.add(io_ns);
+        self.fs_io_time.add(io_ns);
     }
 }
 

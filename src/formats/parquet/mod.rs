@@ -31,9 +31,14 @@ use anyhow::Result;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeBinaryBuilder, RecordBatch, StructArray,
 };
-use arrow::datatypes::DataType;
+#[cfg(test)]
+use arrow::array::{
+    Date32Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::{DataType, Schema};
 use parquet::arrow::arrow_reader::{
-    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
+    ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
 };
 use parquet::file::metadata::ParquetMetaData;
 use std::collections::{HashMap, HashSet};
@@ -198,12 +203,85 @@ pub fn build_parquet_iter(
     Ok(Box::new(iter))
 }
 
+enum ParquetRangeReader {
+    Eager(ParquetRecordBatchReader),
+    Delayed(DelayedMaterializeReader),
+}
+
+struct DelayedMaterializeReader {
+    active_reader: ParquetRecordBatchReader,
+    lazy_reader: ParquetRecordBatchReader,
+    output_sources: Vec<DelayedColumnSource>,
+}
+
+#[derive(Clone, Copy)]
+enum DelayedColumnSource {
+    Active(usize),
+    Lazy(usize),
+}
+
+enum DelayedReaderDecision {
+    Use(DelayedMaterializeReader),
+    SkipRange,
+    Fallback,
+}
+
+impl DelayedMaterializeReader {
+    fn next_batch(&mut self) -> Option<Result<RecordBatch, String>> {
+        let active_next = self.active_reader.next();
+        let lazy_next = self.lazy_reader.next();
+        match (active_next, lazy_next) {
+            (Some(Ok(active_batch)), Some(Ok(lazy_batch))) => {
+                if active_batch.num_rows() != lazy_batch.num_rows() {
+                    return Some(Err(format!(
+                        "delayed materialization batch row mismatch: active_rows={} lazy_rows={}",
+                        active_batch.num_rows(),
+                        lazy_batch.num_rows()
+                    )));
+                }
+                let active_schema = active_batch.schema();
+                let lazy_schema = lazy_batch.schema();
+                let mut fields = Vec::with_capacity(self.output_sources.len());
+                let mut columns = Vec::with_capacity(self.output_sources.len());
+                for source in &self.output_sources {
+                    match source {
+                        DelayedColumnSource::Active(idx) => {
+                            fields.push(active_schema.field(*idx).as_ref().clone());
+                            columns.push(active_batch.column(*idx).clone());
+                        }
+                        DelayedColumnSource::Lazy(idx) => {
+                            fields.push(lazy_schema.field(*idx).as_ref().clone());
+                            columns.push(lazy_batch.column(*idx).clone());
+                        }
+                    }
+                }
+                let schema = Arc::new(Schema::new(fields));
+                match RecordBatch::try_new(schema, columns) {
+                    Ok(batch) => Some(Ok(batch)),
+                    Err(e) => Some(Err(e.to_string())),
+                }
+            }
+            (Some(Err(e)), _) => Some(Err(e.to_string())),
+            (_, Some(Err(e))) => Some(Err(e.to_string())),
+            (None, None) => None,
+            (Some(Ok(_)), None) => Some(Err(
+                "delayed materialization stream mismatch: active has rows but lazy reached EOF"
+                    .to_string(),
+            )),
+            (None, Some(Ok(_))) => Some(Err(
+                "delayed materialization stream mismatch: lazy has rows but active reached EOF"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
 struct ParquetScanIter {
     cfg: ParquetScanConfig,
     ranges: Vec<FileScanRange>,
     factory: OpendalRangeReaderFactory,
     range_idx: usize,
-    reader: Option<ParquetRecordBatchReader>,
+    reader: Option<ParquetRangeReader>,
     remaining: usize,
     limit: Option<usize>,
     profile: Option<RuntimeProfile>,
@@ -211,6 +289,12 @@ struct ParquetScanIter {
 }
 
 impl ParquetScanIter {
+    fn record_delayed_decision(&self, counter: &str) {
+        if let Some(profile) = self.profile.as_ref() {
+            profile.counter_add(counter, metrics::TUnit::UNIT, 1);
+        }
+    }
+
     fn current_predicates(&self) -> Result<Vec<MinMaxPredicate>, String> {
         let mut predicates = self.cfg.min_max_predicates.clone();
         if let Some(filters) = self.runtime_filters.as_ref() {
@@ -222,31 +306,44 @@ impl ParquetScanIter {
         Ok(predicates)
     }
 
-    fn build_parquet_reader(
+    fn new_parquet_builder(
+        &self,
+        cached_reader: &CachedRangeReader,
+    ) -> Result<ParquetRecordBatchReaderBuilder<ParquetCachedReader>, String> {
+        let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+        if self.cfg.enable_page_index {
+            opts = opts.with_page_index(true);
+        }
+        let parquet_reader =
+            ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
+        ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
+            .map_err(|e| e.to_string())
+    }
+
+    fn build_projected_parquet_reader(
         &self,
         mut builder: ParquetRecordBatchReaderBuilder<ParquetCachedReader>,
         metadata: &Arc<ParquetMetaData>,
         row_groups: &[usize],
+        projected_columns: &[String],
         predicates: &[MinMaxPredicate],
+        explicit_row_selection: Option<RowSelection>,
+        apply_page_selection: bool,
     ) -> Result<Option<ParquetRecordBatchReader>, String> {
-        // Set batch size if configured
         if let Some(batch_size) = self.cfg.batch_size {
             builder = builder.with_batch_size(batch_size);
             debug!("parquet reader: batch_size={}", batch_size);
         }
 
-        if !self.cfg.columns.is_empty() {
+        if !projected_columns.is_empty() {
             let mask = {
                 let arrow_schema = builder.schema();
                 let parquet_schema = builder.parquet_schema();
                 let mut indices = Vec::new();
-                for col_name in &self.cfg.columns {
-                    // Skip ___count___ column - it's a special optimization column for count(*)
-                    // that doesn't exist in the parquet file
+                for col_name in projected_columns {
                     if col_name == "___count___" {
                         continue;
                     }
-
                     let idx = if self.cfg.case_sensitive {
                         arrow_schema.index_of(col_name).ok()
                     } else {
@@ -255,7 +352,6 @@ impl ParquetScanIter {
                             .iter()
                             .position(|f| f.name().eq_ignore_ascii_case(col_name))
                     };
-
                     if let Some(i) = idx {
                         indices.push(i);
                     } else {
@@ -271,19 +367,19 @@ impl ParquetScanIter {
             builder = builder.with_limit(self.remaining);
         }
 
-        if self.cfg.enable_page_index && !predicates.is_empty() {
+        if let Some(selection) = explicit_row_selection {
+            builder = builder.with_row_selection(selection);
+        } else if apply_page_selection && self.cfg.enable_page_index && !predicates.is_empty() {
             let selection = build_row_selection_for_row_groups(
                 metadata,
                 row_groups,
                 predicates,
-                &self.cfg.columns,
+                projected_columns,
                 self.cfg.case_sensitive,
             );
-
             if selection.rows_selected == 0 {
                 return Ok(None);
             }
-
             if let Some(sel) = selection.selection {
                 builder = builder.with_row_selection(sel);
             }
@@ -292,6 +388,24 @@ impl ParquetScanIter {
         builder = builder.with_row_groups(row_groups.to_vec());
         let reader = builder.build().map_err(|e| e.to_string())?;
         Ok(Some(reader))
+    }
+
+    fn build_parquet_reader(
+        &self,
+        builder: ParquetRecordBatchReaderBuilder<ParquetCachedReader>,
+        metadata: &Arc<ParquetMetaData>,
+        row_groups: &[usize],
+        predicates: &[MinMaxPredicate],
+    ) -> Result<Option<ParquetRecordBatchReader>, String> {
+        self.build_projected_parquet_reader(
+            builder,
+            metadata,
+            row_groups,
+            &self.cfg.columns,
+            predicates,
+            None,
+            true,
+        )
     }
 
     fn new(
@@ -314,6 +428,108 @@ impl ParquetScanIter {
             profile,
             runtime_filters,
         }
+    }
+
+    fn maybe_build_delayed_reader(
+        &self,
+        cached_reader: &CachedRangeReader,
+        metadata: &Arc<ParquetMetaData>,
+        row_groups: &[usize],
+        predicates: &[MinMaxPredicate],
+    ) -> Result<DelayedReaderDecision, String> {
+        self.record_delayed_decision("ParquetDelayedDecisionTry");
+        let Some(plan) =
+            build_delayed_projection_plan(predicates, &self.cfg.columns, self.cfg.case_sensitive)
+        else {
+            self.record_delayed_decision("ParquetDelayedDecisionFallbackNoPlan");
+            return Ok(DelayedReaderDecision::Fallback);
+        };
+
+        // Use page index as a cheap pre-check: only enable delayed materialization when
+        // it can actually prune rows in this range. This avoids an expensive pre-scan
+        // that would otherwise fallback to eager path with no pruning benefit.
+        let selection = build_row_selection_for_row_groups(
+            metadata,
+            row_groups,
+            predicates,
+            &self.cfg.columns,
+            self.cfg.case_sensitive,
+        );
+
+        if selection.rows_selected == 0 {
+            self.record_delayed_decision("ParquetDelayedDecisionSkipRangeNoRows");
+            return Ok(DelayedReaderDecision::SkipRange);
+        }
+        if selection.selection.is_none() || selection.rows_selected == selection.rows_total {
+            self.record_delayed_decision("ParquetDelayedDecisionFallbackNoPagePrune");
+            return Ok(DelayedReaderDecision::Fallback);
+        }
+        let base_selection = selection.selection.clone().expect("checked is_some");
+
+        let output_sources = build_delayed_output_sources(
+            &self.cfg.columns,
+            &plan.active_columns,
+            &plan.lazy_columns,
+            self.cfg.case_sensitive,
+        )?;
+        let active_selection = base_selection.clone();
+        let lazy_selection = base_selection;
+
+        let active_builder = self.new_parquet_builder(cached_reader)?;
+        let lazy_builder = self.new_parquet_builder(cached_reader)?;
+        let Some(active_reader) = self.build_projected_parquet_reader(
+            active_builder,
+            metadata,
+            row_groups,
+            &plan.active_columns,
+            predicates,
+            Some(active_selection),
+            false,
+        )?
+        else {
+            return Ok(DelayedReaderDecision::SkipRange);
+        };
+        let Some(lazy_reader) = self.build_projected_parquet_reader(
+            lazy_builder,
+            metadata,
+            row_groups,
+            &plan.lazy_columns,
+            predicates,
+            Some(lazy_selection),
+            false,
+        )?
+        else {
+            self.record_delayed_decision("ParquetDelayedDecisionSkipRangeLazyReaderEmpty");
+            return Ok(DelayedReaderDecision::SkipRange);
+        };
+
+        self.record_delayed_decision("ParquetDelayedDecisionUse");
+        if let Some(profile) = self.profile.as_ref() {
+            profile.counter_add("ParquetDelayedRange", metrics::TUnit::UNIT, 1);
+            profile.counter_add(
+                "ParquetDelayedRowsTotal",
+                metrics::TUnit::UNIT,
+                clamp_u128_to_i64(selection.rows_total as u128),
+            );
+            profile.counter_add(
+                "ParquetDelayedRowsSelected",
+                metrics::TUnit::UNIT,
+                clamp_u128_to_i64(selection.rows_selected as u128),
+            );
+            profile.counter_add(
+                "ParquetDelayedRowsPruned",
+                metrics::TUnit::UNIT,
+                clamp_u128_to_i64(
+                    selection.rows_total.saturating_sub(selection.rows_selected) as u128
+                ),
+            );
+        }
+
+        Ok(DelayedReaderDecision::Use(DelayedMaterializeReader {
+            active_reader,
+            lazy_reader,
+            output_sources,
+        }))
     }
 
     fn open_next_reader(&mut self) -> Result<bool, String> {
@@ -339,11 +555,21 @@ impl ParquetScanIter {
                 profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
             }
 
+            let open_file_start = std::time::Instant::now();
             let reader = self
                 .factory
                 .open_with_len(&path, len)
                 .map(|r| r.with_modification_time_override(range_modification_time))
                 .map_err(|e| e.to_string())?;
+            let open_file_ns = open_file_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "OpenFile",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(open_file_ns),
+                );
+            }
+            let reader_init_start = std::time::Instant::now();
             let identity = reader.file_identity().clone();
             let meta_cache_evict_probability = u32::try_from(
                 self.cfg
@@ -362,18 +588,19 @@ impl ParquetScanIter {
                 None
             };
 
+            let cached_reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
             // Build reader - parquet crate will still read footer, but we can use cached metadata
             // for row group filtering to avoid re-parsing
-            let mut opts = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
-            if self.cfg.enable_page_index {
-                opts = opts.with_page_index(true);
+            let footer_read_start = std::time::Instant::now();
+            let builder = self.new_parquet_builder(&cached_reader)?;
+            let footer_read_ns = footer_read_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ReaderInitFooterRead",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(footer_read_ns),
+                );
             }
-            let cached_reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
-            let parquet_reader =
-                ParquetCachedReader::new(cached_reader.clone(), self.cfg.cache_policy.clone());
-            let builder =
-                ParquetRecordBatchReaderBuilder::try_new_with_options(parquet_reader, opts)
-                    .map_err(|e| e.to_string())?;
 
             // If we have cached metadata, verify it matches and use it for optimization
             if let Some(cached_meta) = cached_metadata {
@@ -480,6 +707,14 @@ impl ParquetScanIter {
 
                 if row_groups.is_empty() {
                     debug!("all row groups filtered out for file: {}", path);
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    if let Some(profile) = self.profile.as_ref() {
+                        profile.counter_add(
+                            "ReaderInit",
+                            metrics::TUnit::TIME_NS,
+                            clamp_u128_to_i64(reader_init_ns),
+                        );
+                    }
                     continue;
                 }
                 debug!(
@@ -494,6 +729,14 @@ impl ParquetScanIter {
             };
 
             if row_groups.is_empty() {
+                let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                if let Some(profile) = self.profile.as_ref() {
+                    profile.counter_add(
+                        "ReaderInit",
+                        metrics::TUnit::TIME_NS,
+                        clamp_u128_to_i64(reader_init_ns),
+                    );
+                }
                 continue;
             }
             let active_projection_columns = build_active_projection_columns(
@@ -517,9 +760,57 @@ impl ParquetScanIter {
             // TODO: Unlike StarRocks, this implementation fixes the row-group set when opening
             // the range-level reader. Late-arriving runtime filters cannot re-prune row groups
             // within the same range and may reduce pruning efficiency.
-            if let Some(reader) =
-                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?
-            {
+            match self.maybe_build_delayed_reader(
+                &cached_reader,
+                &metadata,
+                &row_groups,
+                &predicates,
+            )? {
+                DelayedReaderDecision::Use(reader) => {
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    if let Some(profile) = self.profile.as_ref() {
+                        profile.counter_add(
+                            "ReaderInit",
+                            metrics::TUnit::TIME_NS,
+                            clamp_u128_to_i64(reader_init_ns),
+                        );
+                    }
+                    let prep_ns = prep_start.elapsed().as_nanos() as u128;
+                    if let Some(profile) = self.profile.as_ref() {
+                        profile.counter_add(
+                            "PrepareChunkSourceTime",
+                            metrics::TUnit::TIME_NS,
+                            clamp_u128_to_i64(prep_ns),
+                        );
+                    }
+                    self.reader = Some(ParquetRangeReader::Delayed(reader));
+                    return Ok(true);
+                }
+                DelayedReaderDecision::SkipRange => {
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    if let Some(profile) = self.profile.as_ref() {
+                        profile.counter_add(
+                            "ReaderInit",
+                            metrics::TUnit::TIME_NS,
+                            clamp_u128_to_i64(reader_init_ns),
+                        );
+                    }
+                    continue;
+                }
+                DelayedReaderDecision::Fallback => {}
+            }
+
+            let maybe_reader =
+                self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?;
+            let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ReaderInit",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(reader_init_ns),
+                );
+            }
+            if let Some(reader) = maybe_reader {
                 let prep_ns = prep_start.elapsed().as_nanos() as u128;
                 if let Some(profile) = self.profile.as_ref() {
                     profile.counter_add(
@@ -528,7 +819,7 @@ impl ParquetScanIter {
                         clamp_u128_to_i64(prep_ns),
                     );
                 }
-                self.reader = Some(reader);
+                self.reader = Some(ParquetRangeReader::Eager(reader));
                 return Ok(true);
             }
         }
@@ -552,7 +843,22 @@ impl Iterator for ParquetScanIter {
             }
 
             let reader = self.reader.as_mut().expect("reader");
-            match reader.next() {
+            let column_read_start = std::time::Instant::now();
+            let next_batch = match reader {
+                ParquetRangeReader::Eager(reader) => {
+                    reader.next().map(|r| r.map_err(|e| e.to_string()))
+                }
+                ParquetRangeReader::Delayed(reader) => reader.next_batch(),
+            };
+            let column_read_ns = column_read_start.elapsed().as_nanos() as u128;
+            if let Some(profile) = self.profile.as_ref() {
+                profile.counter_add(
+                    "ColumnReadTime",
+                    metrics::TUnit::TIME_NS,
+                    clamp_u128_to_i64(column_read_ns),
+                );
+            }
+            match next_batch {
                 Some(Ok(batch)) => {
                     if batch.num_rows() == 0 {
                         continue;
@@ -588,13 +894,415 @@ impl Iterator for ParquetScanIter {
                 }
                 Some(Err(e)) => {
                     self.reader = None;
-                    return Some(Err(e.to_string()));
+                    return Some(Err(e));
                 }
                 None => {
                     self.reader = None;
                 }
             }
         }
+    }
+}
+
+struct DelayedProjectionPlan {
+    active_columns: Vec<String>,
+    lazy_columns: Vec<String>,
+}
+
+fn build_delayed_projection_plan(
+    predicates: &[MinMaxPredicate],
+    projected_columns: &[String],
+    case_sensitive: bool,
+) -> Option<DelayedProjectionPlan> {
+    if predicates.is_empty() || projected_columns.is_empty() {
+        return None;
+    }
+    if projected_columns.iter().any(|c| c == "___count___") {
+        return None;
+    }
+
+    let active_projection_columns =
+        build_active_projection_columns(predicates, projected_columns, case_sensitive);
+    if active_projection_columns.is_empty() {
+        return None;
+    }
+
+    let mut active_columns = Vec::new();
+    let mut lazy_columns = Vec::new();
+    for col in projected_columns {
+        if is_active_projection_column(col, &active_projection_columns, case_sensitive) {
+            active_columns.push(col.clone());
+        } else {
+            lazy_columns.push(col.clone());
+        }
+    }
+    if active_columns.is_empty() || lazy_columns.is_empty() {
+        return None;
+    }
+
+    Some(DelayedProjectionPlan {
+        active_columns,
+        lazy_columns,
+    })
+}
+
+fn build_delayed_output_sources(
+    output_columns: &[String],
+    active_columns: &[String],
+    lazy_columns: &[String],
+    case_sensitive: bool,
+) -> Result<Vec<DelayedColumnSource>, String> {
+    let mut output_sources = Vec::with_capacity(output_columns.len());
+    for col_name in output_columns {
+        if let Some(idx) = find_column_index_by_name(active_columns, col_name, case_sensitive) {
+            output_sources.push(DelayedColumnSource::Active(idx));
+            continue;
+        }
+        if let Some(idx) = find_column_index_by_name(lazy_columns, col_name, case_sensitive) {
+            output_sources.push(DelayedColumnSource::Lazy(idx));
+            continue;
+        }
+        return Err(format!(
+            "delayed materialization output column {} not found in active/lazy projection",
+            col_name
+        ));
+    }
+    Ok(output_sources)
+}
+
+fn find_column_index_by_name(
+    columns: &[String],
+    col_name: &str,
+    case_sensitive: bool,
+) -> Option<usize> {
+    columns.iter().position(|c| {
+        if case_sensitive {
+            c == col_name
+        } else {
+            c.eq_ignore_ascii_case(col_name)
+        }
+    })
+}
+
+#[cfg(test)]
+fn predicate_column_name<'a>(
+    predicate: &MinMaxPredicate,
+    projected_columns: &'a [String],
+) -> Option<&'a str> {
+    let idx = predicate.column().parse::<usize>().ok()?;
+    let col_name = projected_columns.get(idx)?;
+    if col_name == "___count___" {
+        return None;
+    }
+    Some(col_name.as_str())
+}
+
+#[cfg(test)]
+fn find_column_index_in_schema(
+    schema: &Schema,
+    col_name: &str,
+    case_sensitive: bool,
+) -> Option<usize> {
+    if case_sensitive {
+        return schema.index_of(col_name).ok();
+    }
+    schema
+        .fields()
+        .iter()
+        .position(|f| f.name().eq_ignore_ascii_case(col_name))
+}
+
+#[cfg(test)]
+fn evaluate_batch_predicate_mask(
+    batch: &RecordBatch,
+    predicates: &[MinMaxPredicate],
+    projected_columns: &[String],
+    case_sensitive: bool,
+) -> Result<(Vec<bool>, bool), String> {
+    let row_count = batch.num_rows();
+    let mut selected = vec![true; row_count];
+    let mut has_effective_predicate = false;
+    let schema = batch.schema();
+
+    for predicate in predicates {
+        let Some(col_name) = predicate_column_name(predicate, projected_columns) else {
+            continue;
+        };
+        let Some(col_idx) = find_column_index_in_schema(schema.as_ref(), col_name, case_sensitive)
+        else {
+            continue;
+        };
+
+        let Some(predicate_mask) =
+            evaluate_min_max_predicate_mask(batch.column(col_idx), predicate)?
+        else {
+            continue;
+        };
+
+        has_effective_predicate = true;
+        let mut any_selected = false;
+        for (selected_row, predicate_ok) in selected.iter_mut().zip(predicate_mask.into_iter()) {
+            *selected_row = *selected_row && predicate_ok;
+            if *selected_row {
+                any_selected = true;
+            }
+        }
+        if !any_selected {
+            break;
+        }
+    }
+
+    Ok((selected, has_effective_predicate))
+}
+
+#[cfg(test)]
+fn evaluate_min_max_predicate_mask(
+    array: &ArrayRef,
+    predicate: &MinMaxPredicate,
+) -> Result<Option<Vec<bool>>, String> {
+    match array.data_type() {
+        DataType::Int8 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "failed to downcast INT8 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_i64(arr.value(idx) as i64, v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::Int16 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to downcast INT16 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_i64(arr.value(idx) as i64, v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::Int32 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to downcast INT32 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_i64(arr.value(idx) as i64, v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::Int64 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to downcast INT64 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_i64(arr.value(idx), v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::UInt8 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let Ok(v) = u64::try_from(v) else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| "failed to downcast UINT8 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_u64(arr.value(idx) as u64, v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::UInt16 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let Ok(v) = u64::try_from(v) else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .ok_or_else(|| "failed to downcast UINT16 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_u64(arr.value(idx) as u64, v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::UInt32 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let Ok(v) = u64::try_from(v) else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .ok_or_else(|| "failed to downcast UINT32 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_u64(arr.value(idx) as u64, v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::UInt64 => {
+            let Some(v) = predicate.value().as_i64() else {
+                return Ok(None);
+            };
+            let Ok(v) = u64::try_from(v) else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| "failed to downcast UINT64 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_u64(arr.value(idx), v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::Date32 => {
+            let Some(v) = predicate.value().as_date32() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast DATE32 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_i32(arr.value(idx), v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        DataType::Float32 => {
+            let Some(v) = predicate.value().as_f64() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast FLOAT32 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                let value = arr.value(idx) as f64;
+                out.push(!arr.is_null(idx) && value_satisfies_predicate_f64(value, v, predicate));
+            }
+            Ok(Some(out))
+        }
+        DataType::Float64 => {
+            let Some(v) = predicate.value().as_f64() else {
+                return Ok(None);
+            };
+            let arr = array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast FLOAT64 array".to_string())?;
+            let mut out = Vec::with_capacity(arr.len());
+            for idx in 0..arr.len() {
+                out.push(
+                    !arr.is_null(idx)
+                        && value_satisfies_predicate_f64(arr.value(idx), v, predicate),
+                );
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+fn value_satisfies_predicate_i64(value: i64, target: i64, predicate: &MinMaxPredicate) -> bool {
+    match predicate {
+        MinMaxPredicate::Le { .. } => value <= target,
+        MinMaxPredicate::Ge { .. } => value >= target,
+        MinMaxPredicate::Lt { .. } => value < target,
+        MinMaxPredicate::Gt { .. } => value > target,
+        MinMaxPredicate::Eq { .. } => value == target,
+    }
+}
+
+#[cfg(test)]
+fn value_satisfies_predicate_u64(value: u64, target: u64, predicate: &MinMaxPredicate) -> bool {
+    match predicate {
+        MinMaxPredicate::Le { .. } => value <= target,
+        MinMaxPredicate::Ge { .. } => value >= target,
+        MinMaxPredicate::Lt { .. } => value < target,
+        MinMaxPredicate::Gt { .. } => value > target,
+        MinMaxPredicate::Eq { .. } => value == target,
+    }
+}
+
+#[cfg(test)]
+fn value_satisfies_predicate_i32(value: i32, target: i32, predicate: &MinMaxPredicate) -> bool {
+    match predicate {
+        MinMaxPredicate::Le { .. } => value <= target,
+        MinMaxPredicate::Ge { .. } => value >= target,
+        MinMaxPredicate::Lt { .. } => value < target,
+        MinMaxPredicate::Gt { .. } => value > target,
+        MinMaxPredicate::Eq { .. } => value == target,
+    }
+}
+
+#[cfg(test)]
+fn value_satisfies_predicate_f64(value: f64, target: f64, predicate: &MinMaxPredicate) -> bool {
+    match predicate {
+        MinMaxPredicate::Le { .. } => value <= target,
+        MinMaxPredicate::Ge { .. } => value >= target,
+        MinMaxPredicate::Lt { .. } => value < target,
+        MinMaxPredicate::Gt { .. } => value > target,
+        MinMaxPredicate::Eq { .. } => value == target,
     }
 }
 
@@ -932,7 +1640,7 @@ mod tests {
     use std::fs::{self, File};
     use std::sync::Arc;
 
-    use arrow::array::Int32Array;
+    use arrow::array::{Float64Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
     use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -941,8 +1649,9 @@ mod tests {
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
 
     use super::{
-        ParquetReadCachePolicy, build_active_projection_columns,
-        collect_parquet_coalesce_io_ranges, reader::ParquetCachedReader,
+        ParquetReadCachePolicy, build_active_projection_columns, build_delayed_output_sources,
+        build_delayed_projection_plan, collect_parquet_coalesce_io_ranges,
+        evaluate_batch_predicate_mask, reader::ParquetCachedReader,
     };
 
     #[test]
@@ -1098,5 +1807,93 @@ mod tests {
         );
         assert!(!io_ranges.active.is_empty());
         assert!(!io_ranges.lazy.is_empty());
+    }
+
+    #[test]
+    fn delayed_projection_plan_splits_active_and_lazy_columns() {
+        let predicates = vec![super::MinMaxPredicate::Ge {
+            column: "0".to_string(),
+            value: super::MinMaxPredicateValue::Int32(10),
+        }];
+        let plan = build_delayed_projection_plan(
+            &predicates,
+            &[
+                "predicate_col".to_string(),
+                "lazy_col_a".to_string(),
+                "lazy_col_b".to_string(),
+            ],
+            true,
+        )
+        .expect("delayed plan");
+        assert_eq!(plan.active_columns, vec!["predicate_col".to_string()]);
+        assert_eq!(
+            plan.lazy_columns,
+            vec!["lazy_col_a".to_string(), "lazy_col_b".to_string()]
+        );
+    }
+
+    #[test]
+    fn evaluate_batch_predicate_mask_applies_min_max_predicates() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("discount", DataType::Int32, true),
+            Field::new("quantity", DataType::Int32, true),
+            Field::new("revenue", DataType::Float64, true),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(4), None])),
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    Some(30),
+                    Some(20),
+                    Some(5),
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(10.0),
+                    Some(20.0),
+                    Some(30.0),
+                    Some(40.0),
+                ])),
+            ],
+        )
+        .expect("record batch");
+        let predicates = vec![
+            super::MinMaxPredicate::Ge {
+                column: "0".to_string(),
+                value: super::MinMaxPredicateValue::Int32(2),
+            },
+            super::MinMaxPredicate::Lt {
+                column: "1".to_string(),
+                value: super::MinMaxPredicateValue::Int32(25),
+            },
+        ];
+        let (mask, has_effective_predicate) = evaluate_batch_predicate_mask(
+            &batch,
+            &predicates,
+            &[
+                "discount".to_string(),
+                "quantity".to_string(),
+                "revenue".to_string(),
+            ],
+            true,
+        )
+        .expect("evaluate mask");
+        assert!(has_effective_predicate);
+        assert_eq!(mask, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn build_delayed_output_sources_supports_case_insensitive_mapping() {
+        let sources = build_delayed_output_sources(
+            &["ColA".to_string(), "colb".to_string()],
+            &["cola".to_string()],
+            &["COLB".to_string()],
+            false,
+        )
+        .expect("output sources");
+        assert_eq!(sources.len(), 2);
+        assert!(matches!(sources[0], super::DelayedColumnSource::Active(0)));
+        assert!(matches!(sources[1], super::DelayedColumnSource::Lazy(0)));
     }
 }

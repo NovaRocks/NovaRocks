@@ -40,6 +40,9 @@ use crate::exec::chunk::Chunk;
 
 use super::min_max::RuntimeMinMaxFilter;
 
+const DEFAULT_L2_CACHE_SIZE: usize = 1 * 1024 * 1024;
+const DEFAULT_L3_CACHE_SIZE: usize = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 /// Bitset-based runtime filter for exact membership tests on compact value domains.
 pub(crate) struct RuntimeBitsetFilter {
@@ -104,6 +107,18 @@ impl RuntimeBitsetFilter {
 
     pub(crate) fn size(&self) -> u64 {
         self.size
+    }
+
+    pub(in crate::exec::runtime_filter) fn min_value(&self) -> i64 {
+        self.min_value
+    }
+
+    pub(in crate::exec::runtime_filter) fn max_value(&self) -> i64 {
+        self.max_value
+    }
+
+    pub(in crate::exec::runtime_filter) fn bitset(&self) -> &[u8] {
+        &self.bitset
     }
 
     pub(crate) fn min_max(&self) -> &RuntimeMinMaxFilter {
@@ -215,6 +230,295 @@ impl RuntimeBitsetFilter {
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         Ok(Some(Chunk::new(filtered_batch)))
     }
+}
+
+pub(crate) fn maybe_build_runtime_bitset_filter(
+    filter_id: i32,
+    slot_id: SlotId,
+    ltype: crate::types::TPrimitiveType,
+    join_mode: i8,
+    size: u64,
+    arrays: &[ArrayRef],
+    min_max: RuntimeMinMaxFilter,
+) -> Result<Option<RuntimeBitsetFilter>, String> {
+    if arrays.is_empty() || size == 0 {
+        return Ok(None);
+    }
+    if !supports_runtime_bitset_ltype(&ltype) {
+        return Ok(None);
+    }
+
+    let (has_null, min_value, max_value) = match scan_bitset_build_stats(&ltype, arrays)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if min_value > max_value {
+        return Ok(None);
+    }
+
+    let value_interval = match (max_value as i128)
+        .checked_sub(min_value as i128)
+        .and_then(|v| v.checked_add(1))
+    {
+        Some(v) if v > 0 => v as u128,
+        _ => return Ok(None),
+    };
+    let bitset_bytes_u128 = (value_interval + 7) / 8;
+    let bitset_bytes = match usize::try_from(bitset_bytes_u128) {
+        Ok(v) if v > 0 => v,
+        _ => return Ok(None),
+    };
+    let bloom_bytes = usize::try_from(size).unwrap_or(usize::MAX);
+    if !should_use_bitset(bitset_bytes, bloom_bytes) {
+        return Ok(None);
+    }
+
+    let mut bitset = vec![0u8; bitset_bytes];
+    fill_bitset_from_arrays(&ltype, arrays, min_value, max_value, &mut bitset)?;
+    Ok(Some(RuntimeBitsetFilter::new(
+        filter_id, slot_id, ltype, has_null, join_mode, size, min_value, max_value, bitset, min_max,
+    )))
+}
+
+fn supports_runtime_bitset_ltype(ltype: &crate::types::TPrimitiveType) -> bool {
+    use crate::types::TPrimitiveType;
+    matches!(
+        ltype,
+        t if *t == TPrimitiveType::BOOLEAN
+            || *t == TPrimitiveType::TINYINT
+            || *t == TPrimitiveType::SMALLINT
+            || *t == TPrimitiveType::INT
+            || *t == TPrimitiveType::BIGINT
+            || *t == TPrimitiveType::DATE
+    )
+}
+
+fn should_use_bitset(bitset_memory_usage: usize, bloom_memory_usage: usize) -> bool {
+    bitset_memory_usage <= bloom_memory_usage
+        || (bitset_memory_usage <= bloom_memory_usage.saturating_mul(4)
+            && bitset_memory_usage <= DEFAULT_L2_CACHE_SIZE)
+        || (bitset_memory_usage <= bloom_memory_usage.saturating_mul(2)
+            && bitset_memory_usage <= DEFAULT_L3_CACHE_SIZE)
+}
+
+fn scan_bitset_build_stats(
+    ltype: &crate::types::TPrimitiveType,
+    arrays: &[ArrayRef],
+) -> Result<Option<(bool, i64, i64)>, String> {
+    let mut has_null = false;
+    let mut has_value = false;
+    let mut min_value = i64::MAX;
+    let mut max_value = i64::MIN;
+    let mut update = |value: i64| {
+        has_value = true;
+        if value < min_value {
+            min_value = value;
+        }
+        if value > max_value {
+            max_value = value;
+        }
+    };
+
+    for array in arrays {
+        match array.data_type() {
+            DataType::Boolean if *ltype == crate::types::TPrimitiveType::BOOLEAN => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Boolean".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(if arr.value(i) { 1 } else { 0 });
+                }
+            }
+            DataType::Int8 if *ltype == crate::types::TPrimitiveType::TINYINT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int8".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(arr.value(i) as i64);
+                }
+            }
+            DataType::Int16 if *ltype == crate::types::TPrimitiveType::SMALLINT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int16".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(arr.value(i) as i64);
+                }
+            }
+            DataType::Int32 if *ltype == crate::types::TPrimitiveType::INT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int32".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(arr.value(i) as i64);
+                }
+            }
+            DataType::Int64 if *ltype == crate::types::TPrimitiveType::BIGINT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int64".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(arr.value(i));
+                }
+            }
+            DataType::Date32 if *ltype == crate::types::TPrimitiveType::DATE => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Date32".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        has_null = true;
+                        continue;
+                    }
+                    update(arr.value(i) as i64);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
+                    ltype,
+                    array.data_type()
+                ));
+            }
+        }
+    }
+
+    if !has_value {
+        return Ok(None);
+    }
+    Ok(Some((has_null, min_value, max_value)))
+}
+
+fn fill_bitset_from_arrays(
+    ltype: &crate::types::TPrimitiveType,
+    arrays: &[ArrayRef],
+    min_value: i64,
+    max_value: i64,
+    bitset: &mut [u8],
+) -> Result<(), String> {
+    let mut set_value = |value: i64| {
+        if value < min_value || value > max_value {
+            return;
+        }
+        let offset = (value - min_value) as u64;
+        let byte_idx = (offset / 8) as usize;
+        if byte_idx >= bitset.len() {
+            return;
+        }
+        let bit_idx = (offset % 8) as u8;
+        bitset[byte_idx] |= 1u8 << bit_idx;
+    };
+
+    for array in arrays {
+        match array.data_type() {
+            DataType::Boolean if *ltype == crate::types::TPrimitiveType::BOOLEAN => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Boolean".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(if arr.value(i) { 1 } else { 0 });
+                }
+            }
+            DataType::Int8 if *ltype == crate::types::TPrimitiveType::TINYINT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int8Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int8".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(arr.value(i) as i64);
+                }
+            }
+            DataType::Int16 if *ltype == crate::types::TPrimitiveType::SMALLINT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int16".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(arr.value(i) as i64);
+                }
+            }
+            DataType::Int32 if *ltype == crate::types::TPrimitiveType::INT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int32".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(arr.value(i) as i64);
+                }
+            }
+            DataType::Int64 if *ltype == crate::types::TPrimitiveType::BIGINT => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Int64".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(arr.value(i));
+                }
+            }
+            DataType::Date32 if *ltype == crate::types::TPrimitiveType::DATE => {
+                let arr = array
+                    .as_any()
+                    .downcast_ref::<Date32Array>()
+                    .ok_or_else(|| "runtime bitset build type mismatch for Date32".to_string())?;
+                for i in 0..arr.len() {
+                    if arr.is_null(i) {
+                        continue;
+                    }
+                    set_value(arr.value(i) as i64);
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "runtime bitset build unsupported type mapping: ltype={:?} data_type={:?}",
+                    ltype,
+                    array.data_type()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_bitset_filter(

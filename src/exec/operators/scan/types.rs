@@ -36,6 +36,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 struct ScanBufferState {
     queue: VecDeque<Chunk>,
@@ -43,9 +44,16 @@ struct ScanBufferState {
     error: Option<String>,
 }
 
+struct IoExecState {
+    active_tasks: usize,
+    active_since: Option<Instant>,
+    idle_since: Option<Instant>,
+}
+
 /// Shared async scan queue/state observed by scan workers and scan source operators.
 pub(super) struct ScanAsyncState {
     mu: Mutex<ScanBufferState>,
+    io_exec_state: Mutex<IoExecState>,
     observable: Arc<Observable>,
     canceled: AtomicBool,
     max_buffered: usize,
@@ -67,6 +75,11 @@ impl ScanAsyncState {
                 queue: VecDeque::new(),
                 finished: false,
                 error: None,
+            }),
+            io_exec_state: Mutex::new(IoExecState {
+                active_tasks: 0,
+                active_since: None,
+                idle_since: None,
             }),
             observable: Arc::new(Observable::new()),
             canceled: AtomicBool::new(false),
@@ -169,6 +182,40 @@ impl ScanAsyncState {
                 chunk.transfer_to(&tracker);
             }
         }
+    }
+
+    pub(super) fn begin_io_task_exec(&self) -> u128 {
+        let mut state = self.io_exec_state.lock().expect("scan io exec state lock");
+        state.active_tasks = state.active_tasks.saturating_add(1);
+        if state.active_tasks == 1 {
+            let now = Instant::now();
+            let idle_ns = state
+                .idle_since
+                .take()
+                .map(|idle_since| now.duration_since(idle_since).as_nanos())
+                .unwrap_or(0);
+            state.active_since = Some(now);
+            return idle_ns;
+        }
+        0
+    }
+
+    pub(super) fn end_io_task_exec(&self) -> u128 {
+        let mut state = self.io_exec_state.lock().expect("scan io exec state lock");
+        if state.active_tasks == 0 {
+            return 0;
+        }
+        state.active_tasks -= 1;
+        if state.active_tasks != 0 {
+            return 0;
+        }
+        let now = Instant::now();
+        let Some(start) = state.active_since.take() else {
+            state.idle_since = Some(now);
+            return 0;
+        };
+        state.idle_since = Some(now);
+        now.duration_since(start).as_nanos()
     }
 }
 
