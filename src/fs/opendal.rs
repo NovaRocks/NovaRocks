@@ -31,6 +31,14 @@ use tokio::runtime::Runtime;
 
 pub const DEFAULT_OPENDAL_READ_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_READ_CONCURRENCY_LOG_INTERVAL_MS: u64 = 30_000;
+const IO_TASK_EXEC_TIME_COUNTER: &str = "IOTaskExecTime";
+const INPUT_STREAM_PROFILE_GROUP: &str = "InputStream";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteReadKind {
+    Direct,
+    SharedBuffered,
+}
 
 #[derive(Debug)]
 struct RemoteReadConcurrencyWindow {
@@ -173,7 +181,6 @@ fn remote_read_concurrency_tracker() -> &'static RemoteReadConcurrencyTracker {
 pub(crate) struct OpendalRemoteIoCounters {
     read_requests: CounterRef,
     bytes_read: CounterRef,
-    io_timer: CounterRef,
     app_io_time: CounterRef,
     fs_io_time: CounterRef,
     remote_read_in_flight_peak: CounterRef,
@@ -182,12 +189,16 @@ pub(crate) struct OpendalRemoteIoCounters {
 
 impl OpendalRemoteIoCounters {
     fn new(profile: &RuntimeProfile) -> Self {
+        let _ = profile.add_child_counter(
+            INPUT_STREAM_PROFILE_GROUP,
+            metrics::TUnit::NONE,
+            IO_TASK_EXEC_TIME_COUNTER,
+        );
         Self {
             read_requests: profile.add_counter("ReadRequests", metrics::TUnit::UNIT),
             bytes_read: profile.add_counter("BytesRead", metrics::TUnit::BYTES),
-            io_timer: profile.add_counter("IOTimer", metrics::TUnit::TIME_NS),
-            app_io_time: profile.add_counter("AppIOTime", metrics::TUnit::TIME_NS),
-            fs_io_time: profile.add_counter("FSIOTime", metrics::TUnit::TIME_NS),
+            app_io_time: profile.add_child_timer("AppIOTime", INPUT_STREAM_PROFILE_GROUP),
+            fs_io_time: profile.add_child_timer("FSIOTime", INPUT_STREAM_PROFILE_GROUP),
             remote_read_in_flight_peak: profile
                 .add_counter("RemoteReadInFlightPeak", metrics::TUnit::UNIT),
             observed_remote_read_peak: Arc::new(AtomicI64::new(0)),
@@ -213,13 +224,13 @@ impl OpendalRemoteIoCounters {
         }
     }
 
-    pub(crate) fn record_remote_read(&self, length: usize, io_ns: u128) {
+    pub(crate) fn record_remote_read(&self, length: usize, io_ns: u128, kind: RemoteReadKind) {
         self.read_requests.add(1);
         self.bytes_read.add(clamp_u128_to_i64(length as u128));
         let io_ns = clamp_u128_to_i64(io_ns);
-        self.io_timer.add(io_ns);
         self.app_io_time.add(io_ns);
         self.fs_io_time.add(io_ns);
+        let _ = kind;
     }
 }
 
@@ -385,10 +396,19 @@ impl OpendalRangeReader {
                 ),
             ));
         }
-        self.read_remote_range(start, end)
+        self.read_remote_range_with_kind(start, end, RemoteReadKind::SharedBuffered)
     }
 
     pub(crate) fn read_remote_range(&self, start: u64, end: u64) -> io::Result<Bytes> {
+        self.read_remote_range_with_kind(start, end, RemoteReadKind::Direct)
+    }
+
+    pub(crate) fn read_remote_range_with_kind(
+        &self,
+        start: u64,
+        end: u64,
+        kind: RemoteReadKind,
+    ) -> io::Result<Bytes> {
         let length = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX);
         if length == 0 {
             return Ok(Bytes::new());
@@ -435,7 +455,7 @@ impl OpendalRangeReader {
             )
         })?;
         if let Some(counters) = self.counters.as_ref() {
-            counters.record_remote_read(length, io_ns);
+            counters.record_remote_read(length, io_ns, kind);
         }
         Ok(data.to_bytes())
     }

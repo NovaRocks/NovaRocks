@@ -64,6 +64,16 @@ use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
+const IO_TASK_EXEC_TIME_COUNTER: &str = "IOTaskExecTime";
+const PARQUET_PROFILE_GROUP: &str = "Parquet";
+const INPUT_STREAM_PROFILE_GROUP: &str = "InputStream";
+const SHARED_BUFFERED_PROFILE_GROUP: &str = "SharedBuffered";
+
+fn read_app_io_time_ns(profile: &RuntimeProfile) -> i64 {
+    profile
+        .add_child_timer("AppIOTime", INPUT_STREAM_PROFILE_GROUP)
+        .value()
+}
 
 fn runtime_filters_to_min_max_predicates(
     cfg: &ParquetScanConfig,
@@ -553,6 +563,16 @@ impl ParquetScanIter {
 
             if let Some(profile) = self.profile.as_ref() {
                 profile.counter_add("ParquetRanges", metrics::TUnit::UNIT, 1);
+                let _ = profile.add_child_counter(
+                    PARQUET_PROFILE_GROUP,
+                    metrics::TUnit::NONE,
+                    IO_TASK_EXEC_TIME_COUNTER,
+                );
+                let _ = profile.add_child_counter(
+                    SHARED_BUFFERED_PROFILE_GROUP,
+                    metrics::TUnit::NONE,
+                    IO_TASK_EXEC_TIME_COUNTER,
+                );
             }
 
             let open_file_start = std::time::Instant::now();
@@ -562,14 +582,20 @@ impl ParquetScanIter {
                 .map(|r| r.with_modification_time_override(range_modification_time))
                 .map_err(|e| e.to_string())?;
             let open_file_ns = open_file_start.elapsed().as_nanos() as u128;
-            if let Some(profile) = self.profile.as_ref() {
-                profile.counter_add(
-                    "OpenFile",
-                    metrics::TUnit::TIME_NS,
-                    clamp_u128_to_i64(open_file_ns),
-                );
-            }
             let reader_init_start = std::time::Instant::now();
+            let app_io_before_reader_init = self.profile.as_ref().map(read_app_io_time_ns);
+            let record_reader_init = |profile: &RuntimeProfile, reader_init_wall_ns: u128| {
+                let reader_init_ns = clamp_u128_to_i64(reader_init_wall_ns);
+                let reader_init_io_ns = app_io_before_reader_init
+                    .map(|before| read_app_io_time_ns(profile).saturating_sub(before))
+                    .unwrap_or(0);
+                profile.counter_add_with_parent(
+                    "ReaderInit",
+                    metrics::TUnit::TIME_NS,
+                    std::cmp::max(reader_init_ns, reader_init_io_ns),
+                    IO_TASK_EXEC_TIME_COUNTER,
+                );
+            };
             let identity = reader.file_identity().clone();
             let meta_cache_evict_probability = u32::try_from(
                 self.cfg
@@ -591,14 +617,33 @@ impl ParquetScanIter {
             let cached_reader = CachedRangeReader::new(reader, Some(self.cfg.datacache.clone()));
             // Build reader - parquet crate will still read footer, but we can use cached metadata
             // for row group filtering to avoid re-parsing
+            let app_io_before_footer = self.profile.as_ref().map(read_app_io_time_ns);
             let footer_read_start = std::time::Instant::now();
             let builder = self.new_parquet_builder(&cached_reader)?;
             let footer_read_ns = footer_read_start.elapsed().as_nanos() as u128;
             if let Some(profile) = self.profile.as_ref() {
-                profile.counter_add(
+                let footer_read_ns = clamp_u128_to_i64(footer_read_ns);
+                let footer_io_ns = app_io_before_footer
+                    .map(|before| read_app_io_time_ns(profile).saturating_sub(before))
+                    .unwrap_or(0);
+                let footer_ns = std::cmp::max(footer_read_ns, footer_io_ns);
+                profile.counter_add_with_parent(
                     "ReaderInitFooterRead",
                     metrics::TUnit::TIME_NS,
-                    clamp_u128_to_i64(footer_read_ns),
+                    footer_ns,
+                    PARQUET_PROFILE_GROUP,
+                );
+                profile.counter_add_with_parent(
+                    "OpenFile",
+                    metrics::TUnit::TIME_NS,
+                    std::cmp::max(clamp_u128_to_i64(open_file_ns), footer_ns),
+                    IO_TASK_EXEC_TIME_COUNTER,
+                );
+                profile.counter_add_with_parent(
+                    "DirectIOTime",
+                    metrics::TUnit::TIME_NS,
+                    footer_ns,
+                    SHARED_BUFFERED_PROFILE_GROUP,
                 );
             }
 
@@ -709,11 +754,7 @@ impl ParquetScanIter {
                     debug!("all row groups filtered out for file: {}", path);
                     let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
                     if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add(
-                            "ReaderInit",
-                            metrics::TUnit::TIME_NS,
-                            clamp_u128_to_i64(reader_init_ns),
-                        );
+                        record_reader_init(profile, reader_init_ns);
                     }
                     continue;
                 }
@@ -731,11 +772,7 @@ impl ParquetScanIter {
             if row_groups.is_empty() {
                 let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
                 if let Some(profile) = self.profile.as_ref() {
-                    profile.counter_add(
-                        "ReaderInit",
-                        metrics::TUnit::TIME_NS,
-                        clamp_u128_to_i64(reader_init_ns),
-                    );
+                    record_reader_init(profile, reader_init_ns);
                 }
                 continue;
             }
@@ -769,11 +806,7 @@ impl ParquetScanIter {
                 DelayedReaderDecision::Use(reader) => {
                     let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
                     if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add(
-                            "ReaderInit",
-                            metrics::TUnit::TIME_NS,
-                            clamp_u128_to_i64(reader_init_ns),
-                        );
+                        record_reader_init(profile, reader_init_ns);
                     }
                     let prep_ns = prep_start.elapsed().as_nanos() as u128;
                     if let Some(profile) = self.profile.as_ref() {
@@ -789,11 +822,7 @@ impl ParquetScanIter {
                 DelayedReaderDecision::SkipRange => {
                     let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
                     if let Some(profile) = self.profile.as_ref() {
-                        profile.counter_add(
-                            "ReaderInit",
-                            metrics::TUnit::TIME_NS,
-                            clamp_u128_to_i64(reader_init_ns),
-                        );
+                        record_reader_init(profile, reader_init_ns);
                     }
                     continue;
                 }
@@ -804,11 +833,7 @@ impl ParquetScanIter {
                 self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?;
             let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
             if let Some(profile) = self.profile.as_ref() {
-                profile.counter_add(
-                    "ReaderInit",
-                    metrics::TUnit::TIME_NS,
-                    clamp_u128_to_i64(reader_init_ns),
-                );
+                record_reader_init(profile, reader_init_ns);
             }
             if let Some(reader) = maybe_reader {
                 let prep_ns = prep_start.elapsed().as_nanos() as u128;
@@ -844,6 +869,7 @@ impl Iterator for ParquetScanIter {
 
             let reader = self.reader.as_mut().expect("reader");
             let column_read_start = std::time::Instant::now();
+            let app_io_before_batch = self.profile.as_ref().map(read_app_io_time_ns);
             let next_batch = match reader {
                 ParquetRangeReader::Eager(reader) => {
                     reader.next().map(|r| r.map_err(|e| e.to_string()))
@@ -852,10 +878,33 @@ impl Iterator for ParquetScanIter {
             };
             let column_read_ns = column_read_start.elapsed().as_nanos() as u128;
             if let Some(profile) = self.profile.as_ref() {
-                profile.counter_add(
+                let column_read_ns = clamp_u128_to_i64(column_read_ns);
+                let shared_io_ns = app_io_before_batch
+                    .map(|before| read_app_io_time_ns(profile).saturating_sub(before))
+                    .unwrap_or(0);
+                profile.counter_add_with_parent(
                     "ColumnReadTime",
                     metrics::TUnit::TIME_NS,
-                    clamp_u128_to_i64(column_read_ns),
+                    column_read_ns,
+                    IO_TASK_EXEC_TIME_COUNTER,
+                );
+                profile.counter_add_with_parent(
+                    "GroupChunkRead",
+                    metrics::TUnit::TIME_NS,
+                    column_read_ns,
+                    PARQUET_PROFILE_GROUP,
+                );
+                profile.counter_add_with_parent(
+                    "PageReadTime",
+                    metrics::TUnit::TIME_NS,
+                    column_read_ns,
+                    PARQUET_PROFILE_GROUP,
+                );
+                profile.counter_add_with_parent(
+                    "SharedIOTime",
+                    metrics::TUnit::TIME_NS,
+                    shared_io_ns,
+                    SHARED_BUFFERED_PROFILE_GROUP,
                 );
             }
             match next_batch {
