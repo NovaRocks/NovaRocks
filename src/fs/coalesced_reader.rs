@@ -20,12 +20,22 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use crate::fs::opendal::OpendalRangeReader;
+use crate::fs::opendal::{OpendalRangeReader, RemoteReadKind};
 use crate::fs::range_plan::{IoRange, IoRangeKind, PlannedIoRanges, merge_adjacent_ranges};
 
 pub trait RemoteRangeSource: Clone + Send + Sync + 'static {
     fn file_len(&self) -> u64;
     fn read_remote_range(&self, start: u64, end: u64) -> io::Result<Bytes>;
+
+    fn read_remote_range_with_kind(
+        &self,
+        start: u64,
+        end: u64,
+        kind: RemoteReadKind,
+    ) -> io::Result<Bytes> {
+        let _ = kind;
+        self.read_remote_range(start, end)
+    }
 }
 
 impl RemoteRangeSource for OpendalRangeReader {
@@ -35,6 +45,15 @@ impl RemoteRangeSource for OpendalRangeReader {
 
     fn read_remote_range(&self, start: u64, end: u64) -> io::Result<Bytes> {
         OpendalRangeReader::read_remote_range(self, start, end)
+    }
+
+    fn read_remote_range_with_kind(
+        &self,
+        start: u64,
+        end: u64,
+        kind: RemoteReadKind,
+    ) -> io::Result<Bytes> {
+        OpendalRangeReader::read_remote_range_with_kind(self, start, end, kind)
     }
 }
 
@@ -143,7 +162,9 @@ impl<R: RemoteRangeSource> CoalescedRangeReader<R> {
             return Ok(Bytes::new());
         }
         if !self.options.enable || self.options.max_buffer_size == 0 {
-            return self.inner.read_remote_range(start, end);
+            return self
+                .inner
+                .read_remote_range_with_kind(start, end, RemoteReadKind::Direct);
         }
 
         // StarRocks-like behavior: coalesce only for planned ranges.
@@ -158,14 +179,20 @@ impl<R: RemoteRangeSource> CoalescedRangeReader<R> {
         };
 
         let Some((range, maybe_data)) = candidate else {
-            return self.inner.read_remote_range(start, end);
+            return self
+                .inner
+                .read_remote_range_with_kind(start, end, RemoteReadKind::Direct);
         };
 
         if let Some(data) = maybe_data {
             return slice_range(&range, &data, start, end);
         }
 
-        let fetched = self.inner.read_remote_range(range.offset, range.end())?;
+        let fetched = self.inner.read_remote_range_with_kind(
+            range.offset,
+            range.end(),
+            RemoteReadKind::SharedBuffered,
+        )?;
         let out = slice_range(&range, &fetched, start, end)?;
         let mut state = self.state.lock().expect("coalesced reader state lock");
         if let Some(plan) = state

@@ -25,6 +25,7 @@ use crate::{metrics, runtime_profile};
 #[derive(Clone, Debug)]
 struct CounterSnapshot {
     name: String,
+    parent_name: String,
     unit: metrics::TUnit,
     strategy: runtime_profile::TCounterStrategy,
     value: i64,
@@ -43,10 +44,18 @@ pub type Profiler = RuntimeProfile;
 struct RuntimeProfileInner {
     name: RwLock<String>,
     metadata: AtomicI64,
-    counters: Mutex<HashMap<String, CounterRef>>,
+    counters: Mutex<HashMap<String, CounterEntry>>,
     info_strings: Mutex<BTreeMap<String, String>>,
     children: Mutex<Vec<RuntimeProfile>>,
     child_map: Mutex<HashMap<String, RuntimeProfile>>,
+}
+
+const ROOT_COUNTER: &str = "";
+
+#[derive(Clone, Debug)]
+struct CounterEntry {
+    counter: CounterRef,
+    parent_name: String,
 }
 
 impl RuntimeProfile {
@@ -177,7 +186,12 @@ impl RuntimeProfile {
     pub fn copy_all_counters_from(&self, other: &RuntimeProfile) {
         let snapshots = other.counter_snapshots();
         for s in snapshots {
-            let c = self.add_counter_with_strategy(s.name, s.unit, s.strategy);
+            let c = self.add_counter_with_parent_and_strategy(
+                s.name,
+                s.unit,
+                s.strategy,
+                s.parent_name,
+            );
             c.set(s.value);
             if let Some(min) = s.min_value {
                 c.set_min(min);
@@ -189,7 +203,26 @@ impl RuntimeProfile {
     }
 
     pub fn add_counter(&self, name: impl Into<String>, unit: metrics::TUnit) -> CounterRef {
-        self.add_counter_with_strategy(name, unit, default_counter_strategy(unit))
+        self.add_counter_with_parent_and_strategy(
+            name,
+            unit,
+            default_counter_strategy(unit),
+            ROOT_COUNTER,
+        )
+    }
+
+    pub fn add_child_counter(
+        &self,
+        name: impl Into<String>,
+        unit: metrics::TUnit,
+        parent_name: impl Into<String>,
+    ) -> CounterRef {
+        self.add_counter_with_parent_and_strategy(
+            name,
+            unit,
+            default_counter_strategy(unit),
+            parent_name,
+        )
     }
 
     pub fn add_counter_with_strategy(
@@ -198,22 +231,50 @@ impl RuntimeProfile {
         unit: metrics::TUnit,
         strategy: runtime_profile::TCounterStrategy,
     ) -> CounterRef {
+        self.add_counter_with_parent_and_strategy(name, unit, strategy, ROOT_COUNTER)
+    }
+
+    pub fn add_counter_with_parent_and_strategy(
+        &self,
+        name: impl Into<String>,
+        unit: metrics::TUnit,
+        strategy: runtime_profile::TCounterStrategy,
+        parent_name: impl Into<String>,
+    ) -> CounterRef {
         let name = name.into();
+        let parent_name = parent_name.into();
         let mut guard = self
             .inner
             .counters
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(counter) = guard.get(&name) {
-            return Arc::clone(counter);
+        if let Some(entry) = guard.get(&name) {
+            return Arc::clone(&entry.counter);
         }
         let counter = Arc::new(Counter::new(name.clone(), unit, strategy));
-        guard.insert(name, Arc::clone(&counter));
+        guard.insert(
+            name,
+            CounterEntry {
+                counter: Arc::clone(&counter),
+                parent_name,
+            },
+        );
         counter
     }
 
     pub fn counter_add(&self, name: &str, unit: metrics::TUnit, delta: i64) {
         let c = self.add_counter(name.to_string(), unit);
+        c.add(delta);
+    }
+
+    pub fn counter_add_with_parent(
+        &self,
+        name: &str,
+        unit: metrics::TUnit,
+        delta: i64,
+        parent_name: &str,
+    ) {
+        let c = self.add_child_counter(name.to_string(), unit, parent_name.to_string());
         c.add(delta);
     }
 
@@ -224,6 +285,14 @@ impl RuntimeProfile {
 
     pub fn add_timer(&self, name: impl Into<String>) -> CounterRef {
         self.add_counter(name, metrics::TUnit::TIME_NS)
+    }
+
+    pub fn add_child_timer(
+        &self,
+        name: impl Into<String>,
+        parent_name: impl Into<String>,
+    ) -> CounterRef {
+        self.add_child_counter(name, metrics::TUnit::TIME_NS, parent_name)
     }
 
     pub fn scoped_timer(&self, name: impl Into<String>) -> ScopedTimer {
@@ -269,10 +338,11 @@ impl RuntimeProfile {
             }
             let unit = snapshots[0].unit;
             let strategy = snapshots[0].strategy.clone();
+            let parent_name = snapshots[0].parent_name.clone();
             let values: Vec<i64> = snapshots.iter().map(|s| s.value).collect();
             let (merged_value, min_value, max_value) = merge_counter_values(&strategy, &values);
 
-            let c = merged.add_counter_with_strategy(name, unit, strategy);
+            let c = merged.add_counter_with_parent_and_strategy(name, unit, strategy, parent_name);
             c.set(merged_value);
             c.set_min(min_value);
             c.set_max(max_value);
@@ -315,8 +385,24 @@ impl RuntimeProfile {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|c| c.to_thrift())
+            .map(|entry| entry.counter.to_thrift())
             .collect::<Vec<_>>();
+
+        let child_counters_map = self
+            .inner
+            .counters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut acc, (name, entry)| {
+                    acc.entry(entry.parent_name.clone())
+                        .or_default()
+                        .insert(name.clone());
+                    acc
+                },
+            );
 
         let children = self
             .inner
@@ -333,7 +419,7 @@ impl RuntimeProfile {
             false,
             info_strings,
             info_strings_display_order,
-            BTreeMap::<String, BTreeSet<String>>::new(),
+            child_counters_map,
             None,
         ));
 
@@ -348,7 +434,8 @@ impl RuntimeProfile {
             .counters
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let c = guard.get(name)?;
+        let entry = guard.get(name)?;
+        let c = &entry.counter;
         let min_value = c
             .min_value
             .lock()
@@ -361,6 +448,7 @@ impl RuntimeProfile {
             .clone();
         Some(CounterSnapshot {
             name: c.name.clone(),
+            parent_name: entry.parent_name.clone(),
             unit: c.unit,
             strategy: c.strategy.clone(),
             value: c.value(),
@@ -377,7 +465,8 @@ impl RuntimeProfile {
             .unwrap_or_else(|e| e.into_inner());
         guard
             .values()
-            .map(|c| {
+            .map(|entry| {
+                let c = &entry.counter;
                 let min_value = c
                     .min_value
                     .lock()
@@ -390,6 +479,7 @@ impl RuntimeProfile {
                     .clone();
                 CounterSnapshot {
                     name: c.name.clone(),
+                    parent_name: entry.parent_name.clone(),
                     unit: c.unit,
                     strategy: c.strategy.clone(),
                     value: c.value(),
@@ -589,4 +679,63 @@ fn merge_counter_values(
         _ => sum,
     };
     (value, min_value, max_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROOT_COUNTER, RuntimeProfile};
+    use crate::metrics;
+
+    #[test]
+    fn thrift_tree_keeps_child_counter_hierarchy() {
+        let profile = RuntimeProfile::new("test");
+        profile.counter_add("IOTaskExecTime", metrics::TUnit::TIME_NS, 10);
+        profile.counter_add_with_parent(
+            "ColumnReadTime",
+            metrics::TUnit::TIME_NS,
+            5,
+            "IOTaskExecTime",
+        );
+        let _ = profile.add_child_counter("InputStream", metrics::TUnit::NONE, "IOTaskExecTime");
+        profile.counter_add_with_parent("AppIOTime", metrics::TUnit::TIME_NS, 3, "InputStream");
+
+        let tree = profile.to_thrift_tree();
+        let node = tree.nodes.first().expect("runtime profile node");
+        let root_children = node
+            .child_counters_map
+            .get(ROOT_COUNTER)
+            .expect("root children");
+        assert!(root_children.contains("IOTaskExecTime"));
+        let io_children = node
+            .child_counters_map
+            .get("IOTaskExecTime")
+            .expect("IOTaskExecTime children");
+        assert!(io_children.contains("ColumnReadTime"));
+        assert!(io_children.contains("InputStream"));
+        let input_stream_children = node
+            .child_counters_map
+            .get("InputStream")
+            .expect("InputStream children");
+        assert!(input_stream_children.contains("AppIOTime"));
+    }
+
+    #[test]
+    fn merge_isomorphic_profiles_keeps_counter_parent() {
+        let p1 = RuntimeProfile::new("p");
+        p1.counter_add("IOTaskExecTime", metrics::TUnit::TIME_NS, 10);
+        p1.counter_add_with_parent("OpenFile", metrics::TUnit::TIME_NS, 4, "IOTaskExecTime");
+
+        let p2 = RuntimeProfile::new("p");
+        p2.counter_add("IOTaskExecTime", metrics::TUnit::TIME_NS, 12);
+        p2.counter_add_with_parent("OpenFile", metrics::TUnit::TIME_NS, 5, "IOTaskExecTime");
+
+        let merged = RuntimeProfile::merge_isomorphic_profiles(&[p1, p2]);
+        let tree = merged.to_thrift_tree();
+        let node = tree.nodes.first().expect("runtime profile node");
+        let io_children = node
+            .child_counters_map
+            .get("IOTaskExecTime")
+            .expect("IOTaskExecTime children");
+        assert!(io_children.contains("OpenFile"));
+    }
 }
