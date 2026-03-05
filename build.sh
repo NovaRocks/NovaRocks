@@ -29,19 +29,21 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 print_usage() {
     cat <<'EOF'
 Usage:
-  ./build.sh [--output <dir>] [--no-package] [build args...]
+  ./build.sh [--debug|--release] [--package] [--output <dir>] [build args...]
 
 Examples:
   ./build.sh
+  ./build.sh --debug
   ./build.sh --release
-  ./build.sh --output ./output/novarocks --release
-  ./build.sh --no-package --release
+  ./build.sh --release --package
+  ./build.sh --release --package --output ./output/novarocks-release
   STARROCKS_THIRDPARTY=./thirdparty ./build.sh --release
 
 Description:
   This wrapper resolves thirdparty root from STARROCKS_THIRDPARTY (default: ./thirdparty)
   and exports OPENSSL_* / PKG_CONFIG_PATH so openssl-sys can use bundled thirdparty libs.
-  It only runs `cargo build` and packages runtime files into output/novarocks by default.
+  Build mode only controls cargo profile (debug/release).
+  Packaging is disabled by default; use --package to generate runtime output.
 EOF
 }
 
@@ -240,22 +242,26 @@ resolve_build_artifact_path() {
                 profile="release"
                 ;;
             --profile)
-                ((i++))
+                i=$((i + 1))
                 profile="${args[$i]}"
                 ;;
             --profile=*)
                 profile="${arg#--profile=}"
                 ;;
             --target)
-                ((i++))
+                i=$((i + 1))
                 target_triple="${args[$i]}"
                 ;;
             --target=*)
                 target_triple="${arg#--target=}"
                 ;;
         esac
-        ((i++))
+        i=$((i + 1))
     done
+
+    if [[ "${profile}" == "dev" ]]; then
+        profile="debug"
+    fi
 
     local target_root="${ROOT_DIR}/target"
     if [[ -n "${target_triple}" ]]; then
@@ -289,7 +295,7 @@ PID file: `bin/novarocks.pid`
 ## Start
 
 ```bash
-cd output/novarocks
+cd <runtime-output-dir>
 ./bin/novarocksctl start
 ```
 
@@ -316,6 +322,7 @@ EOF
 package_output() {
     local binary_path="$1"
     local out_root="$2"
+    local build_mode="$3"
     local saved_config=""
     local has_saved_config=0
 
@@ -354,11 +361,86 @@ package_output() {
     # Bundle runtime libs resolved from current binary linkage.
     copy_non_system_linked_libs "${binary_path}" "${out_root}/lib"
 
+    printf "%s\n" "${build_mode}" > "${out_root}/BUILD_MODE"
     : > "${out_root}/log/.gitkeep"
 }
 
-NOVAROCKS_OUTPUT="${NOVAROCKS_OUTPUT:-${ROOT_DIR}/output/novarocks}"
-AUTO_PACKAGE=1
+normalize_build_mode() {
+    local mode
+    mode="$(echo "$1" | tr '[:upper:]' '[:lower:]')"
+    case "${mode}" in
+        # Backward-compatible alias.
+        dev)
+            mode="debug"
+            ;;
+    esac
+    echo "${mode}"
+}
+
+validate_build_mode() {
+    local mode="$1"
+    case "${mode}" in
+        debug|release)
+            ;;
+        *)
+            echo "Error: invalid build mode '${mode}', expected debug or release" >&2
+            exit 1
+            ;;
+    esac
+}
+
+detect_build_profile_from_args() {
+    BUILD_ARG_PROFILE=""
+    BUILD_ARG_HAS_RELEASE=0
+
+    local args=("$@")
+    local i=0
+    while [[ ${i} -lt ${#args[@]} ]]; do
+        local arg="${args[$i]}"
+        case "${arg}" in
+            --release)
+                BUILD_ARG_HAS_RELEASE=1
+                BUILD_ARG_PROFILE="release"
+                ;;
+            --profile)
+                i=$((i + 1))
+                if [[ ${i} -ge ${#args[@]} ]]; then
+                    echo "Error: --profile requires a value" >&2
+                    exit 1
+                fi
+                BUILD_ARG_PROFILE="${args[$i]}"
+                if [[ -z "${BUILD_ARG_PROFILE}" ]]; then
+                    echo "Error: --profile requires a non-empty value" >&2
+                    exit 1
+                fi
+                ;;
+            --profile=*)
+                BUILD_ARG_PROFILE="${arg#--profile=}"
+                if [[ -z "${BUILD_ARG_PROFILE}" ]]; then
+                    echo "Error: --profile requires a non-empty value" >&2
+                    exit 1
+                fi
+                ;;
+        esac
+        i=$((i + 1))
+    done
+}
+
+default_output_dir() {
+    echo "${ROOT_DIR}/output/novarocks"
+}
+
+BUILD_MODE="$(normalize_build_mode "${NOVAROCKS_BUILD_MODE:-debug}")"
+validate_build_mode "${BUILD_MODE}"
+
+OUTPUT_IS_EXPLICIT=0
+NOVAROCKS_OUTPUT="${NOVAROCKS_OUTPUT:-}"
+if [[ -n "${NOVAROCKS_OUTPUT}" ]]; then
+    OUTPUT_IS_EXPLICIT=1
+fi
+
+ENABLE_PACKAGE=0
+LEGACY_NO_PACKAGE=0
 declare -a BUILD_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -366,16 +448,34 @@ while [[ $# -gt 0 ]]; do
             print_usage
             exit 0
             ;;
+        --mode|--mode=*)
+            echo "Error: --mode is no longer supported. Use --debug or --release." >&2
+            exit 1
+            ;;
+        --debug)
+            BUILD_MODE="debug"
+            shift
+            ;;
+        --release)
+            BUILD_MODE="release"
+            shift
+            ;;
+        --package)
+            ENABLE_PACKAGE=1
+            shift
+            ;;
         --output)
             if [[ $# -lt 2 ]]; then
                 echo "Error: --output requires a directory path" >&2
                 exit 1
             fi
             NOVAROCKS_OUTPUT="$2"
+            OUTPUT_IS_EXPLICIT=1
             shift 2
             ;;
         --no-package)
-            AUTO_PACKAGE=0
+            LEGACY_NO_PACKAGE=1
+            ENABLE_PACKAGE=0
             shift
             ;;
         *)
@@ -384,6 +484,19 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "${LEGACY_NO_PACKAGE}" == "1" ]]; then
+    echo "Info: --no-package is deprecated; default is no package."
+fi
+
+if [[ "${ENABLE_PACKAGE}" == "1" && "${OUTPUT_IS_EXPLICIT}" != "1" ]]; then
+    NOVAROCKS_OUTPUT="$(default_output_dir)"
+fi
+
+if [[ "${ENABLE_PACKAGE}" != "1" && "${OUTPUT_IS_EXPLICIT}" == "1" ]]; then
+    echo "Error: --output requires --package because packaging is disabled by default." >&2
+    exit 1
+fi
 
 if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
     if [[ "${BUILD_ARGS[0]}" == "build" ]]; then
@@ -396,6 +509,35 @@ if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
         echo "Error: build.sh only supports cargo build, got subcommand '${BUILD_ARGS[0]}'" >&2
         echo "Use 'cargo ${BUILD_ARGS[*]}' directly, and use './bin/novarocksctl' for runtime control." >&2
         exit 1
+    fi
+fi
+
+if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+    detect_build_profile_from_args "${BUILD_ARGS[@]}"
+else
+    detect_build_profile_from_args
+fi
+if [[ "${BUILD_MODE}" == "debug" ]]; then
+    if [[ "${BUILD_ARG_HAS_RELEASE}" == "1" || "${BUILD_ARG_PROFILE}" == "release" ]]; then
+        echo "Error: build mode is debug but release profile was requested in cargo args" >&2
+        echo "Use '--release' to build release artifacts." >&2
+        exit 1
+    fi
+    if [[ -n "${BUILD_ARG_PROFILE}" && "${BUILD_ARG_PROFILE}" != "dev" ]]; then
+        echo "Error: build mode is debug but cargo profile '${BUILD_ARG_PROFILE}' was requested" >&2
+        echo "Use '--release' for release profile builds, or remove custom --profile." >&2
+        exit 1
+    fi
+fi
+
+if [[ "${BUILD_MODE}" == "release" ]]; then
+    if [[ -n "${BUILD_ARG_PROFILE}" && "${BUILD_ARG_PROFILE}" != "release" ]]; then
+        echo "Error: build mode is release but cargo profile '${BUILD_ARG_PROFILE}' was requested" >&2
+        echo "Use '--debug' for non-release profile builds." >&2
+        exit 1
+    fi
+    if [[ "${BUILD_ARG_HAS_RELEASE}" != "1" && "${BUILD_ARG_PROFILE}" != "release" ]]; then
+        BUILD_ARGS+=("--release")
     fi
 fi
 
@@ -475,6 +617,24 @@ if [[ -n "${target}" ]]; then
     fi
 fi
 
+if [[ "${BUILD_MODE}" == "release" && -z "${RUSTFLAGS:-}" ]]; then
+    if [[ "${NOVAROCKS_RELEASE_RUSTFLAGS+x}" == "x" ]]; then
+        release_rustflags="${NOVAROCKS_RELEASE_RUSTFLAGS}"
+    else
+        release_rustflags="-C target-cpu=native"
+    fi
+    if [[ -n "${release_rustflags}" ]]; then
+        export RUSTFLAGS="${release_rustflags}"
+    fi
+fi
+
+echo "Build mode: ${BUILD_MODE}"
+if [[ "${ENABLE_PACKAGE}" == "1" ]]; then
+    echo "Package output: enabled"
+    echo "Output directory: ${NOVAROCKS_OUTPUT}"
+else
+    echo "Package output: disabled (default)"
+fi
 echo "Using thirdparty root: ${THIRDPARTY_ROOT}"
 echo "Using thirdparty install root: ${THIRDPARTY_INSTALL_ROOT}"
 if [[ "${use_thirdparty_openssl}" == "1" ]]; then
@@ -495,6 +655,9 @@ fi
 if [[ -n "${cargo_linker_var:-}" ]]; then
     echo "${cargo_linker_var}=${!cargo_linker_var}"
 fi
+if [[ -n "${RUSTFLAGS:-}" ]]; then
+    echo "RUSTFLAGS=${RUSTFLAGS}"
+fi
 
 if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
     cargo build "${BUILD_ARGS[@]}"
@@ -502,12 +665,16 @@ else
     cargo build
 fi
 
-if [[ "${AUTO_PACKAGE}" == "1" ]]; then
-    if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
-        artifact_path="$(resolve_build_artifact_path "${BUILD_ARGS[@]}")"
-    else
-        artifact_path="$(resolve_build_artifact_path)"
-    fi
-    package_output "${artifact_path}" "${NOVAROCKS_OUTPUT}"
+if [[ ${#BUILD_ARGS[@]} -gt 0 ]]; then
+    artifact_path="$(resolve_build_artifact_path "${BUILD_ARGS[@]}")"
+else
+    artifact_path="$(resolve_build_artifact_path)"
+fi
+echo "Build artifact: ${artifact_path}"
+
+if [[ "${ENABLE_PACKAGE}" == "1" ]]; then
+    package_output "${artifact_path}" "${NOVAROCKS_OUTPUT}" "${BUILD_MODE}"
     echo "Packaged runtime output: ${NOVAROCKS_OUTPUT}"
+else
+    echo "Package step skipped. Use --package to generate runtime output."
 fi

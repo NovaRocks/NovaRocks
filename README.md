@@ -60,13 +60,47 @@ Prepare thirdparty:
 
 ## Build
 
-Use the same build command on Linux and macOS:
+`build.sh` supports explicit compile modes on Linux and macOS:
 
 ```bash
+# debug mode (default)
 ./build.sh
+./build.sh --debug
+
+# release mode
+./build.sh --release
 ```
 
-If you use custom thirdparty (for example, StarRocks thirdparty), complete the corresponding setup in `Prerequisites` first, then run the same command above.
+Build mode only controls cargo profile:
+
+- debug artifact: `./target/debug/novarocks`
+- release artifact: `./target/release/novarocks`
+
+Packaging is disabled by default.  
+Use `--package` explicitly when you need StarRocks-style runtime output:
+
+```bash
+./build.sh --release --package
+```
+
+Default package output directory:
+
+- `./output/novarocks`
+
+Release mode uses `RUSTFLAGS="-C target-cpu=native"` by default when `RUSTFLAGS` is not already set.  
+You can override it with:
+
+```bash
+NOVAROCKS_RELEASE_RUSTFLAGS="-C target-cpu=native -C debuginfo=1" ./build.sh --release
+```
+
+You can always override output path explicitly:
+
+```bash
+./build.sh --release --package --output ./output/novarocks-release
+```
+
+If you use custom thirdparty (for example, StarRocks thirdparty), complete the corresponding setup in `Prerequisites` first, then run one of the commands above.
 
 ## Configuration
 
@@ -108,7 +142,11 @@ Run through control script:
 Run built binary directly:
 
 ```bash
+# debug build
 ./target/debug/novarocks run --config ./novarocks.toml
+
+# release build
+./target/release/novarocks run --config ./novarocks.toml
 ```
 
 ## Development Workflow
