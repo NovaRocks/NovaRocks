@@ -16,9 +16,11 @@
 // under the License.
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use axum::routing::{post, put};
+use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Routes;
 use tonic::transport::Server;
@@ -37,6 +39,18 @@ use crate::service::stream_load_http;
 pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct GrpcServerState {
+    started: bool,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+fn grpc_server_state() -> &'static Mutex<GrpcServerState> {
+    static STATE: OnceLock<Mutex<GrpcServerState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(GrpcServerState::default()))
+}
 
 #[derive(Default)]
 pub struct GrpcService;
@@ -573,9 +587,13 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
 }
 
 pub fn start_grpc_server(host: &str) -> Result<(), String> {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    if STARTED.get().is_some() {
-        return Ok(());
+    {
+        let state = grpc_server_state()
+            .lock()
+            .map_err(|_| "lock grpc server state failed".to_string())?;
+        if state.started {
+            return Ok(());
+        }
     }
 
     let host = host.to_string();
@@ -584,12 +602,9 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
     validate_grpc_ports(grpc_http_port, grpc_starlet_port)?;
     ensure_bindable(&host, grpc_http_port, "novarocks grpc/http")?;
     ensure_bindable(&host, grpc_starlet_port, "starlet grpc")?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    STARTED
-        .set(())
-        .map_err(|_| "grpc server already started".to_string())?;
-
-    std::thread::spawn(move || {
+    let join_handle = std::thread::spawn(move || {
         info!(
             target: "novarocks::grpc",
             host = %host,
@@ -610,6 +625,8 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             let starlet_addr: SocketAddr = format!("{host}:{grpc_starlet_port}")
                 .parse()
                 .expect("parse starlet bind addr");
+            let mut http_shutdown = shutdown_rx.clone();
+            let mut starlet_shutdown = shutdown_rx.clone();
 
             let svc = GrpcService::default();
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
@@ -634,13 +651,28 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             let novarocks_server = Server::builder()
                 .accept_http1(true)
                 .add_routes(Routes::from(app))
-                .serve(http_addr);
+                .serve_with_shutdown(http_addr, async move {
+                    while !*http_shutdown.borrow() {
+                        if http_shutdown.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
 
             let starlet = StarletGrpcService::default();
             let starlet = proto::staros::starlet_server::StarletServer::new(starlet)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-            let starlet_server = Server::builder().add_service(starlet).serve(starlet_addr);
+            let starlet_server = Server::builder().add_service(starlet).serve_with_shutdown(
+                starlet_addr,
+                async move {
+                    while !*starlet_shutdown.borrow() {
+                        if starlet_shutdown.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                },
+            );
 
             if let Err(e) = tokio::try_join!(novarocks_server, starlet_server) {
                 error!(
@@ -653,7 +685,38 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             }
         });
     });
+
+    let mut state = grpc_server_state()
+        .lock()
+        .map_err(|_| "lock grpc server state failed".to_string())?;
+    if state.started {
+        return Ok(());
+    }
+    state.started = true;
+    state.shutdown_tx = Some(shutdown_tx);
+    state.join_handle = Some(join_handle);
     Ok(())
+}
+
+pub fn stop_grpc_server() {
+    let (shutdown_tx, join_handle) = {
+        let mut state = match grpc_server_state().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if !state.started {
+            return;
+        }
+        state.started = false;
+        (state.shutdown_tx.take(), state.join_handle.take())
+    };
+
+    if let Some(tx) = shutdown_tx {
+        let _ = tx.send(true);
+    }
+    if let Some(handle) = join_handle {
+        let _ = handle.join();
+    }
 }
 
 fn validate_grpc_ports(http_port: u16, starlet_port: u16) -> Result<(), String> {

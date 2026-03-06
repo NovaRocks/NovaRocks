@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use threadpool::ThreadPool;
@@ -35,6 +37,7 @@ use thrift::transport::{
 
 use crate::common::thrift::thrift_named_json;
 use crate::connector::starrocks::lake::{create_lake_tablet_from_req, execute_alter_tablet_task};
+use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
 use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::master_service;
 use crate::novarocks_config::config as novarocks_app_config;
@@ -57,6 +60,14 @@ use crate::{
 pub struct BackendServiceConfig {
     pub host: String,
     pub be_port: u16,
+}
+
+#[derive(Default)]
+struct BackendServerState {
+    started: bool,
+    stop: Option<Arc<AtomicBool>>,
+    join_handle: Option<JoinHandle<()>>,
+    wake_addr: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +98,19 @@ fn next_report_version() -> i64 {
 const CREATE_TABLET_ADD_SHARD_WAIT_MS: u64 = 1_500;
 const CREATE_TABLET_ADD_SHARD_POLL_MS: u64 = 25;
 const ALTER_FAILFAST_ERROR_REPORT_TIMES: usize = 3;
+
+fn backend_server_state() -> &'static Mutex<BackendServerState> {
+    static STATE: OnceLock<Mutex<BackendServerState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(BackendServerState::default()))
+}
+
+fn shutdown_probe_host(bind_host: &str) -> String {
+    match bind_host {
+        "" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "::1".to_string(),
+        other => other.to_string(),
+    }
+}
 
 fn submit_task_worker_pool() -> &'static ThreadPool {
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
@@ -236,6 +260,16 @@ fn execute_update_tablet_meta_info_task(
     Err("update_tablet_meta_info is unsupported in NovaRocks Lake SCHEMA_CHANGE V1".to_string())
 }
 
+fn execute_drop_auto_increment_map_task(
+    task: &agent_service::TAgentTaskRequest,
+) -> Result<(), String> {
+    let req = task.drop_auto_increment_map_req.as_ref().ok_or_else(|| {
+        "drop_auto_increment_map task missing drop_auto_increment_map_req".to_string()
+    })?;
+    clear_auto_increment_cache_for_table(req.table_id);
+    Ok(())
+}
+
 fn wait_for_starlet_add_shard(tablet_id: i64) -> Option<starlet_shard_registry::StarletShardInfo> {
     let started_at = Instant::now();
     loop {
@@ -325,6 +359,8 @@ fn execute_backend_task(task: &agent_service::TAgentTaskRequest) -> Result<(), S
         }
         types::TTaskType::UPDATE_TABLET_META_INFO => execute_update_tablet_meta_info_task(&task)
             .map_err(|err| format!("update_tablet_meta_info failed: {err}")),
+        types::TTaskType::DROP_AUTO_INCREMENT_MAP => execute_drop_auto_increment_map_task(&task)
+            .map_err(|err| format!("drop_auto_increment_map failed: {err}")),
         other => Err(format!(
             "unsupported backend task_type={other:?} in submit_tasks"
         )),
@@ -651,24 +687,28 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
 
     tracing::info!("Starting BackendService on {}", addr);
 
-    thread::Builder::new()
+    let listener =
+        TcpListener::bind(&addr).map_err(|e| format!("BackendService bind error: {e}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("BackendService set_nonblocking failed: {e}"))?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_thread = Arc::clone(&stop);
+    let wake_addr = format!("{}:{}", shutdown_probe_host(&host), config.be_port);
+
+    let join_handle = thread::Builder::new()
         .name("backend-service".to_string())
         .spawn(move || {
             tracing::info!("BackendService listening on {}", addr_for_log);
-
-            let listener = match TcpListener::bind(&addr) {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!("BackendService bind error: {}", e);
-                    return;
-                }
-            };
-
             let worker_pool = ThreadPool::with_name("BackendService processor".to_owned(), 4);
 
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(s) => {
+            while !stop_for_thread.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        if stop_for_thread.load(Ordering::Acquire) {
+                            break;
+                        }
                         worker_pool.execute(move || {
                             let peer = s.peer_addr().ok();
 
@@ -685,7 +725,8 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
                                 Err(_) => return,
                             };
 
-                            let r_tran = TBufferedReadTransportFactory::new().create(Box::new(r_chan));
+                            let r_tran =
+                                TBufferedReadTransportFactory::new().create(Box::new(r_chan));
                             let mut i_prot = TBinaryInputProtocolFactory::new().create(r_tran);
 
                             let w_tran =
@@ -718,25 +759,120 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
                             }
                         });
                     }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
                     Err(e) => {
-                        tracing::warn!("failed to accept remote connection: {}", e);
-                        continue;
+                        if !stop_for_thread.load(Ordering::Acquire) {
+                            tracing::warn!("failed to accept remote connection: {}", e);
+                        }
                     }
                 }
             }
         })
         .map_err(|e| format!("Failed to spawn backend service thread: {e}"))?;
 
+    let mut state = backend_server_state()
+        .lock()
+        .map_err(|_| "lock backend service state failed".to_string())?;
+    if state.started {
+        return Ok(());
+    }
+    state.started = true;
+    state.stop = Some(stop);
+    state.join_handle = Some(join_handle);
+    state.wake_addr = Some(wake_addr);
+
     Ok(())
+}
+
+pub fn stop_backend_service() {
+    let (stop, wake_addr, join_handle) = {
+        let mut state = match backend_server_state().lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if !state.started {
+            return;
+        }
+        state.started = false;
+        (
+            state.stop.take(),
+            state.wake_addr.take(),
+            state.join_handle.take(),
+        )
+    };
+
+    if let Some(stop) = stop {
+        stop.store(true, Ordering::Release);
+    }
+    if let Some(addr) = wake_addr {
+        let _ = TcpStream::connect(addr);
+    }
+    if let Some(handle) = join_handle {
+        let _ = handle.join();
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Mutex, OnceLock};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol, TSerializable};
     use thrift::transport::{TBufferChannel, TIoChannel};
 
-    use super::{execute_backend_task, finish_task_report_times_for_error};
+    use super::{
+        BackendServiceConfig, execute_backend_task, finish_task_report_times_for_error,
+        start_backend_service, stop_backend_service,
+    };
     use crate::{agent_service, descriptors, types};
+
+    fn backend_test_guard() -> &'static Mutex<()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD.get_or_init(|| Mutex::new(()))
+    }
+
+    fn pick_free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral port")
+            .local_addr()
+            .expect("get local addr")
+            .port()
+    }
+
+    fn wait_for_connectable(addr: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpStream::connect(addr) {
+                Ok(_) => return,
+                Err(err) if Instant::now() < deadline => {
+                    let _ = err;
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("timed out waiting for {addr} to accept connections: {err}"),
+            }
+        }
+    }
+
+    fn wait_for_bindable(addr: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(addr) {
+                Ok(listener) => {
+                    drop(listener);
+                    return;
+                }
+                Err(err) if Instant::now() < deadline => {
+                    let _ = err;
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => panic!("timed out waiting for {addr} to become bindable: {err}"),
+            }
+        }
+    }
 
     fn test_task(task_type: types::TTaskType) -> agent_service::TAgentTaskRequest {
         agent_service::TAgentTaskRequest {
@@ -853,6 +989,14 @@ mod tests {
     }
 
     #[test]
+    fn execute_backend_task_accepts_drop_auto_increment_map() {
+        let mut task = test_task(types::TTaskType::DROP_AUTO_INCREMENT_MAP);
+        task.drop_auto_increment_map_req =
+            Some(agent_service::TDropAutoIncrementMapReq { table_id: 99 });
+        execute_backend_task(&task).expect("drop_auto_increment_map should succeed");
+    }
+
+    #[test]
     fn execute_backend_task_fails_fast_for_unsupported_task_type() {
         let task = test_task(types::TTaskType::PUSH);
         let err = execute_backend_task(&task).expect_err("unsupported task must fail");
@@ -942,5 +1086,32 @@ mod tests {
             decoded.base_tablet_read_schema.is_none(),
             "base_tablet_read_schema should stay None when not provided"
         );
+    }
+
+    #[test]
+    fn backend_service_can_stop_and_restart_on_same_port() {
+        let _guard = backend_test_guard()
+            .lock()
+            .expect("lock backend test guard");
+        stop_backend_service();
+
+        let port = pick_free_port();
+        let addr = format!("127.0.0.1:{port}");
+        let config = BackendServiceConfig {
+            host: "127.0.0.1".to_string(),
+            be_port: port,
+        };
+
+        start_backend_service(config.clone()).expect("start backend service first time");
+        wait_for_connectable(&addr);
+
+        stop_backend_service();
+        wait_for_bindable(&addr);
+
+        start_backend_service(config).expect("start backend service second time");
+        wait_for_connectable(&addr);
+
+        stop_backend_service();
+        wait_for_bindable(&addr);
     }
 }

@@ -119,53 +119,6 @@ fn parse_bucket_from_object_store_path(path: &str) -> Option<&str> {
     }
 }
 
-fn read_nonempty_env(keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn infer_s3_config_from_env(path: &str) -> Option<S3StoreConfig> {
-    let bucket = parse_bucket_from_object_store_path(path)?.to_string();
-    let access_key_id =
-        read_nonempty_env(&["AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", "MINIO_ROOT_USER"])?;
-    let access_key_secret = read_nonempty_env(&[
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SECRET_KEY",
-        "MINIO_ROOT_PASSWORD",
-    ])?;
-    let endpoint = read_nonempty_env(&[
-        "AWS_ENDPOINT_URL_S3",
-        "S3_ENDPOINT",
-        "OSS_ENDPOINT",
-        "MINIO_ENDPOINT",
-    ])
-    .or_else(|| {
-        if std::env::var("MINIO_ROOT_USER").is_ok() && std::env::var("MINIO_ROOT_PASSWORD").is_ok()
-        {
-            Some("http://localhost:9000".to_string())
-        } else {
-            None
-        }
-    })?;
-    let region = read_nonempty_env(&["AWS_REGION", "AWS_DEFAULT_REGION"]);
-    Some(S3StoreConfig {
-        endpoint,
-        bucket,
-        root: String::new(),
-        access_key_id,
-        access_key_secret,
-        region,
-        enable_path_style_access: Some(true),
-    })
-}
-
 pub(crate) fn upsert_many(entries: impl IntoIterator<Item = (i64, String)>) -> usize {
     let mapped = entries.into_iter().map(|(tablet_id, full_path)| {
         (
@@ -241,6 +194,22 @@ pub(crate) fn select_infos(tablet_ids: &[i64]) -> HashMap<i64, StarletShardInfo>
     selected
 }
 
+pub(crate) fn select_tablet_ids_by_path(path: &str) -> Vec<i64> {
+    let Some(target) = normalize_full_path(path) else {
+        return Vec::new();
+    };
+    let Ok(guard) = shard_registry().lock() else {
+        return Vec::new();
+    };
+    let mut tablet_ids = guard
+        .active
+        .iter()
+        .filter_map(|(tablet_id, info)| (info.full_path == target).then_some(*tablet_id))
+        .collect::<Vec<_>>();
+    tablet_ids.sort_unstable();
+    tablet_ids
+}
+
 pub(crate) fn find_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
     let target = normalize_full_path(path)?;
     let guard = shard_registry().lock().ok()?;
@@ -308,7 +277,7 @@ pub(crate) fn infer_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
             return Some(cfg);
         }
     }
-    infer_s3_config_from_env(path)
+    None
 }
 
 #[cfg(test)]
@@ -331,8 +300,8 @@ pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
 mod tests {
     use super::{
         S3StoreConfig, StarletShardInfo, clear_for_test, find_s3_config_for_path,
-        infer_s3_config_for_path, lock_for_test, remove_many, select_infos, upsert_many,
-        upsert_many_infos,
+        infer_s3_config_for_path, lock_for_test, remove_many, select_infos,
+        select_tablet_ids_by_path, upsert_many, upsert_many_infos,
     };
 
     fn sample_s3_config() -> S3StoreConfig {
@@ -435,6 +404,39 @@ mod tests {
             .expect("infer config by bucket");
         assert_eq!(cfg.bucket, bucket);
         assert_eq!(cfg.access_key_id, "ak");
+    }
+
+    #[test]
+    fn select_tablet_ids_by_path_returns_sorted_siblings() {
+        let _guard = lock_for_test();
+        clear_for_test();
+        let shared_path = "s3://bucket/root/db1/p1".to_string();
+        upsert_many_infos(vec![
+            (
+                11,
+                StarletShardInfo {
+                    full_path: shared_path.clone(),
+                    s3: Some(sample_s3_config()),
+                },
+            ),
+            (
+                7,
+                StarletShardInfo {
+                    full_path: shared_path.clone(),
+                    s3: Some(sample_s3_config()),
+                },
+            ),
+            (
+                19,
+                StarletShardInfo {
+                    full_path: "s3://bucket/root/db1/p2".to_string(),
+                    s3: Some(sample_s3_config()),
+                },
+            ),
+        ]);
+
+        let tablet_ids = select_tablet_ids_by_path(&shared_path);
+        assert_eq!(tablet_ids, vec![7, 11]);
     }
 
     #[test]

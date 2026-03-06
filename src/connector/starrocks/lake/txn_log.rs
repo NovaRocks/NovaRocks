@@ -1825,7 +1825,7 @@ fn is_missing_tablet_metadata_error(error: &str) -> bool {
         || lowered.contains("bundle metadata missing tablet page for tablet_id=")
 }
 
-fn build_metadata_object_store_profile_for_partial(
+pub(crate) fn build_metadata_object_store_profile_for_partial(
     tablet_root_path: &str,
     s3_config: Option<&S3StoreConfig>,
 ) -> Result<Option<ObjectStoreProfile>, String> {
@@ -2545,7 +2545,7 @@ fn resolve_batch_write_format(
     }
 }
 
-fn build_rowset_for_upsert_batch(
+pub(crate) fn build_rowset_for_upsert_batch(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
     txn_id: i64,

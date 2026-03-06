@@ -38,7 +38,7 @@ pub(crate) fn ensure_started() {
 }
 
 #[allow(dead_code)]
-pub(crate) fn stop() {
+pub fn stop() {
     REPORT_WORKER_STOP.store(true, Ordering::Release);
 }
 

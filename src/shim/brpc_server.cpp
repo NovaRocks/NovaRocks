@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <brpc/closure_guard.h>
+#include <brpc/channel.h>
 #include <brpc/controller.h>
 #include <brpc/server.h>
 #include <butil/endpoint.h>
@@ -608,6 +609,184 @@ public:
                   << std::endl;
     }
 
+    void compact(google::protobuf::RpcController* controller,
+                 const starrocks::CompactRequest* request,
+                 starrocks::CompactResponse* response,
+                 google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                response->clear_failed_tablets();
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing compact request/response");
+            }
+            cntl->SetFailed("missing compact request/response");
+            return;
+        }
+        response->clear_failed_tablets();
+
+        if (request->tablet_ids_size() == 0) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT, "missing tablet_ids");
+            cntl->SetFailed("missing tablet_ids");
+            return;
+        }
+        if (!request->has_txn_id()) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT, "missing txn_id");
+            cntl->SetFailed("missing txn_id");
+            return;
+        }
+        if (!request->has_version()) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT, "missing version");
+            cntl->SetFailed("missing version");
+            return;
+        }
+
+        std::string err;
+        if (!invoke_compact(*request, response, &err)) {
+            response->clear_failed_tablets();
+            for (auto tablet_id : request->tablet_ids()) {
+                response->add_failed_tablets(tablet_id);
+            }
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            cntl->SetFailed(err);
+            std::cerr << "[WARN] lake compact failed, remote=" << cntl->remote_side()
+                      << " txn_id=" << request->txn_id() << " version=" << request->version()
+                      << " err=" << err << std::endl;
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+        std::cerr << "[DEBUG] lake compact, remote=" << cntl->remote_side()
+                  << " tablets=" << request->tablet_ids_size() << " txn_id=" << request->txn_id()
+                  << " version=" << request->version()
+                  << " failed_tablets=" << response->failed_tablets_size()
+                  << std::endl;
+    }
+
+    void aggregate_compact(google::protobuf::RpcController* controller,
+                           const starrocks::AggregateCompactRequest* request,
+                           starrocks::CompactResponse* response,
+                           google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                response->clear_failed_tablets();
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing aggregate_compact request/response");
+            }
+            cntl->SetFailed("missing aggregate_compact request/response");
+            return;
+        }
+        response->Clear();
+        status_ok(response->mutable_status());
+
+        if (request->requests_size() == 0) {
+            cntl->SetFailed("empty requests");
+            return;
+        }
+        if (request->compute_nodes_size() != request->requests_size()) {
+            cntl->SetFailed("compute nodes size not equal to requests size");
+            return;
+        }
+
+        int64_t total_input_size = 0;
+        for (int i = 0; i < request->requests_size(); ++i) {
+            const auto& compute_node = request->compute_nodes(i);
+            if (!compute_node.has_host() || !compute_node.has_brpc_port()) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
+                           "compute node missing host/port");
+                return;
+            }
+
+            starrocks::CompactRequest node_request = request->requests(i);
+            // Keep publish path compatible without requiring combined txn log writer.
+            node_request.set_skip_write_txnlog(false);
+
+            brpc::Channel channel;
+            std::string endpoint = compute_node.host() + ":" + std::to_string(compute_node.brpc_port());
+            if (channel.Init(endpoint.c_str(), nullptr) != 0) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
+                           "aggregate_compact channel init failed: " + endpoint);
+                return;
+            }
+            starrocks::LakeService_Stub stub(&channel);
+            brpc::Controller node_cntl;
+            if (node_request.has_timeout_ms()) {
+                node_cntl.set_timeout_ms(node_request.timeout_ms());
+            }
+            starrocks::CompactResponse node_response;
+            stub.compact(&node_cntl, &node_request, &node_response, nullptr);
+
+            if (node_cntl.Failed()) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
+                           "aggregate_compact call compact failed: " + std::string(node_cntl.ErrorText()));
+                return;
+            }
+            if (node_response.has_status() &&
+                node_response.status().status_code() != static_cast<int32_t>(starrocks::TStatusCode::OK)) {
+                std::string err = node_response.status().error_msgs_size() > 0
+                                          ? node_response.status().error_msgs(0)
+                                          : "aggregate_compact sub compact returned non-OK status";
+                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+                return;
+            }
+            if (node_response.failed_tablets_size() > 0) {
+                std::string err = "aggregate_compact sub compact returned failed_tablets";
+                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+                return;
+            }
+
+            if (node_response.has_success_compaction_input_file_size()) {
+                total_input_size += node_response.success_compaction_input_file_size();
+            }
+            for (const auto& stat : node_response.compact_stats()) {
+                response->add_compact_stats()->CopyFrom(stat);
+            }
+        }
+
+        response->set_success_compaction_input_file_size(total_input_size);
+        std::cerr << "[DEBUG] lake aggregate_compact, remote=" << cntl->remote_side()
+                  << " sub_requests=" << request->requests_size()
+                  << " partition_id=" << (request->has_partition_id() ? request->partition_id() : 0)
+                  << std::endl;
+    }
+
+    void abort_compaction(google::protobuf::RpcController* controller,
+                          const starrocks::AbortCompactionRequest* request,
+                          starrocks::AbortCompactionResponse* response,
+                          google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing abort_compaction request/response");
+            }
+            cntl->SetFailed("missing abort_compaction request/response");
+            return;
+        }
+        if (!request->has_txn_id()) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT, "missing txn_id");
+            cntl->SetFailed("missing txn_id");
+            return;
+        }
+
+        std::string err;
+        if (!invoke_abort_compaction(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            cntl->SetFailed(err);
+            std::cerr << "[WARN] lake abort_compaction failed, remote=" << cntl->remote_side()
+                      << " txn_id=" << request->txn_id() << " err=" << err << std::endl;
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+    }
+
     void delete_tablet(google::protobuf::RpcController* controller,
                        const starrocks::DeleteTabletRequest* request,
                        starrocks::DeleteTabletResponse* response,
@@ -1134,6 +1313,98 @@ private:
         if (!ok) {
             if (err != nullptr) {
                 *err = "parse TabletStatResponse from rust buffer failed";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    static bool invoke_compact(const starrocks::CompactRequest& request,
+                               starrocks::CompactResponse* response,
+                               std::string* err) {
+        if (response == nullptr) {
+            if (err != nullptr) {
+                *err = "compact response is null";
+            }
+            return false;
+        }
+
+        std::string request_bytes;
+        if (!request.SerializeToString(&request_bytes)) {
+            if (err != nullptr) {
+                *err = "serialize CompactRequest failed";
+            }
+            return false;
+        }
+
+        NovaRocksRustBuf resp_buf{nullptr, 0};
+        NovaRocksRustBuf err_buf{nullptr, 0};
+        int32_t rc = novarocks_rs_lake_compact(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+                                               request_bytes.size(), &resp_buf, &err_buf);
+        std::string rust_err = take_rust_buf_string(&err_buf);
+        if (rc != 0) {
+            take_rust_buf_string(&resp_buf);
+            if (err != nullptr) {
+                *err = rust_err.empty() ? "rust lake compact failed" : rust_err;
+            }
+            return false;
+        }
+        if (resp_buf.ptr == nullptr || resp_buf.len == 0) {
+            response->Clear();
+            take_rust_buf_string(&resp_buf);
+            return true;
+        }
+        bool ok = response->ParseFromArray(resp_buf.ptr, static_cast<int>(resp_buf.len));
+        take_rust_buf_string(&resp_buf);
+        if (!ok) {
+            if (err != nullptr) {
+                *err = "parse CompactResponse from rust buffer failed";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    static bool invoke_abort_compaction(const starrocks::AbortCompactionRequest& request,
+                                        starrocks::AbortCompactionResponse* response,
+                                        std::string* err) {
+        if (response == nullptr) {
+            if (err != nullptr) {
+                *err = "abort_compaction response is null";
+            }
+            return false;
+        }
+
+        std::string request_bytes;
+        if (!request.SerializeToString(&request_bytes)) {
+            if (err != nullptr) {
+                *err = "serialize AbortCompactionRequest failed";
+            }
+            return false;
+        }
+
+        NovaRocksRustBuf resp_buf{nullptr, 0};
+        NovaRocksRustBuf err_buf{nullptr, 0};
+        int32_t rc = novarocks_rs_lake_abort_compaction(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+                                                        request_bytes.size(), &resp_buf, &err_buf);
+        std::string rust_err = take_rust_buf_string(&err_buf);
+        if (rc != 0) {
+            take_rust_buf_string(&resp_buf);
+            if (err != nullptr) {
+                *err = rust_err.empty() ? "rust lake abort_compaction failed" : rust_err;
+            }
+            return false;
+        }
+        if (resp_buf.ptr == nullptr || resp_buf.len == 0) {
+            response->Clear();
+            take_rust_buf_string(&resp_buf);
+            return true;
+        }
+        bool ok = response->ParseFromArray(resp_buf.ptr, static_cast<int>(resp_buf.len));
+        take_rust_buf_string(&resp_buf);
+        if (!ok) {
+            if (err != nullptr) {
+                *err = "parse AbortCompactionResponse from rust buffer failed";
             }
             return false;
         }

@@ -450,6 +450,12 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
 
+            novarocks::service::compat::stop();
+            novarocks::service::backend_service::stop_backend_service();
+            novarocks::service::heartbeat_service::stop_heartbeat_server();
+            novarocks::service::grpc_server::stop_grpc_server();
+            novarocks::service::report_worker::stop();
+
             // Cleanup: remove pid file
             let _ = fs::remove_file(pid_file);
             println!("novarocksd stopped");

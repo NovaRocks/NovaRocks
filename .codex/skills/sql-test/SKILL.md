@@ -1,11 +1,11 @@
 ---
 name: sql-test
-description: 在 NovaRocks 仓库中运行 StarRocks `dev/test` SQL-tester（重点 schema change），严格绑定 `dev/fe/conf/fe.conf` 与 `novarocks.toml` 的端口约束，禁止使用系统其他 StarRocks 实例。
+description: 在 NovaRocks 仓库中运行 StarRocks `dev/test` SQL-tester，严格绑定 `dev/fe/conf/fe.conf` 与 `novarocks.toml` 的端口约束，禁止使用系统其他 StarRocks 实例。
 ---
 
 # SQL Test（StarRocks `dev/test` + NovaRocks）
 
-目标：在本仓库内稳定执行 SQL-tester，优先验证 schema change 路径，并快速归因失败。
+目标：在本仓库内稳定执行 SQL-tester，复用已有 SQL case 做验证，并快速归因失败。
 
 ## 1) 硬约束（必须遵守）
 
@@ -126,31 +126,57 @@ mysql -h 127.0.0.1 -P<query_port_from_fe_conf> -u root -e "select 1"
 
 探针失败时先修复服务，不要继续跑 SQL case。
 
-## 6) Schema change 用例优先执行
+## 6) 如何查找并执行现成 SQL case
 
-先检索 schema change 相关用例：
+先在 `dev/test/sql` 下定位已有 case，再按目录执行，不要为常规验证重新造 case。
+
+通用检索方式：
 
 ```bash
-rg -n "schema change|SCHEMA_CHANGE|ALTER TABLE .*ADD COLUMN|ALTER TABLE .*DROP COLUMN|ALTER TABLE .*MODIFY COLUMN" dev/test/sql -S
+find dev/test/sql -maxdepth 3 -type f | sort
+rg -n "<keyword>" dev/test/sql -S
 ```
 
-建议优先目录：
+常见调用方式：
 
-- `dev/test/sql/test_schema_change/**`
-- `dev/test/sql/test_default_value/**`
-- `tests/**` 与 `sql-tests/**` 中与 schema change 相关的 Rust/SQL 回归（作为补充验证）
-
-首轮先跑单文件、单并发、禁重跑：
+- 跑一个目录：
 
 ```bash
 cd dev/test
 .venv311/bin/python run.py \
-  -d sql/test_schema_change/R/test_schema_change_with_partition_table \
+  -d sql/test_profile/T/ \
   --skip_reruns \
   -v -c 1 -t 300
 ```
 
-需要缩小时再加 `--case_filter`。
+- 跑一个具体 case 文件：
+
+```bash
+cd dev/test
+.venv311/bin/python run.py \
+  -d sql/test_profile/T/test_profile_analysis \
+  --skip_reruns \
+  -v -c 1 -t 300
+```
+
+- 在目录下按关键字缩小范围：
+
+```bash
+cd dev/test
+.venv311/bin/python run.py \
+  -d sql/test_profile/T/ \
+  --case_filter profile \
+  --skip_reruns \
+  -v -c 1 -t 300
+```
+
+建议默认策略：
+
+- 首轮先跑单目录或单文件
+- 单并发：`-c 1`
+- 禁重跑：`--skip_reruns`
+- 超时显式给出：`-t 300`
+- 若目标已经很明确，优先直接复用现有 case 路径，不要先大范围扫全量 suite
 
 ## 7) 失败分流（fail-fast）
 
@@ -183,7 +209,7 @@ cd dev/test
 - FE: `dev/fe/conf/fe.conf query_port=9031 http_port=8031`
 - NovaRocks ports: `heartbeat=9051, be=9061, brpc=8061, http=8041, starlet=9071`（unchanged）
 - Python: `dev/test/.venv311/bin/python (3.11.x)`
-- Command: `run.py -d sql/test_schema_change/R/test_schema_change_with_partition_table --skip_reruns -v -c 1 -t 300`
+- Command: `run.py -d sql/test_profile/T/test_profile_analysis --skip_reruns -v -c 1 -t 300`
 - Result: `PASS`
 
 ## 9) 禁止事项

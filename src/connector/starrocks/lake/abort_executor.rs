@@ -100,10 +100,22 @@ fn abort_one_txn_log(
         return Ok(());
     }
 
-    if txn_log.op_compaction.is_some()
-        || txn_log.op_alter_metadata.is_some()
-        || txn_log.op_replication.is_some()
-    {
+    if let Some(op_compaction) = txn_log.op_compaction.as_ref() {
+        if let Some(output_rowset) = op_compaction.output_rowset.as_ref() {
+            for seg in output_rowset
+                .segments
+                .iter()
+                .skip(op_compaction.new_segment_offset.unwrap_or(0).max(0) as usize)
+                .take(op_compaction.new_segment_count.unwrap_or(i32::MAX).max(0) as usize)
+            {
+                let seg_path = join_tablet_path(tablet_root_path, &format!("{DATA_DIR}/{seg}"))?;
+                delete_path_if_exists(&seg_path)?;
+            }
+        }
+        return Ok(());
+    }
+
+    if txn_log.op_alter_metadata.is_some() || txn_log.op_replication.is_some() {
         return Err(format!(
             "abort_txn unsupported txn log operation: tablet_id={} txn_id={:?}",
             tablet_id, txn_log.txn_id
