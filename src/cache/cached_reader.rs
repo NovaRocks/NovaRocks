@@ -362,7 +362,7 @@ impl Read for CachedRead {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::Once;
+    use std::sync::{Mutex, Once, OnceLock};
 
     use crate::cache::block_cache::{BlockCacheOptions, get_block_cache, init_block_cache};
     use crate::cache::{CacheOptions, DataCacheManager};
@@ -374,6 +374,14 @@ mod tests {
     use super::CachedRangeReader;
 
     static BLOCK_CACHE_INIT: Once = Once::new();
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock cached_reader test guard")
+    }
 
     fn ensure_block_cache() {
         BLOCK_CACHE_INIT.call_once(|| {
@@ -415,6 +423,7 @@ mod tests {
 
     #[test]
     fn read_bytes_uses_block_cache_after_first_fetch() {
+        let _guard = test_guard();
         ensure_block_cache();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         fs::write(temp_dir.path().join("sample.bin"), b"abcdefgh").expect("write fixture");
@@ -443,6 +452,7 @@ mod tests {
 
     #[test]
     fn read_bytes_can_cross_multiple_cache_blocks() {
+        let _guard = test_guard();
         ensure_block_cache();
         let temp_dir = tempfile::tempdir().expect("tempdir");
         fs::write(temp_dir.path().join("sample.bin"), b"abcdefghij").expect("write fixture");

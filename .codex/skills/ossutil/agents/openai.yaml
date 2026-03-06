@@ -1,0 +1,4 @@
+interface:
+  display_name: "OSSUtil"
+  short_description: "Aliyun OSS 对象排查与管理：列举、查看、上传、下载、删除、同步"
+  default_prompt: "Use $starust-ossutil to inspect or manage Aliyun OSS objects for the current task. Replace all placeholder bucket and prefix values with the real target before running commands."

@@ -59,8 +59,6 @@ impl HeartbeatHandler {
 
 impl HeartbeatServiceSyncHandler for HeartbeatHandler {
     fn handle_heartbeat(&self, master_info: TMasterInfo) -> thrift::Result<THeartbeatResult> {
-        // This is the real StarRocks FE -> BE heartbeat RPC payload.
-        // Log only non-sensitive fields (avoid printing token).
         tracing::debug!(
             fe_host = %master_info.network_address.hostname,
             fe_port = master_info.network_address.port,
@@ -76,7 +74,6 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             "Received HeartbeatService.heartbeat"
         );
         if let Some(id) = master_info.backend_id {
-            // Row position uses backend_id as row_source_id; missing it breaks fetch routing.
             backend_id_store::set_backend_id(id);
         }
         let mut backend_host = master_info
@@ -106,7 +103,6 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             .map(|n| n.get() as i32)
             .unwrap_or(1);
 
-        // TPort is i32 type alias, not a struct
         let backend_info = TBackendInfo::new(
             self.config.be_port as i32,
             self.config.http_port as i32,
@@ -116,9 +112,9 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             Some(num_cores),
             Some(self.config.starlet_port as i32),
             Some(reboot_time),
-            Some(true), // is_set_storage_path
-            None,       // mem_limit_bytes
-            None,       // arrow_flight_port
+            Some(true),
+            None,
+            None,
         );
 
         tracing::debug!("Heartbeat response: reboot_time={}", reboot_time);
@@ -127,7 +123,6 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
     }
 }
 
-/// Starts the heartbeat Thrift server in a background thread
 pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
     let host = if config.host.is_empty() {
         "0.0.0.0".to_string()
@@ -145,21 +140,18 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
         config.starlet_port
     );
 
-    // Create handler and processor
     let handler = HeartbeatHandler::new(config);
     let processor = HeartbeatServiceSyncProcessor::new(handler);
 
-    // Create server
     let mut server = TServer::new(
         TBufferedReadTransportFactory::new(),
         TBinaryInputProtocolFactory::new(),
         TBufferedWriteTransportFactory::new(),
         TBinaryOutputProtocolFactory::new(),
         processor,
-        4, // num_workers
+        4,
     );
 
-    // Start server in background thread
     thread::Builder::new()
         .name("heartbeat-server".to_string())
         .spawn(move || {
@@ -171,4 +163,9 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
         .map_err(|e| format!("Failed to spawn heartbeat thread: {}", e))?;
 
     Ok(())
+}
+
+pub fn stop_heartbeat_server() {
+    // Keep heartbeat implementation aligned with the proven TServer path.
+    // Process shutdown will terminate the background heartbeat thread.
 }

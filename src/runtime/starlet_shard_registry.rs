@@ -76,10 +76,15 @@ pub(crate) struct StarletShardInfo {
     pub(crate) s3: Option<S3StoreConfig>,
 }
 
-static SHARD_INFOS: OnceLock<Mutex<HashMap<i64, StarletShardInfo>>> = OnceLock::new();
+#[derive(Default)]
+struct ShardRegistry {
+    active: HashMap<i64, StarletShardInfo>,
+}
 
-fn shard_infos() -> &'static Mutex<HashMap<i64, StarletShardInfo>> {
-    SHARD_INFOS.get_or_init(|| Mutex::new(HashMap::new()))
+static SHARD_INFOS: OnceLock<Mutex<ShardRegistry>> = OnceLock::new();
+
+fn shard_registry() -> &'static Mutex<ShardRegistry> {
+    SHARD_INFOS.get_or_init(|| Mutex::new(ShardRegistry::default()))
 }
 
 fn normalize_full_path(path: &str) -> Option<String> {
@@ -114,53 +119,6 @@ fn parse_bucket_from_object_store_path(path: &str) -> Option<&str> {
     }
 }
 
-fn read_nonempty_env(keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Ok(value) = std::env::var(key) {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn infer_s3_config_from_env(path: &str) -> Option<S3StoreConfig> {
-    let bucket = parse_bucket_from_object_store_path(path)?.to_string();
-    let access_key_id =
-        read_nonempty_env(&["AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", "MINIO_ROOT_USER"])?;
-    let access_key_secret = read_nonempty_env(&[
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_SECRET_KEY",
-        "MINIO_ROOT_PASSWORD",
-    ])?;
-    let endpoint = read_nonempty_env(&[
-        "AWS_ENDPOINT_URL_S3",
-        "S3_ENDPOINT",
-        "OSS_ENDPOINT",
-        "MINIO_ENDPOINT",
-    ])
-    .or_else(|| {
-        if std::env::var("MINIO_ROOT_USER").is_ok() && std::env::var("MINIO_ROOT_PASSWORD").is_ok()
-        {
-            Some("http://localhost:9000".to_string())
-        } else {
-            None
-        }
-    })?;
-    let region = read_nonempty_env(&["AWS_REGION", "AWS_DEFAULT_REGION"]);
-    Some(S3StoreConfig {
-        endpoint,
-        bucket,
-        root: String::new(),
-        access_key_id,
-        access_key_secret,
-        region,
-        enable_path_style_access: Some(true),
-    })
-}
-
 pub(crate) fn upsert_many(entries: impl IntoIterator<Item = (i64, String)>) -> usize {
     let mapped = entries.into_iter().map(|(tablet_id, full_path)| {
         (
@@ -177,7 +135,7 @@ pub(crate) fn upsert_many(entries: impl IntoIterator<Item = (i64, String)>) -> u
 pub(crate) fn upsert_many_infos(
     entries: impl IntoIterator<Item = (i64, StarletShardInfo)>,
 ) -> usize {
-    let Ok(mut guard) = shard_infos().lock() else {
+    let Ok(mut guard) = shard_registry().lock() else {
         return 0;
     };
     let mut count = 0usize;
@@ -188,8 +146,8 @@ pub(crate) fn upsert_many_infos(
         let Some(full_path) = normalize_full_path(&info.full_path) else {
             continue;
         };
-        let preserved_s3 = guard.get(&tablet_id).and_then(|old| old.s3.clone());
-        guard.insert(
+        let preserved_s3 = guard.active.get(&tablet_id).and_then(|old| old.s3.clone());
+        guard.active.insert(
             tablet_id,
             StarletShardInfo {
                 full_path,
@@ -202,12 +160,12 @@ pub(crate) fn upsert_many_infos(
 }
 
 pub(crate) fn remove_many(tablet_ids: impl IntoIterator<Item = i64>) -> usize {
-    let Ok(mut guard) = shard_infos().lock() else {
+    let Ok(mut guard) = shard_registry().lock() else {
         return 0;
     };
     let mut count = 0usize;
     for tablet_id in tablet_ids {
-        if guard.remove(&tablet_id).is_some() {
+        if guard.active.remove(&tablet_id).is_some() {
             count += 1;
         }
     }
@@ -224,23 +182,39 @@ pub(crate) fn select_paths(tablet_ids: &[i64]) -> HashMap<i64, String> {
 }
 
 pub(crate) fn select_infos(tablet_ids: &[i64]) -> HashMap<i64, StarletShardInfo> {
-    let Ok(guard) = shard_infos().lock() else {
+    let Ok(guard) = shard_registry().lock() else {
         return HashMap::new();
     };
     let mut selected = HashMap::with_capacity(tablet_ids.len());
     for tablet_id in tablet_ids {
-        if let Some(info) = guard.get(tablet_id) {
+        if let Some(info) = guard.active.get(tablet_id) {
             selected.insert(*tablet_id, info.clone());
         }
     }
     selected
 }
 
+pub(crate) fn select_tablet_ids_by_path(path: &str) -> Vec<i64> {
+    let Some(target) = normalize_full_path(path) else {
+        return Vec::new();
+    };
+    let Ok(guard) = shard_registry().lock() else {
+        return Vec::new();
+    };
+    let mut tablet_ids = guard
+        .active
+        .iter()
+        .filter_map(|(tablet_id, info)| (info.full_path == target).then_some(*tablet_id))
+        .collect::<Vec<_>>();
+    tablet_ids.sort_unstable();
+    tablet_ids
+}
+
 pub(crate) fn find_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
     let target = normalize_full_path(path)?;
-    let guard = shard_infos().lock().ok()?;
+    let guard = shard_registry().lock().ok()?;
     let mut best: Option<(usize, S3StoreConfig)> = None;
-    for info in guard.values() {
+    for info in guard.active.values() {
         let s3 = match info.s3.as_ref() {
             Some(v) => v,
             None => continue,
@@ -271,7 +245,7 @@ pub(crate) fn oss_config_for_path(
         .ok_or_else(|| {
             format!(
                 "missing shard registry config for path={path}; \
-                expected AddShard or persisted tablet runtime to provide S3 credentials"
+                expected AddShard/runtime registry/StarManager retrieval to provide S3 credentials"
             )
         })
 }
@@ -282,10 +256,10 @@ pub(crate) fn infer_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
     }
 
     let target_bucket = parse_bucket_from_object_store_path(path);
-    let guard = shard_infos().lock().ok()?;
+    let guard = shard_registry().lock().ok()?;
     let mut unique_cfg: Option<S3StoreConfig> = None;
     let mut has_conflict = false;
-    for info in guard.values() {
+    for info in guard.active.values() {
         let Some(cfg) = info.s3.as_ref() else {
             continue;
         };
@@ -303,21 +277,31 @@ pub(crate) fn infer_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
             return Some(cfg);
         }
     }
-    infer_s3_config_from_env(path)
+    None
 }
 
 #[cfg(test)]
 pub(crate) fn clear_for_test() {
-    if let Ok(mut guard) = shard_infos().lock() {
-        guard.clear();
+    if let Ok(mut guard) = shard_registry().lock() {
+        guard.active.clear();
     }
+}
+
+#[cfg(test)]
+pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock starlet shard registry test guard")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         S3StoreConfig, StarletShardInfo, clear_for_test, find_s3_config_for_path,
-        infer_s3_config_for_path, upsert_many, upsert_many_infos,
+        infer_s3_config_for_path, lock_for_test, remove_many, select_infos,
+        select_tablet_ids_by_path, upsert_many, upsert_many_infos,
     };
 
     fn sample_s3_config() -> S3StoreConfig {
@@ -334,6 +318,7 @@ mod tests {
 
     #[test]
     fn path_only_upsert_preserves_existing_s3_config() {
+        let _guard = lock_for_test();
         clear_for_test();
         let inserted = upsert_many_infos(vec![(
             1001,
@@ -356,6 +341,7 @@ mod tests {
 
     #[test]
     fn find_s3_config_prefers_longest_path_prefix() {
+        let _guard = lock_for_test();
         clear_for_test();
         let _ = upsert_many_infos(vec![
             (
@@ -396,6 +382,7 @@ mod tests {
 
     #[test]
     fn infer_s3_config_uses_bucket_when_path_prefix_does_not_match() {
+        let _guard = lock_for_test();
         clear_for_test();
         let bucket = "bucket-infer-3001";
         let _ = upsert_many_infos(vec![(
@@ -417,5 +404,53 @@ mod tests {
             .expect("infer config by bucket");
         assert_eq!(cfg.bucket, bucket);
         assert_eq!(cfg.access_key_id, "ak");
+    }
+
+    #[test]
+    fn select_tablet_ids_by_path_returns_sorted_siblings() {
+        let _guard = lock_for_test();
+        clear_for_test();
+        let shared_path = "s3://bucket/root/db1/p1".to_string();
+        upsert_many_infos(vec![
+            (
+                11,
+                StarletShardInfo {
+                    full_path: shared_path.clone(),
+                    s3: Some(sample_s3_config()),
+                },
+            ),
+            (
+                7,
+                StarletShardInfo {
+                    full_path: shared_path.clone(),
+                    s3: Some(sample_s3_config()),
+                },
+            ),
+            (
+                19,
+                StarletShardInfo {
+                    full_path: "s3://bucket/root/db1/p2".to_string(),
+                    s3: Some(sample_s3_config()),
+                },
+            ),
+        ]);
+
+        let tablet_ids = select_tablet_ids_by_path(&shared_path);
+        assert_eq!(tablet_ids, vec![7, 11]);
+    }
+
+    #[test]
+    fn remove_many_drops_active_shard_info_immediately() {
+        let _guard = lock_for_test();
+        clear_for_test();
+        let _ = upsert_many_infos(vec![(
+            4001,
+            StarletShardInfo {
+                full_path: "s3://bucket/removed/path".to_string(),
+                s3: Some(sample_s3_config()),
+            },
+        )]);
+        assert_eq!(remove_many([4001]), 1);
+        assert!(select_infos(&[4001]).is_empty());
     }
 }

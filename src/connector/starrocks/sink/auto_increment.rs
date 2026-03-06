@@ -179,3 +179,20 @@ pub(crate) fn allocate_auto_increment_ids(
 
     Ok(result)
 }
+
+pub(crate) fn clear_auto_increment_cache_for_table(table_id: i64) {
+    if table_id <= 0 {
+        return;
+    }
+    if let Ok(mut guard) = interval_cache().lock() {
+        guard.remove(&table_id);
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn clear_auto_increment_cache_for_test() {
+    if let Ok(mut guard) = interval_cache().lock() {
+        guard.clear();
+    }
+}

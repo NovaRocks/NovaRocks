@@ -26,6 +26,7 @@ use crate::service::grpc_client::proto::starrocks::{
 
 enum TxnLogDispatch<'a> {
     Write(&'a txn_log_pb::OpWrite),
+    Compaction(&'a txn_log_pb::OpCompaction),
     SchemaChange(&'a txn_log_pb::OpSchemaChange),
     AlterMetadata(&'a txn_log_pb::OpAlterMetadata),
     Unsupported(&'static str),
@@ -36,8 +37,8 @@ fn dispatch_txn_log(txn_log: &TxnLogPb) -> TxnLogDispatch<'_> {
     if let Some(op_write) = txn_log.op_write.as_ref() {
         return TxnLogDispatch::Write(op_write);
     }
-    if txn_log.op_compaction.is_some() {
-        return TxnLogDispatch::Unsupported("op_compaction");
+    if let Some(op_compaction) = txn_log.op_compaction.as_ref() {
+        return TxnLogDispatch::Compaction(op_compaction);
     }
     if let Some(op_schema_change) = txn_log.op_schema_change.as_ref() {
         return TxnLogDispatch::SchemaChange(op_schema_change);
@@ -116,6 +117,15 @@ pub(crate) fn apply_txn_log_to_metadata(
             }
             Ok(())
         }
+        TxnLogDispatch::Compaction(op_compaction) => {
+            if is_primary_keys_table(tablet_schema)? {
+                return Err(format!(
+                    "publish_version does not support op_compaction for PRIMARY_KEYS yet: tablet_id={:?} txn_id={:?}",
+                    txn_log.tablet_id, txn_log.txn_id
+                ));
+            }
+            apply_compaction_log(metadata, op_compaction, default_schema_id)
+        }
         TxnLogDispatch::SchemaChange(op_schema_change) => {
             if is_primary_keys_table(tablet_schema)? {
                 return Err(format!(
@@ -134,6 +144,118 @@ pub(crate) fn apply_txn_log_to_metadata(
         )),
         TxnLogDispatch::Empty => Ok(()),
     }
+}
+
+fn apply_compaction_log(
+    metadata: &mut TabletMetadataPb,
+    op_compaction: &txn_log_pb::OpCompaction,
+    default_schema_id: i64,
+) -> Result<(), String> {
+    if op_compaction.input_rowsets.is_empty() {
+        return Ok(());
+    }
+
+    let first_input_id = op_compaction.input_rowsets[0];
+    let Some(first_input_pos) = metadata
+        .rowsets
+        .iter()
+        .position(|rowset| rowset.id == Some(first_input_id))
+    else {
+        return Err(format!(
+            "op_compaction input rowset {} not exist",
+            first_input_id
+        ));
+    };
+
+    let mut last_input_pos = first_input_pos;
+    for input_rowset_id in op_compaction.input_rowsets.iter().skip(1) {
+        let next_pos = last_input_pos.saturating_add(1);
+        let Some(found) = metadata.rowsets.get(next_pos) else {
+            return Err(format!(
+                "op_compaction input rowset {} not exist",
+                input_rowset_id
+            ));
+        };
+        if found.id != Some(*input_rowset_id) {
+            return Err("op_compaction input rowset position not adjacent".to_string());
+        }
+        last_input_pos = next_pos;
+    }
+
+    let old_input_ids = op_compaction.input_rowsets.clone();
+    let current_schema_id = metadata
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.id)
+        .filter(|v| *v > 0)
+        .unwrap_or(default_schema_id);
+    let rowset_id_base = metadata
+        .next_rowset_id
+        .unwrap_or_else(|| next_rowset_id(&metadata.rowsets));
+
+    let mut output_rowset_id = None;
+    let mut keep_output_rowset = false;
+    if let Some(output_rowset) = op_compaction.output_rowset.as_ref()
+        && output_rowset.num_rows.unwrap_or(0) > 0
+    {
+        let mut new_rowset = output_rowset.clone();
+        ensure_rowset_segment_meta_consistency(&new_rowset)?;
+        normalize_rowset_shared_segments(&mut new_rowset);
+        new_rowset.id = Some(rowset_id_base);
+        new_rowset.max_compact_input_rowset_id = old_input_ids.iter().copied().max();
+        output_rowset_id = new_rowset.id;
+        metadata.next_rowset_id =
+            Some(rowset_id_base.saturating_add(std::cmp::max(1, new_rowset.segments.len()) as u32));
+        metadata.rowsets[first_input_pos] = new_rowset;
+        keep_output_rowset = true;
+    }
+
+    let remove_start = if keep_output_rowset {
+        first_input_pos.saturating_add(1)
+    } else {
+        first_input_pos
+    };
+    metadata.rowsets.drain(remove_start..=last_input_pos);
+
+    if !metadata.rowset_to_schema.is_empty() {
+        for input_rowset_id in &old_input_ids {
+            metadata.rowset_to_schema.remove(input_rowset_id);
+        }
+        if let Some(output_rowset_id) = output_rowset_id {
+            metadata
+                .rowset_to_schema
+                .insert(output_rowset_id, current_schema_id);
+        }
+
+        let active_schema_ids = metadata
+            .rowset_to_schema
+            .values()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        metadata
+            .historical_schemas
+            .retain(|schema_id, _| active_schema_ids.contains(schema_id));
+    }
+
+    let mut new_cumulative_point = 0_u32;
+    let current_cumulative_point = metadata.cumulative_point.unwrap_or(0);
+    if first_input_pos as u32 >= current_cumulative_point {
+        new_cumulative_point = first_input_pos as u32;
+    } else if current_cumulative_point >= old_input_ids.len() as u32 {
+        new_cumulative_point = current_cumulative_point - old_input_ids.len() as u32;
+    }
+    if keep_output_rowset {
+        new_cumulative_point = new_cumulative_point.saturating_add(1);
+    }
+    if new_cumulative_point > metadata.rowsets.len() as u32 {
+        return Err(format!(
+            "op_compaction new cumulative point exceeds rowset size: cumulative_point={} rowsets={}",
+            new_cumulative_point,
+            metadata.rowsets.len()
+        ));
+    }
+    metadata.cumulative_point = Some(new_cumulative_point);
+    Ok(())
 }
 
 fn maybe_update_metadata_schema_for_write(
@@ -545,14 +667,19 @@ mod tests {
     }
 
     #[test]
-    fn apply_txn_log_rejects_unsupported_operation_with_explicit_name() {
+    fn apply_txn_log_applies_compaction_rowset_rewrite() {
+        let old_schema = test_tablet_schema();
+        let mut input_a = test_rowset("seg_a.dat", 2, 20);
+        input_a.id = Some(4);
+        let mut input_b = test_rowset("seg_b.dat", 3, 30);
+        input_b.id = Some(5);
         let mut meta = TabletMetadataPb {
             id: Some(2),
             version: Some(1),
-            schema: None,
-            rowsets: Vec::new(),
-            next_rowset_id: Some(1),
-            cumulative_point: Some(0),
+            schema: Some(old_schema),
+            rowsets: vec![input_a, input_b],
+            next_rowset_id: Some(6),
+            cumulative_point: Some(1),
             delvec_meta: None,
             compaction_inputs: Vec::new(),
             prev_garbage_version: None,
@@ -564,7 +691,7 @@ mod tests {
             sstable_meta: None,
             dcg_meta: None,
             historical_schemas: std::collections::HashMap::new(),
-            rowset_to_schema: std::collections::HashMap::new(),
+            rowset_to_schema: std::collections::HashMap::from([(4_u32, 1_i64), (5_u32, 1_i64)]),
             gtid: Some(0),
             compaction_strategy: None,
             flat_json_config: None,
@@ -573,7 +700,16 @@ mod tests {
             tablet_id: Some(2),
             txn_id: Some(20),
             op_write: None,
-            op_compaction: Some(Default::default()),
+            op_compaction: Some(txn_log_pb::OpCompaction {
+                input_rowsets: vec![4, 5],
+                output_rowset: Some(test_rowset("seg_compact.dat", 5, 40)),
+                input_sstables: Vec::new(),
+                output_sstable: None,
+                compact_version: Some(1),
+                new_segment_offset: Some(0),
+                new_segment_count: Some(1),
+                ssts: Vec::new(),
+            }),
             op_schema_change: None,
             op_alter_metadata: None,
             op_replication: None,
@@ -582,17 +718,25 @@ mod tests {
         };
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
-        let err = apply_txn_log_to_metadata(
+        apply_txn_log_to_metadata(
             &mut meta,
             &txn_log,
-            3,
+            1,
             &test_tablet_schema(),
             &root,
             None,
             2,
         )
-        .expect_err("compaction should fail");
-        assert!(err.contains("op_compaction"), "unexpected error: {err}");
+        .expect("compaction should succeed");
+        assert_eq!(meta.rowsets.len(), 1);
+        assert_eq!(meta.rowsets[0].id, Some(6));
+        assert_eq!(
+            meta.rowsets[0].segments,
+            vec!["seg_compact.dat".to_string()]
+        );
+        assert_eq!(meta.rowset_to_schema.get(&6), Some(&1));
+        assert_eq!(meta.next_rowset_id, Some(7));
+        assert_eq!(meta.cumulative_point, Some(1));
     }
 
     #[test]

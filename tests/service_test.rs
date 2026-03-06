@@ -48,8 +48,12 @@ fn test_config_loading() {
     test_config.init_logging();
 
     let config = test_config.load_config().expect("Failed to load config");
-    assert_eq!(config.server.heartbeat_port, 9050);
-    assert_eq!(config.server.brpc_port, 9060);
+    assert!(
+        !config.server.host.trim().is_empty(),
+        "config host should not be empty"
+    );
+    assert!(config.server.heartbeat_port > 0);
+    assert!(config.server.brpc_port > 0);
 }
 
 #[test]

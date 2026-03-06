@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use crate::connector::starrocks::lake::context::{TabletWriteContext, register_tablet_runtime};
 use crate::formats::starrocks::writer::bundle_meta::{
     empty_tablet_metadata, load_latest_tablet_metadata, load_tablet_metadata_at_version,
-    write_bundle_meta_file,
+    write_initial_meta_file, write_standalone_meta_file,
 };
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
@@ -222,11 +222,7 @@ pub(crate) fn create_lake_tablet_from_req(
     };
     register_tablet_runtime(&runtime_ctx)?;
 
-    let existing_base = match load_tablet_metadata_at_version(tablet_root_path, tablet_id, 1) {
-        Ok(v) => v,
-        Err(err) if is_missing_tablet_page_in_bundle_error(&err) => None,
-        Err(err) => return Err(err),
-    };
+    let existing_base = load_tablet_metadata_at_version(tablet_root_path, tablet_id, 1)?;
     if existing_base.is_some() {
         return Ok(());
     }
@@ -262,9 +258,14 @@ pub(crate) fn create_lake_tablet_from_req(
     tablet_meta.gtid = Some(request.gtid.unwrap_or(0));
     tablet_meta.compaction_strategy = compaction_strategy;
     tablet_meta.flat_json_config = flat_json_config;
-    write_bundle_meta_file(tablet_root_path, tablet_id, 1, &tablet_schema, &tablet_meta)
+    if request.enable_tablet_creation_optimization.unwrap_or(false) {
+        write_initial_meta_file(tablet_root_path, &tablet_meta)
+    } else {
+        write_standalone_meta_file(tablet_root_path, tablet_id, 1, &tablet_meta)
+    }
 }
 
+#[allow(dead_code)]
 fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
     error.contains("bundle metadata missing tablet page for tablet_id=")
         || error.contains("bundle metadata does not contain tablet page:")
@@ -1076,7 +1077,11 @@ fn map_primitive_to_starrocks_type(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type};
+    use super::{
+        create_lake_tablet_from_req, is_missing_tablet_page_in_bundle_error,
+        map_primitive_to_starrocks_type,
+    };
+    use tempfile::TempDir;
 
     #[test]
     fn create_tablet_map_supports_largeint() {
@@ -1126,5 +1131,121 @@ mod tests {
         assert!(is_missing_tablet_page_in_bundle_error(
             "bundle metadata does not contain tablet page: tablet_id=123, path=s3://bucket/meta"
         ));
+    }
+
+    #[test]
+    fn create_tablet_writes_standalone_initial_metadata_by_default() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let req = build_test_create_tablet_req(41001, false);
+
+        create_lake_tablet_from_req(
+            &req,
+            temp_dir.path().to_str().expect("temp path to str"),
+            None,
+        )
+        .expect("create tablet");
+
+        let standalone_path = temp_dir
+            .path()
+            .join("meta/000000000000A029_0000000000000001.meta");
+        let initial_path = temp_dir
+            .path()
+            .join("meta/0000000000000000_0000000000000001.meta");
+        assert!(standalone_path.exists(), "expected standalone metadata");
+        assert!(!initial_path.exists(), "unexpected initial raw metadata");
+    }
+
+    #[test]
+    fn create_tablet_writes_raw_initial_metadata_when_optimized() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let req = build_test_create_tablet_req(41002, true);
+
+        create_lake_tablet_from_req(
+            &req,
+            temp_dir.path().to_str().expect("temp path to str"),
+            None,
+        )
+        .expect("create tablet");
+
+        let standalone_path = temp_dir
+            .path()
+            .join("meta/000000000000A02A_0000000000000001.meta");
+        let initial_path = temp_dir
+            .path()
+            .join("meta/0000000000000000_0000000000000001.meta");
+        assert!(!standalone_path.exists(), "unexpected standalone metadata");
+        assert!(initial_path.exists(), "expected initial raw metadata");
+    }
+
+    fn build_test_create_tablet_req(
+        tablet_id: i64,
+        enable_tablet_creation_optimization: bool,
+    ) -> crate::agent_service::TCreateTabletReq {
+        let column = crate::descriptors::TColumn {
+            column_name: "c1".to_string(),
+            column_type: Some(crate::types::TColumnType {
+                type_: crate::types::TPrimitiveType::BIGINT,
+                len: Some(8),
+                index_len: Some(8),
+                precision: None,
+                scale: None,
+            }),
+            aggregation_type: None,
+            is_key: Some(true),
+            is_allow_null: Some(true),
+            default_value: None,
+            is_bloom_filter_column: None,
+            define_expr: None,
+            is_auto_increment: Some(false),
+            col_unique_id: Some(0),
+            has_bitmap_index: Some(false),
+            agg_state_desc: None,
+            index_len: Some(8),
+            type_desc: None,
+        };
+        let schema = crate::agent_service::TTabletSchema {
+            short_key_column_count: 1,
+            schema_hash: 1001,
+            keys_type: crate::types::TKeysType::DUP_KEYS,
+            storage_type: crate::types::TStorageType::COLUMN,
+            columns: vec![column],
+            bloom_filter_fpp: None,
+            indexes: None,
+            is_in_memory: None,
+            id: Some(88001),
+            sort_key_idxes: None,
+            sort_key_unique_ids: None,
+            schema_version: Some(0),
+            compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+            compression_level: None,
+        };
+        crate::agent_service::TCreateTabletReq {
+            tablet_id,
+            tablet_schema: schema,
+            version: None,
+            version_hash: None,
+            storage_medium: None,
+            in_restore_mode: None,
+            base_tablet_id: None,
+            base_schema_hash: None,
+            table_id: Some(99001),
+            partition_id: Some(99101),
+            allocation_term: None,
+            is_eco_mode: None,
+            storage_format: None,
+            tablet_type: None,
+            enable_persistent_index: Some(false),
+            compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
+            binlog_config: None,
+            persistent_index_type: None,
+            primary_index_cache_expire_sec: None,
+            create_schema_file: Some(false),
+            compression_level: None,
+            enable_tablet_creation_optimization: Some(enable_tablet_creation_optimization),
+            timeout_ms: None,
+            gtid: Some(0),
+            flat_json_config: None,
+            compaction_strategy: None,
+        }
     }
 }

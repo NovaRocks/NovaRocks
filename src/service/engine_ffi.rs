@@ -18,17 +18,18 @@
 
 use crate::common::thrift::thrift_serialize_result_batch;
 use crate::connector::starrocks::lake::{
-    abort_txn as lake_abort_txn, delete_data as lake_delete_data,
-    delete_tablet as lake_delete_tablet, drop_table as lake_drop_table,
-    get_tablet_stats as lake_get_tablet_stats, publish_log_version as lake_publish_log_version,
+    abort_compaction as lake_abort_compaction, abort_txn as lake_abort_txn,
+    compact as lake_compact, delete_data as lake_delete_data, delete_tablet as lake_delete_tablet,
+    drop_table as lake_drop_table, get_tablet_stats as lake_get_tablet_stats,
+    publish_log_version as lake_publish_log_version,
     publish_log_version_batch as lake_publish_log_version_batch,
     publish_version as lake_publish_version, vacuum as lake_vacuum,
 };
 use crate::novarocks_logging::error;
 use crate::service::grpc_client::proto::starrocks::{
-    AbortTxnRequest, DeleteDataRequest, DeleteTabletRequest, DropTableRequest,
-    PublishLogVersionBatchRequest, PublishLogVersionRequest, PublishVersionRequest,
-    TabletStatRequest, VacuumRequest,
+    AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
+    DeleteTabletRequest, DropTableRequest, PublishLogVersionBatchRequest, PublishLogVersionRequest,
+    PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
 use crate::{FetchResult, UniqueId};
 use prost::Message;
@@ -556,6 +557,101 @@ pub extern "C" fn novarocks_rs_lake_get_tablet_stats(
         }
         Err(e) => {
             error!(target: "novarocks::ffi", error = %e, "lake get_tablet_stats failed");
+            write_string_buf(e, out_err);
+            1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_lake_compact(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    unsafe {
+        if !out_resp.is_null() {
+            (*out_resp).ptr = std::ptr::null_mut();
+            (*out_resp).len = 0;
+        }
+        if !out_err.is_null() {
+            (*out_err).ptr = std::ptr::null_mut();
+            (*out_err).len = 0;
+        }
+    }
+    if ptr.is_null() {
+        write_string_buf("lake compact request ptr is null".to_string(), out_err);
+        return 2;
+    }
+
+    let req_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let request = match CompactRequest::decode(req_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = format!("decode lake compact request failed: {e}");
+            write_string_buf(err.clone(), out_err);
+            error!(target: "novarocks::ffi", error = %err, "lake compact decode failed");
+            return 2;
+        }
+    };
+
+    match lake_compact(&request) {
+        Ok(response) => {
+            write_bytes_buf(response.encode_to_vec(), out_resp);
+            0
+        }
+        Err(e) => {
+            error!(target: "novarocks::ffi", error = %e, "lake compact failed");
+            write_string_buf(e, out_err);
+            1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_lake_abort_compaction(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    unsafe {
+        if !out_resp.is_null() {
+            (*out_resp).ptr = std::ptr::null_mut();
+            (*out_resp).len = 0;
+        }
+        if !out_err.is_null() {
+            (*out_err).ptr = std::ptr::null_mut();
+            (*out_err).len = 0;
+        }
+    }
+    if ptr.is_null() {
+        write_string_buf(
+            "lake abort_compaction request ptr is null".to_string(),
+            out_err,
+        );
+        return 2;
+    }
+
+    let req_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let request = match AbortCompactionRequest::decode(req_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = format!("decode lake abort_compaction request failed: {e}");
+            write_string_buf(err.clone(), out_err);
+            error!(target: "novarocks::ffi", error = %err, "lake abort_compaction decode failed");
+            return 2;
+        }
+    };
+
+    match lake_abort_compaction(&request) {
+        Ok(response) => {
+            write_bytes_buf(response.encode_to_vec(), out_resp);
+            0
+        }
+        Err(e) => {
+            error!(target: "novarocks::ffi", error = %e, "lake abort_compaction failed");
             write_string_buf(e, out_err);
             1
         }

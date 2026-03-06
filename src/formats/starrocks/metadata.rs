@@ -38,6 +38,7 @@ use crate::service::grpc_client::proto::starrocks::{
 const METADATA_DIR: &str = "meta";
 const DATA_DIR: &str = "data";
 const BUNDLE_METADATA_FOOTER_SIZE: usize = 8;
+const INITIAL_VERSION: i64 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// One segment entry resolved from tablet rowsets.
@@ -147,31 +148,7 @@ fn load_tablet_snapshot_from_root(
     rt: &tokio::runtime::Runtime,
     op: &Operator,
 ) -> Result<StarRocksTabletSnapshot, String> {
-    let mut fallback_error: Option<String> = None;
-    for candidate_version in (1..=version).rev() {
-        match load_tablet_snapshot_at_version(tablet_id, candidate_version, root, rt, op) {
-            Ok(mut snapshot) => {
-                // Keep the caller-visible version stable even when metadata is carried over
-                // from an earlier version due missing page/file in a newer bundle.
-                snapshot.version = version;
-                return Ok(snapshot);
-            }
-            Err(err) => {
-                if fallback_error.is_none() {
-                    fallback_error = Some(err.clone());
-                }
-                if candidate_version == 1 || !should_try_previous_metadata_version(&err) {
-                    return Err(err);
-                }
-            }
-        }
-    }
-    Err(fallback_error.unwrap_or_else(|| {
-        format!(
-            "load tablet snapshot failed with unknown error: tablet_id={}, version={}",
-            tablet_id, version
-        )
-    }))
+    load_tablet_snapshot_at_version(tablet_id, version, root, rt, op)
 }
 
 fn load_tablet_snapshot_at_version(
@@ -196,6 +173,23 @@ fn load_tablet_snapshot_at_version(
         }
     }
 
+    if version == INITIAL_VERSION && tablet_id != 0 {
+        let initial_metadata_rel = metadata_rel_path(0, INITIAL_VERSION)?;
+        for candidate_rel in metadata_rel_path_candidates(tablet_id, &initial_metadata_rel) {
+            if object_exists(rt, op, &candidate_rel)? {
+                let metadata_bytes = read_all_bytes(rt, op, &candidate_rel)?;
+                let metadata_path = root.join_relative_path(&candidate_rel);
+                return parse_initial_snapshot(
+                    tablet_id,
+                    version,
+                    root,
+                    &metadata_path,
+                    &metadata_bytes,
+                );
+            }
+        }
+    }
+
     let bundle_metadata_rel = metadata_rel_path(0, version)?;
     for candidate_rel in metadata_rel_path_candidates(tablet_id, &bundle_metadata_rel) {
         if object_exists(rt, op, &candidate_rel)? {
@@ -211,11 +205,6 @@ fn load_tablet_snapshot_at_version(
         }
     }
     Err(format!("metadata file not found: {}", bundle_metadata_rel))
-}
-
-fn should_try_previous_metadata_version(error: &str) -> bool {
-    error.contains("metadata file not found:")
-        || error.contains("bundle metadata does not contain tablet page:")
 }
 
 /// Load and validate segment footers from a metadata snapshot.
@@ -286,6 +275,33 @@ fn parse_standalone_snapshot(
             metadata_path, e
         )
     })?;
+    build_standalone_snapshot(tablet_id, version, root, metadata_path, metadata)
+}
+
+fn parse_initial_snapshot(
+    tablet_id: i64,
+    version: i64,
+    root: &TabletRoot,
+    metadata_path: &str,
+    metadata_bytes: &[u8],
+) -> Result<StarRocksTabletSnapshot, String> {
+    let mut metadata = TabletMetadataPb::decode(metadata_bytes).map_err(|e| {
+        format!(
+            "decode initial TabletMetadataPB failed: path={}, error={}",
+            metadata_path, e
+        )
+    })?;
+    metadata.id = Some(tablet_id);
+    build_standalone_snapshot(tablet_id, version, root, metadata_path, metadata)
+}
+
+fn build_standalone_snapshot(
+    tablet_id: i64,
+    version: i64,
+    root: &TabletRoot,
+    metadata_path: &str,
+    metadata: TabletMetadataPb,
+) -> Result<StarRocksTabletSnapshot, String> {
     ensure_tablet_identity(&metadata, tablet_id, version, metadata_path)?;
     let tablet_schema = metadata.schema.clone().ok_or_else(|| {
         format!(
@@ -1226,6 +1242,85 @@ mod tests {
         assert_eq!(snapshot.segment_files[0].relative_path, "data/seg0.dat");
         assert_eq!(snapshot.segment_files[0].bundle_file_offset, None);
         assert_eq!(snapshot.segment_files[0].segment_size, None);
+    }
+
+    #[test]
+    fn load_initial_metadata_snapshot_from_raw_shared_file() {
+        let owner_tablet_id = 20001_i64;
+        let requested_tablet_id = 20004_i64;
+        let version = 1_i64;
+        let temp_dir = TempDir::new().expect("create temp dir");
+        std::fs::create_dir_all(temp_dir.path().join("meta")).expect("create meta dir");
+        let initial_metadata = TabletMetadataPb {
+            id: Some(owner_tablet_id),
+            version: Some(version),
+            schema: Some(TabletSchemaPb {
+                keys_type: Some(KeysType::DupKeys as i32),
+                id: Some(88_i64),
+                ..Default::default()
+            }),
+            next_rowset_id: Some(1),
+            cumulative_point: Some(0),
+            ..Default::default()
+        };
+        let initial_file = temp_dir
+            .path()
+            .join(metadata_rel_path(0, version).expect("initial rel path"));
+        std::fs::write(&initial_file, initial_metadata.encode_to_vec())
+            .expect("write initial metadata");
+
+        let snapshot = load_tablet_snapshot(
+            requested_tablet_id,
+            version,
+            temp_dir.path().to_str().expect("temp path to str"),
+            None,
+        )
+        .expect("load initial snapshot");
+
+        assert_eq!(snapshot.tablet_id, requested_tablet_id);
+        assert_eq!(snapshot.version, version);
+        assert_eq!(snapshot.rowset_count, 0);
+        assert!(
+            snapshot
+                .metadata_path
+                .ends_with("meta/0000000000000000_0000000000000001.meta"),
+            "path={}",
+            snapshot.metadata_path
+        );
+    }
+
+    #[test]
+    fn load_tablet_snapshot_does_not_fallback_to_previous_versions() {
+        let tablet_id = 20010_i64;
+        let temp_dir = TempDir::new().expect("create temp dir");
+        std::fs::create_dir_all(temp_dir.path().join("meta")).expect("create meta dir");
+        let initial_metadata = TabletMetadataPb {
+            id: Some(tablet_id),
+            version: Some(1),
+            schema: Some(TabletSchemaPb {
+                keys_type: Some(KeysType::DupKeys as i32),
+                id: Some(91_i64),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let initial_file = temp_dir
+            .path()
+            .join(metadata_rel_path(0, 1).expect("initial rel path"));
+        std::fs::write(&initial_file, initial_metadata.encode_to_vec())
+            .expect("write initial metadata");
+
+        let err = load_tablet_snapshot(
+            tablet_id,
+            2,
+            temp_dir.path().to_str().expect("temp path to str"),
+            None,
+        )
+        .expect_err("version 2 must not fall back to version 1");
+        assert!(
+            err.contains("metadata file not found"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

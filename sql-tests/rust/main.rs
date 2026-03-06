@@ -24,6 +24,7 @@ struct QueryMeta {
     order_sensitive: Option<bool>,
     float_epsilon: Option<f64>,
     db: Option<String>,
+    expect_error: Option<String>,
     tags: Vec<String>,
 }
 
@@ -288,6 +289,9 @@ fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "db" => {
                 meta.db = Some(raw_value);
             }
+            "expect_error" => {
+                meta.expect_error = Some(raw_value);
+            }
             "catalog" => {
                 bail!(
                     "@catalog metadata is no longer supported; use runner --catalog/--ref-catalog options"
@@ -312,6 +316,10 @@ fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         order_sensitive: override_meta.order_sensitive.or(base.order_sensitive),
         float_epsilon: override_meta.float_epsilon.or(base.float_epsilon),
         db: override_meta.db.clone().or_else(|| base.db.clone()),
+        expect_error: override_meta
+            .expect_error
+            .clone()
+            .or_else(|| base.expect_error.clone()),
         tags: if override_meta.tags.is_empty() {
             base.tags.clone()
         } else {
@@ -922,6 +930,15 @@ fn execute_query(
     (true, Some(execution), String::new())
 }
 
+fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
+    if expected_substring.trim().is_empty() {
+        return false;
+    }
+    actual
+        .to_ascii_lowercase()
+        .contains(&expected_substring.to_ascii_lowercase())
+}
+
 fn parse_query_list(value: Option<&str>) -> HashSet<String> {
     value
         .unwrap_or_default()
@@ -1412,6 +1429,41 @@ fn main() -> Result<()> {
             Mode::Verify => {
                 let (ok, execution, err_msg) =
                     execute_query(&target_conn, query_timeout, &case.sql);
+                if let Some(expected_error) = case.meta.expect_error.as_deref() {
+                    let elapsed = execution
+                        .as_ref()
+                        .map(|result| result.elapsed)
+                        .unwrap_or_default();
+                    total_time += elapsed;
+                    if ok {
+                        failed += 1;
+                        failed_query_ids.push(case.query_id.clone());
+                        per_query_times.push((case.query_id.clone(), elapsed, false));
+                        println!(
+                            "    ❌ expected error containing {:?}, but query succeeded",
+                            expected_error
+                        );
+                    } else if error_message_matches(&err_msg, expected_error) {
+                        passed += 1;
+                        per_query_times.push((case.query_id.clone(), elapsed, true));
+                        println!(
+                            "    ✅ PASS (expected error matched): {}",
+                            err_msg
+                        );
+                    } else {
+                        failed += 1;
+                        failed_query_ids.push(case.query_id.clone());
+                        per_query_times.push((case.query_id.clone(), elapsed, false));
+                        println!(
+                            "    ❌ expected error containing {:?}, got: {}",
+                            expected_error, err_msg
+                        );
+                    }
+                    if cli.fail_fast && failed > 0 {
+                        break;
+                    }
+                    continue;
+                }
                 if !ok || execution.is_none() {
                     failed += 1;
                     failed_query_ids.push(case.query_id.clone());
@@ -1524,6 +1576,44 @@ fn main() -> Result<()> {
                 } else {
                     &reference_conn
                 };
+                if let Some(expected_error) = case.meta.expect_error.as_deref() {
+                    let (ok, execution, err_msg) =
+                        execute_query(record_conn, query_timeout, &case.sql);
+                    let elapsed = execution
+                        .as_ref()
+                        .map(|result| result.elapsed)
+                        .unwrap_or_default();
+                    total_time += elapsed;
+                    if ok {
+                        failed += 1;
+                        failed_query_ids.push(case.query_id.clone());
+                        per_query_times.push((case.query_id.clone(), elapsed, false));
+                        println!(
+                            "    ❌ expected error containing {:?}, but query succeeded",
+                            expected_error
+                        );
+                    } else if error_message_matches(&err_msg, expected_error) {
+                        passed += 1;
+                        per_query_times.push((case.query_id.clone(), elapsed, true));
+                        println!(
+                            "    ✅ RECORDED EXPECTED ERROR ({:.2}s): {}",
+                            elapsed.as_secs_f64(),
+                            err_msg
+                        );
+                    } else {
+                        failed += 1;
+                        failed_query_ids.push(case.query_id.clone());
+                        per_query_times.push((case.query_id.clone(), elapsed, false));
+                        println!(
+                            "    ❌ expected error containing {:?}, got: {}",
+                            expected_error, err_msg
+                        );
+                    }
+                    if cli.fail_fast && failed > 0 {
+                        break;
+                    }
+                    continue;
+                }
 
                 let (ok, execution, err_msg) = execute_query(record_conn, query_timeout, &case.sql);
                 if !ok || execution.is_none() {
@@ -1584,6 +1674,45 @@ fn main() -> Result<()> {
                 );
             }
             Mode::Diff => {
+                if let Some(expected_error) = case.meta.expect_error.as_deref() {
+                    let (ok_t, execution_t, err_t) =
+                        execute_query(&target_conn, query_timeout, &case.sql);
+                    let (ok_r, execution_r, err_r) =
+                        execute_query(&reference_conn, query_timeout, &case.sql);
+                    let elapsed = execution_t
+                        .as_ref()
+                        .map(|result| result.elapsed)
+                        .unwrap_or_default()
+                        + execution_r
+                            .as_ref()
+                            .map(|result| result.elapsed)
+                            .unwrap_or_default();
+                    total_time += elapsed;
+
+                    let target_matched = !ok_t && error_message_matches(&err_t, expected_error);
+                    let reference_matched = !ok_r && error_message_matches(&err_r, expected_error);
+                    if target_matched && reference_matched {
+                        passed += 1;
+                        per_query_times.push((case.query_id.clone(), elapsed, true));
+                        println!(
+                            "    ✅ DIFF PASS (both sides matched expected error: {:?})",
+                            expected_error
+                        );
+                    } else {
+                        failed += 1;
+                        failed_query_ids.push(case.query_id.clone());
+                        per_query_times.push((case.query_id.clone(), elapsed, false));
+                        println!(
+                            "    ❌ DIFF FAILED expected error {:?} (target_ok={}, target_err={}, reference_ok={}, reference_err={})",
+                            expected_error, ok_t, err_t, ok_r, err_r
+                        );
+                        if cli.fail_fast {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+
                 let (ok_t, execution_t, err_t) =
                     execute_query(&target_conn, query_timeout, &case.sql);
                 if !ok_t || execution_t.is_none() {

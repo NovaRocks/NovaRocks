@@ -16,11 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-
-use prost::Message;
 
 use crate::common::ids::SlotId;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
@@ -28,41 +24,11 @@ use crate::runtime::starlet_shard_registry::{self, S3StoreConfig, StarletShardIn
 use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
 use crate::types;
 
-const TABLET_RUNTIME_PERSIST_DIR: &str = "starust_lake_tablet_runtime";
-
 #[derive(Clone)]
 pub(crate) struct TabletRuntimeEntry {
     pub(crate) root_path: String,
     pub(crate) schema: TabletSchemaPb,
     pub(crate) s3_config: Option<S3StoreConfig>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct TabletRuntimeS3ConfigPb {
-    #[prost(string, tag = "1")]
-    endpoint: String,
-    #[prost(string, tag = "2")]
-    bucket: String,
-    #[prost(string, tag = "3")]
-    root: String,
-    #[prost(string, tag = "4")]
-    access_key_id: String,
-    #[prost(string, tag = "5")]
-    access_key_secret: String,
-    #[prost(string, optional, tag = "6")]
-    region: Option<String>,
-    #[prost(bool, optional, tag = "7")]
-    enable_path_style_access: Option<bool>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-struct TabletRuntimePersistPb {
-    #[prost(string, tag = "1")]
-    root_path: String,
-    #[prost(message, optional, tag = "2")]
-    schema: Option<TabletSchemaPb>,
-    #[prost(message, optional, tag = "3")]
-    s3_config: Option<TabletRuntimeS3ConfigPb>,
 }
 
 static TABLET_RUNTIME_REGISTRY: OnceLock<Mutex<HashMap<i64, TabletRuntimeEntry>>> = OnceLock::new();
@@ -273,7 +239,6 @@ pub(crate) fn register_tablet_runtime(ctx: &TabletWriteContext) -> Result<(), St
             .map_err(|_| "lock tablet runtime registry failed".to_string())?;
         guard.insert(ctx.tablet_id, entry.clone());
     }
-    persist_tablet_runtime(ctx.tablet_id, &entry)?;
     sync_runtime_to_shard_registry(ctx.tablet_id, &entry);
     Ok(())
 }
@@ -292,16 +257,9 @@ pub(crate) fn get_tablet_runtime(tablet_id: i64) -> Result<TabletRuntimeEntry, S
         sync_runtime_to_shard_registry(tablet_id, &found);
         return Ok(found);
     }
-
-    let persisted = load_persisted_tablet_runtime(tablet_id)?.ok_or_else(|| {
-        format!("tablet runtime is not registered or persisted for tablet_id={tablet_id}")
-    })?;
-    let mut guard = tablet_runtime_registry()
-        .lock()
-        .map_err(|_| "lock tablet runtime registry failed".to_string())?;
-    guard.insert(tablet_id, persisted.clone());
-    sync_runtime_to_shard_registry(tablet_id, &persisted);
-    Ok(persisted)
+    Err(format!(
+        "tablet runtime is not registered for tablet_id={tablet_id}"
+    ))
 }
 
 pub(crate) fn remove_tablet_runtime(tablet_id: i64) -> Result<(), String> {
@@ -315,134 +273,7 @@ pub(crate) fn remove_tablet_runtime(tablet_id: i64) -> Result<(), String> {
         guard.remove(&tablet_id);
     }
     let _ = starlet_shard_registry::remove_many([tablet_id]);
-
-    let file = tablet_runtime_persist_file(tablet_id)?;
-    if file.exists() {
-        fs::remove_file(&file).map_err(|e| {
-            format!(
-                "remove persisted tablet runtime failed: file={}, error={}",
-                file.display(),
-                e
-            )
-        })?;
-    }
     Ok(())
-}
-
-fn tablet_runtime_persist_file(tablet_id: i64) -> Result<PathBuf, String> {
-    if tablet_id <= 0 {
-        return Err(format!(
-            "invalid tablet_id for runtime persistence file: {tablet_id}"
-        ));
-    }
-    Ok(std::env::temp_dir()
-        .join(TABLET_RUNTIME_PERSIST_DIR)
-        .join(format!("{tablet_id}.pb")))
-}
-
-fn persist_tablet_runtime(tablet_id: i64, entry: &TabletRuntimeEntry) -> Result<(), String> {
-    let file = tablet_runtime_persist_file(tablet_id)?;
-    if let Some(parent) = file.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("create tablet runtime persist dir failed: {}", e))?;
-    }
-    let bytes = TabletRuntimePersistPb {
-        root_path: entry.root_path.clone(),
-        schema: Some(entry.schema.clone()),
-        s3_config: entry.s3_config.as_ref().map(|cfg| TabletRuntimeS3ConfigPb {
-            endpoint: cfg.endpoint.clone(),
-            bucket: cfg.bucket.clone(),
-            root: cfg.root.clone(),
-            access_key_id: cfg.access_key_id.clone(),
-            access_key_secret: cfg.access_key_secret.clone(),
-            region: cfg.region.clone(),
-            enable_path_style_access: cfg.enable_path_style_access,
-        }),
-    }
-    .encode_to_vec();
-    fs::write(&file, bytes).map_err(|e| {
-        format!(
-            "persist tablet runtime failed: file={}, error={}",
-            file.display(),
-            e
-        )
-    })
-}
-
-fn load_persisted_tablet_runtime(tablet_id: i64) -> Result<Option<TabletRuntimeEntry>, String> {
-    let file = tablet_runtime_persist_file(tablet_id)?;
-    if !file.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(&file).map_err(|e| {
-        format!(
-            "read persisted tablet runtime failed: file={}, error={}",
-            file.display(),
-            e
-        )
-    })?;
-    let persisted = TabletRuntimePersistPb::decode(bytes.as_slice()).map_err(|e| {
-        format!(
-            "decode persisted tablet runtime failed: file={}, error={}",
-            file.display(),
-            e
-        )
-    })?;
-    if persisted.root_path.trim().is_empty() {
-        return Err(format!(
-            "persisted tablet runtime has empty root_path: file={}",
-            file.display()
-        ));
-    }
-    let schema = persisted.schema.ok_or_else(|| {
-        format!(
-            "persisted tablet runtime missing schema: file={}",
-            file.display()
-        )
-    })?;
-    let root_path = persisted.root_path.trim_end_matches('/').to_string();
-    let s3_config = match persisted.s3_config {
-        Some(cfg) => Some(normalize_s3_config(&S3StoreConfig {
-            endpoint: cfg.endpoint,
-            bucket: cfg.bucket,
-            root: cfg.root,
-            access_key_id: cfg.access_key_id,
-            access_key_secret: cfg.access_key_secret,
-            region: cfg.region,
-            enable_path_style_access: cfg.enable_path_style_access,
-        })?),
-        None => None,
-    };
-    let scheme = classify_scan_paths([root_path.as_str()])?;
-    match scheme {
-        ScanPathScheme::Local => {
-            if s3_config.is_some() {
-                return Err(format!(
-                    "persisted tablet runtime for local path must not contain S3 config: file={}",
-                    file.display()
-                ));
-            }
-        }
-        ScanPathScheme::Oss => {
-            if s3_config.is_none() {
-                return Err(format!(
-                    "persisted tablet runtime for object-store path is missing S3 config: file={}",
-                    file.display()
-                ));
-            }
-        }
-        ScanPathScheme::Hdfs => {
-            return Err(format!(
-                "persisted tablet runtime does not support hdfs path yet: file={}",
-                file.display()
-            ));
-        }
-    }
-    Ok(Some(TabletRuntimeEntry {
-        root_path,
-        schema,
-        s3_config,
-    }))
 }
 
 #[cfg(test)]
@@ -453,16 +284,54 @@ pub(crate) fn clear_tablet_runtime_cache_for_test() {
 }
 
 #[cfg(test)]
-pub(crate) fn clear_persisted_tablet_runtime_for_test(tablet_id: i64) -> Result<(), String> {
-    let file = tablet_runtime_persist_file(tablet_id)?;
-    if file.exists() {
-        fs::remove_file(&file).map_err(|e| {
-            format!(
-                "remove persisted tablet runtime failed: file={}, error={}",
-                file.display(),
-                e
-            )
-        })?;
+mod tests {
+    use super::{
+        TabletWriteContext, clear_tablet_runtime_cache_for_test, get_tablet_runtime,
+        register_tablet_runtime,
+    };
+    use crate::runtime::starlet_shard_registry;
+    use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+
+    fn local_context(tablet_id: i64, root_path: String) -> TabletWriteContext {
+        TabletWriteContext {
+            db_id: 1,
+            table_id: 2,
+            tablet_id,
+            tablet_root_path: root_path,
+            tablet_schema: TabletSchemaPb::default(),
+            s3_config: None,
+            partial_update: Default::default(),
+        }
     }
-    Ok(())
+
+    #[test]
+    fn runtime_lookup_fails_after_cache_clear_without_persistence() {
+        starlet_shard_registry::clear_for_test();
+        clear_tablet_runtime_cache_for_test();
+        let tablet_id = 79_001;
+        let root = std::env::temp_dir()
+            .join("novarocks_lake_context_test")
+            .join(tablet_id.to_string())
+            .to_string_lossy()
+            .to_string();
+        let ctx = local_context(tablet_id, root);
+        register_tablet_runtime(&ctx).expect("register runtime");
+
+        let found = get_tablet_runtime(tablet_id).expect("runtime should exist before clear");
+        assert_eq!(
+            found.root_path,
+            ctx.tablet_root_path.trim_end_matches('/').to_string()
+        );
+
+        clear_tablet_runtime_cache_for_test();
+        let err = match get_tablet_runtime(tablet_id) {
+            Ok(_) => panic!("lookup should fail after cache clear"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("is not registered"),
+            "unexpected error after cache clear: {err}"
+        );
+        starlet_shard_registry::clear_for_test();
+    }
 }

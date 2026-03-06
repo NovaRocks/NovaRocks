@@ -41,10 +41,14 @@ use crate::connector::starrocks::lake::txn_log::{
 use crate::exec::chunk::{Chunk, field_with_slot_id};
 use crate::exec::expr::ExprArena;
 use crate::formats::starrocks::writer::bundle_meta::{
-    empty_tablet_metadata, load_tablet_metadata_at_version, write_bundle_meta_file,
+    empty_tablet_metadata, load_tablet_metadata_at_version, write_initial_meta_file,
+    write_standalone_meta_file,
 };
-use crate::formats::starrocks::writer::io::write_bytes;
-use crate::formats::starrocks::writer::layout::{DATA_DIR, join_tablet_path, txn_log_file_path};
+use crate::formats::starrocks::writer::io::{read_bytes_if_exists, write_bytes};
+use crate::formats::starrocks::writer::layout::{
+    DATA_DIR, initial_meta_file_path, join_tablet_path, standalone_meta_file_path,
+    txn_log_file_path,
+};
 use crate::formats::starrocks::writer::{
     StarRocksWriteFormat, build_single_segment_metadata, build_starrocks_native_segment_bytes,
     build_txn_data_file_name, sort_batch_for_native_write,
@@ -177,13 +181,28 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     if !schemas_equivalent(&new_metadata_schema, &new_schema) {
         let mut patched_meta = new_metadata.clone();
         patched_meta.schema = Some(new_schema.clone());
-        write_bundle_meta_file(
-            &new_ctx.tablet_root_path,
-            new_tablet_id,
-            1,
-            &new_schema,
-            &patched_meta,
-        )?;
+        patched_meta.id = Some(new_tablet_id);
+        patched_meta.version = Some(1);
+        let initial_path = initial_meta_file_path(&new_ctx.tablet_root_path)?;
+        if read_bytes_if_exists(&initial_path)?.is_some() {
+            write_initial_meta_file(&new_ctx.tablet_root_path, &patched_meta)?;
+        } else {
+            let standalone_path =
+                standalone_meta_file_path(&new_ctx.tablet_root_path, new_tablet_id, 1)?;
+            if read_bytes_if_exists(&standalone_path)?.is_some() {
+                write_standalone_meta_file(
+                    &new_ctx.tablet_root_path,
+                    new_tablet_id,
+                    1,
+                    &patched_meta,
+                )?;
+            } else {
+                return Err(format!(
+                    "schema_change could not find initial v1 metadata layout for new tablet: tablet_id={} root_path={}",
+                    new_tablet_id, new_ctx.tablet_root_path
+                ));
+            }
+        }
     }
 
     let source_output_schema = build_tablet_output_schema(&base_read_schema)?;
@@ -289,6 +308,13 @@ fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
         || error.contains("bundle metadata does not contain tablet page:")
 }
 
+fn is_expected_initial_metadata_without_schema(metadata: &TabletMetadataPb, version: i64) -> bool {
+    version == 1
+        && metadata.schema.is_none()
+        && metadata.rowsets.is_empty()
+        && metadata.historical_schemas.is_empty()
+}
+
 fn resolve_tablet_schema_from_metadata_or_runtime(
     op: &str,
     metadata: &TabletMetadataPb,
@@ -304,12 +330,21 @@ fn resolve_tablet_schema_from_metadata_or_runtime(
             tablet_id, version, runtime_err
         )
     })?;
-    tracing::warn!(
-        op,
-        tablet_id,
-        version,
-        "alter task metadata missing schema, falling back to runtime schema"
-    );
+    if is_expected_initial_metadata_without_schema(metadata, version) {
+        tracing::debug!(
+            op,
+            tablet_id,
+            version,
+            "alter task initial metadata does not embed schema, using runtime schema"
+        );
+    } else {
+        tracing::warn!(
+            op,
+            tablet_id,
+            version,
+            "alter task metadata missing schema, falling back to runtime schema"
+        );
+    }
     Ok(runtime.schema)
 }
 
@@ -1401,4 +1436,37 @@ fn write_schema_change_txn_log(
         });
         write_txn_log_file(&txn_log_path, &txn_log)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_expected_initial_metadata_without_schema;
+    use crate::service::grpc_client::proto::starrocks::{RowsetMetadataPb, TabletMetadataPb};
+
+    #[test]
+    fn initial_empty_v1_metadata_without_schema_is_expected() {
+        let mut metadata = TabletMetadataPb::default();
+        metadata.id = Some(123);
+        metadata.version = Some(1);
+        assert!(is_expected_initial_metadata_without_schema(&metadata, 1));
+    }
+
+    #[test]
+    fn non_initial_or_non_empty_metadata_without_schema_is_not_expected() {
+        let mut metadata = TabletMetadataPb::default();
+        metadata.id = Some(123);
+        metadata.version = Some(2);
+        assert!(!is_expected_initial_metadata_without_schema(&metadata, 2));
+
+        let mut metadata_with_rowset = TabletMetadataPb::default();
+        metadata_with_rowset.id = Some(123);
+        metadata_with_rowset.version = Some(1);
+        metadata_with_rowset
+            .rowsets
+            .push(RowsetMetadataPb::default());
+        assert!(!is_expected_initial_metadata_without_schema(
+            &metadata_with_rowset,
+            1
+        ));
+    }
 }

@@ -24,6 +24,7 @@ pub const META_DIR: &str = "meta";
 pub const DATA_DIR: &str = "data";
 pub const LOG_DIR: &str = "log";
 pub const BUNDLE_TABLET_ID: i64 = 0;
+pub const INITIAL_VERSION: i64 = 1;
 
 #[allow(dead_code)]
 pub fn build_data_file_name(
@@ -112,6 +113,40 @@ pub fn bundle_meta_file_path(tablet_root_path: &str, version: i64) -> Result<Str
             "{META_DIR}/{:016X}_{:016X}.meta",
             BUNDLE_TABLET_ID as u64, version as u64
         ),
+    )
+}
+
+pub fn tablet_meta_rel_path(tablet_id: i64, version: i64) -> Result<String, String> {
+    if tablet_id < 0 {
+        return Err(format!(
+            "invalid tablet_id for metadata path generation: {}",
+            tablet_id
+        ));
+    }
+    if version <= 0 {
+        return Err(format!(
+            "invalid version for metadata path generation: {}",
+            version
+        ));
+    }
+    Ok(format!(
+        "{META_DIR}/{:016X}_{:016X}.meta",
+        tablet_id as u64, version as u64
+    ))
+}
+
+pub fn standalone_meta_file_path(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    version: i64,
+) -> Result<String, String> {
+    join_tablet_path(tablet_root_path, &tablet_meta_rel_path(tablet_id, version)?)
+}
+
+pub fn initial_meta_file_path(tablet_root_path: &str) -> Result<String, String> {
+    join_tablet_path(
+        tablet_root_path,
+        &tablet_meta_rel_path(BUNDLE_TABLET_ID, INITIAL_VERSION)?,
     )
 }
 

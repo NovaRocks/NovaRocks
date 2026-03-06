@@ -54,9 +54,16 @@ struct ReportInstance {
     mem_tracker: Option<Arc<MemTracker>>,
     query_mem_tracker: Option<Arc<MemTracker>>,
     report_interval_ns: Option<i64>,
+    fe_query_gone: bool,
 }
 
 static REPORT_REGISTRY: OnceLock<Mutex<HashMap<UniqueId, ReportInstance>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReportSendOutcome {
+    Delivered,
+    QueryGone,
+}
 
 fn registry() -> &'static Mutex<HashMap<UniqueId, ReportInstance>> {
     REPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -112,6 +119,7 @@ pub(crate) fn register_instance(
             mem_tracker,
             query_mem_tracker,
             report_interval_ns,
+            fe_query_gone: false,
         },
     );
 }
@@ -125,6 +133,7 @@ pub(crate) fn list_report_instances() -> Vec<(UniqueId, ReportInstanceSnapshot)>
     let guard = registry().lock().expect("report registry lock");
     guard
         .iter()
+        .filter(|(_, instance)| !instance.fe_query_gone)
         .map(|(id, instance)| {
             (
                 *id,
@@ -135,6 +144,14 @@ pub(crate) fn list_report_instances() -> Vec<(UniqueId, ReportInstanceSnapshot)>
             )
         })
         .collect()
+}
+
+fn mark_fe_query_gone(finst_id: UniqueId) {
+    if let Ok(mut guard) = registry().lock()
+        && let Some(instance) = guard.get_mut(&finst_id)
+    {
+        instance.fe_query_gone = true;
+    }
 }
 
 pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
@@ -148,6 +165,7 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
             finst_id = %finst_id,
             "report instance missing"
         );
+        sink_commit::unregister(finst_id);
         return;
     };
     let status = match error {
@@ -172,13 +190,24 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         None,
         load_datacache_metrics,
     );
-    if let Err(e) = send_report(&instance.coord, params) {
-        warn!(
-            target: "novarocks::report",
-            finst_id = %finst_id,
-            error = %e,
-            "reportExecStatus failed"
-        );
+    match send_report(&instance.coord, params) {
+        Ok(ReportSendOutcome::Delivered) => {}
+        Ok(ReportSendOutcome::QueryGone) => {
+            debug!(
+                target: "novarocks::report",
+                finst_id = %finst_id,
+                query_id = %instance.query_id,
+                "skip final reportExecStatus because FE query is already gone"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "novarocks::report",
+                finst_id = %finst_id,
+                error = %e,
+                "reportExecStatus failed"
+            );
+        }
     }
     sink_commit::unregister(finst_id);
 }
@@ -196,6 +225,15 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         );
         return;
     };
+    if instance.fe_query_gone {
+        debug!(
+            target: "novarocks::report",
+            finst_id = %finst_id,
+            query_id = %instance.query_id,
+            "skip periodic reportExecStatus because FE query is already gone"
+        );
+        return;
+    }
     let status = status::TStatus::new(status_code::TStatusCode::OK, None);
     let profile = build_profile_tree(
         instance.enable_profile,
@@ -213,13 +251,25 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         None,
         load_datacache_metrics,
     );
-    if let Err(e) = send_report(&instance.coord, params) {
-        warn!(
-            target: "novarocks::report",
-            finst_id = %finst_id,
-            error = %e,
-            "reportExecStatus failed"
-        );
+    match send_report(&instance.coord, params) {
+        Ok(ReportSendOutcome::Delivered) => {}
+        Ok(ReportSendOutcome::QueryGone) => {
+            mark_fe_query_gone(finst_id);
+            debug!(
+                target: "novarocks::report",
+                finst_id = %finst_id,
+                query_id = %instance.query_id,
+                "suppress future reportExecStatus because FE query is already gone"
+            );
+        }
+        Err(e) => {
+            warn!(
+                target: "novarocks::report",
+                finst_id = %finst_id,
+                error = %e,
+                "reportExecStatus failed"
+            );
+        }
     }
 }
 
@@ -635,10 +685,22 @@ fn normalize_profile_tree_for_fe(tree: &mut runtime_profile::TRuntimeProfileTree
     }
 }
 
+fn is_query_gone_status(status: &status::TStatus) -> bool {
+    status.status_code == status_code::TStatusCode::NOT_FOUND
+        && status
+            .error_msgs
+            .as_ref()
+            .map(|msgs| {
+                msgs.iter()
+                    .any(|msg| msg.contains("query id") && msg.contains("not found"))
+            })
+            .unwrap_or(false)
+}
+
 fn send_report(
     coord: &types::TNetworkAddress,
     params: frontend_service::TReportExecStatusParams,
-) -> Result<(), String> {
+) -> Result<ReportSendOutcome, String> {
     let addr: SocketAddr = format!("{}:{}", coord.hostname, coord.port)
         .parse()
         .map_err(|e| format!("invalid coord address: {e}"))?;
@@ -706,9 +768,39 @@ fn send_report(
     i_prot.read_message_end().map_err(|e| e.to_string())?;
 
     if let Some(status) = result.status {
+        if status.status_code == status_code::TStatusCode::OK {
+            return Ok(ReportSendOutcome::Delivered);
+        }
+        if is_query_gone_status(&status) {
+            return Ok(ReportSendOutcome::QueryGone);
+        }
         if status.status_code != status_code::TStatusCode::OK {
             return Err(format!("FE returned error: {:?}", status));
         }
     }
-    Ok(())
+    Ok(ReportSendOutcome::Delivered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_query_gone_status;
+    use crate::{status, status_code};
+
+    #[test]
+    fn query_gone_status_is_treated_as_benign() {
+        let status = status::TStatus::new(
+            status_code::TStatusCode::NOT_FOUND,
+            Some(vec!["query id abc not found".to_string()]),
+        );
+        assert!(is_query_gone_status(&status));
+    }
+
+    #[test]
+    fn unrelated_not_found_status_is_not_query_gone() {
+        let status = status::TStatus::new(
+            status_code::TStatusCode::NOT_FOUND,
+            Some(vec!["tablet not found".to_string()]),
+        );
+        assert!(!is_query_gone_status(&status));
+    }
 }

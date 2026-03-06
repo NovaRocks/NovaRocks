@@ -151,6 +151,26 @@ int32_t novarocks_rs_lake_get_tablet_stats(const uint8_t* ptr,
                                          NovaRocksRustBuf* out_resp,
                                          NovaRocksRustBuf* out_err);
 
+// lake_service.proto CompactRequest -> CompactResponse (protobuf bytes).
+// Returns:
+// - 0: OK
+// - 1: execution failed (out_err set)
+// - 2: invalid request/decode failure (out_err set)
+int32_t novarocks_rs_lake_compact(const uint8_t* ptr,
+                                size_t len,
+                                NovaRocksRustBuf* out_resp,
+                                NovaRocksRustBuf* out_err);
+
+// lake_service.proto AbortCompactionRequest -> AbortCompactionResponse (protobuf bytes).
+// Returns:
+// - 0: OK
+// - 1: execution failed (out_err set)
+// - 2: invalid request/decode failure (out_err set)
+int32_t novarocks_rs_lake_abort_compaction(const uint8_t* ptr,
+                                         size_t len,
+                                         NovaRocksRustBuf* out_resp,
+                                         NovaRocksRustBuf* out_err);
+
 // lake_service.proto VacuumRequest -> VacuumResponse (protobuf bytes).
 // Returns:
 // - 0: OK
