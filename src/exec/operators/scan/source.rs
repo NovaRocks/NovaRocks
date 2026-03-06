@@ -77,11 +77,10 @@ impl ScanSourceFactory {
             .unwrap_or_else(|| "ScanSource".to_string());
         if !name.contains("plan_node_id=") && !name.contains("(id=") {
             if let Some(node_id) = scan.node_id() {
-                warn!(
-                    "scan profile name missing plan_node_id, appending from scan node id: name={} node_id={}",
-                    name, node_id
-                );
-                name = format!("{name} (id={node_id})");
+                // Most scan ops (including schema scan) don't carry plan_node_id in their
+                // profile name template. Append it here to keep profile naming consistent
+                // without log spam on normal queries.
+                name = format!("{name} (plan_node_id={node_id})");
             } else {
                 warn!(
                     "scan profile name missing plan_node_id and node_id, using plan_node_id=-1: name={}",

@@ -199,6 +199,12 @@ pub struct RuntimeConfig {
     pub olap_sink_max_tablet_write_chunk_bytes: usize,
     #[serde(default = "default_pipeline_scan_thread_pool_thread_num")]
     pub pipeline_scan_thread_pool_thread_num: usize,
+    #[serde(default = "default_enable_tablet_write_log")]
+    pub enable_tablet_write_log: bool,
+    #[serde(default = "default_tablet_write_log_buffer_size")]
+    pub tablet_write_log_buffer_size: usize,
+    #[serde(default = "default_be_txn_info_history_size")]
+    pub be_txn_info_history_size: usize,
     #[serde(default = "default_connector_io_tasks_per_scan_operator")]
     pub connector_io_tasks_per_scan_operator: i32,
     #[serde(default = "default_io_coalesce_read_enable")]
@@ -406,6 +412,18 @@ fn default_pipeline_scan_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores, aligned with StarRocks pipeline_scan_thread_pool_thread_num
 }
 
+fn default_enable_tablet_write_log() -> bool {
+    false // aligned with StarRocks enable_tablet_write_log
+}
+
+fn default_tablet_write_log_buffer_size() -> usize {
+    100_000 // aligned with StarRocks tablet_write_log_buffer_size
+}
+
+fn default_be_txn_info_history_size() -> usize {
+    20_000 // aligned with StarRocks txn_info_history_size
+}
+
 fn default_connector_io_tasks_per_scan_operator() -> i32 {
     16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
 }
@@ -465,6 +483,9 @@ impl Default for RuntimeConfig {
             olap_sink_max_tablet_write_chunk_bytes: default_olap_sink_max_tablet_write_chunk_bytes(
             ),
             pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
+            enable_tablet_write_log: default_enable_tablet_write_log(),
+            tablet_write_log_buffer_size: default_tablet_write_log_buffer_size(),
+            be_txn_info_history_size: default_be_txn_info_history_size(),
             connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
             io_coalesce_read_enable: default_io_coalesce_read_enable(),
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),

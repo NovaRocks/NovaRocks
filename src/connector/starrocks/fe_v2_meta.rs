@@ -197,7 +197,7 @@ fn resolve_tablet_paths_for_refs(
     let requested_tablet_ids = refs.iter().map(|r| r.tablet_id).collect::<Vec<_>>();
     let mut local_paths = starlet_shard_registry::select_paths(&requested_tablet_ids);
     let recovered_paths =
-        recover_missing_paths_from_persisted_runtime(&requested_tablet_ids, &local_paths);
+        recover_missing_paths_from_runtime_registry(&requested_tablet_ids, &local_paths);
     if !recovered_paths.is_empty() {
         let upserted = starlet_shard_registry::upsert_many(
             recovered_paths
@@ -209,7 +209,7 @@ fn resolve_tablet_paths_for_refs(
                 target: "novarocks::lake",
                 table = %table.cache_key(),
                 recovered = upserted,
-                "recovered tablet root paths from persisted runtime because AddShard cache was incomplete"
+                "recovered tablet root paths from runtime registry because AddShard cache was incomplete"
             );
         }
         local_paths.extend(recovered_paths);
@@ -267,7 +267,7 @@ fn resolve_tablet_paths_for_refs(
             .unwrap_or_default();
         return Err(format!(
             "missing shard path for tablet_ids={missing:?} after local AddShard cache, \
-            persisted runtime, and FE fallback{fe_context}"
+            runtime registry, and FE fallback{fe_context}"
         ));
     }
 
@@ -278,7 +278,7 @@ fn resolve_tablet_paths_for_refs(
     select_paths_for_refs(local_paths, refs)
 }
 
-fn recover_missing_paths_from_persisted_runtime(
+fn recover_missing_paths_from_runtime_registry(
     requested_tablet_ids: &[i64],
     resolved_paths: &HashMap<i64, String>,
 ) -> HashMap<i64, String> {
@@ -297,6 +297,59 @@ fn recover_missing_paths_from_persisted_runtime(
         recovered.insert(*tablet_id, root_path);
     }
     recovered
+}
+
+pub(crate) fn recover_tablet_paths_from_fe_metadata(
+    fe_addr: Option<&types::TNetworkAddress>,
+    tablet_ids: &[i64],
+) -> Result<HashMap<i64, String>, String> {
+    let mut deduped = tablet_ids
+        .iter()
+        .copied()
+        .filter(|tablet_id| *tablet_id > 0)
+        .collect::<Vec<_>>();
+    deduped.sort_unstable();
+    deduped.dedup();
+    if deduped.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let table = LakeTableIdentity {
+        catalog: "default_catalog".to_string(),
+        db_name: "__unknown_db__".to_string(),
+        table_name: "__unknown_table__".to_string(),
+        db_id: 0,
+        table_id: 0,
+        schema_id: 0,
+    };
+
+    let recovered = recover_missing_paths_from_fe(fe_addr, &table, &deduped)?;
+    if recovered.is_empty() {
+        return Ok(recovered);
+    }
+
+    let recovered_infos = recovered
+        .iter()
+        .map(|(tablet_id, path)| {
+            (
+                *tablet_id,
+                starlet_shard_registry::StarletShardInfo {
+                    full_path: path.clone(),
+                    // Build the inferred config before taking shard registry mutex.
+                    s3: starlet_shard_registry::infer_s3_config_for_path(path),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let upserted = starlet_shard_registry::upsert_many_infos(recovered_infos);
+    if upserted > 0 {
+        tracing::warn!(
+            target: "novarocks::lake",
+            recovered = upserted,
+            "recovered tablet root paths from FE metadata fallback"
+        );
+    }
+    Ok(recovered)
 }
 
 fn collect_missing_tablet_ids(
@@ -849,8 +902,7 @@ mod tests {
         resolve_tablet_paths_for_refs,
     };
     use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, clear_persisted_tablet_runtime_for_test,
-        clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
     };
     use crate::runtime::starlet_shard_registry;
     use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
@@ -880,8 +932,6 @@ mod tests {
         let _guard = global_test_guard();
         starlet_shard_registry::clear_for_test();
         clear_tablet_runtime_cache_for_test();
-        clear_persisted_tablet_runtime_for_test(9_001_001).expect("cleanup 9001001");
-        clear_persisted_tablet_runtime_for_test(9_001_002).expect("cleanup 9001002");
         let table = sample_table_identity();
         let inserted = starlet_shard_registry::upsert_many(vec![
             (9_001_001_i64, "s3://bucket/root/p10".to_string()),
@@ -914,8 +964,6 @@ mod tests {
         let _guard = global_test_guard();
         starlet_shard_registry::clear_for_test();
         clear_tablet_runtime_cache_for_test();
-        clear_persisted_tablet_runtime_for_test(9_004_051).expect("cleanup 9004051");
-        clear_persisted_tablet_runtime_for_test(9_004_053).expect("cleanup 9004053");
         let table = sample_table_identity();
         let inserted = starlet_shard_registry::upsert_many(vec![
             (9_004_051_i64, "s3://bucket/root/db1/p1/9004051".to_string()),
@@ -948,8 +996,6 @@ mod tests {
         let _guard = global_test_guard();
         starlet_shard_registry::clear_for_test();
         clear_tablet_runtime_cache_for_test();
-        clear_persisted_tablet_runtime_for_test(9_002_001).expect("cleanup 9002001");
-        clear_persisted_tablet_runtime_for_test(9_002_002).expect("cleanup 9002002");
         let table = sample_table_identity();
         let inserted = starlet_shard_registry::upsert_many(vec![(
             9_002_001_i64,
@@ -971,13 +1017,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tablet_paths_recovers_from_persisted_runtime() {
+    fn resolve_tablet_paths_recovers_from_runtime_registry() {
         let _guard = global_test_guard();
         starlet_shard_registry::clear_for_test();
         clear_tablet_runtime_cache_for_test();
-        clear_persisted_tablet_runtime_for_test(9_003_001).expect("cleanup 9003001");
 
-        let persisted = TabletWriteContext {
+        let runtime = TabletWriteContext {
             db_id: 11,
             table_id: 12,
             tablet_id: 9_003_001,
@@ -994,7 +1039,7 @@ mod tests {
             }),
             partial_update: Default::default(),
         };
-        register_tablet_runtime(&persisted).expect("persist runtime");
+        register_tablet_runtime(&runtime).expect("register runtime");
 
         let table = sample_table_identity();
         let refs = vec![LakeTabletPartitionRef {
@@ -1013,7 +1058,6 @@ mod tests {
         );
 
         clear_tablet_runtime_cache_for_test();
-        clear_persisted_tablet_runtime_for_test(9_003_001).expect("cleanup 9003001");
     }
 
     #[test]

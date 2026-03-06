@@ -386,7 +386,7 @@ fn lower_node_with_children(
                     children.len()
                 ));
             }
-            lower_schema_scan_node(node, &out_layout, desc_tbl)?
+            lower_schema_scan_node(node, &out_layout, desc_tbl, exec_params)?
         }
         t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
             lower_fetch_node(children, node, out_layout)?

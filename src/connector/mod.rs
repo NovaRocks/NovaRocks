@@ -16,6 +16,7 @@
 // under the License.
 pub mod hdfs;
 pub mod jdbc;
+pub mod schema;
 pub mod starrocks;
 
 use std::collections::HashMap;

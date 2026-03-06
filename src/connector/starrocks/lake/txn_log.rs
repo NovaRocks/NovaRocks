@@ -31,6 +31,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use prost::Message;
 
+use crate::connector::schema::{self, BeTabletWriteLoadLogRecord, BeTxnActiveRecord};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWriteMode, TabletWriteContext, register_tablet_runtime, with_txn_log_append_lock,
@@ -76,6 +77,7 @@ pub(crate) fn append_lake_txn_log_with_rowset(
     partition_id: i64,
     load_id: Option<&PUniqueId>,
 ) -> Result<(), String> {
+    let begin_time_ms = unix_millis_now();
     if ctx.table_id <= 0 {
         return Err(format!("invalid table_id for lake write: {}", ctx.table_id));
     }
@@ -327,6 +329,52 @@ pub(crate) fn append_lake_txn_log_with_rowset(
             }
             write_txn_log_file(&legacy_log_path, &legacy_log)?;
         }
+
+        let backend_id = crate::runtime::backend_id::backend_id().unwrap_or(-1);
+        let mut rowset_id = String::new();
+        let mut output_rows = 0_i64;
+        let mut output_bytes = 0_i64;
+        let mut output_segments = 0_i32;
+        let mut num_delfile = 0_i64;
+        if let Some(op_write) = txn_log.op_write.as_ref() {
+            if let Some(rowset) = op_write.rowset.as_ref() {
+                rowset_id = rowset.id.map(|value| value.to_string()).unwrap_or_default();
+                output_rows = rowset.num_rows.unwrap_or(0).max(0);
+                output_bytes = rowset.data_size.unwrap_or(0).max(0);
+                output_segments = i32::try_from(rowset.segments.len()).unwrap_or(i32::MAX);
+            }
+            num_delfile = i64::try_from(op_write.dels.len()).unwrap_or(i64::MAX);
+        }
+        let label = load_id.map(|value| crate::common::types::format_uuid(value.hi, value.lo));
+        let finish_time_ms = unix_millis_now();
+        schema::record_tablet_write_load_log(BeTabletWriteLoadLogRecord {
+            backend_id,
+            begin_time_ms,
+            finish_time_ms,
+            txn_id,
+            tablet_id: ctx.tablet_id,
+            table_id: ctx.table_id,
+            partition_id,
+            input_rows: i64::try_from(batch.num_rows()).unwrap_or(i64::MAX),
+            input_bytes: i64::try_from(batch.get_array_memory_size()).unwrap_or(i64::MAX),
+            output_rows,
+            output_bytes,
+            output_segments,
+            label,
+        });
+        schema::record_be_txn_active(BeTxnActiveRecord {
+            backend_id,
+            load_id_hi: load_id.map(|value| value.hi),
+            load_id_lo: load_id.map(|value| value.lo),
+            txn_id,
+            partition_id,
+            tablet_id: ctx.tablet_id,
+            rowset_id: Some(rowset_id),
+            num_segment: i64::from(output_segments),
+            num_delfile,
+            num_row: output_rows,
+            data_size: output_bytes,
+        });
         Ok(())
     })
 }
@@ -3126,6 +3174,14 @@ pub(crate) fn read_combined_txn_log_if_exists(
     let logs = CombinedTxnLogPb::decode(bytes.as_slice())
         .map_err(|e| format!("decode combined txn log failed: {}", e))?;
     Ok(Some(logs))
+}
+
+fn unix_millis_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

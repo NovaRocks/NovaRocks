@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use crate::connector::schema;
+use crate::connector::starrocks::fe_v2_meta;
 use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
 use crate::connector::starrocks::lake::applier::apply_txn_log_to_metadata;
@@ -189,6 +191,7 @@ pub(crate) fn publish_version(
         successful_tablets,
         base_version,
         new_version,
+        &txn_infos,
         txn_infos.len(),
         &mut failed_tablets,
         &mut tablet_row_nums,
@@ -531,6 +534,7 @@ fn finalize_publish_outputs(
     successful_tablets: Vec<(i64, PublishOneTabletOutput)>,
     base_version: i64,
     new_version: i64,
+    txn_infos: &[TxnInfoPb],
     txn_infos_len: usize,
     failed_tablets: &mut Vec<i64>,
     tablet_row_nums: &mut HashMap<i64, i64>,
@@ -544,6 +548,7 @@ fn finalize_publish_outputs(
                 .push((tablet_id, output));
             continue;
         }
+        record_published_txn_rows_for_tablet(tablet_id, base_version, new_version, txn_infos);
         if base_version == 1 {
             tablet_row_nums.insert(tablet_id, tablet_row_count(&output.metadata));
         }
@@ -576,6 +581,7 @@ fn finalize_publish_outputs(
         }
 
         for (tablet_id, output) in group {
+            record_published_txn_rows_for_tablet(tablet_id, base_version, new_version, txn_infos);
             info!(
                 target: "novarocks::lake",
                 tablet_id,
@@ -599,12 +605,46 @@ fn finalize_publish_outputs(
     }
 }
 
+fn record_published_txn_rows_for_tablet(
+    tablet_id: i64,
+    base_version: i64,
+    new_version: i64,
+    txn_infos: &[TxnInfoPb],
+) {
+    if tablet_id <= 0 || txn_infos.is_empty() {
+        return;
+    }
+    let publish_time = unix_seconds_now();
+    for (idx, txn_info) in txn_infos.iter().enumerate() {
+        let Some(txn_id) = txn_info.txn_id else {
+            continue;
+        };
+        if txn_id <= 0 {
+            continue;
+        }
+        let version = if txn_infos.len() == 1 {
+            new_version
+        } else {
+            base_version.saturating_add(idx as i64 + 1)
+        };
+        schema::mark_be_txn_published(txn_id, tablet_id, publish_time, version);
+    }
+}
+
 fn tablet_row_count(metadata: &TabletMetadataPb) -> i64 {
     metadata
         .rowsets
         .iter()
         .map(|rowset| rowset.num_rows.unwrap_or(0))
         .sum()
+}
+
+fn unix_seconds_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return 0;
+    };
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
 pub(crate) fn abort_txn(request: &AbortTxnRequest) -> Result<AbortTxnResponse, String> {
@@ -625,15 +665,30 @@ pub(crate) fn abort_txn(request: &AbortTxnRequest) -> Result<AbortTxnResponse, S
     }
 
     let mut failed_tablets = Vec::new();
+    let mut successful_tablets = Vec::new();
     let mut combined_logs_to_delete = HashSet::new();
     for tablet_id in &request.tablet_ids {
         if abort_one_tablet(*tablet_id, &txn_infos, &mut combined_logs_to_delete).is_err() {
             failed_tablets.push(*tablet_id);
+        } else {
+            successful_tablets.push(*tablet_id);
         }
     }
 
     for path in combined_logs_to_delete {
         let _ = delete_path_if_exists(&path);
+    }
+
+    for tablet_id in successful_tablets {
+        for txn_info in &txn_infos {
+            let Some(txn_id) = txn_info.txn_id else {
+                continue;
+            };
+            if txn_id <= 0 {
+                continue;
+            }
+            schema::abort_be_txn_active(txn_id, tablet_id);
+        }
     }
 
     Ok(AbortTxnResponse { failed_tablets })
@@ -972,6 +1027,7 @@ pub(crate) fn vacuum(request: &VacuumRequest) -> Result<VacuumResponse, String> 
         .iter()
         .filter_map(|info| info.tablet_id)
         .collect::<Vec<_>>();
+    warmup_tablet_locations("vacuum", &tablet_ids);
     let (root_path, s3_config) = resolve_tablet_root_location("vacuum", &tablet_ids)?;
     let target_set = tablet_ids.iter().copied().collect::<HashSet<_>>();
 
@@ -1188,6 +1244,14 @@ pub(crate) fn get_tablet_stats(request: &TabletStatRequest) -> Result<TabletStat
         .checked_add(Duration::from_millis(timeout_ms as u64))
         .unwrap_or_else(Instant::now);
 
+    let tablet_ids = request
+        .tablet_infos
+        .iter()
+        .filter_map(|info| info.tablet_id)
+        .filter(|tablet_id| *tablet_id > 0)
+        .collect::<Vec<_>>();
+    warmup_tablet_locations("get_tablet_stats", &tablet_ids);
+
     let mut tablet_stats = Vec::with_capacity(request.tablet_infos.len());
     for tablet_info in &request.tablet_infos {
         if Instant::now() >= deadline {
@@ -1315,6 +1379,67 @@ fn normalize_vacuum_tablet_infos(request: &VacuumRequest) -> Result<Vec<TabletIn
         .collect())
 }
 
+fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
+    if tablet_ids.is_empty() {
+        return;
+    }
+    let missing = collect_missing_tablet_runtime_ids(tablet_ids);
+    if missing.is_empty() {
+        return;
+    }
+    match fe_v2_meta::recover_tablet_paths_from_fe_metadata(None, &missing) {
+        Ok(recovered) => {
+            if recovered.is_empty() {
+                warn!(
+                    "{op} tablet location warmup recovered nothing: missing={:?}",
+                    missing
+                );
+                return;
+            }
+            if recovered.len() < missing.len() {
+                let mut unresolved = missing
+                    .iter()
+                    .copied()
+                    .filter(|tablet_id| !recovered.contains_key(tablet_id))
+                    .collect::<Vec<_>>();
+                unresolved.sort_unstable();
+                unresolved.dedup();
+                warn!(
+                    "{op} tablet location warmup partially recovered: recovered={} unresolved={:?}",
+                    recovered.len(),
+                    unresolved
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                "{op} tablet location warmup from FE metadata failed: missing={:?}, error={}",
+                missing, err
+            );
+        }
+    }
+}
+
+fn collect_missing_tablet_runtime_ids(tablet_ids: &[i64]) -> Vec<i64> {
+    let mut deduped = tablet_ids
+        .iter()
+        .copied()
+        .filter(|tablet_id| *tablet_id > 0)
+        .collect::<Vec<_>>();
+    deduped.sort_unstable();
+    deduped.dedup();
+    if deduped.is_empty() {
+        return deduped;
+    }
+    let shard_paths = starlet_shard_registry::select_paths(&deduped);
+    deduped
+        .into_iter()
+        .filter(|tablet_id| {
+            get_tablet_runtime(*tablet_id).is_err() && !shard_paths.contains_key(tablet_id)
+        })
+        .collect()
+}
+
 fn resolve_tablet_root_location(
     op: &str,
     tablet_ids: &[i64],
@@ -1362,6 +1487,11 @@ fn resolve_tablet_location(
         Ok(runtime) => Ok((runtime.root_path, runtime.s3_config)),
         Err(runtime_err) => {
             let mut infos = starlet_shard_registry::select_infos(&[tablet_id]);
+            if let Some(info) = infos.remove(&tablet_id) {
+                return Ok((info.full_path, info.s3));
+            }
+            warmup_tablet_locations(op, &[tablet_id]);
+            infos = starlet_shard_registry::select_infos(&[tablet_id]);
             if let Some(info) = infos.remove(&tablet_id) {
                 return Ok((info.full_path, info.s3));
             }
@@ -2692,8 +2822,7 @@ mod tests {
         publish_log_version, publish_log_version_batch, publish_version, vacuum,
     };
     use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, clear_persisted_tablet_runtime_for_test,
-        clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::{
         append_lake_txn_log_with_rowset, txn_log::write_txn_log_file,
@@ -3433,12 +3562,11 @@ mod tests {
     }
 
     #[test]
-    fn publish_version_recovers_runtime_from_persisted_cache_after_restart() {
+    fn publish_version_fails_after_runtime_cache_cleared() {
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88005;
         let txn_id = 3001;
-        clear_persisted_tablet_runtime_for_test(tablet_id).expect("clear persisted runtime");
         clear_tablet_runtime_cache_for_test();
 
         let ctx = test_context(&root, 7005, tablet_id, 4005);
@@ -3461,15 +3589,15 @@ mod tests {
             enable_aggregate_publish: None,
             resharding_tablet_infos: Vec::new(),
         };
-        let resp = publish_version(&req).expect("publish version should succeed");
+        let resp = publish_version(&req).expect("publish version should return response");
         assert!(
-            resp.failed_tablets.is_empty(),
-            "unexpected failed tablets: {:?}",
+            resp.failed_tablets.contains(&tablet_id),
+            "expected failed tablets to contain {tablet_id}, got {:?}",
             resp.failed_tablets
         );
         assert!(
-            !std::path::Path::new(&path).exists(),
-            "txn log should be cleaned after successful publish: {}",
+            std::path::Path::new(&path).exists(),
+            "txn log should be kept when publish fails: {}",
             path
         );
     }
@@ -3480,7 +3608,6 @@ mod tests {
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88006;
         let txn_id = 3002;
-        clear_persisted_tablet_runtime_for_test(tablet_id).expect("clear persisted runtime");
         clear_tablet_runtime_cache_for_test();
 
         let ctx = test_context(&root, 7006, tablet_id, 4006);

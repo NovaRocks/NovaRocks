@@ -46,6 +46,9 @@ pub enum ScanMorsel {
     },
     JdbcSingle,
     Exchange,
+    Schema {
+        table_name: String,
+    },
     Empty,
 }
 
@@ -67,6 +70,7 @@ impl ScanMorsel {
             ScanMorsel::StarRocksRange { index } => format!("starrocks_range_index={index}"),
             ScanMorsel::JdbcSingle => "jdbc_single".to_string(),
             ScanMorsel::Exchange => "exchange".to_string(),
+            ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
         }
     }

@@ -271,7 +271,7 @@ pub(crate) fn oss_config_for_path(
         .ok_or_else(|| {
             format!(
                 "missing shard registry config for path={path}; \
-                expected AddShard or persisted tablet runtime to provide S3 credentials"
+                expected AddShard/runtime registry/FE fallback to provide S3 credentials"
             )
         })
 }
