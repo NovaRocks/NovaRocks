@@ -209,14 +209,8 @@ pub(crate) fn lower_lake_scan_node(
         }
         ranges.push(StarRocksScanRange {
             tablet_id: internal.tablet_id,
+            partition_id: internal.partition_id,
             version: Some(version),
-            schema_hash: None,
-            db_name: None,
-            table_name: None,
-            hosts: internal.hosts.clone(),
-            fill_data_cache,
-            skip_page_cache,
-            skip_disk_cache,
         });
     }
     if has_more {
@@ -330,8 +324,13 @@ pub(crate) fn lower_lake_scan_node(
             )
         })?;
     let mut properties = build_lake_properties(&tablet_path_map)?;
-    properties.insert("fetch_mode".to_string(), "object_store".to_string());
-
+    let partition_storage_paths = build_partition_storage_paths(&ranges, &tablet_path_map)?;
+    properties.remove("tablet_root_paths");
+    properties.insert(
+        "partition_storage_paths".to_string(),
+        serde_json::to_string(&partition_storage_paths)
+            .map_err(|e| format!("serialize partition_storage_paths json failed: {}", e))?,
+    );
     let limit = (node.limit >= 0).then_some(node.limit as usize);
     let batch_size = query_opts.and_then(|opts| opts.batch_size).or(Some(4096));
     let query_timeout = query_opts.and_then(|opts| opts.query_timeout);
@@ -358,7 +357,6 @@ pub(crate) fn lower_lake_scan_node(
     let cfg = StarRocksScanConfig {
         db_name: normalize_optional_table_name(&db_name, "__unknown_db__"),
         table_name: normalize_optional_table_name(&table_name, "__unknown_table__"),
-        opaqued_query_plan: String::new(),
         properties,
         ranges,
         has_more,
@@ -602,4 +600,108 @@ pub(crate) fn build_lake_properties(
         }
     }
     Ok(props)
+}
+
+fn build_partition_storage_paths(
+    ranges: &[StarRocksScanRange],
+    tablet_path_map: &HashMap<i64, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for range in ranges {
+        let partition_id = range.partition_id.ok_or_else(|| {
+            format!(
+                "missing partition_id while building partition_storage_paths for tablet_id={}",
+                range.tablet_id
+            )
+        })?;
+        if partition_id <= 0 {
+            return Err(format!(
+                "invalid partition_id while building partition_storage_paths: {}",
+                partition_id
+            ));
+        }
+        let raw_path = tablet_path_map.get(&range.tablet_id).ok_or_else(|| {
+            format!(
+                "missing resolved tablet path while building partition_storage_paths for tablet_id={}",
+                range.tablet_id
+            )
+        })?;
+        let partition_path = normalize_partition_storage_path(raw_path, range.tablet_id)?;
+        let key = partition_id.to_string();
+        match out.get(&key) {
+            None => {
+                out.insert(key, partition_path);
+            }
+            Some(existing) if existing == &partition_path => {}
+            Some(existing) => {
+                return Err(format!(
+                    "inconsistent partition storage paths for partition_id={}: existing={} new={} (tablet_id={})",
+                    partition_id, existing, partition_path, range.tablet_id
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_partition_storage_path(path: &str, tablet_id: i64) -> Result<String, String> {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(format!(
+            "empty storage path while building partition_storage_paths for tablet_id={}",
+            tablet_id
+        ));
+    }
+    let tablet_id_suffix = format!("/{tablet_id}");
+    if let Some(prefix) = trimmed.strip_suffix(&tablet_id_suffix)
+        && !prefix.is_empty()
+    {
+        return Ok(prefix.trim_end_matches('/').to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_partition_storage_paths;
+    use crate::connector::starrocks::StarRocksScanRange;
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_partition_storage_paths_collapses_tablet_suffix() {
+        let ranges = vec![
+            StarRocksScanRange {
+                tablet_id: 101,
+                partition_id: Some(7),
+                version: Some(1),
+            },
+            StarRocksScanRange {
+                tablet_id: 102,
+                partition_id: Some(7),
+                version: Some(1),
+            },
+            StarRocksScanRange {
+                tablet_id: 201,
+                partition_id: Some(8),
+                version: Some(1),
+            },
+        ];
+        let tablet_path_map = HashMap::from([
+            (101, "s3://bucket/root/7/101".to_string()),
+            (102, "s3://bucket/root/7/102/".to_string()),
+            (201, "s3://bucket/root/8".to_string()),
+        ]);
+
+        let paths = build_partition_storage_paths(&ranges, &tablet_path_map)
+            .expect("partition_storage_paths should build");
+
+        assert_eq!(
+            paths.get("7").map(String::as_str),
+            Some("s3://bucket/root/7")
+        );
+        assert_eq!(
+            paths.get("8").map(String::as_str),
+            Some("s3://bucket/root/8")
+        );
+    }
 }

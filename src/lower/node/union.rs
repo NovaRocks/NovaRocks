@@ -451,66 +451,18 @@ mod tests {
     }
 
     fn union_plan_node(result_expr_lists: Vec<Vec<exprs::TExpr>>) -> plan_nodes::TPlanNode {
-        plan_nodes::TPlanNode {
-            node_id: 9,
-            node_type: plan_nodes::TPlanNodeType::UNION_NODE,
-            num_children: 1,
-            limit: -1,
-            row_tuples: vec![],
-            nullable_tuples: vec![],
-            conjuncts: None,
-            compact_data: true,
-            common: None,
-            hash_join_node: None,
-            agg_node: None,
-            sort_node: None,
-            merge_node: None,
-            exchange_node: None,
-            mysql_scan_node: None,
-            olap_scan_node: None,
-            file_scan_node: None,
-            schema_scan_node: None,
-            meta_scan_node: None,
-            analytic_node: None,
-            union_node: Some(plan_nodes::TUnionNode {
-                tuple_id: 1,
-                result_expr_lists,
-                const_expr_lists: vec![],
-                first_materialized_child_idx: 0,
-                pass_through_slot_maps: None,
-                local_exchanger_type: None,
-                local_partition_by_exprs: None,
-            }),
-            resource_profile: None,
-            es_scan_node: None,
-            repeat_node: None,
-            assert_num_rows_node: None,
-            intersect_node: None,
-            except_node: None,
-            merge_join_node: None,
-            raw_values_node: None,
-            use_vectorized: None,
-            hdfs_scan_node: None,
-            project_node: None,
-            table_function_node: None,
-            probe_runtime_filters: None,
-            decode_node: None,
-            local_rf_waiting_set: None,
-            filter_null_value_columns: None,
-            need_create_tuple_columns: None,
-            jdbc_scan_node: None,
-            connector_scan_node: None,
-            cross_join_node: None,
-            lake_scan_node: None,
-            nestloop_join_node: None,
-            starrocks_scan_node: None,
-            stream_scan_node: None,
-            stream_join_node: None,
-            stream_agg_node: None,
-            select_node: None,
-            fetch_node: None,
-            look_up_node: None,
-        }
+        let mut node =
+            crate::lower::node::test_plan_node(9, plan_nodes::TPlanNodeType::UNION_NODE, 1);
+        node.union_node = Some(plan_nodes::TUnionNode {
+            tuple_id: 1,
+            result_expr_lists,
+            const_expr_lists: vec![],
+            first_materialized_child_idx: 0,
+            pass_through_slot_maps: None,
+            local_exchanger_type: None,
+            local_partition_by_exprs: None,
+        });
+        node
     }
 
     #[test]

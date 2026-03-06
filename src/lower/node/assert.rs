@@ -70,7 +70,7 @@ pub(crate) fn lower_assert_num_rows_node(
 mod tests {
     use super::*;
     use crate::lower::layout::Layout;
-    use crate::plan_nodes::{TAssertNumRowsNode, TAssertion, TPlanNode, TPlanNodeType};
+    use crate::plan_nodes::{TAssertNumRowsNode, TAssertion, TPlanNodeType};
     use std::collections::HashMap;
 
     #[test]
@@ -90,62 +90,13 @@ mod tests {
             layout,
         };
 
-        let t_node = TPlanNode {
-            node_id: 0,
-            node_type: TPlanNodeType::ASSERT_NUM_ROWS_NODE,
-            num_children: 1,
-            limit: -1,
-            row_tuples: vec![],
-            nullable_tuples: vec![],
-            conjuncts: None,
-            compact_data: true,
-            common: None,
-            hash_join_node: None,
-            agg_node: None,
-            sort_node: None,
-            merge_node: None,
-            exchange_node: None,
-            mysql_scan_node: None,
-            olap_scan_node: None,
-            file_scan_node: None,
-            schema_scan_node: None,
-            meta_scan_node: None,
-            analytic_node: None,
-            union_node: None,
-            resource_profile: None,
-            es_scan_node: None,
-            repeat_node: None,
-            assert_num_rows_node: Some(TAssertNumRowsNode {
-                desired_num_rows: Some(1),
-                subquery_string: Some("select c1 from test".to_string()),
-                assertion: Some(TAssertion::EQ),
-            }),
-            intersect_node: None,
-            except_node: None,
-            merge_join_node: None,
-            raw_values_node: None,
-            use_vectorized: None,
-            hdfs_scan_node: None,
-            project_node: None,
-            table_function_node: None,
-            probe_runtime_filters: None,
-            decode_node: None,
-            local_rf_waiting_set: None,
-            filter_null_value_columns: None,
-            need_create_tuple_columns: None,
-            jdbc_scan_node: None,
-            connector_scan_node: None,
-            cross_join_node: None,
-            lake_scan_node: None,
-            nestloop_join_node: None,
-            starrocks_scan_node: None,
-            stream_scan_node: None,
-            stream_join_node: None,
-            stream_agg_node: None,
-            select_node: None,
-            fetch_node: None,
-            look_up_node: None,
-        };
+        let mut t_node =
+            crate::lower::node::test_plan_node(0, TPlanNodeType::ASSERT_NUM_ROWS_NODE, 1);
+        t_node.assert_num_rows_node = Some(TAssertNumRowsNode {
+            desired_num_rows: Some(1),
+            subquery_string: Some("select c1 from test".to_string()),
+            assertion: Some(TAssertion::EQ),
+        });
 
         let mut out_layout = Layout {
             order: Vec::new(),

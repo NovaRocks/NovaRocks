@@ -60,20 +60,20 @@ fn schema_signature(schema: &SchemaRef) -> String {
 impl StarRocksNativeReader {
     pub(super) fn open(
         tablet_id: i64,
-        tablet_root_path: &str,
+        storage_path: &str,
         version: i64,
         required_schema: SchemaRef,
         output_schema: SchemaRef,
         query_global_dicts: QueryGlobalDictEncodeMap,
         min_max_predicates: Vec<MinMaxPredicate>,
-        object_store_profile: &ObjectStoreProfile,
+        object_store_profile: Option<&ObjectStoreProfile>,
         lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {
         let use_batch_cache = query_global_dicts.is_empty();
         let output_schema_sig = schema_signature(&output_schema);
         if use_batch_cache {
             if let Some(batch) = native_cache::native_batch_cache_get(
-                tablet_root_path,
+                storage_path,
                 tablet_id,
                 version,
                 &output_schema_sig,
@@ -88,20 +88,16 @@ impl StarRocksNativeReader {
         let snapshot = match load_tablet_snapshot(
             tablet_id,
             version,
-            tablet_root_path,
-            Some(object_store_profile),
+            storage_path,
+            object_store_profile,
         ) {
             Ok(snapshot) => snapshot,
             Err(err)
-                if should_treat_missing_tablet_metadata_as_empty(
-                    tablet_root_path,
-                    version,
-                    &err,
-                ) =>
+                if should_treat_missing_tablet_metadata_as_empty(storage_path, version, &err) =>
             {
                 warn!(
                     "starrocks native reader degrades missing tablet metadata to empty batch: tablet_id={} version={} path={} error={}",
-                    tablet_id, version, tablet_root_path, err
+                    tablet_id, version, storage_path, err
                 );
                 return Ok(Self {
                     tablet_id,
@@ -111,6 +107,24 @@ impl StarRocksNativeReader {
             }
             Err(err) => return Err(err),
         };
+        eprintln!(
+            "[DEBUG] starrocks native reader snapshot tablet_id={} requested_version={} metadata_path={} total_num_rows={} rowset_count={} segment_count={}",
+            tablet_id,
+            version,
+            snapshot.metadata_path,
+            snapshot.total_num_rows,
+            snapshot.rowset_count,
+            snapshot.segment_files.len()
+        );
+        info!(
+            "starrocks native reader loaded snapshot tablet_id={} requested_version={} metadata_path={} total_num_rows={} rowset_count={} segment_count={}",
+            tablet_id,
+            version,
+            snapshot.metadata_path,
+            snapshot.total_num_rows,
+            snapshot.rowset_count,
+            snapshot.segment_files.len()
+        );
         let output_schema_for_plan = enrich_output_schema_with_lake_hints(
             &snapshot,
             &required_schema,
@@ -130,13 +144,23 @@ impl StarRocksNativeReader {
             };
             if use_batch_cache && cacheable_small_snapshot {
                 native_cache::native_batch_cache_put(
-                    tablet_root_path,
+                    storage_path,
                     tablet_id,
                     version,
                     &output_schema_sig,
                     batch.clone(),
                 );
             }
+            eprintln!(
+                "[DEBUG] starrocks native reader parquet snapshot batch tablet_id={} rows={}",
+                tablet_id,
+                batch.num_rows()
+            );
+            info!(
+                "starrocks native reader served parquet snapshot tablet_id={} rows={}",
+                tablet_id,
+                batch.num_rows()
+            );
             return Ok(Self {
                 tablet_id,
                 version,
@@ -144,7 +168,7 @@ impl StarRocksNativeReader {
             });
         }
         let segment_footers =
-            load_bundle_segment_footers(&snapshot, tablet_root_path, Some(object_store_profile))?;
+            load_bundle_segment_footers(&snapshot, storage_path, object_store_profile)?;
         let plan = build_native_read_plan(&snapshot, &segment_footers, &scan_schema)?;
         if let Some(first_footer) = segment_footers.first() {
             let column_debug = first_footer
@@ -173,8 +197,8 @@ impl StarRocksNativeReader {
         let batch = build_native_record_batch(
             &plan,
             &segment_footers,
-            tablet_root_path,
-            Some(object_store_profile),
+            storage_path,
+            object_store_profile,
             &scan_schema,
             if cacheable_small_snapshot {
                 &[]
@@ -198,9 +222,19 @@ impl StarRocksNativeReader {
         } else {
             batch
         };
+        eprintln!(
+            "[DEBUG] starrocks native reader built batch tablet_id={} rows={}",
+            tablet_id,
+            batch.num_rows()
+        );
+        info!(
+            "starrocks native reader built batch tablet_id={} rows={}",
+            tablet_id,
+            batch.num_rows()
+        );
         if use_batch_cache && cacheable_small_snapshot {
             native_cache::native_batch_cache_put(
-                tablet_root_path,
+                storage_path,
                 tablet_id,
                 version,
                 &output_schema_sig,

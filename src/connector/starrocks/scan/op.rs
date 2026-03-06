@@ -27,9 +27,11 @@ use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
+use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::metrics;
 use crate::novarocks_logging::{info, warn};
 use crate::runtime::profile::RuntimeProfile;
+use crate::runtime::starlet_shard_registry;
 use crate::types;
 
 use super::reader::StarRocksNativeReader;
@@ -39,14 +41,8 @@ pub type QueryGlobalDictEncodeMap = HashMap<SlotId, Arc<HashMap<Vec<u8>, i32>>>;
 #[derive(Clone, Debug)]
 pub struct StarRocksScanRange {
     pub tablet_id: i64,
+    pub partition_id: Option<i64>,
     pub version: Option<i64>,
-    pub schema_hash: Option<i32>,
-    pub db_name: Option<String>,
-    pub table_name: Option<String>,
-    pub hosts: Vec<types::TNetworkAddress>,
-    pub fill_data_cache: bool,
-    pub skip_page_cache: bool,
-    pub skip_disk_cache: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,7 +58,6 @@ pub struct LakeScanSchemaMeta {
 pub struct StarRocksScanConfig {
     pub db_name: Option<String>,
     pub table_name: Option<String>,
-    pub opaqued_query_plan: String,
     pub properties: BTreeMap<String, String>,
     pub ranges: Vec<StarRocksScanRange>,
     pub has_more: bool,
@@ -81,35 +76,19 @@ pub struct StarRocksScanConfig {
 
 #[derive(Clone, Debug)]
 struct StarRocksExecutionContext {
-    fetch_mode: Option<String>,
-    tablet_root_paths: HashMap<i64, String>,
-    object_store_profile: ObjectStoreProfile,
+    partition_storage_paths: HashMap<i64, String>,
+    object_store_profile: Option<ObjectStoreProfile>,
 }
 
 impl StarRocksExecutionContext {
-    fn from_properties(props: &BTreeMap<String, String>) -> Result<Self, String> {
-        let fetch_mode = props.get("fetch_mode").cloned().filter(|v| !v.is_empty());
-        let tablet_root_paths = parse_tablet_root_paths(props)?;
-        let object_store_profile = ObjectStoreProfile::from_properties_required(props)?;
+    fn from_scan_config(cfg: &StarRocksScanConfig) -> Result<Self, String> {
+        let partition_storage_paths = resolve_partition_storage_paths(cfg)?;
+        let object_store_profile =
+            resolve_object_store_profile(&cfg.properties, partition_storage_paths.values())?;
         Ok(Self {
-            fetch_mode,
-            tablet_root_paths,
+            partition_storage_paths,
             object_store_profile,
         })
-    }
-
-    fn validate_fetch_mode(&self) -> Result<(), String> {
-        if let Some(mode) = self.fetch_mode.as_deref() {
-            let normalized = mode.trim_matches(|c: char| c.is_whitespace() || c == '\0');
-            if normalized != "object_store" {
-                return Err(format!(
-                    "unsupported starrocks fetch_mode: {normalized} (only object_store is supported)"
-                ));
-            }
-        } else {
-            warn!("starrocks scan missing fetch_mode, assuming object_store");
-        }
-        Ok(())
     }
 }
 
@@ -145,8 +124,7 @@ impl ScanOp for StarRocksScanOp {
         cfg.ranges = vec![range];
         cfg.limit = None;
 
-        let ctx = StarRocksExecutionContext::from_properties(&cfg.properties)?;
-        ctx.validate_fetch_mode()?;
+        let ctx = StarRocksExecutionContext::from_scan_config(&cfg)?;
 
         if let Some(profile) = profile.as_ref() {
             profile.add_info_string("DataSourceType", "StarRocks");
@@ -360,13 +338,19 @@ impl StarRocksScanner {
             output_slot_meta,
             cfg.query_global_dicts.keys().collect::<Vec<_>>()
         );
-        let tablet_root_path = ctx
-            .tablet_root_paths
-            .get(&range.tablet_id)
+        let partition_id = range.partition_id.ok_or_else(|| {
+            format!(
+                "missing partition_id in starrocks scan range for tablet_id {}",
+                range.tablet_id
+            )
+        })?;
+        let storage_path = ctx
+            .partition_storage_paths
+            .get(&partition_id)
             .ok_or_else(|| {
                 format!(
-                    "missing tablet_root_path for tablet_id {} in tablet_root_paths",
-                    range.tablet_id
+                    "missing partition_storage_path for partition_id {} (tablet_id={}) in partition_storage_paths",
+                    partition_id, range.tablet_id
                 )
             })?
             .clone();
@@ -374,17 +358,20 @@ impl StarRocksScanner {
         let version = range
             .version
             .ok_or_else(|| format!("missing tablet version for tablet_id {}", range.tablet_id))?;
+        eprintln!(
+            "[DEBUG] StarRocksScanner::open tablet_id={} partition_id={} version={} storage_path={}",
+            range.tablet_id, partition_id, version, storage_path
+        );
 
-        let options = build_native_options(ctx);
         let reader = StarRocksNativeReader::open(
             range.tablet_id,
-            &tablet_root_path,
+            &storage_path,
             version,
             cfg.required_schema.clone(),
             cfg.schema.clone(),
             cfg.query_global_dicts.clone(),
             cfg.min_max_predicates.clone(),
-            &options,
+            ctx.object_store_profile.as_ref(),
             cfg.lake_schema_meta.as_ref(),
         )?;
 
@@ -412,44 +399,117 @@ impl StarRocksScanner {
     }
 }
 
-fn build_native_options(ctx: &StarRocksExecutionContext) -> ObjectStoreProfile {
-    ctx.object_store_profile.clone()
-}
-
 pub(crate) fn build_native_object_store_profile_from_properties(
     props: &BTreeMap<String, String>,
 ) -> Result<Option<ObjectStoreProfile>, String> {
     ObjectStoreProfile::from_properties_optional(props)
 }
 
-fn parse_tablet_root_paths(
-    props: &BTreeMap<String, String>,
+fn resolve_partition_storage_paths(
+    cfg: &StarRocksScanConfig,
 ) -> Result<HashMap<i64, String>, String> {
-    let raw = props.get("tablet_root_paths").ok_or_else(|| {
-        "tablet_root_paths not found in properties for object_store mode".to_string()
-    })?;
+    if let Some(paths) = parse_partition_storage_paths_optional(&cfg.properties)? {
+        return Ok(paths);
+    }
+    Err(
+        "starrocks direct read requires FE to provide partition_storage_paths in execution properties"
+            .to_string(),
+    )
+}
+
+fn parse_partition_storage_paths_optional(
+    props: &BTreeMap<String, String>,
+) -> Result<Option<HashMap<i64, String>>, String> {
+    let Some(raw) = props.get("partition_storage_paths") else {
+        return Ok(None);
+    };
 
     let value: Value = serde_json::from_str(raw)
-        .map_err(|e| format!("parse tablet_root_paths json failed: {e}"))?;
+        .map_err(|e| format!("parse partition_storage_paths json failed: {e}"))?;
     let obj = value
         .as_object()
-        .ok_or_else(|| "tablet_root_paths must be a JSON object".to_string())?;
+        .ok_or_else(|| "partition_storage_paths must be a JSON object".to_string())?;
 
     let mut out = HashMap::with_capacity(obj.len());
     for (key, value) in obj {
-        let tablet_id = key
+        let partition_id = key
             .parse::<i64>()
-            .map_err(|_| format!("invalid tablet_id in tablet_root_paths: {key}"))?;
+            .map_err(|_| format!("invalid partition_id in partition_storage_paths: {key}"))?;
         let path = value
             .as_str()
-            .ok_or_else(|| format!("tablet_root_paths entry for {key} is not a string"))?;
+            .ok_or_else(|| format!("partition_storage_paths entry for {key} is not a string"))?;
         if path.is_empty() {
-            return Err(format!("tablet_root_paths entry for {key} is empty"));
+            return Err(format!("partition_storage_paths entry for {key} is empty"));
         }
-        out.insert(tablet_id, path.to_string());
+        out.insert(partition_id, path.to_string());
     }
 
-    Ok(out)
+    Ok(Some(out))
+}
+
+fn resolve_object_store_profile<'a>(
+    props: &BTreeMap<String, String>,
+    storage_paths: impl Iterator<Item = &'a String>,
+) -> Result<Option<ObjectStoreProfile>, String> {
+    if let Some(profile) = ObjectStoreProfile::from_properties_optional(props)? {
+        eprintln!(
+            "[DEBUG] starrocks direct read explicit object store profile endpoint={}",
+            profile.endpoint
+        );
+        info!(
+            "starrocks direct read uses explicit object store profile endpoint={}",
+            profile.endpoint
+        );
+        return Ok(Some(profile));
+    }
+
+    let paths = storage_paths.cloned().collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    match classify_scan_paths(paths.iter().map(|path| path.as_str()))? {
+        ScanPathScheme::Local => Ok(None),
+        ScanPathScheme::Hdfs => Err(
+            "starrocks direct read does not support hdfs tablet paths without explicit cloud configuration"
+                .to_string(),
+        ),
+        ScanPathScheme::Oss => {
+            let mut selected: Option<crate::runtime::starlet_shard_registry::S3StoreConfig> = None;
+            for path in &paths {
+                let s3 = starlet_shard_registry::infer_s3_config_for_path(path).ok_or_else(|| {
+                    format!(
+                        "missing object store config for direct-read path={path}; provide aws.s3.* \
+                         properties or ensure shard/env credentials can be inferred"
+                    )
+                })?;
+                match selected.as_ref() {
+                    None => selected = Some(s3),
+                    Some(prev) if prev == &s3 => {}
+                    Some(prev) => {
+                        return Err(format!(
+                            "inconsistent inferred object store configs across starrocks direct-read paths: \
+                             current_bucket={} current_endpoint={} previous_bucket={} previous_endpoint={}",
+                            s3.bucket, s3.endpoint, prev.bucket, prev.endpoint
+                        ));
+                    }
+                }
+            }
+            selected
+                .as_ref()
+                .map(|config| {
+                    eprintln!(
+                        "[DEBUG] starrocks direct read inferred object store config bucket={} endpoint={} root={}",
+                        config.bucket, config.endpoint, config.root
+                    );
+                    info!(
+                        "starrocks direct read inferred object store config bucket={} endpoint={} root={}",
+                        config.bucket, config.endpoint, config.root
+                    );
+                    ObjectStoreProfile::from_s3_store_config(config)
+                })
+                .transpose()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -463,7 +523,6 @@ mod tests {
         StarRocksScanConfig {
             db_name: None,
             table_name: None,
-            opaqued_query_plan: String::new(),
             properties: BTreeMap::new(),
             ranges: Vec::new(),
             has_more: false,
@@ -529,5 +588,32 @@ mod tests {
             "starrocks_scan_node_id=8".to_string(),
         )));
         assert_eq!(op.profile_name().as_deref(), Some("STARROCKS_SCAN (id=8)"));
+    }
+
+    #[test]
+    fn resolve_partition_storage_paths_requires_fe_execution_properties() {
+        let cfg = mock_scan_config(None);
+        let err = resolve_partition_storage_paths(&cfg)
+            .expect_err("missing partition_storage_paths should fail");
+        assert!(
+            err.contains("partition_storage_paths"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_partition_storage_paths_reads_json_map() {
+        let mut cfg = mock_scan_config(None);
+        cfg.properties.insert(
+            "partition_storage_paths".to_string(),
+            "{\"17\":\"s3://bucket/root/table/17\"}".to_string(),
+        );
+
+        let partition_storage_paths =
+            resolve_partition_storage_paths(&cfg).expect("partition_storage_paths should parse");
+        assert_eq!(
+            partition_storage_paths.get(&17).map(String::as_str),
+            Some("s3://bucket/root/table/17")
+        );
     }
 }
