@@ -25,6 +25,18 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+fn default_sys_log_dir() -> String {
+    "log".to_string()
+}
+
+fn default_sys_log_roll_mode() -> String {
+    "SIZE-MB-1024".to_string()
+}
+
+fn default_sys_log_roll_num() -> usize {
+    10
+}
+
 pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
@@ -81,6 +93,15 @@ pub struct NovaRocksConfig {
     #[serde(default)]
     pub log_filter: Option<String>,
 
+    #[serde(default = "default_sys_log_dir")]
+    pub sys_log_dir: String,
+
+    #[serde(default = "default_sys_log_roll_mode")]
+    pub sys_log_roll_mode: String,
+
+    #[serde(default = "default_sys_log_roll_num")]
+    pub sys_log_roll_num: usize,
+
     #[serde(default)]
     pub server: ServerConfig,
 
@@ -119,6 +140,9 @@ impl Default for NovaRocksConfig {
         Self {
             log_level: default_log_level(),
             log_filter: None,
+            sys_log_dir: default_sys_log_dir(),
+            sys_log_roll_mode: default_sys_log_roll_mode(),
+            sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
             debug: DebugConfig::default(),

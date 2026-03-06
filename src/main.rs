@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -165,6 +165,24 @@ fn wait_for_start_ready(
     ))
 }
 
+fn open_daemon_stdout_log() -> Result<(File, String), String> {
+    let log_path = novarocks_logging::resolve_stdout_log_path();
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "create daemon log directory {} failed: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("open daemon stdout log {} failed: {e}", log_path.display()))?;
+    Ok((file, log_path.display().to_string()))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let mut idx = 1usize;
@@ -203,8 +221,6 @@ fn main() {
         }
     }
     let pid_file = "novarocks.pid";
-    let log_file = "novarocks.log";
-
     match mode {
         "start" => {
             if Path::new(pid_file).exists() {
@@ -228,15 +244,14 @@ fn main() {
                 }
             }
 
-            let stdout = File::create(log_file).expect("create log file");
-            let stderr = stdout.try_clone().expect("clone log file handle");
-
             let cfg = match config_path.as_deref() {
                 Some(p) => novarocks_config::init_from_path(p).expect("load novarocks config"),
                 None => {
                     novarocks_config::init_from_env_or_default().expect("load novarocks config")
                 }
             };
+            let (stdout, log_file) = open_daemon_stdout_log().expect("open daemon stdout log");
+            let stderr = stdout.try_clone().expect("clone log file handle");
             let ready_host = health_check_host(&cfg.server.host);
             let ready_port = cfg.server.heartbeat_port;
 
@@ -491,7 +506,7 @@ fn main() {
             let ready_port = cfg.server.heartbeat_port;
 
             // Start again
-            let stdout = File::create(log_file).expect("create log file");
+            let (stdout, log_file) = open_daemon_stdout_log().expect("open daemon stdout log");
             let stderr = stdout.try_clone().expect("clone log file handle");
 
             let mut cmd = Command::new(env::current_exe().expect("current exe"));
