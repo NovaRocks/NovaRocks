@@ -153,6 +153,8 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/proto/tablet_schema.proto");
     println!("cargo:rerun-if-changed=idl/proto/starust_grpc.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/starlet.proto");
+    println!("cargo:rerun-if-changed=idl/proto/staros/manager.proto");
+    println!("cargo:rerun-if-changed=idl/proto/staros/service.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/star_status.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/file_store.proto");
     println!("cargo:rerun-if-changed=idl/proto/staros/shard.proto");
@@ -425,10 +427,16 @@ static C++ runtime is required.",
         .expect("compile novarocks_grpc.proto");
 
     tonic_build::configure()
-        .build_client(false)
+        .build_client(true)
         .build_server(true)
-        .compile_protos(&["idl/proto/staros/starlet.proto"], &["idl/proto/staros"])
-        .expect("compile staros starlet.proto");
+        .compile_protos(
+            &[
+                "idl/proto/staros/starlet.proto",
+                "idl/proto/staros/manager.proto",
+            ],
+            &["idl/proto/staros"],
+        )
+        .expect("compile staros protos");
 }
 
 fn patch_plan_nodes_rs(thrift_rs_out: &std::path::Path) {

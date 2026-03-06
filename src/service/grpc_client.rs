@@ -26,14 +26,7 @@ use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
 use crate::runtime::global_async_runtime::{data_block_on, data_runtime_handle};
 
-pub mod proto {
-    pub mod novarocks {
-        tonic::include_proto!("novarocks");
-    }
-    pub mod starrocks {
-        tonic::include_proto!("starrocks");
-    }
-}
+pub use crate::service::grpc_proto as proto;
 
 #[derive(Default)]
 struct ChannelCache {

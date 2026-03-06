@@ -26,6 +26,7 @@ use tonic::transport::Server;
 use crate::common::config::{http_port, starlet_port};
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
+use crate::connector::starrocks::starmgr;
 use crate::novarocks_logging::{error, info, warn};
 use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
@@ -33,17 +34,7 @@ use crate::runtime::query_context::{QueryId, query_context_manager, query_expire
 use crate::runtime::starlet_shard_registry;
 use crate::service::stream_load_http;
 
-pub mod proto {
-    pub mod novarocks {
-        tonic::include_proto!("novarocks");
-    }
-    pub mod starrocks {
-        tonic::include_proto!("starrocks");
-    }
-    pub mod staros {
-        tonic::include_proto!("staros");
-    }
-}
+pub use crate::service::grpc_proto as proto;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -402,144 +393,10 @@ fn staros_ok_status() -> proto::staros::StarStatus {
     }
 }
 
-fn parse_bucket_from_full_path(full_path: &str) -> Option<String> {
-    let trimmed = full_path.trim();
-    for scheme in ["s3://", "oss://"] {
-        if let Some(rest) = trimmed.strip_prefix(scheme) {
-            let bucket = rest.split('/').next().unwrap_or_default().trim();
-            if !bucket.is_empty() {
-                return Some(bucket.to_string());
-            }
-        }
-    }
-    None
-}
-
 fn parse_add_shard_s3_config(
     path_info: &proto::staros::FilePathInfo,
 ) -> Result<Option<starlet_shard_registry::S3StoreConfig>, String> {
-    let Some(fs_info) = path_info.fs_info.as_ref() else {
-        return Ok(None);
-    };
-    if fs_info.fs_type != proto::staros::FileStoreType::S3 as i32 {
-        return Ok(None);
-    }
-
-    let s3 = fs_info
-        .s3_fs_info
-        .as_ref()
-        .ok_or_else(|| "AddShard fs_type=S3 but s3_fs_info is missing".to_string())?;
-    let endpoint = s3.endpoint.trim();
-    if endpoint.is_empty() {
-        return Err("AddShard S3 endpoint is empty".to_string());
-    }
-
-    let bucket = if s3.bucket.trim().is_empty() {
-        parse_bucket_from_full_path(&path_info.full_path).ok_or_else(|| {
-            "AddShard S3 bucket is empty and cannot be inferred from full_path".to_string()
-        })?
-    } else {
-        s3.bucket.trim().to_string()
-    };
-    let root = s3.path_prefix.trim_matches('/').to_string();
-    let credential = s3
-        .credential
-        .as_ref()
-        .ok_or_else(|| "AddShard S3 credential is missing".to_string())?;
-    let (access_key_id, access_key_secret) = match credential.credential.as_ref() {
-        Some(proto::staros::aws_credential_info::Credential::SimpleCredential(simple)) => {
-            let ak = simple.access_key.trim();
-            let sk = simple.access_key_secret.trim();
-            if ak.is_empty() || sk.is_empty() {
-                return Err(
-                    "AddShard S3 simple credential contains empty access key/secret".to_string(),
-                );
-            }
-            (ak.to_string(), sk.to_string())
-        }
-        Some(other) => resolve_add_shard_s3_credentials_fallback(
-            &path_info.full_path,
-            Some(other),
-            endpoint,
-            &bucket,
-        )?,
-        None => resolve_add_shard_s3_credentials_fallback(
-            &path_info.full_path,
-            None,
-            endpoint,
-            &bucket,
-        )?,
-    };
-
-    let enable_path_style_access = match s3.path_style_access {
-        1 => Some(true),
-        2 => Some(false),
-        _ => None,
-    };
-    let region = s3
-        .region
-        .trim()
-        .split_once('\0')
-        .map(|(v, _)| v)
-        .unwrap_or(s3.region.as_str())
-        .trim();
-    let region = (!region.is_empty()).then_some(region.to_string());
-
-    Ok(Some(starlet_shard_registry::S3StoreConfig {
-        endpoint: endpoint.to_string(),
-        bucket,
-        root,
-        access_key_id,
-        access_key_secret,
-        region,
-        enable_path_style_access,
-    }))
-}
-
-fn resolve_add_shard_s3_credentials_fallback(
-    full_path: &str,
-    credential_mode: Option<&proto::staros::aws_credential_info::Credential>,
-    endpoint: &str,
-    bucket: &str,
-) -> Result<(String, String), String> {
-    if let Some(existing) = starlet_shard_registry::infer_s3_config_for_path(full_path)
-        && !existing.access_key_id.trim().is_empty()
-        && !existing.access_key_secret.trim().is_empty()
-    {
-        return Ok((existing.access_key_id, existing.access_key_secret));
-    }
-
-    let access_key_id = std::env::var("AWS_ACCESS_KEY_ID")
-        .ok()
-        .or_else(|| std::env::var("AWS_ACCESS_KEY").ok())
-        .or_else(|| std::env::var("MINIO_ROOT_USER").ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    let access_key_secret = std::env::var("AWS_SECRET_ACCESS_KEY")
-        .ok()
-        .or_else(|| std::env::var("AWS_SECRET_KEY").ok())
-        .or_else(|| std::env::var("MINIO_ROOT_PASSWORD").ok())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    if let (Some(ak), Some(sk)) = (access_key_id, access_key_secret) {
-        return Ok((ak, sk));
-    }
-
-    let mode = match credential_mode {
-        Some(proto::staros::aws_credential_info::Credential::SimpleCredential(_)) => "SIMPLE",
-        Some(proto::staros::aws_credential_info::Credential::DefaultCredential(_)) => "DEFAULT",
-        Some(proto::staros::aws_credential_info::Credential::ProfileCredential(_)) => {
-            "INSTANCE_PROFILE"
-        }
-        Some(proto::staros::aws_credential_info::Credential::AssumeRoleCredential(_)) => {
-            "ASSUME_ROLE"
-        }
-        None => "EMPTY",
-    };
-    Err(format!(
-        "AddShard S3 credential fallback failed: mode={}, endpoint={}, bucket={}, full_path={}",
-        mode, endpoint, bucket, full_path
-    ))
+    starmgr::parse_s3_config_from_file_path_info(path_info)
 }
 
 fn summarize_top_counts(counts: &HashMap<String, usize>, top_n: usize) -> String {
@@ -566,6 +423,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         request: tonic::Request<proto::staros::AddShardRequest>,
     ) -> Result<tonic::Response<proto::staros::AddShardResponse>, tonic::Status> {
         let req = request.into_inner();
+        starmgr::observe_starlet_service(&req.service_id);
         let worker_id = req.worker_id;
         let shard_count = req.shard_info.len();
         let shard_infos = req.shard_info;
@@ -651,6 +509,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         request: tonic::Request<proto::staros::RemoveShardRequest>,
     ) -> Result<tonic::Response<proto::staros::RemoveShardResponse>, tonic::Status> {
         let req = request.into_inner();
+        starmgr::observe_starlet_service(&req.service_id);
         let tablet_ids = req
             .shard_ids
             .iter()
@@ -660,6 +519,7 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         info!(
             target: "novarocks::grpc",
             worker_id = req.worker_id,
+            service_id = req.service_id,
             shard_count = req.shard_ids.len(),
             removed,
             "received starlet RemoveShard"
@@ -674,10 +534,18 @@ impl proto::staros::starlet_server::Starlet for StarletGrpcService {
         request: tonic::Request<proto::staros::StarletHeartbeatRequest>,
     ) -> Result<tonic::Response<proto::staros::StarletHeartbeatResponse>, tonic::Status> {
         let req = request.into_inner();
+        starmgr::observe_starlet_heartbeat(
+            &req.star_mgr_leader,
+            &req.service_id,
+            req.worker_group_id,
+            req.worker_id,
+        );
         info!(
             target: "novarocks::grpc",
             worker_id = req.worker_id,
             worker_group_id = req.worker_group_id,
+            service_id = req.service_id,
+            star_mgr_leader = req.star_mgr_leader,
             "received starlet StarletHeartbeat"
         );
         Ok(tonic::Response::new(

@@ -25,7 +25,6 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::connector::schema;
-use crate::connector::starrocks::fe_v2_meta;
 use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
 use crate::connector::starrocks::lake::applier::apply_txn_log_to_metadata;
@@ -42,6 +41,7 @@ use crate::connector::starrocks::lake::txn_log::{
     ensure_rowset_segment_meta_consistency, normalize_rowset_shared_segments,
     read_txn_log_if_exists, write_txn_log_file,
 };
+use crate::connector::starrocks::starmgr;
 use crate::formats::starrocks::writer::bundle_meta::{
     BundleMetaWriteEntry, decode_bundle_metadata_from_bytes,
     decode_tablet_metadata_from_bundle_bytes, empty_tablet_metadata,
@@ -710,8 +710,8 @@ pub(crate) fn drop_table(request: &DropTableRequest) -> Result<DropTableResponse
                 .and_then(|runtime| runtime.s3_config.clone())
                 .or_else(|| {
                     starlet_shard_registry::select_infos(&[id])
-                        .get(&id)
-                        .and_then(|info| info.s3.clone())
+                        .remove(&id)
+                        .and_then(|info| info.s3)
                 })
         })
         .or_else(|| starlet_shard_registry::find_s3_config_for_path(path))
@@ -1387,7 +1387,7 @@ fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
     if missing.is_empty() {
         return;
     }
-    match fe_v2_meta::recover_tablet_paths_from_fe_metadata(None, &missing) {
+    match starmgr::retrieve_shard_infos(&missing) {
         Ok(recovered) => {
             if recovered.is_empty() {
                 warn!(
@@ -1413,7 +1413,7 @@ fn warmup_tablet_locations(op: &str, tablet_ids: &[i64]) {
         }
         Err(err) => {
             warn!(
-                "{op} tablet location warmup from FE metadata failed: missing={:?}, error={}",
+                "{op} tablet location warmup from StarManager failed: missing={:?}, error={}",
                 missing, err
             );
         }
@@ -1490,7 +1490,12 @@ fn resolve_tablet_location(
             if let Some(info) = infos.remove(&tablet_id) {
                 return Ok((info.full_path, info.s3));
             }
-            warmup_tablet_locations(op, &[tablet_id]);
+            if let Err(err) = starmgr::retrieve_shard_info(tablet_id) {
+                warn!(
+                    "{op} single-tablet StarManager recovery failed: tablet_id={}, error={}",
+                    tablet_id, err
+                );
+            }
             infos = starlet_shard_registry::select_infos(&[tablet_id]);
             if let Some(info) = infos.remove(&tablet_id) {
                 return Ok((info.full_path, info.s3));
@@ -1940,7 +1945,7 @@ fn drop_table_path(path: &str, s3_config: Option<&S3StoreConfig>) -> Result<(), 
                 .ok_or_else(|| {
                     format!(
                         "drop_table missing S3 config for object-store path={path}; \
-                        expected tablet runtime or AddShard cache to provide credentials"
+                        expected tablet runtime or Starlet shard cache to provide credentials"
                     )
                 })?
                 .to_object_store_config(),
@@ -2819,11 +2824,10 @@ mod tests {
 
     use super::{
         abort_txn, delete_tablet, drop_table, get_tablet_stats, parse_txn_vlog_file_name,
-        publish_log_version, publish_log_version_batch, publish_version, vacuum,
+        publish_log_version, publish_log_version_batch, publish_version, remove_tablet_runtime,
+        vacuum,
     };
-    use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
-    };
+    use crate::connector::starrocks::lake::context::{TabletWriteContext, register_tablet_runtime};
     use crate::connector::starrocks::lake::{
         append_lake_txn_log_with_rowset, txn_log::write_txn_log_file,
     };
@@ -3155,6 +3159,7 @@ mod tests {
         txn_id: i64,
         segment_name: &str,
         row_count: i64,
+        schema_id: i64,
     ) -> TxnLogPb {
         TxnLogPb {
             tablet_id: Some(tablet_id),
@@ -3173,7 +3178,7 @@ mod tests {
                 schema_key: Some(TableSchemaKeyPb {
                     db_id: Some(1),
                     table_id: Some(1),
-                    schema_id: Some(1),
+                    schema_id: Some(schema_id),
                 }),
             }),
             op_compaction: None,
@@ -3224,7 +3229,7 @@ mod tests {
         let log_path = txn_log_file_path(&root, tablet_id, txn_id).expect("build txn log path");
         write_txn_log_file(
             &log_path,
-            &test_write_txn_log(tablet_id, txn_id, seg_name, 3),
+            &test_write_txn_log(tablet_id, txn_id, seg_name, 3, 4001),
         )
         .expect("write txn log");
 
@@ -3262,7 +3267,7 @@ mod tests {
         write_bytes(&seg_path, vec![7, 8, 9]).expect("write segment file");
 
         let combined = CombinedTxnLogPb {
-            txn_logs: vec![test_write_txn_log(tablet_id, txn_id, seg_name, 5)],
+            txn_logs: vec![test_write_txn_log(tablet_id, txn_id, seg_name, 5, 4002)],
         };
         let combined_path = combined_txn_log_file_path(&root, txn_id).expect("build combined path");
         write_bytes(&combined_path, combined.encode_to_vec()).expect("write combined txn log");
@@ -3301,7 +3306,7 @@ mod tests {
         let txn_log_path = txn_log_file_path(&root, tablet_id, txn_id).expect("build txn log path");
         write_txn_log_file(
             &txn_log_path,
-            &test_write_txn_log(tablet_id, txn_id, "seg_publish_log.dat", 3),
+            &test_write_txn_log(tablet_id, txn_id, "seg_publish_log.dat", 3, 4003),
         )
         .expect("write txn log");
 
@@ -3342,12 +3347,12 @@ mod tests {
         let txn2_path = txn_log_file_path(&root, tablet_id, txn2_id).expect("build txn2 path");
         write_txn_log_file(
             &txn1_path,
-            &test_write_txn_log(tablet_id, txn1_id, "seg_publish_batch_1.dat", 2),
+            &test_write_txn_log(tablet_id, txn1_id, "seg_publish_batch_1.dat", 2, 4004),
         )
         .expect("write txn1 log");
         write_txn_log_file(
             &txn2_path,
-            &test_write_txn_log(tablet_id, txn2_id, "seg_publish_batch_2.dat", 4),
+            &test_write_txn_log(tablet_id, txn2_id, "seg_publish_batch_2.dat", 4, 4004),
         )
         .expect("write txn2 log");
 
@@ -3421,12 +3426,12 @@ mod tests {
             txn_log_file_path_with_load_id(&root, tablet_id, txn_id, &load_id_2).expect("path2");
         write_txn_log_file(
             &path_1,
-            &test_write_txn_log(tablet_id, txn_id, "seg_a.dat", 2),
+            &test_write_txn_log(tablet_id, txn_id, "seg_a.dat", 2, 4001),
         )
         .expect("write path1");
         write_txn_log_file(
             &path_2,
-            &test_write_txn_log(tablet_id, txn_id, "seg_b.dat", 3),
+            &test_write_txn_log(tablet_id, txn_id, "seg_b.dat", 3, 4001),
         )
         .expect("write path2");
 
@@ -3469,7 +3474,13 @@ mod tests {
         register_tablet_runtime(&ctx).expect("register tablet runtime");
 
         let combined = CombinedTxnLogPb {
-            txn_logs: vec![test_write_txn_log(tablet_id, txn_id, "seg_combined.dat", 5)],
+            txn_logs: vec![test_write_txn_log(
+                tablet_id,
+                txn_id,
+                "seg_combined.dat",
+                5,
+                4003,
+            )],
         };
         let path = combined_txn_log_file_path(&root, txn_id).expect("build combined path");
         write_bytes(&path, combined.encode_to_vec()).expect("write combined txn log");
@@ -3567,15 +3578,13 @@ mod tests {
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88005;
         let txn_id = 3001;
-        clear_tablet_runtime_cache_for_test();
-
         let ctx = test_context(&root, 7005, tablet_id, 4005);
         register_tablet_runtime(&ctx).expect("register tablet runtime");
-        let log = test_write_txn_log(tablet_id, txn_id, "seg_restart.dat", 7);
+        let log = test_write_txn_log(tablet_id, txn_id, "seg_restart.dat", 7, 4005);
         let path = txn_log_file_path(&root, tablet_id, txn_id).expect("build txn log path");
         write_txn_log_file(&path, &log).expect("write txn log");
 
-        clear_tablet_runtime_cache_for_test();
+        remove_tablet_runtime(tablet_id).expect("remove runtime for missing-runtime test");
 
         let req = PublishVersionRequest {
             tablet_ids: vec![tablet_id],
@@ -3608,8 +3617,6 @@ mod tests {
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88006;
         let txn_id = 3002;
-        clear_tablet_runtime_cache_for_test();
-
         let ctx = test_context(&root, 7006, tablet_id, 4006);
         register_tablet_runtime(&ctx).expect("register tablet runtime");
 
@@ -3619,6 +3626,7 @@ mod tests {
                 txn_id,
                 "seg_combined_a.dat",
                 3,
+                4006,
             )],
         };
         let path = combined_txn_log_file_path(&root, txn_id).expect("build combined txn log path");
@@ -3665,12 +3673,12 @@ mod tests {
         let txn2_path = txn_log_file_path(&root, tablet_id, txn2_id).expect("build txn2 path");
         write_txn_log_file(
             &txn1_path,
-            &test_write_txn_log(tablet_id, txn1_id, "seg_batch_txn1.dat", 2),
+            &test_write_txn_log(tablet_id, txn1_id, "seg_batch_txn1.dat", 2, 4061),
         )
         .expect("write txn1 log");
         write_txn_log_file(
             &txn2_path,
-            &test_write_txn_log(tablet_id, txn2_id, "seg_batch_txn2.dat", 3),
+            &test_write_txn_log(tablet_id, txn2_id, "seg_batch_txn2.dat", 3, 4061),
         )
         .expect("write txn2 log");
 
@@ -3715,13 +3723,16 @@ mod tests {
         let mut version_2_meta =
             crate::formats::starrocks::writer::bundle_meta::empty_tablet_metadata(tablet_id);
         version_2_meta.version = Some(2);
-        version_2_meta.rowsets = vec![test_rowset("seg_prev.dat", 1, 8)];
+        version_2_meta.rowsets = vec![RowsetMetadataPb {
+            id: Some(1),
+            ..test_rowset("seg_prev.dat", 1, 8)
+        }];
         version_2_meta.next_rowset_id = Some(2);
         write_bundle_meta_file(&root, tablet_id, 2, &ctx.tablet_schema, &version_2_meta)
             .expect("write version-2 metadata");
 
         let txn2_id = 1002;
-        let txn2_log = test_write_txn_log(tablet_id, txn2_id, "seg_retry_txn2.dat", 3);
+        let txn2_log = test_write_txn_log(tablet_id, txn2_id, "seg_retry_txn2.dat", 3, 4002);
         let txn2_path = txn_log_file_path(&root, tablet_id, txn2_id).expect("build txn2 path");
         write_txn_log_file(&txn2_path, &txn2_log).expect("write txn2 log");
 
@@ -4033,7 +4044,7 @@ mod tests {
         let log_path = txn_log_file_path(&root_str, tablet_id, txn_id).expect("build txn log path");
         write_txn_log_file(
             &log_path,
-            &test_write_txn_log(tablet_id, txn_id, "seg_delete_tablet.dat", 2),
+            &test_write_txn_log(tablet_id, txn_id, "seg_delete_tablet.dat", 2, 4301),
         )
         .expect("write txn log");
 

@@ -20,7 +20,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp};
+use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp, SchemaTable};
 use crate::descriptors;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::scan::ScanNode;
@@ -29,7 +29,7 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{Layout, schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
-use crate::{internal_service, plan_nodes};
+use crate::{internal_service, plan_nodes, types};
 
 use super::local_rf_waiting_set;
 
@@ -42,18 +42,38 @@ pub(crate) fn lower_schema_scan_node(
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+    fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
     let schema_scan = node
         .schema_scan_node
         .as_ref()
         .ok_or_else(|| "SCHEMA_SCAN_NODE missing schema_scan_node payload".to_string())?;
 
-    if let Some(table) = BeSchemaTable::from_table_name(&schema_scan.table_name) {
+    if let Some(table) = SchemaTable::from_table_name(&schema_scan.table_name) {
         return match table {
-            BeSchemaTable::TabletWriteLog | BeSchemaTable::Txns | BeSchemaTable::Compactions => {
-                lower_be_schema_scan_node(node, out_layout, desc_tbl, exec_params, table)
+            SchemaTable::Be(
+                BeSchemaTable::TabletWriteLog | BeSchemaTable::Txns | BeSchemaTable::Compactions,
+            ) => lower_supported_schema_scan_node(
+                node,
+                out_layout,
+                desc_tbl,
+                exec_params,
+                fe_addr,
+                table,
+                true,
+            ),
+            SchemaTable::Loads => lower_supported_schema_scan_node(
+                node,
+                out_layout,
+                desc_tbl,
+                exec_params,
+                fe_addr,
+                table,
+                false,
+            ),
+            SchemaTable::Be(BeSchemaTable::Unsupported(name)) => {
+                Err(format!("unsupported be schema table {name}"))
             }
-            BeSchemaTable::Unsupported(name) => Err(format!("unsupported be schema table {name}")),
         };
     }
 
@@ -80,12 +100,14 @@ pub(crate) fn lower_schema_scan_node(
     })
 }
 
-fn lower_be_schema_scan_node(
+fn lower_supported_schema_scan_node(
     node: &plan_nodes::TPlanNode,
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
-    table: BeSchemaTable,
+    fe_addr: Option<&types::TNetworkAddress>,
+    table: SchemaTable,
+    require_scan_ranges: bool,
 ) -> Result<Lowered, String> {
     let schema_scan = node
         .schema_scan_node
@@ -98,18 +120,23 @@ fn lower_be_schema_scan_node(
             desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
         schema_for_layout(desc_tbl, out_layout)?
     };
-    let should_scan = schema_scan_selected_for_current_fragment(node.node_id, exec_params)?;
     let output_slots = out_layout
         .order
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
         .collect::<Result<Vec<_>, _>>()?;
     let context = SchemaScanContext::from_thrift(schema_scan);
+    let should_scan = if require_scan_ranges {
+        schema_scan_selected_for_current_fragment(node.node_id, exec_params)?
+    } else {
+        schema_scan_selected_if_present(node.node_id, exec_params)?
+    };
     let scan = ScanNode::new(Arc::new(SchemaScanOp::new(
         table,
         context,
         output_schema,
         should_scan,
+        fe_addr.cloned(),
     )))
     .with_node_id(node.node_id)
     .with_output_slots(output_slots)
@@ -133,6 +160,33 @@ fn schema_scan_selected_for_current_fragment(
         .per_node_scan_ranges
         .get(&node_id)
         .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={node_id}"))?;
+    if scan_ranges
+        .iter()
+        .any(|scan_range| scan_range.has_more.unwrap_or(false))
+    {
+        return Err(format!(
+            "SCHEMA_SCAN_NODE node_id={} has incremental scan ranges which are not supported",
+            node_id
+        ));
+    }
+    if scan_ranges.is_empty() {
+        return Ok(true);
+    }
+    Ok(scan_ranges
+        .iter()
+        .any(|scan_range| !scan_range.empty.unwrap_or(false)))
+}
+
+fn schema_scan_selected_if_present(
+    node_id: i32,
+    exec_params: Option<&internal_service::TPlanFragmentExecParams>,
+) -> Result<bool, String> {
+    let Some(exec_params) = exec_params else {
+        return Ok(true);
+    };
+    let Some(scan_ranges) = exec_params.per_node_scan_ranges.get(&node_id) else {
+        return Ok(true);
+    };
     if scan_ranges
         .iter()
         .any(|scan_range| scan_range.has_more.unwrap_or(false))
@@ -289,13 +343,25 @@ mod tests {
         for table_name in table_names {
             let node = schema_scan_plan_node(table_name);
             let params = scan_exec_params(node.node_id);
-            let lowered = lower_schema_scan_node(&node, &layout, None, Some(&params))
+            let lowered = lower_schema_scan_node(&node, &layout, None, Some(&params), None)
                 .unwrap_or_else(|err| panic!("table_name={table_name} err={err}"));
             assert!(
                 matches!(lowered.node.kind, ExecNodeKind::Scan(_)),
                 "table_name={table_name} lower result should be scan"
             );
         }
+    }
+
+    #[test]
+    fn lower_schema_scan_node_loads_to_scan() {
+        let layout = Layout {
+            order: Vec::new(),
+            index: std::collections::HashMap::new(),
+        };
+        let node = schema_scan_plan_node("loads");
+        let lowered = lower_schema_scan_node(&node, &layout, None, None, None)
+            .expect("loads schema table should lower to scan");
+        assert!(matches!(lowered.node.kind, ExecNodeKind::Scan(_)));
     }
 
     #[test]
@@ -306,7 +372,7 @@ mod tests {
         };
         let node = schema_scan_plan_node("be_metrics");
         let params = scan_exec_params(node.node_id);
-        let err = lower_schema_scan_node(&node, &layout, None, Some(&params))
+        let err = lower_schema_scan_node(&node, &layout, None, Some(&params), None)
             .expect_err("non-core be schema table should fail fast");
         assert!(err.contains("unsupported be schema table"), "err={err}");
     }

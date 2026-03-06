@@ -21,6 +21,8 @@ description: 在 NovaRocks 仓库中运行 StarRocks `dev/test` SQL-tester（重
   - `starlet_port`
 - NovaRocks 端口号不可修改；`novarocks.toml` 其他非端口配置可修改。
 - 执行 SQL-tester 前必须确保本机 `127.0.0.1/localhost` 请求不走代理（否则 `/_stream_load` 可能出现空响应或 `502`）。
+- 在 Codex `exec_command` 环境中，`nohup ... &` / 一次性后台启动的长驻进程可能会在命令结束后被会话回收；不要把这种方式当作可靠守护进程方案。
+- 若需要稳定保活 FE / NovaRocks，优先复用用户已手动启动的实例，或在持久 PTY 会话中前台运行并保持会话存活。
 - 若 StarRocks FE / NovaRocks 启停遇到无法解决的问题（重试后仍失败），允许中断并直接报告阻塞原因。
 
 ## 2) 启动前检查
@@ -109,6 +111,12 @@ NovaRocks（端口严格来自 `novarocks.toml`）：
 ./build.sh run -- start --config ./novarocks.toml
 ./build.sh run -- stop
 ```
+
+注意：
+
+- 在 Codex 工具环境中，不要假设通过一次性 `exec_command` 触发的 `start_fe.sh --daemon`、`./build.sh run -- start`、`nohup ... &` 一定能持续存活。
+- 若需要 agent 自己托管服务，优先使用持久 PTY 会话并持续保留该 session；否则优先让用户手动启动服务后再做 SQL 验证。
+- 每次启服后都要立即做端口与探针校验，不要仅凭启动命令返回成功就继续跑 case。
 
 MySQL 探针（端口取自 `fe.conf`）：
 

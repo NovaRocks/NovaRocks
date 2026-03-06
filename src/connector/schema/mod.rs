@@ -19,6 +19,7 @@ mod be_tablet_write_log_store;
 mod be_txn_store;
 mod chunk_builder;
 mod context;
+mod loads;
 mod op;
 
 pub(crate) use be_tablet_write_log_store::BeTabletWriteLoadLogRecord;
@@ -54,6 +55,29 @@ impl BeSchemaTable {
             Self::Txns => "be_txns",
             Self::Compactions => "be_compactions",
             Self::Unsupported(name) => name.as_str(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SchemaTable {
+    Loads,
+    Be(BeSchemaTable),
+}
+
+impl SchemaTable {
+    pub(crate) fn from_table_name(table_name: &str) -> Option<Self> {
+        let normalized = table_name.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "loads" => Some(Self::Loads),
+            _ => BeSchemaTable::from_table_name(&normalized).map(Self::Be),
+        }
+    }
+
+    pub(crate) fn table_name(&self) -> &str {
+        match self {
+            Self::Loads => "loads",
+            Self::Be(table) => table.table_name(),
         }
     }
 }

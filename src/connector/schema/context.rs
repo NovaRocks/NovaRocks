@@ -26,6 +26,8 @@ pub(crate) struct SchemaScanContext {
     pub(crate) partition_id: Option<i64>,
     pub(crate) tablet_id: Option<i64>,
     pub(crate) txn_id: Option<i64>,
+    pub(crate) job_id: Option<i64>,
+    pub(crate) label: Option<String>,
     pub(crate) type_: Option<String>,
     pub(crate) state: Option<String>,
     pub(crate) limit: Option<i64>,
@@ -46,6 +48,8 @@ impl SchemaScanContext {
             partition_id: node.partition_id.filter(|value| *value > 0),
             tablet_id: node.tablet_id.filter(|value| *value > 0),
             txn_id: node.txn_id.filter(|value| *value > 0),
+            job_id: node.job_id.filter(|value| *value > 0),
+            label: normalize_optional_string(node.label.as_ref()),
             type_: normalize_optional_string(node.type_.as_ref())
                 .map(|value| value.to_ascii_uppercase()),
             state: normalize_optional_string(node.state.as_ref())

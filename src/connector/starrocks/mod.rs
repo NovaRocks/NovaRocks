@@ -3,6 +3,7 @@ pub mod lake;
 mod object_store_profile;
 pub mod scan;
 pub mod sink;
+pub mod starmgr;
 
 pub(crate) use object_store_profile::ObjectStoreProfile;
 pub(crate) use scan::build_native_object_store_profile_from_properties;

@@ -21,6 +21,7 @@ pub mod engine_ffi;
 pub mod exchange_sender;
 pub mod fe_report;
 pub mod grpc_client;
+pub mod grpc_proto;
 pub mod grpc_server;
 pub mod heartbeat_service;
 pub mod internal_service;

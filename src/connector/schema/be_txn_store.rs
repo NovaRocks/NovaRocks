@@ -247,6 +247,8 @@ mod tests {
             partition_id: None,
             tablet_id: None,
             txn_id: None,
+            job_id: None,
+            label: None,
             type_: None,
             state: None,
             limit: None,

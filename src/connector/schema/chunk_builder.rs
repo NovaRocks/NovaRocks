@@ -26,7 +26,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::Chunk;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SchemaValue {
     Int32(i32),
     Int64(i64),
