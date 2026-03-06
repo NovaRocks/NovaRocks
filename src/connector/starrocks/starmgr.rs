@@ -583,11 +583,20 @@ pub(crate) fn clear_state_for_test() {
 }
 
 #[cfg(test)]
+pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("lock starmgr test guard")
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        clear_state_for_test, key_matches_root, observe_starlet_heartbeat,
+        clear_state_for_test, key_matches_root, lock_for_test, observe_starlet_heartbeat,
         parse_s3_config_from_file_path_info, parse_s3_config_from_file_store_info,
         require_ok_status, resolve_routing, split_object_store_path,
     };
@@ -657,6 +666,7 @@ mod tests {
 
     #[test]
     fn heartbeat_updates_routing_state() {
+        let _guard = lock_for_test();
         clear_state_for_test();
         observe_starlet_heartbeat("127.0.0.1:6091", "service-1", 7, 9);
         let routing = data_block_on(resolve_routing())
@@ -669,6 +679,7 @@ mod tests {
 
     #[test]
     fn resolve_routing_waits_for_delayed_heartbeat() {
+        let _guard = lock_for_test();
         clear_state_for_test();
         let handle = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));

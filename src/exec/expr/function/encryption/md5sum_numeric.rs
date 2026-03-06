@@ -115,4 +115,16 @@ mod tests {
         let parsed = largeint::i128_from_be_bytes(out.value(0)).unwrap();
         assert_eq!(parsed, -148866708576779697295343134153845407886_i128);
     }
+
+    #[test]
+    fn test_md5sum_numeric_skips_null_arguments() {
+        let mut arena = ExprArena::default();
+        let expr = typed_null(&mut arena, DataType::FixedSizeBinary(16));
+        let null_arg = typed_null(&mut arena, DataType::Utf8);
+
+        let out = eval_md5sum_numeric(&arena, expr, &[null_arg], &chunk_len_1()).unwrap();
+        let out = out.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+        let parsed = largeint::i128_from_be_bytes(out.value(0)).unwrap();
+        assert_eq!(parsed, -58332598431525814501020785164969033090_i128);
+    }
 }

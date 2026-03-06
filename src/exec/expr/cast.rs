@@ -582,7 +582,7 @@ fn sanitize_non_finite_float64(arr: &Float64Array) -> ArrayRef {
             continue;
         }
         let value = arr.value(i);
-        if value.is_nan() {
+        if !value.is_finite() {
             builder.append_null();
         } else {
             builder.append_value(value);
@@ -599,7 +599,7 @@ fn sanitize_non_finite_float32(arr: &Float32Array) -> ArrayRef {
             continue;
         }
         let value = arr.value(i);
-        if value.is_nan() {
+        if !value.is_finite() {
             builder.append_null();
         } else {
             builder.append_value(value);
@@ -3593,8 +3593,8 @@ mod tests {
         let out = sanitize_non_finite_cast_result(input, &DataType::Float64).unwrap();
         let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(out.value(0), 1.5);
-        assert_eq!(out.value(1), f64::INFINITY);
-        assert_eq!(out.value(2), f64::NEG_INFINITY);
+        assert!(out.is_null(1));
+        assert!(out.is_null(2));
         assert!(out.is_null(3));
         assert!(out.is_null(4));
     }
@@ -3611,8 +3611,8 @@ mod tests {
         let out = sanitize_non_finite_cast_result(input, &DataType::Float32).unwrap();
         let out = out.as_any().downcast_ref::<Float32Array>().unwrap();
         assert_eq!(out.value(0), 2.5);
-        assert_eq!(out.value(1), f32::INFINITY);
-        assert_eq!(out.value(2), f32::NEG_INFINITY);
+        assert!(out.is_null(1));
+        assert!(out.is_null(2));
         assert!(out.is_null(3));
         assert!(out.is_null(4));
     }

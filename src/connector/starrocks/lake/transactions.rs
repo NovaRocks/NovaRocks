@@ -2985,7 +2985,7 @@ fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::Arc;
+    use std::sync::{Arc, MutexGuard};
 
     use arrow::array::{Int8Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -3013,6 +3013,7 @@ mod tests {
         DATA_DIR, bundle_meta_file_path, combined_txn_log_file_path, initial_meta_file_path,
         join_tablet_path, txn_log_file_path, txn_log_file_path_with_load_id, txn_vlog_file_path,
     };
+    use crate::runtime::starlet_shard_registry;
     use crate::service::grpc_client::proto::starrocks::{
         AbortTxnRequest, ColumnPb, CombinedTxnLogPb, DeleteTabletRequest, DelvecMetadataPb,
         DropTableRequest, FileMetaPb, KeysType, PUniqueId, PublishLogVersionBatchRequest,
@@ -3020,6 +3021,13 @@ mod tests {
         TabletInfoPb, TabletSchemaPb, TabletStatRequest, TxnInfoPb, TxnLogPb, TxnTypePb,
         VacuumRequest, tablet_stat_request, txn_log_pb,
     };
+
+    fn lock_runtime_test_state() -> MutexGuard<'static, ()> {
+        let guard = starlet_shard_registry::lock_for_test();
+        starlet_shard_registry::clear_for_test();
+        clear_tablet_runtime_cache_for_test();
+        guard
+    }
 
     fn test_tablet_schema(schema_id: i64) -> TabletSchemaPb {
         TabletSchemaPb {
@@ -3388,6 +3396,7 @@ mod tests {
 
     #[test]
     fn abort_txn_deletes_per_tablet_log_and_segment_files() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88101;
@@ -3427,6 +3436,7 @@ mod tests {
 
     #[test]
     fn abort_txn_deletes_combined_log_after_success() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88102;
@@ -3468,6 +3478,7 @@ mod tests {
 
     #[test]
     fn publish_log_version_is_idempotent_when_vlog_already_exists() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88111;
@@ -3508,6 +3519,7 @@ mod tests {
 
     #[test]
     fn publish_log_version_batch_maps_txn_ids_to_versions() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88112;
@@ -3548,6 +3560,7 @@ mod tests {
 
     #[test]
     fn publish_log_version_reports_missing_source_log() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88113;
@@ -3584,6 +3597,7 @@ mod tests {
 
     #[test]
     fn publish_version_supports_multi_stmt_logs_with_load_ids() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88010;
@@ -3639,6 +3653,7 @@ mod tests {
 
     #[test]
     fn publish_version_reads_combined_txn_log_when_requested() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88003;
@@ -3683,6 +3698,7 @@ mod tests {
 
     #[test]
     fn publish_version_supports_empty_txnlog_txn_id() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88004;
@@ -3722,6 +3738,7 @@ mod tests {
 
     #[test]
     fn publish_version_rejects_empty_txnlog_txn_id_in_batch() {
+        let _guard = lock_runtime_test_state();
         let req = PublishVersionRequest {
             tablet_ids: vec![12345],
             txn_ids: Vec::new(),
@@ -3747,6 +3764,7 @@ mod tests {
 
     #[test]
     fn publish_version_persists_missing_sibling_tablets_into_bundle() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id_1 = 88051;
@@ -3814,6 +3832,7 @@ mod tests {
 
     #[test]
     fn publish_version_recovers_runtime_from_shard_cache() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88005;
@@ -3874,6 +3893,7 @@ mod tests {
 
     #[test]
     fn publish_version_keeps_combined_log_after_success() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88006;
@@ -3922,6 +3942,7 @@ mod tests {
 
     #[test]
     fn publish_version_keeps_batch_txn_logs_for_retry_safety() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88061;
@@ -3975,6 +3996,7 @@ mod tests {
 
     #[test]
     fn publish_version_handles_first_missing_txn_log_in_batch_retry() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88002;
@@ -4020,6 +4042,7 @@ mod tests {
 
     #[test]
     fn publish_version_applies_primary_key_mixed_op_and_persists_delvec_visibility() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88071;
@@ -4108,6 +4131,7 @@ mod tests {
 
     #[test]
     fn publish_version_applies_primary_key_composite_mixed_op_and_persists_delvec_visibility() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88072;
@@ -4199,6 +4223,7 @@ mod tests {
 
     #[test]
     fn get_tablet_stats_returns_visible_rows_and_data_size() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().to_string_lossy().to_string();
         let tablet_id = 88091;
@@ -4259,6 +4284,7 @@ mod tests {
 
     #[test]
     fn drop_table_removes_local_directory_recursively() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().join("drop_table_case");
         let nested_dir = root.join("nested");
@@ -4286,6 +4312,7 @@ mod tests {
 
     #[test]
     fn delete_tablet_drops_local_partition_root_when_all_tablets_are_deleted() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().join("delete_tablet_case");
         std::fs::create_dir_all(&root).expect("create root dir");
@@ -4330,6 +4357,7 @@ mod tests {
 
     #[test]
     fn delete_tablet_is_idempotent_when_runtime_is_already_removed() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().join("delete_tablet_idempotent");
         std::fs::create_dir_all(&root).expect("create root dir");
@@ -4370,6 +4398,7 @@ mod tests {
 
     #[test]
     fn delete_tablet_allows_missing_runtime_entries() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().join("delete_tablet_missing_runtime");
         std::fs::create_dir_all(&root).expect("create root dir");
@@ -4404,6 +4433,7 @@ mod tests {
 
     #[test]
     fn vacuum_deletes_old_metadata_and_old_txn_logs() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let root = tmp.path().join("vacuum_case");
         std::fs::create_dir_all(&root).expect("create root dir");
