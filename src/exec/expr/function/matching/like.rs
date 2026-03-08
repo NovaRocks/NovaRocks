@@ -26,7 +26,20 @@ pub fn like_match(text: &str, pattern: &str) -> bool {
     like_match_recursive(&text_chars, 0, &pattern_chars, 0)
 }
 
-// Simple LIKE pattern matching algorithm (handles % and _)
+fn match_literal(
+    text: &[char],
+    text_idx: usize,
+    pattern: &[char],
+    next_pattern_idx: usize,
+    literal: char,
+) -> bool {
+    if text_idx >= text.len() || text[text_idx] != literal {
+        return false;
+    }
+    like_match_recursive(text, text_idx + 1, pattern, next_pattern_idx)
+}
+
+// Simple LIKE pattern matching algorithm (handles %, _, and backslash escapes)
 fn like_match_recursive(
     text: &[char],
     text_idx: usize,
@@ -60,16 +73,16 @@ fn like_match_recursive(
             }
             like_match_recursive(text, text_idx + 1, pattern, pattern_idx + 1)
         }
+        '\\' => {
+            if pattern_idx + 1 >= pattern.len() {
+                return match_literal(text, text_idx, pattern, pattern_idx + 1, '\\');
+            }
+            let escaped = pattern[pattern_idx + 1];
+            match_literal(text, text_idx, pattern, pattern_idx + 2, escaped)
+        }
         c => {
             // Literal character must match
-            if text_idx >= text.len() {
-                return false;
-            }
-            if text[text_idx] == c {
-                like_match_recursive(text, text_idx + 1, pattern, pattern_idx + 1)
-            } else {
-                false
-            }
+            match_literal(text, text_idx, pattern, pattern_idx + 1, c)
         }
     }
 }
@@ -113,4 +126,31 @@ pub fn eval_like(
 
     let result_array = BooleanArray::from_iter(result_values);
     Ok(Arc::new(result_array))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::like_match;
+
+    #[test]
+    fn test_like_match_wildcards() {
+        assert!(like_match("abc", "a_c"));
+        assert!(like_match("abcdef", "a%f"));
+        assert!(!like_match("abc", "a_d"));
+    }
+
+    #[test]
+    fn test_like_match_backslash_escapes_wildcards() {
+        assert!(like_match("a_a", r"a\_a"));
+        assert!(like_match("a%a", r"a\%a"));
+        assert!(like_match(r"a\a", r"a\\a"));
+        assert!(!like_match("aba", r"a\_a"));
+        assert!(!like_match("axa", r"a\%a"));
+    }
+
+    #[test]
+    fn test_like_match_trailing_backslash_is_literal() {
+        assert!(like_match(r"abc\", r"abc\"));
+        assert!(!like_match("abc", r"abc\"));
+    }
 }

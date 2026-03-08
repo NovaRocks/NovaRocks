@@ -33,7 +33,9 @@ use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChan
 
 use crate::cache::DataCacheManager;
 use crate::common::types::UniqueId;
+use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
+use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
@@ -370,9 +372,10 @@ fn build_report_params(
     // NOTE: FE derives loadedRows from load_counters (dpp.norm.ALL). If we only
     // report sink/tablet commit infos without load_counters, FE may treat the
     // insert as "no rows" and skip first-load statistics collection.
-    let (state_rows, state_bytes) = sink_commit::get_load_counters(finst_id);
-    let mut normal_rows: i64 = state_rows.max(0);
-    let mut loaded_bytes: i64 = state_bytes.max(0);
+    let state_stats = sink_commit::get_load_stats(finst_id);
+    let mut normal_rows: i64 = state_stats.loaded_rows.max(0);
+    let mut loaded_bytes: i64 = state_stats.loaded_bytes.max(0);
+    let filtered_rows: i64 = state_stats.filtered_rows.max(0);
     for info in &sink_commit_infos {
         if let Some(file) = info.iceberg_data_file.as_ref() {
             if let Some(rows) = file.record_count {
@@ -393,10 +396,10 @@ fn build_report_params(
     }
     // NOTE: Use the same counter keys FE expects (LoadEtlTask.DPP_NORMAL_ALL / DPP_ABNORMAL_ALL).
     // Missing or mismatched keys will make FE see loadedRows=0.
-    let load_counters = if normal_rows > 0 || loaded_bytes > 0 {
+    let load_counters = if normal_rows > 0 || loaded_bytes > 0 || filtered_rows > 0 {
         let mut counters = BTreeMap::new();
         counters.insert("dpp.norm.ALL".to_string(), normal_rows.to_string());
-        counters.insert("dpp.abnorm.ALL".to_string(), "0".to_string());
+        counters.insert("dpp.abnorm.ALL".to_string(), filtered_rows.to_string());
         if loaded_bytes > 0 {
             counters.insert("loaded.bytes".to_string(), loaded_bytes.to_string());
         }
@@ -404,6 +407,7 @@ fn build_report_params(
     } else {
         None
     };
+    let tracking_url = build_tracking_url(instance.query_id);
     debug!(
         target: "novarocks::sink_commit",
         finst_id = %finst_id,
@@ -447,17 +451,17 @@ fn build_report_params(
         Option::<Vec<String>>::None,
         Option::<Vec<String>>::None,
         load_counters,
-        Option::<String>::None,
+        tracking_url,
         Option::<Vec<String>>::None,
         tablet_commit_infos,
+        (normal_rows > 0).then_some(normal_rows),
         Option::<i64>::None,
-        Option::<i64>::None,
-        Option::<i64>::None,
+        (loaded_bytes > 0).then_some(loaded_bytes),
         Option::<i64>::None,
         Option::<i64>::None,
         Option::<internal_service::TLoadJobType>::None,
         tablet_fail_infos,
-        Option::<i64>::None,
+        (filtered_rows > 0).then_some(filtered_rows),
         Option::<i64>::None,
         Option::<i64>::None,
         sink_commit_infos,
@@ -465,6 +469,26 @@ fn build_report_params(
         load_channel_profile,
         load_datacache_metrics,
     )
+}
+
+fn build_tracking_url(query_id: QueryId) -> Option<String> {
+    if !load_tracking::has_tracking_log(query_id) {
+        return None;
+    }
+    let cfg = novarocks_app_config().ok()?;
+    let mut host = cfg.server.host.trim().to_string();
+    if host.is_empty() || host == "0.0.0.0" {
+        host = "127.0.0.1".to_string();
+    } else if host == "::" || host == "[::]" {
+        host = "::1".to_string();
+    }
+    if host.contains(':') && !host.starts_with('[') {
+        host = format!("[{host}]");
+    }
+    Some(format!(
+        "http://{host}:{}/api/_load_tracking/{}/{}",
+        cfg.server.http_port, query_id.hi, query_id.lo
+    ))
 }
 
 fn sum_counter_from_profile_tree(

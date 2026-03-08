@@ -50,29 +50,21 @@ pub(crate) fn lower_schema_scan_node(
         .ok_or_else(|| "SCHEMA_SCAN_NODE missing schema_scan_node payload".to_string())?;
 
     if let Some(table) = SchemaTable::from_table_name(&schema_scan.table_name) {
-        return match table {
-            SchemaTable::Be(
-                BeSchemaTable::TabletWriteLog | BeSchemaTable::Txns | BeSchemaTable::Compactions,
-            ) => lower_supported_schema_scan_node(
-                node,
-                out_layout,
-                desc_tbl,
-                exec_params,
-                fe_addr,
-                table,
-                true,
-            ),
-            SchemaTable::Loads => lower_supported_schema_scan_node(
-                node,
-                out_layout,
-                desc_tbl,
-                exec_params,
-                fe_addr,
-                table,
-                false,
-            ),
+        return match &table {
             SchemaTable::Be(BeSchemaTable::Unsupported(name)) => {
                 Err(format!("unsupported be schema table {name}"))
+            }
+            _ => {
+                let require_scan_ranges = schema_table_requires_scan_ranges(&table);
+                lower_supported_schema_scan_node(
+                    node,
+                    out_layout,
+                    desc_tbl,
+                    exec_params,
+                    fe_addr,
+                    table,
+                    require_scan_ranges,
+                )
             }
         };
     }
@@ -98,6 +90,25 @@ pub(crate) fn lower_schema_scan_node(
         },
         layout: out_layout.clone(),
     })
+}
+
+fn schema_table_requires_scan_ranges(table: &SchemaTable) -> bool {
+    matches!(
+        table,
+        SchemaTable::Be(
+            BeSchemaTable::TabletWriteLog
+                | BeSchemaTable::Txns
+                | BeSchemaTable::Compactions
+                | BeSchemaTable::CloudNativeCompactions
+                | BeSchemaTable::Configs
+                | BeSchemaTable::DatacacheMetrics
+                | BeSchemaTable::Logs
+                | BeSchemaTable::Tablets
+                | BeSchemaTable::Threads
+                | BeSchemaTable::Bvars
+                | BeSchemaTable::Metrics
+        )
+    )
 }
 
 fn lower_supported_schema_scan_node(
@@ -339,7 +350,13 @@ mod tests {
             order: Vec::new(),
             index: std::collections::HashMap::new(),
         };
-        let table_names = ["be_tablet_write_log", "be_txns", "be_compactions"];
+        let table_names = [
+            "be_tablet_write_log",
+            "be_txns",
+            "be_compactions",
+            "be_bvars",
+            "be_metrics",
+        ];
         for table_name in table_names {
             let node = schema_scan_plan_node(table_name);
             let params = scan_exec_params(node.node_id);
@@ -365,15 +382,32 @@ mod tests {
     }
 
     #[test]
-    fn lower_schema_scan_node_non_core_be_tables_fail_fast() {
+    fn lower_schema_scan_node_fe_backed_tables_to_scan() {
         let layout = Layout {
             order: Vec::new(),
             index: std::collections::HashMap::new(),
         };
-        let node = schema_scan_plan_node("be_metrics");
+        for table_name in ["keywords", "tables", "columns", "fe_locks"] {
+            let node = schema_scan_plan_node(table_name);
+            let lowered = lower_schema_scan_node(&node, &layout, None, None, None)
+                .unwrap_or_else(|err| panic!("table_name={table_name} err={err}"));
+            assert!(
+                matches!(lowered.node.kind, ExecNodeKind::Scan(_)),
+                "table_name={table_name} lower result should be scan"
+            );
+        }
+    }
+
+    #[test]
+    fn lower_schema_scan_node_unknown_be_tables_fail_fast() {
+        let layout = Layout {
+            order: Vec::new(),
+            index: std::collections::HashMap::new(),
+        };
+        let node = schema_scan_plan_node("be_unknown_table");
         let params = scan_exec_params(node.node_id);
         let err = lower_schema_scan_node(&node, &layout, None, Some(&params), None)
-            .expect_err("non-core be schema table should fail fast");
+            .expect_err("unknown be schema table should fail fast");
         assert!(err.contains("unsupported be schema table"), "err={err}");
     }
 }

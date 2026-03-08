@@ -243,6 +243,14 @@ mod tests {
             table_name: "be_txns".to_string(),
             db: None,
             table: None,
+            wild: None,
+            user: None,
+            ip: None,
+            port: None,
+            thread_id: None,
+            user_ip: None,
+            current_user_ident: None,
+            catalog_name: None,
             table_id: None,
             partition_id: None,
             tablet_id: None,
@@ -257,6 +265,7 @@ mod tests {
             log_level: None,
             log_pattern: None,
             log_limit: None,
+            frontends: Vec::new(),
         }
     }
 

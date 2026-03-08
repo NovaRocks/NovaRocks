@@ -19,7 +19,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 
-use axum::routing::{post, put};
+use axum::routing::{get, post, put};
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::service::Routes;
@@ -34,7 +34,7 @@ use crate::runtime::exchange;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
 use crate::runtime::starlet_shard_registry;
-use crate::service::stream_load_http;
+use crate::service::{load_tracking_http, stream_load_http};
 
 pub use crate::service::grpc_proto as proto;
 
@@ -647,6 +647,10 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
                     "/api/transaction/:txn_op",
                     post(stream_load_http::handle_transaction_op)
                         .put(stream_load_http::handle_transaction_op),
+                )
+                .route(
+                    "/api/_load_tracking/:hi/:lo",
+                    get(load_tracking_http::handle_load_tracking_log),
                 );
             let novarocks_server = Server::builder()
                 .accept_http1(true)

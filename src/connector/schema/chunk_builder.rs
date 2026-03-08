@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+    ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
     TimestampMicrosecondBuilder,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
@@ -28,6 +28,7 @@ use crate::exec::chunk::Chunk;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SchemaValue {
+    Boolean(bool),
     Int32(i32),
     Int64(i64),
     Float64(f64),
@@ -52,6 +53,29 @@ pub(crate) fn build_chunk(schema: SchemaRef, rows: &[SchemaRow]) -> Result<Chunk
         let nullable = field.is_nullable();
         let data_type = field.data_type();
         let array = match data_type {
+            DataType::Boolean => {
+                let mut builder = BooleanBuilder::with_capacity(rows.len());
+                for row in rows {
+                    match row.get(&key) {
+                        Some(SchemaValue::Boolean(value)) => builder.append_value(*value),
+                        None if nullable => builder.append_null(),
+                        None => {
+                            return Err(format!(
+                                "schema scan column {} is non-nullable but row value is missing",
+                                field.name()
+                            ));
+                        }
+                        Some(other) => {
+                            return Err(format!(
+                                "schema scan value type mismatch for BOOLEAN column {}: {:?}",
+                                field.name(),
+                                other
+                            ));
+                        }
+                    }
+                }
+                Arc::new(builder.finish()) as ArrayRef
+            }
             DataType::Int32 => {
                 let mut builder = Int32Builder::with_capacity(rows.len());
                 for row in rows {
