@@ -52,6 +52,23 @@ pub(crate) struct RowRoutingPlan {
     pub(crate) partitions: Vec<PartitionRoutingEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RowRejectReason {
+    OutOfPartitionRanges,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RowRejection {
+    pub(crate) row_index: u32,
+    pub(crate) reason: RowRejectReason,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RoutedRows {
+    pub(crate) per_tablet: Vec<Vec<u32>>,
+    pub(crate) rejections: Vec<RowRejection>,
+}
+
 pub(crate) struct SinkRouting {
     pub(crate) commit_infos: Vec<types::TTabletCommitInfo>,
     pub(crate) tablet_to_partition: BTreeMap<i64, i64>,
@@ -593,7 +610,7 @@ pub(crate) fn route_chunk_rows(
     row_routing: &RowRoutingPlan,
     chunk: &Chunk,
     next_random_hash: &mut u32,
-) -> Result<Vec<Vec<u32>>, String> {
+) -> Result<RoutedRows, String> {
     if row_routing.tablet_ids.is_empty() {
         return Err("OLAP_TABLE_SINK has empty tablet routing".to_string());
     }
@@ -602,6 +619,7 @@ pub(crate) fn route_chunk_rows(
     }
 
     let mut per_tablet = vec![Vec::<u32>::new(); row_routing.tablet_ids.len()];
+    let mut rejections = Vec::new();
     let mut dist_columns = Vec::with_capacity(row_routing.distributed_slot_ids.len());
     for slot_id in &row_routing.distributed_slot_ids {
         let col = chunk.column_by_slot_id(*slot_id).map_err(|e| {
@@ -642,7 +660,13 @@ pub(crate) fn route_chunk_rows(
             ));
         }
 
-        let partition = select_partition_for_row(row_routing, &row_key, hash)?;
+        let Some(partition) = select_partition_for_row(row_routing, &row_key, hash)? else {
+            rejections.push(RowRejection {
+                row_index: u32::try_from(row).map_err(|_| format!("row index overflow: {row}"))?,
+                reason: RowRejectReason::OutOfPartitionRanges,
+            });
+            continue;
+        };
         if partition.tablet_ids.is_empty() {
             return Err(format!(
                 "OLAP_TABLE_SINK partition {} has empty tablet_ids in routing",
@@ -663,14 +687,17 @@ pub(crate) fn route_chunk_rows(
             .push(u32::try_from(row).map_err(|_| format!("row index overflow: {row}"))?);
     }
 
-    Ok(per_tablet)
+    Ok(RoutedRows {
+        per_tablet,
+        rejections,
+    })
 }
 
 fn select_partition_for_row<'a>(
     row_routing: &'a RowRoutingPlan,
     row_key: &[PartitionKeyValue],
     hash: u32,
-) -> Result<&'a PartitionRoutingEntry, String> {
+) -> Result<Option<&'a PartitionRoutingEntry>, String> {
     let mut candidates = Vec::new();
     match row_routing.partition_mode {
         PartitionMode::Unpartitioned => {
@@ -712,15 +739,13 @@ fn select_partition_for_row<'a>(
     }
 
     if candidates.is_empty() {
-        return Err(format!(
-            "OLAP_TABLE_SINK row does not match any partition (mode={:?})",
-            row_routing.partition_mode
-        ));
+        return Ok(None);
     }
     let selected_idx = candidates[(hash as usize) % candidates.len()];
     row_routing
         .partitions
         .get(selected_idx)
+        .map(Some)
         .ok_or_else(|| format!("invalid partition routing index: {}", selected_idx))
 }
 
@@ -972,8 +997,8 @@ mod tests {
     use chrono::{Datelike, NaiveDate};
 
     use super::{
-        RowRoutingPlan, build_output_expr_slot_name_map, build_sink_routing,
-        crc32_hash_array_value, route_chunk_rows, zlib_crc_hash,
+        RoutedRows, RowRejectReason, RowRejection, RowRoutingPlan, build_output_expr_slot_name_map,
+        build_sink_routing, crc32_hash_array_value, route_chunk_rows, zlib_crc_hash,
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::sink::partition_key::{PartitionKeySource, PartitionSlotRef};
@@ -1239,7 +1264,7 @@ mod tests {
         row_to_tablet
     }
 
-    fn route_rows(plan: &RowRoutingPlan, chunk: &Chunk) -> Result<Vec<Vec<u32>>, String> {
+    fn route_rows(plan: &RowRoutingPlan, chunk: &Chunk) -> Result<RoutedRows, String> {
         let mut seed = 0;
         route_chunk_rows(plan, chunk, &mut seed)
     }
@@ -1306,9 +1331,10 @@ mod tests {
 
         let chunk = build_test_chunk(vec![1, 2, 1, 2]);
         let grouped = route_rows(&routing.row_routing, &chunk).expect("route chunk rows by hash");
+        assert!(grouped.rejections.is_empty());
 
         let mut row_to_bucket = HashMap::new();
-        for (bucket, rows) in grouped.iter().enumerate() {
+        for (bucket, rows) in grouped.per_tablet.iter().enumerate() {
             for row in rows {
                 row_to_bucket.insert(*row as usize, bucket);
             }
@@ -1328,7 +1354,9 @@ mod tests {
         let chunk = build_test_chunk(vec![9, 9, 10, 10, 19, 19]);
         let grouped = route_rows(&routing.row_routing, &chunk)
             .expect("route rows for multi partition and multi bucket");
-        let row_to_tablet = map_rows_to_tablets(&grouped, &routing.row_routing.tablet_ids);
+        assert!(grouped.rejections.is_empty());
+        let row_to_tablet =
+            map_rows_to_tablets(&grouped.per_tablet, &routing.row_routing.tablet_ids);
 
         assert_eq!(row_to_tablet.len(), 6);
         assert_eq!(row_to_tablet.get(&0), row_to_tablet.get(&1));
@@ -1350,9 +1378,16 @@ mod tests {
         let routing = build_sink_routing(&sink, 10, None).expect("build sink routing");
 
         let chunk = build_test_chunk(vec![21]);
-        let err = route_rows(&routing.row_routing, &chunk)
-            .expect_err("row outside partition range should fail");
-        assert!(err.contains("does not match any partition"), "err={}", err);
+        let routed = route_rows(&routing.row_routing, &chunk)
+            .expect("row outside partition range should be rejected");
+        assert!(routed.per_tablet.iter().all(Vec::is_empty));
+        assert_eq!(
+            routed.rejections,
+            vec![RowRejection {
+                row_index: 0,
+                reason: RowRejectReason::OutOfPartitionRanges,
+            }]
+        );
     }
 
     #[test]
@@ -1397,7 +1432,8 @@ mod tests {
 
         let chunk = build_test_chunk(vec![42]);
         let grouped = route_rows(&row_routing, &chunk).expect("route with column-name fallback");
-        let row_to_tablet = map_rows_to_tablets(&grouped, &row_routing.tablet_ids);
+        assert!(grouped.rejections.is_empty());
+        let row_to_tablet = map_rows_to_tablets(&grouped.per_tablet, &row_routing.tablet_ids);
         assert_eq!(row_to_tablet.len(), 1);
     }
 
@@ -1443,7 +1479,9 @@ mod tests {
         let chunk = build_test_chunk_with_slot(SlotId::new(7), vec![42]);
         let grouped = route_rows(&routing.row_routing, &chunk)
             .expect("route rows with remapped partition expr slot ids");
-        let row_to_tablet = map_rows_to_tablets(&grouped, &routing.row_routing.tablet_ids);
+        assert!(grouped.rejections.is_empty());
+        let row_to_tablet =
+            map_rows_to_tablets(&grouped.per_tablet, &routing.row_routing.tablet_ids);
         assert_eq!(row_to_tablet.len(), 1);
     }
 
@@ -1477,7 +1515,15 @@ mod tests {
         let chunk = build_test_chunk(vec![1, 2, 3]);
         let grouped =
             route_rows(&routing.row_routing, &chunk).expect("route with location fallback");
-        assert_eq!(grouped.iter().map(|rows| rows.len()).sum::<usize>(), 3);
+        assert!(grouped.rejections.is_empty());
+        assert_eq!(
+            grouped
+                .per_tablet
+                .iter()
+                .map(|rows| rows.len())
+                .sum::<usize>(),
+            3
+        );
     }
 
     #[test]
@@ -1535,6 +1581,14 @@ mod tests {
         let chunk = build_test_chunk(vec![1, 2, 3, 4]);
         let grouped = route_rows(&routing.row_routing, &chunk)
             .expect("route rows for unpartitioned fallback");
-        assert_eq!(grouped.iter().map(|rows| rows.len()).sum::<usize>(), 4);
+        assert!(grouped.rejections.is_empty());
+        assert_eq!(
+            grouped
+                .per_tablet
+                .iter()
+                .map(|rows| rows.len())
+                .sum::<usize>(),
+            4
+        );
     }
 }

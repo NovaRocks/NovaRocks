@@ -23,6 +23,7 @@ use crate::common::types::UniqueId;
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::internal_service;
 use crate::novarocks_logging::debug;
+use crate::runtime::load_tracking;
 use crate::runtime::mem_tracker::{self, MemTracker};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_context::QueryId;
@@ -188,7 +189,12 @@ impl RuntimeState {
         sink_commit::add(finst_id, info);
     }
 
-    pub(crate) fn add_sink_load_counters(&self, loaded_rows: i64, loaded_bytes: i64) {
+    pub(crate) fn add_sink_load_stats(
+        &self,
+        loaded_rows: i64,
+        loaded_bytes: i64,
+        filtered_rows: i64,
+    ) {
         let Some(finst_id) = self.fragment_instance_id else {
             debug!(
                 target: "novarocks::sink_commit",
@@ -196,7 +202,7 @@ impl RuntimeState {
             );
             return;
         };
-        if loaded_rows <= 0 && loaded_bytes <= 0 {
+        if loaded_rows <= 0 && loaded_bytes <= 0 && filtered_rows <= 0 {
             return;
         }
         debug!(
@@ -204,9 +210,29 @@ impl RuntimeState {
             finst_id = %finst_id,
             loaded_rows,
             loaded_bytes,
+            filtered_rows,
             "add sink load counters"
         );
-        sink_commit::add_load_counters(finst_id, loaded_rows, loaded_bytes);
+        sink_commit::add_load_stats(finst_id, loaded_rows, loaded_bytes, filtered_rows);
+    }
+
+    pub(crate) fn add_load_tracking_logs(&self, logs: impl IntoIterator<Item = String>) {
+        let Some(query_id) = self.query_id else {
+            debug!(
+                target: "novarocks::sink_commit",
+                "skip load tracking logs because query_id is missing"
+            );
+            return;
+        };
+        let appended = load_tracking::append_logs(query_id, logs);
+        if let Some(content) = appended {
+            debug!(
+                target: "novarocks::sink_commit",
+                query_id = %query_id,
+                tracking_log_len = content.len(),
+                "append load tracking logs"
+            );
+        }
     }
 
     pub(crate) fn add_tablet_commit_info(&self, info: crate::types::TTabletCommitInfo) {

@@ -73,18 +73,7 @@ pub(crate) fn build_sink_tablet_schema(
         let mut column_pb =
             resolve_sink_column_pb(col, &name, idx, schema_id, &slot_descs_by_name)?;
 
-        let unique_id = col.col_unique_id.ok_or_else(|| {
-            format!(
-                "schema.indexes(schema_id={schema_id}).column_param.columns[{}] missing col_unique_id",
-                idx
-            )
-        })?;
-        if unique_id < 0 {
-            return Err(format!(
-                "schema.indexes(schema_id={schema_id}).column_param.columns[{}] has negative col_unique_id={}",
-                idx, unique_id
-            ));
-        }
+        let unique_id = resolve_sink_unique_id(col, &name, idx, &slot_descs_by_name);
         if used_unique_ids.contains(&unique_id) {
             return Err(format!(
                 "duplicate col_unique_id detected in schema.indexes(schema_id={}): unique_id={}",
@@ -925,6 +914,24 @@ fn build_slot_descs_by_name(
     Ok(map)
 }
 
+fn resolve_sink_unique_id(
+    column: &crate::descriptors::TColumn,
+    column_name: &str,
+    column_idx: usize,
+    slot_descs_by_name: &HashMap<String, &crate::descriptors::TSlotDescriptor>,
+) -> i32 {
+    column
+        .col_unique_id
+        .filter(|v| *v >= 0)
+        .or_else(|| {
+            slot_descs_by_name
+                .get(&column_name.to_ascii_lowercase())
+                .and_then(|slot| slot.col_unique_id)
+                .filter(|v| *v >= 0)
+        })
+        .unwrap_or(column_idx as i32)
+}
+
 fn resolve_sink_column_pb(
     column: &crate::descriptors::TColumn,
     column_name: &str,
@@ -1078,9 +1085,10 @@ fn map_primitive_to_starrocks_type(
 #[cfg(test)]
 mod tests {
     use super::{
-        create_lake_tablet_from_req, is_missing_tablet_page_in_bundle_error,
-        map_primitive_to_starrocks_type,
+        build_sink_tablet_schema, create_lake_tablet_from_req,
+        is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type,
     };
+    use crate::service::grpc_client::proto::starrocks::KeysType;
     use tempfile::TempDir;
 
     #[test]
@@ -1177,6 +1185,30 @@ mod tests {
         assert!(initial_path.exists(), "expected initial raw metadata");
     }
 
+    #[test]
+    fn sink_schema_uses_slot_unique_id_when_column_unique_id_is_negative() {
+        let schema = build_test_sink_schema(Some(-1), Some(7));
+
+        let tablet_schema =
+            build_sink_tablet_schema(&schema, 10, KeysType::DupKeys).expect("build sink schema");
+
+        assert_eq!(tablet_schema.column[0].unique_id, 7);
+        assert_eq!(tablet_schema.sort_key_unique_ids, vec![7]);
+        assert_eq!(tablet_schema.next_column_unique_id, Some(8));
+    }
+
+    #[test]
+    fn sink_schema_falls_back_to_column_ordinal_when_unique_id_missing() {
+        let schema = build_test_sink_schema(None, None);
+
+        let tablet_schema =
+            build_sink_tablet_schema(&schema, 10, KeysType::DupKeys).expect("build sink schema");
+
+        assert_eq!(tablet_schema.column[0].unique_id, 0);
+        assert_eq!(tablet_schema.sort_key_unique_ids, vec![0]);
+        assert_eq!(tablet_schema.next_column_unique_id, Some(1));
+    }
+
     fn build_test_create_tablet_req(
         tablet_id: i64,
         enable_tablet_creation_optimization: bool,
@@ -1246,6 +1278,88 @@ mod tests {
             gtid: Some(0),
             flat_json_config: None,
             compaction_strategy: None,
+        }
+    }
+
+    fn build_test_sink_schema(
+        column_unique_id: Option<i32>,
+        slot_unique_id: Option<i32>,
+    ) -> crate::descriptors::TOlapTableSchemaParam {
+        let column = crate::descriptors::TColumn {
+            column_name: "c1".to_string(),
+            column_type: Some(crate::types::TColumnType {
+                type_: crate::types::TPrimitiveType::BIGINT,
+                len: Some(8),
+                index_len: Some(8),
+                precision: None,
+                scale: None,
+            }),
+            aggregation_type: None,
+            is_key: Some(true),
+            is_allow_null: Some(false),
+            default_value: None,
+            is_bloom_filter_column: Some(false),
+            define_expr: None,
+            is_auto_increment: Some(false),
+            col_unique_id: column_unique_id,
+            has_bitmap_index: Some(false),
+            agg_state_desc: None,
+            index_len: Some(8),
+            type_desc: None,
+        };
+        crate::descriptors::TOlapTableSchemaParam {
+            db_id: 1,
+            table_id: 2,
+            version: 1,
+            slot_descs: vec![crate::descriptors::TSlotDescriptor {
+                id: Some(1),
+                parent: None,
+                slot_type: Some(crate::types::TTypeDesc {
+                    types: Some(vec![crate::types::TTypeNode {
+                        type_: crate::types::TTypeNodeType::SCALAR,
+                        scalar_type: Some(crate::types::TScalarType {
+                            type_: crate::types::TPrimitiveType::BIGINT,
+                            len: None,
+                            precision: None,
+                            scale: None,
+                        }),
+                        is_named: None,
+                        struct_fields: None,
+                    }]),
+                }),
+                column_pos: None,
+                byte_offset: None,
+                null_indicator_byte: None,
+                null_indicator_bit: None,
+                col_name: Some("c1".to_string()),
+                slot_idx: None,
+                is_materialized: Some(true),
+                is_output_column: Some(true),
+                is_nullable: Some(false),
+                col_unique_id: slot_unique_id,
+                col_physical_name: None,
+            }],
+            tuple_desc: crate::descriptors::TTupleDescriptor {
+                id: Some(1),
+                byte_size: Some(8),
+                num_null_bytes: Some(0),
+                table_id: Some(2),
+                num_null_slots: Some(0),
+            },
+            indexes: vec![crate::descriptors::TOlapTableIndexSchema {
+                id: 10,
+                columns: vec!["c1".to_string()],
+                schema_hash: 1,
+                column_param: Some(crate::descriptors::TOlapTableColumnParam {
+                    columns: vec![column],
+                    sort_key_uid: Vec::new(),
+                    short_key_column_count: 1,
+                }),
+                where_clause: None,
+                schema_id: Some(10),
+                column_to_expr_value: None,
+                is_shadow: Some(false),
+            }],
         }
     }
 }

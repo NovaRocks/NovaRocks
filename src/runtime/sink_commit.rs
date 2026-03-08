@@ -20,6 +20,13 @@ use std::sync::{Mutex, OnceLock};
 use crate::common::types::UniqueId;
 use crate::types::{TSinkCommitInfo, TTabletCommitInfo, TTabletFailInfo};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SinkLoadStats {
+    pub(crate) loaded_rows: i64,
+    pub(crate) loaded_bytes: i64,
+    pub(crate) filtered_rows: i64,
+}
+
 struct SinkCommitStore {
     mu: Mutex<HashMap<UniqueId, SinkCommitEntry>>,
 }
@@ -31,6 +38,7 @@ struct SinkCommitEntry {
     tablet_fail_infos: Vec<TTabletFailInfo>,
     loaded_rows: i64,
     loaded_bytes: i64,
+    filtered_rows: i64,
 }
 
 static STORE: OnceLock<SinkCommitStore> = OnceLock::new();
@@ -115,20 +123,39 @@ pub(crate) fn list_tablet_fail_infos(finst_id: UniqueId) -> Vec<TTabletFailInfo>
 }
 
 pub(crate) fn add_load_counters(finst_id: UniqueId, loaded_rows: i64, loaded_bytes: i64) {
+    add_load_stats(finst_id, loaded_rows, loaded_bytes, 0);
+}
+
+pub(crate) fn add_load_stats(
+    finst_id: UniqueId,
+    loaded_rows: i64,
+    loaded_bytes: i64,
+    filtered_rows: i64,
+) {
     let store = store();
     let mut guard = store.mu.lock().expect("sink commit store lock");
     let entry = guard.entry(finst_id).or_default();
     entry.loaded_rows = entry.loaded_rows.saturating_add(loaded_rows.max(0));
     entry.loaded_bytes = entry.loaded_bytes.saturating_add(loaded_bytes.max(0));
+    entry.filtered_rows = entry.filtered_rows.saturating_add(filtered_rows.max(0));
 }
 
 pub(crate) fn get_load_counters(finst_id: UniqueId) -> (i64, i64) {
+    let stats = get_load_stats(finst_id);
+    (stats.loaded_rows, stats.loaded_bytes)
+}
+
+pub(crate) fn get_load_stats(finst_id: UniqueId) -> SinkLoadStats {
     let store = store();
     let guard = store.mu.lock().expect("sink commit store lock");
     guard
         .get(&finst_id)
-        .map(|entry| (entry.loaded_rows, entry.loaded_bytes))
-        .unwrap_or((0, 0))
+        .map(|entry| SinkLoadStats {
+            loaded_rows: entry.loaded_rows,
+            loaded_bytes: entry.loaded_bytes,
+            filtered_rows: entry.filtered_rows,
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -193,5 +220,26 @@ mod tests {
 
         unregister(finst_id);
         assert_eq!(get_load_counters(finst_id), (0, 0));
+    }
+
+    #[test]
+    fn accumulate_filtered_rows_in_load_stats() {
+        let finst_id = UniqueId { hi: 904, lo: 1 };
+        unregister(finst_id);
+        register(finst_id);
+
+        add_load_stats(finst_id, 10, 100, 2);
+        add_load_stats(finst_id, 5, 50, 3);
+        assert_eq!(
+            get_load_stats(finst_id),
+            SinkLoadStats {
+                loaded_rows: 15,
+                loaded_bytes: 150,
+                filtered_rows: 5,
+            }
+        );
+
+        unregister(finst_id);
+        assert_eq!(get_load_stats(finst_id), SinkLoadStats::default());
     }
 }

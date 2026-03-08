@@ -14,18 +14,24 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod backend_service;
-pub mod compat;
-pub mod disk_report;
-pub mod engine_ffi;
-pub mod exchange_sender;
-pub mod fe_report;
-pub mod grpc_client;
-pub mod grpc_proto;
-pub mod grpc_server;
-pub mod heartbeat_service;
-pub mod internal_service;
-pub mod load_tracking_http;
-pub mod report_worker;
-pub mod stream_load;
-pub mod stream_load_http;
+
+use axum::extract::Path;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+
+use crate::runtime::load_tracking;
+use crate::runtime::query_context::QueryId;
+
+pub(crate) async fn handle_load_tracking_log(
+    Path((hi, lo)): Path<(i64, i64)>,
+) -> impl IntoResponse {
+    let query_id = QueryId { hi, lo };
+    match load_tracking::get_tracking_log(query_id) {
+        Some(log) => (StatusCode::OK, format!("{log}\n")).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            format!("tracking log is not available for query_id={query_id}"),
+        )
+            .into_response(),
+    }
+}

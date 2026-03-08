@@ -14,30 +14,19 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
-
 use chrono::NaiveDateTime;
-use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
-use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
 
-use crate::frontend_service::{self, FrontendServiceSyncClient, TFrontendServiceSyncClient};
-use crate::service::disk_report;
+use crate::frontend_service;
 use crate::types;
 
 use super::SchemaScanContext;
 use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
-
-const FE_LOADS_TIMEOUT_SECS: u64 = 5;
+use super::frontend::with_frontend_client;
 
 pub(crate) fn fetch_rows(
     ctx: &SchemaScanContext,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
-    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
-        "missing FE address for schema scan loads (coord is absent and heartbeat cache is empty)"
-            .to_string()
-    })?;
     let request = frontend_service::TGetLoadsParams::new(
         ctx.db.clone(),
         ctx.job_id,
@@ -45,7 +34,7 @@ pub(crate) fn fetch_rows(
         ctx.label.clone(),
         None::<String>,
     );
-    let response = with_frontend_client(&fe_addr, |client| {
+    let response = with_frontend_client(fe_addr, |client| {
         client.get_loads(request).map_err(|err| err.to_string())
     })?;
     Ok(response
@@ -54,37 +43,6 @@ pub(crate) fn fetch_rows(
         .iter()
         .map(build_load_row)
         .collect())
-}
-
-fn resolve_frontend_addr(
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Option<types::TNetworkAddress> {
-    fe_addr.cloned().or_else(disk_report::latest_fe_addr)
-}
-
-fn with_frontend_client<T>(
-    fe_addr: &types::TNetworkAddress,
-    f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-) -> Result<T, String> {
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| format!("invalid FE address: {e}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(FE_LOADS_TIMEOUT_SECS))
-        .map_err(|e| format!("connect FE failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(FE_LOADS_TIMEOUT_SECS)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(FE_LOADS_TIMEOUT_SECS)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel
-        .split()
-        .map_err(|e| format!("split FE thrift channel failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-    f(&mut client)
 }
 
 fn build_load_row(info: &frontend_service::TLoadInfo) -> SchemaRow {

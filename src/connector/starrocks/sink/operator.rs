@@ -30,6 +30,7 @@ use arrow::array::{
 use arrow::compute::{concat_batches, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow::util::display::array_value_to_string;
 use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::common::ids::SlotId;
@@ -48,7 +49,9 @@ use crate::connector::starrocks::sink::partition_key::{
     parse_partition_boundary_key, parse_partition_in_keys, partition_key_source_len,
     validate_partition_key_length,
 };
-use crate::connector::starrocks::sink::routing::{RowRoutingPlan, route_chunk_rows};
+use crate::connector::starrocks::sink::routing::{
+    RowRejectReason, RowRoutingPlan, route_chunk_rows,
+};
 use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
@@ -79,6 +82,8 @@ pub(crate) struct OlapTableSinkOperator {
     auto_partition_initialized: bool,
     auto_partition_debug_logged: bool,
     input_rows: i64,
+    loaded_rows: i64,
+    filtered_rows: i64,
     finished: bool,
     written_tablets: HashSet<i64>,
     dirty_partitions: HashSet<i64>,
@@ -285,6 +290,107 @@ fn concat_buffered_batches(batches: &mut Vec<RecordBatch>) -> Result<Option<Reco
     Ok(Some(merged))
 }
 
+#[derive(Debug)]
+struct FilteredBatch {
+    batch: RecordBatch,
+    rejected_rows: usize,
+    tracking_logs: Vec<String>,
+}
+
+fn filter_rows_for_tablet_schema(
+    batch: &RecordBatch,
+    tablet_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+) -> Result<FilteredBatch, String> {
+    if batch.num_rows() == 0 {
+        return Ok(FilteredBatch {
+            batch: batch.clone(),
+            rejected_rows: 0,
+            tracking_logs: Vec::new(),
+        });
+    }
+
+    let mut rejected = vec![false; batch.num_rows()];
+    let mut tracking_logs = Vec::new();
+    let column_count = batch.num_columns().min(tablet_schema.column.len());
+    for column_idx in 0..column_count {
+        let schema_col = &tablet_schema.column[column_idx];
+        if schema_col.is_nullable.unwrap_or(true) {
+            continue;
+        }
+        let column = batch.column(column_idx);
+        if column.null_count() == 0 {
+            continue;
+        }
+        let column_name = schema_col
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| batch.schema().field(column_idx).name().to_string());
+        for row_idx in 0..batch.num_rows() {
+            if !column.is_null(row_idx) || rejected[row_idx] {
+                continue;
+            }
+            rejected[row_idx] = true;
+            tracking_logs.push(format!(
+                "Error: NULL value in non-nullable column '{}'. Row: {}",
+                column_name,
+                format_tracking_row(batch, row_idx)?
+            ));
+        }
+    }
+
+    let rejected_rows = rejected.iter().filter(|flag| **flag).count();
+    if rejected_rows == 0 {
+        return Ok(FilteredBatch {
+            batch: batch.clone(),
+            rejected_rows: 0,
+            tracking_logs,
+        });
+    }
+
+    let kept_indices = rejected
+        .iter()
+        .enumerate()
+        .filter_map(|(row_idx, rejected)| (!rejected).then_some(row_idx as u32))
+        .collect::<Vec<_>>();
+    let filtered_batch = take_batch_rows(batch, &kept_indices)?;
+    Ok(FilteredBatch {
+        batch: filtered_batch,
+        rejected_rows,
+        tracking_logs,
+    })
+}
+
+fn format_tracking_row(batch: &RecordBatch, row_idx: usize) -> Result<String, String> {
+    let mut values = Vec::new();
+    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
+        if field.name() == LOAD_OP_COLUMN {
+            continue;
+        }
+        let column = batch.column(col_idx);
+        if column.is_null(row_idx) {
+            values.push("NULL".to_string());
+            continue;
+        }
+        let rendered = array_value_to_string(column.as_ref(), row_idx).map_err(|e| {
+            format!(
+                "OLAP_TABLE_SINK render tracking row failed: column_index={}, row_index={}, error={}",
+                col_idx, row_idx, e
+            )
+        })?;
+        values.push(rendered);
+    }
+    Ok(format!("[{}]", values.join(", ")))
+}
+
+fn format_partition_rejection(batch: &RecordBatch, row_idx: usize) -> Result<String, String> {
+    Ok(format!(
+        "Error: The row is out of partition ranges. Please add a new partition.. Row: {}",
+        format_tracking_row(batch, row_idx)?
+    ))
+}
+
 impl OlapTableSinkOperator {
     const FLUSH_RETRY_MAX_TIMES: usize = 3;
     const FLUSH_RETRY_BASE_BACKOFF_MS: u64 = 200;
@@ -362,6 +468,8 @@ impl OlapTableSinkOperator {
             auto_partition_initialized: false,
             auto_partition_debug_logged: false,
             input_rows: 0,
+            loaded_rows: 0,
+            filtered_rows: 0,
             finished: false,
             written_tablets: HashSet::new(),
             dirty_partitions: HashSet::new(),
@@ -1031,9 +1139,14 @@ impl OlapTableSinkOperator {
         let flush_start_random_hash = self.next_random_hash;
         let flush_start_pending_input_rows = self.pending_input_rows;
         let flush_start_pending_input_bytes = self.pending_input_bytes;
+        let flush_start_loaded_rows = self.loaded_rows;
+        let flush_start_filtered_rows = self.filtered_rows;
         let pending_chunks = std::mem::take(&mut self.pending_chunks);
         self.pending_input_rows = 0;
         self.pending_input_bytes = 0;
+        let mut flush_tracking_logs = Vec::new();
+        let mut flush_loaded_rows_delta = 0_i64;
+        let mut flush_filtered_rows_delta = 0_i64;
         let flush_result: Result<(), String> = (|| {
             self.ensure_auto_partitions_for_chunks(&pending_chunks)?;
             let index_write_plans = self.index_write_plans.clone();
@@ -1054,8 +1167,19 @@ impl OlapTableSinkOperator {
                     )?;
                     if plan_idx == 0 {
                         first_plan_next_random_hash = plan_random_hash;
+                        flush_filtered_rows_delta = flush_filtered_rows_delta
+                            .saturating_add(routed.rejections.len() as i64);
+                        for rejection in &routed.rejections {
+                            let row_idx = rejection.row_index as usize;
+                            let log = match rejection.reason {
+                                RowRejectReason::OutOfPartitionRanges => {
+                                    format_partition_rejection(&sink_chunk.batch, row_idx)?
+                                }
+                            };
+                            flush_tracking_logs.push(log);
+                        }
                     }
-                    for (tablet_idx, row_indices) in routed.into_iter().enumerate() {
+                    for (tablet_idx, row_indices) in routed.per_tablet.into_iter().enumerate() {
                         if row_indices.is_empty() {
                             continue;
                         }
@@ -1150,6 +1274,22 @@ impl OlapTableSinkOperator {
                             }
                             Err(err) => return Err(err),
                         };
+                        let filtered_batch = filter_rows_for_tablet_schema(
+                            &routed_batch,
+                            &target.context.tablet_schema,
+                        )?;
+                        if plan_idx == 0 {
+                            flush_loaded_rows_delta = flush_loaded_rows_delta
+                                .saturating_add(filtered_batch.batch.num_rows() as i64);
+                            flush_filtered_rows_delta = flush_filtered_rows_delta
+                                .saturating_add(filtered_batch.rejected_rows as i64);
+                            flush_tracking_logs
+                                .extend(filtered_batch.tracking_logs.iter().cloned());
+                        }
+                        let routed_batch = filtered_batch.batch;
+                        if routed_batch.num_rows() == 0 {
+                            continue;
+                        }
                         if !buffered_by_tablet.contains_key(&tablet_id) {
                             buffered_by_tablet.insert(
                                 tablet_id,
@@ -1215,7 +1355,15 @@ impl OlapTableSinkOperator {
             self.pending_input_bytes = flush_start_pending_input_bytes;
             self.file_seq = flush_start_file_seq;
             self.next_random_hash = flush_start_random_hash;
+            self.loaded_rows = flush_start_loaded_rows;
+            self.filtered_rows = flush_start_filtered_rows;
             return Err(err);
+        }
+
+        self.loaded_rows = flush_start_loaded_rows.saturating_add(flush_loaded_rows_delta);
+        self.filtered_rows = flush_start_filtered_rows.saturating_add(flush_filtered_rows_delta);
+        if !flush_tracking_logs.is_empty() {
+            state.add_load_tracking_logs(flush_tracking_logs);
         }
 
         Ok(())
@@ -1312,9 +1460,9 @@ impl ProcessorOperator for OlapTableSinkOperator {
         let flush_result = self.flush_pending_chunks_with_retry(state);
         if let Err(err) = &flush_result {
             self.finalize_shared.record_error(err.clone());
-        } else if self.input_rows > 0 {
+        } else if self.loaded_rows > 0 || self.filtered_rows > 0 {
             // FE derives loaded rows from reportExecStatus load counters.
-            state.add_sink_load_counters(self.input_rows, 0);
+            state.add_sink_load_stats(self.loaded_rows, 0, self.filtered_rows);
         }
 
         self.finalize_shared.record_progress(
@@ -1820,15 +1968,17 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, Int8Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+        ArrayRef, Date32Array, Int8Array, Int32Array, Int64Array, StringArray,
+        TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use chrono::Datelike;
     use tempfile::tempdir;
 
     use super::{
         LOAD_OP_COLUMN, OlapTableSinkOperator, align_batch_to_schema_slot_bindings,
-        is_retryable_sink_write_error,
+        filter_rows_for_tablet_schema, format_partition_rejection, is_retryable_sink_write_error,
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
@@ -1887,6 +2037,90 @@ mod tests {
             table_indices: Vec::new(),
             compression_level: None,
             id: Some(5001),
+        }
+    }
+
+    fn non_nullable_three_col_schema() -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("k1".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("k2".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 3,
+                    name: Some("k3".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(4),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(5003),
         }
     }
 
@@ -2285,6 +2519,62 @@ mod tests {
                 .filter(|field| field.name() == LOAD_OP_COLUMN)
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn partition_rejection_message_matches_information_schema_expectation() {
+        let days = chrono::NaiveDate::from_ymd_opt(2022, 1, 14)
+            .expect("valid date")
+            .num_days_from_ce()
+            - 719_163;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                field_with_slot_id(
+                    Field::new("event_day", DataType::Date32, false),
+                    SlotId::new(1),
+                ),
+                field_with_slot_id(Field::new("pv", DataType::Int64, false), SlotId::new(2)),
+            ])),
+            vec![
+                Arc::new(Date32Array::from(vec![days])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef,
+            ],
+        )
+        .expect("build date batch");
+
+        assert_eq!(
+            format_partition_rejection(&batch, 0).expect("format partition rejection"),
+            "Error: The row is out of partition ranges. Please add a new partition.. Row: [2022-01-14, 2]"
+        );
+    }
+
+    #[test]
+    fn filter_rows_for_tablet_schema_rejects_null_rows_with_tracking_log() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                field_with_slot_id(Field::new("k1", DataType::Int64, true), SlotId::new(1)),
+                field_with_slot_id(Field::new("k2", DataType::Int64, true), SlotId::new(2)),
+                field_with_slot_id(Field::new("k3", DataType::Int64, true), SlotId::new(3)),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+            ],
+        )
+        .expect("build nullable batch");
+
+        let filtered = filter_rows_for_tablet_schema(&batch, &non_nullable_three_col_schema())
+            .expect("filter batch");
+        assert_eq!(filtered.batch.num_rows(), 0);
+        assert_eq!(filtered.rejected_rows, 1);
+        assert_eq!(
+            filtered.tracking_logs,
+            vec![
+                "Error: NULL value in non-nullable column 'k1'. Row: [NULL, NULL, NULL]"
+                    .to_string()
+            ]
         );
     }
 
