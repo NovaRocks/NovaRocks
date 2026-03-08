@@ -77,13 +77,6 @@ impl ObjectStoreProfile {
         Ok(Some(Self::from_aws_s3_properties(&aws_props)?))
     }
 
-    pub(crate) fn from_properties_required(
-        props: &BTreeMap<String, String>,
-    ) -> Result<Self, String> {
-        Self::from_properties_optional(props)?
-            .ok_or_else(|| "missing aws.s3.* properties for object_store mode".to_string())
-    }
-
     pub(crate) fn from_s3_store_config(config: &S3StoreConfig) -> Result<Self, String> {
         let endpoint = normalize_endpoint(&config.endpoint, None)?;
         let access_key_id = non_empty("S3 access_key_id", &config.access_key_id)?;
@@ -246,7 +239,9 @@ mod tests {
         props.insert("aws.s3.accessKeyId".to_string(), "ak".to_string());
         props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
         props.insert("aws.s3.enable_ssl".to_string(), "false".to_string());
-        let profile = ObjectStoreProfile::from_properties_required(&props).expect("build profile");
+        let profile = ObjectStoreProfile::from_properties_optional(&props)
+            .expect("build profile")
+            .expect("profile should exist");
         assert_eq!(profile.endpoint, "http://minio.local:9000");
     }
 
@@ -259,7 +254,9 @@ mod tests {
         );
         props.insert("aws.s3.accessKeyId".to_string(), "ak".to_string());
         props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
-        let profile = ObjectStoreProfile::from_properties_required(&props).expect("build profile");
+        let profile = ObjectStoreProfile::from_properties_optional(&props)
+            .expect("build profile")
+            .expect("profile should exist");
         assert_eq!(profile.endpoint, "https://minio.local:9000");
     }
 
@@ -272,7 +269,9 @@ mod tests {
         );
         props.insert("aws.s3.accessKeyId".to_string(), "ak".to_string());
         props.insert("aws.s3.accessKeySecret".to_string(), "sk".to_string());
-        let profile = ObjectStoreProfile::from_properties_required(&props).expect("build profile");
+        let profile = ObjectStoreProfile::from_properties_optional(&props)
+            .expect("build profile")
+            .expect("profile should exist");
         assert_eq!(profile.enable_path_style_access, None);
     }
 
@@ -291,7 +290,9 @@ mod tests {
         props.insert("aws.s3.request_timeout_ms".to_string(), "3400".to_string());
         props.insert("aws.s3.io_timeout_ms".to_string(), "4400".to_string());
 
-        let profile = ObjectStoreProfile::from_properties_required(&props).expect("build profile");
+        let profile = ObjectStoreProfile::from_properties_optional(&props)
+            .expect("build profile")
+            .expect("profile should exist");
         assert_eq!(profile.retry_max_times, Some(8));
         assert_eq!(profile.retry_min_delay_ms, Some(120));
         assert_eq!(profile.retry_max_delay_ms, Some(2600));

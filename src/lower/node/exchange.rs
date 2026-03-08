@@ -294,65 +294,17 @@ mod tests {
     }
 
     fn exchange_plan_node(sort_info: plan_nodes::TSortInfo) -> plan_nodes::TPlanNode {
-        plan_nodes::TPlanNode {
-            node_id: 11,
-            node_type: plan_nodes::TPlanNodeType::EXCHANGE_NODE,
-            num_children: 0,
-            limit: -1,
-            row_tuples: vec![],
-            nullable_tuples: vec![],
-            conjuncts: None,
-            compact_data: true,
-            common: None,
-            hash_join_node: None,
-            agg_node: None,
-            sort_node: None,
-            merge_node: None,
-            exchange_node: Some(plan_nodes::TExchangeNode {
-                input_row_tuples: vec![0],
-                sort_info: Some(sort_info),
-                offset: Some(0),
-                partition_type: None,
-                enable_parallel_merge: None,
-                parallel_merge_late_materialize_mode: None,
-            }),
-            mysql_scan_node: None,
-            olap_scan_node: None,
-            file_scan_node: None,
-            schema_scan_node: None,
-            meta_scan_node: None,
-            analytic_node: None,
-            union_node: None,
-            resource_profile: None,
-            es_scan_node: None,
-            repeat_node: None,
-            assert_num_rows_node: None,
-            intersect_node: None,
-            except_node: None,
-            merge_join_node: None,
-            raw_values_node: None,
-            use_vectorized: None,
-            hdfs_scan_node: None,
-            project_node: None,
-            table_function_node: None,
-            probe_runtime_filters: None,
-            decode_node: None,
-            local_rf_waiting_set: None,
-            filter_null_value_columns: None,
-            need_create_tuple_columns: None,
-            jdbc_scan_node: None,
-            connector_scan_node: None,
-            cross_join_node: None,
-            lake_scan_node: None,
-            nestloop_join_node: None,
-            starrocks_scan_node: None,
-            stream_scan_node: None,
-            stream_join_node: None,
-            stream_agg_node: None,
-            select_node: None,
-            fetch_node: None,
-            look_up_node: None,
-        }
+        let mut node =
+            crate::lower::node::test_plan_node(11, plan_nodes::TPlanNodeType::EXCHANGE_NODE, 0);
+        node.exchange_node = Some(plan_nodes::TExchangeNode {
+            input_row_tuples: vec![0],
+            sort_info: Some(sort_info),
+            offset: Some(0),
+            partition_type: None,
+            enable_parallel_merge: None,
+            parallel_merge_late_materialize_mode: None,
+        });
+        node
     }
 
     fn exchange_exec_params(node_id: i32) -> internal_service::TPlanFragmentExecParams {

@@ -114,7 +114,6 @@ pub(crate) fn lower_starrocks_scan_node(
             continue;
         };
         let version = internal.version.parse::<i64>().ok().filter(|v| *v >= 0);
-        let schema_hash = internal.schema_hash.parse::<i32>().ok().filter(|v| *v > 0);
         let fill_data_cache = internal.fill_data_cache.unwrap_or(true);
         let skip_page_cache = internal.skip_page_cache.unwrap_or(false);
         let skip_disk_cache = internal.skip_disk_cache.unwrap_or(false);
@@ -127,14 +126,8 @@ pub(crate) fn lower_starrocks_scan_node(
 
         ranges.push(StarRocksScanRange {
             tablet_id: internal.tablet_id,
+            partition_id: internal.partition_id,
             version,
-            schema_hash,
-            db_name: Some(internal.db_name.clone()),
-            table_name: internal.table_name.clone().filter(|s| !s.is_empty()),
-            hosts: internal.hosts.clone(),
-            fill_data_cache,
-            skip_page_cache,
-            skip_disk_cache,
         });
     }
 
@@ -180,7 +173,6 @@ pub(crate) fn lower_starrocks_scan_node(
     let cfg = StarRocksScanConfig {
         db_name: sr.db_name.clone().filter(|s| !s.is_empty()),
         table_name: sr.table_name.clone().filter(|s| !s.is_empty()),
-        opaqued_query_plan: sr.opaqued_query_plan.clone().unwrap_or_default(),
         properties: sr.properties.clone().unwrap_or_default(),
         ranges,
         has_more,
