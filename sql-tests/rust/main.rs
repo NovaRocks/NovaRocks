@@ -15,6 +15,7 @@ struct SuiteConfig {
     sql_dir: PathBuf,
     result_dir: Option<PathBuf>,
     sql_glob: String,
+    default_catalog: String,
     default_db: String,
     verify_default: bool,
 }
@@ -25,6 +26,8 @@ struct QueryMeta {
     float_epsilon: Option<f64>,
     db: Option<String>,
     expect_error: Option<String>,
+    result_contains: Vec<String>,
+    result_not_contains: Vec<String>,
     tags: Vec<String>,
 }
 
@@ -42,6 +45,7 @@ struct ConnectionConfig {
     host: String,
     port: String,
     user: String,
+    password: Option<String>,
     catalog: Option<String>,
     db: Option<String>,
 }
@@ -50,7 +54,15 @@ struct ConnectionConfig {
 struct QueryExecution {
     header: Vec<String>,
     rows: Vec<Vec<String>>,
+    text_output: String,
     elapsed: Duration,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RunnerConfig {
+    path: Option<PathBuf>,
+    values: HashMap<String, String>,
+    cluster: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -74,6 +86,9 @@ enum RecordFrom {
 struct Cli {
     #[arg(long)]
     suite: String,
+
+    #[arg(long)]
+    config: Option<String>,
 
     #[arg(long, value_enum, default_value_t = Mode::Verify)]
     mode: Mode,
@@ -103,6 +118,9 @@ struct Cli {
     user: Option<String>,
 
     #[arg(long)]
+    password: Option<String>,
+
+    #[arg(long)]
     catalog: Option<String>,
 
     #[arg(long)]
@@ -119,6 +137,9 @@ struct Cli {
 
     #[arg(long)]
     ref_user: Option<String>,
+
+    #[arg(long)]
+    ref_password: Option<String>,
 
     #[arg(long)]
     ref_catalog: Option<String>,
@@ -180,6 +201,143 @@ fn env_optional(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+fn strip_optional_quotes(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2 {
+        let quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\''));
+        if quoted {
+            return trimmed[1..trimmed.len() - 1].to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn detect_default_config(base_dir: &Path) -> Option<PathBuf> {
+    let sr_conf = base_dir
+        .join("dev")
+        .join("test")
+        .join("conf")
+        .join("sr.conf");
+    sr_conf.exists().then_some(sr_conf)
+}
+
+fn resolve_config_path(cli_path: Option<&str>, base_dir: &Path) -> Option<PathBuf> {
+    if let Some(path) = resolve_path(cli_path, base_dir) {
+        return Some(path);
+    }
+    if let Some(raw) = env_optional("STARUST_TEST_CONFIG") {
+        return resolve_path(Some(&raw), base_dir).or_else(|| Some(PathBuf::from(raw)));
+    }
+    detect_default_config(base_dir)
+}
+
+fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
+    let Some(path) = path else {
+        return Ok(RunnerConfig::default());
+    };
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
+    let mut config = RunnerConfig {
+        path: Some(path.to_path_buf()),
+        ..RunnerConfig::default()
+    };
+
+    let mut current_section: Option<String> = None;
+    let mut current_scope: Option<String> = None;
+    for (line_no, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section_name = trimmed[1..trimmed.len() - 1].trim();
+            if let Some(stripped) = section_name.strip_prefix('.') {
+                let Some(parent) = current_section.as_deref() else {
+                    bail!(
+                        "{}:{} subsection [{}] missing parent section",
+                        path.display(),
+                        line_no + 1,
+                        section_name
+                    );
+                };
+                current_scope = Some(format!("{}.{}", parent, stripped));
+            } else {
+                current_section = Some(section_name.to_string());
+                current_scope = Some(section_name.to_string());
+            }
+            continue;
+        }
+
+        let Some((key, raw_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+
+        let value = strip_optional_quotes(raw_value);
+        if let Some(scope) = current_scope.as_deref() {
+            config
+                .values
+                .insert(format!("{}.{}", scope, key), value.clone());
+        }
+        if current_section.as_deref() == Some("env") {
+            config.values.insert(key.clone(), value.clone());
+        }
+        if current_section.as_deref() == Some("cluster") {
+            config.cluster.insert(key, value);
+        }
+    }
+
+    Ok(config)
+}
+
+fn placeholder_variables(
+    runner_config: &RunnerConfig,
+    suite_name: &str,
+) -> HashMap<String, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let run_id = format!("sqlt_{:x}_{}", nanos, std::process::id());
+
+    let mut variables = runner_config.values.clone();
+    variables.insert("run_id".to_string(), run_id.clone());
+    variables.insert("suite".to_string(), suite_name.to_string());
+    for idx in 0..10 {
+        variables.insert(format!("uuid{}", idx), format!("{}_{}", run_id, idx));
+    }
+    variables
+}
+
+fn substitute_placeholders(
+    raw: &str,
+    variables: &HashMap<String, String>,
+    context: &str,
+) -> Result<String> {
+    let placeholder_re =
+        Regex::new(r"\$\{([A-Za-z0-9_.-]+)\}").context("failed to compile placeholder regex")?;
+    let mut substituted = String::with_capacity(raw.len());
+    let mut last = 0usize;
+    for captures in placeholder_re.captures_iter(raw) {
+        let matched = captures.get(0).expect("placeholder match");
+        let key = captures.get(1).expect("placeholder key").as_str();
+        substituted.push_str(&raw[last..matched.start()]);
+        let Some(value) = variables.get(key) else {
+            bail!("{}: missing placeholder variable '{}'", context, key);
+        };
+        substituted.push_str(value);
+        last = matched.end();
+    }
+    substituted.push_str(&raw[last..]);
+    Ok(substituted)
+}
+
 fn detect_local_target_port(base_dir: &Path) -> Result<Option<String>> {
     let fe_conf = base_dir.join("dev").join("fe").join("conf").join("fe.conf");
     if !fe_conf.exists() {
@@ -209,12 +367,23 @@ fn detect_local_target_port(base_dir: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn resolve_target_port(cli_port: Option<&str>, base_dir: &Path) -> Result<String> {
+fn resolve_target_port(
+    cli_port: Option<&str>,
+    base_dir: &Path,
+    runner_config: &RunnerConfig,
+) -> Result<String> {
     if let Some(port) = cli_port.filter(|v| !v.trim().is_empty()) {
         return Ok(port.trim().to_string());
     }
     if let Some(port) = env_optional("STARUST_TEST_PORT") {
         return Ok(port);
+    }
+    if let Some(port) = runner_config
+        .cluster
+        .get("port")
+        .filter(|v| !v.trim().is_empty())
+    {
+        return Ok(port.trim().to_string());
     }
     if let Some(port) = detect_local_target_port(base_dir)? {
         return Ok(port);
@@ -292,6 +461,12 @@ fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "expect_error" => {
                 meta.expect_error = Some(raw_value);
             }
+            "result_contains" => {
+                meta.result_contains.push(raw_value);
+            }
+            "result_not_contains" => {
+                meta.result_not_contains.push(raw_value);
+            }
             "catalog" => {
                 bail!(
                     "@catalog metadata is no longer supported; use runner --catalog/--ref-catalog options"
@@ -320,6 +495,16 @@ fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .expect_error
             .clone()
             .or_else(|| base.expect_error.clone()),
+        result_contains: if override_meta.result_contains.is_empty() {
+            base.result_contains.clone()
+        } else {
+            override_meta.result_contains.clone()
+        },
+        result_not_contains: if override_meta.result_not_contains.is_empty() {
+            base.result_not_contains.clone()
+        } else {
+            override_meta.result_not_contains.clone()
+        },
         tags: if override_meta.tags.is_empty() {
             base.tags.clone()
         } else {
@@ -377,6 +562,7 @@ fn load_sql_queries_from_file(
     sql_path: &Path,
     meta_re: &Regex,
     marker_re: &Regex,
+    variables: &HashMap<String, String>,
 ) -> Result<Vec<QueryCase>> {
     let content = match fs::read_to_string(sql_path) {
         Ok(c) => c,
@@ -389,6 +575,11 @@ fn load_sql_queries_from_file(
             return Ok(vec![]);
         }
     };
+    let content = substitute_placeholders(
+        &content,
+        variables,
+        &format!("{}: placeholder substitution", sql_path.display()),
+    )?;
 
     let base_name = sql_path
         .file_stem()
@@ -398,7 +589,16 @@ fn load_sql_queries_from_file(
 
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
     let sections = split_queries(&lines, marker_re);
-    let (file_meta, _) = extract_meta_and_sql(&lines, meta_re)
+    let file_meta_lines = if sections.len() > 1 {
+        let first_marker_idx = lines
+            .iter()
+            .position(|line| marker_re.is_match(line.trim()))
+            .unwrap_or(0);
+        lines[..first_marker_idx].to_vec()
+    } else {
+        lines.clone()
+    };
+    let (file_meta, _) = extract_meta_and_sql(&file_meta_lines, meta_re)
         .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
 
     let mut cases = Vec::new();
@@ -544,6 +744,36 @@ fn parse_output(stdout: &str) -> (Vec<String>, Vec<Vec<String>>) {
     let header = split_row(lines[0]);
     let rows = lines[1..].iter().map(|line| split_row(line)).collect();
     (header, rows)
+}
+
+fn render_output(header: &[String], rows: &[Vec<String>]) -> String {
+    let mut lines = Vec::new();
+    if !header.is_empty() {
+        lines.push(header.join("\t"));
+    }
+    lines.extend(rows.iter().map(|row| row.join("\t")));
+    lines.join("\n")
+}
+
+fn verify_text_assertions(case: &QueryCase, execution: &QueryExecution) -> (bool, String) {
+    let haystack = execution.text_output.as_str();
+    for needle in &case.meta.result_contains {
+        if !haystack.contains(needle) {
+            return (
+                false,
+                format!("result missing required substring {:?}", needle),
+            );
+        }
+    }
+    for needle in &case.meta.result_not_contains {
+        if haystack.contains(needle) {
+            return (
+                false,
+                format!("result unexpectedly contains substring {:?}", needle),
+            );
+        }
+    }
+    (true, String::new())
 }
 
 fn parse_float(cell: &str) -> Option<f64> {
@@ -795,6 +1025,11 @@ fn run_mysql_sql(conn: &ConnectionConfig, sql: &str, skip_column_names: bool) ->
         .arg("--batch")
         .arg("--raw")
         .arg("--default-character-set=utf8mb4");
+    if let Some(password) = conn.password.as_deref() {
+        if !password.is_empty() {
+            cmd.arg(format!("-p{}", password));
+        }
+    }
     if skip_column_names {
         cmd.arg("--skip-column-names");
     }
@@ -887,6 +1122,13 @@ fn execute_query(
         .arg("--batch")
         .arg("--raw")
         .arg("--default-character-set=utf8mb4")
+        .args(
+            conn.password
+                .as_deref()
+                .filter(|password| !password.is_empty())
+                .map(|password| vec![format!("-p{}", password)])
+                .unwrap_or_default(),
+        )
         .arg("-e")
         .arg(full_sql)
         .output()
@@ -923,6 +1165,7 @@ fn execute_query(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let (header, rows) = parse_output(&stdout);
     let execution = QueryExecution {
+        text_output: render_output(&header, &rows),
         header,
         rows,
         elapsed,
@@ -966,6 +1209,13 @@ fn suite_default_db(suite_name: &str) -> String {
     }
 }
 
+fn suite_default_catalog(suite_name: &str) -> String {
+    match suite_name {
+        "iceberg" => "default_catalog".to_string(),
+        _ => DEFAULT_TEST_CATALOG.to_string(),
+    }
+}
+
 fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>> {
     let sql_tests_dir = base_dir.join("sql-tests");
     let entries = fs::read_dir(&sql_tests_dir)
@@ -994,6 +1244,7 @@ fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>>
             sql_dir,
             result_dir: Some(path.join("result")),
             sql_glob: suite_sql_glob(&name),
+            default_catalog: suite_default_catalog(&name),
             default_db: suite_default_db(&name),
             verify_default: true,
         };
@@ -1116,6 +1367,8 @@ fn main() -> Result<()> {
         .parent()
         .map(Path::to_path_buf)
         .context("failed to resolve repo root from sql-tests manifest path")?;
+    let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
+    let runner_config = load_runner_config(config_path.as_deref())?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
@@ -1167,36 +1420,43 @@ fn main() -> Result<()> {
     });
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
-    let target_port = resolve_target_port(cli.port.as_deref(), &base_dir)?;
+    let target_port = resolve_target_port(cli.port.as_deref(), &base_dir, &runner_config)?;
     let reference_port =
         resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
     let target_catalog_name = cli
         .catalog
         .clone()
         .or_else(|| env_optional("STARUST_TEST_CATALOG"))
-        .unwrap_or_else(|| DEFAULT_TEST_CATALOG.to_string());
+        .unwrap_or_else(|| suite.default_catalog.clone());
     let reference_catalog_name = cli
         .ref_catalog
         .clone()
         .or_else(|| env_optional("STARUST_REF_CATALOG"))
-        .unwrap_or_else(|| DEFAULT_TEST_CATALOG.to_string());
+        .unwrap_or_else(|| suite.default_catalog.clone());
 
     let target_conn_base = ConnectionConfig {
-        mysql: cli.mysql.clone().unwrap_or_else(|| {
-            env_or_default(
-                "STARUST_TEST_MYSQL",
-                "mysql",
-            )
-        }),
+        mysql: cli
+            .mysql
+            .clone()
+            .unwrap_or_else(|| env_or_default("STARUST_TEST_MYSQL", "mysql")),
         host: cli
             .host
             .clone()
-            .unwrap_or_else(|| env_or_default("STARUST_TEST_HOST", "127.0.0.1")),
+            .or_else(|| env_optional("STARUST_TEST_HOST"))
+            .or_else(|| runner_config.cluster.get("host").cloned())
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
         port: target_port,
         user: cli
             .user
             .clone()
-            .unwrap_or_else(|| env_or_default("STARUST_TEST_USER", "root")),
+            .or_else(|| env_optional("STARUST_TEST_USER"))
+            .or_else(|| runner_config.cluster.get("user").cloned())
+            .unwrap_or_else(|| "root".to_string()),
+        password: cli
+            .password
+            .clone()
+            .or_else(|| env_optional("STARUST_TEST_PASSWORD"))
+            .or_else(|| runner_config.cluster.get("password").cloned()),
         catalog: Some(target_catalog_name.clone()),
         db: if target_db_default.is_empty() {
             None
@@ -1214,21 +1474,25 @@ fn main() -> Result<()> {
         })?;
 
     let reference_conn_base = ConnectionConfig {
-        mysql: cli.ref_mysql.clone().unwrap_or_else(|| {
-            env_or_default(
-                "STARUST_REF_MYSQL",
-                "mysql",
-            )
-        }),
+        mysql: cli
+            .ref_mysql
+            .clone()
+            .unwrap_or_else(|| env_or_default("STARUST_REF_MYSQL", "mysql")),
         host: cli
             .ref_host
             .clone()
-            .unwrap_or_else(|| env_or_default("STARUST_REF_HOST", "127.0.0.1")),
+            .or_else(|| env_optional("STARUST_REF_HOST"))
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
         port: reference_port,
         user: cli
             .ref_user
             .clone()
-            .unwrap_or_else(|| env_or_default("STARUST_REF_USER", "root")),
+            .or_else(|| env_optional("STARUST_REF_USER"))
+            .unwrap_or_else(|| "root".to_string()),
+        password: cli
+            .ref_password
+            .clone()
+            .or_else(|| env_optional("STARUST_REF_PASSWORD")),
         catalog: Some(reference_catalog_name.clone()),
         db: if ref_db_default.is_empty() {
             None
@@ -1255,6 +1519,9 @@ fn main() -> Result<()> {
     println!("mode={}", mode_name(cli.mode));
     println!("sql_dir={}", sql_dir.display());
     println!("sql_glob={}", sql_glob);
+    if let Some(path) = runner_config.path.as_deref() {
+        println!("config={}", path.display());
+    }
     if let Some(dir) = &result_dir {
         println!("result_dir={}", dir.display());
     }
@@ -1293,18 +1560,20 @@ fn main() -> Result<()> {
 
     let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
     let marker_re = Regex::new(r"(?i)^--\s*query\s+\d+(?:\s+.*)?$")?;
+    let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
 
     let mut cases: Vec<QueryCase> = Vec::new();
     let mut failed_query_ids: Vec<String> = Vec::new();
 
     for sql_file in sql_files {
-        let loaded_cases = match load_sql_queries_from_file(&sql_file, &meta_re, &marker_re) {
-            Ok(c) => c,
-            Err(exc) => {
-                println!("❌ ERROR: {}", exc);
-                std::process::exit(1);
-            }
-        };
+        let loaded_cases =
+            match load_sql_queries_from_file(&sql_file, &meta_re, &marker_re, &placeholder_vars) {
+                Ok(c) => c,
+                Err(exc) => {
+                    println!("❌ ERROR: {}", exc);
+                    std::process::exit(1);
+                }
+            };
 
         if loaded_cases.is_empty() {
             if let Some(stem) = sql_file.file_stem().and_then(|s| s.to_str()) {
@@ -1403,6 +1672,7 @@ fn main() -> Result<()> {
             host: target_conn_base.host.clone(),
             port: target_conn_base.port.clone(),
             user: target_conn_base.user.clone(),
+            password: target_conn_base.password.clone(),
             catalog: target_conn_base.catalog.clone(),
             db: query_db(case, target_conn_base.db.as_deref()),
         };
@@ -1412,6 +1682,7 @@ fn main() -> Result<()> {
             host: reference_conn_base.host.clone(),
             port: reference_conn_base.port.clone(),
             user: reference_conn_base.user.clone(),
+            password: reference_conn_base.password.clone(),
             catalog: reference_conn_base.catalog.clone(),
             db: query_db(case, reference_conn_base.db.as_deref()),
         };
@@ -1446,10 +1717,7 @@ fn main() -> Result<()> {
                     } else if error_message_matches(&err_msg, expected_error) {
                         passed += 1;
                         per_query_times.push((case.query_id.clone(), elapsed, true));
-                        println!(
-                            "    ✅ PASS (expected error matched): {}",
-                            err_msg
-                        );
+                        println!("    ✅ PASS (expected error matched): {}", err_msg);
                     } else {
                         failed += 1;
                         failed_query_ids.push(case.query_id.clone());
@@ -1479,6 +1747,17 @@ fn main() -> Result<()> {
                 per_query_times.push((case.query_id.clone(), execution.elapsed, true));
                 total_time += execution.elapsed;
 
+                let (assertions_ok, assertions_reason) = verify_text_assertions(case, &execution);
+                if !assertions_ok {
+                    failed += 1;
+                    failed_query_ids.push(case.query_id.clone());
+                    println!("    ❌ VERIFY FAILED: {}", assertions_reason);
+                    if cli.fail_fast {
+                        break;
+                    }
+                    continue;
+                }
+
                 if !verify_enabled {
                     passed += 1;
                     println!(
@@ -1505,11 +1784,21 @@ fn main() -> Result<()> {
                     .unwrap_or_default();
                 let expected_path = expected_result_path(result_dir, &case.query_id, base_query_id);
                 let Some(expected_path) = expected_path else {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!("    ❌ missing expected result file");
-                    if cli.fail_fast {
-                        break;
+                    if !case.meta.result_contains.is_empty()
+                        || !case.meta.result_not_contains.is_empty()
+                    {
+                        passed += 1;
+                        println!(
+                            "    ✅ PASS ({:.2}s, text assertions only)",
+                            execution.elapsed.as_secs_f64()
+                        );
+                    } else {
+                        failed += 1;
+                        failed_query_ids.push(case.query_id.clone());
+                        println!("    ❌ missing expected result file");
+                        if cli.fail_fast {
+                            break;
+                        }
                     }
                     continue;
                 };

@@ -30,13 +30,16 @@ pub use cache::{
 use anyhow::Result;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeBinaryBuilder, RecordBatch, StructArray,
+    new_null_array,
 };
 #[cfg(test)]
 use arrow::array::{
     Date32Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Schema};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
+use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::arrow::arrow_reader::{
     ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowSelection,
 };
@@ -156,6 +159,7 @@ pub struct ParquetScanConfig {
     pub datacache: DataCacheContext,
     pub cache_policy: ParquetReadCachePolicy,
     pub profile_label: Option<String>,
+    pub iceberg_output_schema: Option<SchemaRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,6 +303,10 @@ struct ParquetScanIter {
 }
 
 impl ParquetScanIter {
+    fn has_iceberg_schema_evolution(&self) -> bool {
+        self.cfg.iceberg_output_schema.is_some()
+    }
+
     fn record_delayed_decision(&self, counter: &str) {
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add(counter, metrics::TUnit::UNIT, 1);
@@ -306,6 +314,9 @@ impl ParquetScanIter {
     }
 
     fn current_predicates(&self) -> Result<Vec<MinMaxPredicate>, String> {
+        if self.has_iceberg_schema_evolution() {
+            return Ok(Vec::new());
+        }
         let mut predicates = self.cfg.min_max_predicates.clone();
         if let Some(filters) = self.runtime_filters.as_ref() {
             let mut runtime_preds = runtime_filters_to_min_max_predicates(&self.cfg, filters)?;
@@ -349,25 +360,20 @@ impl ParquetScanIter {
             let mask = {
                 let arrow_schema = builder.schema();
                 let parquet_schema = builder.parquet_schema();
-                let mut indices = Vec::new();
-                for col_name in projected_columns {
-                    if col_name == "___count___" {
-                        continue;
-                    }
-                    let idx = if self.cfg.case_sensitive {
-                        arrow_schema.index_of(col_name).ok()
-                    } else {
-                        arrow_schema
-                            .fields()
-                            .iter()
-                            .position(|f| f.name().eq_ignore_ascii_case(col_name))
-                    };
-                    if let Some(i) = idx {
-                        indices.push(i);
-                    } else {
-                        return Err(format!("Column {} not found in parquet file", col_name));
-                    }
-                }
+                let indices = if let Some(output_schema) = self.cfg.iceberg_output_schema.as_ref() {
+                    build_iceberg_root_projection_indices(
+                        output_schema,
+                        arrow_schema.as_ref(),
+                        parquet_schema,
+                        self.cfg.case_sensitive,
+                    )?
+                } else {
+                    build_name_projection_indices(
+                        projected_columns,
+                        arrow_schema.as_ref(),
+                        self.cfg.case_sensitive,
+                    )?
+                };
                 parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
             };
             builder = builder.with_projection(mask);
@@ -776,15 +782,24 @@ impl ParquetScanIter {
                 }
                 continue;
             }
-            let active_projection_columns = build_active_projection_columns(
-                &predicates,
-                &self.cfg.columns,
-                self.cfg.case_sensitive,
-            );
+            let use_name_based_projection = !self.has_iceberg_schema_evolution();
+            let active_projection_columns = if use_name_based_projection {
+                build_active_projection_columns(
+                    &predicates,
+                    &self.cfg.columns,
+                    self.cfg.case_sensitive,
+                )
+            } else {
+                HashSet::new()
+            };
             let io_ranges = collect_parquet_coalesce_io_ranges(
                 &metadata,
                 &row_groups,
-                &self.cfg.columns,
+                if use_name_based_projection {
+                    &self.cfg.columns
+                } else {
+                    &[] as &[String]
+                },
                 self.cfg.case_sensitive,
                 &active_projection_columns,
             );
@@ -1355,7 +1370,215 @@ fn value_satisfies_predicate_f64(value: f64, target: f64, predicate: &MinMaxPred
     }
 }
 
+fn parse_parquet_field_id(field: &Field) -> Result<Option<i32>, String> {
+    let Some(raw) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) else {
+        return Ok(None);
+    };
+    raw.parse::<i32>().map(Some).map_err(|e| {
+        format!(
+            "invalid parquet field_id metadata: field={} key={} value={} error={}",
+            field.name(),
+            PARQUET_FIELD_ID_META_KEY,
+            raw,
+            e
+        )
+    })
+}
+
+fn find_matching_field_index(
+    fields: &[FieldRef],
+    target: &Field,
+    case_sensitive: bool,
+) -> Result<Option<usize>, String> {
+    let target_field_id = parse_parquet_field_id(target)?;
+    if let Some(target_field_id) = target_field_id {
+        for (idx, source) in fields.iter().enumerate() {
+            if parse_parquet_field_id(source.as_ref())? == Some(target_field_id) {
+                return Ok(Some(idx));
+            }
+        }
+    }
+    Ok(fields.iter().position(|field| {
+        if case_sensitive {
+            field.name() == target.name()
+        } else {
+            field.name().eq_ignore_ascii_case(target.name())
+        }
+    }))
+}
+
+fn build_name_projection_indices(
+    projected_columns: &[String],
+    arrow_schema: &Schema,
+    case_sensitive: bool,
+) -> Result<Vec<usize>, String> {
+    let mut indices = Vec::new();
+    for col_name in projected_columns {
+        if col_name == "___count___" {
+            continue;
+        }
+        let idx = if case_sensitive {
+            arrow_schema.index_of(col_name).ok()
+        } else {
+            arrow_schema
+                .fields()
+                .iter()
+                .position(|f| f.name().eq_ignore_ascii_case(col_name))
+        };
+        if let Some(i) = idx {
+            indices.push(i);
+        } else {
+            return Err(format!("Column {} not found in parquet file", col_name));
+        }
+    }
+    Ok(indices)
+}
+
+fn build_iceberg_root_projection_indices(
+    output_schema: &SchemaRef,
+    arrow_schema: &Schema,
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    case_sensitive: bool,
+) -> Result<Vec<usize>, String> {
+    let root_fields = parquet_schema.root_schema().get_fields();
+    let mut indices = Vec::new();
+    for target in output_schema.fields() {
+        let target_field_id = parse_parquet_field_id(target.as_ref())?;
+        let idx = if let Some(target_field_id) = target_field_id {
+            root_fields
+                .iter()
+                .position(|field| field.get_basic_info().id() == target_field_id)
+                .or_else(|| {
+                    if case_sensitive {
+                        arrow_schema.index_of(target.name()).ok()
+                    } else {
+                        arrow_schema
+                            .fields()
+                            .iter()
+                            .position(|field| field.name().eq_ignore_ascii_case(target.name()))
+                    }
+                })
+        } else if case_sensitive {
+            arrow_schema.index_of(target.name()).ok()
+        } else {
+            arrow_schema
+                .fields()
+                .iter()
+                .position(|field| field.name().eq_ignore_ascii_case(target.name()))
+        };
+        if let Some(idx) = idx {
+            indices.push(idx);
+        }
+    }
+    Ok(indices)
+}
+
+fn align_iceberg_array_to_field(
+    source_field: &Field,
+    source_array: ArrayRef,
+    target_field: &Field,
+    row_count: usize,
+    case_sensitive: bool,
+) -> Result<ArrayRef, String> {
+    match (source_field.data_type(), target_field.data_type()) {
+        (DataType::Struct(source_children), DataType::Struct(target_children)) => {
+            let struct_array = source_array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| {
+                    format!(
+                        "expected StructArray for iceberg schema evolution column {}",
+                        source_field.name()
+                    )
+                })?;
+            let mut columns = Vec::with_capacity(target_children.len());
+            for target_child in target_children {
+                if let Some(source_idx) = find_matching_field_index(
+                    source_children,
+                    target_child.as_ref(),
+                    case_sensitive,
+                )? {
+                    let source_child = source_children[source_idx].as_ref();
+                    let aligned = align_iceberg_array_to_field(
+                        source_child,
+                        struct_array.column(source_idx).clone(),
+                        target_child.as_ref(),
+                        row_count,
+                        case_sensitive,
+                    )?;
+                    columns.push(aligned);
+                } else {
+                    columns.push(new_null_array(target_child.data_type(), row_count));
+                }
+            }
+            let array = StructArray::try_new(
+                target_children.clone(),
+                columns,
+                struct_array.nulls().cloned(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(Arc::new(array))
+        }
+        _ => {
+            if source_array.data_type() == target_field.data_type() {
+                return Ok(source_array);
+            }
+            let casted = cast(source_array.as_ref(), target_field.data_type()).map_err(|e| {
+                format!(
+                    "iceberg parquet cast failed for column {} from {:?} to {:?}: {}",
+                    target_field.name(),
+                    source_array.data_type(),
+                    target_field.data_type(),
+                    e
+                )
+            })?;
+            if casted.null_count() > source_array.null_count() {
+                return Err(format!(
+                    "iceberg parquet cast introduced nulls for column {} from {:?} to {:?}",
+                    target_field.name(),
+                    source_array.data_type(),
+                    target_field.data_type()
+                ));
+            }
+            Ok(casted)
+        }
+    }
+}
+
+fn align_batch_to_iceberg_schema(
+    output_schema: &SchemaRef,
+    batch: RecordBatch,
+    case_sensitive: bool,
+) -> Result<RecordBatch, String> {
+    let row_count = batch.num_rows();
+    let batch_schema = batch.schema();
+    let mut columns = Vec::with_capacity(output_schema.fields().len());
+    for target in output_schema.fields() {
+        if let Some(source_idx) =
+            find_matching_field_index(batch_schema.fields(), target.as_ref(), case_sensitive)?
+        {
+            let source_field = batch_schema.field(source_idx);
+            let array = align_iceberg_array_to_field(
+                source_field.as_ref(),
+                batch.column(source_idx).clone(),
+                target.as_ref(),
+                row_count,
+                case_sensitive,
+            )?;
+            columns.push(array);
+        } else {
+            columns.push(new_null_array(target.data_type(), row_count));
+        }
+    }
+    RecordBatch::try_new(Arc::clone(output_schema), columns).map_err(|e| e.to_string())
+}
+
 fn reorder_batch(cfg: &ParquetScanConfig, batch: RecordBatch) -> Result<RecordBatch, String> {
+    if let Some(output_schema) = cfg.iceberg_output_schema.as_ref() {
+        let batch = align_batch_to_iceberg_schema(output_schema, batch, cfg.case_sensitive)?;
+        return attach_slot_ids_to_batch(cfg, batch);
+    }
+
     let batch_schema = batch.schema();
 
     if !cfg.columns.is_empty() {
@@ -1685,23 +1908,92 @@ fn is_active_projection_column(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::collections::HashSet;
     use std::fs::{self, File};
+    use std::path::Path;
     use std::sync::Arc;
 
-    use arrow::array::{Float64Array, Int32Array};
+    use arrow::array::{Array, Float64Array, Int32Array, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+    use parquet::arrow::{
+        ArrowWriter, PARQUET_FIELD_ID_META_KEY, arrow_reader::ParquetRecordBatchReaderBuilder,
+    };
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
-    use crate::cache::{CachedRangeReader, DataCacheManager, DataCachePageCacheOptions};
+    use crate::cache::{
+        CacheOptions, CachedRangeReader, DataCacheManager, DataCachePageCacheOptions,
+    };
+    use crate::common::ids::SlotId;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
+    use crate::fs::scan_context::{FileScanContext, FileScanRange};
+    use crate::types;
 
     use super::{
-        ParquetReadCachePolicy, build_active_projection_columns, build_delayed_output_sources,
-        build_delayed_projection_plan, collect_parquet_coalesce_io_ranges,
-        evaluate_batch_predicate_mask, reader::ParquetCachedReader,
+        ParquetReadCachePolicy, ParquetScanConfig, build_active_projection_columns,
+        build_delayed_output_sources, build_delayed_projection_plan, build_parquet_iter,
+        collect_parquet_coalesce_io_ranges, evaluate_batch_predicate_mask,
+        reader::ParquetCachedReader,
     };
+
+    fn field_id_meta(field_id: i32) -> HashMap<String, String> {
+        HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string())])
+    }
+
+    fn field_with_id(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(field_id_meta(field_id))
+    }
+
+    fn test_datacache_context() -> crate::cache::DataCacheContext {
+        let cache_options = CacheOptions::from_query_options(None).expect("cache options");
+        DataCacheManager::instance().external_context(cache_options)
+    }
+
+    fn test_parquet_scan_cfg(
+        columns: Vec<String>,
+        slot_types: Vec<types::TPrimitiveType>,
+        iceberg_output_schema: Option<Schema>,
+    ) -> ParquetScanConfig {
+        let slot_ids = (0..columns.len())
+            .map(|idx| SlotId::try_from((idx + 1) as i32).expect("slot id"))
+            .collect();
+        ParquetScanConfig {
+            columns,
+            slot_ids,
+            slot_types,
+            case_sensitive: true,
+            enable_page_index: false,
+            min_max_predicates: Vec::new(),
+            batch_size: Some(1024),
+            datacache: test_datacache_context(),
+            cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
+            profile_label: None,
+            iceberg_output_schema: iceberg_output_schema.map(Arc::new),
+        }
+    }
+
+    fn read_single_batch(cfg: ParquetScanConfig, path: &Path) -> arrow::record_batch::RecordBatch {
+        let file_len = fs::metadata(path).expect("file metadata").len();
+        let scan = FileScanContext::build(
+            vec![FileScanRange {
+                path: path.to_string_lossy().to_string(),
+                file_len,
+                offset: 0,
+                length: file_len,
+                scan_range_id: -1,
+                first_row_id: None,
+                external_datacache: None,
+            }],
+            None,
+            None,
+        )
+        .expect("file scan context");
+        let mut iter = build_parquet_iter(scan, cfg, None, None, None).expect("build parquet iter");
+        iter.next()
+            .expect("first batch")
+            .expect("decode batch")
+            .batch
+    }
 
     #[test]
     fn parquet_cached_reader_smoke_test() {
@@ -1856,6 +2148,242 @@ mod tests {
         );
         assert!(!io_ranges.active.is_empty());
         assert!(!io_ranges.lazy.is_empty());
+    }
+
+    #[test]
+    fn iceberg_schema_evolution_reads_renamed_columns_by_field_id() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("rename.parquet");
+        let source_schema = Arc::new(Schema::new(vec![
+            field_with_id("old_id", DataType::Int32, true, 1),
+            field_with_id("payload", DataType::Int32, true, 2),
+        ]));
+        let source_batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])),
+            ],
+        )
+        .expect("source batch");
+        let file = File::create(&file_path).expect("create parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&source_schema), None).expect("writer");
+        writer.write(&source_batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let target_schema = Schema::new(vec![
+            field_with_id("new_id", DataType::Int32, true, 1),
+            field_with_id("payload", DataType::Int32, true, 2),
+        ]);
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["new_id".to_string(), "payload".to_string()],
+                vec![types::TPrimitiveType::INT, types::TPrimitiveType::INT],
+                Some(target_schema),
+            ),
+            &file_path,
+        );
+
+        assert_eq!(batch.schema().field(0).name(), "new_id");
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("new_id int32");
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(2), 3);
+    }
+
+    #[test]
+    fn iceberg_schema_evolution_supports_add_drop_and_reorder() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("add_drop_reorder.parquet");
+        let source_schema = Arc::new(Schema::new(vec![
+            field_with_id("id", DataType::Int32, true, 1),
+            field_with_id("value", DataType::Int32, true, 2),
+            field_with_id("removed", DataType::Int32, true, 3),
+        ]));
+        let source_batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(7), Some(8)])),
+                Arc::new(Int32Array::from(vec![Some(70), Some(80)])),
+                Arc::new(Int32Array::from(vec![Some(700), Some(800)])),
+            ],
+        )
+        .expect("source batch");
+        let file = File::create(&file_path).expect("create parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&source_schema), None).expect("writer");
+        writer.write(&source_batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let target_schema = Schema::new(vec![
+            field_with_id("value", DataType::Int32, true, 2),
+            field_with_id("id", DataType::Int32, true, 1),
+            field_with_id("extra", DataType::Int32, true, 4),
+        ]);
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["value".to_string(), "id".to_string(), "extra".to_string()],
+                vec![
+                    types::TPrimitiveType::INT,
+                    types::TPrimitiveType::INT,
+                    types::TPrimitiveType::INT,
+                ],
+                Some(target_schema),
+            ),
+            &file_path,
+        );
+
+        let value = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("value int32");
+        let id = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id int32");
+        let extra = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("extra int32");
+        assert_eq!(value.value(0), 70);
+        assert_eq!(id.value(1), 8);
+        assert!(extra.is_null(0));
+        assert!(extra.is_null(1));
+    }
+
+    #[test]
+    fn iceberg_schema_evolution_falls_back_to_name_matching_without_field_ids() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("no_field_id.parquet");
+        let source_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+        let source_batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+        )
+        .expect("source batch");
+        let file = File::create(&file_path).expect("create parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&source_schema), None).expect("writer");
+        writer.write(&source_batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let target_schema = Schema::new(vec![
+            Field::new("b", DataType::Int32, true),
+            Field::new("a", DataType::Int32, true),
+        ]);
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["b".to_string(), "a".to_string()],
+                vec![types::TPrimitiveType::INT, types::TPrimitiveType::INT],
+                Some(target_schema),
+            ),
+            &file_path,
+        );
+        let b = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("b int32");
+        let a = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("a int32");
+        assert_eq!(b.value(0), 10);
+        assert_eq!(a.value(1), 2);
+    }
+
+    #[test]
+    fn iceberg_schema_evolution_aligns_struct_children_by_field_id() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let file_path = temp_dir.path().join("struct_evolution.parquet");
+        let source_children = vec![
+            Arc::new(field_with_id("a", DataType::Int32, true, 2)),
+            Arc::new(field_with_id("b", DataType::Int32, true, 3)),
+        ];
+        let source_struct = StructArray::try_new(
+            source_children.clone().into(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int32Array::from(vec![Some(10), Some(20)])),
+            ],
+            None,
+        )
+        .expect("source struct");
+        let source_schema = Arc::new(Schema::new(vec![field_with_id(
+            "payload",
+            DataType::Struct(source_children.into()),
+            true,
+            1,
+        )]));
+        let source_batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&source_schema),
+            vec![Arc::new(source_struct)],
+        )
+        .expect("source batch");
+        let file = File::create(&file_path).expect("create parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&source_schema), None).expect("writer");
+        writer.write(&source_batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let target_children = vec![
+            Arc::new(field_with_id("b", DataType::Int32, true, 3)),
+            Arc::new(field_with_id("a", DataType::Int32, true, 2)),
+            Arc::new(field_with_id("c", DataType::Int32, true, 4)),
+        ];
+        let target_schema = Schema::new(vec![field_with_id(
+            "payload",
+            DataType::Struct(target_children.into()),
+            true,
+            1,
+        )]);
+        let batch = read_single_batch(
+            test_parquet_scan_cfg(
+                vec!["payload".to_string()],
+                vec![types::TPrimitiveType::INVALID_TYPE],
+                Some(target_schema),
+            ),
+            &file_path,
+        );
+
+        let payload = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("payload struct");
+        let b = payload
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("b int32");
+        let a = payload
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("a int32");
+        let c = payload
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("c int32");
+        assert_eq!(b.value(0), 10);
+        assert_eq!(a.value(1), 2);
+        assert!(c.is_null(0));
+        assert!(c.is_null(1));
     }
 
     #[test]

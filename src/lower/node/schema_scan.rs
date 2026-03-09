@@ -302,6 +302,7 @@ mod tests {
             select_node: None,
             fetch_node: None,
             look_up_node: None,
+            benchmark_scan_node: None,
         }
     }
 
@@ -317,6 +318,7 @@ mod tests {
                     Option::<plan_nodes::TEsScanRange>::None,
                     Option::<plan_nodes::THdfsScanRange>::None,
                     Option::<plan_nodes::TBinlogScanRange>::None,
+                    Option::<plan_nodes::TBenchmarkScanRange>::None,
                 ),
                 volume_id: None,
                 empty: Some(false),

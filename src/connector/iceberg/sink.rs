@@ -38,20 +38,20 @@ use arrow::array::{
     TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, SchemaRef};
 use base64::Engine;
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
+use super::cache_iceberg_object_store_config_for_paths;
+use super::schema::build_full_output_schema;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
-use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
@@ -118,13 +118,17 @@ impl IcebergTableSinkFactory {
 
         let data_location = resolve_data_location(&sink)?;
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
+        if let Some(s3) = object_store_s3.as_ref() {
+            let cfg = s3.to_object_store_config();
+            cache_iceberg_object_store_config_for_paths(&cfg, [data_location.as_str()]);
+        }
         let file_format = sink
             .file_format
             .clone()
             .ok_or_else(|| "iceberg sink missing file_format".to_string())?;
         if file_format.to_lowercase() != "parquet" {
             return Err(format!(
-                "iceberg sink only supports parquet, got {}",
+                "iceberg sink does not support {} files; NovaRocks currently only supports Parquet for Iceberg writes",
                 file_format
             ));
         }
@@ -456,142 +460,7 @@ fn resolve_iceberg_table(
 }
 
 fn build_output_schema(iceberg: &descriptors::TIcebergTable) -> Result<SchemaRef, String> {
-    let columns = iceberg
-        .columns
-        .as_ref()
-        .ok_or_else(|| "iceberg table missing columns".to_string())?;
-    if let Some(schema) = iceberg.iceberg_schema.as_ref() {
-        let schema_fields = schema
-            .fields
-            .as_ref()
-            .ok_or_else(|| "iceberg schema missing fields".to_string())?;
-        let mut fields = Vec::with_capacity(schema_fields.len());
-        for schema_field in schema_fields {
-            let name = schema_field
-                .name
-                .as_ref()
-                .ok_or_else(|| "iceberg schema field missing name".to_string())?;
-            let col = columns
-                .iter()
-                .find(|c| &c.column_name == name)
-                .ok_or_else(|| {
-                    format!("iceberg schema field {} missing column descriptor", name)
-                })?;
-            let dtype = col
-                .type_desc
-                .as_ref()
-                .and_then(arrow_type_from_desc)
-                .ok_or_else(|| format!("iceberg column {} missing type_desc", col.column_name))?;
-            let nullable = col.is_allow_null.unwrap_or(true);
-            let field = Field::new(col.column_name.clone(), dtype, nullable);
-            let field = apply_field_id_recursive(field, schema_field)?;
-            fields.push(field);
-        }
-        return Ok(Arc::new(Schema::new(fields)));
-    }
-
-    let mut fields = Vec::with_capacity(columns.len());
-    for col in columns {
-        let dtype = col
-            .type_desc
-            .as_ref()
-            .and_then(arrow_type_from_desc)
-            .ok_or_else(|| format!("iceberg column {} missing type_desc", col.column_name))?;
-        let nullable = col.is_allow_null.unwrap_or(true);
-        fields.push(Field::new(col.column_name.clone(), dtype, nullable));
-    }
-
-    Ok(Arc::new(Schema::new(fields)))
-}
-
-fn apply_field_id_recursive(
-    field: Field,
-    schema_field: &descriptors::TIcebergSchemaField,
-) -> Result<Field, String> {
-    let field_id = schema_field
-        .field_id
-        .ok_or_else(|| format!("iceberg schema field {} missing field_id", field.name()))?;
-    let mut meta = field.metadata().clone();
-    meta.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-    let data_type = match field.data_type() {
-        DataType::Struct(children) => {
-            let schema_children = schema_field
-                .children
-                .as_ref()
-                .ok_or_else(|| format!("iceberg schema field {} missing children", field.name()))?;
-            if children.len() != schema_children.len() {
-                return Err(format!(
-                    "iceberg schema children mismatch for {}: fields={} schema_fields={}",
-                    field.name(),
-                    children.len(),
-                    schema_children.len()
-                ));
-            }
-            let mut new_children = Vec::with_capacity(children.len());
-            for (child, schema_child) in children.iter().zip(schema_children.iter()) {
-                let new_child = apply_field_id_recursive(child.as_ref().clone(), schema_child)?;
-                new_children.push(new_child);
-            }
-            DataType::Struct(new_children.into())
-        }
-        DataType::List(child) => {
-            let schema_children = schema_field
-                .children
-                .as_ref()
-                .ok_or_else(|| format!("iceberg schema field {} missing children", field.name()))?;
-            if schema_children.len() != 1 {
-                return Err(format!(
-                    "iceberg schema list field {} should have 1 child, got {}",
-                    field.name(),
-                    schema_children.len()
-                ));
-            }
-            let new_child = apply_field_id_recursive(child.as_ref().clone(), &schema_children[0])?;
-            DataType::List(Arc::new(new_child))
-        }
-        DataType::Map(entries, sorted) => {
-            let schema_children = schema_field
-                .children
-                .as_ref()
-                .ok_or_else(|| format!("iceberg schema field {} missing children", field.name()))?;
-            if schema_children.len() != 2 {
-                return Err(format!(
-                    "iceberg schema map field {} should have 2 children, got {}",
-                    field.name(),
-                    schema_children.len()
-                ));
-            }
-            let entries_field = entries.as_ref();
-            let entry_fields = match entries_field.data_type() {
-                DataType::Struct(fields) => fields,
-                _ => {
-                    return Err(format!(
-                        "iceberg map field {} has non-struct entries",
-                        field.name()
-                    ));
-                }
-            };
-            if entry_fields.len() != 2 {
-                return Err(format!(
-                    "iceberg map field {} entries should have 2 fields",
-                    field.name()
-                ));
-            }
-            let key_field =
-                apply_field_id_recursive(entry_fields[0].as_ref().clone(), &schema_children[0])?;
-            let value_field =
-                apply_field_id_recursive(entry_fields[1].as_ref().clone(), &schema_children[1])?;
-            let entries_struct = DataType::Struct(vec![key_field, value_field].into());
-            let entries_field = Field::new(
-                entries_field.name(),
-                entries_struct,
-                entries_field.is_nullable(),
-            );
-            DataType::Map(Arc::new(entries_field), *sorted)
-        }
-        other => other.clone(),
-    };
-    Ok(Field::new(field.name(), data_type, field.is_nullable()).with_metadata(meta))
+    build_full_output_schema(iceberg)
 }
 
 fn build_partition_exprs(
@@ -1108,7 +977,7 @@ mod tests {
     use arrow::array::{Array, ArrayRef, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
 
-    use super::align_arrays_to_schema;
+    use super::{align_arrays_to_schema, iceberg_partition_key_for_row};
 
     #[test]
     fn test_align_arrays_to_schema_casts_int64_to_int32() {
@@ -1136,5 +1005,31 @@ mod tests {
 
         let err = align_arrays_to_schema(arrays, &schema).expect_err("should fail");
         assert!(err.contains("introduced nulls"));
+    }
+
+    #[test]
+    fn test_iceberg_partition_key_formats_transforms_and_null_fingerprint() {
+        let partition_column_names = vec![
+            "p_year".to_string(),
+            "p_bucket".to_string(),
+            "p_void".to_string(),
+        ];
+        let transform_exprs = vec![
+            "year".to_string(),
+            "bucket[16]".to_string(),
+            "void".to_string(),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(2)])),
+            Arc::new(Int32Array::from(vec![Some(7)])),
+            Arc::new(Int32Array::from(vec![Some(123)])),
+        ];
+
+        let (path, fingerprint) =
+            iceberg_partition_key_for_row(&partition_column_names, &transform_exprs, &arrays, 0)
+                .expect("partition key");
+
+        assert_eq!(path, "p_year=1972/p_bucket=7/p_void=null/");
+        assert_eq!(fingerprint, "001");
     }
 }

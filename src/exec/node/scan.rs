@@ -46,6 +46,9 @@ pub enum ScanMorsel {
     },
     JdbcSingle,
     Exchange,
+    IcebergMetadata {
+        index: usize,
+    },
     Schema {
         table_name: String,
     },
@@ -70,6 +73,9 @@ impl ScanMorsel {
             ScanMorsel::StarRocksRange { index } => format!("starrocks_range_index={index}"),
             ScanMorsel::JdbcSingle => "jdbc_single".to_string(),
             ScanMorsel::Exchange => "exchange".to_string(),
+            ScanMorsel::IcebergMetadata { index } => {
+                format!("iceberg_metadata_index={index}")
+            }
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
             ScanMorsel::Empty => "empty".to_string(),
         }
