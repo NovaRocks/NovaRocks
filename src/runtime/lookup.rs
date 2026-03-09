@@ -290,6 +290,7 @@ pub(crate) fn execute_lookup_request(
                 u32::try_from(cache_options.datacache_evict_probability).ok(),
             ),
             profile_label: None,
+            iceberg_output_schema: None,
         };
         let format = match scan_cfg.file_format {
             descriptors::THdfsFileFormat::PARQUET => FileFormatConfig::Parquet(parquet_cfg),

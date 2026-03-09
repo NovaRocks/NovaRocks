@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod hdfs;
+pub mod iceberg;
 pub mod jdbc;
 pub mod schema;
 pub mod starrocks;
@@ -30,6 +31,7 @@ pub use crate::formats::orc::OrcScanConfig;
 pub use crate::formats::parquet::ParquetScanConfig;
 pub use crate::fs::scan_context::FileScanRange;
 pub use hdfs::HdfsScanConfig;
+pub use iceberg::IcebergMetadataScanConfig;
 pub use jdbc::JdbcScanConfig;
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
 
@@ -37,6 +39,7 @@ pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange}
 pub enum ScanConfig {
     Jdbc(JdbcScanConfig),
     Hdfs(HdfsScanConfig),
+    IcebergMetadata(IcebergMetadataScanConfig),
     StarRocks(StarRocksScanConfig),
 }
 
@@ -79,10 +82,12 @@ impl Default for ConnectorRegistry {
         let jdbc = Arc::new(JdbcConnector { name: "jdbc" });
         let mysql = Arc::new(JdbcConnector { name: "mysql" });
         let hdfs = Arc::new(HdfsConnector { name: "hdfs" });
+        let iceberg = Arc::new(IcebergConnector { name: "iceberg" });
         let starrocks = Arc::new(StarRocksConnector { name: "starrocks" });
         reg.register_scan_connector(jdbc);
         reg.register_scan_connector(mysql);
         reg.register_scan_connector(hdfs);
+        reg.register_scan_connector(iceberg);
         reg.register_scan_connector(starrocks);
         reg
     }
@@ -132,6 +137,29 @@ impl ScanConnector for HdfsConnector {
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
             ScanConfig::Hdfs(cfg) => Ok(ScanNode::new(Arc::new(hdfs::HdfsScanOp::new(cfg)))),
+            _ => Err(format!(
+                "unsupported scan config for connector {}",
+                self.name
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct IcebergConnector {
+    name: &'static str,
+}
+
+impl ScanConnector for IcebergConnector {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
+        match cfg {
+            ScanConfig::IcebergMetadata(cfg) => Ok(ScanNode::new(Arc::new(
+                iceberg::IcebergMetadataScanOp::new(cfg),
+            ))),
             _ => Err(format!(
                 "unsupported scan config for connector {}",
                 self.name

@@ -15,10 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
 
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
+use crate::connector::iceberg::{
+    IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
+    IcebergMetadataScanRange, IcebergMetadataTableType, build_projected_output_schema,
+    cache_iceberg_object_store_config_for_paths, lookup_iceberg_object_store_config_for_path,
+    lookup_iceberg_table_location, snapshot_iceberg_table_locations,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::ParquetReadCachePolicy;
 use crate::lower::expr::parse_min_max_conjunct;
@@ -35,30 +40,9 @@ use crate::novarocks_connectors::{
 use crate::novarocks_logging::{debug, warn};
 use crate::{descriptors, internal_service, plan_nodes, types};
 
-static ICEBERG_TABLE_LOCATIONS: OnceLock<Mutex<HashMap<types::TTableId, String>>> = OnceLock::new();
-
-fn iceberg_table_locations() -> &'static Mutex<HashMap<types::TTableId, String>> {
-    ICEBERG_TABLE_LOCATIONS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 /// Cache Iceberg table locations from descriptor table for later use in HDFS scan lowering.
 pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDescriptorTable>) {
-    let Some(desc_tbl) = desc_tbl else { return };
-    let Some(tables) = desc_tbl.table_descriptors.as_ref() else {
-        return;
-    };
-    let mut guard = iceberg_table_locations()
-        .lock()
-        .expect("iceberg_table_locations lock");
-    for t in tables {
-        let Some(iceberg) = t.iceberg_table.as_ref() else {
-            continue;
-        };
-        let Some(location) = iceberg.location.as_ref().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        guard.insert(t.id, location.clone());
-    }
+    crate::connector::iceberg::cache_iceberg_table_locations(desc_tbl);
 }
 
 fn apply_path_rewrite(ranges: &mut [FileScanRange]) -> Result<(), String> {
@@ -144,6 +128,21 @@ fn is_paimon_table(desc_tbl: &descriptors::TDescriptorTable, tuple_id: types::TT
         return false;
     };
     table_desc.paimon_table.is_some()
+}
+
+fn find_iceberg_table(
+    desc_tbl: &descriptors::TDescriptorTable,
+    tuple_id: types::TTupleId,
+) -> Option<descriptors::TIcebergTable> {
+    let Ok(tuple_desc) = find_tuple_descriptor(desc_tbl, tuple_id) else {
+        return None;
+    };
+    let table_id = tuple_desc.table_id?;
+    let table_descs = desc_tbl.table_descriptors.as_ref()?;
+    table_descs
+        .iter()
+        .find(|t| t.id == table_id)
+        .and_then(|t| t.iceberg_table.clone())
 }
 
 fn parse_true_false(value: &str) -> Option<bool> {
@@ -347,6 +346,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut data_columns = Vec::new();
     let mut data_slot_ids = Vec::new();
     let mut data_slot_types = Vec::new();
+    let mut iceberg_projected_columns = Vec::new();
 
     let mut row_source_slot: Option<SlotId> = None;
     let mut scan_range_slot: Option<SlotId> = None;
@@ -406,9 +406,14 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
 
-        data_columns.push(name);
+        data_columns.push(name.clone());
         data_slot_ids.push(slot_id);
         data_slot_types.push(primitive);
+        iceberg_projected_columns.push(IcebergArrowColumn {
+            name,
+            data_type: arrow_type,
+            nullable,
+        });
     }
 
     if !slot_ids.is_empty() && slot_ids.len() != columns.len() {
@@ -493,7 +498,24 @@ pub(crate) fn lower_hdfs_scan_node(
         .per_node_scan_ranges
         .get(&node.node_id)
         .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
+    let limit = node.limit;
+    let limit = (limit >= 0).then_some(limit as usize);
+    let connector_io_tasks_per_scan_operator =
+        query_opts.and_then(|opts| opts.connector_io_tasks_per_scan_operator);
+    let iceberg_metadata_table_type = hdfs
+        .metadata_table_type
+        .as_deref()
+        .map(IcebergMetadataTableType::parse)
+        .transpose()?;
+    if row_position_spec.is_some() && iceberg_metadata_table_type.is_some() {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={} does not support row position with Iceberg metadata tables",
+            node.node_id
+        ));
+    }
+    let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
     let mut ranges: Vec<FileScanRange> = Vec::new();
+    let mut iceberg_metadata_ranges: Vec<IcebergMetadataScanRange> = Vec::new();
     let mut has_more = false;
     let mut scan_format: Option<descriptors::THdfsFileFormat> = None;
     let mut next_scan_range_id: i32 = 0;
@@ -507,6 +529,54 @@ pub(crate) fn lower_hdfs_scan_node(
         let Some(hdfs_range) = p.scan_range.hdfs_scan_range.as_ref() else {
             continue;
         };
+        if is_iceberg_metadata_scan {
+            if !hdfs_range.use_iceberg_jni_metadata_reader.unwrap_or(false) {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} expected Iceberg metadata scan range with use_iceberg_jni_metadata_reader=true",
+                    node.node_id
+                ));
+            }
+            let path = if let Some(path) = hdfs_range
+                .full_path
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                path.to_string()
+            } else if let Some(rel) = hdfs_range
+                .relative_path
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                let table_id = hdfs_range.table_id.ok_or_else(|| {
+                    format!(
+                        "HDFS_SCAN_NODE node_id={} has relative_path={rel:?} but missing table_id for Iceberg metadata scan",
+                        node.node_id
+                    )
+                })?;
+                let loc = lookup_iceberg_table_location(table_id).ok_or_else(|| {
+                    format!(
+                        "HDFS_SCAN_NODE node_id={} has relative_path={rel:?} but missing cached iceberg location for table_id={table_id}",
+                        node.node_id
+                    )
+                })?;
+                let base = loc.trim_end_matches('/');
+                let rel = rel.trim_start_matches('/');
+                if rel.is_empty() {
+                    base.to_string()
+                } else {
+                    format!("{base}/{rel}")
+                }
+            } else {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} Iceberg metadata scan requires full_path or relative_path",
+                    node.node_id
+                ));
+            };
+            iceberg_metadata_ranges.push(IcebergMetadataScanRange { path });
+            continue;
+        }
         if hdfs_range.use_paimon_jni_reader.unwrap_or(false) {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={} does not support Paimon JNI reader; require raw parquet/orc scan ranges",
@@ -676,17 +746,12 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id
                 )
             })?;
-            let loc = iceberg_table_locations()
-                .lock()
-                .expect("iceberg_table_locations lock")
-                .get(&table_id)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "HDFS_SCAN_NODE node_id={} has relative_path={rp:?} but missing cached iceberg location for table_id={table_id}",
-                        node.node_id
-                    )
-                })?;
+            let loc = lookup_iceberg_table_location(table_id).ok_or_else(|| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={} has relative_path={rp:?} but missing cached iceberg location for table_id={table_id}",
+                    node.node_id
+                )
+            })?;
             let base = loc.trim_end_matches('/');
             let rel = rp.trim_start_matches('/');
             ranges.push(FileScanRange {
@@ -700,16 +765,56 @@ pub(crate) fn lower_hdfs_scan_node(
             });
         }
     }
+    if let Some(metadata_table_type) = iceberg_metadata_table_type {
+        let batch_size: usize = query_opts
+            .and_then(|opts| opts.batch_size)
+            .and_then(|bs| usize::try_from(bs).ok())
+            .unwrap_or(4096)
+            .max(1);
+        let output_columns = output_slots_from_layout(&out_layout, &slot_info_map)?;
+        let cloud_props = hdfs
+            .cloud_configuration
+            .as_ref()
+            .and_then(|c| c.cloud_properties.as_ref());
+        let object_store_config =
+            resolve_cloud_object_store_config(cloud_props, &[]).or_else(|| {
+                iceberg_metadata_ranges
+                    .iter()
+                    .find_map(|range| lookup_iceberg_object_store_config_for_path(&range.path))
+            });
+        let cfg = IcebergMetadataScanConfig {
+            metadata_table_type,
+            serialized_table: hdfs.serialized_table.clone().unwrap_or_default(),
+            load_column_stats: hdfs.load_column_stats.unwrap_or(false),
+            ranges: iceberg_metadata_ranges,
+            batch_size,
+            output_columns,
+            object_store_config,
+            profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
+        };
+        let scan = connectors
+            .create_scan_node(
+                "iceberg",
+                crate::connector::ScanConfig::IcebergMetadata(cfg),
+            )?
+            .with_node_id(node.node_id)
+            .with_output_slots(slot_ids.clone())
+            .with_limit(limit)
+            .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
+            .with_accept_empty_scan_ranges(true)
+            .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        return Ok(Lowered {
+            node: ExecNode {
+                kind: ExecNodeKind::Scan(scan),
+            },
+            layout: out_layout,
+        });
+    }
     let original_range_count = ranges.len();
     apply_path_rewrite(&mut ranges)?;
-
-    let limit = node.limit;
-    let limit = (limit >= 0).then_some(limit as usize);
     let mut enable_page_index = query_opts
         .and_then(|opts| opts.enable_parquet_reader_page_index)
         .unwrap_or(false);
-    let connector_io_tasks_per_scan_operator =
-        query_opts.and_then(|opts| opts.connector_io_tasks_per_scan_operator);
 
     let mut min_max_predicates = Vec::new();
     if let Some(min_max_conjs) = hdfs.min_max_conjuncts.as_ref() {
@@ -755,6 +860,18 @@ pub(crate) fn lower_hdfs_scan_node(
     let external_datacache = DataCacheManager::instance().external_context(cache_options.clone());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
+    let iceberg_table = find_iceberg_table(desc_tbl, tuple_id);
+    if iceberg_table.is_some() && scan_format == Some(descriptors::THdfsFileFormat::ORC) {
+        return Err(format!(
+            "HDFS_SCAN_NODE node_id={} does not support Iceberg ORC files; NovaRocks currently only supports Parquet for Iceberg schema/partition evolution",
+            node.node_id
+        ));
+    }
+    let iceberg_output_schema = iceberg_table
+        .as_ref()
+        .map(|iceberg| build_projected_output_schema(iceberg, &iceberg_projected_columns))
+        .transpose()?
+        .flatten();
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
         slot_ids: data_slot_ids,
@@ -770,6 +887,7 @@ pub(crate) fn lower_hdfs_scan_node(
             u32::try_from(cache_options.datacache_evict_probability).ok(),
         ),
         profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
+        iceberg_output_schema,
     };
     let orc_cfg = OrcScanConfig {
         columns: parquet_cfg.columns.clone(),
@@ -796,10 +914,10 @@ pub(crate) fn lower_hdfs_scan_node(
         .as_ref()
         .and_then(|c| c.cloud_properties.as_ref());
     let object_store_config = resolve_cloud_object_store_config(cloud_props, &ranges);
-    let iceberg_table_locations = iceberg_table_locations()
-        .lock()
-        .expect("iceberg_table_locations lock")
-        .clone();
+    if let Some(cfg) = object_store_config.as_ref() {
+        cache_iceberg_object_store_config_for_paths(cfg, ranges.iter().map(|r| r.path.as_str()));
+    }
+    let iceberg_table_locations = snapshot_iceberg_table_locations();
     let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
     let cfg = HdfsScanConfig {
         ranges,
@@ -841,6 +959,37 @@ pub(crate) fn lower_hdfs_scan_node(
         },
         layout: out_layout,
     })
+}
+
+fn output_slots_from_layout(
+    layout: &Layout,
+    slot_info_map: &HashMap<
+        SlotId,
+        (
+            String,
+            types::TPrimitiveType,
+            arrow::datatypes::DataType,
+            bool,
+        ),
+    >,
+) -> Result<Vec<IcebergMetadataOutputColumn>, String> {
+    layout
+        .order
+        .iter()
+        .map(|(_, slot_id)| {
+            let slot_id = SlotId::try_from(*slot_id)?;
+            let (name, _, data_type, nullable) = slot_info_map
+                .get(&slot_id)
+                .ok_or_else(|| format!("missing slot info for slot_id={slot_id}"))?
+                .clone();
+            Ok(IcebergMetadataOutputColumn {
+                name,
+                slot_id,
+                data_type,
+                nullable,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

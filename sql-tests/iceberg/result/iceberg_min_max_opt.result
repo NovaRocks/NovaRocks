@@ -1,0 +1,2 @@
+min_tinyint	max_tinyint	min_smallint	max_smallint	min_int	max_int	min_bigint	max_bigint	min_bool	max_bool	min_float	max_float	min_double	max_double	min_date	max_date
+1	3	10	30	100	300	1000	3000	0	1	1.1	3.3	2.2	4.4	2025-06-29	2025-07-01

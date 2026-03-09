@@ -34,7 +34,6 @@ mod exchange_source;
 mod fetch_processor;
 mod filter_processor;
 pub(crate) mod hashjoin;
-mod iceberg_table_sink;
 mod limit_processor;
 mod local_exchange_sink;
 mod local_exchange_source;
@@ -54,6 +53,7 @@ mod table_function_processor;
 mod values_source;
 
 // Re-export all public types to maintain compatibility
+pub use crate::connector::iceberg::IcebergTableSinkFactory;
 pub use crate::connector::starrocks::sink::OlapTableSinkFactory;
 pub use aggregate::AggregateProcessorFactory;
 pub use analytic_sink::AnalyticSinkFactory;
@@ -67,7 +67,6 @@ pub use hashjoin::{
     BroadcastJoinProbeProcessorFactory, HashJoinBuildSinkFactory,
     PartitionedJoinProbeProcessorFactory,
 };
-pub use iceberg_table_sink::IcebergTableSinkFactory;
 pub use limit_processor::LimitProcessorFactory;
 pub use local_exchange_sink::LocalExchangeSinkFactory;
 pub use local_exchange_source::LocalExchangeSourceFactory;
