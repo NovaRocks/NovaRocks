@@ -56,6 +56,7 @@ const STARROCKS_TYPE_HLL: &str = "HLL";
 const STARROCKS_TYPE_OBJECT: &str = "OBJECT";
 const STARROCKS_TYPE_BITMAP: &str = "BITMAP";
 const STARROCKS_TYPE_JSON: &str = "JSON";
+const STARROCKS_TYPE_PERCENTILE: &str = "PERCENTILE";
 const STARROCKS_TYPE_BINARY: &str = "BINARY";
 const STARROCKS_TYPE_VARBINARY: &str = "VARBINARY";
 const STARROCKS_TYPE_DECIMAL32: &str = "DECIMAL32";
@@ -67,7 +68,7 @@ const STARROCKS_TYPE_MAP: &str = "MAP";
 const STARROCKS_TYPE_STRUCT: &str = "STRUCT";
 pub(crate) const FIELD_META_STARROCKS_COLUMN_ID: &str = "starrocks.format.column.id";
 pub(crate) const FIELD_META_STARROCKS_DEFAULT_VALUE: &str = "starrocks.format.column.default_value";
-const SUPPORTED_SCHEMA_TYPES: [&str; 29] = [
+const SUPPORTED_SCHEMA_TYPES: [&str; 30] = [
     STARROCKS_TYPE_TINYINT,
     STARROCKS_TYPE_SMALLINT,
     STARROCKS_TYPE_INT,
@@ -88,6 +89,7 @@ const SUPPORTED_SCHEMA_TYPES: [&str; 29] = [
     STARROCKS_TYPE_OBJECT,
     STARROCKS_TYPE_BITMAP,
     STARROCKS_TYPE_JSON,
+    STARROCKS_TYPE_PERCENTILE,
     STARROCKS_TYPE_BINARY,
     STARROCKS_TYPE_VARBINARY,
     STARROCKS_TYPE_DECIMAL32,
@@ -116,6 +118,7 @@ enum SupportedSchemaType {
     Varchar,
     Hll,
     Object,
+    Percentile,
     Binary,
     VarBinary,
     Decimal32,
@@ -148,6 +151,7 @@ impl SupportedSchemaType {
             STARROCKS_TYPE_OBJECT | STARROCKS_TYPE_BITMAP | STARROCKS_TYPE_JSON => {
                 Some(Self::Object)
             }
+            STARROCKS_TYPE_PERCENTILE => Some(Self::Percentile),
             STARROCKS_TYPE_BINARY => Some(Self::Binary),
             STARROCKS_TYPE_VARBINARY => Some(Self::VarBinary),
             STARROCKS_TYPE_DECIMAL32 => Some(Self::Decimal32),
@@ -177,6 +181,7 @@ impl SupportedSchemaType {
             Self::Varchar => STARROCKS_TYPE_VARCHAR,
             Self::Hll => STARROCKS_TYPE_HLL,
             Self::Object => STARROCKS_TYPE_OBJECT,
+            Self::Percentile => STARROCKS_TYPE_PERCENTILE,
             Self::Binary => STARROCKS_TYPE_BINARY,
             Self::VarBinary => STARROCKS_TYPE_VARBINARY,
             Self::Decimal32 => STARROCKS_TYPE_DECIMAL32,
@@ -205,6 +210,7 @@ impl SupportedSchemaType {
             Self::Varchar => "Utf8",
             Self::Hll => "Binary",
             Self::Object => "Binary",
+            Self::Percentile => "Binary",
             Self::Binary => "Binary",
             Self::VarBinary => "Binary",
             Self::Decimal32 => "Decimal128(precision<=9,scale)",
@@ -234,6 +240,8 @@ impl SupportedSchemaType {
             | (Self::Hll, DataType::Utf8)
             | (Self::Object, DataType::Binary)
             | (Self::Object, DataType::Utf8)
+            | (Self::Percentile, DataType::Binary)
+            | (Self::Percentile, DataType::Utf8)
             | (Self::Binary, DataType::Binary)
             | (Self::VarBinary, DataType::Binary) => true,
             (Self::LargeInt, DataType::FixedSizeBinary(width))
@@ -506,6 +514,56 @@ pub fn build_native_read_plan(
             &current_lookup,
             segment_source_schema,
         )?;
+        if segment_projected_columns.len() != projected_columns.len() {
+            let global_columns = projected_columns
+                .iter()
+                .map(|col| {
+                    format!(
+                        "{}#{}:{}",
+                        col.output_index, col.output_name, col.schema_unique_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let segment_columns = segment_projected_columns
+                .iter()
+                .map(|col| {
+                    format!(
+                        "{}#{}:{}",
+                        col.output_index, col.output_name, col.schema_unique_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let segment_schema_columns = segment_source_schema
+                .map(|schema| {
+                    schema
+                        .column
+                        .iter()
+                        .map(|col| {
+                            format!(
+                                "{}:{}",
+                                col.name.as_deref().unwrap_or("<unnamed>"),
+                                col.unique_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "<none>".to_string());
+            return Err(format!(
+                "segment projected column count drifted from global plan: tablet_id={}, version={}, segment_index={}, path={}, global_count={}, segment_count={}, global_columns=[{}], segment_columns=[{}], segment_schema_columns=[{}]",
+                snapshot.tablet_id,
+                snapshot.version,
+                idx,
+                segment.path,
+                projected_columns.len(),
+                segment_projected_columns.len(),
+                global_columns,
+                segment_columns,
+                segment_schema_columns
+            ));
+        }
         let footer_unique_ids = collect_unique_ids(&footer.columns)?;
         let mut projected_schemas = Vec::with_capacity(projected_columns.len());
         let mut source_column_missing_by_output = Vec::with_capacity(projected_columns.len());
@@ -1202,6 +1260,7 @@ fn infer_group_key_arrow_type(
         }
         SupportedSchemaType::Hll
         | SupportedSchemaType::Object
+        | SupportedSchemaType::Percentile
         | SupportedSchemaType::Array
         | SupportedSchemaType::Map
         | SupportedSchemaType::Struct => Err(format!(

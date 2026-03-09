@@ -26,7 +26,8 @@ use crate::types;
 
 use super::chunk_builder::{SchemaRow, SchemaValue, normalize_column_key};
 use super::frontend::{
-    build_auth_info, ensure_ok_status, extract_db_name, forward_show_result, with_frontend_client,
+    build_auth_info, effective_current_user_ident, ensure_ok_status, extract_db_name,
+    forward_show_result, with_frontend_client,
 };
 use super::{SchemaScanContext, SchemaTable};
 
@@ -191,7 +192,7 @@ fn fetch_fe_tablet_schedules(
         ctx.type_.clone(),
         ctx.state.clone(),
         ctx.limit,
-        ctx.current_user_ident.clone(),
+        effective_current_user_ident(ctx),
     );
     let response = with_frontend_client(fe_addr, |client| {
         client
@@ -376,7 +377,7 @@ fn fetch_table_privileges(
     ctx: &SchemaScanContext,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
-    let request = frontend_service::TGetTablePrivsParams::new(ctx.current_user_ident.clone());
+    let request = frontend_service::TGetTablePrivsParams::new(effective_current_user_ident(ctx));
     let response = with_frontend_client(fe_addr, |client| {
         client
             .get_table_privs(request)
@@ -396,7 +397,7 @@ fn fetch_tasks(
 ) -> Result<Vec<SchemaRow>, String> {
     let request = frontend_service::TGetTasksParams::new(
         ctx.db.clone(),
-        ctx.current_user_ident.clone(),
+        effective_current_user_ident(ctx),
         None::<String>,
         None::<String>,
         ctx.state.clone(),
@@ -435,7 +436,7 @@ fn fetch_user_privileges(
     ctx: &SchemaScanContext,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
-    let request = frontend_service::TGetUserPrivsParams::new(ctx.current_user_ident.clone());
+    let request = frontend_service::TGetUserPrivsParams::new(effective_current_user_ident(ctx));
     let response = with_frontend_client(fe_addr, |client| {
         client
             .get_user_privs(request)
@@ -463,7 +464,7 @@ fn fetch_schema_privileges(
     ctx: &SchemaScanContext,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
-    let request = frontend_service::TGetDBPrivsParams::new(ctx.current_user_ident.clone());
+    let request = frontend_service::TGetDBPrivsParams::new(effective_current_user_ident(ctx));
     let response = with_frontend_client(fe_addr, |client| {
         client.get_d_b_privs(request).map_err(|err| err.to_string())
     })?;
@@ -638,7 +639,7 @@ fn fetch_pipes(
     ctx: &SchemaScanContext,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
-    let request = frontend_service::TListPipesParams::new(ctx.current_user_ident.clone());
+    let request = frontend_service::TListPipesParams::new(effective_current_user_ident(ctx));
     let response = with_frontend_client(fe_addr, |client| {
         client.list_pipes(request).map_err(|err| err.to_string())
     })?;
@@ -654,7 +655,7 @@ fn fetch_pipe_files(
     ctx: &SchemaScanContext,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
-    let request = frontend_service::TListPipeFilesParams::new(ctx.current_user_ident.clone());
+    let request = frontend_service::TListPipeFilesParams::new(effective_current_user_ident(ctx));
     let response = with_frontend_client(fe_addr, |client| {
         client
             .list_pipe_files(request)
@@ -774,7 +775,7 @@ fn fetch_columns(
                 table_name.clone(),
                 ctx.user.clone(),
                 ctx.user_ip.clone().or_else(|| ctx.ip.clone()),
-                ctx.current_user_ident.clone(),
+                effective_current_user_ident(ctx),
                 None::<i64>,
                 ctx.catalog_name.clone(),
             );
@@ -808,7 +809,7 @@ fn fetch_materialized_views(
             None::<String>,
             ctx.user.clone(),
             ctx.user_ip.clone().or_else(|| ctx.ip.clone()),
-            ctx.current_user_ident.clone(),
+            effective_current_user_ident(ctx),
             Some(types::TTableType::MATERIALIZED_VIEW),
             None::<i64>,
             ctx.catalog_name.clone(),
@@ -832,7 +833,7 @@ fn fetch_task_runs(
 ) -> Result<Vec<SchemaRow>, String> {
     let request = frontend_service::TGetTasksParams::new(
         ctx.db.clone(),
-        ctx.current_user_ident.clone(),
+        effective_current_user_ident(ctx),
         None::<String>,
         None::<String>,
         None::<String>,
@@ -944,7 +945,7 @@ fn fetch_recyclebin_catalogs(
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Vec<SchemaRow>, String> {
     let request =
-        frontend_service::TListRecycleBinCatalogsParams::new(ctx.current_user_ident.clone());
+        frontend_service::TListRecycleBinCatalogsParams::new(effective_current_user_ident(ctx));
     let response = with_frontend_client(fe_addr, |client| {
         client
             .list_recycle_bin_catalogs(request)
@@ -1018,7 +1019,7 @@ fn fetch_db_names(
         ctx.wild.clone().or_else(|| ctx.db.clone()),
         ctx.user.clone(),
         ctx.user_ip.clone().or_else(|| ctx.ip.clone()),
-        ctx.current_user_ident.clone(),
+        effective_current_user_ident(ctx),
         ctx.catalog_name.clone(),
     );
     let response = with_frontend_client(fe_addr, |client| {
@@ -1042,7 +1043,7 @@ fn fetch_table_names(
         None::<String>,
         ctx.user.clone(),
         ctx.user_ip.clone().or_else(|| ctx.ip.clone()),
-        ctx.current_user_ident.clone(),
+        effective_current_user_ident(ctx),
         None::<types::TTableType>,
         None::<i64>,
         ctx.catalog_name.clone(),

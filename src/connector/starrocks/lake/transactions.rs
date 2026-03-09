@@ -46,9 +46,9 @@ use crate::connector::starrocks::starmgr;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::formats::starrocks::writer::bundle_meta::{
     BundleMetaWriteEntry, decode_bundle_metadata_from_bytes,
-    decode_tablet_metadata_from_bundle_bytes, empty_tablet_metadata,
-    load_tablet_metadata_at_version, next_rowset_id, parse_bundle_version_from_meta_file_name,
-    write_bundle_meta_file, write_bundle_meta_file_batch,
+    decode_tablet_metadata_from_bundle_bytes, discover_latest_tablet_metadata_version_at_most,
+    empty_tablet_metadata, load_tablet_metadata_at_version, next_rowset_id,
+    parse_bundle_version_from_meta_file_name, write_bundle_meta_file, write_bundle_meta_file_batch,
 };
 use crate::formats::starrocks::writer::io::{
     delete_path_if_exists, read_bytes_if_exists, write_bytes,
@@ -652,19 +652,45 @@ fn synthesize_missing_bundle_siblings(
         let runtime = get_runtime_for_publish(tablet_id, base_version)?;
         let mut metadata = if base_version == 0 {
             empty_tablet_metadata(tablet_id)
-        } else {
-            match load_tablet_metadata_with_missing_page_policy(
-                &runtime.root_path,
+        } else if let Some((source_version, meta)) = load_bundle_sibling_source_metadata(
+            &runtime.root_path,
+            tablet_id,
+            new_version,
+            txn_infos,
+        )? {
+            info!(
+                target: "novarocks::lake",
                 tablet_id,
                 base_version,
-                true,
-            )? {
-                Some(meta) => meta,
-                None => empty_tablet_metadata(tablet_id),
-            }
+                new_version,
+                source_version,
+                root_path,
+                "publish_version synthesized sibling tablet from latest existing metadata before final bundle write"
+            );
+            meta
+        } else if can_bootstrap_missing_base_metadata(base_version, &runtime.root_path) {
+            info!(
+                target: "novarocks::lake",
+                tablet_id,
+                base_version,
+                new_version,
+                root_path,
+                "publish_version synthesized sibling from empty metadata because no prior metadata exists during bootstrap"
+            );
+            empty_tablet_metadata(tablet_id)
+        } else {
+            return Err(format!(
+                "publish_version cannot synthesize sibling tablet without prior metadata: tablet_id={} base_version={} new_version={} root_path={}",
+                tablet_id, base_version, new_version, runtime.root_path
+            ));
         };
         metadata.id = Some(tablet_id);
         metadata.version = Some(new_version);
+        if let Some(commit_time) = txn_infos.last().and_then(|info| info.commit_time)
+            && commit_time > 0
+        {
+            metadata.commit_time = Some(commit_time);
+        }
         metadata.gtid = Some(publish_gtid);
         if metadata.next_rowset_id.is_none() {
             metadata.next_rowset_id = Some(next_rowset_id(&metadata.rowsets));
@@ -689,6 +715,44 @@ fn synthesize_missing_bundle_siblings(
         ));
     }
     Ok(())
+}
+
+fn load_bundle_sibling_source_metadata(
+    root_path: &str,
+    tablet_id: i64,
+    new_version: i64,
+    txn_infos: &[TxnInfoPb],
+) -> Result<Option<(i64, TabletMetadataPb)>, String> {
+    if let Some(existing) = probe_new_version_metadata(root_path, tablet_id, new_version, true)?
+        .filter(|meta| is_existing_metadata_published_for_target_txn(meta, txn_infos))
+    {
+        return Ok(Some((new_version, existing)));
+    }
+
+    let upper_bound = new_version.saturating_sub(1);
+    if upper_bound <= 0 {
+        return Ok(None);
+    }
+
+    let Some(source_version) =
+        discover_latest_tablet_metadata_version_at_most(root_path, tablet_id, upper_bound)?
+    else {
+        return Ok(None);
+    };
+
+    let metadata = load_tablet_metadata_with_missing_page_policy(
+        root_path,
+        tablet_id,
+        source_version,
+        true,
+    )?
+    .ok_or_else(|| {
+        format!(
+            "publish_version discovered sibling source metadata version but could not load tablet page: tablet_id={} source_version={} root_path={}",
+            tablet_id, source_version, root_path
+        )
+    })?;
+    Ok(Some((source_version, metadata)))
 }
 
 fn record_published_txn_rows_for_tablet(
@@ -2692,8 +2756,6 @@ fn initialize_publish_state(
         ));
     }
     let current_base_version = base_version;
-    let can_bootstrap_missing_base_metadata =
-        current_base_version == 1 || is_internal_statistics_tablet_root(&runtime.root_path);
     let metadata = if current_base_version == 0 {
         empty_tablet_metadata(tablet_id)
     } else {
@@ -2715,11 +2777,10 @@ fn initialize_publish_state(
                 {
                     return Ok(PublishInit::AlreadyPublished(published_meta));
                 }
-                let no_txn_logs_for_this_tablet =
-                    has_no_publish_logs_for_tablet(&runtime.root_path, tablet_id, txn_infos)?;
-                if can_bootstrap_missing_base_metadata || no_txn_logs_for_this_tablet {
-                    // Allow untouched tablets to advance publish lineage even when
-                    // partition-root bundle metadata doesn't contain a tablet page yet.
+                if can_bootstrap_missing_base_metadata(current_base_version, &runtime.root_path) {
+                    // Only allow version-1 bootstrap roots to synthesize empty metadata.
+                    // For later versions, treating a missing tablet page as empty metadata
+                    // can silently wipe untouched tablets during rollup/schema-change publish.
                     empty_tablet_metadata(tablet_id)
                 } else {
                     return Err(format!(
@@ -2743,6 +2804,10 @@ fn initialize_publish_state(
         new_version,
         metadata,
     }))
+}
+
+fn can_bootstrap_missing_base_metadata(base_version: i64, root_path: &str) -> bool {
+    base_version == 1 || is_internal_statistics_tablet_root(root_path)
 }
 
 fn is_existing_metadata_published_for_target_txn(
@@ -3010,6 +3075,7 @@ mod tests {
     use crate::formats::starrocks::writer::StarRocksWriteFormat;
     use crate::formats::starrocks::writer::bundle_meta::{
         load_tablet_metadata_at_version, write_bundle_meta_file, write_initial_meta_file,
+        write_standalone_meta_file,
     };
     use crate::formats::starrocks::writer::io::{read_bytes, write_bytes};
     use crate::formats::starrocks::writer::layout::{
@@ -3831,6 +3897,195 @@ mod tests {
             .expect("sibling 2 metadata exists");
         assert_eq!(meta1.version, Some(2));
         assert_eq!(meta2.version, Some(2));
+    }
+
+    #[test]
+    fn publish_version_rejects_missing_sibling_tablet_page_after_bootstrap_versions() {
+        let _guard = lock_runtime_test_state();
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let tablet_id_1 = 88151;
+        let tablet_id_2 = 88152;
+        let ctx1 = test_context(&root, 7151, tablet_id_1, 4151);
+        let ctx2 = test_context(&root, 7152, tablet_id_2, 4152);
+        register_tablet_runtime(&ctx1).expect("register tablet 1 runtime");
+        register_tablet_runtime(&ctx2).expect("register tablet 2 runtime");
+        crate::runtime::starlet_shard_registry::upsert_many_infos(vec![
+            (
+                tablet_id_1,
+                crate::runtime::starlet_shard_registry::StarletShardInfo {
+                    full_path: root.clone(),
+                    s3: None,
+                },
+            ),
+            (
+                tablet_id_2,
+                crate::runtime::starlet_shard_registry::StarletShardInfo {
+                    full_path: root.clone(),
+                    s3: None,
+                },
+            ),
+        ]);
+
+        let mut initial_metadata =
+            crate::formats::starrocks::writer::bundle_meta::empty_tablet_metadata(tablet_id_1);
+        initial_metadata.version = Some(1);
+        initial_metadata.schema = Some(ctx1.tablet_schema.clone());
+        if let Some(schema_id) = ctx1.tablet_schema.id {
+            initial_metadata
+                .historical_schemas
+                .insert(schema_id, ctx1.tablet_schema.clone());
+        }
+        write_initial_meta_file(&root, &initial_metadata).expect("write initial metadata");
+
+        let mut version_2_meta = initial_metadata.clone();
+        version_2_meta.version = Some(2);
+        write_bundle_meta_file(&root, tablet_id_1, 2, &ctx1.tablet_schema, &version_2_meta)
+            .expect("write v2 metadata for tablet 1 only");
+
+        let req = PublishVersionRequest {
+            tablet_ids: vec![tablet_id_1],
+            txn_ids: Vec::new(),
+            base_version: Some(2),
+            new_version: Some(3),
+            commit_time: Some(456),
+            timeout_ms: None,
+            txn_infos: vec![default_txn_info(super::EMPTY_TXNLOG_TXN_ID)],
+            rebuild_pindex_tablet_ids: Vec::new(),
+            enable_aggregate_publish: None,
+            resharding_tablet_infos: Vec::new(),
+        };
+
+        let resp = publish_version(&req).expect("publish version should return response");
+        assert_eq!(resp.failed_tablets, vec![tablet_id_1]);
+        assert!(
+            load_tablet_metadata_at_version(&root, tablet_id_1, 3)
+                .expect("load v3 metadata for tablet 1")
+                .is_none(),
+            "tablet 1 should not publish a v3 empty metadata page when sibling bundle page is missing"
+        );
+        assert!(
+            load_tablet_metadata_at_version(&root, tablet_id_2, 3)
+                .expect("load v3 metadata for tablet 2")
+                .is_none(),
+            "tablet 2 should not be synthesized from empty metadata after bootstrap versions"
+        );
+    }
+
+    #[test]
+    fn publish_version_schema_change_gap_preserves_untouched_sibling_latest_rows() {
+        let _guard = lock_runtime_test_state();
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let base_tablet_id = 88251;
+        let mv_tablet_id = 88252;
+        let txn_id = 182251;
+        let base_ctx = test_context(&root, 7251, base_tablet_id, 4251);
+        let mv_ctx = test_context(&root, 7252, mv_tablet_id, 4252);
+        register_tablet_runtime(&base_ctx).expect("register base tablet runtime");
+        register_tablet_runtime(&mv_ctx).expect("register mv tablet runtime");
+        crate::runtime::starlet_shard_registry::upsert_many_infos(vec![
+            (
+                base_tablet_id,
+                crate::runtime::starlet_shard_registry::StarletShardInfo {
+                    full_path: root.clone(),
+                    s3: None,
+                },
+            ),
+            (
+                mv_tablet_id,
+                crate::runtime::starlet_shard_registry::StarletShardInfo {
+                    full_path: root.clone(),
+                    s3: None,
+                },
+            ),
+        ]);
+
+        let mut base_v2 =
+            crate::formats::starrocks::writer::bundle_meta::empty_tablet_metadata(base_tablet_id);
+        base_v2.id = Some(base_tablet_id);
+        base_v2.version = Some(2);
+        base_v2.schema = Some(base_ctx.tablet_schema.clone());
+        if let Some(schema_id) = base_ctx.tablet_schema.id {
+            base_v2
+                .historical_schemas
+                .insert(schema_id, base_ctx.tablet_schema.clone());
+            base_v2.rowset_to_schema.insert(1, schema_id);
+        }
+        let mut base_rowset = test_rowset("seg_base_v2.dat", 7, 56);
+        base_rowset.id = Some(1);
+        base_rowset.version = Some(2);
+        base_v2.rowsets = vec![base_rowset];
+        base_v2.next_rowset_id = Some(2);
+        write_bundle_meta_file(&root, base_tablet_id, 2, &base_ctx.tablet_schema, &base_v2)
+            .expect("write base tablet v2 metadata");
+
+        let mut mv_v1 =
+            crate::formats::starrocks::writer::bundle_meta::empty_tablet_metadata(mv_tablet_id);
+        mv_v1.id = Some(mv_tablet_id);
+        mv_v1.version = Some(1);
+        mv_v1.schema = Some(mv_ctx.tablet_schema.clone());
+        if let Some(schema_id) = mv_ctx.tablet_schema.id {
+            mv_v1
+                .historical_schemas
+                .insert(schema_id, mv_ctx.tablet_schema.clone());
+        }
+        write_standalone_meta_file(&root, mv_tablet_id, 1, &mv_v1)
+            .expect("write mv tablet v1 metadata");
+
+        let schema_change_log = TxnLogPb {
+            tablet_id: Some(mv_tablet_id),
+            txn_id: Some(txn_id),
+            op_write: None,
+            op_compaction: None,
+            op_schema_change: Some(txn_log_pb::OpSchemaChange {
+                rowsets: vec![test_rowset("seg_mv_v3.dat", 3, 24)],
+                linked_segment: Some(false),
+                alter_version: Some(2),
+                delvec_meta: None,
+            }),
+            op_alter_metadata: None,
+            op_replication: None,
+            partition_id: Some(1),
+            load_id: None,
+        };
+        let txn_log_path =
+            txn_log_file_path(&root, mv_tablet_id, txn_id).expect("build schema change txn log");
+        write_txn_log_file(&txn_log_path, &schema_change_log).expect("write schema change txn log");
+
+        let req = PublishVersionRequest {
+            tablet_ids: vec![mv_tablet_id],
+            txn_ids: Vec::new(),
+            base_version: Some(1),
+            new_version: Some(3),
+            commit_time: Some(789),
+            timeout_ms: None,
+            txn_infos: vec![default_txn_info(txn_id)],
+            rebuild_pindex_tablet_ids: Vec::new(),
+            enable_aggregate_publish: None,
+            resharding_tablet_infos: Vec::new(),
+        };
+
+        let resp = publish_version(&req).expect("schema change publish should succeed");
+        assert!(
+            resp.failed_tablets.is_empty(),
+            "unexpected failed tablets: {:?}",
+            resp.failed_tablets
+        );
+
+        let preserved_base = load_tablet_metadata_at_version(&root, base_tablet_id, 3)
+            .expect("load base tablet v3 metadata")
+            .expect("base tablet v3 metadata exists");
+        assert_eq!(preserved_base.version, Some(3));
+        assert_eq!(preserved_base.rowsets.len(), 1);
+        assert_eq!(super::tablet_row_count(&preserved_base), 7);
+
+        let mv_meta = load_tablet_metadata_at_version(&root, mv_tablet_id, 3)
+            .expect("load mv tablet v3 metadata")
+            .expect("mv tablet v3 metadata exists");
+        assert_eq!(mv_meta.version, Some(3));
+        assert_eq!(mv_meta.rowsets.len(), 1);
+        assert_eq!(super::tablet_row_count(&mv_meta), 3);
     }
 
     #[test]

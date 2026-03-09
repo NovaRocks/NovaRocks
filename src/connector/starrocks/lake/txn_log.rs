@@ -2498,6 +2498,7 @@ fn native_writer_supports_column(column: &ColumnPb) -> bool {
             | "BINARY"
             | "VARBINARY"
             | "HLL"
+            | "PERCENTILE"
             | "BITMAP"
             | "OBJECT"
             | "JSON"

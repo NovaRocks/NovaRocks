@@ -262,6 +262,516 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
     Ok(out)
 }
 
+pub(crate) fn http_json_row_from_arrays_with_primitives(
+    columns: &[ArrayRef],
+    row: usize,
+    primitive_types: Option<&[types::TPrimitiveType]>,
+    json_semantics: Option<&[bool]>,
+) -> Result<Vec<u8>, String> {
+    let mut out = String::from("{\"data\":[");
+    for (idx, col) in columns.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        let primitive = primitive_types
+            .and_then(|prims| prims.get(idx))
+            .copied()
+            .unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+        let json_semantic = json_semantics
+            .and_then(|flags| flags.get(idx))
+            .copied()
+            .unwrap_or(false);
+        append_http_json_value(&mut out, col, row, primitive, json_semantic)?;
+    }
+    out.push_str("]}\n");
+    Ok(out.into_bytes())
+}
+
+fn append_http_json_quoted(out: &mut String, value: &str) -> Result<(), String> {
+    let encoded =
+        serde_json::to_string(value).map_err(|e| format!("encode HTTP json string failed: {e}"))?;
+    out.push_str(&encoded);
+    Ok(())
+}
+
+fn append_http_json_value(
+    out: &mut String,
+    col: &ArrayRef,
+    row: usize,
+    primitive: types::TPrimitiveType,
+    json_semantic: bool,
+) -> Result<(), String> {
+    if col.is_null(row) {
+        out.push_str("null");
+        return Ok(());
+    }
+
+    match col.data_type() {
+        DataType::Null => out.push_str("null"),
+        DataType::Boolean => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+            out.push_str(if arr.value(row) { "true" } else { "false" });
+        }
+        DataType::Int64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
+            out.push_str(&arr.value(row).to_string());
+        }
+        DataType::Int32 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
+            out.push_str(&arr.value(row).to_string());
+        }
+        DataType::Int16 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
+            out.push_str(&arr.value(row).to_string());
+        }
+        DataType::Int8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
+            out.push_str(&arr.value(row).to_string());
+        }
+        DataType::Float64 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
+            let value = arr.value(row);
+            if value.is_finite() {
+                out.push_str(&value.to_string());
+            } else {
+                out.push_str("null");
+            }
+        }
+        DataType::Float32 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
+            let value = arr.value(row);
+            if value.is_finite() {
+                out.push_str(&value.to_string());
+            } else {
+                out.push_str("null");
+            }
+        }
+        DataType::Utf8 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+            let value = arr.value(row);
+            if json_semantic || primitive == types::TPrimitiveType::JSON {
+                serde_json::from_str::<serde_json::Value>(value).map_err(|e| {
+                    format!("invalid JSON UTF8 value for HTTP result row: value={value}, error={e}")
+                })?;
+                out.push_str(value);
+            } else {
+                append_http_json_quoted(out, value)?;
+            }
+        }
+        DataType::Date32 => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
+            append_http_json_quoted(out, &format_date32_for_mysql(arr.value(row)))?;
+        }
+        DataType::Timestamp(unit, tz) => {
+            let tz = tz.as_deref();
+            let ts = match unit {
+                TimeUnit::Second => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
+                    format_timestamp_with_primitive(TimeUnit::Second, arr.value(row), tz, primitive)
+                }
+                TimeUnit::Millisecond => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast to TimestampMillisecondArray".to_string()
+                        })?;
+                    format_timestamp_with_primitive(
+                        TimeUnit::Millisecond,
+                        arr.value(row),
+                        tz,
+                        primitive,
+                    )
+                }
+                TimeUnit::Microsecond => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast to TimestampMicrosecondArray".to_string()
+                        })?;
+                    format_timestamp_with_primitive(
+                        TimeUnit::Microsecond,
+                        arr.value(row),
+                        tz,
+                        primitive,
+                    )
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast to TimestampNanosecondArray".to_string()
+                        })?;
+                    format_timestamp_with_primitive(
+                        TimeUnit::Nanosecond,
+                        arr.value(row),
+                        tz,
+                        primitive,
+                    )
+                }
+            };
+            append_http_json_quoted(out, &ts)?;
+        }
+        DataType::Decimal128(_, scale) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+            append_http_json_quoted(out, &format_decimal(arr.value(row), *scale))?;
+        }
+        DataType::Decimal256(_, scale) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
+            append_http_json_quoted(out, &format_decimal256(arr.value(row), *scale))?;
+        }
+        DataType::Binary => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
+            append_http_json_quoted(out, &String::from_utf8_lossy(arr.value(row)))?;
+        }
+        DataType::FixedSizeBinary(width) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
+            if primitive == types::TPrimitiveType::LARGEINT
+                || *width == largeint::LARGEINT_BYTE_WIDTH
+            {
+                let value = largeint::i128_from_be_bytes(arr.value(row))?;
+                append_http_json_quoted(out, &value.to_string())?;
+            } else {
+                append_http_json_quoted(out, &String::from_utf8_lossy(arr.value(row)))?;
+            }
+        }
+        DataType::LargeBinary => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
+            let text = VariantValue::from_serialized(arr.value(row))
+                .and_then(|v| v.to_json_local())
+                .map_err(|e| {
+                    format!("decode VARIANT/JSON column for HTTP result row failed: {e}")
+                })?;
+            serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
+                format!("invalid JSON VARIANT value for HTTP result row: value={text}, error={e}")
+            })?;
+            out.push_str(&text);
+        }
+        DataType::List(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+            let offsets = arr.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let values = arr.values();
+            let item_is_json = list_item_json_semantic(arr.data_type());
+            out.push('[');
+            for idx in start..end {
+                if idx > start {
+                    out.push(',');
+                }
+                append_http_json_value(
+                    out,
+                    &values,
+                    idx,
+                    types::TPrimitiveType::INVALID_TYPE,
+                    item_is_json,
+                )?;
+            }
+            out.push(']');
+        }
+        DataType::LargeList(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| "failed to downcast to LargeListArray".to_string())?;
+            let offsets = arr.value_offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let values = arr.values();
+            let item_is_json = list_item_json_semantic(arr.data_type());
+            out.push('[');
+            for idx in start..end {
+                if idx > start {
+                    out.push(',');
+                }
+                append_http_json_value(
+                    out,
+                    &values,
+                    idx,
+                    types::TPrimitiveType::INVALID_TYPE,
+                    item_is_json,
+                )?;
+            }
+            out.push(']');
+        }
+        DataType::Map(_, _) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+            let offsets = arr.offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let keys = arr.keys();
+            let values = arr.values();
+            let value_is_json = map_value_json_semantic(arr.data_type());
+            let mut entry_indices: Vec<usize> = (start..end).collect();
+            if !matches!(keys.data_type(), DataType::Utf8) {
+                sort_map_entry_indices(keys, &mut entry_indices)?;
+            }
+            out.push('{');
+            for (idx, entry_idx) in entry_indices.into_iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                append_http_json_quoted(out, &http_json_object_key(keys, entry_idx)?)?;
+                out.push(':');
+                append_http_json_value(
+                    out,
+                    &values,
+                    entry_idx,
+                    types::TPrimitiveType::INVALID_TYPE,
+                    value_is_json,
+                )?;
+            }
+            out.push('}');
+        }
+        DataType::Struct(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+            let fields = arr.fields();
+            out.push('{');
+            for (idx, field) in fields.iter().enumerate() {
+                if idx > 0 {
+                    out.push(',');
+                }
+                append_http_json_quoted(out, field.name())?;
+                out.push(':');
+                append_http_json_value(
+                    out,
+                    &arr.column(idx),
+                    row,
+                    types::TPrimitiveType::INVALID_TYPE,
+                    field
+                        .metadata()
+                        .get(FIELD_META_PRIMITIVE_TYPE)
+                        .is_some_and(|v| v == FIELD_META_PRIMITIVE_JSON),
+                )?;
+            }
+            out.push('}');
+        }
+        other => {
+            return Err(format!(
+                "unsupported array type in http_json_row_from_arrays_with_primitives: {:?}",
+                other
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn http_json_object_key(keys: &ArrayRef, row: usize) -> Result<String, String> {
+    if keys.is_null(row) {
+        return Err("map key should not be null in HTTP JSON row".to_string());
+    }
+    match keys.data_type() {
+        DataType::Boolean => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast map key to BooleanArray".to_string())?;
+            Ok(if arr.value(row) { "true" } else { "false" }.to_string())
+        }
+        DataType::Int64 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to downcast map key to Int64Array".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Int32 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to downcast map key to Int32Array".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Int16 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to downcast map key to Int16Array".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Int8 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "failed to downcast map key to Int8Array".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Float64 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast map key to Float64Array".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Float32 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast map key to Float32Array".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Utf8 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast map key to StringArray".to_string())?;
+            Ok(arr.value(row).to_string())
+        }
+        DataType::Date32 => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast map key to Date32Array".to_string())?;
+            Ok(format_date32_for_mysql(arr.value(row)))
+        }
+        DataType::Decimal128(_, scale) => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "failed to downcast map key to Decimal128Array".to_string())?;
+            Ok(format_decimal(arr.value(row), *scale))
+        }
+        DataType::Decimal256(_, scale) => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| "failed to downcast map key to Decimal256Array".to_string())?;
+            Ok(format_decimal256(arr.value(row), *scale))
+        }
+        DataType::Timestamp(unit, tz) => {
+            let tz = tz.as_deref();
+            Ok(match unit {
+                TimeUnit::Second => {
+                    let arr = keys
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast map key to TimestampSecondArray".to_string()
+                        })?;
+                    format_timestamp(TimeUnit::Second, arr.value(row), tz)
+                }
+                TimeUnit::Millisecond => {
+                    let arr = keys
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast map key to TimestampMillisecondArray".to_string()
+                        })?;
+                    format_timestamp(TimeUnit::Millisecond, arr.value(row), tz)
+                }
+                TimeUnit::Microsecond => {
+                    let arr = keys
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast map key to TimestampMicrosecondArray".to_string()
+                        })?;
+                    format_timestamp(TimeUnit::Microsecond, arr.value(row), tz)
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = keys
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or_else(|| {
+                            "failed to downcast map key to TimestampNanosecondArray".to_string()
+                        })?;
+                    format_timestamp(TimeUnit::Nanosecond, arr.value(row), tz)
+                }
+            })
+        }
+        DataType::Binary => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| "failed to downcast map key to BinaryArray".to_string())?;
+            Ok(String::from_utf8_lossy(arr.value(row)).to_string())
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "failed to downcast map key to FixedSizeBinaryArray".to_string())?;
+            Ok(largeint::i128_from_be_bytes(arr.value(row))?.to_string())
+        }
+        DataType::LargeBinary => {
+            let arr = keys
+                .as_any()
+                .downcast_ref::<LargeBinaryArray>()
+                .ok_or_else(|| "failed to downcast map key to LargeBinaryArray".to_string())?;
+            VariantValue::from_serialized(arr.value(row))
+                .and_then(|v| v.to_json_local())
+                .map_err(|e| format!("decode map key VARIANT failed: {e}"))
+        }
+        _ => {
+            let mut rendered = String::new();
+            append_http_json_value(
+                &mut rendered,
+                keys,
+                row,
+                types::TPrimitiveType::INVALID_TYPE,
+                false,
+            )?;
+            Ok(rendered.trim_matches('"').to_string())
+        }
+    }
+}
+
 fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, String> {
     if col.is_null(row) {
         return Ok("null".to_string());
@@ -940,8 +1450,13 @@ fn append_lenenc_int(out: &mut Vec<u8>, v: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::format_timestamp;
+    use std::sync::Arc;
+
+    use super::{format_timestamp, http_json_row_from_arrays_with_primitives};
+    use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::TimeUnit;
+
+    use crate::types;
 
     #[test]
     fn format_timestamp_microsecond_omits_zero_fraction() {
@@ -957,5 +1472,31 @@ mod tests {
             format_timestamp(TimeUnit::Microsecond, 1, None),
             "1970-01-01 00:00:00.000001"
         );
+    }
+
+    #[test]
+    fn http_json_row_keeps_numeric_values_unquoted() {
+        let columns = vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef];
+        let row = http_json_row_from_arrays_with_primitives(
+            &columns,
+            0,
+            Some(&[types::TPrimitiveType::INT]),
+            None,
+        )
+        .expect("http json row");
+        assert_eq!(String::from_utf8(row).unwrap(), "{\"data\":[1]}\n");
+    }
+
+    #[test]
+    fn http_json_row_embeds_json_columns_without_extra_quotes() {
+        let columns = vec![Arc::new(StringArray::from(vec![r#"{"a":1}"#])) as ArrayRef];
+        let row = http_json_row_from_arrays_with_primitives(
+            &columns,
+            0,
+            Some(&[types::TPrimitiveType::JSON]),
+            None,
+        )
+        .expect("http json row");
+        assert_eq!(String::from_utf8(row).unwrap(), "{\"data\":[{\"a\":1}]}\n");
     }
 }

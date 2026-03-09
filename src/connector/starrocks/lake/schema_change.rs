@@ -61,7 +61,6 @@ use crate::service::grpc_client::proto::starrocks::{
     CompactionStrategyPb, FlatJsonConfigPb, KeysType, MetadataUpdateInfoPb, PersistentIndexTypePb,
     RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
 };
-use crate::types::{TKeysType, TStorageType};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AlterMode {
@@ -92,6 +91,42 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         return Err(format!("alter task has invalid txn_id={txn_id}"));
     }
 
+    let materialized_view_param_summary = request
+        .materialized_view_params
+        .as_ref()
+        .map(|params| {
+            params
+                .iter()
+                .map(|param| {
+                    format!(
+                        "{}=>origin={:?},mv_expr={}",
+                        param.column_name,
+                        param.origin_column_name.as_deref(),
+                        param.mv_expr.is_some()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+    let slot_desc_summary = request
+        .desc_tbl
+        .as_ref()
+        .and_then(|tbl| tbl.slot_descriptors.as_ref())
+        .map(|slots| {
+            slots
+                .iter()
+                .map(|slot| {
+                    format!(
+                        "slot_id={:?},col={:?},physical={:?},parent={:?}",
+                        slot.id, slot.col_name, slot.col_physical_name, slot.parent
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
+
     tracing::info!(
         alter_mode = ?alter_mode,
         base_tablet_id,
@@ -106,9 +141,15 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
             .as_ref()
             .map(|v| v.len())
             .unwrap_or(0),
+        materialized_view_param_count = request
+            .materialized_view_params
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0),
+        materialized_view_param_summary,
+        slot_desc_summary,
         "schema_change alter task received"
     );
-
     let (base_root_path, base_s3) = resolve_tablet_location("alter_base_tablet", base_tablet_id)?;
     let (new_root_path, new_s3) = resolve_tablet_location("alter_new_tablet", new_tablet_id)?;
 
@@ -148,7 +189,12 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         new_metadata_schema_columns = new_metadata_schema.column.len(),
         "schema_change resolved base/new metadata schemas"
     );
-    let new_schema = resolve_target_schema(request, &base_read_schema, &new_metadata_schema)?;
+    let new_schema = resolve_target_schema(
+        request,
+        &base_read_schema,
+        &new_metadata_schema,
+        new_tablet_id,
+    )?;
     tracing::info!(
         target_schema_columns = new_schema.column.len(),
         "schema_change resolved target schema"
@@ -180,7 +226,7 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     // later publish_version lookup consistent.
     register_tablet_runtime(&base_ctx)?;
     register_tablet_runtime(&new_ctx)?;
-    if new_metadata_schema != new_schema {
+    if should_patch_initial_metadata_schema(&new_metadata, &new_schema) {
         let mut patched_meta = new_metadata.clone();
         patched_meta.schema = Some(new_schema.clone());
         patched_meta.id = Some(new_tablet_id);
@@ -484,6 +530,13 @@ fn is_expected_initial_metadata_without_schema(metadata: &TabletMetadataPb, vers
         && metadata.historical_schemas.is_empty()
 }
 
+fn should_patch_initial_metadata_schema(
+    metadata: &TabletMetadataPb,
+    target_schema: &TabletSchemaPb,
+) -> bool {
+    metadata.schema.as_ref() != Some(target_schema)
+}
+
 fn resolve_tablet_schema_from_metadata_or_runtime(
     op: &str,
     metadata: &TabletMetadataPb,
@@ -622,95 +675,28 @@ fn resolve_target_schema(
     request: &TAlterTabletReqV2,
     base_read_schema: &TabletSchemaPb,
     new_metadata_schema: &TabletSchemaPb,
+    new_tablet_id: i64,
 ) -> Result<TabletSchemaPb, String> {
-    if let Some(columns) = request.columns.as_ref()
-        && !columns.is_empty()
-    {
-        return build_target_schema_from_columns(request, columns, new_metadata_schema);
+    if let Ok(runtime) = get_tablet_runtime(new_tablet_id) {
+        if &runtime.schema != new_metadata_schema {
+            tracing::info!(
+                tablet_id = new_tablet_id,
+                metadata_schema_id = new_metadata_schema.id,
+                runtime_schema_id = runtime.schema.id,
+                "schema_change target schema uses runtime schema instead of on-disk metadata"
+            );
+        }
+        return Ok(runtime.schema);
     }
     if request.new_schema_hash != request.base_schema_hash
         && schemas_equivalent(base_read_schema, new_metadata_schema)
     {
         return Err(format!(
-            "alter task target schema unresolved: new_schema_hash={} base_schema_hash={} but new tablet metadata schema is equivalent to base schema and request.columns is empty",
+            "alter task target schema unresolved: new_schema_hash={} base_schema_hash={} but new tablet metadata schema is equivalent to base schema and runtime schema is unavailable",
             request.new_schema_hash, request.base_schema_hash
         ));
     }
     Ok(new_metadata_schema.clone())
-}
-
-fn build_target_schema_from_columns(
-    request: &TAlterTabletReqV2,
-    columns: &[crate::descriptors::TColumn],
-    template_schema: &TabletSchemaPb,
-) -> Result<TabletSchemaPb, String> {
-    let short_key_column_count = i16::try_from(template_schema.num_short_key_columns.unwrap_or(0))
-        .map_err(|_| {
-            format!(
-                "alter task short key column count overflows i16 for target schema: {}",
-                template_schema.num_short_key_columns.unwrap_or(0)
-            )
-        })?;
-    let keys_type = map_keys_type_to_thrift(
-        template_schema
-            .keys_type
-            .ok_or_else(|| "alter task target schema template missing keys_type".to_string())?,
-    )?;
-    let sort_key_idxes = if template_schema.sort_key_idxes.is_empty() {
-        None
-    } else {
-        Some(
-            template_schema
-                .sort_key_idxes
-                .iter()
-                .map(|v| i32::try_from(*v))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "alter task sort_key_idxes overflow i32".to_string())?,
-        )
-    };
-    let sort_key_unique_ids = if template_schema.sort_key_unique_ids.is_empty() {
-        None
-    } else {
-        Some(
-            template_schema
-                .sort_key_unique_ids
-                .iter()
-                .map(|v| i32::try_from(*v))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| "alter task sort_key_unique_ids overflow i32".to_string())?,
-        )
-    };
-
-    let thrift_schema = crate::agent_service::TTabletSchema {
-        short_key_column_count,
-        schema_hash: request.new_schema_hash,
-        keys_type,
-        storage_type: TStorageType::COLUMN,
-        columns: columns.to_vec(),
-        bloom_filter_fpp: None,
-        indexes: None,
-        is_in_memory: template_schema.deprecated_is_in_memory,
-        id: template_schema
-            .id
-            .or(Some(i64::from(request.new_schema_hash))),
-        sort_key_idxes,
-        sort_key_unique_ids,
-        schema_version: template_schema.schema_version,
-        compression_type: None,
-        compression_level: template_schema.compression_level,
-    };
-    build_tablet_schema_pb_from_thrift(&thrift_schema)
-}
-
-fn map_keys_type_to_thrift(keys_type_raw: i32) -> Result<TKeysType, String> {
-    let keys_type = KeysType::try_from(keys_type_raw)
-        .map_err(|_| format!("unknown keys_type={keys_type_raw}"))?;
-    Ok(match keys_type {
-        KeysType::DupKeys => TKeysType::DUP_KEYS,
-        KeysType::AggKeys => TKeysType::AGG_KEYS,
-        KeysType::UniqueKeys => TKeysType::UNIQUE_KEYS,
-        KeysType::PrimaryKeys => TKeysType::PRIMARY_KEYS,
-    })
 }
 
 fn schemas_equivalent(lhs: &TabletSchemaPb, rhs: &TabletSchemaPb) -> bool {
@@ -1629,10 +1615,19 @@ fn write_schema_change_txn_log(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_expected_initial_metadata_without_schema, schemas_equivalent};
+    use super::{
+        is_expected_initial_metadata_without_schema, resolve_target_schema, schemas_equivalent,
+        should_patch_initial_metadata_schema,
+    };
+    use crate::agent_service::TAlterTabletReqV2;
+    use crate::connector::starrocks::lake::context::PartialUpdateWritePolicy;
+    use crate::connector::starrocks::lake::context::{
+        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+    };
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
     };
+    use tempfile::tempdir;
 
     #[test]
     fn initial_empty_v1_metadata_without_schema_is_expected() {
@@ -1716,6 +1711,85 @@ mod tests {
         );
     }
 
+    #[test]
+    fn missing_or_mismatched_initial_schema_requires_patch() {
+        let target = test_schema(7, vec![test_scalar_column(11, "v1", "INT")]);
+
+        let missing = TabletMetadataPb::default();
+        assert!(should_patch_initial_metadata_schema(&missing, &target));
+
+        let mut mismatched = TabletMetadataPb::default();
+        mismatched.schema = Some(test_schema(7, vec![test_scalar_column(12, "v2", "INT")]));
+        assert!(should_patch_initial_metadata_schema(&mismatched, &target));
+
+        let mut matched = TabletMetadataPb::default();
+        matched.schema = Some(target.clone());
+        assert!(!should_patch_initial_metadata_schema(&matched, &target));
+    }
+
+    #[test]
+    fn resolve_target_schema_prefers_runtime_schema_for_new_tablet() {
+        clear_tablet_runtime_cache_for_test();
+        let root = tempdir().expect("tempdir");
+        let runtime_schema = test_schema(
+            88,
+            vec![
+                test_scalar_column(10, "ds", "DATE"),
+                test_scalar_column(11, "tag", "VARCHAR"),
+                test_scalar_column(12, "mv_sum_v1", "BIGINT"),
+            ],
+        );
+        let runtime_ctx = TabletWriteContext {
+            db_id: 0,
+            table_id: 0,
+            tablet_id: 70001,
+            tablet_root_path: root.path().to_string_lossy().into_owned(),
+            tablet_schema: runtime_schema.clone(),
+            s3_config: None,
+            partial_update: PartialUpdateWritePolicy::default(),
+        };
+        register_tablet_runtime(&runtime_ctx).expect("register runtime");
+
+        let metadata_schema = test_schema(
+            77,
+            vec![
+                test_scalar_column(10, "ds", "DATE"),
+                test_scalar_column(13, "k1", "VARCHAR"),
+                test_scalar_column(14, "v1", "INT"),
+            ],
+        );
+        let base_schema = metadata_schema.clone();
+        let request = test_alter_request(1, 2);
+
+        let resolved = resolve_target_schema(&request, &base_schema, &metadata_schema, 70001)
+            .expect("resolve target schema");
+
+        assert_eq!(resolved, runtime_schema);
+        clear_tablet_runtime_cache_for_test();
+    }
+
+    #[test]
+    fn resolve_target_schema_errors_when_only_stale_metadata_is_available() {
+        clear_tablet_runtime_cache_for_test();
+        let base_schema = test_schema(
+            77,
+            vec![
+                test_scalar_column(10, "ds", "DATE"),
+                test_scalar_column(13, "k1", "VARCHAR"),
+                test_scalar_column(14, "v1", "INT"),
+            ],
+        );
+        let request = test_alter_request(1, 2);
+
+        let err = resolve_target_schema(&request, &base_schema, &base_schema, 70002)
+            .expect_err("stale metadata without runtime should fail");
+
+        assert!(
+            err.contains("target schema unresolved"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn test_schema(schema_id: i64, columns: Vec<ColumnPb>) -> TabletSchemaPb {
         TabletSchemaPb {
             keys_type: Some(0),
@@ -1764,5 +1838,28 @@ mod tests {
             referenced_column: None,
             agg_state_desc: None,
         }
+    }
+
+    fn test_alter_request(base_schema_hash: i32, new_schema_hash: i32) -> TAlterTabletReqV2 {
+        TAlterTabletReqV2::new(
+            1,
+            2,
+            base_schema_hash,
+            new_schema_hash,
+            None::<i64>,
+            None::<Vec<crate::agent_service::TAlterMaterializedViewParam>>,
+            None::<crate::agent_service::TTabletType>,
+            None::<i64>,
+            None::<crate::agent_service::TAlterTabletMaterializedColumnReq>,
+            None::<i64>,
+            None::<crate::internal_service::TQueryGlobals>,
+            None::<crate::internal_service::TQueryOptions>,
+            None::<Vec<crate::descriptors::TColumn>>,
+            None::<crate::agent_service::TAlterJobType>,
+            None::<crate::descriptors::TDescriptorTable>,
+            None::<crate::exprs::TExpr>,
+            None::<Vec<String>>,
+            None::<crate::agent_service::TTabletSchema>,
+        )
     }
 }

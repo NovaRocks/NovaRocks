@@ -97,6 +97,7 @@ pub(crate) struct OlapTableSinkOperator {
 pub(crate) struct OlapSinkFinalizeSharedState {
     registered_drivers: AtomicUsize,
     remaining_drivers: AtomicUsize,
+    write_targets: Mutex<HashMap<i64, TabletWriteTarget>>,
     dirty_partitions: Mutex<HashSet<i64>>,
     written_tablets: Mutex<HashSet<i64>>,
     tablet_commit_infos: Mutex<Vec<types::TTabletCommitInfo>>,
@@ -121,10 +122,18 @@ impl OlapSinkFinalizeSharedState {
 
     fn record_progress(
         &self,
+        write_targets: &HashMap<i64, TabletWriteTarget>,
         written_tablets: &HashSet<i64>,
         dirty_partitions: &HashSet<i64>,
         tablet_commit_infos: &[types::TTabletCommitInfo],
     ) {
+        if !write_targets.is_empty()
+            && let Ok(mut guard) = self.write_targets.lock()
+        {
+            for (tablet_id, target) in write_targets {
+                guard.entry(*tablet_id).or_insert_with(|| target.clone());
+            }
+        }
         if !written_tablets.is_empty() {
             if let Ok(mut guard) = self.written_tablets.lock() {
                 guard.extend(written_tablets.iter().copied());
@@ -149,7 +158,19 @@ impl OlapSinkFinalizeSharedState {
         }
     }
 
-    fn snapshot_progress(&self) -> (HashSet<i64>, HashSet<i64>, Vec<types::TTabletCommitInfo>) {
+    fn snapshot_progress(
+        &self,
+    ) -> (
+        HashMap<i64, TabletWriteTarget>,
+        HashSet<i64>,
+        HashSet<i64>,
+        Vec<types::TTabletCommitInfo>,
+    ) {
+        let write_targets = self
+            .write_targets
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let dirty_partitions = self
             .dirty_partitions
             .lock()
@@ -165,7 +186,12 @@ impl OlapSinkFinalizeSharedState {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
-        (dirty_partitions, written_tablets, tablet_commit_infos)
+        (
+            write_targets,
+            dirty_partitions,
+            written_tablets,
+            tablet_commit_infos,
+        )
     }
 
     fn record_error(&self, err: String) {
@@ -612,6 +638,7 @@ impl OlapTableSinkOperator {
 
     fn finalize_dirty_partition_tablets(
         &self,
+        write_targets: &HashMap<i64, TabletWriteTarget>,
         dirty_partitions: &HashSet<i64>,
         written_tablets: &mut HashSet<i64>,
     ) -> Result<(), String> {
@@ -619,7 +646,7 @@ impl OlapTableSinkOperator {
             return Ok(());
         }
         let mut empty_targets = Vec::new();
-        for target in self.all_write_targets.values() {
+        for target in write_targets.values() {
             if !dirty_partitions.contains(&target.partition_id) {
                 continue;
             }
@@ -807,28 +834,22 @@ impl OlapTableSinkOperator {
         let partitions = response.partitions.unwrap_or_default();
         let tablets = response.tablets.unwrap_or_default();
 
-        let mut new_partitions = Vec::<PartitionRoutingEntry>::new();
+        let primary_index_id = self
+            .index_write_plans
+            .first()
+            .map(|plan| plan.index_id)
+            .ok_or_else(|| "OLAP_TABLE_SINK has empty index_write_plans".to_string())?;
+        let write_index_ids = self
+            .index_write_plans
+            .iter()
+            .map(|plan| plan.index_id)
+            .collect::<HashSet<_>>();
+        let mut new_partitions_by_index = HashMap::<i64, Vec<PartitionRoutingEntry>>::new();
         let mut tablet_to_partition = HashMap::<i64, i64>::new();
         let partition_key_len = partition_key_source_len(&auto_partition.partition_key_source);
         for partition in partitions {
             if partition.is_shadow_partition.unwrap_or(false) {
                 continue;
-            }
-            let index = partition
-                .indexes
-                .iter()
-                .find(|idx| auto_partition.candidate_index_ids.contains(&idx.index_id))
-                .ok_or_else(|| {
-                    format!(
-                        "OLAP_TABLE_SINK createPartition returned partition {} without routing index for schema_id={} (candidate_index_ids={:?})",
-                        partition.id, auto_partition.schema_id, auto_partition.candidate_index_ids
-                    )
-                })?;
-            if index.tablet_ids.is_empty() {
-                return Err(format!(
-                    "OLAP_TABLE_SINK createPartition returned partition {} with empty tablet_ids",
-                    partition.id
-                ));
             }
             let start_key = parse_partition_boundary_key(
                 partition.start_keys.as_deref(),
@@ -852,92 +873,95 @@ impl OlapTableSinkOperator {
                     partition.id
                 ));
             }
-            for tablet_id in &index.tablet_ids {
-                tablet_to_partition.insert(*tablet_id, partition.id);
-            }
-            if self
-                .row_routing
-                .partitions
+
+            let partition_index_ids = partition
+                .indexes
                 .iter()
-                .any(|entry| entry.partition_id == partition.id)
+                .map(|index| index.index_id)
+                .collect::<HashSet<_>>();
+            for index_id in &write_index_ids {
+                if !partition_index_ids.contains(index_id) {
+                    return Err(format!(
+                        "OLAP_TABLE_SINK createPartition returned partition {} without write index {} (write_index_ids={:?})",
+                        partition.id, index_id, write_index_ids
+                    ));
+                }
+            }
+
+            for index in partition
+                .indexes
+                .iter()
+                .filter(|index| write_index_ids.contains(&index.index_id))
             {
-                continue;
+                if index.tablet_ids.is_empty() {
+                    return Err(format!(
+                        "OLAP_TABLE_SINK createPartition returned partition {} index {} with empty tablet_ids",
+                        partition.id, index.index_id
+                    ));
+                }
+                for tablet_id in &index.tablet_ids {
+                    tablet_to_partition.insert(*tablet_id, partition.id);
+                }
+                let already_present = self
+                    .index_write_plans
+                    .iter()
+                    .find(|plan| plan.index_id == index.index_id)
+                    .is_some_and(|plan| {
+                        plan.row_routing
+                            .partitions
+                            .iter()
+                            .any(|entry| entry.partition_id == partition.id)
+                    });
+                if already_present {
+                    continue;
+                }
+                new_partitions_by_index
+                    .entry(index.index_id)
+                    .or_default()
+                    .push(PartitionRoutingEntry {
+                        partition_id: partition.id,
+                        tablet_ids: index.tablet_ids.clone(),
+                        start_key: start_key.clone(),
+                        end_key: end_key.clone(),
+                        in_keys: in_keys.clone(),
+                    });
             }
-            new_partitions.push(PartitionRoutingEntry {
-                partition_id: partition.id,
-                tablet_ids: index.tablet_ids.clone(),
-                start_key,
-                end_key,
-                in_keys,
-            });
         }
-        if !new_partitions.is_empty() {
+        let has_new_partitions = new_partitions_by_index
+            .values()
+            .any(|entries| !entries.is_empty());
+        if has_new_partitions {
             if !self.auto_partition_initialized {
-                self.row_routing.partitions.clear();
-                self.row_routing.tablet_ids.clear();
-                self.row_routing.tablet_idx_by_id.clear();
+                for index_plan in &mut self.index_write_plans {
+                    index_plan.row_routing.partitions.clear();
+                    index_plan.row_routing.tablet_ids.clear();
+                    index_plan.row_routing.tablet_idx_by_id.clear();
+                }
             }
-            self.row_routing.partitions.extend(new_partitions);
+            for index_plan in &mut self.index_write_plans {
+                if let Some(new_partitions) = new_partitions_by_index.remove(&index_plan.index_id) {
+                    index_plan.row_routing.partitions.extend(new_partitions);
+                }
+                rebuild_auto_partition_routing(
+                    &mut index_plan.row_routing,
+                    &auto_partition.partition_key_source,
+                    partition_key_len,
+                )?;
+            }
             self.auto_partition_initialized = true;
         }
 
         if self.auto_partition_initialized {
-            self.row_routing.partition_key_source = auto_partition.partition_key_source.clone();
-            self.row_routing.partition_key_len = partition_key_len;
-
-            let has_any_in_keys = self
-                .row_routing
-                .partitions
+            self.row_routing = self
+                .index_write_plans
                 .iter()
-                .any(|entry| !entry.in_keys.is_empty());
-            let has_any_range_bound = self
-                .row_routing
-                .partitions
-                .iter()
-                .any(|entry| entry.start_key.is_some() || entry.end_key.is_some());
-            self.row_routing.partition_mode = if self.row_routing.partition_key_len == 0
-                || (!has_any_in_keys && !has_any_range_bound)
-            {
-                PartitionMode::Unpartitioned
-            } else if has_any_in_keys {
-                if self
-                    .row_routing
-                    .partitions
-                    .iter()
-                    .any(|entry| entry.in_keys.is_empty())
-                {
-                    return Err(
-                        "OLAP_TABLE_SINK mixed list/range partitions are not supported in auto partition routing"
-                            .to_string(),
-                    );
-                }
-                PartitionMode::List
-            } else {
-                if self
-                    .row_routing
-                    .partitions
-                    .iter()
-                    .any(|entry| entry.end_key.is_none())
-                {
-                    return Err(
-                        "OLAP_TABLE_SINK auto partition range routing has partition without end key"
-                            .to_string(),
-                    );
-                }
-                PartitionMode::Range
-            };
-
-            let mut all_tablets = BTreeSet::new();
-            for entry in &self.row_routing.partitions {
-                for tablet_id in &entry.tablet_ids {
-                    all_tablets.insert(*tablet_id);
-                }
-            }
-            self.row_routing.tablet_ids = all_tablets.into_iter().collect::<Vec<_>>();
-            self.row_routing.tablet_idx_by_id.clear();
-            for (idx, tablet_id) in self.row_routing.tablet_ids.iter().enumerate() {
-                self.row_routing.tablet_idx_by_id.insert(*tablet_id, idx);
-            }
+                .find(|plan| plan.index_id == primary_index_id)
+                .map(|plan| plan.row_routing.clone())
+                .ok_or_else(|| {
+                    format!(
+                        "OLAP_TABLE_SINK auto partition lost primary index routing: index_id={primary_index_id}"
+                    )
+                })?;
         }
 
         for tablet in tablets {
@@ -961,110 +985,138 @@ impl OlapTableSinkOperator {
             }
         }
 
-        let new_tablets = self
-            .row_routing
-            .tablet_ids
-            .iter()
-            .copied()
-            .filter(|tablet_id| !self.write_targets.contains_key(tablet_id))
-            .collect::<Vec<_>>();
-        if new_tablets.is_empty() {
-            return Ok(());
-        }
-        let refs = new_tablets
-            .iter()
-            .map(|tablet_id| LakeTabletPartitionRef {
-                tablet_id: *tablet_id,
-            })
-            .collect::<Vec<_>>();
-        let path_map = resolve_tablet_paths_for_olap_sink(
-            None,
-            Some(&auto_partition.fe_addr),
-            &self.plan.table_identity,
-            &refs,
-        )?;
-        let shard_infos = starlet_shard_registry::select_infos(&new_tablets);
-        let template = self
-            .write_targets
-            .values()
-            .next()
-            .map(|target| target.context.clone())
-            .ok_or_else(|| {
-                "OLAP_TABLE_SINK cannot build runtime write target: no template context available"
-                    .to_string()
-            })?;
-        for tablet_id in new_tablets {
-            let partition_id = self
-                .row_routing
-                .partitions
-                .iter()
-                .find(|entry| entry.tablet_ids.contains(&tablet_id))
-                .map(|entry| entry.partition_id)
-                .or_else(|| tablet_to_partition.get(&tablet_id).copied())
-                .ok_or_else(|| {
-                    format!(
-                        "OLAP_TABLE_SINK cannot resolve partition for runtime tablet {}",
-                        tablet_id
-                    )
-                })?;
-            let tablet_root_path = path_map.get(&tablet_id).ok_or_else(|| {
-                format!(
-                    "OLAP_TABLE_SINK missing resolved storage path for runtime tablet {}",
-                    tablet_id
-                )
-            })?;
-            let scheme = classify_scan_paths([tablet_root_path.as_str()])?;
-            let s3_config = match scheme {
-                ScanPathScheme::Local => None,
-                ScanPathScheme::Oss => {
-                    let from_shard = shard_infos.get(&tablet_id).and_then(|info| info.s3.clone());
-                    let from_runtime = if from_shard.is_none() {
-                        get_tablet_runtime(tablet_id)
-                            .ok()
-                            .and_then(|entry| entry.s3_config.clone())
-                    } else {
-                        None
-                    };
-                    let inferred = if from_shard.is_none() && from_runtime.is_none() {
-                        starlet_shard_registry::infer_s3_config_for_path(tablet_root_path)
-                    } else {
-                        None
-                    };
-                    Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
-                        format!(
-                            "OLAP_TABLE_SINK missing S3 config for runtime object-store tablet {} (path={})",
-                            tablet_id, tablet_root_path
-                        )
-                    })?)
+        let mut new_tablets_by_index = HashMap::<i64, Vec<i64>>::new();
+        let mut new_tablets = BTreeSet::<i64>::new();
+        for index_plan in &self.index_write_plans {
+            for tablet_id in &index_plan.row_routing.tablet_ids {
+                if !index_plan.write_targets.contains_key(tablet_id) {
+                    new_tablets_by_index
+                        .entry(index_plan.index_id)
+                        .or_default()
+                        .push(*tablet_id);
+                    new_tablets.insert(*tablet_id);
                 }
-                ScanPathScheme::Hdfs => {
-                    return Err(format!(
-                        "OLAP_TABLE_SINK does not support hdfs tablet path yet: tablet_id={} path={}",
-                        tablet_id, tablet_root_path
-                    ));
-                }
-            };
-
-            let mut context = template.clone();
-            context.db_id = self.plan.db_id;
-            context.table_id = self.plan.table_id;
-            context.tablet_id = tablet_id;
-            context.tablet_root_path = tablet_root_path.clone();
-            context.s3_config = s3_config;
-
-            let target = TabletWriteTarget {
-                tablet_id,
-                partition_id,
-                context,
-            };
-            self.write_targets.insert(tablet_id, target.clone());
-            self.all_write_targets.insert(tablet_id, target.clone());
-            if let Some(primary_index_plan) = self.index_write_plans.first_mut() {
-                primary_index_plan.write_targets.insert(tablet_id, target);
             }
         }
-        if let Some(primary_index_plan) = self.index_write_plans.first_mut() {
-            primary_index_plan.row_routing = self.row_routing.clone();
+        let new_tablets = new_tablets.into_iter().collect::<Vec<_>>();
+        if !new_tablets.is_empty() {
+            let refs = new_tablets
+                .iter()
+                .map(|tablet_id| LakeTabletPartitionRef {
+                    tablet_id: *tablet_id,
+                })
+                .collect::<Vec<_>>();
+            let path_map = resolve_tablet_paths_for_olap_sink(
+                None,
+                Some(&auto_partition.fe_addr),
+                &self.plan.table_identity,
+                &refs,
+            )?;
+            let shard_infos = starlet_shard_registry::select_infos(&new_tablets);
+            for index_plan in &mut self.index_write_plans {
+                let Some(index_new_tablets) = new_tablets_by_index.get(&index_plan.index_id) else {
+                    continue;
+                };
+                let template = index_plan
+                    .write_targets
+                    .values()
+                    .next()
+                    .map(|target| target.context.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "OLAP_TABLE_SINK cannot build runtime write target: index_id={} has no template context",
+                            index_plan.index_id
+                        )
+                    })?;
+                for tablet_id in index_new_tablets {
+                    let partition_id = index_plan
+                        .row_routing
+                        .partitions
+                        .iter()
+                        .find(|entry| entry.tablet_ids.contains(tablet_id))
+                        .map(|entry| entry.partition_id)
+                        .or_else(|| tablet_to_partition.get(tablet_id).copied())
+                        .ok_or_else(|| {
+                            format!(
+                                "OLAP_TABLE_SINK cannot resolve partition for runtime tablet {} in index_id={}",
+                                tablet_id, index_plan.index_id
+                            )
+                        })?;
+                    let tablet_root_path = path_map.get(tablet_id).ok_or_else(|| {
+                        format!(
+                            "OLAP_TABLE_SINK missing resolved storage path for runtime tablet {}",
+                            tablet_id
+                        )
+                    })?;
+                    let scheme = classify_scan_paths([tablet_root_path.as_str()])?;
+                    let s3_config = match scheme {
+                        ScanPathScheme::Local => None,
+                        ScanPathScheme::Oss => {
+                            let from_shard =
+                                shard_infos.get(tablet_id).and_then(|info| info.s3.clone());
+                            let from_runtime = if from_shard.is_none() {
+                                get_tablet_runtime(*tablet_id)
+                                    .ok()
+                                    .and_then(|entry| entry.s3_config.clone())
+                            } else {
+                                None
+                            };
+                            let inferred = if from_shard.is_none() && from_runtime.is_none() {
+                                starlet_shard_registry::infer_s3_config_for_path(tablet_root_path)
+                            } else {
+                                None
+                            };
+                            Some(from_shard.or(from_runtime).or(inferred).ok_or_else(|| {
+                                format!(
+                                    "OLAP_TABLE_SINK missing S3 config for runtime object-store tablet {} (path={})",
+                                    tablet_id, tablet_root_path
+                                )
+                            })?)
+                        }
+                        ScanPathScheme::Hdfs => {
+                            return Err(format!(
+                                "OLAP_TABLE_SINK does not support hdfs tablet path yet: tablet_id={} path={}",
+                                tablet_id, tablet_root_path
+                            ));
+                        }
+                    };
+
+                    let mut context = template.clone();
+                    context.db_id = self.plan.db_id;
+                    context.table_id = self.plan.table_id;
+                    context.tablet_id = *tablet_id;
+                    context.tablet_root_path = tablet_root_path.clone();
+                    context.s3_config = s3_config;
+
+                    index_plan.write_targets.insert(
+                        *tablet_id,
+                        TabletWriteTarget {
+                            tablet_id: *tablet_id,
+                            partition_id,
+                            context,
+                        },
+                    );
+                }
+            }
+        }
+        self.write_targets = self
+            .index_write_plans
+            .iter()
+            .find(|plan| plan.index_id == primary_index_id)
+            .map(|plan| plan.write_targets.clone())
+            .ok_or_else(|| {
+                format!(
+                    "OLAP_TABLE_SINK auto partition lost primary index write targets: index_id={primary_index_id}"
+                )
+            })?;
+        self.all_write_targets.clear();
+        for index_plan in &self.index_write_plans {
+            self.all_write_targets.extend(
+                index_plan
+                    .write_targets
+                    .iter()
+                    .map(|(tablet_id, target)| (*tablet_id, target.clone())),
+            );
         }
         Ok(())
     }
@@ -1118,16 +1170,72 @@ impl OlapTableSinkOperator {
         Chunk::try_new(projected_batch)
             .map_err(|e| format!("OLAP_TABLE_SINK build projected output chunk failed: {e}"))
     }
+}
 
+fn rebuild_auto_partition_routing(
+    row_routing: &mut RowRoutingPlan,
+    partition_key_source: &PartitionKeySource,
+    partition_key_len: usize,
+) -> Result<(), String> {
+    row_routing.partition_key_source = partition_key_source.clone();
+    row_routing.partition_key_len = partition_key_len;
+
+    let has_any_in_keys = row_routing
+        .partitions
+        .iter()
+        .any(|entry| !entry.in_keys.is_empty());
+    let has_any_range_bound = row_routing
+        .partitions
+        .iter()
+        .any(|entry| entry.start_key.is_some() || entry.end_key.is_some());
+    row_routing.partition_mode = if row_routing.partition_key_len == 0
+        || (!has_any_in_keys && !has_any_range_bound)
+    {
+        PartitionMode::Unpartitioned
+    } else if has_any_in_keys {
+        if row_routing
+            .partitions
+            .iter()
+            .any(|entry| entry.in_keys.is_empty())
+        {
+            return Err(
+                "OLAP_TABLE_SINK mixed list/range partitions are not supported in auto partition routing"
+                    .to_string(),
+            );
+        }
+        PartitionMode::List
+    } else {
+        if row_routing
+            .partitions
+            .iter()
+            .any(|entry| entry.end_key.is_none())
+        {
+            return Err(
+                "OLAP_TABLE_SINK auto partition range routing has partition without end key"
+                    .to_string(),
+            );
+        }
+        PartitionMode::Range
+    };
+
+    let mut all_tablets = BTreeSet::new();
+    for entry in &row_routing.partitions {
+        for tablet_id in &entry.tablet_ids {
+            all_tablets.insert(*tablet_id);
+        }
+    }
+    row_routing.tablet_ids = all_tablets.into_iter().collect::<Vec<_>>();
+    row_routing.tablet_idx_by_id.clear();
+    for (idx, tablet_id) in row_routing.tablet_ids.iter().enumerate() {
+        row_routing.tablet_idx_by_id.insert(*tablet_id, idx);
+    }
+    Ok(())
+}
+
+impl OlapTableSinkOperator {
     fn flush_real_data(&mut self, state: &RuntimeState) -> Result<(), String> {
         if self.index_write_plans.is_empty() || self.all_write_targets.is_empty() {
             return Err("OLAP_TABLE_SINK has empty write_targets".to_string());
-        }
-        if self.plan.auto_partition.is_some() && self.index_write_plans.len() > 1 {
-            return Err(
-                "OLAP_TABLE_SINK automatic partition with multi-index sink is not supported yet"
-                    .to_string(),
-            );
         }
 
         let request_rows_threshold = state.chunk_size().max(1);
@@ -1466,6 +1574,7 @@ impl ProcessorOperator for OlapTableSinkOperator {
         }
 
         self.finalize_shared.record_progress(
+            &self.all_write_targets,
             &self.written_tablets,
             &self.dirty_partitions,
             &self.tablet_commit_infos,
@@ -1476,8 +1585,12 @@ impl ProcessorOperator for OlapTableSinkOperator {
             if let Some(err) = self.finalize_shared.first_error() {
                 Err(err)
             } else {
-                let (dirty_partitions, mut merged_written_tablets, merged_tablet_commit_infos) =
-                    self.finalize_shared.snapshot_progress();
+                let (
+                    merged_write_targets,
+                    dirty_partitions,
+                    mut merged_written_tablets,
+                    merged_tablet_commit_infos,
+                ) = self.finalize_shared.snapshot_progress();
                 let mut merged_written_tablet_ids =
                     merged_written_tablets.iter().copied().collect::<Vec<_>>();
                 merged_written_tablet_ids.sort_unstable();
@@ -1485,12 +1598,14 @@ impl ProcessorOperator for OlapTableSinkOperator {
                     target: "novarocks::starrocks::sink",
                     table_id = self.plan.table_id,
                     txn_id = self.plan.txn_id,
+                    merged_write_target_count = merged_write_targets.len(),
                     dirty_partition_count = dirty_partitions.len(),
                     merged_written_tablet_count = merged_written_tablets.len(),
                     merged_written_tablet_ids = ?merged_written_tablet_ids,
                     "OLAP_TABLE_SINK finalizing sink progress"
                 );
                 self.finalize_dirty_partition_tablets(
+                    &merged_write_targets,
                     &dirty_partitions,
                     &mut merged_written_tablets,
                 )?;
@@ -1964,7 +2079,7 @@ fn align_batch_to_schema_slot_bindings(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use arrow::array::{
@@ -1977,23 +2092,30 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        LOAD_OP_COLUMN, OlapTableSinkOperator, align_batch_to_schema_slot_bindings,
-        filter_rows_for_tablet_schema, format_partition_rejection, is_retryable_sink_write_error,
+        LOAD_OP_COLUMN, OlapSinkFinalizeSharedState, OlapTableSinkOperator,
+        align_batch_to_schema_slot_bindings, filter_rows_for_tablet_schema,
+        format_partition_rejection, is_retryable_sink_write_error,
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
+    use crate::connector::starrocks::lake::context::{
+        clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+    };
     use crate::connector::starrocks::lake::{TabletWriteContext, txn_log::read_txn_log_if_exists};
     use crate::connector::starrocks::sink::factory::{
-        OlapTableSinkPlan, SinkOutputProjectionPlan, TabletWriteTarget,
+        AutomaticPartitionPlan, OlapTableSinkPlan, SinkIndexWritePlan, SinkOutputProjectionPlan,
+        TabletWriteTarget,
     };
     use crate::connector::starrocks::sink::partition_key::{
         PartitionKeySource, PartitionMode, PartitionRoutingEntry,
     };
     use crate::connector::starrocks::sink::routing::RowRoutingPlan;
+    use crate::descriptors::{TOlapTableIndexTablets, TOlapTablePartition, TTabletLocation};
     use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::formats::starrocks::writer::{StarRocksWriteFormat, layout::txn_log_file_path};
+    use crate::frontend_service::TCreatePartitionResult;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
@@ -2321,6 +2443,24 @@ mod tests {
         })
     }
 
+    fn single_tablet_routing(tablet_id: i64, partition_id: i64) -> RowRoutingPlan {
+        RowRoutingPlan {
+            tablet_ids: vec![tablet_id],
+            tablet_idx_by_id: HashMap::from([(tablet_id, 0)]),
+            distributed_slot_ids: Vec::new(),
+            partition_key_source: PartitionKeySource::None,
+            partition_key_len: 0,
+            partition_mode: PartitionMode::Unpartitioned,
+            partitions: vec![PartitionRoutingEntry {
+                partition_id,
+                tablet_ids: vec![tablet_id],
+                start_key: None,
+                end_key: None,
+                in_keys: Vec::new(),
+            }],
+        }
+    }
+
     fn build_two_tablet_plan(
         tablet_a_root_path: String,
         tablet_b_root_path: String,
@@ -2411,6 +2551,186 @@ mod tests {
             output_projection: None,
             auto_partition: None,
         })
+    }
+
+    fn build_write_target(
+        tablet_root_path: String,
+        table_id: i64,
+        tablet_id: i64,
+        partition_id: i64,
+        tablet_schema: TabletSchemaPb,
+    ) -> TabletWriteTarget {
+        TabletWriteTarget {
+            tablet_id,
+            partition_id,
+            context: TabletWriteContext {
+                db_id: 6001,
+                table_id,
+                tablet_id,
+                tablet_root_path,
+                tablet_schema,
+                s3_config: None,
+                partial_update: Default::default(),
+            },
+        }
+    }
+
+    fn register_test_runtime(
+        tablet_id: i64,
+        tablet_root_path: String,
+        tablet_schema: TabletSchemaPb,
+    ) {
+        let ctx = TabletWriteContext {
+            db_id: 6001,
+            table_id: 7000,
+            tablet_id,
+            tablet_root_path,
+            tablet_schema,
+            s3_config: None,
+            partial_update: Default::default(),
+        };
+        register_tablet_runtime(&ctx).expect("register tablet runtime");
+    }
+
+    #[test]
+    fn ingest_auto_partition_response_updates_all_index_write_plans() {
+        clear_tablet_runtime_cache_for_test();
+        let tmp = tempdir().expect("create tempdir");
+        let primary_tablet_schema = test_tablet_schema();
+        let secondary_tablet_schema = test_tablet_schema();
+
+        let primary_target = build_write_target(
+            tmp.path()
+                .join("tablet_primary_template")
+                .to_string_lossy()
+                .to_string(),
+            7005,
+            9904,
+            3004,
+            primary_tablet_schema.clone(),
+        );
+        let secondary_target = build_write_target(
+            tmp.path()
+                .join("tablet_secondary_template")
+                .to_string_lossy()
+                .to_string(),
+            7005,
+            9905,
+            3004,
+            secondary_tablet_schema.clone(),
+        );
+        let base_plan = build_test_plan(
+            primary_target.context.tablet_root_path.clone(),
+            7005,
+            9904,
+            3004,
+            primary_tablet_schema.clone(),
+        );
+        let plan = Arc::new(OlapTableSinkPlan {
+            index_write_plans: vec![
+                SinkIndexWritePlan {
+                    index_id: 10,
+                    schema_id: 5001,
+                    row_routing: single_tablet_routing(9904, 3004),
+                    write_targets: HashMap::from([(9904, primary_target.clone())]),
+                    schema_slot_bindings: Vec::new(),
+                    op_slot_id: None,
+                },
+                SinkIndexWritePlan {
+                    index_id: 20,
+                    schema_id: 5002,
+                    row_routing: single_tablet_routing(9905, 3004),
+                    write_targets: HashMap::from([(9905, secondary_target.clone())]),
+                    schema_slot_bindings: Vec::new(),
+                    op_slot_id: None,
+                },
+            ],
+            auto_partition: Some(AutomaticPartitionPlan {
+                db_id: 6001,
+                table_id: 7005,
+                txn_id: 8001,
+                fe_addr: types::TNetworkAddress::new("127.0.0.1".to_string(), 9031),
+                partition_key_source: PartitionKeySource::None,
+                partition_column_names: Vec::new(),
+                partition_slot_ids: Vec::new(),
+            }),
+            ..(*base_plan).clone()
+        });
+        let mut op = OlapTableSinkOperator::new("OLAP_TABLE_SINK".to_string(), plan, 0);
+
+        let new_primary_root = tmp
+            .path()
+            .join("tablet_primary_new")
+            .to_string_lossy()
+            .to_string();
+        let new_secondary_root = tmp
+            .path()
+            .join("tablet_secondary_new")
+            .to_string_lossy()
+            .to_string();
+        register_test_runtime(9916, new_primary_root.clone(), primary_tablet_schema);
+        register_test_runtime(9917, new_secondary_root.clone(), secondary_tablet_schema);
+
+        let response = TCreatePartitionResult::new(
+            None::<crate::status::TStatus>,
+            Some(vec![TOlapTablePartition::new(
+                3005,
+                None::<crate::exprs::TExprNode>,
+                None::<crate::exprs::TExprNode>,
+                None::<i32>,
+                vec![
+                    TOlapTableIndexTablets::new(
+                        10,
+                        vec![9916],
+                        None::<Vec<crate::descriptors::TOlapTableTablet>>,
+                    ),
+                    TOlapTableIndexTablets::new(
+                        20,
+                        vec![9917],
+                        None::<Vec<crate::descriptors::TOlapTableTablet>>,
+                    ),
+                ],
+                None::<Vec<crate::exprs::TExprNode>>,
+                None::<Vec<crate::exprs::TExprNode>>,
+                None::<Vec<Vec<crate::exprs::TExprNode>>>,
+                Some(false),
+            )]),
+            Some(vec![
+                TTabletLocation::new(9916, vec![1001]),
+                TTabletLocation::new(9917, vec![1001]),
+            ]),
+            None::<Vec<crate::descriptors::TNodeInfo>>,
+        );
+
+        let auto_partition = op.plan.auto_partition.clone().expect("auto partition plan");
+        op.ingest_auto_partition_response(&auto_partition, response)
+            .expect("ingest auto partition response");
+
+        assert!(op.write_targets.contains_key(&9916));
+        assert!(!op.write_targets.contains_key(&9917));
+        assert!(op.all_write_targets.contains_key(&9916));
+        assert!(op.all_write_targets.contains_key(&9917));
+        assert!(op.index_write_plans[0].write_targets.contains_key(&9916));
+        assert!(op.index_write_plans[1].write_targets.contains_key(&9917));
+        assert_eq!(
+            op.index_write_plans[0]
+                .row_routing
+                .partitions
+                .last()
+                .expect("primary partition entry")
+                .tablet_ids,
+            vec![9916]
+        );
+        assert_eq!(
+            op.index_write_plans[1]
+                .row_routing
+                .partitions
+                .last()
+                .expect("secondary partition entry")
+                .tablet_ids,
+            vec![9917]
+        );
+        clear_tablet_runtime_cache_for_test();
     }
 
     #[test]
@@ -2786,6 +3106,127 @@ mod tests {
         assert_eq!(rows_a + rows_b, 16);
         assert_eq!(rowset_a.segments.len(), 1);
         assert_eq!(rowset_b.segments.len(), 1);
+    }
+
+    #[test]
+    fn finalize_shared_merges_runtime_write_targets_across_drivers() {
+        let tmp = tempdir().expect("create tempdir");
+        let table_id = 7011;
+        let schema = test_tablet_schema();
+        let target_1 = build_write_target(
+            tmp.path().join("tablet_9912").to_string_lossy().to_string(),
+            table_id,
+            9912,
+            3011,
+            schema.clone(),
+        );
+        let target_2 = build_write_target(
+            tmp.path().join("tablet_9913").to_string_lossy().to_string(),
+            table_id,
+            9913,
+            3011,
+            schema.clone(),
+        );
+        let target_3 = build_write_target(
+            tmp.path().join("tablet_9914").to_string_lossy().to_string(),
+            table_id,
+            9914,
+            3012,
+            schema.clone(),
+        );
+        let target_4 = build_write_target(
+            tmp.path().join("tablet_9915").to_string_lossy().to_string(),
+            table_id,
+            9915,
+            3012,
+            schema.clone(),
+        );
+
+        let shared = OlapSinkFinalizeSharedState::default();
+        shared.record_progress(
+            &HashMap::from([(9912, target_1.clone()), (9913, target_2.clone())]),
+            &HashSet::from([9912]),
+            &HashSet::from([3011]),
+            &[
+                types::TTabletCommitInfo::new(
+                    9912,
+                    1001,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<i64>>::None,
+                ),
+                types::TTabletCommitInfo::new(
+                    9913,
+                    1001,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<i64>>::None,
+                ),
+            ],
+        );
+        shared.record_progress(
+            &HashMap::from([(9914, target_3.clone()), (9915, target_4.clone())]),
+            &HashSet::from([9914]),
+            &HashSet::from([3012]),
+            &[
+                types::TTabletCommitInfo::new(
+                    9914,
+                    1001,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<i64>>::None,
+                ),
+                types::TTabletCommitInfo::new(
+                    9915,
+                    1001,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<String>>::None,
+                    Option::<Vec<i64>>::None,
+                ),
+            ],
+        );
+
+        let (merged_targets, dirty_partitions, mut merged_written, merged_commit_infos) =
+            shared.snapshot_progress();
+        assert_eq!(merged_targets.len(), 4);
+        assert_eq!(dirty_partitions, HashSet::from([3011, 3012]));
+        assert_eq!(merged_written, HashSet::from([9912, 9914]));
+        assert_eq!(merged_commit_infos.len(), 4);
+
+        let plan = build_test_plan(
+            tmp.path().join("tablet_9912").to_string_lossy().to_string(),
+            table_id,
+            9912,
+            3011,
+            schema,
+        );
+        let op = OlapTableSinkOperator::new("OLAP_TABLE_SINK".to_string(), plan.clone(), 0);
+        op.finalize_dirty_partition_tablets(
+            &merged_targets,
+            &dirty_partitions,
+            &mut merged_written,
+        )
+        .expect("finalize empty rowsets across merged targets");
+
+        assert_eq!(merged_written, HashSet::from([9912, 9913, 9914, 9915]));
+
+        for tablet_id in [9913_i64, 9915_i64] {
+            let tablet_root = tmp.path().join(format!("tablet_{tablet_id}"));
+            let log_path = txn_log_file_path(
+                tablet_root.to_str().expect("tablet root to str"),
+                tablet_id,
+                plan.txn_id,
+            )
+            .expect("build txn log path");
+            let txn_log = read_txn_log_if_exists(&log_path)
+                .expect("read txn log")
+                .expect("txn log should exist");
+            let rowset = txn_log
+                .op_write
+                .and_then(|op_write| op_write.rowset)
+                .expect("rowset should exist");
+            assert_eq!(rowset.num_rows, Some(0));
+        }
     }
 
     #[test]

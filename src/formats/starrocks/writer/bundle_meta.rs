@@ -450,13 +450,27 @@ pub fn discover_latest_tablet_metadata_version(
     tablet_root_path: &str,
     tablet_id: i64,
 ) -> Result<Option<i64>, String> {
+    discover_latest_tablet_metadata_version_at_most(tablet_root_path, tablet_id, i64::MAX)
+}
+
+#[allow(dead_code)]
+pub fn discover_latest_tablet_metadata_version_at_most(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    max_version: i64,
+) -> Result<Option<i64>, String> {
+    if max_version <= 0 {
+        return Ok(None);
+    }
     let mut latest = discover_latest_metadata_version_in_dir(
         &join_tablet_path(tablet_root_path, META_DIR)?,
         tablet_id,
+        max_version,
     )?;
     let tablet_scoped = discover_latest_metadata_version_in_dir(
         &join_tablet_path(tablet_root_path, &format!("{tablet_id}/{META_DIR}"))?,
         tablet_id,
+        max_version,
     )?;
     if let Some(tablet_scoped) = tablet_scoped {
         latest = Some(
@@ -471,11 +485,16 @@ pub fn discover_latest_tablet_metadata_version(
 fn discover_latest_metadata_version_in_dir(
     meta_root: &str,
     tablet_id: i64,
+    max_version: i64,
 ) -> Result<Option<i64>, String> {
     let scheme = classify_scan_paths([meta_root])?;
     match scheme {
-        ScanPathScheme::Local => discover_latest_metadata_version_local(meta_root, tablet_id),
-        ScanPathScheme::Oss => discover_latest_metadata_version_oss(meta_root, tablet_id),
+        ScanPathScheme::Local => {
+            discover_latest_metadata_version_local(meta_root, tablet_id, max_version)
+        }
+        ScanPathScheme::Oss => {
+            discover_latest_metadata_version_oss(meta_root, tablet_id, max_version)
+        }
         ScanPathScheme::Hdfs => Err(format!(
             "discover latest metadata version does not support hdfs path yet: {}",
             meta_root
@@ -523,6 +542,7 @@ pub fn discover_latest_bundle_version_local(meta_root: &str) -> Result<Option<i6
 fn discover_latest_metadata_version_local(
     meta_root: &str,
     tablet_id: i64,
+    max_version: i64,
 ) -> Result<Option<i64>, String> {
     let dir = PathBuf::from(meta_root);
     if !dir.exists() {
@@ -550,6 +570,7 @@ fn discover_latest_metadata_version_local(
             continue;
         };
         if let Some((file_tablet_id, version)) = parse_meta_file_name(&name)
+            && version <= max_version
             && (file_tablet_id == tablet_id || file_tablet_id == BUNDLE_TABLET_ID)
         {
             latest = Some(latest.map(|prev| prev.max(version)).unwrap_or(version));
@@ -604,6 +625,7 @@ pub fn discover_latest_bundle_version_oss(meta_root: &str) -> Result<Option<i64>
 fn discover_latest_metadata_version_oss(
     meta_root: &str,
     tablet_id: i64,
+    max_version: i64,
 ) -> Result<Option<i64>, String> {
     let cfg = crate::runtime::starlet_shard_registry::oss_config_for_path(meta_root)?;
     let (op, rel_root) =
@@ -641,6 +663,7 @@ fn discover_latest_metadata_version_oss(
                 continue;
             };
             if let Some((file_tablet_id, version)) = parse_meta_file_name(name)
+                && version <= max_version
                 && (file_tablet_id == tablet_id || file_tablet_id == BUNDLE_TABLET_ID)
             {
                 latest = Some(latest.map(|prev| prev.max(version)).unwrap_or(version));
@@ -751,7 +774,7 @@ pub fn decode_tablet_metadata_from_bundle_bytes(
             start, page.size, footer_offset
         ));
     }
-    let meta = TabletMetadataPb::decode(&bytes[start..end])
+    let mut meta = TabletMetadataPb::decode(&bytes[start..end])
         .map_err(|e| format!("decode tablet metadata failed: {}", e))?;
     if meta.id != Some(tablet_id) {
         return Err(format!(
@@ -765,7 +788,65 @@ pub fn decode_tablet_metadata_from_bundle_bytes(
             expected_version, meta.version
         ));
     }
+    hydrate_tablet_metadata_from_bundle(&bundle, tablet_id, &mut meta)?;
     Ok(meta)
+}
+
+fn hydrate_tablet_metadata_from_bundle(
+    bundle: &BundleTabletMetadataPb,
+    tablet_id: i64,
+    metadata: &mut TabletMetadataPb,
+) -> Result<(), String> {
+    let primary_schema_id = metadata
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.id)
+        .or_else(|| bundle.tablet_to_schema.get(&tablet_id).copied());
+
+    if metadata.schema.is_none() {
+        let Some(schema_id) = primary_schema_id else {
+            return Err(format!(
+                "bundle metadata missing tablet schema mapping for tablet_id={}",
+                tablet_id
+            ));
+        };
+        let schema = bundle.schemas.get(&schema_id).cloned().ok_or_else(|| {
+            format!(
+                "bundle metadata missing schema entry: tablet_id={} schema_id={}",
+                tablet_id, schema_id
+            )
+        })?;
+        metadata.schema = Some(schema);
+    }
+
+    if let Some(schema) = metadata.schema.as_ref().cloned()
+        && let Some(schema_id) = schema.id
+    {
+        metadata
+            .historical_schemas
+            .entry(schema_id)
+            .or_insert(schema);
+    }
+
+    let rowset_schema_ids = metadata
+        .rowset_to_schema
+        .values()
+        .copied()
+        .collect::<Vec<_>>();
+    for schema_id in rowset_schema_ids {
+        if metadata.historical_schemas.contains_key(&schema_id) {
+            continue;
+        }
+        let schema = bundle.schemas.get(&schema_id).cloned().ok_or_else(|| {
+            format!(
+                "bundle metadata missing rowset schema entry: tablet_id={} schema_id={}",
+                tablet_id, schema_id
+            )
+        })?;
+        metadata.historical_schemas.insert(schema_id, schema);
+    }
+
+    Ok(())
 }
 
 pub fn next_rowset_id(rowsets: &[RowsetMetadataPb]) -> u32 {
@@ -780,7 +861,9 @@ pub fn next_rowset_id(rowsets: &[RowsetMetadataPb]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::grpc_client::proto::starrocks::{KeysType, TabletSchemaPb};
+    use crate::service::grpc_client::proto::starrocks::{
+        KeysType, RowsetMetadataPb, TabletSchemaPb,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -859,6 +942,50 @@ mod tests {
         assert!(
             loaded.is_none(),
             "version 2 must not fall back to version 1"
+        );
+    }
+
+    #[test]
+    fn load_tablet_metadata_at_version_hydrates_schema_from_bundle() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let tablet_id = 30021_i64;
+        let schema = TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
+            id: Some(303_i64),
+            ..Default::default()
+        };
+        let metadata_v2 = TabletMetadataPb {
+            id: Some(tablet_id),
+            version: Some(2),
+            schema: None,
+            rowsets: vec![RowsetMetadataPb {
+                id: Some(1),
+                ..Default::default()
+            }],
+            next_rowset_id: Some(2),
+            rowset_to_schema: HashMap::from([(1, 303_i64)]),
+            ..Default::default()
+        };
+        write_bundle_meta_file(
+            temp_dir.path().to_str().expect("temp path to str"),
+            tablet_id,
+            2,
+            &schema,
+            &metadata_v2,
+        )
+        .expect("write bundle metadata");
+
+        let loaded = load_tablet_metadata_at_version(
+            temp_dir.path().to_str().expect("temp path to str"),
+            tablet_id,
+            2,
+        )
+        .expect("load metadata")
+        .expect("metadata exists");
+        assert_eq!(loaded.schema.as_ref().and_then(|v| v.id), Some(303_i64));
+        assert_eq!(
+            loaded.historical_schemas.get(&303_i64).and_then(|v| v.id),
+            Some(303_i64)
         );
     }
 }
