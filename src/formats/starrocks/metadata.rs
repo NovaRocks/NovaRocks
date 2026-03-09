@@ -47,6 +47,7 @@ pub struct StarRocksSegmentFile {
     pub relative_path: String,
     pub path: String,
     pub rowset_version: i64,
+    pub schema_id: Option<i64>,
     pub segment_id: Option<u32>,
     pub bundle_file_offset: Option<i64>,
     pub segment_size: Option<u64>,
@@ -109,6 +110,7 @@ pub struct StarRocksTabletSnapshot {
     pub version: i64,
     pub metadata_path: String,
     pub tablet_schema: TabletSchemaPb,
+    pub historical_schemas: BTreeMap<i64, TabletSchemaPb>,
     pub total_num_rows: u64,
     pub rowset_count: usize,
     pub segment_files: Vec<StarRocksSegmentFile>,
@@ -329,12 +331,23 @@ fn build_standalone_snapshot(
     let (segment_files, delete_predicates) = collect_segment_files(root, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
     let delvec_meta = collect_delvec_meta(&metadata)?;
+    let mut historical_schemas = metadata
+        .historical_schemas
+        .clone()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    if let Some(schema_id) = tablet_schema.id {
+        historical_schemas
+            .entry(schema_id)
+            .or_insert_with(|| tablet_schema.clone());
+    }
 
     Ok(StarRocksTabletSnapshot {
         tablet_id,
         version,
         metadata_path: metadata_path.to_string(),
         tablet_schema,
+        historical_schemas,
         total_num_rows,
         rowset_count: metadata.rowsets.len(),
         segment_files,
@@ -369,12 +382,23 @@ fn parse_bundle_snapshot(
     let (segment_files, delete_predicates) = collect_segment_files(root, &metadata)?;
     let total_num_rows = collect_total_num_rows(&metadata, tablet_id, metadata_path)?;
     let delvec_meta = collect_delvec_meta(&metadata)?;
+    let mut historical_schemas = metadata
+        .historical_schemas
+        .clone()
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    if let Some(schema_id) = tablet_schema.id {
+        historical_schemas
+            .entry(schema_id)
+            .or_insert_with(|| tablet_schema.clone());
+    }
 
     Ok(StarRocksTabletSnapshot {
         tablet_id,
         version,
         metadata_path: metadata_path.to_string(),
         tablet_schema,
+        historical_schemas,
         total_num_rows,
         rowset_count: metadata.rowsets.len(),
         segment_files,
@@ -730,6 +754,10 @@ fn collect_segment_files(
                 rowset.segment_size.len()
             ));
         }
+        let rowset_schema_id = rowset
+            .id
+            .and_then(|rowset_id| metadata.rowset_to_schema.get(&rowset_id).copied())
+            .or_else(|| metadata.schema.as_ref().and_then(|schema| schema.id));
         for (index, raw_name) in rowset.segments.iter().enumerate() {
             let name = raw_name.trim().trim_start_matches('/').to_string();
             if name.is_empty() {
@@ -778,6 +806,7 @@ fn collect_segment_files(
                 relative_path: rel_path.clone(),
                 path: root.join_relative_path(&rel_path),
                 rowset_version,
+                schema_id: rowset_schema_id,
                 segment_id,
                 bundle_file_offset,
                 segment_size,

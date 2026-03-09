@@ -136,13 +136,11 @@ pub(crate) struct TabletWriteTarget {
 pub(crate) struct AutomaticPartitionPlan {
     pub(crate) db_id: i64,
     pub(crate) table_id: i64,
-    pub(crate) schema_id: i64,
     pub(crate) txn_id: i64,
     pub(crate) fe_addr: types::TNetworkAddress,
     pub(crate) partition_key_source: PartitionKeySource,
     pub(crate) partition_column_names: Vec<String>,
     pub(crate) partition_slot_ids: Vec<SlotId>,
-    pub(crate) candidate_index_ids: HashSet<i64>,
 }
 
 impl OlapTableSinkFactory {
@@ -185,14 +183,9 @@ impl OlapTableSinkFactory {
         } else {
             output_exprs
         };
-        if sink.partition.enable_automatic_partition.unwrap_or(false) && write_indexes.len() > 1 {
-            return Err(
-                "OLAP_TABLE_SINK automatic partition with multi-index sink is not supported yet"
-                    .to_string(),
-            );
-        }
         let table_identity = build_lake_table_identity_with_schema_id(&sink, schema_id)?;
-        let auto_partition = build_auto_partition_plan(&sink, schema_id, routing_exprs, fe_addr)?;
+        let auto_partition =
+            build_auto_partition_plan(&sink, &write_indexes, schema_id, routing_exprs, fe_addr)?;
         let write_format = load_lake_data_write_format()?;
 
         let mut index_routings = Vec::with_capacity(write_indexes.len());
@@ -256,8 +249,16 @@ impl OlapTableSinkFactory {
         let mut index_write_plans = Vec::with_capacity(index_routings.len());
         for (index, routing) in index_routings {
             let tablet_schema = build_sink_tablet_schema(&sink.schema, index.schema_id, keys_type)?;
-            let (schema_slot_bindings, op_slot_id) =
-                resolve_write_slot_bindings(&sink, index.schema_id, routing_exprs, &tablet_schema)?;
+            let projected_output_slot_ids = output_projection
+                .as_ref()
+                .map(|plan| plan.output_slot_ids.as_slice());
+            let (schema_slot_bindings, op_slot_id) = resolve_write_slot_bindings(
+                &sink,
+                index.schema_id,
+                routing_exprs,
+                projected_output_slot_ids,
+                &tablet_schema,
+            )?;
             let column_to_expr_value =
                 resolve_column_to_expr_value_for_write(&sink, index.schema_id)?;
             let auto_increment =
@@ -508,6 +509,7 @@ fn maybe_create_automatic_partitions_for_literal_insert(
 
 fn build_auto_partition_plan(
     sink: &data_sinks::TOlapTableSink,
+    write_indexes: &[SinkWriteIndexSelection],
     schema_id: i64,
     output_exprs: Option<&[exprs::TExpr]>,
     fe_addr: Option<&types::TNetworkAddress>,
@@ -558,12 +560,9 @@ fn build_auto_partition_plan(
     if partition_slot_ids.is_empty() {
         return Ok(None);
     }
-    let candidate_index_ids = sink
-        .schema
-        .indexes
+    let candidate_index_ids = write_indexes
         .iter()
-        .filter(|idx| idx.schema_id.filter(|v| *v > 0).unwrap_or(idx.id) == schema_id)
-        .map(|idx| idx.id)
+        .map(|index| index.index_id)
         .collect::<HashSet<_>>();
     if candidate_index_ids.is_empty() {
         return Err(format!(
@@ -580,13 +579,11 @@ fn build_auto_partition_plan(
     Ok(Some(AutomaticPartitionPlan {
         db_id: sink.db_id,
         table_id: sink.table_id,
-        schema_id,
         txn_id: sink.txn_id,
         fe_addr,
         partition_key_source,
         partition_column_names,
         partition_slot_ids,
-        candidate_index_ids,
     }))
 }
 
@@ -840,18 +837,23 @@ fn resolve_write_slot_bindings(
     sink: &data_sinks::TOlapTableSink,
     schema_id: i64,
     output_exprs: Option<&[exprs::TExpr]>,
+    projected_output_slot_ids: Option<&[SlotId]>,
     tablet_schema: &TabletSchemaPb,
 ) -> Result<(Vec<Option<SlotId>>, Option<SlotId>), String> {
     let slot_by_name = build_slot_name_map(&sink.schema.slot_descs)?;
     let output_expr_slot_map =
         build_output_expr_slot_name_map_for_write(sink, schema_id, output_exprs)?;
     let output_expr_slot_by_ordinal = resolve_output_expr_slot_ids_for_write(output_exprs)?;
+    let projected_output_slot_by_ordinal = projected_output_slot_ids
+        .map(|slot_ids| slot_ids.iter().copied().map(Some).collect::<Vec<_>>())
+        .unwrap_or_default();
     let schema_slot_by_ordinal = resolve_schema_slot_ids_by_ordinal(&sink.schema.slot_descs)?;
     let index_column_names = resolve_index_column_names_for_write(sink, schema_id)?;
-    let allow_output_ordinal_fallback = output_expr_slot_map.is_empty()
-        && output_expr_slot_by_ordinal.len() == tablet_schema.column.len();
-    let allow_schema_ordinal_fallback =
-        slot_by_name.is_empty() && schema_slot_by_ordinal.len() == tablet_schema.column.len();
+    let allow_output_ordinal_fallback =
+        output_expr_slot_by_ordinal.len() == tablet_schema.column.len();
+    let allow_projected_ordinal_fallback =
+        projected_output_slot_by_ordinal.len() == tablet_schema.column.len();
+    let allow_schema_ordinal_fallback = schema_slot_by_ordinal.len() == tablet_schema.column.len();
     let mut out = Vec::with_capacity(tablet_schema.column.len());
     for (idx, col) in tablet_schema.column.iter().enumerate() {
         let name = col
@@ -883,6 +885,11 @@ fn resolve_write_slot_bindings(
             .or_else(|| {
                 allow_output_ordinal_fallback
                     .then(|| output_expr_slot_by_ordinal.get(idx).and_then(|v| *v))
+                    .flatten()
+            })
+            .or_else(|| {
+                allow_projected_ordinal_fallback
+                    .then(|| projected_output_slot_by_ordinal.get(idx).and_then(|v| *v))
                     .flatten()
             })
             .or_else(|| {
@@ -1767,4 +1774,397 @@ fn collect_required_tablets(partition: &descriptors::TOlapTablePartitionParam) -
         }
     }
     tablets.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_write_slot_bindings;
+    use crate::common::ids::SlotId;
+    use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
+    use crate::{data_sinks, descriptors, exprs, types};
+
+    fn test_sink_with_aliased_agg_slots() -> data_sinks::TOlapTableSink {
+        data_sinks::TOlapTableSink {
+            load_id: types::TUniqueId { hi: 1, lo: 2 },
+            txn_id: 10,
+            db_id: 1,
+            table_id: 2,
+            tuple_id: 1,
+            num_replicas: 1,
+            need_gen_rollup: false,
+            db_name: Some("db".to_string()),
+            table_name: Some("tbl".to_string()),
+            schema: descriptors::TOlapTableSchemaParam {
+                db_id: 1,
+                table_id: 2,
+                version: 1,
+                slot_descs: vec![
+                    descriptors::TSlotDescriptor {
+                        id: Some(1),
+                        parent: None,
+                        slot_type: None,
+                        column_pos: None,
+                        byte_offset: None,
+                        null_indicator_byte: None,
+                        null_indicator_bit: None,
+                        col_name: Some("ds".to_string()),
+                        slot_idx: None,
+                        is_materialized: None,
+                        is_output_column: None,
+                        is_nullable: Some(false),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    descriptors::TSlotDescriptor {
+                        id: Some(2),
+                        parent: None,
+                        slot_type: None,
+                        column_pos: None,
+                        byte_offset: None,
+                        null_indicator_byte: None,
+                        null_indicator_bit: None,
+                        col_name: Some("tag".to_string()),
+                        slot_idx: None,
+                        is_materialized: None,
+                        is_output_column: None,
+                        is_nullable: Some(true),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    descriptors::TSlotDescriptor {
+                        id: Some(3),
+                        parent: None,
+                        slot_type: None,
+                        column_pos: None,
+                        byte_offset: None,
+                        null_indicator_byte: None,
+                        null_indicator_bit: None,
+                        col_name: Some("sum_v1".to_string()),
+                        slot_idx: None,
+                        is_materialized: None,
+                        is_output_column: None,
+                        is_nullable: Some(true),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                    descriptors::TSlotDescriptor {
+                        id: Some(4),
+                        parent: None,
+                        slot_type: None,
+                        column_pos: None,
+                        byte_offset: None,
+                        null_indicator_byte: None,
+                        null_indicator_bit: None,
+                        col_name: Some("uv".to_string()),
+                        slot_idx: None,
+                        is_materialized: None,
+                        is_output_column: None,
+                        is_nullable: Some(true),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                ],
+                tuple_desc: descriptors::TTupleDescriptor {
+                    id: Some(1),
+                    byte_size: Some(16),
+                    num_null_bytes: Some(0),
+                    table_id: Some(2),
+                    num_null_slots: Some(0),
+                },
+                indexes: vec![descriptors::TOlapTableIndexSchema {
+                    id: 10,
+                    columns: vec![
+                        "ds".to_string(),
+                        "tag".to_string(),
+                        "mv_sum_v1".to_string(),
+                        "mv_bitmap_union_user_id".to_string(),
+                    ],
+                    schema_hash: 1,
+                    column_param: None,
+                    where_clause: None,
+                    schema_id: Some(10),
+                    column_to_expr_value: None,
+                    is_shadow: None,
+                }],
+            },
+            partition: descriptors::TOlapTablePartitionParam {
+                db_id: 1,
+                table_id: 2,
+                version: 1,
+                partition_column: None,
+                distributed_columns: Some(vec!["ds".to_string()]),
+                partitions: Vec::new(),
+                partition_columns: None,
+                partition_exprs: None,
+                enable_automatic_partition: Some(false),
+            },
+            location: descriptors::TOlapTableLocationParam {
+                db_id: 1,
+                table_id: 2,
+                version: 1,
+                tablets: Vec::new(),
+            },
+            nodes_info: descriptors::TNodesInfo {
+                version: 1,
+                nodes: Vec::new(),
+            },
+            load_channel_timeout_s: None,
+            is_lake_table: Some(true),
+            txn_trace_parent: None,
+            keys_type: Some(types::TKeysType::AGG_KEYS),
+            write_quorum_type: None,
+            enable_replicated_storage: None,
+            merge_condition: None,
+            null_expr_in_auto_increment: None,
+            miss_auto_increment_column: None,
+            abort_delete: None,
+            auto_increment_slot_id: None,
+            partial_update_mode: None,
+            label: None,
+            enable_colocate_mv_index: None,
+            automatic_bucket_size: None,
+            write_txn_log: None,
+            ignore_out_of_partition: None,
+            encryption_meta: None,
+            dynamic_overwrite: None,
+            enable_data_file_bundling: None,
+            is_multi_statements_txn: None,
+        }
+    }
+
+    fn test_mv_tablet_schema() -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::AggKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("ds".to_string()),
+                    r#type: "DATE".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("tag".to_string()),
+                    r#type: "VARCHAR".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: Some(32),
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 3,
+                    name: Some("mv_sum_v1".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: Some("SUM".to_string()),
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 4,
+                    name: Some("mv_bitmap_union_user_id".to_string()),
+                    r#type: "BITMAP".to_string(),
+                    is_key: Some(false),
+                    aggregation: Some("BITMAP_UNION".to_string()),
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(2),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(5),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0, 1],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1, 2],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(10),
+        }
+    }
+
+    fn dummy_type_desc() -> types::TTypeDesc {
+        types::TTypeDesc {
+            types: Some(vec![types::TTypeNode {
+                type_: types::TTypeNodeType::SCALAR,
+                scalar_type: None,
+                struct_fields: None,
+                is_named: None,
+            }]),
+        }
+    }
+
+    fn default_expr_node() -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: dummy_type_desc(),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn slot_ref_expr(slot_id: i32) -> exprs::TExpr {
+        exprs::TExpr {
+            nodes: vec![exprs::TExprNode {
+                node_type: exprs::TExprNodeType::SLOT_REF,
+                type_: dummy_type_desc(),
+                num_children: 0,
+                slot_ref: Some(exprs::TSlotRef {
+                    slot_id,
+                    tuple_id: 0,
+                }),
+                ..default_expr_node()
+            }],
+        }
+    }
+
+    #[test]
+    fn write_slot_bindings_use_projected_output_ordinals_for_rollup_agg_columns() {
+        let sink = test_sink_with_aliased_agg_slots();
+        let projected_output_slot_ids = vec![
+            SlotId::new(1),
+            SlotId::new(2),
+            SlotId::new(3),
+            SlotId::new(4),
+        ];
+        let (bindings, op_slot_id) = resolve_write_slot_bindings(
+            &sink,
+            10,
+            None,
+            Some(projected_output_slot_ids.as_slice()),
+            &test_mv_tablet_schema(),
+        )
+        .expect("resolve write slot bindings");
+        assert_eq!(
+            bindings,
+            vec![
+                Some(SlotId::new(1)),
+                Some(SlotId::new(2)),
+                Some(SlotId::new(3)),
+                Some(SlotId::new(4)),
+            ]
+        );
+        assert_eq!(op_slot_id, None);
+    }
+
+    #[test]
+    fn write_slot_bindings_use_output_expr_ordinals_when_aliases_do_not_match_physical_mv_names() {
+        let sink = test_sink_with_aliased_agg_slots();
+        let output_exprs = vec![
+            slot_ref_expr(1),
+            slot_ref_expr(2),
+            slot_ref_expr(3),
+            slot_ref_expr(4),
+        ];
+        let (bindings, op_slot_id) = resolve_write_slot_bindings(
+            &sink,
+            10,
+            Some(output_exprs.as_slice()),
+            None,
+            &test_mv_tablet_schema(),
+        )
+        .expect("resolve write slot bindings from output expr ordinals");
+        assert_eq!(
+            bindings,
+            vec![
+                Some(SlotId::new(1)),
+                Some(SlotId::new(2)),
+                Some(SlotId::new(3)),
+                Some(SlotId::new(4)),
+            ]
+        );
+        assert_eq!(op_slot_id, None);
+    }
 }

@@ -450,6 +450,10 @@ fn scan_rowset_primary_key_rows(
             segment_size,
         );
 
+        let schema_id = snapshot_schema.id.filter(|id| *id > 0);
+        let historical_schemas = schema_id
+            .map(|id| std::collections::BTreeMap::from([(id, snapshot_schema.clone())]))
+            .unwrap_or_default();
         let snapshot = StarRocksTabletSnapshot {
             // Use a stable per-segment synthetic cache identity. Partition-root layouts
             // can share the same tablet_root_path across tablets, so rowset_id-based
@@ -458,6 +462,7 @@ fn scan_rowset_primary_key_rows(
             version: cache_version,
             metadata_path: String::new(),
             tablet_schema: snapshot_schema.clone(),
+            historical_schemas,
             total_num_rows: 0,
             rowset_count: 1,
             segment_files: vec![StarRocksSegmentFile {
@@ -465,6 +470,7 @@ fn scan_rowset_primary_key_rows(
                 relative_path: relative_path.clone(),
                 path,
                 rowset_version: rowset.version.unwrap_or(0),
+                schema_id,
                 segment_id: Some(segment_id),
                 bundle_file_offset,
                 segment_size,
@@ -489,7 +495,7 @@ fn scan_rowset_primary_key_rows(
             tablet_root_path,
             object_store_profile.as_ref(),
         )?;
-        let plan = build_native_read_plan(&snapshot, &segment_footers, key_output_schema)?;
+        let plan = build_native_read_plan(&snapshot, &segment_footers, key_output_schema, None)?;
         let batch = build_native_record_batch(
             &plan,
             &segment_footers,

@@ -693,7 +693,8 @@ fn collect_min_max_for_column(
             &tablet.tablet_root_path,
             object_store_profile,
         )?;
-        let plan = build_native_read_plan(&tablet.snapshot, &segment_footers, &output_schema)?;
+        let plan =
+            build_native_read_plan(&tablet.snapshot, &segment_footers, &output_schema, None)?;
         let batch = build_native_record_batch(
             &plan,
             &segment_footers,
@@ -1208,7 +1209,8 @@ fn collect_dict_words_for_column(
             &tablet.tablet_root_path,
             object_store_profile,
         )?;
-        let plan = build_native_read_plan(&tablet.snapshot, &segment_footers, &output_schema)?;
+        let plan =
+            build_native_read_plan(&tablet.snapshot, &segment_footers, &output_schema, None)?;
         let batch = build_native_record_batch(
             &plan,
             &segment_footers,

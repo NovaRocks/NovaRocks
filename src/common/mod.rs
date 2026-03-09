@@ -21,6 +21,7 @@ pub mod ids;
 pub mod largeint;
 pub mod logging;
 pub mod min_max_predicate;
+pub mod percentile;
 pub mod thrift;
 pub mod types;
 pub mod util;

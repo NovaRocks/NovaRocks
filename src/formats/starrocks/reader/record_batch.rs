@@ -218,6 +218,22 @@ pub(super) fn build_dup_record_batch(
                 segment_footers.len()
             )
         })?;
+        if segment.projected_schemas.len() != plan.projected_columns.len() {
+            return Err(format!(
+                "segment projected schema count mismatch in native read plan: segment={}, projected_schemas={}, projected_columns={}",
+                segment.path,
+                segment.projected_schemas.len(),
+                plan.projected_columns.len()
+            ));
+        }
+        if segment.source_column_missing_by_output.len() != plan.projected_columns.len() {
+            return Err(format!(
+                "segment source-missing count mismatch in native read plan: segment={}, source_missing_flags={}, projected_columns={}",
+                segment.path,
+                segment.source_column_missing_by_output.len(),
+                plan.projected_columns.len()
+            ));
+        }
         let segment_rows = segment.footer_num_rows as usize;
         let predicate_bindings = bind_predicates_for_segment(
             min_max_predicates,
@@ -317,7 +333,10 @@ pub(super) fn build_dup_record_batch(
 
         for projected in &plan.projected_columns {
             let output_field = output_schema.field(projected.output_index);
-            let mut array = if projected.source_column_missing {
+            let segment_schema = &segment.projected_schemas[projected.output_index];
+            let source_column_missing =
+                segment.source_column_missing_by_output[projected.output_index];
+            let mut array = if source_column_missing {
                 build_missing_projected_array(
                     projected,
                     output_field.data_type(),
@@ -333,7 +352,7 @@ pub(super) fn build_dup_record_batch(
                             &segment.path,
                             &segment_bytes,
                             column_meta,
-                            &projected.schema,
+                            segment_schema,
                             flat_projection,
                             output_field.data_type(),
                             &projected.output_name,
@@ -346,7 +365,7 @@ pub(super) fn build_dup_record_batch(
                             &segment.path,
                             &segment_bytes,
                             column_meta,
-                            &projected.schema,
+                            segment_schema,
                             output_field.data_type(),
                             &projected.output_name,
                             &selected_ranges,
@@ -1178,6 +1197,8 @@ fn build_delete_keep_mask_for_segment(
             let output_data_type = delete_predicate_output_data_type(term)?;
             let schema = StarRocksNativeSchemaColumnPlan {
                 unique_id: Some(term.schema_unique_id),
+                source_index: None,
+                source_lookup_attempted: false,
                 schema_type: term.schema_type.clone(),
                 is_nullable: true,
                 is_key: true,
@@ -2931,6 +2952,8 @@ mod tests {
             schema_type: "VARCHAR".to_string(),
             schema: StarRocksNativeSchemaColumnPlan {
                 unique_id: Some(9),
+                source_index: None,
+                source_lookup_attempted: false,
                 schema_type: "VARCHAR".to_string(),
                 is_nullable: false,
                 is_key: false,
@@ -2965,6 +2988,8 @@ mod tests {
             schema_type: "BIGINT".to_string(),
             schema: StarRocksNativeSchemaColumnPlan {
                 unique_id: Some(10),
+                source_index: None,
+                source_lookup_attempted: false,
                 schema_type: "BIGINT".to_string(),
                 is_nullable: true,
                 is_key: false,
@@ -2997,6 +3022,8 @@ mod tests {
             schema_type: "BIGINT".to_string(),
             schema: StarRocksNativeSchemaColumnPlan {
                 unique_id: Some(11),
+                source_index: None,
+                source_lookup_attempted: false,
                 schema_type: "BIGINT".to_string(),
                 is_nullable: false,
                 is_key: false,

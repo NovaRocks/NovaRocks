@@ -60,6 +60,7 @@ const LOGICAL_TYPE_DECIMAL64: i32 = 48;
 const LOGICAL_TYPE_DECIMAL128: i32 = 49;
 const LOGICAL_TYPE_DATE: i32 = 50;
 const LOGICAL_TYPE_DATETIME: i32 = 51;
+const LOGICAL_TYPE_PERCENTILE: i32 = 53;
 const COLUMN_INDEX_TYPE_ORDINAL_INDEX: i32 = 1;
 const COLUMN_INDEX_TYPE_ZONE_MAP_INDEX: i32 = 2;
 const SHORT_KEY_NULL_FIRST_MARKER: u8 = 0x01;
@@ -1500,6 +1501,7 @@ fn encode_short_key_value_bytes(
         NativeWriterType::Binary
         | NativeWriterType::VarBinary
         | NativeWriterType::Hll
+        | NativeWriterType::Percentile
         | NativeWriterType::Object => {
             let casted =
                 cast(column.as_ref(), &arrow::datatypes::DataType::Binary).map_err(|e| {
@@ -2553,6 +2555,7 @@ fn build_segment_zone_map_for_column(
         NativeWriterType::Binary
         | NativeWriterType::VarBinary
         | NativeWriterType::Hll
+        | NativeWriterType::Percentile
         | NativeWriterType::Object => {
             let casted = cast(column.as_ref(), &arrow::datatypes::DataType::Binary).map_err(
                 |e| {
@@ -2972,6 +2975,7 @@ enum NativeWriterType {
     Binary,
     VarBinary,
     Hll,
+    Percentile,
     Object,
     Boolean,
 }
@@ -2996,6 +3000,7 @@ impl NativeWriterType {
             Self::Binary => LOGICAL_TYPE_BINARY,
             Self::VarBinary => LOGICAL_TYPE_VARBINARY,
             Self::Hll => LOGICAL_TYPE_HLL,
+            Self::Percentile => LOGICAL_TYPE_PERCENTILE,
             Self::Object => LOGICAL_TYPE_OBJECT,
             Self::Boolean => LOGICAL_TYPE_BOOLEAN,
         }
@@ -3024,6 +3029,7 @@ fn map_schema_type_to_writer_type(column: &ColumnPb) -> Result<NativeWriterType,
         "BINARY" => Ok(NativeWriterType::Binary),
         "VARBINARY" => Ok(NativeWriterType::VarBinary),
         "HLL" => Ok(NativeWriterType::Hll),
+        "PERCENTILE" => Ok(NativeWriterType::Percentile),
         "BITMAP" | "OBJECT" | "JSON" => Ok(NativeWriterType::Object),
         _ => Err(format!(
             "unsupported schema type for native segment writer: {}",
@@ -3577,6 +3583,7 @@ fn encode_native_data_page_for_column(
         NativeWriterType::Binary
         | NativeWriterType::VarBinary
         | NativeWriterType::Hll
+        | NativeWriterType::Percentile
         | NativeWriterType::Object => {
             let casted = cast(column.as_ref(), &arrow::datatypes::DataType::Binary).map_err(
                 |e| {

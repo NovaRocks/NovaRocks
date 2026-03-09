@@ -47,6 +47,7 @@ pub(super) fn expected_logical_type_from_schema_type(schema_type: &str) -> Optio
         "VARCHAR" | "STRING" => Some(LOGICAL_TYPE_VARCHAR),
         "HLL" => Some(LOGICAL_TYPE_HLL),
         "BITMAP" | "OBJECT" => Some(LOGICAL_TYPE_OBJECT),
+        "PERCENTILE" => Some(LOGICAL_TYPE_PERCENTILE),
         "JSON" => Some(LOGICAL_TYPE_JSON),
         "BINARY" => Some(LOGICAL_TYPE_BINARY),
         "VARBINARY" => Some(LOGICAL_TYPE_VARBINARY),

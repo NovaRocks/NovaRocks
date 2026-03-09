@@ -33,10 +33,15 @@ use crate::common::thrift::{
 
 use crate::cache::CacheOptions;
 use crate::common::types::{FetchResult, UniqueId};
-use crate::common::util::{mysql_text_row_from_arrays, mysql_text_row_from_arrays_with_primitives};
+use crate::common::util::{
+    http_json_row_from_arrays_with_primitives, mysql_text_row_from_arrays,
+    mysql_text_row_from_arrays_with_primitives,
+};
 use crate::lower::cache_iceberg_table_locations;
 use crate::lower::fragment::execute_fragment;
-use crate::lower::type_lowering::primitive_type_from_desc;
+use crate::lower::type_lowering::{
+    FIELD_META_PRIMITIVE_JSON, FIELD_META_PRIMITIVE_TYPE, primitive_type_from_desc,
+};
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -832,28 +837,6 @@ fn build_statistic_fetch_result(
     })
 }
 
-fn fields_to_http_json_row(fields: &[Option<Vec<u8>>]) -> Result<Vec<u8>, String> {
-    let mut out = String::from("{\"data\":[");
-    for (idx, value) in fields.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        match value {
-            None => out.push_str("null"),
-            Some(raw) => {
-                let text = std::str::from_utf8(raw)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| String::from_utf8_lossy(raw).to_string());
-                let encoded = serde_json::to_string(&text)
-                    .map_err(|e| format!("encode HTTP json row failed: {e}"))?;
-                out.push_str(&encoded);
-            }
-        }
-    }
-    out.push_str("]}\n");
-    Ok(out.into_bytes())
-}
-
 fn build_http_json_fetch_result(
     chunks: &[Chunk],
     output_exprs: Option<&[exprs::TExpr]>,
@@ -864,17 +847,33 @@ fn build_http_json_fetch_result(
             let columns = columns_for_output_exprs(chunk, output_exprs)?;
             let primitives = primitives_for_output_exprs(output_exprs)?;
             for row in 0..chunk.len() {
-                let mysql_row =
-                    mysql_text_row_from_arrays_with_primitives(&columns, row, Some(&primitives))?;
-                let fields = parse_lenenc_fields(&mysql_row, columns.len())?;
-                batch.rows.push(fields_to_http_json_row(&fields)?);
+                batch.rows.push(http_json_row_from_arrays_with_primitives(
+                    &columns,
+                    row,
+                    Some(&primitives),
+                    None,
+                )?);
             }
         } else {
             let columns = chunk.columns();
+            let json_semantics = chunk
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    field
+                        .metadata()
+                        .get(FIELD_META_PRIMITIVE_TYPE)
+                        .is_some_and(|value| value == FIELD_META_PRIMITIVE_JSON)
+                })
+                .collect::<Vec<_>>();
             for row in 0..chunk.len() {
-                let mysql_row = mysql_text_row_from_arrays(columns, row)?;
-                let fields = parse_lenenc_fields(&mysql_row, columns.len())?;
-                batch.rows.push(fields_to_http_json_row(&fields)?);
+                batch.rows.push(http_json_row_from_arrays_with_primitives(
+                    columns,
+                    row,
+                    None,
+                    Some(&json_semantics),
+                )?);
             }
         }
     }

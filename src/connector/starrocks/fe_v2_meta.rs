@@ -341,12 +341,18 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     tablet_id: Option<i64>,
     query_id: Option<types::TUniqueId>,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
-    if db_id <= 0 || table_id <= 0 || schema_id <= 0 {
+    if schema_id <= 0 {
         return Err(format!(
-            "invalid table schema meta for FE getTableSchema: db_id={} table_id={} schema_id={}",
+            "invalid schema_id for FE getTableSchema: db_id={} table_id={} schema_id={}",
             db_id, table_id, schema_id
         ));
     }
+    let query_id = query_id.ok_or_else(|| {
+        format!(
+            "missing query_id for FE getTableSchema scan request: db_id={} table_id={} schema_id={}",
+            db_id, table_id, schema_id
+        )
+    })?;
     let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
         "missing FE address for getTableSchema (coord is absent and heartbeat cache is empty)"
             .to_string()
@@ -361,7 +367,7 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
             }),
             source: Some(frontend_service::TTableSchemaRequestSource::SCAN),
             tablet_id,
-            query_id,
+            query_id: Some(query_id),
             txn_id: None,
         }]),
     };
@@ -653,5 +659,28 @@ mod tests {
         cache_table_identity_names(&table);
         let cached = find_cached_table_identity_names(&table.catalog, table.db_id, table.table_id);
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn lake_scan_schema_fetch_allows_placeholder_catalog_ids() {
+        let request = crate::frontend_service::TGetTableSchemaRequest {
+            schema_meta: Some(crate::plan_nodes::TTableSchemaMeta {
+                db_id: Some(-1),
+                table_id: Some(70_528),
+                schema_id: Some(70_528),
+            }),
+            source: Some(crate::frontend_service::TTableSchemaRequestSource::SCAN),
+            tablet_id: Some(70_531),
+            query_id: Some(crate::types::TUniqueId { hi: 1, lo: 2 }),
+            txn_id: None,
+        };
+        let schema_meta = request
+            .schema_meta
+            .as_ref()
+            .expect("schema_meta should be set");
+        assert_eq!(schema_meta.db_id, Some(-1));
+        assert_eq!(schema_meta.table_id, Some(70_528));
+        assert_eq!(schema_meta.schema_id, Some(70_528));
+        assert!(request.query_id.is_some());
     }
 }

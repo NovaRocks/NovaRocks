@@ -21,7 +21,7 @@
 //!
 //! Current aggregation scope:
 //! - `SUM`, `MIN`, `MAX`, `REPLACE`, `REPLACE_IF_NOT_NULL`.
-//! - `BITMAP_UNION`, `HLL_UNION`.
+//! - `BITMAP_UNION`, `HLL_UNION`, `PERCENTILE_UNION`.
 //! - `UNIQUE_KEYS` is treated as `REPLACE`-only aggregation.
 //! - Scalar output columns only (no ARRAY/MAP/STRUCT aggregation).
 
@@ -31,15 +31,16 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
-    Date32Builder, Decimal128Array, Decimal128Builder, Float32Array, Float32Builder, Float64Array,
-    Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array, Int32Builder,
-    Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampMicrosecondBuilder, new_empty_array,
+    Date32Builder, Decimal128Array, Decimal128Builder, FixedSizeBinaryArray, Float32Array,
+    Float32Builder, Float64Array, Float64Builder, Int8Array, Int8Builder, Int16Array, Int16Builder,
+    Int32Array, Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder,
+    TimestampMicrosecondArray, TimestampMicrosecondBuilder, new_empty_array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use roaring::RoaringBitmap;
 
+use crate::common::{largeint, percentile};
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::formats::starrocks::plan::{
@@ -57,6 +58,7 @@ enum AggOp {
     ReplaceIfNotNull,
     BitmapUnion,
     HllUnion,
+    PercentileUnion,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +84,7 @@ enum AggCell {
     Int16(i16),
     Int32(i32),
     Int64(i64),
+    LargeInt(i128),
     Float32(f32),
     Float64(f64),
     Boolean(bool),
@@ -165,6 +168,10 @@ fn build_agg_scan_plan(
             fallback_default_literal: None,
             fallback_is_nullable: key.schema.is_nullable,
         });
+        for segment in &mut scan_plan.segments {
+            segment.projected_schemas.push(key.schema.clone());
+            segment.source_column_missing_by_output.push(false);
+        }
         index_by_unique.insert(key.schema_unique_id, output_index);
     }
 
@@ -358,8 +365,9 @@ fn parse_agg_op(raw: &str, output_name: &str) -> Result<AggOp, String> {
         "REPLACE_IF_NOT_NULL" => Ok(AggOp::ReplaceIfNotNull),
         "BITMAP_UNION" => Ok(AggOp::BitmapUnion),
         "HLL_UNION" => Ok(AggOp::HllUnion),
+        "PERCENTILE_UNION" => Ok(AggOp::PercentileUnion),
         other => Err(format!(
-            "unsupported AGG_KEYS aggregation in native reader: output_column={}, aggregation={}, supported=[SUM,MIN,MAX,REPLACE,REPLACE_IF_NOT_NULL,BITMAP_UNION,HLL_UNION]",
+            "unsupported AGG_KEYS aggregation in native reader: output_column={}, aggregation={}, supported=[SUM,MIN,MAX,REPLACE,REPLACE_IF_NOT_NULL,BITMAP_UNION,HLL_UNION,PERCENTILE_UNION]",
             output_name, other
         )),
     }
@@ -416,6 +424,7 @@ fn merge_cell(state: &mut AggCell, incoming: AggCell, spec: &AggColumnSpec) -> R
         AggOp::Max => merge_ordered_cell(state, incoming, spec, false),
         AggOp::BitmapUnion => merge_bitmap_union_cell(state, incoming, spec),
         AggOp::HllUnion => merge_hll_union_cell(state, incoming, spec),
+        AggOp::PercentileUnion => merge_percentile_union_cell(state, incoming, spec),
     }
 }
 
@@ -485,6 +494,27 @@ fn merge_hll_union_cell(
     merge_starrocks_hll(&mut merged, &incoming_hll);
     let encoded = encode_starrocks_hll(&merged)?;
     *state = bytes_to_union_cell(encoded, spec, "HLL_UNION")?;
+    Ok(())
+}
+
+fn merge_percentile_union_cell(
+    state: &mut AggCell,
+    incoming: AggCell,
+    spec: &AggColumnSpec,
+) -> Result<(), String> {
+    let incoming_bytes = cell_bytes_for_union(&incoming, spec, "PERCENTILE_UNION")?;
+    let Some(incoming_bytes) = incoming_bytes else {
+        return Ok(());
+    };
+
+    let mut merged =
+        if let Some(state_bytes) = cell_bytes_for_union(state, spec, "PERCENTILE_UNION")? {
+            percentile::decode_state(&state_bytes)?
+        } else {
+            percentile::PercentileState::default()
+        };
+    percentile::merge_serialized_state_into(&mut merged, &incoming_bytes)?;
+    *state = bytes_to_union_cell(percentile::encode_state(&merged), spec, "PERCENTILE_UNION")?;
     Ok(())
 }
 
@@ -1055,6 +1085,7 @@ fn compare_cells(
         (AggCell::Int16(a), AggCell::Int16(b)) => a.cmp(b),
         (AggCell::Int32(a), AggCell::Int32(b)) => a.cmp(b),
         (AggCell::Int64(a), AggCell::Int64(b)) => a.cmp(b),
+        (AggCell::LargeInt(a), AggCell::LargeInt(b)) => a.cmp(b),
         (AggCell::Float32(a), AggCell::Float32(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (AggCell::Float64(a), AggCell::Float64(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
         (AggCell::Boolean(a), AggCell::Boolean(b)) => a.cmp(b),
@@ -1125,6 +1156,7 @@ fn group_key_arrow_type(key: &StarRocksNativeGroupKeyColumnPlan) -> Result<DataT
         "SMALLINT" => Ok(DataType::Int16),
         "INT" => Ok(DataType::Int32),
         "BIGINT" => Ok(DataType::Int64),
+        "LARGEINT" => Ok(DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH)),
         "FLOAT" => Ok(DataType::Float32),
         "DOUBLE" => Ok(DataType::Float64),
         "BOOLEAN" => Ok(DataType::Boolean),
@@ -1172,6 +1204,10 @@ fn encode_cell_for_key(value: &AggCell, out: &mut Vec<u8>) -> Result<(), String>
         AggCell::Int64(v) => {
             out.push(4);
             out.extend_from_slice(&v.to_le_bytes());
+        }
+        AggCell::LargeInt(v) => {
+            out.push(13);
+            out.extend_from_slice(&v.to_be_bytes());
         }
         AggCell::Float32(v) => {
             out.push(5);
@@ -1261,6 +1297,15 @@ fn cell_from_array(
                 .ok_or_else(|| format!("AGG_KEYS column type mismatch for {}", output_name))?
                 .value(row),
         )),
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            Ok(AggCell::LargeInt(largeint::value_at(
+                array
+                    .as_any()
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .ok_or_else(|| format!("AGG_KEYS column type mismatch for {}", output_name))?,
+                row,
+            )?))
+        }
         DataType::Float32 => Ok(AggCell::Float32(
             array
                 .as_any()
@@ -1407,6 +1452,22 @@ fn build_array_from_cells(spec: &AggColumnSpec, rows: &[Vec<AggCell>]) -> Result
                 }
             }
             Ok(Arc::new(builder.finish()))
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let mut out_values = Vec::with_capacity(values.len());
+            for value in values {
+                match value {
+                    AggCell::Null => out_values.push(None),
+                    AggCell::LargeInt(v) => out_values.push(Some(*v)),
+                    _ => {
+                        return Err(format!(
+                            "AGG_KEYS output type mismatch when building LARGEINT column {}",
+                            spec.output_name
+                        ));
+                    }
+                }
+            }
+            largeint::array_from_i128(&out_values)
         }
         DataType::Float32 => {
             let mut builder = Float32Builder::with_capacity(values.len());
@@ -1559,9 +1620,10 @@ fn build_array_from_cells(spec: &AggColumnSpec, rows: &[Vec<AggCell>]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::largeint;
     use crate::formats::starrocks::plan::{
         StarRocksNativeColumnPlan, StarRocksNativeGroupKeyColumnPlan, StarRocksNativeReadPlan,
-        StarRocksNativeSchemaColumnPlan, StarRocksTableModelPlan,
+        StarRocksNativeSchemaColumnPlan, StarRocksNativeSegmentPlan, StarRocksTableModelPlan,
     };
     use arrow::array::{BinaryArray, Int64Array};
     use arrow::datatypes::{Field, Schema};
@@ -1593,6 +1655,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: true,
@@ -1613,6 +1677,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: false,
@@ -1633,6 +1699,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1703,6 +1771,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(2),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: false,
@@ -1722,6 +1792,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1759,6 +1831,209 @@ mod tests {
     }
 
     #[test]
+    fn build_agg_scan_plan_extends_segment_projection_for_hidden_group_keys() {
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int64, true)]));
+        let value_schema = StarRocksNativeSchemaColumnPlan {
+            unique_id: Some(2),
+            source_index: Some(0),
+            source_lookup_attempted: true,
+            schema_type: "BIGINT".to_string(),
+            is_nullable: true,
+            is_key: false,
+            aggregation: Some("SUM".to_string()),
+            precision: None,
+            scale: None,
+            children: Vec::new(),
+        };
+        let key_schema = StarRocksNativeSchemaColumnPlan {
+            unique_id: Some(1),
+            source_index: Some(1),
+            source_lookup_attempted: true,
+            schema_type: "BIGINT".to_string(),
+            is_nullable: false,
+            is_key: true,
+            aggregation: None,
+            precision: None,
+            scale: None,
+            children: Vec::new(),
+        };
+        let plan = StarRocksNativeReadPlan {
+            tablet_id: 10,
+            version: 20,
+            table_model: StarRocksTableModelPlan::AggKeys,
+            projected_columns: vec![StarRocksNativeColumnPlan {
+                output_index: 0,
+                output_name: "v1".to_string(),
+                schema_unique_id: 2,
+                schema_type: "BIGINT".to_string(),
+                schema: value_schema.clone(),
+                flat_json_projection: None,
+                source_column_missing: false,
+                fallback_default_literal: None,
+                fallback_is_nullable: true,
+            }],
+            group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
+                output_name: "k1".to_string(),
+                schema_unique_id: 1,
+                schema_type: "BIGINT".to_string(),
+                schema: key_schema.clone(),
+            }],
+            segments: vec![StarRocksNativeSegmentPlan {
+                index: 0,
+                path: "/tmp/seg".to_string(),
+                relative_path: "seg".to_string(),
+                rowset_version: 20,
+                segment_id: Some(0),
+                bundle_file_offset: 0,
+                segment_size: 1,
+                footer_version: 1,
+                footer_num_rows: 1,
+                projected_schemas: vec![value_schema],
+                source_column_missing_by_output: vec![false],
+            }],
+            delete_predicates: Vec::new(),
+            primary_delvec: None,
+            estimated_rows: 1,
+        };
+
+        let (scan_plan, scan_schema, group_key_specs) =
+            build_agg_scan_plan(&plan, &output_schema).expect("build agg scan plan");
+
+        assert_eq!(scan_plan.projected_columns.len(), 2);
+        assert_eq!(scan_schema.fields().len(), 2);
+        assert_eq!(scan_schema.field(1).name(), "__sr_group_key_k1");
+        assert_eq!(group_key_specs.len(), 1);
+        assert_eq!(group_key_specs[0].scan_index, 1);
+        assert_eq!(group_key_specs[0].output_name, "k1");
+        assert_eq!(scan_plan.segments.len(), 1);
+        assert_eq!(scan_plan.segments[0].projected_schemas.len(), 2);
+        assert_eq!(
+            scan_plan.segments[0].projected_schemas[1].unique_id,
+            Some(1)
+        );
+        assert_eq!(
+            scan_plan.segments[0].source_column_missing_by_output,
+            vec![false, false]
+        );
+    }
+
+    #[test]
+    fn aggregate_record_batch_supports_largeint_replace_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int64, true),
+            Field::new(
+                "v1",
+                DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
+                true,
+            ),
+        ]));
+        let largeint_values =
+            largeint::array_from_i128(&[Some(5_i128), Some(7_i128), Some(-3_i128)])
+                .expect("build largeint array");
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(1), Some(2)])) as ArrayRef,
+                largeint_values,
+            ],
+        )
+        .expect("build input batch");
+        let plan = StarRocksNativeReadPlan {
+            tablet_id: 12,
+            version: 24,
+            table_model: StarRocksTableModelPlan::AggKeys,
+            projected_columns: vec![
+                StarRocksNativeColumnPlan {
+                    output_index: 0,
+                    output_name: "k1".to_string(),
+                    schema_unique_id: 1,
+                    schema_type: "BIGINT".to_string(),
+                    schema: StarRocksNativeSchemaColumnPlan {
+                        unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
+                        schema_type: "BIGINT".to_string(),
+                        is_nullable: true,
+                        is_key: true,
+                        aggregation: None,
+                        precision: None,
+                        scale: None,
+                        children: Vec::new(),
+                    },
+                    flat_json_projection: None,
+                    source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
+                },
+                StarRocksNativeColumnPlan {
+                    output_index: 1,
+                    output_name: "v1".to_string(),
+                    schema_unique_id: 2,
+                    schema_type: "LARGEINT".to_string(),
+                    schema: StarRocksNativeSchemaColumnPlan {
+                        unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
+                        schema_type: "LARGEINT".to_string(),
+                        is_nullable: true,
+                        is_key: false,
+                        aggregation: Some("REPLACE".to_string()),
+                        precision: None,
+                        scale: None,
+                        children: Vec::new(),
+                    },
+                    flat_json_projection: None,
+                    source_column_missing: false,
+                    fallback_default_literal: None,
+                    fallback_is_nullable: true,
+                },
+            ],
+            group_key_columns: vec![StarRocksNativeGroupKeyColumnPlan {
+                output_name: "k1".to_string(),
+                schema_unique_id: 1,
+                schema_type: "BIGINT".to_string(),
+                schema: StarRocksNativeSchemaColumnPlan {
+                    unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
+                    schema_type: "BIGINT".to_string(),
+                    is_nullable: true,
+                    is_key: true,
+                    aggregation: None,
+                    precision: None,
+                    scale: None,
+                    children: Vec::new(),
+                },
+            }],
+            segments: Vec::new(),
+            delete_predicates: Vec::new(),
+            primary_delvec: None,
+            estimated_rows: 0,
+        };
+
+        let out = aggregate_record_batch(
+            &plan,
+            &batch,
+            &schema,
+            &[GroupKeySpec {
+                scan_index: 0,
+                output_name: "k1".to_string(),
+                data_type: DataType::Int64,
+            }],
+        )
+        .expect("aggregate batch");
+        let out_v = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeBinaryArray>()
+            .expect("largeint output");
+
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(largeint::value_at(out_v, 0).unwrap(), 7);
+        assert_eq!(largeint::value_at(out_v, 1).unwrap(), -3);
+    }
+
+    #[test]
     fn build_agg_specs_treats_unique_values_as_replace() {
         let output_schema = Arc::new(Schema::new(vec![Field::new("c2", DataType::Int64, true)]));
         let plan = StarRocksNativeReadPlan {
@@ -1772,6 +2047,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(2),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: false,
@@ -1791,6 +2068,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1859,6 +2138,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: true,
@@ -1879,6 +2160,8 @@ mod tests {
                     schema_type: "OBJECT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "OBJECT".to_string(),
                         is_nullable: true,
                         is_key: false,
@@ -1899,6 +2182,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1969,6 +2254,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: true,
@@ -1989,6 +2276,8 @@ mod tests {
                     schema_type: "HLL".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "HLL".to_string(),
                         is_nullable: true,
                         is_key: false,
@@ -2009,6 +2298,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,

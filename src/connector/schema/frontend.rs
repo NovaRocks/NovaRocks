@@ -69,7 +69,7 @@ pub(crate) fn forward_show_result(
     fe_addr: Option<&types::TNetworkAddress>,
     sql: &str,
 ) -> Result<frontend_service::TShowResultSet, String> {
-    let current_user_ident = ctx.current_user_ident.clone();
+    let current_user_ident = effective_current_user_ident(ctx);
     let user_roles = current_user_ident
         .as_ref()
         .and_then(|ident| ident.current_role_ids.clone());
@@ -125,9 +125,31 @@ pub(crate) fn build_auth_info(ctx: &SchemaScanContext) -> frontend_service::TAut
         ctx.db.clone(),
         ctx.user.clone(),
         ctx.user_ip.clone().or_else(|| ctx.ip.clone()),
-        ctx.current_user_ident.clone(),
+        effective_current_user_ident(ctx),
         ctx.catalog_name.clone(),
     )
+}
+
+pub(crate) fn effective_current_user_ident(
+    ctx: &SchemaScanContext,
+) -> Option<types::TUserIdentity> {
+    if let Some(ident) = ctx.current_user_ident.clone() {
+        return Some(ident);
+    }
+
+    let username = schema_scan_user(ctx);
+    let host = ctx
+        .user_ip
+        .clone()
+        .or_else(|| ctx.ip.clone())
+        .unwrap_or_else(|| "%".to_string());
+    Some(types::TUserIdentity::new(
+        Some(username),
+        Some(host),
+        Some(false),
+        Some(false),
+        None::<types::TUserRoles>,
+    ))
 }
 
 pub(crate) fn extract_db_name(full_name: &str) -> String {
@@ -166,4 +188,68 @@ fn schema_scan_user(ctx: &SchemaScanContext) -> String {
 
 fn random_unique_id() -> types::TUniqueId {
     types::TUniqueId::new(rand::random::<i64>(), rand::random::<i64>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan_nodes;
+
+    fn make_context() -> SchemaScanContext {
+        SchemaScanContext {
+            table_name: "task_runs".to_string(),
+            db: Some("db1".to_string()),
+            table: None,
+            wild: None,
+            user: Some("alice".to_string()),
+            ip: Some("10.0.0.8".to_string()),
+            port: None,
+            thread_id: None,
+            user_ip: Some("10.0.0.9".to_string()),
+            current_user_ident: None,
+            catalog_name: None,
+            table_id: None,
+            partition_id: None,
+            tablet_id: None,
+            txn_id: None,
+            job_id: None,
+            label: None,
+            type_: None,
+            state: None,
+            limit: None,
+            log_start_ts: None,
+            log_end_ts: None,
+            log_level: None,
+            log_pattern: None,
+            log_limit: None,
+            frontends: Vec::<plan_nodes::TFrontend>::new(),
+        }
+    }
+
+    #[test]
+    fn effective_current_user_ident_preserves_explicit_identity() {
+        let mut ctx = make_context();
+        ctx.current_user_ident = Some(types::TUserIdentity::new(
+            Some("bob".to_string()),
+            Some("192.168.1.2".to_string()),
+            Some(false),
+            Some(false),
+            None::<types::TUserRoles>,
+        ));
+
+        let ident = effective_current_user_ident(&ctx).expect("user identity");
+        assert_eq!(ident.username.as_deref(), Some("bob"));
+        assert_eq!(ident.host.as_deref(), Some("192.168.1.2"));
+    }
+
+    #[test]
+    fn effective_current_user_ident_synthesizes_missing_identity() {
+        let ctx = make_context();
+
+        let ident = effective_current_user_ident(&ctx).expect("user identity");
+        assert_eq!(ident.username.as_deref(), Some("alice"));
+        assert_eq!(ident.host.as_deref(), Some("10.0.0.9"));
+        assert_eq!(ident.is_domain, Some(false));
+        assert_eq!(ident.is_ephemeral, Some(false));
+    }
 }

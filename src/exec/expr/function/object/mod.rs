@@ -26,6 +26,8 @@ mod dispatch;
 mod hll_codec;
 mod hll_hash;
 mod json_object;
+pub(crate) mod percentile_functions;
 mod to_bitmap;
+mod utility_functions;
 
 pub use dispatch::{eval_object_function, metadata, register};

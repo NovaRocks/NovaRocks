@@ -293,6 +293,11 @@ fn select_aggregate_inputs(
         "dict_merge" if is_merge => {
             return select_first_for_merge(args, "dict_merge");
         }
+        // Merge percentile_approx consumes serialized intermediate state; FE may still carry
+        // constant quantile/compression arguments in the merge-stage function call.
+        "percentile_approx" if is_merge => {
+            return select_first_for_merge(args, "percentile_approx");
+        }
         "mann_whitney_u_test" | "percentile_cont" | "percentile_disc" | "percentile_disc_lc"
             if is_merge =>
         {

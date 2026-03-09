@@ -27,9 +27,10 @@
 //! - Parent null flags are stored as dedicated tinyint child columns.
 //! - JSON/VARIANT remain unsupported.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, ListArray, MapArray, StructArray};
+use arrow::array::{ArrayRef, ListArray, MapArray, StructArray, new_empty_array, new_null_array};
 use arrow::datatypes::{DataType, Field};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 
@@ -348,35 +349,82 @@ fn decode_column_array_inner(
                     segment_path, output_name
                 )
             })?;
-            let expected_children = struct_fields.len() + usize::from(is_nullable);
-            if column_meta.children.len() != expected_children {
+            let min_children = usize::from(is_nullable);
+            if column_meta.children.len() < min_children {
                 return Err(format!(
-                    "STRUCT child count mismatch in segment meta: segment={}, output_column={}, children={}, expected={}",
+                    "STRUCT child count mismatch in segment meta: segment={}, output_column={}, children={}, expected_at_least={}",
                     segment_path,
                     output_name,
                     column_meta.children.len(),
-                    expected_children
+                    min_children
                 ));
+            }
+            let physical_field_children =
+                &column_meta.children[..column_meta.children.len() - usize::from(is_nullable)];
+            let mut physical_children_by_unique_id =
+                HashMap::with_capacity(physical_field_children.len());
+            for (idx, child_meta) in physical_field_children.iter().enumerate() {
+                if let Some(unique_id) = child_meta.unique_id {
+                    physical_children_by_unique_id.insert(unique_id, idx);
+                }
             }
 
             let mut field_arrays = Vec::with_capacity(struct_fields.len());
             for (idx, field) in struct_fields.iter().enumerate() {
-                let child_array = decode_column_array_inner(
-                    segment_path,
-                    segment_bytes,
-                    &column_meta.children[idx],
-                    &schema.children[idx],
-                    field.data_type(),
-                    &format!("{output_name}.{}", field.name()),
-                    expected_rows,
-                )?;
+                let child_output_name = format!("{output_name}.{}", field.name());
+                let child_array = if let Some(source_idx) = schema.children[idx].source_index {
+                    if let Some(source_meta) = physical_field_children.get(source_idx) {
+                        decode_column_array_inner(
+                            segment_path,
+                            segment_bytes,
+                            source_meta,
+                            &schema.children[idx],
+                            field.data_type(),
+                            &child_output_name,
+                            expected_rows,
+                        )?
+                    } else {
+                        build_missing_complex_child_array(field.data_type(), expected_rows)
+                    }
+                } else if let Some(unique_id) = schema.children[idx].unique_id {
+                    if let Some(source_idx) =
+                        physical_children_by_unique_id.get(&unique_id).copied()
+                    {
+                        decode_column_array_inner(
+                            segment_path,
+                            segment_bytes,
+                            &physical_field_children[source_idx],
+                            &schema.children[idx],
+                            field.data_type(),
+                            &child_output_name,
+                            expected_rows,
+                        )?
+                    } else {
+                        build_missing_complex_child_array(field.data_type(), expected_rows)
+                    }
+                } else if !schema.children[idx].source_lookup_attempted
+                    && idx < physical_field_children.len()
+                    && physical_field_children.len() == struct_fields.len()
+                {
+                    decode_column_array_inner(
+                        segment_path,
+                        segment_bytes,
+                        &physical_field_children[idx],
+                        &schema.children[idx],
+                        field.data_type(),
+                        &child_output_name,
+                        expected_rows,
+                    )?
+                } else {
+                    build_missing_complex_child_array(field.data_type(), expected_rows)
+                };
                 field_arrays.push(child_array);
             }
             let null_buffer = if is_nullable {
                 let flags = decode_parent_null_flags(
                     segment_path,
                     segment_bytes,
-                    &column_meta.children[struct_fields.len()],
+                    &column_meta.children[physical_field_children.len()],
                     expected_rows,
                     &format!("{output_name}.__struct_nulls"),
                 )?;
@@ -392,6 +440,13 @@ fn decode_column_array_inner(
             segment_path, output_name, schema.schema_type, other
         )),
     }
+}
+
+fn build_missing_complex_child_array(output_data_type: &DataType, row_count: usize) -> ArrayRef {
+    if row_count == 0 {
+        return new_empty_array(output_data_type);
+    }
+    new_null_array(output_data_type, row_count)
 }
 
 fn decode_scalar_array(

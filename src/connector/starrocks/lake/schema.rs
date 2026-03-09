@@ -25,7 +25,7 @@ use crate::formats::starrocks::writer::bundle_meta::{
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
     ColumnPb, CompactionStrategyPb, CompressionTypePb, FlatJsonConfigPb, KeysType,
-    PersistentIndexTypePb, TabletSchemaPb,
+    PersistentIndexTypePb, TabletMetadataPb, TabletSchemaPb,
 };
 pub(crate) fn build_sink_tablet_schema(
     schema: &crate::descriptors::TOlapTableSchemaParam,
@@ -247,10 +247,21 @@ pub(crate) fn create_lake_tablet_from_req(
     tablet_meta.gtid = Some(request.gtid.unwrap_or(0));
     tablet_meta.compaction_strategy = compaction_strategy;
     tablet_meta.flat_json_config = flat_json_config;
+    seed_tablet_metadata_schema(&mut tablet_meta, &tablet_schema);
     if request.enable_tablet_creation_optimization.unwrap_or(false) {
         write_initial_meta_file(tablet_root_path, &tablet_meta)
     } else {
         write_standalone_meta_file(tablet_root_path, tablet_id, 1, &tablet_meta)
+    }
+}
+
+fn seed_tablet_metadata_schema(metadata: &mut TabletMetadataPb, tablet_schema: &TabletSchemaPb) {
+    metadata.schema = Some(tablet_schema.clone());
+    if let Some(schema_id) = tablet_schema.id.filter(|id| *id > 0) {
+        metadata
+            .historical_schemas
+            .entry(schema_id)
+            .or_insert_with(|| tablet_schema.clone());
     }
 }
 
@@ -1088,6 +1099,7 @@ mod tests {
         build_sink_tablet_schema, create_lake_tablet_from_req,
         is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type,
     };
+    use crate::formats::starrocks::writer::bundle_meta::load_tablet_metadata_at_version;
     use crate::service::grpc_client::proto::starrocks::KeysType;
     use tempfile::TempDir;
 
@@ -1161,6 +1173,17 @@ mod tests {
             .join("meta/0000000000000000_0000000000000001.meta");
         assert!(standalone_path.exists(), "expected standalone metadata");
         assert!(!initial_path.exists(), "unexpected initial raw metadata");
+
+        let metadata = load_tablet_metadata_at_version(
+            temp_dir.path().to_str().expect("temp path to str"),
+            41001,
+            1,
+        )
+        .expect("load metadata")
+        .expect("metadata should exist");
+        let schema = metadata.schema.expect("schema should be persisted");
+        assert_eq!(schema.id, Some(88001));
+        assert_eq!(metadata.historical_schemas.get(&88001), Some(&schema));
     }
 
     #[test]
@@ -1183,6 +1206,17 @@ mod tests {
             .join("meta/0000000000000000_0000000000000001.meta");
         assert!(!standalone_path.exists(), "unexpected standalone metadata");
         assert!(initial_path.exists(), "expected initial raw metadata");
+
+        let metadata = load_tablet_metadata_at_version(
+            temp_dir.path().to_str().expect("temp path to str"),
+            41002,
+            1,
+        )
+        .expect("load metadata")
+        .expect("metadata should exist");
+        let schema = metadata.schema.expect("schema should be persisted");
+        assert_eq!(schema.id, Some(88001));
+        assert_eq!(metadata.historical_schemas.get(&88001), Some(&schema));
     }
 
     #[test]

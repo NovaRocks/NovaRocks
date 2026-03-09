@@ -26,14 +26,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use arrow::datatypes::{DataType, Field, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, SchemaRef, TimeUnit};
 
 use crate::common::largeint;
 use crate::formats::starrocks::metadata::{
-    StarRocksDeletePredicateRaw, StarRocksDelvecMetaRaw, StarRocksTabletSnapshot,
+    StarRocksDeletePredicateRaw, StarRocksDelvecMetaRaw, StarRocksSegmentFile,
+    StarRocksTabletSnapshot,
 };
 use crate::formats::starrocks::segment::{StarRocksSegmentColumnMeta, StarRocksSegmentFooter};
-use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType};
+use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
 
 const STARROCKS_TYPE_TINYINT: &str = "TINYINT";
 const STARROCKS_TYPE_SMALLINT: &str = "SMALLINT";
@@ -55,6 +56,7 @@ const STARROCKS_TYPE_HLL: &str = "HLL";
 const STARROCKS_TYPE_OBJECT: &str = "OBJECT";
 const STARROCKS_TYPE_BITMAP: &str = "BITMAP";
 const STARROCKS_TYPE_JSON: &str = "JSON";
+const STARROCKS_TYPE_PERCENTILE: &str = "PERCENTILE";
 const STARROCKS_TYPE_BINARY: &str = "BINARY";
 const STARROCKS_TYPE_VARBINARY: &str = "VARBINARY";
 const STARROCKS_TYPE_DECIMAL32: &str = "DECIMAL32";
@@ -66,7 +68,7 @@ const STARROCKS_TYPE_MAP: &str = "MAP";
 const STARROCKS_TYPE_STRUCT: &str = "STRUCT";
 pub(crate) const FIELD_META_STARROCKS_COLUMN_ID: &str = "starrocks.format.column.id";
 pub(crate) const FIELD_META_STARROCKS_DEFAULT_VALUE: &str = "starrocks.format.column.default_value";
-const SUPPORTED_SCHEMA_TYPES: [&str; 29] = [
+const SUPPORTED_SCHEMA_TYPES: [&str; 30] = [
     STARROCKS_TYPE_TINYINT,
     STARROCKS_TYPE_SMALLINT,
     STARROCKS_TYPE_INT,
@@ -87,6 +89,7 @@ const SUPPORTED_SCHEMA_TYPES: [&str; 29] = [
     STARROCKS_TYPE_OBJECT,
     STARROCKS_TYPE_BITMAP,
     STARROCKS_TYPE_JSON,
+    STARROCKS_TYPE_PERCENTILE,
     STARROCKS_TYPE_BINARY,
     STARROCKS_TYPE_VARBINARY,
     STARROCKS_TYPE_DECIMAL32,
@@ -115,6 +118,7 @@ enum SupportedSchemaType {
     Varchar,
     Hll,
     Object,
+    Percentile,
     Binary,
     VarBinary,
     Decimal32,
@@ -147,6 +151,7 @@ impl SupportedSchemaType {
             STARROCKS_TYPE_OBJECT | STARROCKS_TYPE_BITMAP | STARROCKS_TYPE_JSON => {
                 Some(Self::Object)
             }
+            STARROCKS_TYPE_PERCENTILE => Some(Self::Percentile),
             STARROCKS_TYPE_BINARY => Some(Self::Binary),
             STARROCKS_TYPE_VARBINARY => Some(Self::VarBinary),
             STARROCKS_TYPE_DECIMAL32 => Some(Self::Decimal32),
@@ -176,6 +181,7 @@ impl SupportedSchemaType {
             Self::Varchar => STARROCKS_TYPE_VARCHAR,
             Self::Hll => STARROCKS_TYPE_HLL,
             Self::Object => STARROCKS_TYPE_OBJECT,
+            Self::Percentile => STARROCKS_TYPE_PERCENTILE,
             Self::Binary => STARROCKS_TYPE_BINARY,
             Self::VarBinary => STARROCKS_TYPE_VARBINARY,
             Self::Decimal32 => STARROCKS_TYPE_DECIMAL32,
@@ -204,6 +210,7 @@ impl SupportedSchemaType {
             Self::Varchar => "Utf8",
             Self::Hll => "Binary",
             Self::Object => "Binary",
+            Self::Percentile => "Binary",
             Self::Binary => "Binary",
             Self::VarBinary => "Binary",
             Self::Decimal32 => "Decimal128(precision<=9,scale)",
@@ -233,6 +240,8 @@ impl SupportedSchemaType {
             | (Self::Hll, DataType::Utf8)
             | (Self::Object, DataType::Binary)
             | (Self::Object, DataType::Utf8)
+            | (Self::Percentile, DataType::Binary)
+            | (Self::Percentile, DataType::Utf8)
             | (Self::Binary, DataType::Binary)
             | (Self::VarBinary, DataType::Binary) => true,
             (Self::LargeInt, DataType::FixedSizeBinary(width))
@@ -277,6 +286,8 @@ impl SupportedSchemaType {
 /// Recursive FE schema column plan used by native page readers.
 pub struct StarRocksNativeSchemaColumnPlan {
     pub unique_id: Option<u32>,
+    pub source_index: Option<usize>,
+    pub source_lookup_attempted: bool,
     pub schema_type: String,
     pub is_nullable: bool,
     pub is_key: bool,
@@ -328,6 +339,8 @@ pub struct StarRocksNativeSegmentPlan {
     pub segment_size: u64,
     pub footer_version: u32,
     pub footer_num_rows: u32,
+    pub projected_schemas: Vec<StarRocksNativeSchemaColumnPlan>,
+    pub source_column_missing_by_output: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -404,10 +417,16 @@ pub struct StarRocksNativeReadPlan {
     pub estimated_rows: u64,
 }
 
+struct SchemaColumnLookup<'a> {
+    by_name: HashMap<String, &'a ColumnPb>,
+    by_unique_id: HashMap<u32, &'a ColumnPb>,
+}
+
 pub fn build_native_read_plan(
     snapshot: &StarRocksTabletSnapshot,
     segment_footers: &[StarRocksSegmentFooter],
     output_schema: &SchemaRef,
+    source_tablet_schema: Option<&TabletSchemaPb>,
 ) -> Result<StarRocksNativeReadPlan, String> {
     if segment_footers.len() != snapshot.segment_files.len() {
         return Err(format!(
@@ -429,9 +448,199 @@ pub fn build_native_read_plan(
         snapshot.tablet_id,
         snapshot.version,
     )?;
+    let current_lookup =
+        build_schema_column_lookup(schema_columns, snapshot.tablet_id, snapshot.version)?;
+    let projected_columns = build_projected_columns(
+        snapshot,
+        output_schema,
+        &current_lookup,
+        source_tablet_schema,
+    )?;
+    let group_key_columns = build_group_key_columns_plan(
+        snapshot.tablet_id,
+        snapshot.version,
+        schema_columns,
+        table_model,
+    )?;
+    let delete_predicates = build_delete_predicates_plan(
+        snapshot.tablet_id,
+        snapshot.version,
+        &snapshot.delete_predicates,
+        &current_lookup.by_name,
+    )?;
+    let primary_delvec = build_primary_delvec_plan(
+        table_model,
+        snapshot.tablet_id,
+        snapshot.version,
+        &snapshot.delvec_meta,
+    )?;
+    let mut segments = Vec::with_capacity(snapshot.segment_files.len());
+    let mut estimated_rows = 0_u64;
+    for (idx, (segment, footer)) in snapshot
+        .segment_files
+        .iter()
+        .zip(segment_footers.iter())
+        .enumerate()
+    {
+        let bundle_file_offset = segment.bundle_file_offset.ok_or_else(|| {
+            format!(
+                "segment bundle_file_offset missing in snapshot: index={}, path={}",
+                idx, segment.path
+            )
+        })?;
+        let segment_size = segment.segment_size.ok_or_else(|| {
+            format!(
+                "segment size missing in snapshot: index={}, path={}",
+                idx, segment.path
+            )
+        })?;
+        let footer_num_rows = footer.num_rows.ok_or_else(|| {
+            format!(
+                "segment footer num_rows is missing: index={}, path={}",
+                idx, segment.path
+            )
+        })?;
+        if table_model == StarRocksTableModelPlan::PrimaryKeys && segment.segment_id.is_none() {
+            return Err(format!(
+                "missing segment_id in primary key native read plan segment: tablet_id={}, version={}, segment_index={}, path={}",
+                snapshot.tablet_id, snapshot.version, idx, segment.path
+            ));
+        }
+        let segment_source_schema =
+            resolve_segment_source_schema(snapshot, segment, source_tablet_schema)?;
+        let segment_projected_columns = build_projected_columns(
+            snapshot,
+            output_schema,
+            &current_lookup,
+            segment_source_schema,
+        )?;
+        if segment_projected_columns.len() != projected_columns.len() {
+            let global_columns = projected_columns
+                .iter()
+                .map(|col| {
+                    format!(
+                        "{}#{}:{}",
+                        col.output_index, col.output_name, col.schema_unique_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let segment_columns = segment_projected_columns
+                .iter()
+                .map(|col| {
+                    format!(
+                        "{}#{}:{}",
+                        col.output_index, col.output_name, col.schema_unique_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let segment_schema_columns = segment_source_schema
+                .map(|schema| {
+                    schema
+                        .column
+                        .iter()
+                        .map(|col| {
+                            format!(
+                                "{}:{}",
+                                col.name.as_deref().unwrap_or("<unnamed>"),
+                                col.unique_id
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "<none>".to_string());
+            return Err(format!(
+                "segment projected column count drifted from global plan: tablet_id={}, version={}, segment_index={}, path={}, global_count={}, segment_count={}, global_columns=[{}], segment_columns=[{}], segment_schema_columns=[{}]",
+                snapshot.tablet_id,
+                snapshot.version,
+                idx,
+                segment.path,
+                projected_columns.len(),
+                segment_projected_columns.len(),
+                global_columns,
+                segment_columns,
+                segment_schema_columns
+            ));
+        }
+        let footer_unique_ids = collect_unique_ids(&footer.columns)?;
+        let mut projected_schemas = Vec::with_capacity(projected_columns.len());
+        let mut source_column_missing_by_output = Vec::with_capacity(projected_columns.len());
+        for (projected, segment_projected) in projected_columns
+            .iter()
+            .zip(segment_projected_columns.iter())
+        {
+            if projected.output_index != segment_projected.output_index
+                || projected.schema_unique_id != segment_projected.schema_unique_id
+            {
+                return Err(format!(
+                    "segment projected column plan drifted from global plan: tablet_id={}, version={}, segment_index={}, output_column={}, global_output_index={}, segment_output_index={}, global_unique_id={}, segment_unique_id={}",
+                    snapshot.tablet_id,
+                    snapshot.version,
+                    idx,
+                    projected.output_name,
+                    projected.output_index,
+                    segment_projected.output_index,
+                    projected.schema_unique_id,
+                    segment_projected.schema_unique_id
+                ));
+            }
+            if !footer_unique_ids.contains(&projected.schema_unique_id)
+                && !projected_can_fill_missing_values(
+                    projected,
+                    segment_projected.source_column_missing,
+                )
+            {
+                return Err(format!(
+                    "projected column unique_id is missing in segment footer and cannot be backfilled: tablet_id={}, version={}, segment_index={}, unique_id={}, output_column={}, path={}",
+                    snapshot.tablet_id,
+                    snapshot.version,
+                    idx,
+                    projected.schema_unique_id,
+                    projected.output_name,
+                    segment.path
+                ));
+            }
+            projected_schemas.push(segment_projected.schema.clone());
+            source_column_missing_by_output.push(segment_projected.source_column_missing);
+        }
+        estimated_rows = estimated_rows.saturating_add(u64::from(footer_num_rows));
+        segments.push(StarRocksNativeSegmentPlan {
+            index: idx,
+            path: segment.path.clone(),
+            relative_path: segment.relative_path.clone(),
+            rowset_version: segment.rowset_version,
+            segment_id: segment.segment_id,
+            bundle_file_offset,
+            segment_size,
+            footer_version: footer.version,
+            footer_num_rows,
+            projected_schemas,
+            source_column_missing_by_output,
+        });
+    }
 
-    let mut by_name = HashMap::<String, &ColumnPb>::new();
-    let mut by_unique_id = HashMap::<u32, &ColumnPb>::new();
+    Ok(StarRocksNativeReadPlan {
+        tablet_id: snapshot.tablet_id,
+        version: snapshot.version,
+        table_model,
+        projected_columns,
+        group_key_columns,
+        segments,
+        delete_predicates,
+        primary_delvec,
+        estimated_rows,
+    })
+}
+
+fn build_schema_column_lookup<'a>(
+    schema_columns: &'a [ColumnPb],
+    tablet_id: i64,
+    version: i64,
+) -> Result<SchemaColumnLookup<'a>, String> {
+    let mut by_name = HashMap::<String, &'a ColumnPb>::new();
+    let mut by_unique_id = HashMap::<u32, &'a ColumnPb>::new();
     for col in schema_columns {
         let name = col
             .name
@@ -439,37 +648,74 @@ pub fn build_native_read_plan(
             .ok_or_else(|| {
                 format!(
                     "tablet schema column name is missing: tablet_id={}, version={}, unique_id={}",
-                    snapshot.tablet_id, snapshot.version, col.unique_id
+                    tablet_id, version, col.unique_id
                 )
             })?
             .trim();
         if name.is_empty() {
             return Err(format!(
                 "tablet schema column name is empty: tablet_id={}, version={}, unique_id={}",
-                snapshot.tablet_id, snapshot.version, col.unique_id
+                tablet_id, version, col.unique_id
             ));
         }
         let key = normalize_column_name(name);
         if by_name.insert(key, col).is_some() {
             return Err(format!(
                 "duplicated column name in tablet schema: tablet_id={}, version={}, column_name={}",
-                snapshot.tablet_id, snapshot.version, name
+                tablet_id, version, name
             ));
         }
         let unique_id = u32::try_from(col.unique_id).map_err(|_| {
             format!(
                 "invalid column unique_id in tablet schema: tablet_id={}, version={}, unique_id={}",
-                snapshot.tablet_id, snapshot.version, col.unique_id
+                tablet_id, version, col.unique_id
             )
         })?;
         if by_unique_id.insert(unique_id, col).is_some() {
             return Err(format!(
                 "duplicated column unique_id in tablet schema: tablet_id={}, version={}, unique_id={}",
-                snapshot.tablet_id, snapshot.version, unique_id
+                tablet_id, version, unique_id
             ));
         }
     }
+    Ok(SchemaColumnLookup {
+        by_name,
+        by_unique_id,
+    })
+}
 
+fn build_source_schema_lookup<'a>(
+    source_schema: Option<&'a TabletSchemaPb>,
+) -> SchemaColumnLookup<'a> {
+    let mut by_name = HashMap::<String, &'a ColumnPb>::new();
+    let mut by_unique_id = HashMap::<u32, &'a ColumnPb>::new();
+    if let Some(source_schema) = source_schema {
+        for col in &source_schema.column {
+            let Some(name) = col.name.as_deref().map(str::trim) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            by_name.insert(normalize_column_name(name), col);
+            if let Ok(unique_id) = u32::try_from(col.unique_id) {
+                by_unique_id.insert(unique_id, col);
+            }
+        }
+    }
+    SchemaColumnLookup {
+        by_name,
+        by_unique_id,
+    }
+}
+
+fn build_projected_columns(
+    snapshot: &StarRocksTabletSnapshot,
+    output_schema: &SchemaRef,
+    current_lookup: &SchemaColumnLookup<'_>,
+    source_tablet_schema: Option<&TabletSchemaPb>,
+) -> Result<Vec<StarRocksNativeColumnPlan>, String> {
+    let source_lookup = build_source_schema_lookup(source_tablet_schema);
     let mut projected_columns = Vec::with_capacity(output_schema.fields().len());
     for (idx, field) in output_schema.fields().iter().enumerate() {
         let output_name = field.name().trim();
@@ -480,9 +726,9 @@ pub fn build_native_read_plan(
             snapshot.version,
             output_name,
         )?;
-        let schema_col_from_unique_id =
-            output_field_unique_id.and_then(|unique_id| by_unique_id.get(&unique_id).copied());
-        let schema_col_from_name = by_name.get(&normalized_name).copied();
+        let schema_col_from_unique_id = output_field_unique_id
+            .and_then(|unique_id| current_lookup.by_unique_id.get(&unique_id).copied());
+        let schema_col_from_name = current_lookup.by_name.get(&normalized_name).copied();
         let schema_col = if let Some(schema_col) = schema_col_from_unique_id {
             Some(schema_col)
         } else if let Some(schema_col) = schema_col_from_name {
@@ -501,6 +747,19 @@ pub fn build_native_read_plan(
             None
         };
         let allow_flat_json_fallback = output_field_unique_id.is_none();
+        let source_schema_col = if source_tablet_schema.is_some() {
+            if let Some(unique_id) = output_field_unique_id {
+                source_lookup
+                    .by_unique_id
+                    .get(&unique_id)
+                    .copied()
+                    .or_else(|| source_lookup.by_name.get(&normalized_name).copied())
+            } else {
+                source_lookup.by_name.get(&normalized_name).copied()
+            }
+        } else {
+            None
+        };
         let (
             schema,
             schema_unique_id,
@@ -514,14 +773,17 @@ pub fn build_native_read_plan(
                 snapshot.version,
                 output_name,
                 schema_col,
+                source_schema_col,
+                None,
+                source_schema_col.is_some(),
                 field.data_type(),
             )?;
             let schema_unique_id = schema.unique_id.ok_or_else(|| {
-                    format!(
-                        "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
-                        snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
-                    )
-                })?;
+                format!(
+                    "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
+                    snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
+                )
+            })?;
             (
                 schema,
                 schema_unique_id,
@@ -535,23 +797,24 @@ pub fn build_native_read_plan(
             )
         } else if allow_flat_json_fallback {
             if let Some((schema_col, projection)) =
-                try_build_flat_json_projection(output_name, &by_name)
+                try_build_flat_json_projection(output_name, &current_lookup.by_name)
             {
-                // Flat JSON rewritten slots are typed by FE (`BIGINT/DOUBLE/VARCHAR/...`) but
-                // physically sourced from one JSON column on disk.
                 let schema = build_schema_column_plan(
                     snapshot.tablet_id,
                     snapshot.version,
                     output_name,
                     schema_col,
+                    None,
+                    None,
+                    false,
                     &DataType::Binary,
                 )?;
                 let schema_unique_id = schema.unique_id.ok_or_else(|| {
-                        format!(
-                            "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
-                            snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
-                        )
-                    })?;
+                    format!(
+                        "invalid schema column unique_id for output field: tablet_id={}, version={}, output_field={}, unique_id={}",
+                        snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
+                    )
+                })?;
                 (
                     schema,
                     schema_unique_id,
@@ -561,10 +824,9 @@ pub fn build_native_read_plan(
                     true,
                 )
             } else if let Some(projection) = parse_flat_json_projection(output_name) {
-                // Schema evolution may read old segments that do not contain newly added JSON
-                // base columns. For flat JSON rewritten slots, these rows should surface as NULL.
                 let normalized_base_name = normalize_column_name(&projection.base_column_name);
-                if let Some(schema_col) = by_name.get(&normalized_base_name).copied() {
+                if let Some(schema_col) = current_lookup.by_name.get(&normalized_base_name).copied()
+                {
                     return Err(format!(
                         "flat json projection base column is not JSON: tablet_id={}, version={}, output_field={}, base_column={}, base_schema_type={}",
                         snapshot.tablet_id,
@@ -575,29 +837,31 @@ pub fn build_native_read_plan(
                     ));
                 }
                 let schema_type =
-                        infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {
-                            format!(
-                                "unsupported output field type for missing flat json source column: tablet_id={}, version={}, output_field={}, output_type={:?}, supported=[Boolean,Int8,Int16,Int32,Int64,Float32,Float64,Utf8,Binary]",
-                                snapshot.tablet_id,
-                                snapshot.version,
-                                output_name,
-                                field.data_type()
-                            )
-                        })?;
+                    infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {
+                        format!(
+                            "unsupported output field type for missing flat json source column: tablet_id={}, version={}, output_field={}, output_type={:?}, supported=[Boolean,Int8,Int16,Int32,Int64,Float32,Float64,Utf8,Binary]",
+                            snapshot.tablet_id,
+                            snapshot.version,
+                            output_name,
+                            field.data_type()
+                        )
+                    })?;
                 let output_index_u32 = u32::try_from(idx).map_err(|_| {
-                        format!(
-                            "output index overflow for missing flat json source column: tablet_id={}, version={}, output_field={}, output_index={}",
-                            snapshot.tablet_id, snapshot.version, output_name, idx
-                        )
-                    })?;
+                    format!(
+                        "output index overflow for missing flat json source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
                 let schema_unique_id = u32::MAX.checked_sub(output_index_u32).ok_or_else(|| {
-                        format!(
-                            "failed to assign synthetic unique id for missing flat json source column: tablet_id={}, version={}, output_field={}, output_index={}",
-                            snapshot.tablet_id, snapshot.version, output_name, idx
-                        )
-                    })?;
+                    format!(
+                        "failed to assign synthetic unique id for missing flat json source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
                 let schema = StarRocksNativeSchemaColumnPlan {
                     unique_id: None,
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: schema_type.to_string(),
                     is_nullable: true,
                     is_key: false,
@@ -610,33 +874,32 @@ pub fn build_native_read_plan(
             } else if !output_name.contains('.')
                 && matches!(field.data_type(), DataType::Binary | DataType::Utf8)
             {
-                // For schema-evolved JSON columns, older segment schemas may not contain the
-                // column. FE can still request the raw JSON slot (e.g. JSON_EXISTS(j3, ...)).
-                // These rows should return NULL for the missing source column.
                 let schema_type =
-                        infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {
-                            format!(
-                                "unsupported output field type for missing source column: tablet_id={}, version={}, output_field={}, output_type={:?}",
-                                snapshot.tablet_id,
-                                snapshot.version,
-                                output_name,
-                                field.data_type()
-                            )
-                        })?;
+                    infer_missing_source_schema_type(field.data_type()).ok_or_else(|| {
+                        format!(
+                            "unsupported output field type for missing source column: tablet_id={}, version={}, output_field={}, output_type={:?}",
+                            snapshot.tablet_id,
+                            snapshot.version,
+                            output_name,
+                            field.data_type()
+                        )
+                    })?;
                 let output_index_u32 = u32::try_from(idx).map_err(|_| {
-                        format!(
-                            "output index overflow for missing source column: tablet_id={}, version={}, output_field={}, output_index={}",
-                            snapshot.tablet_id, snapshot.version, output_name, idx
-                        )
-                    })?;
+                    format!(
+                        "output index overflow for missing source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
                 let schema_unique_id = u32::MAX.checked_sub(output_index_u32).ok_or_else(|| {
-                        format!(
-                            "failed to assign synthetic unique id for missing source column: tablet_id={}, version={}, output_field={}, output_index={}",
-                            snapshot.tablet_id, snapshot.version, output_name, idx
-                        )
-                    })?;
+                    format!(
+                        "failed to assign synthetic unique id for missing source column: tablet_id={}, version={}, output_field={}, output_index={}",
+                        snapshot.tablet_id, snapshot.version, output_name, idx
+                    )
+                })?;
                 let schema = StarRocksNativeSchemaColumnPlan {
                     unique_id: None,
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: schema_type.to_string(),
                     is_nullable: true,
                     is_key: false,
@@ -690,101 +953,34 @@ pub fn build_native_read_plan(
             fallback_is_nullable,
         });
     }
-    let group_key_columns = build_group_key_columns_plan(
-        snapshot.tablet_id,
-        snapshot.version,
-        schema_columns,
-        table_model,
-    )?;
-    let delete_predicates = build_delete_predicates_plan(
-        snapshot.tablet_id,
-        snapshot.version,
-        &snapshot.delete_predicates,
-        &by_name,
-    )?;
-    let primary_delvec = build_primary_delvec_plan(
-        table_model,
-        snapshot.tablet_id,
-        snapshot.version,
-        &snapshot.delvec_meta,
-    )?;
-    let mut segments = Vec::with_capacity(snapshot.segment_files.len());
-    let mut estimated_rows = 0_u64;
-    for (idx, (segment, footer)) in snapshot
-        .segment_files
-        .iter()
-        .zip(segment_footers.iter())
-        .enumerate()
-    {
-        let bundle_file_offset = segment.bundle_file_offset.ok_or_else(|| {
-            format!(
-                "segment bundle_file_offset missing in snapshot: index={}, path={}",
-                idx, segment.path
-            )
-        })?;
-        let segment_size = segment.segment_size.ok_or_else(|| {
-            format!(
-                "segment size missing in snapshot: index={}, path={}",
-                idx, segment.path
-            )
-        })?;
-        let footer_num_rows = footer.num_rows.ok_or_else(|| {
-            format!(
-                "segment footer num_rows is missing: index={}, path={}",
-                idx, segment.path
-            )
-        })?;
-        if table_model == StarRocksTableModelPlan::PrimaryKeys && segment.segment_id.is_none() {
-            return Err(format!(
-                "missing segment_id in primary key native read plan segment: tablet_id={}, version={}, segment_index={}, path={}",
-                snapshot.tablet_id, snapshot.version, idx, segment.path
-            ));
-        }
-        let footer_unique_ids = collect_unique_ids(&footer.columns)?;
-        for projected in &projected_columns {
-            if !footer_unique_ids.contains(&projected.schema_unique_id)
-                && !projected_can_fill_missing_values(projected)
-            {
-                return Err(format!(
-                    "projected column unique_id is missing in segment footer and cannot be backfilled: tablet_id={}, version={}, segment_index={}, unique_id={}, output_column={}, path={}",
-                    snapshot.tablet_id,
-                    snapshot.version,
-                    idx,
-                    projected.schema_unique_id,
-                    projected.output_name,
-                    segment.path
-                ));
-            }
-        }
-        estimated_rows = estimated_rows.saturating_add(u64::from(footer_num_rows));
-        segments.push(StarRocksNativeSegmentPlan {
-            index: idx,
-            path: segment.path.clone(),
-            relative_path: segment.relative_path.clone(),
-            rowset_version: segment.rowset_version,
-            segment_id: segment.segment_id,
-            bundle_file_offset,
-            segment_size,
-            footer_version: footer.version,
-            footer_num_rows,
-        });
-    }
-
-    Ok(StarRocksNativeReadPlan {
-        tablet_id: snapshot.tablet_id,
-        version: snapshot.version,
-        table_model,
-        projected_columns,
-        group_key_columns,
-        segments,
-        delete_predicates,
-        primary_delvec,
-        estimated_rows,
-    })
+    Ok(projected_columns)
 }
 
-fn projected_can_fill_missing_values(projected: &StarRocksNativeColumnPlan) -> bool {
-    projected.source_column_missing
+fn resolve_segment_source_schema<'a>(
+    snapshot: &'a StarRocksTabletSnapshot,
+    segment: &StarRocksSegmentFile,
+    fallback_source_schema: Option<&'a TabletSchemaPb>,
+) -> Result<Option<&'a TabletSchemaPb>, String> {
+    let Some(schema_id) = segment.schema_id.filter(|id| *id > 0) else {
+        return Ok(fallback_source_schema);
+    };
+    if let Some(schema) = snapshot.historical_schemas.get(&schema_id) {
+        return Ok(Some(schema));
+    }
+    if fallback_source_schema.is_some_and(|schema| schema.id == Some(schema_id)) {
+        return Ok(fallback_source_schema);
+    }
+    Err(format!(
+        "segment rowset schema id is missing from snapshot historical schemas: tablet_id={}, version={}, segment_path={}, rowset_version={}, schema_id={}",
+        snapshot.tablet_id, snapshot.version, segment.path, segment.rowset_version, schema_id
+    ))
+}
+
+fn projected_can_fill_missing_values(
+    projected: &StarRocksNativeColumnPlan,
+    source_column_missing: bool,
+) -> bool {
+    source_column_missing
         || projected.fallback_default_literal.is_some()
         || projected.fallback_is_nullable
 }
@@ -867,6 +1063,8 @@ fn build_missing_output_schema_column_plan(
         })?;
     let schema = StarRocksNativeSchemaColumnPlan {
         unique_id: Some(schema_unique_id),
+        source_index: None,
+        source_lookup_attempted: false,
         schema_type,
         is_nullable: fallback_is_nullable,
         is_key: false,
@@ -990,6 +1188,9 @@ fn build_group_key_columns_plan(
             version,
             output_name,
             schema_col,
+            None,
+            None,
+            false,
             &output_arrow_type,
         )?;
         let schema_unique_id = schema.unique_id.ok_or_else(|| {
@@ -1059,6 +1260,7 @@ fn infer_group_key_arrow_type(
         }
         SupportedSchemaType::Hll
         | SupportedSchemaType::Object
+        | SupportedSchemaType::Percentile
         | SupportedSchemaType::Array
         | SupportedSchemaType::Map
         | SupportedSchemaType::Struct => Err(format!(
@@ -1128,6 +1330,119 @@ fn build_primary_delvec_plan(
 
 fn normalize_column_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn positive_schema_column_unique_id(column: &ColumnPb) -> Option<u32> {
+    u32::try_from(column.unique_id)
+        .ok()
+        .filter(|unique_id| *unique_id > 0)
+}
+
+fn source_schema_column_matches_output_arrow_type(
+    source_col: &ColumnPb,
+    output_arrow_type: &DataType,
+) -> bool {
+    let Some(source_type) = SupportedSchemaType::parse(&source_col.r#type) else {
+        return false;
+    };
+    if !source_type.matches_arrow_type(output_arrow_type) {
+        return false;
+    }
+    if !source_type.is_decimal_v3() {
+        return true;
+    }
+    match (source_type, output_arrow_type) {
+        (SupportedSchemaType::Decimal256, DataType::Decimal256(precision, scale)) => {
+            source_col.precision == Some((*precision).into())
+                && source_col.frac == Some((*scale).into())
+        }
+        (
+            SupportedSchemaType::Decimal32
+            | SupportedSchemaType::Decimal64
+            | SupportedSchemaType::Decimal128,
+            DataType::Decimal128(precision, scale),
+        ) => {
+            source_col.precision == Some((*precision).into())
+                && source_col.frac == Some((*scale).into())
+        }
+        _ => false,
+    }
+}
+
+fn align_struct_source_children<'a>(
+    source_schema_col: Option<&'a ColumnPb>,
+    current_children: &[ColumnPb],
+    output_fields: &Fields,
+) -> Vec<(Option<usize>, Option<&'a ColumnPb>, bool)> {
+    let lookup_attempted = source_schema_col.is_some();
+    let Some(source_col) = source_schema_col else {
+        return vec![(None, None, false); current_children.len()];
+    };
+
+    let mut source_children_by_unique_id = HashMap::new();
+    for (idx, child_col) in source_col.children_columns.iter().enumerate() {
+        if let Some(unique_id) = positive_schema_column_unique_id(child_col) {
+            source_children_by_unique_id.insert(unique_id, (idx, child_col));
+        }
+    }
+
+    let mut matched_source_indexes = vec![false; source_col.children_columns.len()];
+    let mut next_source_name_idx = 0usize;
+    let mut aligned = Vec::with_capacity(current_children.len());
+
+    for (field, child_schema_col) in output_fields.iter().zip(current_children.iter()) {
+        let matched = if let Some(unique_id) = positive_schema_column_unique_id(child_schema_col) {
+            source_children_by_unique_id
+                .get(&unique_id)
+                .copied()
+                .filter(|(_, source_child)| {
+                    source_schema_column_matches_output_arrow_type(source_child, field.data_type())
+                })
+        } else {
+            let current_name = child_schema_col
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| field.name());
+            let normalized_current_name = normalize_column_name(current_name);
+            let mut found = None;
+            for source_idx in next_source_name_idx..source_col.children_columns.len() {
+                if matched_source_indexes[source_idx] {
+                    continue;
+                }
+                let source_child = &source_col.children_columns[source_idx];
+                let Some(source_name) = source_child
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                if normalize_column_name(source_name) != normalized_current_name {
+                    continue;
+                }
+                if !source_schema_column_matches_output_arrow_type(source_child, field.data_type())
+                {
+                    continue;
+                }
+                found = Some((source_idx, source_child));
+                break;
+            }
+            found
+        };
+
+        if let Some((source_idx, source_child)) = matched {
+            matched_source_indexes[source_idx] = true;
+            next_source_name_idx = next_source_name_idx.max(source_idx.saturating_add(1));
+            aligned.push((Some(source_idx), Some(source_child), lookup_attempted));
+        } else {
+            aligned.push((None, None, lookup_attempted));
+        }
+    }
+
+    aligned
 }
 
 fn infer_missing_source_schema_type(output_arrow_type: &DataType) -> Option<&'static str> {
@@ -1555,6 +1870,9 @@ fn build_schema_column_plan(
     version: i64,
     output_path: &str,
     schema_col: &ColumnPb,
+    source_schema_col: Option<&ColumnPb>,
+    source_index: Option<usize>,
+    source_lookup_attempted: bool,
     output_arrow_type: &DataType,
 ) -> Result<StarRocksNativeSchemaColumnPlan, String> {
     let schema_type = SupportedSchemaType::parse(&schema_col.r#type).ok_or_else(|| {
@@ -1616,6 +1934,9 @@ fn build_schema_column_plan(
                 version,
                 &format!("{output_path}.item"),
                 &schema_col.children_columns[0],
+                source_schema_col.and_then(|col| col.children_columns.first()),
+                source_schema_col.map(|_| 0),
+                source_schema_col.is_some(),
                 item_field.data_type(),
             )?;
             children.push(child);
@@ -1659,6 +1980,9 @@ fn build_schema_column_plan(
                 version,
                 &format!("{output_path}.key"),
                 &schema_col.children_columns[0],
+                source_schema_col.and_then(|col| col.children_columns.first()),
+                source_schema_col.map(|_| 0),
+                source_schema_col.is_some(),
                 entry_fields[0].data_type(),
             )?;
             let value_child = build_schema_column_plan(
@@ -1666,6 +1990,9 @@ fn build_schema_column_plan(
                 version,
                 &format!("{output_path}.value"),
                 &schema_col.children_columns[1],
+                source_schema_col.and_then(|col| col.children_columns.get(1)),
+                source_schema_col.map(|_| 1),
+                source_schema_col.is_some(),
                 entry_fields[1].data_type(),
             )?;
             children.push(key_child);
@@ -1688,6 +2015,11 @@ fn build_schema_column_plan(
                     struct_fields.len()
                 ));
             }
+            let source_children = align_struct_source_children(
+                source_schema_col,
+                &schema_col.children_columns,
+                struct_fields,
+            );
             for (idx, (field, child_schema_col)) in struct_fields
                 .iter()
                 .zip(schema_col.children_columns.iter())
@@ -1708,11 +2040,16 @@ fn build_schema_column_plan(
                         ));
                     }
                 }
+                let (child_source_index, child_source_schema_col, child_source_lookup_attempted) =
+                    source_children[idx];
                 let child = build_schema_column_plan(
                     tablet_id,
                     version,
                     &format!("{output_path}.{}", field.name()),
                     child_schema_col,
+                    child_source_schema_col,
+                    child_source_index,
+                    child_source_lookup_attempted,
                     field.data_type(),
                 )?;
                 children.push(child);
@@ -1736,6 +2073,8 @@ fn build_schema_column_plan(
 
     Ok(StarRocksNativeSchemaColumnPlan {
         unique_id,
+        source_index,
+        source_lookup_attempted,
         schema_type: schema_type.as_str().to_string(),
         is_nullable: schema_col.is_nullable.unwrap_or(true),
         is_key: schema_col.is_key.unwrap_or(false),
@@ -1926,8 +2265,8 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Int64, true),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 2);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
@@ -1993,8 +2332,8 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Utf8, true),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
 
         assert_eq!(plan.delete_predicates.len(), 1);
         assert_eq!(plan.delete_predicates[0].version, 3);
@@ -2035,7 +2374,7 @@ mod tests {
             Field::new("c2", DataType::Int64, true),
         ]));
 
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("missing delete predicate column should fail");
         assert!(
             err.contains("delete predicate column not found in tablet schema"),
@@ -2052,7 +2391,7 @@ mod tests {
             DataType::Int64,
             true,
         )]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("should reject unknown output column");
         assert!(err.contains("output column not found"), "err={}", err);
     }
@@ -2069,8 +2408,8 @@ mod tests {
             Field::new("j.a", DataType::Int64, true),
         ]));
 
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 2);
         assert!(plan.projected_columns[0].flat_json_projection.is_none());
         let flat = plan.projected_columns[1]
@@ -2096,8 +2435,8 @@ mod tests {
             true,
         )]));
 
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         let projected = &plan.projected_columns[0];
         assert!(projected.source_column_missing);
@@ -2119,8 +2458,8 @@ mod tests {
         let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
         let output_schema = Arc::new(Schema::new(vec![Field::new("j3", DataType::Binary, true)]));
 
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         let projected = &plan.projected_columns[0];
         assert!(projected.source_column_missing);
@@ -2136,7 +2475,7 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Int64, false),
         ]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("should reject footer unique id mismatch");
         assert!(err.contains("cannot be backfilled"), "err={}", err);
     }
@@ -2149,7 +2488,7 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Int64, true),
         ]));
-        let plan = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect("nullable column should allow footer fallback");
         assert_eq!(plan.projected_columns.len(), 2);
         assert!(plan.projected_columns[1].fallback_is_nullable);
@@ -2164,7 +2503,7 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Int64, true),
         ]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("unsupported schema type should be rejected");
         assert!(err.contains("unsupported schema type"), "err={}", err);
     }
@@ -2180,7 +2519,7 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Int64, true),
         ]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("schema/output type mismatch should be rejected");
         assert!(
             err.contains("output field type mismatch with tablet schema type"),
@@ -2221,8 +2560,8 @@ mod tests {
                 true,
             ),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 9);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
@@ -2237,8 +2576,8 @@ mod tests {
             DataType::Timestamp(TimeUnit::Microsecond, None),
             true,
         )]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
@@ -2259,8 +2598,8 @@ mod tests {
             Field::new("c1", DataType::Int64, true),
             Field::new("c2", DataType::Int64, true),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.table_model, StarRocksTableModelPlan::UniqueKeys);
         assert_eq!(plan.group_key_columns.len(), 1);
         assert_eq!(plan.group_key_columns[0].output_name, "c1");
@@ -2287,8 +2626,8 @@ mod tests {
             Field::new("c_binary", DataType::Binary, true),
             Field::new("c_varbinary", DataType::Binary, true),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 5);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
@@ -2307,8 +2646,8 @@ mod tests {
             Field::new("c_d64", DataType::Decimal128(18, 4), true),
             Field::new("c_d128", DataType::Decimal128(38, 10), true),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 3);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
@@ -2324,7 +2663,7 @@ mod tests {
             DataType::Decimal128(27, 9),
             true,
         )]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("DECIMALV2 should be rejected");
         assert!(err.contains("unsupported schema type"), "err={}", err);
     }
@@ -2339,7 +2678,7 @@ mod tests {
             DataType::Decimal128(18, 4),
             true,
         )]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("decimal precision/scale mismatch should be rejected");
         assert!(
             err.contains("decimal output field type mismatch with tablet schema decimal metadata"),
@@ -2404,8 +2743,8 @@ mod tests {
                 true,
             ),
         ]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 3);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
@@ -2424,7 +2763,7 @@ mod tests {
             DataType::Struct(vec![Field::new("f1", DataType::Int32, true)].into()),
             true,
         )]));
-        let err = build_native_read_plan(&snapshot, &footers, &output_schema)
+        let err = build_native_read_plan(&snapshot, &footers, &output_schema, None)
             .expect_err("struct child mismatch should fail");
         assert!(
             err.contains("STRUCT schema child count mismatch"),
@@ -2450,8 +2789,8 @@ mod tests {
             .collect(),
         );
         let output_schema = Arc::new(Schema::new(vec![field]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         assert_eq!(plan.projected_columns[0].schema_unique_id, 2);
         assert_eq!(
@@ -2476,11 +2815,223 @@ mod tests {
                 .collect(),
         );
         let output_schema = Arc::new(Schema::new(vec![field]));
-        let plan =
-            build_native_read_plan(&snapshot, &footers, &output_schema).expect("build read plan");
+        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
+            .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         assert_eq!(plan.projected_columns[0].schema_unique_id, 4);
         assert_eq!(plan.projected_columns[0].schema_type, "VARCHAR");
+    }
+
+    #[test]
+    fn align_array_struct_children_monotonically_when_nested_unique_ids_are_missing() {
+        let snapshot = build_snapshot_with_columns(vec![build_array_column(
+            1,
+            "c1",
+            build_struct_column(
+                -1,
+                "element",
+                vec![
+                    build_column(-1, "v2", "INT"),
+                    build_column(-1, "val1", "INT"),
+                ],
+            ),
+        )]);
+        let source_schema = TabletSchemaPb {
+            column: vec![build_array_column(
+                1,
+                "c1",
+                build_struct_column(
+                    -1,
+                    "element",
+                    vec![
+                        build_column(-1, "v1", "INT"),
+                        build_column(-1, "v2", "INT"),
+                        build_column(-1, "val1", "INT"),
+                    ],
+                ),
+            )],
+            ..Default::default()
+        };
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "c1",
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Struct(
+                    vec![
+                        Field::new("v2", DataType::Int32, true),
+                        Field::new("val1", DataType::Int32, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ))),
+            true,
+        )]));
+
+        let plan = build_native_read_plan(
+            &snapshot,
+            &[build_footer(10, &[1]), build_footer(20, &[1])],
+            &output_schema,
+            Some(&source_schema),
+        )
+        .expect("build read plan");
+        let element_schema = &plan.projected_columns[0].schema.children[0];
+        assert_eq!(element_schema.children[0].source_index, Some(1));
+        assert_eq!(element_schema.children[1].source_index, Some(2));
+        assert!(element_schema.children[1].source_lookup_attempted);
+    }
+
+    #[test]
+    fn do_not_reuse_same_name_struct_field_after_drop_and_readd() {
+        let snapshot = build_snapshot_with_columns(vec![build_struct_column(
+            1,
+            "c1",
+            vec![
+                build_column(-1, "v2", "INT"),
+                build_column(-1, "v1", "INT"),
+                build_column(-1, "val1", "INT"),
+            ],
+        )]);
+        let source_schema = TabletSchemaPb {
+            column: vec![build_struct_column(
+                1,
+                "c1",
+                vec![
+                    build_column(-1, "v1", "INT"),
+                    build_column(-1, "v2", "INT"),
+                    build_column(-1, "val1", "INT"),
+                ],
+            )],
+            ..Default::default()
+        };
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "c1",
+            DataType::Struct(
+                vec![
+                    Field::new("v2", DataType::Int32, true),
+                    Field::new("v1", DataType::Int32, true),
+                    Field::new("val1", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+
+        let plan = build_native_read_plan(
+            &snapshot,
+            &[build_footer(10, &[1]), build_footer(20, &[1])],
+            &output_schema,
+            Some(&source_schema),
+        )
+        .expect("build read plan");
+        let struct_schema = &plan.projected_columns[0].schema;
+        assert_eq!(struct_schema.children[0].source_index, Some(1));
+        assert_eq!(struct_schema.children[1].source_index, None);
+        assert!(struct_schema.children[1].source_lookup_attempted);
+        assert_eq!(struct_schema.children[2].source_index, Some(2));
+    }
+
+    #[test]
+    fn do_not_name_fallback_across_nested_type_change() {
+        let snapshot = build_snapshot_with_columns(vec![build_struct_column(
+            1,
+            "c1",
+            vec![
+                build_column(-1, "v2_1", "INT"),
+                build_column(-1, "v2_2", "DATE"),
+            ],
+        )]);
+        let source_schema = TabletSchemaPb {
+            column: vec![build_struct_column(
+                1,
+                "c1",
+                vec![
+                    build_column(-1, "v2_1", "INT"),
+                    build_column(-1, "v2_2", "VARCHAR"),
+                ],
+            )],
+            ..Default::default()
+        };
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "c1",
+            DataType::Struct(
+                vec![
+                    Field::new("v2_1", DataType::Int32, true),
+                    Field::new("v2_2", DataType::Date32, true),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+
+        let plan = build_native_read_plan(
+            &snapshot,
+            &[build_footer(10, &[1]), build_footer(20, &[1])],
+            &output_schema,
+            Some(&source_schema),
+        )
+        .expect("build read plan");
+        let struct_schema = &plan.projected_columns[0].schema;
+        assert_eq!(struct_schema.children[0].source_index, Some(0));
+        assert_eq!(struct_schema.children[1].source_index, None);
+        assert!(struct_schema.children[1].source_lookup_attempted);
+    }
+
+    #[test]
+    fn segment_projected_schema_uses_rowset_historical_schema() {
+        let current_struct = build_struct_column(
+            1,
+            "c1",
+            vec![
+                build_column(-1, "v2", "INT"),
+                build_column(-1, "val1", "INT"),
+            ],
+        );
+        let old_struct = build_struct_column(
+            1,
+            "c1",
+            vec![
+                build_column(-1, "v1", "INT"),
+                build_column(-1, "v2", "INT"),
+                build_column(-1, "val1", "INT"),
+            ],
+        );
+        let mut snapshot = build_snapshot_with_columns(vec![current_struct]);
+        snapshot.historical_schemas.insert(
+            900,
+            TabletSchemaPb {
+                id: Some(900),
+                column: vec![old_struct],
+                ..Default::default()
+            },
+        );
+        snapshot.segment_files[0].schema_id = Some(900);
+        snapshot.segment_files[1].schema_id = snapshot.tablet_schema.id;
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "c1",
+            DataType::Struct(
+                vec![
+                    Field::new("v2", DataType::Int32, true),
+                    Field::new("val1", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            true,
+        )]));
+
+        let plan = build_native_read_plan(
+            &snapshot,
+            &[build_footer(10, &[1]), build_footer(20, &[1])],
+            &output_schema,
+            None,
+        )
+        .expect("build read plan");
+        let old_segment_schema = &plan.segments[0].projected_schemas[0];
+        assert_eq!(old_segment_schema.children[0].source_index, Some(1));
+        assert_eq!(old_segment_schema.children[1].source_index, Some(2));
+        let current_segment_schema = &plan.segments[1].projected_schemas[0];
+        assert_eq!(current_segment_schema.children[0].source_index, Some(0));
+        assert_eq!(current_segment_schema.children[1].source_index, Some(1));
     }
 
     fn build_snapshot() -> StarRocksTabletSnapshot {
@@ -2491,15 +3042,18 @@ mod tests {
     }
 
     fn build_snapshot_with_columns(columns: Vec<ColumnPb>) -> StarRocksTabletSnapshot {
+        let tablet_schema = TabletSchemaPb {
+            id: Some(1000),
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: columns,
+            ..Default::default()
+        };
         StarRocksTabletSnapshot {
             tablet_id: 10,
             version: 20,
             metadata_path: "meta/path".to_string(),
-            tablet_schema: TabletSchemaPb {
-                keys_type: Some(KeysType::DupKeys as i32),
-                column: columns,
-                ..Default::default()
-            },
+            tablet_schema: tablet_schema.clone(),
+            historical_schemas: std::collections::BTreeMap::from([(1000, tablet_schema)]),
             total_num_rows: 30,
             rowset_count: 1,
             segment_files: vec![
@@ -2508,6 +3062,7 @@ mod tests {
                     relative_path: "data/s1.dat".to_string(),
                     path: "/tmp/data/s1.dat".to_string(),
                     rowset_version: 10,
+                    schema_id: None,
                     segment_id: Some(1),
                     bundle_file_offset: Some(0),
                     segment_size: Some(100),
@@ -2517,6 +3072,7 @@ mod tests {
                     relative_path: "data/s2.dat".to_string(),
                     path: "/tmp/data/s2.dat".to_string(),
                     rowset_version: 20,
+                    schema_id: None,
                     segment_id: Some(2),
                     bundle_file_offset: Some(100),
                     segment_size: Some(200),

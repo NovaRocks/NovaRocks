@@ -75,6 +75,7 @@ mod constants {
     pub(super) const LOGICAL_TYPE_DECIMAL128: i32 = 49;
     pub(super) const LOGICAL_TYPE_DATE: i32 = 50;
     pub(super) const LOGICAL_TYPE_DATETIME: i32 = 51;
+    pub(super) const LOGICAL_TYPE_PERCENTILE: i32 = 53;
     pub(super) const LOGICAL_TYPE_JSON: i32 = 54;
 
     pub(super) const COMPRESSION_NO_COMPRESSION: i32 = 0;

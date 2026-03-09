@@ -88,6 +88,8 @@ pub(super) enum AggKind {
     DictMerge,
     BitmapAgg,
     BitmapUnionInt,
+    PercentileUnion,
+    PercentileApprox,
     PercentilePlaceholder,
     ApproxTopK,
     HllRawHash,
@@ -116,6 +118,7 @@ mod max;
 mod max_by;
 mod min;
 mod multi_distinct_sum;
+mod percentile;
 mod percentile_placeholder;
 mod retention;
 mod sum;
@@ -142,6 +145,7 @@ use max::MaxAgg;
 use max_by::MaxMinByAgg;
 use min::MinAgg;
 use multi_distinct_sum::MultiDistinctSumAgg;
+use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
 use sum::SumAgg;
@@ -220,6 +224,7 @@ static HISTOGRAM: HistogramAgg = HistogramAgg;
 static MANN_WHITNEY: MannWhitneyUTestAgg = MannWhitneyUTestAgg;
 static DICT_MERGE: DictMergeAgg = DictMergeAgg;
 static BITMAP_UNION_INT: BitmapUnionIntAgg = BitmapUnionIntAgg;
+static PERCENTILE: PercentileAgg = PercentileAgg;
 static PERCENTILE_PLACEHOLDER: PercentilePlaceholderAgg = PercentilePlaceholderAgg;
 static APPROX_TOP_K: ApproxTopKAgg = ApproxTopKAgg;
 static HLL_RAW: HllRawAgg = HllRawAgg;
@@ -241,6 +246,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "variance" | "variance_pop" | "var_pop" | "variance_samp" | "var_samp" | "stddev"
         | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
         "any_value" => Ok(&ANY_VALUE),
+        "percentile_union" | "percentile_approx" => Ok(&PERCENTILE),
         "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => Ok(&PERCENTILE_PLACEHOLDER),
         "bool_or" | "boolor_agg" => Ok(&BOOL_OR),
         "covar_pop" | "covar_samp" | "corr" => Ok(&COVAR_CORR),
@@ -317,6 +323,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::DictMerge => &DICT_MERGE,
         AggKind::BitmapAgg => &BITMAP_UNION_INT,
         AggKind::BitmapUnionInt => &BITMAP_UNION_INT,
+        AggKind::PercentileUnion | AggKind::PercentileApprox => &PERCENTILE,
         AggKind::PercentilePlaceholder => &PERCENTILE_PLACEHOLDER,
         AggKind::ApproxTopK => &APPROX_TOP_K,
         AggKind::HllRawHash | AggKind::HllRawMerge | AggKind::HllUnionCount => &HLL_RAW,

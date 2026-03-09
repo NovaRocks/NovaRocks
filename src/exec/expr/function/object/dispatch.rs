@@ -89,7 +89,17 @@ pub fn eval_object_function(
         "to_bitmap" => super::to_bitmap::eval_to_bitmap(arena, expr, args, chunk),
         "hll_hash" => super::hll_hash::eval_hll_hash(arena, expr, args, chunk),
         "ds_hll_count_distinct_state" => super::hll_hash::eval_hll_hash(arena, expr, args, chunk),
+        "percentile_hash" => {
+            super::percentile_functions::eval_percentile_hash(arena, expr, args, chunk)
+        }
+        "percentile_empty" => {
+            super::percentile_functions::eval_percentile_empty(arena, expr, args, chunk)
+        }
+        "percentile_approx_raw" => {
+            super::percentile_functions::eval_percentile_approx_raw(arena, expr, args, chunk)
+        }
         "json_object" => super::json_object::eval_json_object(arena, expr, args, chunk),
+        "sleep" => super::utility_functions::eval_sleep(arena, expr, args, chunk),
         other => Err(format!("unsupported object function: {}", other)),
     }
 }
@@ -118,7 +128,11 @@ static OBJECT_FUNCTIONS: &[(&str, &str)] = &[
     ("to_bitmap", "to_bitmap"),
     ("hll_hash", "hll_hash"),
     ("ds_hll_count_distinct_state", "ds_hll_count_distinct_state"),
+    ("percentile_hash", "percentile_hash"),
+    ("percentile_empty", "percentile_empty"),
+    ("percentile_approx_raw", "percentile_approx_raw"),
     ("json_object", "json_object"),
+    ("sleep", "sleep"),
     // Stream load historical alias in StarRocks FE.
     ("hll_hash1", "hll_hash"),
 ];
@@ -240,9 +254,29 @@ static OBJECT_METADATA: &[FunctionMeta] = &[
         max_args: 3,
     },
     FunctionMeta {
+        name: "percentile_hash",
+        min_args: 1,
+        max_args: 1,
+    },
+    FunctionMeta {
+        name: "percentile_empty",
+        min_args: 0,
+        max_args: 0,
+    },
+    FunctionMeta {
+        name: "percentile_approx_raw",
+        min_args: 2,
+        max_args: 2,
+    },
+    FunctionMeta {
         name: "json_object",
         min_args: 1,
         max_args: usize::MAX,
+    },
+    FunctionMeta {
+        name: "sleep",
+        min_args: 1,
+        max_args: 1,
     },
 ];
 

@@ -36,7 +36,10 @@ use thrift::transport::{
 };
 
 use crate::common::thrift::thrift_named_json;
-use crate::connector::starrocks::lake::{create_lake_tablet_from_req, execute_alter_tablet_task};
+use crate::connector::starrocks::lake::{
+    create_lake_tablet_from_req, execute_alter_tablet_task,
+    execute_update_tablet_meta_info_task as execute_lake_update_tablet_meta_info_task,
+};
 use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
 use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::master_service;
@@ -254,10 +257,17 @@ fn execute_alter_task(task: &agent_service::TAgentTaskRequest) -> Result<(), Str
 fn execute_update_tablet_meta_info_task(
     task: &agent_service::TAgentTaskRequest,
 ) -> Result<(), String> {
-    if task.update_tablet_meta_info_req.is_none() {
-        return Err("update_tablet_meta_info task missing update_tablet_meta_info_req".to_string());
-    }
-    Err("update_tablet_meta_info is unsupported in NovaRocks Lake SCHEMA_CHANGE V1".to_string())
+    let req = task.update_tablet_meta_info_req.as_ref().ok_or_else(|| {
+        "update_tablet_meta_info task missing update_tablet_meta_info_req".to_string()
+    })?;
+    tracing::info!(
+        signature = task.signature,
+        txn_id = ?req.txn_id,
+        tablet_meta_info_count = req.tablet_meta_infos.as_ref().map(|v| v.len()).unwrap_or(0),
+        req = %json_summary(req),
+        "BackendService.update_tablet_meta_info received request"
+    );
+    execute_lake_update_tablet_meta_info_task(req)
 }
 
 fn execute_drop_auto_increment_map_task(
@@ -974,16 +984,16 @@ mod tests {
     }
 
     #[test]
-    fn execute_backend_task_fails_fast_for_update_meta_task() {
+    fn execute_backend_task_fails_fast_for_malformed_update_meta_task() {
         let mut task = test_task(types::TTaskType::UPDATE_TABLET_META_INFO);
         task.update_tablet_meta_info_req = Some(agent_service::TUpdateTabletMetaInfoReq::new(
             None::<Vec<agent_service::TTabletMetaInfo>>,
             Some(agent_service::TTabletType::TABLET_TYPE_LAKE),
             Some(99_i64),
         ));
-        let err = execute_backend_task(&task).expect_err("update_meta must fail in V1");
+        let err = execute_backend_task(&task).expect_err("malformed update_meta must fail");
         assert!(
-            err.contains("update_tablet_meta_info failed"),
+            err.contains("missing tablet_meta_infos"),
             "unexpected error message: {err}"
         );
     }
