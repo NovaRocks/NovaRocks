@@ -29,7 +29,8 @@ use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
 use crate::connector::starrocks::lake::applier::apply_txn_log_to_metadata;
 use crate::connector::starrocks::lake::context::{
-    TabletRuntimeEntry, get_tablet_runtime, remove_tablet_runtime, with_txn_log_append_lock,
+    TabletRuntimeEntry, get_tablet_runtime, remove_tablet_runtime, update_tablet_runtime_schema,
+    with_txn_log_append_lock,
 };
 use crate::connector::starrocks::lake::replay_policy::{
     MissingTxnLogPolicy, decide_missing_txn_log_policy,
@@ -2656,9 +2657,11 @@ fn publish_one_tablet(
     } else {
         None
     };
+    let persisted_schema = schema_from_metadata(tablet_id, new_version, &state.metadata)?;
+    update_tablet_runtime_schema(tablet_id, &persisted_schema)?;
     Ok(PublishOneTabletOutput {
         root_path: state.root_path,
-        schema: runtime.schema.clone(),
+        schema: persisted_schema,
         metadata: state.metadata,
         needs_persist: true,
         cleanup_txn_log_path,

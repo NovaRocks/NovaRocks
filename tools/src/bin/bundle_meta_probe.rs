@@ -296,6 +296,40 @@ fn dump_tablet_meta(tablet_id: i64, meta: &novarocks::service::grpc_client::prot
     }
 }
 
+fn dump_schema(
+    schema: &novarocks::service::grpc_client::proto::starrocks::TabletSchemaPb,
+) {
+    println!(
+        "schema id={:?} schema_version={:?} next_column_unique_id={:?} root_columns={}",
+        schema.id,
+        schema.schema_version,
+        schema.next_column_unique_id,
+        schema.column.len()
+    );
+    for column in &schema.column {
+        dump_schema_column(column, 1);
+    }
+}
+
+fn dump_schema_column(
+    column: &novarocks::service::grpc_client::proto::starrocks::ColumnPb,
+    depth: usize,
+) {
+    let indent = "  ".repeat(depth);
+    println!(
+        "{indent}col name={:?} unique_id={} type={} nullable={:?} key={:?} children={}",
+        column.name,
+        column.unique_id,
+        column.r#type,
+        column.is_nullable,
+        column.is_key,
+        column.children_columns.len()
+    );
+    for child in &column.children_columns {
+        dump_schema_column(child, depth + 1);
+    }
+}
+
 fn main() -> Result<(), String> {
     let cfg = parse_args()?;
     let root = parse_root(&cfg.root)?;
@@ -334,7 +368,19 @@ fn main() -> Result<(), String> {
 
     for tablet_id in target_tablet_ids {
         match decode_tablet_metadata_from_bundle_bytes(&bytes, tablet_id, cfg.version) {
-            Ok(meta) => dump_tablet_meta(tablet_id, &meta),
+            Ok(meta) => {
+                dump_tablet_meta(tablet_id, &meta);
+                if let Some(schema_id) = bundle.tablet_to_schema.get(&tablet_id) {
+                    println!("tablet_to_schema tablet_id={} schema_id={}", tablet_id, schema_id);
+                    if let Some(schema) = bundle.schemas.get(schema_id) {
+                        dump_schema(schema);
+                    } else {
+                        println!("schema missing for schema_id={}", schema_id);
+                    }
+                } else {
+                    println!("tablet_to_schema missing for tablet_id={}", tablet_id);
+                }
+            }
             Err(err) => println!("tablet={} decode_error={}", tablet_id, err),
         }
     }

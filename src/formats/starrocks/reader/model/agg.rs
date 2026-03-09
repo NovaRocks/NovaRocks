@@ -1593,6 +1593,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: true,
@@ -1613,6 +1615,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: false,
@@ -1633,6 +1637,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1703,6 +1709,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(2),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: false,
@@ -1722,6 +1730,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1772,6 +1782,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(2),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: false,
@@ -1791,6 +1803,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1859,6 +1873,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: true,
@@ -1879,6 +1895,8 @@ mod tests {
                     schema_type: "OBJECT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "OBJECT".to_string(),
                         is_nullable: true,
                         is_key: false,
@@ -1899,6 +1917,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,
@@ -1969,6 +1989,8 @@ mod tests {
                     schema_type: "BIGINT".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(1),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "BIGINT".to_string(),
                         is_nullable: true,
                         is_key: true,
@@ -1989,6 +2011,8 @@ mod tests {
                     schema_type: "HLL".to_string(),
                     schema: StarRocksNativeSchemaColumnPlan {
                         unique_id: Some(2),
+                        source_index: None,
+                        source_lookup_attempted: false,
                         schema_type: "HLL".to_string(),
                         is_nullable: true,
                         is_key: false,
@@ -2009,6 +2033,8 @@ mod tests {
                 schema_type: "BIGINT".to_string(),
                 schema: StarRocksNativeSchemaColumnPlan {
                     unique_id: Some(1),
+                    source_index: None,
+                    source_lookup_attempted: false,
                     schema_type: "BIGINT".to_string(),
                     is_nullable: true,
                     is_key: true,

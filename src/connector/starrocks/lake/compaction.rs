@@ -256,7 +256,7 @@ fn load_compaction_visible_batch(
     }
     let segment_footers =
         load_bundle_segment_footers(snapshot, tablet_root_path, object_store_profile)?;
-    let plan = build_native_read_plan(snapshot, &segment_footers, output_schema)?;
+    let plan = build_native_read_plan(snapshot, &segment_footers, output_schema, None)?;
     build_native_record_batch(
         &plan,
         &segment_footers,

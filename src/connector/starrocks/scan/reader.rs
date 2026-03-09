@@ -2,6 +2,7 @@ use crate::common::ids::SlotId;
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
+use crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift;
 use crate::exec::chunk::field_slot_id;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
@@ -57,6 +58,58 @@ fn schema_signature(schema: &SchemaRef) -> String {
         .join("|")
 }
 
+fn maybe_refresh_snapshot_schema_for_lake_scan(
+    snapshot: &StarRocksTabletSnapshot,
+    lake_schema_meta: Option<&LakeScanSchemaMeta>,
+) -> Result<StarRocksTabletSnapshot, String> {
+    let Some(meta) = lake_schema_meta else {
+        return Ok(snapshot.clone());
+    };
+    if meta.schema_id <= 0 {
+        return Ok(snapshot.clone());
+    }
+
+    let snapshot_schema_id = snapshot.tablet_schema.id.unwrap_or(0);
+    if snapshot_schema_id == meta.schema_id {
+        return Ok(snapshot.clone());
+    }
+
+    let fe_schema = fetch_table_schema_for_lake_scan(
+        meta.fe_addr.as_ref(),
+        meta.db_id,
+        meta.table_id,
+        meta.schema_id,
+        Some(snapshot.tablet_id),
+        meta.query_id.clone(),
+    )
+    .map_err(|e| {
+        format!(
+            "fetch FE table schema for lake scan failed while refreshing snapshot schema: db_id={} table_id={} schema_id={} tablet_id={} error={}",
+            meta.db_id, meta.table_id, meta.schema_id, snapshot.tablet_id, e
+        )
+    })?;
+    let refreshed_schema = build_tablet_schema_pb_from_thrift(&fe_schema)?;
+    let refreshed_schema_id = refreshed_schema.id.unwrap_or(0);
+    if refreshed_schema_id > 0 && refreshed_schema_id != meta.schema_id {
+        warn!(
+            "lake scan FE schema id mismatch while refreshing snapshot schema: tablet_id={} snapshot_schema_id={} requested_schema_id={} fetched_schema_id={}",
+            snapshot.tablet_id, snapshot_schema_id, meta.schema_id, refreshed_schema_id
+        );
+    }
+
+    let mut refreshed = snapshot.clone();
+    refreshed.tablet_schema = refreshed_schema;
+    info!(
+        "lake scan refreshed tablet schema from FE schema meta: tablet_id={} version={} snapshot_schema_id={} requested_schema_id={} metadata_path={}",
+        refreshed.tablet_id,
+        refreshed.version,
+        snapshot_schema_id,
+        meta.schema_id,
+        refreshed.metadata_path
+    );
+    Ok(refreshed)
+}
+
 impl StarRocksNativeReader {
     pub(super) fn open(
         tablet_id: i64,
@@ -107,6 +160,8 @@ impl StarRocksNativeReader {
             }
             Err(err) => return Err(err),
         };
+        let physical_snapshot = snapshot.clone();
+        let snapshot = maybe_refresh_snapshot_schema_for_lake_scan(&snapshot, lake_schema_meta)?;
         eprintln!(
             "[DEBUG] starrocks native reader snapshot tablet_id={} requested_version={} metadata_path={} total_num_rows={} rowset_count={} segment_count={}",
             tablet_id,
@@ -169,7 +224,12 @@ impl StarRocksNativeReader {
         }
         let segment_footers =
             load_bundle_segment_footers(&snapshot, storage_path, object_store_profile)?;
-        let plan = build_native_read_plan(&snapshot, &segment_footers, &scan_schema)?;
+        let plan = build_native_read_plan(
+            &snapshot,
+            &segment_footers,
+            &scan_schema,
+            Some(&physical_snapshot.tablet_schema),
+        )?;
         if let Some(first_footer) = segment_footers.first() {
             let column_debug = first_footer
                 .columns

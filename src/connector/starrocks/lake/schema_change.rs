@@ -26,12 +26,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::agent_service::{
-    TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TTabletType,
+    TAlterJobType, TAlterMaterializedViewParam, TAlterTabletReqV2, TCompactionStrategy,
+    TPersistentIndexType, TTabletMetaInfo, TTabletType, TUpdateTabletMetaInfoReq,
 };
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, get_tablet_runtime, register_tablet_runtime,
-    with_txn_log_append_lock,
+    update_tablet_runtime_schema, with_txn_log_append_lock,
 };
 use crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift;
 use crate::connector::starrocks::lake::txn_log::{
@@ -57,7 +58,8 @@ use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, normalize_slot_name};
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
 use crate::service::grpc_client::proto::starrocks::{
-    KeysType, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
+    CompactionStrategyPb, FlatJsonConfigPb, KeysType, MetadataUpdateInfoPb, PersistentIndexTypePb,
+    RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
 };
 use crate::types::{TKeysType, TStorageType};
 
@@ -178,7 +180,7 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     // later publish_version lookup consistent.
     register_tablet_runtime(&base_ctx)?;
     register_tablet_runtime(&new_ctx)?;
-    if !schemas_equivalent(&new_metadata_schema, &new_schema) {
+    if new_metadata_schema != new_schema {
         let mut patched_meta = new_metadata.clone();
         patched_meta.schema = Some(new_schema.clone());
         patched_meta.id = Some(new_tablet_id);
@@ -230,6 +232,33 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         alter_version,
         rewritten_rowsets,
     )
+}
+
+pub(crate) fn execute_update_tablet_meta_info_task(
+    request: &TUpdateTabletMetaInfoReq,
+) -> Result<(), String> {
+    let tablet_type = request.tablet_type.unwrap_or(TTabletType::TABLET_TYPE_DISK);
+    if tablet_type != TTabletType::TABLET_TYPE_LAKE {
+        return Err(format!(
+            "update_tablet_meta_info unsupported tablet_type={tablet_type:?} (only TABLET_TYPE_LAKE is supported)"
+        ));
+    }
+    let txn_id = request
+        .txn_id
+        .ok_or_else(|| "update_tablet_meta_info missing txn_id".to_string())?;
+    if txn_id <= 0 {
+        return Err(format!(
+            "update_tablet_meta_info has invalid txn_id={txn_id}"
+        ));
+    }
+    let tablet_meta_infos = request
+        .tablet_meta_infos
+        .as_ref()
+        .ok_or_else(|| "update_tablet_meta_info missing tablet_meta_infos".to_string())?;
+    for tablet_meta_info in tablet_meta_infos {
+        execute_single_tablet_meta_update(tablet_meta_info, txn_id)?;
+    }
+    Ok(())
 }
 
 fn load_tablet_metadata_for_alter_with_retry(
@@ -296,6 +325,146 @@ fn load_tablet_metadata_for_alter_with_retry(
         "{op} exhausted metadata retry attempts unexpectedly: tablet_id={} version={} attempts={}",
         tablet_id, version, ALTER_METADATA_LOAD_MAX_ATTEMPTS
     ))
+}
+
+fn execute_single_tablet_meta_update(
+    tablet_meta_info: &TTabletMetaInfo,
+    txn_id: i64,
+) -> Result<(), String> {
+    let tablet_id = tablet_meta_info
+        .tablet_id
+        .ok_or_else(|| "update_tablet_meta_info tablet_meta_info missing tablet_id".to_string())?;
+    if tablet_id <= 0 {
+        return Err(format!(
+            "update_tablet_meta_info has invalid tablet_id={tablet_id}"
+        ));
+    }
+    let (tablet_root_path, _s3) = resolve_tablet_location("update_tablet_meta_info", tablet_id)?;
+    let metadata_update_info = build_metadata_update_info(tablet_meta_info)?;
+    let updated_schema = metadata_update_info.tablet_schema.clone();
+    write_update_tablet_meta_txn_log(&tablet_root_path, tablet_id, txn_id, metadata_update_info)?;
+    if let Some(schema) = updated_schema.as_ref() {
+        update_tablet_runtime_schema(tablet_id, schema)?;
+    }
+    Ok(())
+}
+
+fn build_metadata_update_info(
+    tablet_meta_info: &TTabletMetaInfo,
+) -> Result<MetadataUpdateInfoPb, String> {
+    let tablet_schema = tablet_meta_info
+        .tablet_schema
+        .as_ref()
+        .map(build_tablet_schema_pb_from_thrift)
+        .transpose()?;
+    let persistent_index_type = tablet_meta_info
+        .persistent_index_type
+        .map(map_update_tablet_meta_persistent_index_type)
+        .transpose()?;
+    let compaction_strategy = tablet_meta_info
+        .compaction_strategy
+        .map(map_update_tablet_meta_compaction_strategy)
+        .transpose()?;
+    let flat_json_config = tablet_meta_info
+        .flat_json_config
+        .as_ref()
+        .map(|cfg| FlatJsonConfigPb {
+            flat_json_enable: cfg.flat_json_enable,
+            flat_json_null_factor: cfg.flat_json_null_factor.map(|v| v.0),
+            flat_json_sparsity_factor: cfg.flat_json_sparsity_factor.map(|v| v.0),
+            flat_json_max_column_max: cfg.flat_json_column_max,
+        });
+    Ok(MetadataUpdateInfoPb {
+        enable_persistent_index: tablet_meta_info.enable_persistent_index,
+        tablet_schema,
+        persistent_index_type,
+        bundle_tablet_metadata: tablet_meta_info.bundle_tablet_metadata,
+        compaction_strategy,
+        flat_json_config,
+    })
+}
+
+fn map_update_tablet_meta_persistent_index_type(
+    persistent_index_type: TPersistentIndexType,
+) -> Result<i32, String> {
+    if persistent_index_type == TPersistentIndexType::LOCAL {
+        return Ok(PersistentIndexTypePb::Local as i32);
+    }
+    if persistent_index_type == TPersistentIndexType::CLOUD_NATIVE {
+        return Ok(PersistentIndexTypePb::CloudNative as i32);
+    }
+    Err(format!(
+        "update_tablet_meta_info unsupported persistent_index_type={persistent_index_type:?}"
+    ))
+}
+
+fn map_update_tablet_meta_compaction_strategy(
+    compaction_strategy: TCompactionStrategy,
+) -> Result<i32, String> {
+    if compaction_strategy == TCompactionStrategy::DEFAULT {
+        return Ok(CompactionStrategyPb::Default as i32);
+    }
+    if compaction_strategy == TCompactionStrategy::REAL_TIME {
+        return Ok(CompactionStrategyPb::RealTime as i32);
+    }
+    Err(format!(
+        "update_tablet_meta_info unsupported compaction_strategy={compaction_strategy:?}"
+    ))
+}
+
+fn write_update_tablet_meta_txn_log(
+    tablet_root_path: &str,
+    tablet_id: i64,
+    txn_id: i64,
+    metadata_update_info: MetadataUpdateInfoPb,
+) -> Result<(), String> {
+    let txn_log_path = txn_log_file_path(tablet_root_path, tablet_id, txn_id)?;
+    with_txn_log_append_lock(tablet_id, txn_id, || {
+        let mut txn_log = match read_txn_log_if_exists(&txn_log_path)? {
+            Some(existing) => existing,
+            None => TxnLogPb {
+                tablet_id: Some(tablet_id),
+                txn_id: Some(txn_id),
+                op_write: None,
+                op_compaction: None,
+                op_schema_change: None,
+                op_alter_metadata: None,
+                op_replication: None,
+                partition_id: None,
+                load_id: None,
+            },
+        };
+        if txn_log.tablet_id != Some(tablet_id) {
+            return Err(format!(
+                "update_tablet_meta_info txn log tablet_id mismatch: expected={} actual={:?}",
+                tablet_id, txn_log.tablet_id
+            ));
+        }
+        if txn_log.txn_id != Some(txn_id) {
+            return Err(format!(
+                "update_tablet_meta_info txn log txn_id mismatch: expected={} actual={:?}",
+                txn_id, txn_log.txn_id
+            ));
+        }
+        if txn_log.op_write.is_some()
+            || txn_log.op_compaction.is_some()
+            || txn_log.op_schema_change.is_some()
+            || txn_log.op_replication.is_some()
+        {
+            return Err(format!(
+                "update_tablet_meta_info does not support mixed txn log operation: tablet_id={} txn_id={}",
+                tablet_id, txn_id
+            ));
+        }
+        txn_log
+            .op_alter_metadata
+            .get_or_insert_with(|| txn_log_pb::OpAlterMetadata {
+                metadata_update_infos: Vec::new(),
+            })
+            .metadata_update_infos
+            .push(metadata_update_info);
+        write_txn_log_file(&txn_log_path, &txn_log)
+    })
 }
 
 fn is_retryable_alter_metadata_load_error(error: &str) -> bool {
@@ -545,18 +714,38 @@ fn map_keys_type_to_thrift(keys_type_raw: i32) -> Result<TKeysType, String> {
 }
 
 fn schemas_equivalent(lhs: &TabletSchemaPb, rhs: &TabletSchemaPb) -> bool {
-    if lhs.column.len() != rhs.column.len() {
-        return false;
-    }
-    lhs.column.iter().zip(rhs.column.iter()).all(|(l, r)| {
-        l.unique_id == r.unique_id
-            && l.name == r.name
-            && l.r#type == r.r#type
-            && l.is_key == r.is_key
-            && l.is_nullable == r.is_nullable
-            && l.aggregation == r.aggregation
-            && l.default_value == r.default_value
-    })
+    lhs.keys_type == rhs.keys_type
+        && lhs.num_short_key_columns == rhs.num_short_key_columns
+        && lhs.sort_key_idxes == rhs.sort_key_idxes
+        && lhs.sort_key_unique_ids == rhs.sort_key_unique_ids
+        && lhs.column.len() == rhs.column.len()
+        && lhs
+            .column
+            .iter()
+            .zip(rhs.column.iter())
+            .all(|(l, r)| columns_equivalent(l, r))
+}
+
+fn columns_equivalent(
+    lhs: &crate::service::grpc_client::proto::starrocks::ColumnPb,
+    rhs: &crate::service::grpc_client::proto::starrocks::ColumnPb,
+) -> bool {
+    lhs.unique_id == rhs.unique_id
+        && lhs.name == rhs.name
+        && lhs.r#type == rhs.r#type
+        && lhs.is_key == rhs.is_key
+        && lhs.is_nullable == rhs.is_nullable
+        && lhs.aggregation == rhs.aggregation
+        && lhs.default_value == rhs.default_value
+        && lhs.precision == rhs.precision
+        && lhs.frac == rhs.frac
+        && lhs.index_length == rhs.index_length
+        && lhs.children_columns.len() == rhs.children_columns.len()
+        && lhs
+            .children_columns
+            .iter()
+            .zip(rhs.children_columns.iter())
+            .all(|(l, r)| columns_equivalent(l, r))
 }
 
 fn build_unique_id_index_map(
@@ -1440,8 +1629,10 @@ fn write_schema_change_txn_log(
 
 #[cfg(test)]
 mod tests {
-    use super::is_expected_initial_metadata_without_schema;
-    use crate::service::grpc_client::proto::starrocks::{RowsetMetadataPb, TabletMetadataPb};
+    use super::{is_expected_initial_metadata_without_schema, schemas_equivalent};
+    use crate::service::grpc_client::proto::starrocks::{
+        ColumnPb, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
+    };
 
     #[test]
     fn initial_empty_v1_metadata_without_schema_is_expected() {
@@ -1468,5 +1659,110 @@ mod tests {
             &metadata_with_rowset,
             1
         ));
+    }
+
+    #[test]
+    fn schemas_equivalent_compares_nested_children_recursively() {
+        let lhs = test_schema(
+            1,
+            vec![test_struct_column(
+                10,
+                "c1",
+                vec![
+                    test_scalar_column(11, "v1", "INT"),
+                    test_scalar_column(12, "v2", "INT"),
+                ],
+            )],
+        );
+        let rhs = test_schema(
+            2,
+            vec![test_struct_column(
+                10,
+                "c1",
+                vec![
+                    test_scalar_column(11, "v1", "INT"),
+                    test_scalar_column(12, "v2", "INT"),
+                    test_scalar_column(13, "v3", "INT"),
+                ],
+            )],
+        );
+        assert!(
+            !schemas_equivalent(&lhs, &rhs),
+            "nested child add/drop must be treated as schema change"
+        );
+    }
+
+    #[test]
+    fn schemas_equivalent_ignores_schema_id_when_column_layout_matches() {
+        let lhs = test_schema(
+            1,
+            vec![test_struct_column(
+                10,
+                "c1",
+                vec![test_scalar_column(11, "v1", "INT")],
+            )],
+        );
+        let rhs = test_schema(
+            99,
+            vec![test_struct_column(
+                10,
+                "c1",
+                vec![test_scalar_column(11, "v1", "INT")],
+            )],
+        );
+        assert!(
+            schemas_equivalent(&lhs, &rhs),
+            "schema id alone should not make target schema unresolved"
+        );
+    }
+
+    fn test_schema(schema_id: i64, columns: Vec<ColumnPb>) -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(0),
+            column: columns,
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(100),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![10],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(schema_id),
+        }
+    }
+
+    fn test_struct_column(unique_id: i32, name: &str, children: Vec<ColumnPb>) -> ColumnPb {
+        let mut column = test_scalar_column(unique_id, name, "STRUCT");
+        column.children_columns = children;
+        column
+    }
+
+    fn test_scalar_column(unique_id: i32, name: &str, ty: &str) -> ColumnPb {
+        ColumnPb {
+            unique_id,
+            name: Some(name.to_string()),
+            r#type: ty.to_string(),
+            aggregation: None,
+            is_key: Some(false),
+            is_nullable: Some(true),
+            default_value: None,
+            index_length: None,
+            precision: None,
+            frac: None,
+            length: None,
+            children_columns: Vec::new(),
+            has_bitmap_index: None,
+            is_bf_column: None,
+            visible: None,
+            is_auto_increment: None,
+            referenced_column_id: None,
+            referenced_column: None,
+            agg_state_desc: None,
+        }
     }
 }

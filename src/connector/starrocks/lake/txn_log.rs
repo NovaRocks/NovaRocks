@@ -1680,7 +1680,7 @@ fn load_published_visible_batch(
         &ctx.tablet_root_path,
         object_store_profile.as_ref(),
     )?;
-    let plan = build_native_read_plan(&snapshot, &segment_footers, output_schema)?;
+    let plan = build_native_read_plan(&snapshot, &segment_footers, output_schema, None)?;
     build_native_record_batch(
         &plan,
         &segment_footers,
@@ -1745,7 +1745,7 @@ pub(crate) fn load_rowset_batch_for_partial_update(
         &ctx.tablet_root_path,
         object_store_profile.as_ref(),
     )?;
-    let plan = build_native_read_plan(&snapshot, &segment_footers, output_schema)?;
+    let plan = build_native_read_plan(&snapshot, &segment_footers, output_schema, None)?;
     build_native_record_batch(
         &plan,
         &segment_footers,
@@ -1761,6 +1761,7 @@ fn build_rowset_snapshot_for_partial_update(
     rowset: &RowsetMetadataPb,
 ) -> Result<StarRocksTabletSnapshot, String> {
     let rowset_id = rowset.id.unwrap_or(1);
+    let schema_id = ctx.tablet_schema.id.filter(|id| *id > 0);
     let mut segment_files = Vec::with_capacity(rowset.segments.len());
     for (idx, segment_name) in rowset.segments.iter().enumerate() {
         let relative_path = format!("{DATA_DIR}/{}", segment_name.trim_start_matches('/'));
@@ -1783,6 +1784,7 @@ fn build_rowset_snapshot_for_partial_update(
             relative_path,
             path,
             rowset_version: rowset.version.unwrap_or(0),
+            schema_id,
             segment_id: Some(segment_id),
             bundle_file_offset: rowset.bundle_file_offsets.get(idx).copied(),
             segment_size: rowset.segment_size.get(idx).copied(),
@@ -1796,6 +1798,9 @@ fn build_rowset_snapshot_for_partial_update(
         version: snapshot_version,
         metadata_path: String::new(),
         tablet_schema: ctx.tablet_schema.clone(),
+        historical_schemas: schema_id
+            .map(|id| std::collections::BTreeMap::from([(id, ctx.tablet_schema.clone())]))
+            .unwrap_or_default(),
         total_num_rows: rowset.num_rows.unwrap_or(0).max(0) as u64,
         rowset_count: 1,
         segment_files,

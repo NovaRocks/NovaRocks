@@ -262,6 +262,30 @@ pub(crate) fn get_tablet_runtime(tablet_id: i64) -> Result<TabletRuntimeEntry, S
     ))
 }
 
+pub(crate) fn update_tablet_runtime_schema(
+    tablet_id: i64,
+    schema: &TabletSchemaPb,
+) -> Result<(), String> {
+    if tablet_id <= 0 {
+        return Err(format!(
+            "invalid tablet_id for runtime schema update: {tablet_id}"
+        ));
+    }
+
+    let updated = {
+        let mut guard = tablet_runtime_registry()
+            .lock()
+            .map_err(|_| "lock tablet runtime registry failed".to_string())?;
+        let entry = guard
+            .get_mut(&tablet_id)
+            .ok_or_else(|| format!("tablet runtime is not registered for tablet_id={tablet_id}"))?;
+        entry.schema = schema.clone();
+        entry.clone()
+    };
+    sync_runtime_to_shard_registry(tablet_id, &updated);
+    Ok(())
+}
+
 pub(crate) fn remove_tablet_runtime(tablet_id: i64) -> Result<(), String> {
     if tablet_id <= 0 {
         return Err(format!(
