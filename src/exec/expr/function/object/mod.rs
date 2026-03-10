@@ -23,6 +23,7 @@ mod bitmap_functions;
 mod bitmap_to_array;
 mod bitmap_to_string;
 mod dispatch;
+mod ds_hll_functions;
 mod hll_codec;
 mod hll_hash;
 mod json_object;

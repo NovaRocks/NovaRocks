@@ -78,7 +78,19 @@ pub(crate) fn lower_aggregate_node(
             .map(|f| f.name.function_name.to_lowercase())
             .ok_or_else(|| "agg expr missing function name".to_string())?;
         let fn_name = encode_aggregate_name(root, &fn_name_raw, query_opts)?;
-        let type_sig = agg_type_signature_from_node(root)?;
+        let rewrite_ds_hll_merge_to_union =
+            !agg.need_finalize && fn_name_raw == "ds_hll_count_distinct_merge";
+        let fn_name = if rewrite_ds_hll_merge_to_union {
+            "ds_hll_count_distinct_union".to_string()
+        } else {
+            fn_name
+        };
+        let mut type_sig = agg_type_signature_from_node(root)?;
+        if rewrite_ds_hll_merge_to_union {
+            if let Some(intermediate_type) = type_sig.intermediate_type.clone() {
+                type_sig.output_type = Some(intermediate_type);
+            }
+        }
 
         // Lower arguments
         let mut args = Vec::new();
@@ -271,11 +283,18 @@ fn select_aggregate_inputs(
         // These aggregates only consume the first intermediate state argument during merge.
         "count_distinct"
         | "multi_distinct_count"
-        | "ds_theta_count_distinct"
-        | "approx_count_distinct_hll_sketch"
             if is_merge =>
         {
             return select_first_for_merge(args, "count_distinct");
+        }
+        "ds_theta_count_distinct"
+        | "ds_hll_count_distinct"
+        | "ds_hll_count_distinct_union"
+        | "ds_hll_count_distinct_merge"
+        | "approx_count_distinct_hll_sketch"
+            if is_merge =>
+        {
+            return select_first_for_merge(args, fn_name);
         }
         // Merge group_concat consumes intermediate state; FE may still carry separator in args.
         "group_concat" if is_merge => {
@@ -289,14 +308,18 @@ fn select_aggregate_inputs(
         "approx_top_k" if is_merge => {
             return select_first_for_merge(args, "approx_top_k");
         }
+        // Merge min_n/max_n consumes serialized intermediate state only.
+        "min_n" | "max_n" if is_merge => {
+            return select_first_for_merge(args, fn_name);
+        }
         // Merge dict_merge consumes intermediate state; FE may still carry threshold in args.
         "dict_merge" if is_merge => {
             return select_first_for_merge(args, "dict_merge");
         }
         // Merge percentile_approx consumes serialized intermediate state; FE may still carry
         // constant quantile/compression arguments in the merge-stage function call.
-        "percentile_approx" if is_merge => {
-            return select_first_for_merge(args, "percentile_approx");
+        "percentile_approx" | "percentile_approx_weighted" if is_merge => {
+            return select_first_for_merge(args, fn_name);
         }
         "mann_whitney_u_test" | "percentile_cont" | "percentile_disc" | "percentile_disc_lc"
             if is_merge =>

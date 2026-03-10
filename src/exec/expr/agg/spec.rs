@@ -47,6 +47,12 @@ fn is_compatible_signature_type(expected: &DataType, sig_type: &DataType) -> boo
         (DataType::Decimal256(_, _), DataType::Decimal256(_, _)) => true,
         (DataType::Timestamp(_, _), DataType::Timestamp(_, _)) => true,
         (DataType::Utf8, DataType::Binary) | (DataType::Binary, DataType::Utf8) => true,
+        (DataType::List(expected_field), DataType::List(sig_field)) => {
+            is_compatible_signature_type(expected_field.data_type(), sig_field.data_type())
+        }
+        (DataType::Map(expected_field, _), DataType::Map(sig_field, _)) => {
+            is_compatible_signature_type(expected_field.data_type(), sig_field.data_type())
+        }
         (DataType::List(_), DataType::Struct(sig_fields)) if sig_fields.len() == 1 => {
             is_compatible_signature_type(expected, sig_fields[0].data_type())
         }

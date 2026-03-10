@@ -1026,6 +1026,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "datasketches"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
+
+[[package]]
 name = "deranged"
 version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2456,6 +2462,7 @@ dependencies = [
  "crc32c",
  "csv",
  "ctrlc",
+ "datasketches",
  "futures",
  "hashbrown 0.14.5",
  "hex",
@@ -2483,6 +2490,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sm3",
+ "tdigest",
  "tempfile",
  "threadpool",
  "thrift",
@@ -2722,6 +2730,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
 dependencies = [
  "num-traits",
+ "serde",
 ]
 
 [[package]]
@@ -3987,6 +3996,16 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "tdigest"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c45d225a08ebccf0e0c7d46db4066ea8ab05b29d3750ecc1a04f1675978bf3c8"
+dependencies = [
+ "ordered-float",
+ "serde",
+]
 
 [[package]]
 name = "tempfile"

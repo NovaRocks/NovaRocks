@@ -75,6 +75,7 @@ pub(super) enum AggKind {
     },
     MultiDistinctSum,
     MapAgg,
+    SumMap,
     ArrayAgg {
         is_distinct: bool,
         is_asc_order: Vec<bool>,
@@ -90,11 +91,19 @@ pub(super) enum AggKind {
     BitmapUnionInt,
     PercentileUnion,
     PercentileApprox,
-    PercentilePlaceholder,
+    PercentileApproxWeighted,
+    PercentileCont,
+    PercentileDisc,
+    PercentileDiscLc,
     ApproxTopK,
     HllRawHash,
     HllRawMerge,
     HllUnionCount,
+    DsHllHash,
+    DsHllMerge,
+    DsHllCount,
+    MinN,
+    MaxN,
 }
 
 mod any_value;
@@ -109,6 +118,8 @@ mod count;
 mod count_distinct;
 mod count_if;
 mod dict_merge;
+mod ds_hll;
+mod ds_theta;
 mod group_concat;
 mod histogram;
 mod hll_raw;
@@ -121,9 +132,11 @@ mod multi_distinct_sum;
 mod percentile;
 mod percentile_placeholder;
 mod retention;
+mod sum_map;
 mod sum;
 mod variance;
 mod window_funnel;
+mod minmax_n;
 
 use any_value::AnyValueAgg;
 use approx_top_k::ApproxTopKAgg;
@@ -136,6 +149,8 @@ use count::CountAgg;
 use count_distinct::CountDistinctAgg;
 use count_if::CountIfAgg;
 use dict_merge::DictMergeAgg;
+use ds_hll::DsHllAgg;
+use ds_theta::DsThetaAgg;
 use group_concat::GroupConcatAgg;
 use histogram::HistogramAgg;
 use hll_raw::HllRawAgg;
@@ -145,9 +160,11 @@ use max::MaxAgg;
 use max_by::MaxMinByAgg;
 use min::MinAgg;
 use multi_distinct_sum::MultiDistinctSumAgg;
+use minmax_n::MinMaxNAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
+use sum_map::SumMapAgg;
 use sum::SumAgg;
 use variance::VarStdAgg;
 use window_funnel::WindowFunnelAgg;
@@ -218,24 +235,25 @@ static COVAR_CORR: CovarCorrAgg = CovarCorrAgg;
 static MAX_MIN_BY: MaxMinByAgg = MaxMinByAgg;
 static MULTI_DISTINCT_SUM: MultiDistinctSumAgg = MultiDistinctSumAgg;
 static MAP_AGG: MapAggAgg = MapAggAgg;
+static SUM_MAP: SumMapAgg = SumMapAgg;
 static RETENTION: RetentionAgg = RetentionAgg;
 static WINDOW_FUNNEL: WindowFunnelAgg = WindowFunnelAgg;
 static HISTOGRAM: HistogramAgg = HistogramAgg;
 static MANN_WHITNEY: MannWhitneyUTestAgg = MannWhitneyUTestAgg;
 static DICT_MERGE: DictMergeAgg = DictMergeAgg;
+static DS_HLL: DsHllAgg = DsHllAgg;
+static DS_THETA: DsThetaAgg = DsThetaAgg;
 static BITMAP_UNION_INT: BitmapUnionIntAgg = BitmapUnionIntAgg;
 static PERCENTILE: PercentileAgg = PercentileAgg;
 static PERCENTILE_PLACEHOLDER: PercentilePlaceholderAgg = PercentilePlaceholderAgg;
 static APPROX_TOP_K: ApproxTopKAgg = ApproxTopKAgg;
 static HLL_RAW: HllRawAgg = HllRawAgg;
+static MIN_MAX_N: MinMaxNAgg = MinMaxNAgg;
 
 fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction, String> {
     match canonical_agg_name(func.name.as_str()) {
         "count" => Ok(&COUNT),
-        "count_distinct"
-        | "multi_distinct_count"
-        | "ds_theta_count_distinct"
-        | "approx_count_distinct_hll_sketch" => Ok(&COUNT_DISTINCT),
+        "count_distinct" | "multi_distinct_count" => Ok(&COUNT_DISTINCT),
         "count_if" => Ok(&COUNT_IF),
         "group_concat" | "string_agg" => Ok(&GROUP_CONCAT),
         "sum" => Ok(&SUM),
@@ -246,13 +264,16 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "variance" | "variance_pop" | "var_pop" | "variance_samp" | "var_samp" | "stddev"
         | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
         "any_value" => Ok(&ANY_VALUE),
-        "percentile_union" | "percentile_approx" => Ok(&PERCENTILE),
-        "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => Ok(&PERCENTILE_PLACEHOLDER),
+        "percentile_union" | "percentile_approx" | "percentile_approx_weighted" => Ok(&PERCENTILE),
+        "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => {
+            Ok(&PERCENTILE_PLACEHOLDER)
+        }
         "bool_or" | "boolor_agg" => Ok(&BOOL_OR),
         "covar_pop" | "covar_samp" | "corr" => Ok(&COVAR_CORR),
         "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
         "multi_distinct_sum" => Ok(&MULTI_DISTINCT_SUM),
         "map_agg" => Ok(&MAP_AGG),
+        "sum_map" => Ok(&SUM_MAP),
         "retention" => Ok(&RETENTION),
         "window_funnel" => Ok(&WINDOW_FUNNEL),
         "histogram" => Ok(&HISTOGRAM),
@@ -261,15 +282,18 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "bitmap_agg" | "bitmap_union" | "bitmap_union_count" => Ok(&BITMAP_UNION_INT),
         "bitmap_union_int" => Ok(&BITMAP_UNION_INT),
         "approx_top_k" => Ok(&APPROX_TOP_K),
+        "min_n" | "max_n" => Ok(&MIN_MAX_N),
+        "ds_theta_count_distinct" => Ok(&DS_THETA),
+        "ds_hll_count_distinct"
+        | "ds_hll_count_distinct_union"
+        | "ds_hll_count_distinct_merge"
+        | "approx_count_distinct_hll_sketch" => Ok(&DS_HLL),
         "hll_union"
         | "hll_raw_agg"
         | "hll_raw"
         | "hll_union_agg"
         | "ndv"
-        | "approx_count_distinct"
-        | "ds_hll_count_distinct"
-        | "ds_hll_count_distinct_union"
-        | "ds_hll_count_distinct_merge" => Ok(&HLL_RAW),
+        | "approx_count_distinct" => Ok(&HLL_RAW),
         other => Err(format!("unsupported agg function: {}", other)),
     }
 }
@@ -316,17 +340,24 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::MaxBy | AggKind::MinBy | AggKind::MaxByV2 | AggKind::MinByV2 => &MAX_MIN_BY,
         AggKind::MultiDistinctSum => &MULTI_DISTINCT_SUM,
         AggKind::MapAgg => &MAP_AGG,
+        AggKind::SumMap => &SUM_MAP,
         AggKind::Retention => &RETENTION,
         AggKind::WindowFunnel => &WINDOW_FUNNEL,
         AggKind::Histogram => &HISTOGRAM,
         AggKind::MannWhitneyUTest => &MANN_WHITNEY,
         AggKind::DictMerge => &DICT_MERGE,
+        AggKind::DsHllHash | AggKind::DsHllMerge | AggKind::DsHllCount => &DS_HLL,
         AggKind::BitmapAgg => &BITMAP_UNION_INT,
         AggKind::BitmapUnionInt => &BITMAP_UNION_INT,
-        AggKind::PercentileUnion | AggKind::PercentileApprox => &PERCENTILE,
-        AggKind::PercentilePlaceholder => &PERCENTILE_PLACEHOLDER,
+        AggKind::PercentileUnion | AggKind::PercentileApprox | AggKind::PercentileApproxWeighted => {
+            &PERCENTILE
+        }
+        AggKind::PercentileCont
+        | AggKind::PercentileDisc
+        | AggKind::PercentileDiscLc => &PERCENTILE_PLACEHOLDER,
         AggKind::ApproxTopK => &APPROX_TOP_K,
         AggKind::HllRawHash | AggKind::HllRawMerge | AggKind::HllUnionCount => &HLL_RAW,
+        AggKind::MinN | AggKind::MaxN => &MIN_MAX_N,
     }
 }
 

@@ -993,6 +993,11 @@ fn materialize_non_primary_full_schema_batch(
             schema_col_count
         ));
     }
+    if batch.num_columns() == schema_col_count {
+        // StarRocks treats full-schema duplicate-key writes as positional writes.
+        // The sink side has already aligned full target columns in schema order.
+        return Ok(batch.clone());
+    }
 
     let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch)?;
     let mut projected_batch_indexes = Vec::with_capacity(schema_col_count);
@@ -3735,6 +3740,147 @@ mod tests {
         .expect("build rollup source batch without value column")
     }
 
+    fn test_duplicate_key_full_schema_tablet_schema(schema_id: i64) -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("c0".to_string()),
+                    r#type: "VARCHAR".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("c1".to_string()),
+                    r#type: "VARCHAR".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 3,
+                    name: Some("c2".to_string()),
+                    r#type: "INT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 4,
+                    name: Some("c3".to_string()),
+                    r#type: "INT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(5),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(schema_id),
+        }
+    }
+
+    fn test_duplicate_key_full_schema_context(
+        root: &str,
+        table_id: i64,
+        tablet_id: i64,
+        schema_id: i64,
+    ) -> TabletWriteContext {
+        TabletWriteContext {
+            db_id: 6001,
+            table_id,
+            tablet_id,
+            tablet_root_path: root.to_string(),
+            tablet_schema: test_duplicate_key_full_schema_tablet_schema(schema_id),
+            s3_config: None,
+            partial_update: Default::default(),
+        }
+    }
+
+    fn duplicate_key_full_schema_repeated_expr_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("generate_series", DataType::Utf8, true),
+            Field::new("generate_series", DataType::Utf8, false),
+            Field::new("generate_series", DataType::Int32, true),
+            Field::new("generate_series", DataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("1"), Some("2")])),
+                Arc::new(StringArray::from(vec!["1", "2"])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(Int32Array::from(vec![1, 2])),
+            ],
+        )
+        .expect("build duplicate-key full-schema batch with repeated expression names")
+    }
+
     fn pk_key_only_batch(keys: Vec<i32>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Int32, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(keys))])
@@ -4107,6 +4253,42 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn non_primary_full_schema_write_keeps_positional_columns() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let ctx = test_duplicate_key_full_schema_context(&root, 7022, 88113, 4022);
+        let batch = duplicate_key_full_schema_repeated_expr_batch();
+
+        let routing = super::resolve_lake_batch_write_routing(&ctx, &batch, None)
+            .expect("resolve non-primary full-schema routing");
+        let super::LakeBatchWriteRouting::Upsert { data_batch } = routing else {
+            panic!("expected upsert routing for non-primary full-schema write");
+        };
+        assert_eq!(data_batch.num_columns(), 4);
+        assert_eq!(
+            data_batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "generate_series",
+                "generate_series",
+                "generate_series",
+                "generate_series",
+            ]
+        );
+        let c3 = data_batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("downcast c3 column");
+        assert_eq!(c3.value(0), 1);
+        assert_eq!(c3.value(1), 2);
     }
 
     #[test]

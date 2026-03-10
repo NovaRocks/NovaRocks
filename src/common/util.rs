@@ -49,6 +49,12 @@ fn format_date32_for_mysql(days: i32) -> String {
     }
 }
 
+fn is_opaque_binary_primitive(primitive: types::TPrimitiveType) -> bool {
+    primitive == types::TPrimitiveType::HLL
+        || primitive == types::TPrimitiveType::OBJECT
+        || primitive == types::TPrimitiveType::PERCENTILE
+}
+
 pub(crate) fn mysql_text_row_from_arrays(
     columns: &[ArrayRef],
     row: usize,
@@ -212,6 +218,10 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
                 append_lenenc_string(&mut out, value.as_bytes());
             }
             DataType::Binary => {
+                if is_opaque_binary_primitive(primitive) {
+                    out.push(0xFB);
+                    continue;
+                }
                 let arr = col
                     .as_any()
                     .downcast_ref::<BinaryArray>()
@@ -459,6 +469,10 @@ fn append_http_json_value(
             append_http_json_quoted(out, &format_decimal256(arr.value(row), *scale))?;
         }
         DataType::Binary => {
+            if is_opaque_binary_primitive(primitive) {
+                out.push_str("null");
+                return Ok(());
+            }
             let arr = col
                 .as_any()
                 .downcast_ref::<BinaryArray>()
