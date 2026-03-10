@@ -65,6 +65,8 @@ num_cpus = "1"
 crc32c = "0.6"
 lz4_flex = "0.11"
 roaring = "0.10"
+datasketches = "0.2.0"
+tdigest = { version = "0.2.3", features = ["use_serde"] }
 
 [dev-dependencies]
 tempfile = "3"

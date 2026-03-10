@@ -226,10 +226,10 @@ mod tests {
         let out = out.as_any().downcast_ref::<BinaryArray>().expect("binary");
 
         let decoded = percentile::decode_state(out.value(0)).expect("decode");
-        assert_eq!(decoded.values, vec![7.0]);
-        assert_eq!(
-            percentile::decode_state(out.value(1)).expect("decode empty"),
-            percentile::PercentileState::default()
-        );
+        assert_eq!(decoded.digest.count(), 1.0);
+        assert_eq!(percentile::quantile_value(&decoded, 0.5), Some(7.0));
+        let empty = percentile::decode_state(out.value(1)).expect("decode empty");
+        assert_eq!(empty.digest.count(), 0.0);
+        assert!(empty.quantiles.is_none());
     }
 }

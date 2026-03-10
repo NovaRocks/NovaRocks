@@ -1057,8 +1057,15 @@ impl AggregateFunction for ArrayAggAgg {
             first_item_type_from_update_input(input_type)?
         };
 
-        let output_list_type =
-            DataType::List(Arc::new(Field::new("item", item_type.clone(), true)));
+        let output_list_type = func
+            .types
+            .as_ref()
+            .and_then(|t| t.output_type.as_ref())
+            .and_then(|t| match t {
+                DataType::List(field) if field.data_type() == &item_type => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| DataType::List(Arc::new(Field::new("item", item_type.clone(), true))));
         let intermediate_type = if input_is_intermediate {
             input_type.clone()
         } else {

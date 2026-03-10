@@ -88,7 +88,9 @@ pub fn eval_object_function(
         "hll_cardinality" => super::hll_codec::eval_hll_cardinality(arena, expr, args, chunk),
         "to_bitmap" => super::to_bitmap::eval_to_bitmap(arena, expr, args, chunk),
         "hll_hash" => super::hll_hash::eval_hll_hash(arena, expr, args, chunk),
-        "ds_hll_count_distinct_state" => super::hll_hash::eval_hll_hash(arena, expr, args, chunk),
+        "ds_hll_count_distinct_state" => {
+            super::ds_hll_functions::eval_ds_hll_count_distinct_state(arena, expr, args, chunk)
+        }
         "percentile_hash" => {
             super::percentile_functions::eval_percentile_hash(arena, expr, args, chunk)
         }

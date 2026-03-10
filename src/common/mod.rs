@@ -16,12 +16,14 @@
 // under the License.
 pub mod app_config;
 pub mod config;
+pub mod datasketches;
 pub mod file_identity;
 pub mod ids;
 pub mod largeint;
 pub mod logging;
 pub mod min_max_predicate;
 pub mod percentile;
+pub mod sketch_hash;
 pub mod thrift;
 pub mod types;
 pub mod util;
