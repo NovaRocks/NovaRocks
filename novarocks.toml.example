@@ -13,6 +13,10 @@ log_level = "info"
 [server]
 # Service bind host. Default: "0.0.0.0".
 host = "0.0.0.0"
+# Optional StarRocks-style advertise IP selector in CIDR form.
+# Use semicolon-separated entries when the machine has multiple NICs/IPs.
+# Example: "10.10.10.0/24;192.168.0.0/16"
+# priority_networks = "10.10.10.0/24;192.168.0.0/16"
 # FE heartbeat Thrift port. Default: 9050.
 heartbeat_port = 9050
 # StarRocks BE Thrift port. Default: 9060.

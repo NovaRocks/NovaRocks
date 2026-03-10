@@ -186,6 +186,10 @@ fn main() {
         project_thirdparty.join("lib"),
         project_thirdparty.join("lib64"),
     );
+    // Check target platform for platform-specific configurations.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_macos = target.contains("apple") || target.contains("darwin");
+    let is_linux = target.contains("linux");
 
     std::fs::create_dir_all(&thrift_out).expect("create thrift out dir");
     std::fs::create_dir_all(&proto_out).expect("create proto out dir");
@@ -317,11 +321,6 @@ fn main() {
         .include(&thrift_out)
         .include(&proto_out);
 
-    // Check target platform for platform-specific configurations
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let is_macos = target.contains("apple") || target.contains("darwin");
-    let is_linux = target.contains("linux");
-
     // On Linux, never let cc crate emit C++ stdlib link directives.
     // We manage runtime linkage explicitly to align with StarRocks BE behavior.
     if is_linux {
@@ -344,11 +343,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", tp_lib.display());
     if tp_lib64.exists() {
         println!("cargo:rustc-link-search=native={}", tp_lib64.display());
-    }
-
-    // macOS-specific library search paths (for other libraries like gperftools)
-    if is_macos {
-        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
     }
 
     if is_linux {
@@ -405,10 +399,14 @@ static C++ runtime is required.",
 
     // macOS-specific libraries and paths
     if is_macos {
-        // Optional: gperftools for profiling (brpc may reference but not require)
-        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
-        println!("cargo:rustc-link-lib=static=profiler"); // Optional profiling support
-        println!("cargo:rustc-link-lib=static=tcmalloc"); // Required for MallocExtension symbols
+        // Align with brpc's Darwin linkage: profiler/tcmalloc are optional.
+        // We do not enable CPU profiler support in NovaRocks, so these symbols
+        // are allowed to remain unresolved and built-in profiling endpoints
+        // will report "not enabled" at runtime.
+        println!("cargo:rustc-link-arg=-Wl,-U,_MallocExtension_ReleaseFreeMemory");
+        println!("cargo:rustc-link-arg=-Wl,-U,_ProfilerStart");
+        println!("cargo:rustc-link-arg=-Wl,-U,_ProfilerStop");
+        println!("cargo:rustc-link-arg=-Wl,-U,__Z13GetStackTracePPvii");
         println!("cargo:rustc-link-lib=objc");
         println!("cargo:rustc-link-lib=framework=Foundation");
     }

@@ -36,6 +36,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct HeartbeatConfig {
     pub host: String,
+    pub advertise_host: String,
     pub heartbeat_port: u16,
     pub be_port: u16,
     pub brpc_port: u16,
@@ -79,9 +80,9 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
         let mut backend_host = master_info
             .backend_ip
             .clone()
-            .unwrap_or_else(|| self.config.host.clone());
-        if backend_host.trim().is_empty() || backend_host == "0.0.0.0" {
-            backend_host = "127.0.0.1".to_string();
+            .unwrap_or_else(|| self.config.advertise_host.clone());
+        if backend_host.trim().is_empty() {
+            backend_host = self.config.advertise_host.clone();
         }
         disk_report::maybe_report_disks(
             &master_info.network_address,
@@ -134,8 +135,9 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
     let addr_for_log = addr.clone();
 
     tracing::info!(
-        "Starting heartbeat service on {} (brpc_port={}, starlet_port={})",
+        "Starting heartbeat service on {} (advertise_host={}, brpc_port={}, starlet_port={})",
         addr,
+        config.advertise_host,
         config.brpc_port,
         config.starlet_port
     );

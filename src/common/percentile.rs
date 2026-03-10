@@ -334,8 +334,12 @@ impl TDigest {
         }
 
         self.unprocessed.clear();
-        self.min = self.min.min(self.processed.first().map(|c| c.mean).unwrap_or(self.min));
-        self.max = self.max.max(self.processed.last().map(|c| c.mean).unwrap_or(self.max));
+        self.min = self
+            .min
+            .min(self.processed.first().map(|c| c.mean).unwrap_or(self.min));
+        self.max = self
+            .max
+            .max(self.processed.last().map(|c| c.mean).unwrap_or(self.max));
         self.update_cumulative();
     }
 
@@ -358,7 +362,12 @@ impl TDigest {
             if i > 0 && i < self.cumulative.len() - 1 {
                 let z1 = index - self.cumulative[i - 1];
                 let z2 = self.cumulative[i] - index;
-                return Some(Self::weighted_average(self.mean(i - 1), z2, self.mean(i), z1));
+                return Some(Self::weighted_average(
+                    self.mean(i - 1),
+                    z2,
+                    self.mean(i),
+                    z1,
+                ));
             }
         }
 
@@ -388,7 +397,8 @@ impl TDigest {
     }
 
     fn integrated_location(&self, q: f32) -> f32 {
-        self.compression * (((2.0 * q - 1.0).asin() + std::f32::consts::FRAC_PI_2) / std::f32::consts::PI)
+        self.compression
+            * (((2.0 * q - 1.0).asin() + std::f32::consts::FRAC_PI_2) / std::f32::consts::PI)
     }
 
     fn integrated_q(&self, k: f32) -> f32 {
@@ -730,8 +740,7 @@ fn decode_state_v4(payload: &[u8]) -> Result<PercentileState, String> {
         _ => {
             return Err(format!(
                 "invalid percentile state quantile metadata: kind={} count={}",
-                quantile_kind,
-                quantile_count
+                quantile_kind, quantile_count
             ));
         }
     };

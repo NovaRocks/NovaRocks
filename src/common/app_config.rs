@@ -157,6 +157,8 @@ impl Default for NovaRocksConfig {
 pub struct ServerConfig {
     #[serde(default = "default_server_host")]
     pub host: String,
+    #[serde(default)]
+    pub priority_networks: String,
     #[serde(default = "default_heartbeat_port")]
     pub heartbeat_port: u16,
     #[serde(default = "default_be_port")]
@@ -192,6 +194,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             host: default_server_host(),
+            priority_networks: String::new(),
             heartbeat_port: default_heartbeat_port(),
             be_port: default_be_port(),
             brpc_port: default_brpc_port(),
@@ -771,6 +774,31 @@ impl std::fmt::Debug for JdbcConfig {
 #[cfg(test)]
 mod tests {
     use super::{NovaRocksConfig, RuntimeConfig};
+
+    #[test]
+    fn test_server_priority_networks_default_is_empty() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+http_port = 8040
+"#,
+        )
+        .expect("parse config");
+        assert!(cfg.server.priority_networks.is_empty());
+    }
+
+    #[test]
+    fn test_server_priority_networks_can_be_overridden() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+http_port = 8040
+priority_networks = "10.10.10.0/24;192.168.0.0/16"
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.server.priority_networks, "10.10.10.0/24;192.168.0.0/16");
+    }
 
     #[test]
     fn test_server_starlet_port_default_is_9070() {
