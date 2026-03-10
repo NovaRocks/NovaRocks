@@ -22,6 +22,7 @@ use crate::common::ids::SlotId;
 use crate::descriptors;
 use crate::exec::chunk::field_with_slot_id;
 use crate::exprs;
+use crate::lower::type_lowering::field_with_desc_metadata;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::planner;
 use crate::types;
@@ -43,8 +44,7 @@ pub(crate) fn schema_for_layout(
         .as_ref()
         .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
 
-    let mut info: HashMap<(types::TTupleId, types::TSlotId), (String, DataType, bool)> =
-        HashMap::new();
+    let mut info: HashMap<(types::TTupleId, types::TSlotId), Field> = HashMap::new();
     for s in slot_descs {
         let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
         else {
@@ -57,21 +57,21 @@ pub(crate) fn schema_for_layout(
             .clone()
             .unwrap_or_else(|| format!("col_{parent}_{id}"));
         let nullable = s.is_nullable.unwrap_or(true);
-        info.insert((parent, id), (name, dt, nullable));
+        info.insert(
+            (parent, id),
+            field_with_desc_metadata(Field::new(name, dt, nullable), slot_type),
+        );
     }
 
     let mut fields = Vec::with_capacity(layout.order.len());
     for (idx, (tuple_id, slot_id)) in layout.order.iter().enumerate() {
-        let (name, dt, nullable) = info.get(&(*tuple_id, *slot_id)).ok_or_else(|| {
+        let field = info.get(&(*tuple_id, *slot_id)).ok_or_else(|| {
             format!(
                 "missing slot descriptor for layout column {idx}: tuple_id={tuple_id} slot_id={slot_id}"
             )
         })?;
         let slot_id = SlotId::try_from(*slot_id)?;
-        fields.push(field_with_slot_id(
-            Field::new(name, dt.clone(), *nullable),
-            slot_id,
-        ));
+        fields.push(field_with_slot_id(field.clone(), slot_id));
     }
 
     Ok(SchemaRef::new(Schema::new(fields)))
@@ -104,7 +104,7 @@ pub(crate) fn schema_for_tuple(
             .unwrap_or_else(|| format!("col_{parent}_{id}"));
         let nullable = s.is_nullable.unwrap_or(true);
 
-        let mut field = Field::new(name, dt, nullable);
+        let mut field = field_with_desc_metadata(Field::new(name, dt, nullable), slot_type);
         if let Some(unique_id) = s.col_unique_id.filter(|v| *v > 0) {
             let mut meta = field.metadata().clone();
             meta.insert(

@@ -40,6 +40,7 @@ use crate::exec::chunk::{Chunk, field_with_slot_id};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
+use crate::lower::type_lowering::field_with_desc_metadata;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
@@ -439,7 +440,10 @@ fn schema_for_slots(
         let dt = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
             .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
         let nullable = s.is_nullable.unwrap_or(true);
-        let field = field_with_slot_id(Field::new(name, dt, nullable), SlotId::try_from(id)?);
+        let field = field_with_slot_id(
+            field_with_desc_metadata(Field::new(name, dt, nullable), slot_type),
+            SlotId::try_from(id)?,
+        );
         map.insert(SlotId::try_from(id)?, (field, nullable));
     }
     let mut fields = Vec::with_capacity(slots.len());

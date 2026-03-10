@@ -41,6 +41,17 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
+fn projected_field_from_existing(
+    existing: &Field,
+    data_type: &arrow::datatypes::DataType,
+) -> Field {
+    let mut field = Field::new(existing.name(), data_type.clone(), existing.is_nullable());
+    if !existing.metadata().is_empty() {
+        field = field.with_metadata(existing.metadata().clone());
+    }
+    field
+}
+
 /// Factory for projection processors that evaluate expression lists into projected chunks.
 pub struct ProjectProcessorFactory {
     name: String,
@@ -218,10 +229,9 @@ impl ProjectProcessorOperator {
                 let mut fields = working_schema.fields().to_vec();
                 let old_field = working_schema.field(existing_idx);
                 let replaced = field_with_slot_id(
-                    Field::new(
-                        old_field.name(),
-                        computed_columns.last().unwrap().data_type().clone(),
-                        true,
+                    projected_field_from_existing(
+                        old_field,
+                        computed_columns.last().unwrap().data_type(),
                     ),
                     *slot_id,
                 );
@@ -242,11 +252,26 @@ impl ProjectProcessorOperator {
 
             // Create new schema with appended field
             let mut fields = working_chunk.batch.schema().fields().to_vec();
-            let field = Field::new(
-                format!("_cse_{}", computed_columns.len() - 1),
-                computed_columns.last().unwrap().data_type().clone(),
-                true,
-            );
+            let field = if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
+                if let Some(source_idx) = working_chunk.slot_id_to_index().get(source_slot) {
+                    projected_field_from_existing(
+                        working_chunk.batch.schema().field(*source_idx),
+                        computed_columns.last().unwrap().data_type(),
+                    )
+                } else {
+                    Field::new(
+                        format!("_cse_{}", computed_columns.len() - 1),
+                        computed_columns.last().unwrap().data_type().clone(),
+                        true,
+                    )
+                }
+            } else {
+                Field::new(
+                    format!("_cse_{}", computed_columns.len() - 1),
+                    computed_columns.last().unwrap().data_type().clone(),
+                    true,
+                )
+            };
             fields.push(Arc::new(field_with_slot_id(field, *slot_id)));
             let new_schema = Arc::new(Schema::new(fields));
 
@@ -284,12 +309,24 @@ impl ProjectProcessorOperator {
         }
 
         let mut fields: Vec<Arc<Field>> = Vec::with_capacity(final_columns.len());
+        let working_schema = working_chunk.batch.schema();
         for (idx, (array, slot_id)) in final_columns
             .iter()
             .zip(self.output_slots.iter())
             .enumerate()
         {
-            let base = Field::new(format!("col_{}", idx), array.data_type().clone(), true);
+            let base = working_chunk
+                .slot_id_to_index()
+                .get(slot_id)
+                .map(|field_idx| {
+                    projected_field_from_existing(
+                        working_schema.field(*field_idx),
+                        array.data_type(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    Field::new(format!("col_{}", idx), array.data_type().clone(), true)
+                });
             fields.push(Arc::new(field_with_slot_id(base, *slot_id)));
         }
         let schema = Arc::new(Schema::new(fields));

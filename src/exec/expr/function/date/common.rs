@@ -65,12 +65,122 @@ pub fn parse_date(s: &str) -> Option<NaiveDate> {
         .ok()
 }
 
+fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
+    let text = raw.trim();
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+
+    let mut pos = 0usize;
+    while pos < bytes.len() && (bytes[pos].is_ascii_digit() || bytes[pos] == b'T') {
+        pos += 1;
+    }
+    let compact_digits = bytes[..pos].iter().filter(|b| b.is_ascii_digit()).count();
+    let is_compact = pos == bytes.len() || bytes.get(pos) == Some(&b'.');
+    let mut field_len = if is_compact {
+        if compact_digits == 4 || compact_digits == 8 || compact_digits >= 14 {
+            4usize
+        } else {
+            2usize
+        }
+    } else {
+        4usize
+    };
+
+    let mut values = [0u32; 7];
+    let mut lengths = [0usize; 7];
+    let mut field_idx = 0usize;
+    let mut ptr = 0usize;
+    while ptr < bytes.len() && bytes[ptr].is_ascii_digit() && field_idx < 7 {
+        let start = ptr;
+        let mut value = 0u32;
+        let scan_to_delim = !is_compact && field_idx != 6;
+        while ptr < bytes.len() && bytes[ptr].is_ascii_digit() && (scan_to_delim || field_len > 0) {
+            value = value
+                .checked_mul(10)?
+                .checked_add((bytes[ptr] - b'0') as u32)?;
+            ptr += 1;
+            if !scan_to_delim {
+                field_len -= 1;
+            }
+        }
+        values[field_idx] = value;
+        lengths[field_idx] = ptr - start;
+        field_len = 2;
+
+        if ptr == bytes.len() {
+            field_idx += 1;
+            break;
+        }
+        if field_idx == 2 && bytes[ptr] == b'T' {
+            ptr += 1;
+            field_idx += 1;
+            continue;
+        }
+        if field_idx == 5 {
+            if bytes[ptr] == b'.' {
+                ptr += 1;
+                field_len = 6;
+            } else if bytes[ptr].is_ascii_digit() {
+                field_idx += 1;
+                break;
+            }
+            field_idx += 1;
+            continue;
+        }
+        while ptr < bytes.len()
+            && (bytes[ptr].is_ascii_punctuation() || bytes[ptr].is_ascii_whitespace())
+        {
+            ptr += 1;
+        }
+        field_idx += 1;
+    }
+
+    let parsed_fields = field_idx;
+    if parsed_fields < 3 {
+        return None;
+    }
+
+    let mut year = values[0] as i32;
+    let month = values[1];
+    let day = values[2];
+    let hour = values[3];
+    let minute = values[4];
+    let second = values[5];
+    let mut microsecond = values[6];
+
+    if lengths[6] > 0 && lengths[6] < 6 {
+        microsecond = microsecond.checked_mul(10u32.pow((6 - lengths[6]) as u32))?;
+    }
+
+    if !is_compact && lengths[0] == 2 {
+        year = if year < 70 { year + 2000 } else { year + 1900 };
+    } else if is_compact && lengths[0] == 2 {
+        year = if year < 70 { year + 2000 } else { year + 1900 };
+    }
+
+    if !(1..=12).contains(&month)
+        || day == 0
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || microsecond >= 1_000_000
+    {
+        return None;
+    }
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    date.and_hms_micro_opt(hour, minute, second, microsecond)
+}
+
 pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()
+        .or_else(|| parse_datetime_flexible(s))
 }
 
 pub fn parse_time(s: &str) -> Option<NaiveTime> {
@@ -548,4 +658,35 @@ pub fn convert_tz_fixed(
     let dt_from = from.from_local_datetime(&dt).unwrap();
     let utc = dt_from.with_timezone(&Utc);
     utc.with_timezone(&to).naive_local()
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDate;
+
+    use super::parse_datetime;
+
+    #[test]
+    fn parse_datetime_accepts_lenient_second_field_width() {
+        let dt = parse_datetime("2023-08-17 08:00:006").expect("parse datetime");
+        assert_eq!(
+            dt,
+            NaiveDate::from_ymd_opt(2023, 8, 17)
+                .unwrap()
+                .and_hms_opt(8, 0, 6)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_datetime_accepts_compact_timestamp() {
+        let dt = parse_datetime("20230817T080006").expect("parse compact datetime");
+        assert_eq!(
+            dt,
+            NaiveDate::from_ymd_opt(2023, 8, 17)
+                .unwrap()
+                .and_hms_opt(8, 0, 6)
+                .unwrap()
+        );
+    }
 }

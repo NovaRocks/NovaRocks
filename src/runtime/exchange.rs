@@ -20,11 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 
 use crate::common::types::format_uuid;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, field_slot_id};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::MemTracker;
@@ -679,6 +681,42 @@ pub fn snapshot_receiver_state(key: ExchangeKey) -> Option<ExchangeReceiverSnaps
     })
 }
 
+fn exchange_schema_compatible(expected: &SchemaRef, actual: &SchemaRef) -> Result<bool, String> {
+    if expected.fields().len() != actual.fields().len() {
+        return Ok(false);
+    }
+
+    for (idx, (expected_field, actual_field)) in expected
+        .fields()
+        .iter()
+        .zip(actual.fields().iter())
+        .enumerate()
+    {
+        let expected_slot = field_slot_id(expected_field.as_ref())?.ok_or_else(|| {
+            format!(
+                "exchange expected schema field missing slot id at index {} (name={})",
+                idx,
+                expected_field.name()
+            )
+        })?;
+        let actual_slot = field_slot_id(actual_field.as_ref())?.ok_or_else(|| {
+            format!(
+                "exchange actual schema field missing slot id at index {} (name={})",
+                idx,
+                actual_field.name()
+            )
+        })?;
+        if expected_slot != actual_slot
+            || expected_field.data_type() != actual_field.data_type()
+            || expected_field.is_nullable() != actual_field.is_nullable()
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
 /// Encode chunks to Arrow IPC stream format
 pub fn encode_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     if chunks.is_empty() {
@@ -689,8 +727,14 @@ pub fn encode_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
 
     // Use the schema from the first chunk.
     let schema = chunks[0].schema();
+    let mut batches = Vec::with_capacity(chunks.len());
+    batches.push(chunks[0].batch.clone());
     for (i, c) in chunks.iter().enumerate().skip(1) {
-        if c.schema().as_ref() != schema.as_ref() {
+        if c.schema().as_ref() == schema.as_ref() {
+            batches.push(c.batch.clone());
+            continue;
+        }
+        if !exchange_schema_compatible(&schema, &c.schema())? {
             return Err(format!(
                 "exchange encode schema mismatch at chunk index {}: expected={:?} actual={:?}",
                 i,
@@ -698,13 +742,21 @@ pub fn encode_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
                 c.schema()
             ));
         }
+        let normalized = RecordBatch::try_new(Arc::clone(&schema), c.batch.columns().to_vec())
+            .map_err(|e| {
+                format!(
+                    "failed to normalize exchange chunk schema at index {}: {e}",
+                    i
+                )
+            })?;
+        batches.push(normalized);
     }
     let mut writer = StreamWriter::try_new(&mut buffer, &schema)
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
-    for chunk in chunks {
+    for batch in batches {
         writer
-            .write(&chunk.batch)
+            .write(&batch)
             .map_err(|e| format!("failed to write batch: {e}"))?;
     }
 
@@ -745,4 +797,67 @@ pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
     }
 
     Ok(chunks)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    use super::{decode_chunks, encode_chunks};
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, field_with_slot_id};
+
+    fn exchange_test_chunk(last_name: &str) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            field_with_slot_id(Field::new("v1", DataType::Int32, true), SlotId::new(33)),
+            field_with_slot_id(Field::new("v2", DataType::Int32, true), SlotId::new(34)),
+            field_with_slot_id(Field::new("k1", DataType::Int32, true), SlotId::new(31)),
+            field_with_slot_id(Field::new(last_name, DataType::Utf8, true), SlotId::new(32)),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(Int32Array::from(vec![Some(2)])),
+            Arc::new(Int32Array::from(vec![Some(3)])),
+            Arc::new(StringArray::from(vec![Some("x")])),
+        ];
+        let batch = RecordBatch::try_new(schema, columns).expect("record batch");
+        Chunk::try_new(batch).expect("chunk")
+    }
+
+    #[test]
+    fn encode_chunks_normalizes_field_name_only_schema_differences() {
+        let chunks = vec![exchange_test_chunk("_cse_0"), exchange_test_chunk("_cse_2")];
+        let bytes = encode_chunks(&chunks).expect("encode");
+        let decoded = decode_chunks(&bytes).expect("decode");
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].schema(), decoded[1].schema());
+        assert_eq!(decoded[0].schema().field(3).name(), "_cse_0");
+    }
+
+    #[test]
+    fn encode_chunks_rejects_slot_id_mismatch() {
+        let first = exchange_test_chunk("_cse_0");
+        let schema = Arc::new(Schema::new(vec![
+            field_with_slot_id(Field::new("v1", DataType::Int32, true), SlotId::new(33)),
+            field_with_slot_id(Field::new("v2", DataType::Int32, true), SlotId::new(34)),
+            field_with_slot_id(Field::new("k1", DataType::Int32, true), SlotId::new(31)),
+            field_with_slot_id(Field::new("_cse_2", DataType::Utf8, true), SlotId::new(99)),
+        ]));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(Int32Array::from(vec![Some(2)])),
+            Arc::new(Int32Array::from(vec![Some(3)])),
+            Arc::new(StringArray::from(vec![Some("x")])),
+        ];
+        let second = Chunk::try_new(RecordBatch::try_new(schema, columns).expect("record batch"))
+            .expect("chunk");
+
+        let err = encode_chunks(&[first, second]).expect_err("should reject mismatched slot id");
+        assert!(err.contains("exchange encode schema mismatch"));
+    }
 }

@@ -42,8 +42,8 @@ use crate::connector::starrocks::lake::delete_payload_codec::{
 use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
 use crate::exec::chunk::field_slot_id;
 use crate::formats::starrocks::metadata::{
-    StarRocksSegmentFile, StarRocksTabletSnapshot, load_bundle_segment_footers,
-    load_tablet_snapshot,
+    StarRocksDeletePredicateRaw, StarRocksSegmentFile, StarRocksTabletSnapshot,
+    load_bundle_segment_footers, load_tablet_snapshot,
 };
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
@@ -1737,7 +1737,34 @@ pub(crate) fn load_rowset_batch_for_partial_update(
     if rowset.segments.is_empty() || rowset.num_rows.unwrap_or(0) <= 0 {
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
-    let snapshot = build_rowset_snapshot_for_partial_update(ctx, rowset)?;
+    let snapshot = build_rowset_snapshot_for_partial_update(ctx, rowset, 0, &[])?;
+    load_rowset_batch_from_partial_update_snapshot(ctx, snapshot, output_schema)
+}
+
+pub(crate) fn load_rowset_batch_for_partial_update_with_delete_predicates(
+    ctx: &TabletWriteContext,
+    rowset: &RowsetMetadataPb,
+    rowset_visibility_version: i64,
+    delete_predicates: &[StarRocksDeletePredicateRaw],
+    output_schema: &SchemaRef,
+) -> Result<RecordBatch, String> {
+    if rowset.segments.is_empty() || rowset.num_rows.unwrap_or(0) <= 0 {
+        return Ok(RecordBatch::new_empty(output_schema.clone()));
+    }
+    let snapshot = build_rowset_snapshot_for_partial_update(
+        ctx,
+        rowset,
+        rowset_visibility_version,
+        delete_predicates,
+    )?;
+    load_rowset_batch_from_partial_update_snapshot(ctx, snapshot, output_schema)
+}
+
+fn load_rowset_batch_from_partial_update_snapshot(
+    ctx: &TabletWriteContext,
+    snapshot: StarRocksTabletSnapshot,
+    output_schema: &SchemaRef,
+) -> Result<RecordBatch, String> {
     let object_store_profile = build_metadata_object_store_profile_for_partial(
         &ctx.tablet_root_path,
         ctx.s3_config.as_ref(),
@@ -1764,6 +1791,8 @@ pub(crate) fn load_rowset_batch_for_partial_update(
 fn build_rowset_snapshot_for_partial_update(
     ctx: &TabletWriteContext,
     rowset: &RowsetMetadataPb,
+    rowset_visibility_version: i64,
+    delete_predicates: &[StarRocksDeletePredicateRaw],
 ) -> Result<StarRocksTabletSnapshot, String> {
     let rowset_id = rowset.id.unwrap_or(1);
     let schema_id = ctx.tablet_schema.id.filter(|id| *id > 0);
@@ -1788,7 +1817,7 @@ fn build_rowset_snapshot_for_partial_update(
             name: segment_name.clone(),
             relative_path,
             path,
-            rowset_version: rowset.version.unwrap_or(0),
+            rowset_version: rowset_visibility_version,
             schema_id,
             segment_id: Some(segment_id),
             bundle_file_offset: rowset.bundle_file_offsets.get(idx).copied(),
@@ -1809,7 +1838,11 @@ fn build_rowset_snapshot_for_partial_update(
         total_num_rows: rowset.num_rows.unwrap_or(0).max(0) as u64,
         rowset_count: 1,
         segment_files,
-        delete_predicates: Vec::new(),
+        delete_predicates: delete_predicates
+            .iter()
+            .filter(|pred| pred.version >= rowset_visibility_version)
+            .cloned()
+            .collect(),
         delvec_meta: Default::default(),
     })
 }
@@ -3207,12 +3240,16 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{TabletWriteContext, append_lake_txn_log_with_rowset, read_txn_log_if_exists};
+    use crate::formats::starrocks::metadata::{
+        collect_delete_predicates, lake_rowset_visibility_version,
+    };
     use crate::formats::starrocks::writer::StarRocksWriteFormat;
     use crate::formats::starrocks::writer::layout::{
         txn_log_file_path, txn_log_file_path_with_load_id,
     };
     use crate::service::grpc_client::proto::starrocks::{
-        ColumnPb, KeysType, PUniqueId, RowsetMetadataPb, TabletSchemaPb,
+        BinaryPredicatePb, ColumnPb, DeletePredicatePb, KeysType, PUniqueId, RowsetMetadataPb,
+        TabletMetadataPb, TabletSchemaPb,
     };
 
     fn test_tablet_schema(schema_id: i64) -> TabletSchemaPb {
@@ -4737,6 +4774,62 @@ mod tests {
         assert_ne!(
             version_a, version_b,
             "distinct rowsets should not share synthetic snapshot cache key"
+        );
+    }
+
+    #[test]
+    fn partial_update_snapshot_uses_lake_rowset_visibility_and_delete_predicates() {
+        let root = tempdir().expect("tempdir");
+        let root_path = root.path().to_string_lossy().into_owned();
+        let ctx = test_rollup_like_context(&root_path, 6001, 8001, 17);
+        let data_rowset = RowsetMetadataPb {
+            id: Some(11),
+            version: Some(42),
+            segments: vec!["segment_a.dat".to_string()],
+            num_rows: Some(2),
+            segment_size: vec![128],
+            bundle_file_offsets: vec![0],
+            ..Default::default()
+        };
+        let delete_rowset = RowsetMetadataPb {
+            id: Some(12),
+            delete_predicate: Some(DeletePredicatePb {
+                version: -1,
+                sub_predicates: Vec::new(),
+                in_predicates: Vec::new(),
+                binary_predicates: vec![BinaryPredicatePb {
+                    column_name: Some("k1".to_string()),
+                    op: Some("=".to_string()),
+                    value: Some("1".to_string()),
+                }],
+                is_null_predicates: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let metadata = TabletMetadataPb {
+            rowsets: vec![data_rowset.clone(), delete_rowset],
+            ..Default::default()
+        };
+
+        let delete_predicates =
+            collect_delete_predicates(&metadata).expect("collect delete predicates");
+        let rowset_visibility_version =
+            lake_rowset_visibility_version(&data_rowset, 0).expect("rowset visibility version");
+        let snapshot = super::build_rowset_snapshot_for_partial_update(
+            &ctx,
+            &data_rowset,
+            rowset_visibility_version,
+            &delete_predicates,
+        )
+        .expect("build rowset snapshot");
+
+        assert_eq!(snapshot.segment_files.len(), 1);
+        assert_eq!(snapshot.segment_files[0].rowset_version, 0);
+        assert_eq!(snapshot.delete_predicates.len(), 1);
+        assert_eq!(snapshot.delete_predicates[0].version, 1);
+        assert_eq!(
+            snapshot.delete_predicates[0].binary_predicates[0].column_name,
+            "k1"
         );
     }
 }

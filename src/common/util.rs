@@ -238,6 +238,8 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
                 {
                     let value = largeint::i128_from_be_bytes(arr.value(row))?;
                     append_lenenc_string(&mut out, value.to_string().as_bytes());
+                } else if renders_mysql_null_for_primitive(primitive) {
+                    out.push(0xFB);
                 } else {
                     append_lenenc_string(&mut out, arr.value(row));
                 }
@@ -489,6 +491,8 @@ fn append_http_json_value(
             {
                 let value = largeint::i128_from_be_bytes(arr.value(row))?;
                 append_http_json_quoted(out, &value.to_string())?;
+            } else if renders_mysql_null_for_primitive(primitive) {
+                out.push_str("null");
             } else {
                 append_http_json_quoted(out, &String::from_utf8_lossy(arr.value(row)))?;
             }

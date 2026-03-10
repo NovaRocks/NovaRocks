@@ -21,6 +21,9 @@ use std::sync::Arc;
 
 pub(crate) const FIELD_META_PRIMITIVE_TYPE: &str = "novarocks.primitive_type";
 pub(crate) const FIELD_META_PRIMITIVE_JSON: &str = "JSON";
+pub(crate) const FIELD_META_PRIMITIVE_HLL: &str = "HLL";
+pub(crate) const FIELD_META_PRIMITIVE_OBJECT: &str = "OBJECT";
+pub(crate) const FIELD_META_PRIMITIVE_PERCENTILE: &str = "PERCENTILE";
 
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
@@ -43,6 +46,48 @@ pub(crate) fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types:
     }
     let scalar = first.scalar_type.as_ref()?;
     Some(scalar.type_)
+}
+
+pub(crate) fn primitive_type_metadata_value(
+    primitive: types::TPrimitiveType,
+) -> Option<&'static str> {
+    match primitive {
+        t if t == types::TPrimitiveType::JSON => Some(FIELD_META_PRIMITIVE_JSON),
+        t if t == types::TPrimitiveType::HLL => Some(FIELD_META_PRIMITIVE_HLL),
+        t if t == types::TPrimitiveType::OBJECT => Some(FIELD_META_PRIMITIVE_OBJECT),
+        t if t == types::TPrimitiveType::PERCENTILE => Some(FIELD_META_PRIMITIVE_PERCENTILE),
+        _ => None,
+    }
+}
+
+pub(crate) fn add_primitive_field_metadata(
+    field: Field,
+    primitive: Option<types::TPrimitiveType>,
+) -> Field {
+    let Some(value) = primitive.and_then(primitive_type_metadata_value) else {
+        return field;
+    };
+    let mut metadata = field.metadata().clone();
+    metadata.insert(FIELD_META_PRIMITIVE_TYPE.to_string(), value.to_string());
+    field.with_metadata(metadata)
+}
+
+pub(crate) fn field_with_desc_metadata(field: Field, desc: &types::TTypeDesc) -> Field {
+    add_primitive_field_metadata(field, primitive_type_from_desc(desc))
+}
+
+pub(crate) fn primitive_type_from_field(field: &Field) -> Option<types::TPrimitiveType> {
+    match field
+        .metadata()
+        .get(FIELD_META_PRIMITIVE_TYPE)
+        .map(|value| value.as_str())
+    {
+        Some(FIELD_META_PRIMITIVE_JSON) => Some(types::TPrimitiveType::JSON),
+        Some(FIELD_META_PRIMITIVE_HLL) => Some(types::TPrimitiveType::HLL),
+        Some(FIELD_META_PRIMITIVE_OBJECT) => Some(types::TPrimitiveType::OBJECT),
+        Some(FIELD_META_PRIMITIVE_PERCENTILE) => Some(types::TPrimitiveType::PERCENTILE),
+        _ => None,
+    }
 }
 
 /// Convert TPrimitiveType to Arrow DataType when precision/scale is not required.
@@ -212,13 +257,11 @@ fn primitive_field_metadata(node: &types::TTypeNode) -> Option<HashMap<String, S
         return None;
     }
     let scalar = node.scalar_type.as_ref()?;
-    if scalar.type_ != types::TPrimitiveType::JSON {
-        return None;
-    }
+    let primitive_value = primitive_type_metadata_value(scalar.type_)?;
     let mut metadata = HashMap::new();
     metadata.insert(
         FIELD_META_PRIMITIVE_TYPE.to_string(),
-        FIELD_META_PRIMITIVE_JSON.to_string(),
+        primitive_value.to_string(),
     );
     Some(metadata)
 }
@@ -240,9 +283,12 @@ pub(crate) fn decimal_params_from_desc(desc: &types::TTypeDesc) -> Option<(u8, i
 
 #[cfg(test)]
 mod tests {
-    use super::arrow_type_from_primitive;
+    use super::{
+        FIELD_META_PRIMITIVE_HLL, FIELD_META_PRIMITIVE_TYPE, add_primitive_field_metadata,
+        arrow_type_from_primitive, primitive_type_from_field,
+    };
     use crate::types::TPrimitiveType;
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, Field};
 
     #[test]
     fn object_family_primitives_lower_to_binary() {
@@ -258,5 +304,18 @@ mod tests {
             arrow_type_from_primitive(TPrimitiveType::PERCENTILE),
             Some(DataType::Binary)
         );
+    }
+
+    #[test]
+    fn add_object_primitive_metadata_to_field() {
+        let field = add_primitive_field_metadata(
+            Field::new("v", DataType::Binary, true),
+            Some(TPrimitiveType::HLL),
+        );
+        assert_eq!(
+            field.metadata().get(FIELD_META_PRIMITIVE_TYPE),
+            Some(&FIELD_META_PRIMITIVE_HLL.to_string())
+        );
+        assert_eq!(primitive_type_from_field(&field), Some(TPrimitiveType::HLL));
     }
 }

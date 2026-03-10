@@ -34,13 +34,13 @@ use crate::common::thrift::{
 use crate::cache::CacheOptions;
 use crate::common::types::{FetchResult, UniqueId};
 use crate::common::util::{
-    http_json_row_from_arrays_with_primitives, mysql_text_row_from_arrays,
-    mysql_text_row_from_arrays_with_primitives,
+    http_json_row_from_arrays_with_primitives, mysql_text_row_from_arrays_with_primitives,
 };
 use crate::lower::cache_iceberg_table_locations;
 use crate::lower::fragment::execute_fragment;
 use crate::lower::type_lowering::{
     FIELD_META_PRIMITIVE_JSON, FIELD_META_PRIMITIVE_TYPE, primitive_type_from_desc,
+    primitive_type_from_field,
 };
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
@@ -406,6 +406,17 @@ fn primitives_for_output_exprs(
         out.push(primitive);
     }
     Ok(out)
+}
+
+fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<types::TPrimitiveType> {
+    chunk
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| {
+            primitive_type_from_field(field).unwrap_or(types::TPrimitiveType::INVALID_TYPE)
+        })
+        .collect()
 }
 
 fn parse_lenenc_fields(
@@ -870,6 +881,7 @@ fn build_http_json_fetch_result(
             }
         } else {
             let columns = chunk.columns();
+            let primitives = primitives_for_chunk_fields(chunk);
             let json_semantics = chunk
                 .schema()
                 .fields()
@@ -885,7 +897,7 @@ fn build_http_json_fetch_result(
                 batch.rows.push(http_json_row_from_arrays_with_primitives(
                     columns,
                     row,
-                    None,
+                    Some(&primitives),
                     Some(&json_semantics),
                 )?);
             }
@@ -941,8 +953,10 @@ fn build_fetch_result(
             }
         } else {
             let columns = chunk.columns();
+            let primitives = primitives_for_chunk_fields(chunk);
             for row in 0..chunk.len() {
-                let bytes = mysql_text_row_from_arrays(columns, row)?;
+                let bytes =
+                    mysql_text_row_from_arrays_with_primitives(columns, row, Some(&primitives))?;
                 batch.rows.push(bytes);
             }
         }
