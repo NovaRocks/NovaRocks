@@ -122,10 +122,6 @@ pub(crate) fn list_tablet_fail_infos(finst_id: UniqueId) -> Vec<TTabletFailInfo>
         .unwrap_or_default()
 }
 
-pub(crate) fn add_load_counters(finst_id: UniqueId, loaded_rows: i64, loaded_bytes: i64) {
-    add_load_stats(finst_id, loaded_rows, loaded_bytes, 0);
-}
-
 pub(crate) fn add_load_stats(
     finst_id: UniqueId,
     loaded_rows: i64,
@@ -214,8 +210,8 @@ mod tests {
         unregister(finst_id);
         register(finst_id);
 
-        add_load_counters(finst_id, 10, 100);
-        add_load_counters(finst_id, 7, 50);
+        add_load_stats(finst_id, 10, 100, 0);
+        add_load_stats(finst_id, 7, 50, 0);
         assert_eq!(get_load_counters(finst_id), (17, 150));
 
         unregister(finst_id);

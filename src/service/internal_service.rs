@@ -108,7 +108,10 @@ fn validate_network_address(
     Ok(())
 }
 
-fn validate_nodes_info(nodes_info: &descriptors::TNodesInfo, field_name: &str) -> Result<(), String> {
+fn validate_nodes_info(
+    nodes_info: &descriptors::TNodesInfo,
+    field_name: &str,
+) -> Result<(), String> {
     for (idx, node) in nodes_info.nodes.iter().enumerate() {
         if node.host.is_empty() {
             return Err(format!("{field_name}[{idx}] host is empty"));
@@ -128,7 +131,9 @@ fn validate_destinations(
 ) -> Result<(), String> {
     for (idx, dest) in dests.iter().enumerate() {
         validate_network_address(
-            dest.brpc_server.as_ref().or_else(|| dest.deprecated_server.as_ref()),
+            dest.brpc_server
+                .as_ref()
+                .or_else(|| dest.deprecated_server.as_ref()),
             "missing destination address",
             &format!("{field_name}[{idx}]"),
         )?;
@@ -1566,7 +1571,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::validate_internal_addresses;
-    use crate::{data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner, runtime_filter, types};
+    use crate::{
+        data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner,
+        runtime_filter, types,
+    };
 
     fn unique_id(hi: i64, lo: i64) -> types::TUniqueId {
         types::TUniqueId::new(hi, lo)
@@ -1778,10 +1786,7 @@ mod tests {
             .expect("validate internal addresses");
 
         assert_eq!(
-            exec_params
-                .destinations
-                .as_ref()
-                .expect("destinations")[0]
+            exec_params.destinations.as_ref().expect("destinations")[0]
                 .brpc_server
                 .as_ref()
                 .expect("destination addr")
@@ -1803,11 +1808,7 @@ mod tests {
             9040
         );
         assert_eq!(
-            fragment
-                .plan
-                .as_ref()
-                .expect("plan")
-                .nodes[0]
+            fragment.plan.as_ref().expect("plan").nodes[0]
                 .fetch_node
                 .as_ref()
                 .expect("fetch node")
@@ -1819,11 +1820,7 @@ mod tests {
             9050
         );
         assert_eq!(
-            fragment
-                .plan
-                .as_ref()
-                .expect("plan")
-                .nodes[1]
+            fragment.plan.as_ref().expect("plan").nodes[1]
                 .hash_join_node
                 .as_ref()
                 .expect("hash join")
@@ -1841,13 +1838,11 @@ mod tests {
     #[test]
     fn test_validate_internal_addresses_rejects_missing_or_invalid_fields() {
         let missing_dest = exec_params(None, Some(address("prober-host", 9040)));
-        let err = validate_internal_addresses(&missing_dest, None).expect_err("missing destination");
+        let err =
+            validate_internal_addresses(&missing_dest, None).expect_err("missing destination");
         assert!(err.contains("missing destination address"));
 
-        let empty_host = exec_params(
-            Some(address("", 9030)),
-            Some(address("prober-host", 9040)),
-        );
+        let empty_host = exec_params(Some(address("", 9030)), Some(address("prober-host", 9040)));
         let err = validate_internal_addresses(&empty_host, None).expect_err("empty host");
         assert!(err.contains("hostname is empty"));
 
@@ -1866,7 +1861,8 @@ mod tests {
             Some(address("dest-host", 9030)),
             Some(address("prober-host", 0)),
         );
-        let err = validate_internal_addresses(&bad_prober_port, None).expect_err("invalid prober port");
+        let err =
+            validate_internal_addresses(&bad_prober_port, None).expect_err("invalid prober port");
         assert!(err.contains("port must be positive"));
     }
 }

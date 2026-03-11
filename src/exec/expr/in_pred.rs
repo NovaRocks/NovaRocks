@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
+use crate::exec::expr::function::compare_values_with_null;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array, Decimal256Array,
@@ -84,6 +85,27 @@ pub fn eval_in(
 }
 
 fn eq_with_scalar(array: &ArrayRef, scalar: &ArrayRef) -> Result<BooleanArray, String> {
+    if matches!(
+        scalar.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
+        if array.data_type() != scalar.data_type() {
+            return Err(format!(
+                "IN nested type mismatch: {:?} vs {:?}",
+                array.data_type(),
+                scalar.data_type()
+            ));
+        }
+        let mut builder = BooleanBuilder::with_capacity(array.len());
+        for i in 0..array.len() {
+            if array.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(compare_values_with_null(array, i, scalar, 0, true)?);
+            }
+        }
+        return Ok(builder.finish());
+    }
     match scalar.data_type() {
         DataType::Int8 => {
             let arr = scalar.as_any().downcast_ref::<Int8Array>().unwrap();
@@ -304,4 +326,97 @@ fn empty_chunk_with_rows(row_count: usize) -> Result<Chunk, String> {
     let batch = arrow::array::RecordBatch::try_new_with_options(schema, vec![], &options)
         .map_err(|e| e.to_string())?;
     Ok(Chunk::new(batch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::field_with_slot_id;
+    use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use arrow::array::{
+        Int32Builder, Int64Builder, MapArray, MapBuilder, MapFieldNames, RecordBatch,
+    };
+    use arrow::datatypes::{Field, Schema};
+
+    fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {
+        let mut builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            Int32Builder::new(),
+            Int64Builder::new(),
+        );
+        for row in rows {
+            match row {
+                Some(entries) => {
+                    for (key, value) in *entries {
+                        builder.keys().append_value(*key);
+                        builder.values().append_value(*value);
+                    }
+                    builder.append(true).unwrap();
+                }
+                None => builder.append(false).unwrap(),
+            }
+        }
+        builder.finish()
+    }
+
+    #[test]
+    fn eq_with_scalar_supports_map_values() {
+        let array = Arc::new(create_test_map_array(&[
+            Some(&[(0, 10), (1, 11)]),
+            Some(&[(0, 10), (1, 12)]),
+            None,
+        ])) as ArrayRef;
+        let scalar = Arc::new(create_test_map_array(&[Some(&[(0, 10), (1, 11)])])) as ArrayRef;
+
+        let result = eq_with_scalar(&array, &scalar).expect("compare map scalar");
+        assert_eq!(result.value(0), true);
+        assert_eq!(result.value(1), false);
+        assert!(result.is_null(2));
+    }
+
+    #[test]
+    fn eval_in_keeps_temporal_matches_when_list_contains_null_literal() {
+        let ts_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let values = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1_672_531_190_000_000_i64),
+            Some(1_672_531_193_000_000_i64),
+            None,
+        ])) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
+            Field::new("dt", ts_type.clone(), true),
+            SlotId::new(1),
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
+        let chunk = Chunk::new(batch);
+
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), ts_type.clone());
+        let match_lit = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Utf8("2022-12-31 23:59:50".to_string())),
+            DataType::Utf8,
+        );
+        let match_cast = arena.push_typed(ExprNode::Cast(match_lit), ts_type.clone());
+        let rogue_lit =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
+        let rogue_cast = arena.push_typed(ExprNode::Cast(rogue_lit), ts_type.clone());
+        let expr = arena.push_typed(
+            ExprNode::In {
+                child,
+                values: vec![match_cast, rogue_cast],
+                is_not_in: false,
+            },
+            DataType::Boolean,
+        );
+
+        let result = arena.eval(expr, &chunk).expect("eval IN");
+        let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(result.value(0), true);
+        assert!(result.is_null(1));
+        assert!(result.is_null(2));
+    }
 }

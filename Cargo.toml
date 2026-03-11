@@ -29,6 +29,7 @@ opendal = { version = "0.55", features = ["services-oss", "services-fs", "servic
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = "25"
+jni = { version = "0.21", features = ["invocation"], optional = true }
 url = "2"
 rand = "0.8"
 regex = "1.10"
@@ -73,6 +74,7 @@ tempfile = "3"
 
 [features]
 ssb = []
+embedded-jvm = ["dep:jni"]
 
 [build-dependencies]
 cc = "1.2"

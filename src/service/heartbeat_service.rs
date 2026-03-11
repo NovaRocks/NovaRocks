@@ -49,7 +49,7 @@ struct HeartbeatHandler {
     start_time: SystemTime,
 }
 
-fn backend_host_for_fe(advertise_host: &str, _fe_backend_ip: Option<&str>) -> String {
+fn backend_host_for_fe(advertise_host: &str) -> String {
     advertise_host.to_string()
 }
 
@@ -81,29 +81,14 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
         if let Some(id) = master_info.backend_id {
             backend_id_store::set_backend_id(id);
         }
-        disk_report::maybe_report_disks(
-            &master_info.network_address,
-            backend_host_for_fe(
-                &self.config.advertise_host,
-                master_info.backend_ip.as_deref(),
-            ),
-            self.config.be_port,
-            self.config.http_port,
-            master_info.http_port,
-        );
-
-        let status = TStatus::new(TStatusCode::OK, None);
-
+        let num_cores = thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(1);
         let reboot_time = self
             .start_time
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-
-        let num_cores = thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(1);
-
         let backend_info = TBackendInfo::new(
             self.config.be_port as i32,
             self.config.http_port as i32,
@@ -117,6 +102,15 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             None,
             None,
         );
+        disk_report::maybe_report_disks(
+            &master_info.network_address,
+            backend_host_for_fe(&self.config.advertise_host),
+            self.config.be_port,
+            self.config.http_port,
+            master_info.http_port,
+        );
+
+        let status = TStatus::new(TStatusCode::OK, None);
 
         tracing::debug!("Heartbeat response: reboot_time={}", reboot_time);
 
@@ -177,14 +171,14 @@ mod tests {
     use super::backend_host_for_fe;
 
     #[test]
-    fn backend_host_for_fe_ignores_fe_backend_ip_when_advertise_host_is_resolved() {
-        let backend_host = backend_host_for_fe("10.0.0.9", Some("127.0.0.1"));
+    fn backend_host_for_fe_uses_advertise_host() {
+        let backend_host = backend_host_for_fe("10.0.0.9");
         assert_eq!(backend_host, "10.0.0.9");
     }
 
     #[test]
-    fn backend_host_for_fe_keeps_detected_host_when_no_explicit_host_is_configured() {
-        let backend_host = backend_host_for_fe("192.168.20.152", None);
+    fn backend_host_for_fe_keeps_advertise_host_unchanged() {
+        let backend_host = backend_host_for_fe("192.168.20.152");
         assert_eq!(backend_host, "192.168.20.152");
     }
 }

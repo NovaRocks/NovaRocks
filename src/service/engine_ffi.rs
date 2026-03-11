@@ -28,10 +28,10 @@ use crate::connector::starrocks::lake::{
 use crate::novarocks_logging::error;
 use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
-    DeleteTabletRequest, DropTableRequest, PLookUpRequest, PLookUpResponse,
-    PTransmitChunkParams, PTransmitChunkResult, PTransmitRuntimeFilterParams,
-    PTransmitRuntimeFilterResult, PublishLogVersionBatchRequest, PublishLogVersionRequest,
-    PublishVersionRequest, TabletStatRequest, VacuumRequest,
+    DeleteTabletRequest, DropTableRequest, PLookUpRequest, PLookUpResponse, PTransmitChunkParams,
+    PTransmitChunkResult, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
+    PublishLogVersionBatchRequest, PublishLogVersionRequest, PublishVersionRequest,
+    TabletStatRequest, VacuumRequest,
 };
 use crate::service::internal_rpc;
 use crate::{FetchResult, UniqueId};

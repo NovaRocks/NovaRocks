@@ -15,27 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use apache_avro::Reader;
-use apache_avro::types::Value as AvroValue;
 use arrow::array::{
     ArrayRef, BinaryBuilder, Int32Array, Int32Builder, Int64Array, Int64Builder, ListArray,
-    ListBuilder, MapBuilder, RecordBatch, RecordBatchOptions, StringArray, StringBuilder,
-    StructArray,
+    ListBuilder, MapBuilder, MapFieldNames, RecordBatch, RecordBatchOptions, StringArray,
+    StringBuilder, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use base64::Engine;
-use regex::Regex;
-use serde_json::{Map as JsonMap, Value as JsonValue, json};
+use serde::Deserialize;
 
+use super::{ensure_embedded_jvm_enabled, jvm::scan_metadata};
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, field_with_slot_id};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
-use crate::fs::path::resolve_opendal_paths;
 use crate::runtime::profile::RuntimeProfile;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +50,14 @@ impl IcebergMetadataTableType {
             other => Err(format!("unsupported iceberg metadata table type: {other}")),
         }
     }
+
+    fn as_jvm_scanner_type(&self) -> &'static str {
+        match self {
+            Self::Files => "FILES",
+            Self::Manifests => "MANIFESTS",
+            Self::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -67,17 +71,18 @@ pub struct IcebergMetadataOutputColumn {
 #[derive(Clone, Debug)]
 pub struct IcebergMetadataScanRange {
     pub path: String,
+    pub serialized_split: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct IcebergMetadataScanConfig {
     pub metadata_table_type: IcebergMetadataTableType,
     pub serialized_table: String,
+    pub serialized_predicate: String,
     pub load_column_stats: bool,
     pub ranges: Vec<IcebergMetadataScanRange>,
     pub batch_size: usize,
     pub output_columns: Vec<IcebergMetadataOutputColumn>,
-    pub object_store_config: Option<crate::fs::object_store::ObjectStoreConfig>,
     pub profile_label: Option<String>,
 }
 
@@ -88,22 +93,83 @@ pub struct IcebergMetadataScanOp {
 }
 
 impl IcebergMetadataScanOp {
-    pub fn new(cfg: IcebergMetadataScanConfig) -> Self {
+    pub fn new(cfg: IcebergMetadataScanConfig) -> Result<Self, String> {
+        ensure_embedded_jvm_enabled("Iceberg metadata scan")?;
         let fields: Vec<_> = cfg
             .output_columns
             .iter()
             .map(|col| {
                 Arc::new(field_with_slot_id(
-                    Field::new(&col.name, col.data_type.clone(), col.nullable),
+                    Field::new(
+                        &col.name,
+                        normalize_metadata_output_type(&col.data_type),
+                        col.nullable,
+                    ),
                     col.slot_id,
                 ))
             })
             .collect();
-        Self {
+        Ok(Self {
             output_schema: Arc::new(Schema::new(fields)),
             cfg,
-        }
+        })
     }
+}
+
+fn normalize_metadata_output_type(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::List(item) => DataType::List(Arc::new(normalize_metadata_output_field(item))),
+        DataType::LargeList(item) => {
+            DataType::LargeList(Arc::new(normalize_metadata_output_field(item)))
+        }
+        DataType::FixedSizeList(item, len) => {
+            DataType::FixedSizeList(Arc::new(normalize_metadata_output_field(item)), *len)
+        }
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|field| normalize_metadata_output_field(field.as_ref()))
+                .collect(),
+        ),
+        DataType::Map(entries, ordered) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return data_type.clone();
+            };
+            if fields.len() != 2 {
+                return data_type.clone();
+            }
+            let mut normalized_fields = fields.iter().cloned().collect::<Vec<_>>();
+            normalized_fields[0] = Arc::new(
+                normalized_fields[0]
+                    .as_ref()
+                    .clone()
+                    .with_data_type(normalize_metadata_output_type(
+                        normalized_fields[0].data_type(),
+                    ))
+                    .with_nullable(false),
+            );
+            normalized_fields[1] = Arc::new(normalized_fields[1].as_ref().clone().with_data_type(
+                normalize_metadata_output_type(normalized_fields[1].data_type()),
+            ));
+            DataType::Map(
+                Arc::new(
+                    entries
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Struct(normalized_fields.into()))
+                        .with_nullable(false),
+                ),
+                *ordered,
+            )
+        }
+        _ => data_type.clone(),
+    }
+}
+
+fn normalize_metadata_output_field(field: &Field) -> Field {
+    field
+        .clone()
+        .with_data_type(normalize_metadata_output_type(field.data_type()))
 }
 
 impl ScanOp for IcebergMetadataScanOp {
@@ -113,15 +179,18 @@ impl ScanOp for IcebergMetadataScanOp {
         profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
+        ensure_embedded_jvm_enabled("Iceberg metadata scan")?;
         let ScanMorsel::IcebergMetadata { index } = morsel else {
             return Err("iceberg metadata scan received unexpected morsel".to_string());
         };
+        let range = self
+            .cfg
+            .ranges
+            .get(index)
+            .ok_or_else(|| format!("iceberg metadata range index out of bounds: {index}"))?;
         let chunks = match self.cfg.metadata_table_type {
             IcebergMetadataTableType::Files => {
-                let range = self.cfg.ranges.get(index).ok_or_else(|| {
-                    format!("iceberg metadata range index out of bounds: {index}")
-                })?;
-                let rows = load_file_rows(range, self.cfg.object_store_config.as_ref())?;
+                let rows = load_file_rows(&self.cfg, range, false)?;
                 build_file_chunks(
                     &rows,
                     &self.cfg.output_columns,
@@ -132,10 +201,7 @@ impl ScanOp for IcebergMetadataScanOp {
                 )?
             }
             IcebergMetadataTableType::LogicalIcebergMetadata => {
-                let range = self.cfg.ranges.get(index).ok_or_else(|| {
-                    format!("iceberg metadata range index out of bounds: {index}")
-                })?;
-                let rows = load_file_rows(range, self.cfg.object_store_config.as_ref())?;
+                let rows = load_file_rows(&self.cfg, range, true)?;
                 build_file_chunks(
                     &rows,
                     &self.cfg.output_columns,
@@ -146,10 +212,7 @@ impl ScanOp for IcebergMetadataScanOp {
                 )?
             }
             IcebergMetadataTableType::Manifests => {
-                let rows = load_manifest_rows(
-                    &self.cfg.serialized_table,
-                    self.cfg.object_store_config.as_ref(),
-                )?;
+                let rows = load_manifest_rows(&self.cfg, range)?;
                 build_manifest_chunks(
                     &rows,
                     &self.cfg.output_columns,
@@ -165,6 +228,9 @@ impl ScanOp for IcebergMetadataScanOp {
                 format!("{:?}", self.cfg.metadata_table_type),
             );
             profile.add_info_string("RangeIndex", index.to_string());
+            if !range.path.is_empty() {
+                profile.add_info_string("RangePath", range.path.clone());
+            }
         }
 
         Ok(Box::new(chunks.into_iter().map(Ok)))
@@ -233,134 +299,186 @@ struct ManifestMetadataRow {
     partitions: Option<Vec<ManifestPartitionSummary>>,
 }
 
+#[derive(Deserialize)]
+struct RawLongEntry {
+    key: i32,
+    value: i64,
+}
+
+#[derive(Deserialize)]
+struct RawStringEntry {
+    key: i32,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct RawFileMetadataRow {
+    content: i32,
+    file_path: String,
+    file_format: String,
+    spec_id: i32,
+    partition_data: Option<String>,
+    record_count: i64,
+    file_size_in_bytes: i64,
+    column_sizes: Option<Vec<RawLongEntry>>,
+    value_counts: Option<Vec<RawLongEntry>>,
+    null_value_counts: Option<Vec<RawLongEntry>>,
+    nan_value_counts: Option<Vec<RawLongEntry>>,
+    lower_bounds: Option<Vec<RawStringEntry>>,
+    upper_bounds: Option<Vec<RawStringEntry>>,
+    split_offsets: Option<Vec<i64>>,
+    sort_id: Option<i32>,
+    equality_ids: Option<Vec<i32>>,
+    file_sequence_number: Option<i64>,
+    data_sequence_number: Option<i64>,
+    column_stats: Option<String>,
+    key_metadata: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawManifestPartitionSummary {
+    contains_null: Option<String>,
+    contains_nan: Option<String>,
+    lower_bound: Option<String>,
+    upper_bound: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawManifestMetadataRow {
+    path: String,
+    length: i64,
+    partition_spec_id: i32,
+    added_snapshot_id: Option<i64>,
+    added_data_files_count: Option<i32>,
+    added_rows_count: Option<i64>,
+    existing_data_files_count: Option<i32>,
+    existing_rows_count: Option<i64>,
+    deleted_data_files_count: Option<i32>,
+    deleted_rows_count: Option<i64>,
+    partitions: Option<Vec<RawManifestPartitionSummary>>,
+}
+
 fn load_file_rows(
+    cfg: &IcebergMetadataScanConfig,
     range: &IcebergMetadataScanRange,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    logical_metadata: bool,
 ) -> Result<Vec<FileMetadataRow>, String> {
-    let bytes = read_path_bytes(&range.path, object_store_config)?;
-    let reader = Reader::new(bytes.as_slice())
-        .map_err(|e| format!("failed to open iceberg manifest avro {}: {}", range.path, e))?;
-    let metadata = reader.user_metadata().clone();
-    let spec_id = avro_metadata_i32(&metadata, "partition-spec-id")?;
-
-    let mut rows = Vec::new();
-    for value in reader {
-        let value = value.map_err(|e| format!("failed to read avro record: {}", e))?;
-        let entry = avro_record_fields(&value)
-            .ok_or_else(|| "iceberg manifest entry is not an avro record".to_string())?;
-        let data_file = avro_field(entry, "data_file")
-            .and_then(avro_record_fields)
-            .ok_or_else(|| "iceberg manifest entry missing data_file record".to_string())?;
-
-        let column_sizes = avro_int_long_map(avro_field(data_file, "column_sizes"))?;
-        let value_counts = avro_int_long_map(avro_field(data_file, "value_counts"))?;
-        let null_value_counts = avro_int_long_map(avro_field(data_file, "null_value_counts"))?;
-        let nan_value_counts = avro_int_long_map(avro_field(data_file, "nan_value_counts"))?;
-        let lower_bounds = avro_int_string_map(avro_field(data_file, "lower_bounds"))?;
-        let upper_bounds = avro_int_string_map(avro_field(data_file, "upper_bounds"))?;
-        let split_offsets = avro_i64_list(avro_field(data_file, "split_offsets"))?;
-        let equality_ids = avro_i32_list(avro_field(data_file, "equality_ids"))?;
-        let partition_data = encode_partition_data(avro_field(data_file, "partition"))?;
-        let key_metadata = avro_bytes(avro_field(data_file, "key_metadata"))?;
-        let column_stats = encode_column_stats(
-            column_sizes.as_ref(),
-            value_counts.as_ref(),
-            null_value_counts.as_ref(),
-            nan_value_counts.as_ref(),
-            lower_bounds.as_ref(),
-            upper_bounds.as_ref(),
-        )?;
-
-        rows.push(FileMetadataRow {
-            content: avro_i32_required(avro_field(data_file, "content"), "content")?,
-            file_path: avro_string_required(avro_field(data_file, "file_path"), "file_path")?,
-            file_format: avro_string_required(avro_field(data_file, "file_format"), "file_format")?,
-            spec_id,
-            partition_data,
-            record_count: avro_i64_required(avro_field(data_file, "record_count"), "record_count")?,
-            file_size_in_bytes: avro_i64_required(
-                avro_field(data_file, "file_size_in_bytes"),
-                "file_size_in_bytes",
-            )?,
-            column_sizes,
-            value_counts,
-            null_value_counts,
-            nan_value_counts,
-            lower_bounds,
-            upper_bounds,
-            split_offsets,
-            sort_id: avro_i32(avro_field(data_file, "sort_order_id"))?,
-            equality_ids,
-            file_sequence_number: avro_i64(avro_field(entry, "file_sequence_number"))?,
-            data_sequence_number: avro_i64(avro_field(entry, "sequence_number"))?,
-            column_stats,
-            key_metadata,
-        });
-    }
-    Ok(rows)
+    let scanner_type = if logical_metadata {
+        IcebergMetadataTableType::LogicalIcebergMetadata.as_jvm_scanner_type()
+    } else {
+        IcebergMetadataTableType::Files.as_jvm_scanner_type()
+    };
+    let payload = scan_metadata(
+        scanner_type,
+        &cfg.serialized_table,
+        &range.serialized_split,
+        &cfg.serialized_predicate,
+        cfg.load_column_stats,
+    )?;
+    let rows: Vec<RawFileMetadataRow> = serde_json::from_slice(&payload)
+        .map_err(|e| format!("parse JVM iceberg file metadata rows failed: {e}"))?;
+    rows.into_iter().map(FileMetadataRow::try_from).collect()
 }
 
 fn load_manifest_rows(
-    serialized_table: &str,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    cfg: &IcebergMetadataScanConfig,
+    range: &IcebergMetadataScanRange,
 ) -> Result<Vec<ManifestMetadataRow>, String> {
-    let metadata_json_path = extract_metadata_json_path(serialized_table)?;
-    let metadata_cfg = adjusted_object_store_config(object_store_config, &metadata_json_path);
-    let metadata_json = read_path_bytes(&metadata_json_path, metadata_cfg.as_ref())?;
-    let manifest_list_path = extract_manifest_list_path(&metadata_json)?;
-    let manifest_cfg = adjusted_object_store_config(object_store_config, &manifest_list_path);
-    let bytes = read_path_bytes(&manifest_list_path, manifest_cfg.as_ref())?;
-    let reader = Reader::new(bytes.as_slice()).map_err(|e| {
-        format!(
-            "failed to open iceberg manifest list avro {}: {}",
-            manifest_list_path, e
-        )
-    })?;
+    let payload = scan_metadata(
+        IcebergMetadataTableType::Manifests.as_jvm_scanner_type(),
+        &cfg.serialized_table,
+        &range.serialized_split,
+        "",
+        cfg.load_column_stats,
+    )?;
+    let rows: Vec<RawManifestMetadataRow> = serde_json::from_slice(&payload)
+        .map_err(|e| format!("parse JVM iceberg manifest metadata rows failed: {e}"))?;
+    Ok(rows.into_iter().map(ManifestMetadataRow::from).collect())
+}
 
-    let mut rows = Vec::new();
-    for value in reader {
-        let value = value.map_err(|e| format!("failed to read avro record: {}", e))?;
-        let fields = avro_record_fields(&value)
-            .ok_or_else(|| "iceberg manifest list entry is not an avro record".to_string())?;
-        rows.push(ManifestMetadataRow {
-            path: avro_string_required(avro_field(fields, "manifest_path"), "manifest_path")?,
-            length: avro_i64_required(avro_field(fields, "manifest_length"), "manifest_length")?,
-            partition_spec_id: avro_i32_required(
-                avro_field(fields, "partition_spec_id"),
-                "partition_spec_id",
-            )?,
-            added_snapshot_id: avro_i64_required(
-                avro_field(fields, "added_snapshot_id"),
-                "added_snapshot_id",
-            )?,
-            added_data_files_count: avro_i32_required(
-                avro_field(fields, "added_files_count"),
-                "added_files_count",
-            )?,
-            added_rows_count: avro_i64_required(
-                avro_field(fields, "added_rows_count"),
-                "added_rows_count",
-            )?,
-            existing_data_files_count: avro_i32_required(
-                avro_field(fields, "existing_files_count"),
-                "existing_files_count",
-            )?,
-            existing_rows_count: avro_i64_required(
-                avro_field(fields, "existing_rows_count"),
-                "existing_rows_count",
-            )?,
-            deleted_data_files_count: avro_i32_required(
-                avro_field(fields, "deleted_files_count"),
-                "deleted_files_count",
-            )?,
-            deleted_rows_count: avro_i64_required(
-                avro_field(fields, "deleted_rows_count"),
-                "deleted_rows_count",
-            )?,
-            partitions: avro_manifest_partitions(avro_field(fields, "partitions"))?,
-        });
+impl TryFrom<RawFileMetadataRow> for FileMetadataRow {
+    type Error = String;
+
+    fn try_from(raw: RawFileMetadataRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            content: raw.content,
+            file_path: raw.file_path,
+            file_format: raw.file_format,
+            spec_id: raw.spec_id,
+            partition_data: decode_optional_bytes(raw.partition_data)?,
+            record_count: raw.record_count,
+            file_size_in_bytes: raw.file_size_in_bytes,
+            column_sizes: convert_long_entries(raw.column_sizes),
+            value_counts: convert_long_entries(raw.value_counts),
+            null_value_counts: convert_long_entries(raw.null_value_counts),
+            nan_value_counts: convert_long_entries(raw.nan_value_counts),
+            lower_bounds: convert_string_entries(raw.lower_bounds),
+            upper_bounds: convert_string_entries(raw.upper_bounds),
+            split_offsets: raw.split_offsets,
+            sort_id: raw.sort_id,
+            equality_ids: raw.equality_ids,
+            file_sequence_number: raw.file_sequence_number,
+            data_sequence_number: raw.data_sequence_number,
+            column_stats: decode_optional_bytes(raw.column_stats)?,
+            key_metadata: decode_optional_bytes(raw.key_metadata)?,
+        })
     }
-    Ok(rows)
+}
+
+impl From<RawManifestMetadataRow> for ManifestMetadataRow {
+    fn from(raw: RawManifestMetadataRow) -> Self {
+        Self {
+            path: raw.path,
+            length: raw.length,
+            partition_spec_id: raw.partition_spec_id,
+            added_snapshot_id: raw.added_snapshot_id.unwrap_or_default(),
+            added_data_files_count: raw.added_data_files_count.unwrap_or_default(),
+            added_rows_count: raw.added_rows_count.unwrap_or_default(),
+            existing_data_files_count: raw.existing_data_files_count.unwrap_or_default(),
+            existing_rows_count: raw.existing_rows_count.unwrap_or_default(),
+            deleted_data_files_count: raw.deleted_data_files_count.unwrap_or_default(),
+            deleted_rows_count: raw.deleted_rows_count.unwrap_or_default(),
+            partitions: raw.partitions.map(|parts| {
+                parts
+                    .into_iter()
+                    .map(|part| ManifestPartitionSummary {
+                        contains_null: part.contains_null,
+                        contains_nan: part.contains_nan,
+                        lower_bound: part.lower_bound,
+                        upper_bound: part.upper_bound,
+                    })
+                    .collect()
+            }),
+        }
+    }
+}
+
+fn decode_optional_bytes(value: Option<String>) -> Result<Option<Vec<u8>>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map(Some)
+        .map_err(|e| format!("decode JVM iceberg binary column failed: {e}"))
+}
+
+fn convert_long_entries(value: Option<Vec<RawLongEntry>>) -> Option<Vec<(i32, i64)>> {
+    value.map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect()
+    })
+}
+
+fn convert_string_entries(value: Option<Vec<RawStringEntry>>) -> Option<Vec<(i32, String)>> {
+    value.map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| (entry.key, entry.value))
+            .collect()
+    })
 }
 
 fn build_file_chunks(
@@ -606,7 +724,11 @@ fn build_i32_i64_map_array<'a, I>(rows: I) -> Result<ArrayRef, String>
 where
     I: IntoIterator<Item = Option<&'a Vec<(i32, i64)>>>,
 {
-    let mut builder = MapBuilder::new(None, Int32Builder::new(), Int64Builder::new());
+    let mut builder = MapBuilder::new(
+        Some(iceberg_map_field_names()),
+        Int32Builder::new(),
+        Int64Builder::new(),
+    );
     for row in rows {
         match row {
             Some(entries) => {
@@ -632,7 +754,11 @@ fn build_i32_utf8_map_array<'a, I>(rows: I) -> Result<ArrayRef, String>
 where
     I: IntoIterator<Item = Option<&'a Vec<(i32, String)>>>,
 {
-    let mut builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+    let mut builder = MapBuilder::new(
+        Some(iceberg_map_field_names()),
+        Int32Builder::new(),
+        StringBuilder::new(),
+    );
     for row in rows {
         match row {
             Some(entries) => {
@@ -652,6 +778,14 @@ where
         }
     }
     Ok(Arc::new(builder.finish()))
+}
+
+fn iceberg_map_field_names() -> MapFieldNames {
+    MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    }
 }
 
 fn build_i64_list_array<'a, I>(rows: I) -> Result<ArrayRef, String>
@@ -772,545 +906,86 @@ fn build_manifest_partitions_array(
     Ok(Arc::new(list))
 }
 
-fn read_path_bytes(
-    path: &str,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-) -> Result<Vec<u8>, String> {
-    let (op, resolved) = resolve_opendal_paths(&[path.to_string()], object_store_config)?;
-    let rel = resolved
-        .paths
-        .first()
-        .ok_or_else(|| format!("failed to resolve path: {}", path))?;
-    let bytes = crate::fs::oss::oss_block_on(op.read(rel))?
-        .map_err(|e| format!("failed to read {}: {}", path, e))?;
-    Ok(bytes.to_vec())
-}
-
-fn adjusted_object_store_config(
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
-    path: &str,
-) -> Option<crate::fs::object_store::ObjectStoreConfig> {
-    let Some(cfg) = object_store_config else {
-        return None;
-    };
-    if !cfg.bucket.is_empty() {
-        return Some(cfg.clone());
-    }
-    let bucket = match parse_bucket_from_path(path) {
-        Some(bucket) => bucket,
-        None => return Some(cfg.clone()),
-    };
-    let mut adjusted = cfg.clone();
-    adjusted.bucket = bucket;
-    Some(adjusted)
-}
-
-fn parse_bucket_from_path(path: &str) -> Option<String> {
-    for prefix in ["oss://", "s3://"] {
-        let rest = path.strip_prefix(prefix)?;
-        let bucket = rest.split('/').next()?.trim();
-        if !bucket.is_empty() {
-            return Some(bucket.to_string());
-        }
-    }
-    None
-}
-
-fn extract_metadata_json_path(serialized_table: &str) -> Result<String, String> {
-    let encoded = serialized_table.replace(['\r', '\n'], "");
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|e| format!("decode iceberg serialized_table failed: {}", e))?;
-    let text = String::from_utf8_lossy(&bytes);
-    let re = Regex::new(
-        r#"(?:(?:oss|s3|hdfs)://[^\s"']+?\.metadata\.json|file:/[^\s"']+?\.metadata\.json|/[^\s"']+?\.metadata\.json)"#,
-    )
-    .map_err(|e| format!("build metadata path regex failed: {}", e))?;
-
-    let mut selected: Option<(i64, String)> = None;
-    for matched in re.find_iter(&text) {
-        let path = normalize_extracted_metadata_path(matched.as_str());
-        let version = metadata_json_version(&path);
-        match selected.as_ref() {
-            Some((current_version, _)) if *current_version > version => {}
-            _ => selected = Some((version, path)),
-        }
-    }
-    selected.map(|(_, path)| path).ok_or_else(|| {
-        "failed to extract iceberg metadata json path from serialized_table".to_string()
-    })
-}
-
-fn metadata_json_version(path: &str) -> i64 {
-    let Some(file_name) = path.rsplit('/').next() else {
-        return -1;
-    };
-    let Some(version) = file_name
-        .strip_prefix('v')
-        .and_then(|rest| rest.strip_suffix(".metadata.json"))
-    else {
-        return -1;
-    };
-    version.parse::<i64>().unwrap_or(-1)
-}
-
-fn normalize_extracted_metadata_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("file://") {
-        if rest.starts_with('/') || rest.starts_with("localhost/") {
-            return path.to_string();
-        }
-        return format!("file:///{}", rest.trim_start_matches('/'));
-    }
-    path.to_string()
-}
-
-fn extract_manifest_list_path(metadata_json: &[u8]) -> Result<String, String> {
-    let json: JsonValue = serde_json::from_slice(metadata_json)
-        .map_err(|e| format!("parse iceberg metadata json failed: {}", e))?;
-    let current_snapshot_id = json
-        .get("current-snapshot-id")
-        .and_then(JsonValue::as_i64)
-        .ok_or_else(|| "iceberg metadata json missing current-snapshot-id".to_string())?;
-    let snapshots = json
-        .get("snapshots")
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| "iceberg metadata json missing snapshots".to_string())?;
-    snapshots
-        .iter()
-        .find(|snapshot| {
-            snapshot.get("snapshot-id").and_then(JsonValue::as_i64) == Some(current_snapshot_id)
-        })
-        .and_then(|snapshot| snapshot.get("manifest-list").and_then(JsonValue::as_str))
-        .map(|path| path.to_string())
-        .ok_or_else(|| {
-            format!(
-                "manifest-list not found for snapshot {}",
-                current_snapshot_id
-            )
-        })
-}
-
-fn encode_partition_data(value: Option<&AvroValue>) -> Result<Option<Vec<u8>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let value = avro_unwrap_union(value);
-    let Some(fields) = avro_record_fields(value) else {
-        return Ok(None);
-    };
-    if fields.is_empty() {
-        return Ok(None);
-    }
-    let mut obj = JsonMap::new();
-    for (name, field_value) in fields {
-        obj.insert(name.clone(), avro_value_to_json(field_value)?);
-    }
-    serde_json::to_vec(&JsonValue::Object(obj))
-        .map(Some)
-        .map_err(|e| format!("serialize partition_data failed: {}", e))
-}
-
-fn encode_column_stats(
-    column_sizes: Option<&Vec<(i32, i64)>>,
-    value_counts: Option<&Vec<(i32, i64)>>,
-    null_value_counts: Option<&Vec<(i32, i64)>>,
-    nan_value_counts: Option<&Vec<(i32, i64)>>,
-    lower_bounds: Option<&Vec<(i32, String)>>,
-    upper_bounds: Option<&Vec<(i32, String)>>,
-) -> Result<Option<Vec<u8>>, String> {
-    if column_sizes.is_none()
-        && value_counts.is_none()
-        && null_value_counts.is_none()
-        && nan_value_counts.is_none()
-        && lower_bounds.is_none()
-        && upper_bounds.is_none()
-    {
-        return Ok(None);
-    }
-    let payload = json!({
-        "column_sizes": map_entries_to_json(column_sizes),
-        "value_counts": map_entries_to_json(value_counts),
-        "null_value_counts": map_entries_to_json(null_value_counts),
-        "nan_value_counts": map_entries_to_json(nan_value_counts),
-        "lower_bounds": string_map_entries_to_json(lower_bounds),
-        "upper_bounds": string_map_entries_to_json(upper_bounds),
-    });
-    serde_json::to_vec(&payload)
-        .map(Some)
-        .map_err(|e| format!("serialize column_stats failed: {}", e))
-}
-
-fn map_entries_to_json(entries: Option<&Vec<(i32, i64)>>) -> JsonValue {
-    let Some(entries) = entries else {
-        return JsonValue::Null;
-    };
-    let mut obj = JsonMap::new();
-    for (key, value) in entries {
-        obj.insert(key.to_string(), JsonValue::from(*value));
-    }
-    JsonValue::Object(obj)
-}
-
-fn string_map_entries_to_json(entries: Option<&Vec<(i32, String)>>) -> JsonValue {
-    let Some(entries) = entries else {
-        return JsonValue::Null;
-    };
-    let mut obj = JsonMap::new();
-    for (key, value) in entries {
-        obj.insert(key.to_string(), JsonValue::from(value.clone()));
-    }
-    JsonValue::Object(obj)
-}
-
-fn avro_record_fields(value: &AvroValue) -> Option<&Vec<(String, AvroValue)>> {
-    match avro_unwrap_union(value) {
-        AvroValue::Record(fields) => Some(fields),
-        _ => None,
-    }
-}
-
-fn avro_field<'a>(fields: &'a [(String, AvroValue)], name: &str) -> Option<&'a AvroValue> {
-    fields
-        .iter()
-        .find(|(field_name, _)| field_name == name)
-        .map(|(_, value)| value)
-}
-
-fn avro_unwrap_union(value: &AvroValue) -> &AvroValue {
-    match value {
-        AvroValue::Union(_, inner) => avro_unwrap_union(inner.as_ref()),
-        other => other,
-    }
-}
-
-fn avro_string(value: Option<&AvroValue>) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::String(value) => Ok(Some(value.clone())),
-        AvroValue::Bytes(value) => Ok(Some(hex::encode(value))),
-        AvroValue::Fixed(_, value) => Ok(Some(hex::encode(value))),
-        AvroValue::Null => Ok(None),
-        other => Err(format!(
-            "expected string-compatible avro value, got {:?}",
-            other
-        )),
-    }
-}
-
-fn avro_string_required(value: Option<&AvroValue>, name: &str) -> Result<String, String> {
-    avro_string(value)?.ok_or_else(|| format!("missing required avro string field {}", name))
-}
-
-fn avro_i32(value: Option<&AvroValue>) -> Result<Option<i32>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Int(value) => Ok(Some(*value)),
-        AvroValue::Long(value) => i32::try_from(*value)
-            .map(Some)
-            .map_err(|_| format!("avro long out of i32 range: {}", value)),
-        AvroValue::Null => Ok(None),
-        other => Err(format!(
-            "expected int-compatible avro value, got {:?}",
-            other
-        )),
-    }
-}
-
-fn avro_i32_required(value: Option<&AvroValue>, name: &str) -> Result<i32, String> {
-    avro_i32(value)?.ok_or_else(|| format!("missing required avro int field {}", name))
-}
-
-fn avro_i64(value: Option<&AvroValue>) -> Result<Option<i64>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Int(value) => Ok(Some(i64::from(*value))),
-        AvroValue::Long(value) => Ok(Some(*value)),
-        AvroValue::Null => Ok(None),
-        other => Err(format!(
-            "expected long-compatible avro value, got {:?}",
-            other
-        )),
-    }
-}
-
-fn avro_i64_required(value: Option<&AvroValue>, name: &str) -> Result<i64, String> {
-    avro_i64(value)?.ok_or_else(|| format!("missing required avro long field {}", name))
-}
-
-fn avro_bytes(value: Option<&AvroValue>) -> Result<Option<Vec<u8>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Bytes(value) => Ok(Some(value.clone())),
-        AvroValue::Fixed(_, value) => Ok(Some(value.clone())),
-        AvroValue::Null => Ok(None),
-        other => Err(format!("expected bytes avro value, got {:?}", other)),
-    }
-}
-
-fn avro_i64_list(value: Option<&AvroValue>) -> Result<Option<Vec<i64>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Array(values) => values
-            .iter()
-            .map(|value| avro_i64_required(Some(value), "list_item"))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        AvroValue::Null => Ok(None),
-        other => Err(format!("expected array avro value, got {:?}", other)),
-    }
-}
-
-fn avro_i32_list(value: Option<&AvroValue>) -> Result<Option<Vec<i32>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Array(values) => values
-            .iter()
-            .map(|value| avro_i32_required(Some(value), "list_item"))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        AvroValue::Null => Ok(None),
-        other => Err(format!("expected array avro value, got {:?}", other)),
-    }
-}
-
-fn avro_int_long_map(value: Option<&AvroValue>) -> Result<Option<Vec<(i32, i64)>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Array(entries) => entries
-            .iter()
-            .map(|entry| {
-                let fields = avro_record_fields(entry)
-                    .ok_or_else(|| "expected avro key/value record".to_string())?;
-                Ok((
-                    avro_i32_required(avro_field(fields, "key"), "key")?,
-                    avro_i64_required(avro_field(fields, "value"), "value")?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        AvroValue::Map(entries) => {
-            let mut out = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                out.push((
-                    key.parse::<i32>()
-                        .map_err(|e| format!("invalid avro map key {}: {}", key, e))?,
-                    avro_i64_required(Some(value), "value")?,
-                ));
-            }
-            Ok(Some(out))
-        }
-        AvroValue::Null => Ok(None),
-        other => Err(format!(
-            "expected map-compatible avro value, got {:?}",
-            other
-        )),
-    }
-}
-
-fn avro_int_string_map(value: Option<&AvroValue>) -> Result<Option<Vec<(i32, String)>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Array(entries) => entries
-            .iter()
-            .map(|entry| {
-                let fields = avro_record_fields(entry)
-                    .ok_or_else(|| "expected avro key/value record".to_string())?;
-                Ok((
-                    avro_i32_required(avro_field(fields, "key"), "key")?,
-                    avro_string_required(avro_field(fields, "value"), "value")?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        AvroValue::Map(entries) => {
-            let mut out = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                out.push((
-                    key.parse::<i32>()
-                        .map_err(|e| format!("invalid avro map key {}: {}", key, e))?,
-                    avro_string_required(Some(value), "value")?,
-                ));
-            }
-            Ok(Some(out))
-        }
-        AvroValue::Null => Ok(None),
-        other => Err(format!(
-            "expected map-compatible avro value, got {:?}",
-            other
-        )),
-    }
-}
-
-fn avro_manifest_partitions(
-    value: Option<&AvroValue>,
-) -> Result<Option<Vec<ManifestPartitionSummary>>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Array(values) => values
-            .iter()
-            .map(|value| {
-                let fields = avro_record_fields(value)
-                    .ok_or_else(|| "expected avro manifest partition summary record".to_string())?;
-                Ok(ManifestPartitionSummary {
-                    contains_null: avro_bool_to_string(avro_field(fields, "contains_null"))?,
-                    contains_nan: avro_bool_to_string(avro_field(fields, "contains_nan"))?,
-                    lower_bound: avro_string(avro_field(fields, "lower_bound"))?,
-                    upper_bound: avro_string(avro_field(fields, "upper_bound"))?,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some),
-        AvroValue::Null => Ok(None),
-        other => Err(format!(
-            "expected array avro value for manifest partitions, got {:?}",
-            other
-        )),
-    }
-}
-
-fn avro_bool_to_string(value: Option<&AvroValue>) -> Result<Option<String>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    match avro_unwrap_union(value) {
-        AvroValue::Boolean(value) => Ok(Some(value.to_string())),
-        AvroValue::Null => Ok(None),
-        other => Err(format!("expected bool avro value, got {:?}", other)),
-    }
-}
-
-fn avro_metadata_i32(metadata: &HashMap<String, Vec<u8>>, key: &str) -> Result<i32, String> {
-    let value = metadata
-        .get(key)
-        .ok_or_else(|| format!("iceberg avro metadata missing key {}", key))?;
-    let text = std::str::from_utf8(value)
-        .map_err(|e| format!("iceberg avro metadata {} is not utf8: {}", key, e))?;
-    text.parse::<i32>()
-        .map_err(|e| format!("parse iceberg avro metadata {} failed: {}", key, e))
-}
-
-fn avro_value_to_json(value: &AvroValue) -> Result<JsonValue, String> {
-    match avro_unwrap_union(value) {
-        AvroValue::Null => Ok(JsonValue::Null),
-        AvroValue::Boolean(value) => Ok(JsonValue::Bool(*value)),
-        AvroValue::Int(value) => Ok(JsonValue::from(*value)),
-        AvroValue::Long(value) => Ok(JsonValue::from(*value)),
-        AvroValue::Float(value) => Ok(JsonValue::from(*value)),
-        AvroValue::Double(value) => Ok(JsonValue::from(*value)),
-        AvroValue::String(value) => Ok(JsonValue::from(value.clone())),
-        AvroValue::Bytes(value) => Ok(JsonValue::from(hex::encode(value))),
-        AvroValue::Fixed(_, value) => Ok(JsonValue::from(hex::encode(value))),
-        AvroValue::Array(values) => values
-            .iter()
-            .map(avro_value_to_json)
-            .collect::<Result<Vec<_>, _>>()
-            .map(JsonValue::Array),
-        AvroValue::Map(values) => {
-            let mut out = JsonMap::new();
-            for (key, value) in values {
-                out.insert(key.clone(), avro_value_to_json(value)?);
-            }
-            Ok(JsonValue::Object(out))
-        }
-        AvroValue::Record(fields) => {
-            let mut out = JsonMap::new();
-            for (key, value) in fields {
-                out.insert(key.clone(), avro_value_to_json(value)?);
-            }
-            Ok(JsonValue::Object(out))
-        }
-        other => Err(format!(
-            "unsupported avro value to json conversion: {:?}",
-            other
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use base64::Engine;
-
     use super::{
-        IcebergMetadataScanRange, adjusted_object_store_config, extract_manifest_list_path,
-        extract_metadata_json_path, load_file_rows, load_manifest_rows,
+        IcebergMetadataScanConfig, IcebergMetadataScanOp, IcebergMetadataTableType,
+        build_i32_i64_map_array, build_i32_utf8_map_array, normalize_metadata_output_type,
     };
+    use crate::common::ids::SlotId;
+    use arrow::array::MapArray;
+    use arrow::datatypes::{DataType, Field};
+    use std::sync::Arc;
 
     #[test]
-    fn extract_metadata_path_prefers_latest_version() {
-        let serialized = "rO0ABXQAJGZpbGU6L3RtcC90L21ldGFkYXRhL3YxLm1ldGFkYXRhLmpzb250AClkZmlsZTovL3RtcC90L21ldGFkYXRhL3YyLm1ldGFkYXRhLmpzb24=";
-        let path = extract_metadata_json_path(serialized).expect("extract metadata path");
-        assert_eq!(path, "file:///tmp/t/metadata/v2.metadata.json");
+    fn test_build_i32_i64_map_array_uses_iceberg_field_names() {
+        let rows = [Some(vec![(1, 10_i64)]), None];
+        let array = build_i32_i64_map_array(rows.iter().map(|row| row.as_ref())).unwrap();
+        let map = array.as_any().downcast_ref::<MapArray>().unwrap();
+        let (key_field, value_field) = map.entries_fields();
+        assert_eq!(key_field.name(), "key");
+        assert_eq!(value_field.name(), "value");
     }
 
     #[test]
-    fn adjusted_object_store_config_fills_bucket_from_path() {
-        let cfg = crate::fs::object_store::ObjectStoreConfig {
-            endpoint: "http://127.0.0.1:9000".to_string(),
-            bucket: String::new(),
-            root: String::new(),
-            access_key_id: "ak".to_string(),
-            access_key_secret: "sk".to_string(),
-            session_token: None,
-            enable_path_style_access: Some(true),
-            region: None,
-            retry_max_times: None,
-            retry_min_delay_ms: None,
-            retry_max_delay_ms: None,
-            timeout_ms: None,
-            io_timeout_ms: None,
-        };
-        let adjusted = adjusted_object_store_config(Some(&cfg), "oss://demo-bucket/path/to/file")
-            .expect("adjusted config");
-        assert_eq!(adjusted.bucket, "demo-bucket");
+    fn test_build_i32_utf8_map_array_uses_iceberg_field_names() {
+        let rows = [Some(vec![(2, "abc".to_string())]), None];
+        let array = build_i32_utf8_map_array(rows.iter().map(|row| row.as_ref())).unwrap();
+        let map = array.as_any().downcast_ref::<MapArray>().unwrap();
+        let (key_field, value_field) = map.entries_fields();
+        assert_eq!(key_field.name(), "key");
+        assert_eq!(value_field.name(), "value");
     }
 
     #[test]
-    fn extract_manifest_list_path_from_local_metadata_json() {
-        let bytes = std::fs::read(
-            "/Users/harbor/project/NovaRocks/sql-tests/.sql_test_catalog/tpch/customer/metadata/v2.metadata.json",
-        )
-        .expect("read metadata json");
-        let path = extract_manifest_list_path(&bytes).expect("extract manifest list path");
-        assert!(path.ends_with(".avro"));
-        assert!(path.contains("snap-"));
-    }
-
-    #[test]
-    fn load_manifest_rows_from_local_catalog() {
-        let serialized = base64::engine::general_purpose::STANDARD.encode(
-            b"file:///Users/harbor/project/NovaRocks/sql-tests/.sql_test_catalog/tpch/customer/metadata/v2.metadata.json",
+    fn test_normalize_metadata_output_type_makes_map_keys_non_nullable() {
+        let ty = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, true)),
+                        Arc::new(Field::new("value", DataType::Int64, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
         );
-        let rows = load_manifest_rows(&serialized, None).expect("load manifest rows");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].path.ends_with(".avro"));
+        let normalized = normalize_metadata_output_type(&ty);
+        let DataType::Map(entries, _) = normalized else {
+            panic!("expected map type");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected map entries struct");
+        };
+        assert!(!fields[0].is_nullable());
+        assert!(fields[1].is_nullable());
     }
 
     #[test]
-    fn load_file_rows_from_local_catalog() {
-        let range = IcebergMetadataScanRange {
-            path: "/Users/harbor/project/NovaRocks/sql-tests/.sql_test_catalog/tpch/customer/metadata/2a1f36d0-237d-41b0-9dec-6b3228da8fba-m0.avro".to_string(),
-        };
-        let rows = load_file_rows(&range, None).expect("load file rows");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].spec_id, 0);
-        assert!(rows[0].value_counts.is_some());
+    fn test_metadata_scan_requires_embedded_jvm_config() {
+        let err = IcebergMetadataScanOp::new(IcebergMetadataScanConfig {
+            metadata_table_type: IcebergMetadataTableType::Files,
+            serialized_table: String::new(),
+            serialized_predicate: String::new(),
+            load_column_stats: false,
+            ranges: Vec::new(),
+            batch_size: 1,
+            output_columns: vec![super::IcebergMetadataOutputColumn {
+                name: "content".to_string(),
+                slot_id: SlotId::new(1),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+            profile_label: None,
+        })
+        .expect_err("embedded JVM gate should reject metadata scans by default");
+        if cfg!(feature = "embedded-jvm") {
+            assert!(err.contains("[iceberg].enable_embedded_jvm"));
+        } else {
+            assert!(err.contains("built without the `embedded-jvm` feature"));
+        }
     }
 }

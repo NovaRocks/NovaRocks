@@ -1,5 +1,6 @@
 /bin
 /log
+/java/iceberg-metadata-bridge/target
 /novarocks.log
 /novarocks.pid
 /novarocks.toml

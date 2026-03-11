@@ -51,4 +51,5 @@ mod element_at;
 mod test_utils;
 
 pub use array_map::eval_array_map;
+pub(crate) use common::compare_values_with_null;
 pub use dispatch::{eval_array_function, metadata, register};

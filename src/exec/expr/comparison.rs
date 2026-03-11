@@ -17,7 +17,7 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Builder, ListArray, StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Date32Builder, ListArray, MapArray, StringArray, StructArray,
     TimestampMicrosecondBuilder,
 };
 use arrow::compute::cast;
@@ -320,6 +320,17 @@ fn compare_value_recursive(
             .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
         return compare_struct_rows(l, left_idx, r, right_idx);
     }
+    if matches!(left.data_type(), DataType::Map(_, _)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+        return compare_map_rows(l, left_idx, r, right_idx);
+    }
     compare_scalar_non_null(left, left_idx, right, right_idx).map(Some)
 }
 
@@ -354,6 +365,28 @@ fn compare_value_recursive_in_list(
             .downcast_ref::<ListArray>()
             .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
         return compare_list_rows_non_null(l, left_idx, r, right_idx);
+    }
+    if matches!(left.data_type(), DataType::Struct(_)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+        return compare_struct_rows_non_null(l, left_idx, r, right_idx);
+    }
+    if matches!(left.data_type(), DataType::Map(_, _)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+        return compare_map_rows_non_null(l, left_idx, r, right_idx);
     }
     compare_scalar_non_null(left, left_idx, right, right_idx)
 }
@@ -432,6 +465,80 @@ fn compare_struct_rows(
     }
 }
 
+fn compare_struct_rows_non_null(
+    left: &StructArray,
+    left_row: usize,
+    right: &StructArray,
+    right_row: usize,
+) -> Result<Ordering, String> {
+    if left.columns().len() != right.columns().len() {
+        return Err(format!(
+            "struct compare field count mismatch: {} vs {}",
+            left.columns().len(),
+            right.columns().len()
+        ));
+    }
+
+    for (left_col, right_col) in left.columns().iter().zip(right.columns()) {
+        let ord = compare_value_recursive_in_list(left_col, left_row, right_col, right_row)?;
+        if ord != Ordering::Equal {
+            return Ok(ord);
+        }
+    }
+
+    Ok(Ordering::Equal)
+}
+
+fn compare_map_rows_non_null(
+    left: &MapArray,
+    left_row: usize,
+    right: &MapArray,
+    right_row: usize,
+) -> Result<Ordering, String> {
+    let left_offsets = left.value_offsets();
+    let right_offsets = right.value_offsets();
+    let left_start = left_offsets[left_row] as usize;
+    let left_end = left_offsets[left_row + 1] as usize;
+    let right_start = right_offsets[right_row] as usize;
+    let right_end = right_offsets[right_row + 1] as usize;
+    let left_len = left_end.saturating_sub(left_start);
+    let right_len = right_end.saturating_sub(right_start);
+    let min_len = left_len.min(right_len);
+
+    let left_keys = left.keys();
+    let right_keys = right.keys();
+    let left_values = left.values();
+    let right_values = right.values();
+    for idx in 0..min_len {
+        let left_idx = left_start + idx;
+        let right_idx = right_start + idx;
+        let key_ord =
+            compare_value_recursive_in_list(&left_keys, left_idx, &right_keys, right_idx)?;
+        if key_ord != Ordering::Equal {
+            return Ok(key_ord);
+        }
+        let value_ord =
+            compare_value_recursive_in_list(&left_values, left_idx, &right_values, right_idx)?;
+        if value_ord != Ordering::Equal {
+            return Ok(value_ord);
+        }
+    }
+
+    Ok(left_len.cmp(&right_len))
+}
+
+fn compare_map_rows(
+    left: &MapArray,
+    left_row: usize,
+    right: &MapArray,
+    right_row: usize,
+) -> Result<Option<Ordering>, String> {
+    if left.is_null(left_row) || right.is_null(right_row) {
+        return Ok(None);
+    }
+    compare_map_rows_non_null(left, left_row, right, right_row).map(Some)
+}
+
 fn eq_value_recursive_null_safe(
     left: &ArrayRef,
     left_idx: usize,
@@ -471,6 +578,17 @@ fn eq_value_recursive_null_safe(
             .downcast_ref::<StructArray>()
             .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
         return eq_struct_rows_null_safe(l, left_idx, r, right_idx);
+    }
+    if matches!(left.data_type(), DataType::Map(_, _)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+        return eq_map_rows_null_safe(l, left_idx, r, right_idx);
     }
     Ok(compare_scalar_non_null(left, left_idx, right, right_idx)? == Ordering::Equal)
 }
@@ -532,6 +650,47 @@ fn eq_struct_rows_null_safe(
 
     for (left_col, right_col) in left.columns().iter().zip(right.columns()) {
         if !eq_value_recursive_null_safe(left_col, left_row, right_col, right_row)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn eq_map_rows_null_safe(
+    left: &MapArray,
+    left_row: usize,
+    right: &MapArray,
+    right_row: usize,
+) -> Result<bool, String> {
+    let left_is_null = left.is_null(left_row);
+    let right_is_null = right.is_null(right_row);
+    if left_is_null || right_is_null {
+        return Ok(left_is_null && right_is_null);
+    }
+
+    let left_offsets = left.value_offsets();
+    let right_offsets = right.value_offsets();
+    let left_start = left_offsets[left_row] as usize;
+    let left_end = left_offsets[left_row + 1] as usize;
+    let right_start = right_offsets[right_row] as usize;
+    let right_end = right_offsets[right_row + 1] as usize;
+    let left_len = left_end.saturating_sub(left_start);
+    let right_len = right_end.saturating_sub(right_start);
+    if left_len != right_len {
+        return Ok(false);
+    }
+
+    let left_keys = left.keys();
+    let right_keys = right.keys();
+    let left_values = left.values();
+    let right_values = right.values();
+    for idx in 0..left_len {
+        let left_idx = left_start + idx;
+        let right_idx = right_start + idx;
+        if !eq_value_recursive_null_safe(&left_keys, left_idx, &right_keys, right_idx)? {
+            return Ok(false);
+        }
+        if !eq_value_recursive_null_safe(&left_values, left_idx, &right_values, right_idx)? {
             return Ok(false);
         }
     }
@@ -752,7 +911,10 @@ pub fn eval_eq(
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    if matches!(l_norm.data_type(), DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        l_norm.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
         return eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Equal);
     }
     let result = eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
@@ -780,7 +942,10 @@ pub fn eval_ne(
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    if matches!(l_norm.data_type(), DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        l_norm.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
         return eval_nested_compare(&l_norm, &r_norm, |ord| ord != Ordering::Equal);
     }
     let result = neq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
@@ -796,7 +961,10 @@ pub fn eval_lt(
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    if matches!(l_norm.data_type(), DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        l_norm.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
         return eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Less);
     }
     let result = lt(&l_norm, &r_norm).map_err(|e| e.to_string())?;
@@ -812,7 +980,10 @@ pub fn eval_le(
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    if matches!(l_norm.data_type(), DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        l_norm.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
         return eval_nested_compare(&l_norm, &r_norm, |ord| {
             ord == Ordering::Less || ord == Ordering::Equal
         });
@@ -830,7 +1001,10 @@ pub fn eval_gt(
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    if matches!(l_norm.data_type(), DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        l_norm.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
         return eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Greater);
     }
     let result = gt(&l_norm, &r_norm).map_err(|e| e.to_string())?;
@@ -846,7 +1020,10 @@ pub fn eval_ge(
     let l = arena.eval(left, chunk)?;
     let r = arena.eval(right, chunk)?;
     let (l_norm, r_norm) = normalize_comparison_types(l, r)?;
-    if matches!(l_norm.data_type(), DataType::List(_) | DataType::Struct(_)) {
+    if matches!(
+        l_norm.data_type(),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
+    ) {
         return eval_nested_compare(&l_norm, &r_norm, |ord| {
             ord == Ordering::Greater || ord == Ordering::Equal
         });
@@ -1071,7 +1248,8 @@ mod tests {
     use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
-        BooleanArray, Decimal128Array, Int32Array, Int64Array, ListArray, StringArray, StructArray,
+        BooleanArray, Decimal128Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
+        ListArray, MapArray, MapBuilder, MapFieldNames, StringArray, StructArray,
     };
     use arrow::datatypes::{Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
@@ -1129,6 +1307,42 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             field_with_slot_id(Field::new("l", struct_type.clone(), true), SlotId::new(1)),
             field_with_slot_id(Field::new("r", struct_type, true), SlotId::new(2)),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
+        Chunk::new(batch)
+    }
+
+    fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {
+        let mut builder = MapBuilder::new(
+            Some(MapFieldNames {
+                entry: "entries".to_string(),
+                key: "key".to_string(),
+                value: "value".to_string(),
+            }),
+            Int32Builder::new(),
+            Int64Builder::new(),
+        );
+        for row in rows {
+            match row {
+                Some(entries) => {
+                    for (key, value) in *entries {
+                        builder.keys().append_value(*key);
+                        builder.values().append_value(*value);
+                    }
+                    builder.append(true).unwrap();
+                }
+                None => builder.append(false).unwrap(),
+            }
+        }
+        builder.finish()
+    }
+
+    fn create_test_chunk_map_i32_i64(left: MapArray, right: MapArray, map_type: DataType) -> Chunk {
+        let left = Arc::new(left) as ArrayRef;
+        let right = Arc::new(right) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![
+            field_with_slot_id(Field::new("l", map_type.clone(), true), SlotId::new(1)),
+            field_with_slot_id(Field::new("r", map_type, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
         Chunk::new(batch)
@@ -1465,5 +1679,61 @@ mod tests {
         assert_eq!(out.value(0), true);
         assert_eq!(out.value(1), false);
         assert_eq!(out.value(2), true);
+    }
+
+    #[test]
+    fn test_eq_map_arrays() {
+        let mut arena = ExprArena::default();
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", DataType::Int64, true),
+            ])),
+            false,
+        ));
+        let map_type = DataType::Map(entries_field, false);
+        let left =
+            create_test_map_array(&[Some(&[(0, 10), (1, 11)]), Some(&[(0, 10), (1, 11)]), None]);
+        let right =
+            create_test_map_array(&[Some(&[(0, 10), (1, 11)]), Some(&[(0, 10), (1, 12)]), None]);
+        let chunk = create_test_chunk_map_i32_i64(left, right, map_type.clone());
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type.clone());
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), map_type);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(1), false);
+        assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn test_eq_for_null_map_arrays() {
+        let mut arena = ExprArena::default();
+        let entries_field = Arc::new(Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", DataType::Int64, true),
+            ])),
+            false,
+        ));
+        let map_type = DataType::Map(entries_field, false);
+        let left =
+            create_test_map_array(&[None, Some(&[(0, 10), (1, 11)]), Some(&[(0, 10), (1, 11)])]);
+        let right =
+            create_test_map_array(&[None, Some(&[(0, 10), (1, 11)]), Some(&[(0, 10), (1, 12)])]);
+        let chunk = create_test_chunk_map_i32_i64(left, right, map_type.clone());
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type.clone());
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), map_type);
+        let expr = arena.push_typed(ExprNode::EqForNull(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(1), true);
+        assert_eq!(out.value(2), false);
     }
 }

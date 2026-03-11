@@ -11,8 +11,8 @@ log_level = "info"
 # log_filter = "info"
 
 [server]
-# Service bind host. Default: "0.0.0.0".
-host = "0.0.0.0"
+# Service bind host. Default: "127.0.0.1".
+host = "127.0.0.1"
 # Optional StarRocks-style advertise IP selector in CIDR form.
 # Use semicolon-separated entries when the machine has multiple NICs/IPs.
 # Example: "10.10.10.0/24;192.168.0.0/16"
