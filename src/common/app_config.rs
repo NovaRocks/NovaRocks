@@ -194,7 +194,7 @@ pub struct ServerConfig {
 }
 
 fn default_server_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 fn default_heartbeat_port() -> u16 {
     9050
@@ -807,6 +807,18 @@ http_port = 8040
         )
         .expect("parse config");
         assert!(cfg.server.priority_networks.is_empty());
+    }
+
+    #[test]
+    fn test_server_host_default_is_loopback() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[server]
+http_port = 8040
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.server.host, "127.0.0.1");
     }
 
     #[test]

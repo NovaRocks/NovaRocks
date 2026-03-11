@@ -84,10 +84,7 @@ fn status_error(status: Option<&proto::starrocks::StatusPb>, rpc: &str) -> Resul
     if status.error_msgs.is_empty() {
         return Err(format!("{rpc} returned status_code={}", status.status_code));
     }
-    Err(format!(
-        "{rpc} failed: {}",
-        status.error_msgs.join("; ")
-    ))
+    Err(format!("{rpc} failed: {}", status.error_msgs.join("; ")))
 }
 
 fn call_unary<Request, Response>(
@@ -187,7 +184,8 @@ pub fn transmit_runtime_filter(
 ) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = maybe_transmit_runtime_filter_hook(dest_host, dest_port, params.clone()) {
-        return result.and_then(|resp| status_error(resp.status.as_ref(), "transmit_runtime_filter"));
+        return result
+            .and_then(|resp| status_error(resp.status.as_ref(), "transmit_runtime_filter"));
     }
 
     let response: proto::starrocks::PTransmitRuntimeFilterResult = call_unary(
@@ -253,16 +251,14 @@ type LookupHook = std::sync::Arc<
 >;
 
 #[cfg(test)]
-fn transmit_chunk_hook(
-) -> &'static std::sync::Mutex<Option<TransmitChunkHook>> {
+fn transmit_chunk_hook() -> &'static std::sync::Mutex<Option<TransmitChunkHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TransmitChunkHook>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[cfg(test)]
-fn transmit_runtime_filter_hook(
-) -> &'static std::sync::Mutex<Option<TransmitRuntimeFilterHook>> {
+fn transmit_runtime_filter_hook() -> &'static std::sync::Mutex<Option<TransmitRuntimeFilterHook>> {
     static HOOK: std::sync::OnceLock<std::sync::Mutex<Option<TransmitRuntimeFilterHook>>> =
         std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(None))

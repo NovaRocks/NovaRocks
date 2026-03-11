@@ -291,8 +291,11 @@ impl FetchProcessor {
                     data: Some(data),
                 });
         }
-        let resp =
-            internal_rpc_client::lookup(&node_info.host, node_info.async_internal_port as u16, req)?;
+        let resp = internal_rpc_client::lookup(
+            &node_info.host,
+            node_info.async_internal_port as u16,
+            req,
+        )?;
         if let Some(status) = resp.status.as_ref() {
             if status.status_code != 0 {
                 return Err(format!("lookup failed: {:?}", status.error_msgs));
