@@ -1121,6 +1121,13 @@ impl OlapTableSinkOperator {
         Ok(())
     }
 
+    fn prepare_sink_chunks(&self, chunks: &[Chunk]) -> Result<Vec<Chunk>, String> {
+        chunks
+            .iter()
+            .map(|chunk| self.project_chunk_for_sink_output(chunk))
+            .collect()
+    }
+
     fn project_chunk_for_sink_output(&self, chunk: &Chunk) -> Result<Chunk, String> {
         let Some(projection) = self.plan.output_projection.as_ref() else {
             return Ok(chunk.clone());
@@ -1256,14 +1263,14 @@ impl OlapTableSinkOperator {
         let mut flush_loaded_rows_delta = 0_i64;
         let mut flush_filtered_rows_delta = 0_i64;
         let flush_result: Result<(), String> = (|| {
-            self.ensure_auto_partitions_for_chunks(&pending_chunks)?;
+            let sink_chunks = self.prepare_sink_chunks(&pending_chunks)?;
+            self.ensure_auto_partitions_for_chunks(&sink_chunks)?;
             let index_write_plans = self.index_write_plans.clone();
             let mut buffered_by_tablet = BTreeMap::<i64, TabletBufferedState>::new();
-            for chunk in &pending_chunks {
-                if chunk.is_empty() {
+            for sink_chunk in &sink_chunks {
+                if sink_chunk.is_empty() {
                     continue;
                 }
-                let sink_chunk = self.project_chunk_for_sink_output(chunk)?;
                 let chunk_random_hash_seed = self.next_random_hash;
                 let mut first_plan_next_random_hash = chunk_random_hash_seed;
                 for (plan_idx, index_plan) in index_write_plans.iter().enumerate() {
@@ -2988,6 +2995,56 @@ mod tests {
             .expect("op column should be Int8");
         assert_eq!(op_array.value(0), 0);
         assert_eq!(op_array.value(1), 0);
+    }
+
+    #[test]
+    fn prepare_sink_chunks_projects_partition_columns_before_auto_partition() {
+        let tmp = tempdir().expect("create tempdir");
+        let tablet_id = 9905;
+        let partition_id = 3005;
+        let tablet_root_path = tmp.path().join("tablet_9905").to_string_lossy().to_string();
+        let base_plan = build_test_plan(
+            tablet_root_path,
+            7005,
+            tablet_id,
+            partition_id,
+            test_tablet_schema(),
+        );
+        let mut arena = ExprArena::default();
+        let ts_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int64);
+        let projection = SinkOutputProjectionPlan {
+            arena: Arc::new(arena),
+            expr_ids: vec![ts_expr],
+            output_slot_ids: vec![SlotId::new(7)],
+            output_field_names: vec!["ts".to_string()],
+        };
+        let plan = Arc::new(OlapTableSinkPlan {
+            output_projection: Some(projection),
+            ..(*base_plan).clone()
+        });
+        let op = OlapTableSinkOperator::new("OLAP_TABLE_SINK".to_string(), plan, 0);
+        let raw_chunk = one_col_chunk(vec![1_196_440_219]);
+
+        let raw_values = super::collect_partition_values_from_chunk(
+            &raw_chunk,
+            &[SlotId::new(7)],
+            &[String::from("ts")],
+        );
+        assert!(raw_values.is_err());
+
+        let projected_chunks = op
+            .prepare_sink_chunks(std::slice::from_ref(&raw_chunk))
+            .expect("prepare sink chunks");
+        let projected_values = super::collect_partition_values_from_chunk(
+            &projected_chunks[0],
+            &[SlotId::new(7)],
+            &[String::from("ts")],
+        )
+        .expect("collect projected partition values");
+        assert_eq!(
+            projected_values.into_iter().collect::<Vec<_>>(),
+            vec![vec!["1196440219".to_string()]]
+        );
     }
 
     #[test]

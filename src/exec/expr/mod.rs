@@ -137,6 +137,7 @@ pub struct ExprArena {
     types: Vec<DataType>,
     allow_throw_exception: bool,
     query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
+    session_time_zone: Option<String>,
 }
 
 impl ExprArena {
@@ -173,6 +174,14 @@ impl ExprArena {
 
     pub fn query_global_dict(&self, slot_id: SlotId) -> Option<&Arc<HashMap<i32, Vec<u8>>>> {
         self.query_global_dicts.get(&slot_id)
+    }
+
+    pub fn set_session_time_zone(&mut self, time_zone: Option<String>) {
+        self.session_time_zone = time_zone;
+    }
+
+    pub fn session_time_zone(&self) -> Option<&str> {
+        self.session_time_zone.as_deref()
     }
 
     pub fn eval(&self, id: ExprId, chunk: &Chunk) -> Result<ArrayRef, String> {

@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use crate::exec::expr::agg::functions::common::{
     AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array,
 };
-use crate::exec::expr::function::object::percentile_functions::{numeric_value_at, payload_bytes_at};
+use crate::exec::expr::function::object::percentile_functions::{
+    numeric_value_at, payload_bytes_at,
+};
 use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
@@ -132,12 +134,10 @@ fn apply_rate(state: &mut ExactPercentileState, rate: f64) -> Result<(), String>
         return Err("Percentile rate must be between 0 and 1".to_string());
     }
     match state.rate {
-        Some(existing) if (existing - rate).abs() > f64::EPSILON => {
-            Err(format!(
-                "percentile rate mismatch while merging states: existing={} incoming={}",
-                existing, rate
-            ))
-        }
+        Some(existing) if (existing - rate).abs() > f64::EPSILON => Err(format!(
+            "percentile rate mismatch while merging states: existing={} incoming={}",
+            existing, rate
+        )),
         Some(_) => Ok(()),
         None => {
             state.rate = Some(rate);
@@ -247,28 +247,35 @@ fn update_from_struct(
     Ok(())
 }
 
-fn finalize_cont(state: &ExactPercentileState, output_type: &DataType) -> Result<Option<AggScalarValue>, String> {
+fn finalize_cont(
+    state: &ExactPercentileState,
+    output_type: &DataType,
+) -> Result<Option<AggScalarValue>, String> {
     if state.values.is_empty() {
         return Ok(None);
     }
     let rate = state.rate.unwrap_or(0.0);
     let mut values: Vec<AggScalarValue> = state.values.iter().map(serializable_to_scalar).collect();
-    values.sort_by(|left, right| compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_by(|left, right| {
+        compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     if values.len() == 1 || rate == 1.0 {
         return match output_type {
-            DataType::Float64 => Ok(Some(AggScalarValue::Float64(
-                numeric_from_scalar(values.last().expect("last"), "percentile_cont")?,
-            ))),
+            DataType::Float64 => Ok(Some(AggScalarValue::Float64(numeric_from_scalar(
+                values.last().expect("last"),
+                "percentile_cont",
+            )?))),
             _ => Ok(Some(values.last().expect("last").clone())),
         };
     }
 
     if rate == 0.0 {
         return match output_type {
-            DataType::Float64 => Ok(Some(AggScalarValue::Float64(
-                numeric_from_scalar(values.first().expect("first"), "percentile_cont")?,
-            ))),
+            DataType::Float64 => Ok(Some(AggScalarValue::Float64(numeric_from_scalar(
+                values.first().expect("first"),
+                "percentile_cont",
+            )?))),
             _ => Ok(Some(values.first().expect("first").clone())),
         };
     }
@@ -278,9 +285,10 @@ fn finalize_cont(state: &ExactPercentileState, output_type: &DataType) -> Result
     let fraction = u - index as f64;
     if fraction == 0.0 {
         return match output_type {
-            DataType::Float64 => Ok(Some(AggScalarValue::Float64(
-                numeric_from_scalar(&values[index], "percentile_cont")?,
-            ))),
+            DataType::Float64 => Ok(Some(AggScalarValue::Float64(numeric_from_scalar(
+                &values[index],
+                "percentile_cont",
+            )?))),
             _ => Ok(Some(values[index].clone())),
         };
     }
@@ -297,7 +305,9 @@ fn finalize_disc(state: &ExactPercentileState) -> Result<Option<AggScalarValue>,
     }
     let rate = state.rate.unwrap_or(0.0);
     let mut values: Vec<AggScalarValue> = state.values.iter().map(serializable_to_scalar).collect();
-    values.sort_by(|left, right| compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal));
+    values.sort_by(|left, right| {
+        compare_scalar_values(left, right).unwrap_or(std::cmp::Ordering::Equal)
+    });
     if values.len() == 1 || rate == 1.0 {
         return Ok(values.last().cloned());
     }
@@ -320,7 +330,12 @@ impl AggregateFunction for PercentilePlaceholderAgg {
             "percentile_cont" => AggKind::PercentileCont,
             "percentile_disc" => AggKind::PercentileDisc,
             "percentile_disc_lc" => AggKind::PercentileDiscLc,
-            other => return Err(format!("unsupported percentile aggregate function: {}", other)),
+            other => {
+                return Err(format!(
+                    "unsupported percentile aggregate function: {}",
+                    other
+                ));
+            }
         };
         let output_type = sig
             .output_type
@@ -397,7 +412,12 @@ impl AggregateFunction for PercentilePlaceholderAgg {
             return Err("percentile_disc/cont input type mismatch".to_string());
         };
         if let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() {
-            update_from_struct(struct_array, offset, state_ptrs, "percentile_disc_cont_update")
+            update_from_struct(
+                struct_array,
+                offset,
+                state_ptrs,
+                "percentile_disc_cont_update",
+            )
         } else {
             merge_payload_array(array, offset, state_ptrs, "percentile_disc_cont_update")
         }
@@ -445,7 +465,10 @@ impl AggregateFunction for PercentilePlaceholderAgg {
             let value = unsafe { get_state(ptr) }.map_or(Ok(None), |state| match &spec.kind {
                 AggKind::PercentileCont => finalize_cont(state, output_type),
                 AggKind::PercentileDisc | AggKind::PercentileDiscLc => finalize_disc(state),
-                other => Err(format!("unexpected percentile placeholder kind: {:?}", other)),
+                other => Err(format!(
+                    "unexpected percentile placeholder kind: {:?}",
+                    other
+                )),
             })?;
             values.push(value);
         }

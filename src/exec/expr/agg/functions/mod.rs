@@ -128,15 +128,15 @@ mod map_agg;
 mod max;
 mod max_by;
 mod min;
+mod minmax_n;
 mod multi_distinct_sum;
 mod percentile;
 mod percentile_placeholder;
 mod retention;
-mod sum_map;
 mod sum;
+mod sum_map;
 mod variance;
 mod window_funnel;
-mod minmax_n;
 
 use any_value::AnyValueAgg;
 use approx_top_k::ApproxTopKAgg;
@@ -159,13 +159,13 @@ use map_agg::MapAggAgg;
 use max::MaxAgg;
 use max_by::MaxMinByAgg;
 use min::MinAgg;
-use multi_distinct_sum::MultiDistinctSumAgg;
 use minmax_n::MinMaxNAgg;
+use multi_distinct_sum::MultiDistinctSumAgg;
 use percentile::PercentileAgg;
 use percentile_placeholder::PercentilePlaceholderAgg;
 use retention::RetentionAgg;
-use sum_map::SumMapAgg;
 use sum::SumAgg;
+use sum_map::SumMapAgg;
 use variance::VarStdAgg;
 use window_funnel::WindowFunnelAgg;
 
@@ -265,9 +265,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         | "stddev_pop" | "stddev_samp" | "std" => Ok(&VAR_STD),
         "any_value" => Ok(&ANY_VALUE),
         "percentile_union" | "percentile_approx" | "percentile_approx_weighted" => Ok(&PERCENTILE),
-        "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => {
-            Ok(&PERCENTILE_PLACEHOLDER)
-        }
+        "percentile_disc" | "percentile_cont" | "percentile_disc_lc" => Ok(&PERCENTILE_PLACEHOLDER),
         "bool_or" | "boolor_agg" => Ok(&BOOL_OR),
         "covar_pop" | "covar_samp" | "corr" => Ok(&COVAR_CORR),
         "max_by" | "min_by" | "max_by_v2" | "min_by_v2" => Ok(&MAX_MIN_BY),
@@ -349,12 +347,12 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::DsHllHash | AggKind::DsHllMerge | AggKind::DsHllCount => &DS_HLL,
         AggKind::BitmapAgg => &BITMAP_UNION_INT,
         AggKind::BitmapUnionInt => &BITMAP_UNION_INT,
-        AggKind::PercentileUnion | AggKind::PercentileApprox | AggKind::PercentileApproxWeighted => {
-            &PERCENTILE
+        AggKind::PercentileUnion
+        | AggKind::PercentileApprox
+        | AggKind::PercentileApproxWeighted => &PERCENTILE,
+        AggKind::PercentileCont | AggKind::PercentileDisc | AggKind::PercentileDiscLc => {
+            &PERCENTILE_PLACEHOLDER
         }
-        AggKind::PercentileCont
-        | AggKind::PercentileDisc
-        | AggKind::PercentileDiscLc => &PERCENTILE_PLACEHOLDER,
         AggKind::ApproxTopK => &APPROX_TOP_K,
         AggKind::HllRawHash | AggKind::HllRawMerge | AggKind::HllUnionCount => &HLL_RAW,
         AggKind::MinN | AggKind::MaxN => &MIN_MAX_N,

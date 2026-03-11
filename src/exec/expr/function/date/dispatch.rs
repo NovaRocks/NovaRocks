@@ -422,7 +422,7 @@ static DATE_METADATA: &[FunctionMeta] = &[
     FunctionMeta {
         name: "from_unixtime",
         min_args: 1,
-        max_args: 1,
+        max_args: 3,
     },
     FunctionMeta {
         name: "from_unixtime_ms",
@@ -1321,16 +1321,60 @@ mod tests {
         let chunk = chunk_len_1();
         let expr_ts = typed_null(&mut arena, DataType::Timestamp(TimeUnit::Microsecond, None));
         let expr_i64 = typed_null(&mut arena, DataType::Int64);
+        let expr_str = typed_null(&mut arena, DataType::Utf8);
 
-        let micros = literal_i64(&mut arena, 1_000_000);
+        let secs_one = literal_i64(&mut arena, 1);
+        let expected_local = Local
+            .timestamp_opt(1, 0)
+            .single()
+            .map(|dt| dt.naive_local().and_utc().timestamp_micros())
+            .unwrap();
         assert_eq!(
-            eval_ts("from_unixtime", &arena, expr_ts, &[micros], &chunk),
-            dt_micros("1970-01-01 00:00:01")
+            eval_ts("from_unixtime", &arena, expr_ts, &[secs_one], &chunk),
+            expected_local
         );
         let millis = literal_i64(&mut arena, 1_000);
         assert_eq!(
             eval_ts("from_unixtime_ms", &arena, expr_ts, &[millis], &chunk),
-            dt_micros("1970-01-01 00:00:01")
+            expected_local
+        );
+        let secs_two = literal_i64(&mut arena, 1);
+        let fmt_date = literal_string(&mut arena, "%Y-%m-%d");
+        assert_eq!(
+            eval_str(
+                "from_unixtime",
+                &arena,
+                expr_str,
+                &[secs_two, fmt_date],
+                &chunk
+            ),
+            "1970-01-01"
+        );
+        let secs_three = literal_i64(&mut arena, 1);
+        let fmt_dt = literal_string(&mut arena, "yyyy-MM-dd HH:mm:ss");
+        let tz = literal_string(&mut arena, "UTC");
+        assert_eq!(
+            eval_str(
+                "from_unixtime",
+                &arena,
+                expr_str,
+                &[secs_three, fmt_dt, tz],
+                &chunk
+            ),
+            "1970-01-01 00:00:01"
+        );
+        arena.set_session_time_zone(Some("+10:00".to_string()));
+        let secs_four = literal_i64(&mut arena, 1_196_440_219);
+        let fmt_session = literal_string(&mut arena, "yyyy-MM-dd HH:mm:ss");
+        assert_eq!(
+            eval_str(
+                "from_unixtime",
+                &arena,
+                expr_str,
+                &[secs_four, fmt_session],
+                &chunk
+            ),
+            "2007-12-01 02:30:19"
         );
 
         let dt = literal_string(&mut arena, "1970-01-01 00:00:01");

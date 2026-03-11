@@ -24,9 +24,7 @@ use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array,
-};
+use super::common::{AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array};
 
 pub(super) struct SumMapAgg;
 
@@ -69,7 +67,10 @@ impl AggregateFunction for SumMapAgg {
             kind: AggKind::SumMap,
             output_type,
             intermediate_type,
-            input_arg_type: func.types.as_ref().and_then(|sig| sig.input_arg_type.clone()),
+            input_arg_type: func
+                .types
+                .as_ref()
+                .and_then(|sig| sig.input_arg_type.clone()),
             count_all: false,
         })
     }
@@ -231,7 +232,10 @@ fn compare_optional_scalars(
     }
 }
 
-fn sum_scalar_in_place(target: &mut AggScalarValue, incoming: &AggScalarValue) -> Result<(), String> {
+fn sum_scalar_in_place(
+    target: &mut AggScalarValue,
+    incoming: &AggScalarValue,
+) -> Result<(), String> {
     match (target, incoming) {
         (AggScalarValue::Int64(left), AggScalarValue::Int64(right)) => {
             *left = left
