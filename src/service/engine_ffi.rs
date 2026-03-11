@@ -28,9 +28,12 @@ use crate::connector::starrocks::lake::{
 use crate::novarocks_logging::error;
 use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
-    DeleteTabletRequest, DropTableRequest, PublishLogVersionBatchRequest, PublishLogVersionRequest,
+    DeleteTabletRequest, DropTableRequest, PLookUpRequest, PLookUpResponse,
+    PTransmitChunkParams, PTransmitChunkResult, PTransmitRuntimeFilterParams,
+    PTransmitRuntimeFilterResult, PublishLogVersionBatchRequest, PublishLogVersionRequest,
     PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
+use crate::service::internal_rpc;
 use crate::{FetchResult, UniqueId};
 use prost::Message;
 
@@ -102,6 +105,50 @@ fn write_bytes_buf(bytes: Vec<u8>, out: *mut NovaRocksRustBuf) {
         let ptr = Box::into_raw(boxed) as *mut u8;
         *out = NovaRocksRustBuf { ptr, len };
     }
+}
+
+fn init_out_buf(out: *mut NovaRocksRustBuf) {
+    unsafe {
+        if !out.is_null() {
+            (*out).ptr = std::ptr::null_mut();
+            (*out).len = 0;
+        }
+    }
+}
+
+fn handle_unary_proto_rpc<Request, Response, F>(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+    rpc_name: &str,
+    handler: F,
+) -> i32
+where
+    Request: Message + Default,
+    Response: Message,
+    F: FnOnce(Request) -> Response,
+{
+    init_out_buf(out_resp);
+    init_out_buf(out_err);
+    if ptr.is_null() {
+        write_string_buf(format!("{rpc_name} request ptr is null"), out_err);
+        return 2;
+    }
+
+    let req_bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let request = match Request::decode(req_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = format!("decode {rpc_name} request failed: {e}");
+            write_string_buf(err.clone(), out_err);
+            error!(target: "novarocks::ffi", error = %err, rpc = rpc_name, "decode failed");
+            return 2;
+        }
+    };
+
+    write_bytes_buf(handler(request).encode_to_vec(), out_resp);
+    0
 }
 
 #[unsafe(no_mangle)]
@@ -178,6 +225,57 @@ pub extern "C" fn novarocks_rs_fetch_result_batch(
 pub extern "C" fn novarocks_rs_cancel(finst_id_hi: i64, finst_id_lo: i64) -> i32 {
     crate::cancel(unique_id(finst_id_hi, finst_id_lo));
     0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_transmit_chunk(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    handle_unary_proto_rpc::<PTransmitChunkParams, PTransmitChunkResult, _>(
+        ptr,
+        len,
+        out_resp,
+        out_err,
+        "transmit_chunk",
+        internal_rpc::handle_transmit_chunk,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_transmit_runtime_filter(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    handle_unary_proto_rpc::<PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult, _>(
+        ptr,
+        len,
+        out_resp,
+        out_err,
+        "transmit_runtime_filter",
+        internal_rpc::handle_transmit_runtime_filter,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_lookup(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    handle_unary_proto_rpc::<PLookUpRequest, PLookUpResponse, _>(
+        ptr,
+        len,
+        out_resp,
+        out_err,
+        "lookup",
+        internal_rpc::handle_lookup,
+    )
 }
 
 #[unsafe(no_mangle)]

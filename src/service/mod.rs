@@ -24,6 +24,8 @@ pub mod grpc_client;
 pub mod grpc_proto;
 pub mod grpc_server;
 pub mod heartbeat_service;
+pub(crate) mod internal_rpc;
+pub(crate) mod internal_rpc_client;
 pub mod internal_service;
 pub mod load_tracking_http;
 pub mod report_worker;

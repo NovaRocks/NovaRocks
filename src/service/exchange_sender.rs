@@ -27,7 +27,7 @@ use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
-use crate::service::grpc_client;
+use crate::service::internal_rpc_client;
 
 pub struct ExchangeSendTracker {
     inflight_tasks: AtomicUsize,
@@ -83,9 +83,9 @@ pub struct ExchangeSendTask {
 pub fn send_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: grpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+    params: internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
 ) -> Result<(), String> {
-    grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
+    internal_rpc_client::transmit_runtime_filter(dest_host, dest_port, params)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -265,7 +265,7 @@ impl ExchangeSendQueue {
 
 fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_bytes: usize) {
     let send_start = Instant::now();
-    let result = grpc_client::send_chunks(
+    let result = internal_rpc_client::send_chunks(
         &task.dest_host,
         task.dest_port,
         task.finst_id,

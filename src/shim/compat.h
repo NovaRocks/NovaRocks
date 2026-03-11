@@ -71,6 +71,24 @@ int32_t novarocks_rs_fetch_result_batch(int64_t finst_id_hi,
 
 int32_t novarocks_rs_cancel(int64_t finst_id_hi, int64_t finst_id_lo);
 
+// internal_service.proto PTransmitChunkParams -> PTransmitChunkResult (protobuf bytes).
+int32_t novarocks_rs_transmit_chunk(const uint8_t* ptr,
+                                    size_t len,
+                                    NovaRocksRustBuf* out_resp,
+                                    NovaRocksRustBuf* out_err);
+
+// internal_service.proto PTransmitRuntimeFilterParams -> PTransmitRuntimeFilterResult (protobuf bytes).
+int32_t novarocks_rs_transmit_runtime_filter(const uint8_t* ptr,
+                                             size_t len,
+                                             NovaRocksRustBuf* out_resp,
+                                             NovaRocksRustBuf* out_err);
+
+// internal_service.proto PLookUpRequest -> PLookUpResponse (protobuf bytes).
+int32_t novarocks_rs_lookup(const uint8_t* ptr,
+                            size_t len,
+                            NovaRocksRustBuf* out_resp,
+                            NovaRocksRustBuf* out_err);
+
 // lake_service.proto PublishVersionRequest -> PublishVersionResponse (protobuf bytes).
 // Returns:
 // - 0: OK
@@ -180,6 +198,30 @@ int32_t novarocks_rs_lake_vacuum(const uint8_t* ptr,
                                size_t len,
                                NovaRocksRustBuf* out_resp,
                                NovaRocksRustBuf* out_err);
+
+// C++ brpc client wrappers for Rust.
+int32_t novarocks_compat_transmit_chunk(const char* host,
+                                        uint16_t port,
+                                        const uint8_t* ptr,
+                                        size_t len,
+                                        NovaRocksRustBuf* out_resp,
+                                        NovaRocksRustBuf* out_err);
+
+int32_t novarocks_compat_transmit_runtime_filter(const char* host,
+                                                 uint16_t port,
+                                                 const uint8_t* ptr,
+                                                 size_t len,
+                                                 NovaRocksRustBuf* out_resp,
+                                                 NovaRocksRustBuf* out_err);
+
+int32_t novarocks_compat_lookup(const char* host,
+                                uint16_t port,
+                                const uint8_t* ptr,
+                                size_t len,
+                                NovaRocksRustBuf* out_resp,
+                                NovaRocksRustBuf* out_err);
+
+void novarocks_compat_free_buf(uint8_t* ptr, size_t len);
 
 void novarocks_rs_free_buf(uint8_t* ptr, size_t len);
 

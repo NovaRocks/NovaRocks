@@ -43,7 +43,7 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
-use crate::service::grpc_client;
+use crate::service::internal_rpc_client;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
 pub struct FetchProcessorFactory {
@@ -275,8 +275,8 @@ impl FetchProcessor {
             .as_ref()
             .and_then(|info| find_node(info, backend_id))
             .ok_or_else(|| format!("node info not found for backend_id {}", backend_id))?;
-        let mut req = grpc_client::proto::starrocks::PLookUpRequest::default();
-        req.query_id = Some(grpc_client::proto::starrocks::PUniqueId {
+        let mut req = internal_rpc_client::proto::starrocks::PLookUpRequest::default();
+        req.query_id = Some(internal_rpc_client::proto::starrocks::PUniqueId {
             hi: query_id.hi,
             lo: query_id.lo,
         });
@@ -285,13 +285,14 @@ impl FetchProcessor {
         for (slot_id, array) in request_columns {
             let data = encode_column_ipc(array)?;
             req.request_columns
-                .push(grpc_client::proto::starrocks::PColumn {
+                .push(internal_rpc_client::proto::starrocks::PColumn {
                     slot_id: Some(slot_id.as_u32() as i32),
                     data_size: Some(data.len() as i64),
                     data: Some(data),
                 });
         }
-        let resp = grpc_client::lookup(&node_info.host, node_info.async_internal_port as u16, req)?;
+        let resp =
+            internal_rpc_client::lookup(&node_info.host, node_info.async_internal_port as u16, req)?;
         if let Some(status) = resp.status.as_ref() {
             if status.status_code != 0 {
                 return Err(format!("lookup failed: {:?}", status.error_msgs));
@@ -311,6 +312,64 @@ impl FetchProcessor {
             out.push((slot_id, array));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::FetchProcessor;
+    use crate::common::ids::SlotId;
+    use crate::descriptors;
+    use crate::runtime::query_context::QueryId;
+    use crate::service::internal_rpc_client;
+
+    #[test]
+    fn test_lookup_remote_uses_nodes_info_async_internal_port() {
+        let _hook_guard = internal_rpc_client::test_hook_lock();
+        internal_rpc_client::clear_test_hooks();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured_hook = std::sync::Arc::clone(&captured);
+        internal_rpc_client::set_lookup_hook(move |host, port, _req| {
+            *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port));
+            Ok(internal_rpc_client::proto::starrocks::PLookUpResponse {
+                status: Some(internal_rpc_client::proto::starrocks::StatusPb {
+                    status_code: 0,
+                    error_msgs: Vec::new(),
+                }),
+                columns: Vec::new(),
+            })
+        });
+
+        let processor = FetchProcessor {
+            name: "FETCH (test)".to_string(),
+            node_id: 1,
+            target_node_id: 2,
+            row_pos_descs: HashMap::new(),
+            nodes_info: Some(descriptors::TNodesInfo::new(
+                1,
+                vec![descriptors::TNodeInfo::new(
+                    9,
+                    0,
+                    "remote-host".to_string(),
+                    9911,
+                )],
+            )),
+            output_slots: vec![SlotId::new(1)],
+            pending_output: None,
+            finishing: false,
+            output_schema: None,
+        };
+
+        let result = processor.lookup_remote(QueryId { hi: 1, lo: 2 }, 3, &HashMap::new(), 9);
+        assert!(result.is_ok());
+        assert_eq!(
+            *captured.lock().expect("captured lock"),
+            Some(("remote-host".to_string(), 9911))
+        );
+        internal_rpc_client::clear_test_hooks();
     }
 }
 
