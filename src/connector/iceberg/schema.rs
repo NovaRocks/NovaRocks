@@ -23,6 +23,8 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::descriptors;
 use crate::lower::type_lowering::arrow_type_from_desc;
 
+const VIRTUAL_COUNT_COLUMN: &str = "___count___";
+
 #[derive(Clone, Debug)]
 pub struct IcebergArrowColumn {
     pub name: String,
@@ -92,6 +94,10 @@ pub fn build_projected_output_schema(
         .ok_or_else(|| "iceberg schema missing fields".to_string())?;
     let mut fields = Vec::with_capacity(columns.len());
     for column in columns {
+        if column.name == VIRTUAL_COUNT_COLUMN {
+            fields.push(Field::new(column.name.clone(), DataType::Boolean, false));
+            continue;
+        }
         let schema_field = schema_fields
             .iter()
             .find(|field| field.name.as_deref() == Some(column.name.as_str()))

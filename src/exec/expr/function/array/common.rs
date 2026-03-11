@@ -208,7 +208,7 @@ pub(super) fn compare_values_at(
     compare_values_with_null(left, left_idx, right, right_idx, false)
 }
 
-pub(super) fn compare_values_with_null(
+pub(crate) fn compare_values_with_null(
     left: &ArrayRef,
     left_idx: usize,
     right: &ArrayRef,

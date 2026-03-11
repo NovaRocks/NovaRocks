@@ -122,6 +122,126 @@ fn resolve_thirdparty_root(manifest_dir: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+fn emit_rerun_if_changed_recursive(path: &Path) {
+    if path.is_file() {
+        println!("cargo:rerun-if-changed={}", path.display());
+        return;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        emit_rerun_if_changed_recursive(&entry.path());
+    }
+}
+
+fn resolve_java_home() -> Result<PathBuf, String> {
+    if let Ok(raw) = env::var("JAVA_HOME") {
+        let path = PathBuf::from(raw.trim());
+        if path.join("lib").exists() {
+            return Ok(path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/libexec/java_home")
+            .output()
+            .map_err(|e| format!("run /usr/libexec/java_home failed: {e}"))?;
+        if output.status.success() {
+            let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if path.join("lib").exists() {
+                return Ok(path);
+            }
+        }
+    }
+
+    let java = which::which("java").map_err(|e| format!("locate java failed: {e}"))?;
+    let java = fs::canonicalize(java).map_err(|e| format!("canonicalize java failed: {e}"))?;
+    let home = java
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| format!("cannot derive JAVA_HOME from {}", java.display()))?;
+    if home.join("lib").exists() {
+        return Ok(home.to_path_buf());
+    }
+    Err(format!(
+        "failed to resolve JAVA_HOME from {}",
+        java.display()
+    ))
+}
+
+fn build_embedded_iceberg_bridge(manifest_dir: &Path, out_dir: &Path) -> Result<PathBuf, String> {
+    let module_dir = manifest_dir.join("java/iceberg-metadata-bridge");
+    emit_rerun_if_changed_recursive(&module_dir);
+    println!("cargo:rerun-if-env-changed=JAVA_HOME");
+
+    let mvn = which::which("mvn").map_err(|e| format!("locate mvn failed: {e}"))?;
+    let status = std::process::Command::new(mvn)
+        .args(["-q", "-DskipTests", "package"])
+        .current_dir(&module_dir)
+        .status()
+        .map_err(|e| format!("run mvn package failed: {e}"))?;
+    if !status.success() {
+        return Err(format!(
+            "embedded iceberg bridge maven build failed with status={status}"
+        ));
+    }
+
+    let shaded_jar = module_dir.join("target/novarocks-iceberg-metadata-bridge.jar");
+    if !shaded_jar.exists() {
+        return Err(format!(
+            "embedded iceberg bridge jar not found: {}",
+            shaded_jar.display()
+        ));
+    }
+
+    let out_jar = out_dir.join("novarocks-iceberg-metadata-bridge.jar");
+    fs::copy(&shaded_jar, &out_jar)
+        .map_err(|e| format!("copy embedded iceberg bridge jar failed: {e}"))?;
+    Ok(out_jar)
+}
+
+fn configure_embedded_jvm_linking(manifest_dir: &Path, out_dir: &Path) -> Result<(), String> {
+    let bridge_jar = build_embedded_iceberg_bridge(manifest_dir, out_dir)?;
+    println!(
+        "cargo:rustc-env=NOVAROCKS_ICEBERG_BRIDGE_JAR={}",
+        bridge_jar.display()
+    );
+
+    let java_home = resolve_java_home()?;
+    let target = env::var("TARGET").unwrap_or_default();
+    let server_lib_dir = java_home.join("lib/server");
+    if !server_lib_dir.exists() {
+        return Err(format!(
+            "libjvm server directory not found under {}",
+            java_home.display()
+        ));
+    }
+
+    println!(
+        "cargo:rustc-link-search=native={}",
+        server_lib_dir.display()
+    );
+    println!("cargo:rustc-link-lib=dylib=jvm");
+    if target.contains("apple") || target.contains("darwin") {
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            server_lib_dir.display()
+        );
+    } else if target.contains("linux") {
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            server_lib_dir.display()
+        );
+    }
+    Ok(())
+}
+
+fn embedded_jvm_feature_enabled() -> bool {
+    env::var_os("CARGO_FEATURE_EMBEDDED_JVM").is_some()
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=src/shim/compat.cpp");
     println!("cargo:rerun-if-changed=src/shim/compat.h");
@@ -161,6 +281,7 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/proto/staros/worker.proto");
     println!("cargo:rerun-if-env-changed=STARROCKS_THIRDPARTY");
     println!("cargo:rerun-if-env-changed=STARROCKS_GCC_HOME");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EMBEDDED_JVM");
 
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let thrift_out = out_dir.join("thrift");
@@ -169,6 +290,12 @@ fn main() {
 
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    if embedded_jvm_feature_enabled() {
+        if let Err(e) = configure_embedded_jvm_linking(&manifest_dir, &out_dir) {
+            eprintln!("Error: {e}");
+            panic!("embedded iceberg bridge setup failed");
+        }
+    }
     let project_thirdparty_root = resolve_thirdparty_root(&manifest_dir).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
         eprintln!("  To build default thirdparty, run: ./thirdparty/build-thirdparty.sh");

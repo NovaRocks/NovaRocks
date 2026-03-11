@@ -27,7 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -42,9 +43,11 @@ use arrow::datatypes::{DataType, SchemaRef};
 use base64::Engine;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::data_type::AsBytes;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::{Statistics, ValueStatistics};
 
-use super::cache_iceberg_object_store_config_for_paths;
 use super::schema::build_full_output_schema;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -118,10 +121,6 @@ impl IcebergTableSinkFactory {
 
         let data_location = resolve_data_location(&sink)?;
         let object_store_s3 = resolve_sink_s3_config(&sink, &data_location)?;
-        if let Some(s3) = object_store_s3.as_ref() {
-            let cfg = s3.to_object_store_config();
-            cache_iceberg_object_store_config_for_paths(&cfg, [data_location.as_str()]);
-        }
         let file_format = sink
             .file_format
             .clone()
@@ -264,7 +263,7 @@ impl ProcessorOperator for IcebergTableSinkOperator {
                 continue;
             }
             let (file_path, partition_path) = self.build_file_path(state, &key.path)?;
-            let file_size = write_parquet_file(
+            let write_result = write_parquet_file(
                 &file_path,
                 self.plan.object_store_s3.as_ref(),
                 Arc::clone(&self.plan.output_schema),
@@ -276,10 +275,10 @@ impl ProcessorOperator for IcebergTableSinkOperator {
                 path: Some(file_path),
                 format: Some(self.plan.file_format.clone()),
                 record_count: Some(part_batch.num_rows() as i64),
-                file_size_in_bytes: Some(file_size as i64),
+                file_size_in_bytes: Some(write_result.file_size as i64),
                 partition_path: Some(partition_path),
-                split_offsets: None,
-                column_stats: None,
+                split_offsets: write_result.split_offsets,
+                column_stats: write_result.column_stats,
                 partition_null_fingerprint: Some(key.null_fingerprint),
                 file_content: Some(types::TIcebergFileContent::DATA),
                 referenced_data_file: None,
@@ -346,6 +345,21 @@ struct PartitionKey {
 #[derive(Debug)]
 struct PartitionGroup {
     indices: Vec<u32>,
+}
+
+struct ParquetWriteResult {
+    file_size: u64,
+    split_offsets: Option<Vec<i64>>,
+    column_stats: Option<types::TIcebergColumnStats>,
+}
+
+#[derive(Default)]
+struct ColumnStatsAccumulator {
+    column_size: i64,
+    value_count: i64,
+    null_value_count: i64,
+    has_statistics: bool,
+    merged_statistics: Option<Statistics>,
 }
 
 fn lower_output_exprs(
@@ -694,15 +708,14 @@ fn write_parquet_file(
     schema: SchemaRef,
     batch: &RecordBatch,
     compression: types::TCompressionType,
-) -> Result<u64, String> {
+) -> Result<ParquetWriteResult, String> {
     let compression = map_parquet_compression(compression)?;
     let props = WriterProperties::builder()
         .set_compression(compression)
         .build();
 
     if path.starts_with("oss://") || path.starts_with("s3://") {
-        let data = write_parquet_to_bytes(schema, batch, props)?;
-        let size = data.len() as u64;
+        let (data, write_result) = write_parquet_to_bytes(schema, batch, props)?;
         let s3 = s3_config.ok_or_else(|| {
             format!(
                 "iceberg sink missing S3 config for object-store path={path}; \
@@ -720,7 +733,7 @@ fn write_parquet_file(
         data_block_on(op.write(&rel, data))
             .map_err(|e| format!("run object-store write on data runtime failed: {e}"))?
             .map_err(|e| format!("opendal write failed: {e}"))?;
-        return Ok(size);
+        return Ok(write_result);
     }
 
     let path_buf = PathBuf::from(path);
@@ -734,19 +747,20 @@ fn write_parquet_file(
     writer
         .write(batch)
         .map_err(|e| format!("write parquet batch failed: {e}"))?;
-    writer
+    let parquet_metadata = writer
         .close()
         .map_err(|e| format!("close parquet writer failed: {e}"))?;
     let meta = fs::metadata(&path_buf).map_err(|e| format!("stat parquet file failed: {e}"))?;
-    Ok(meta.len())
+    Ok(build_parquet_write_result(meta.len(), &parquet_metadata))
 }
 
 fn write_parquet_to_bytes(
     schema: SchemaRef,
     batch: &RecordBatch,
     props: WriterProperties,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, ParquetWriteResult), String> {
     let mut buffer = Vec::new();
+    let parquet_metadata;
     {
         let cursor = Cursor::new(&mut buffer);
         let mut writer = ArrowWriter::try_new(cursor, schema, Some(props))
@@ -754,11 +768,210 @@ fn write_parquet_to_bytes(
         writer
             .write(batch)
             .map_err(|e| format!("write parquet batch failed: {e}"))?;
-        writer
+        parquet_metadata = writer
             .close()
             .map_err(|e| format!("close parquet writer failed: {e}"))?;
     }
-    Ok(buffer)
+    let write_result = build_parquet_write_result(buffer.len() as u64, &parquet_metadata);
+    Ok((buffer, write_result))
+}
+
+fn build_parquet_write_result(file_size: u64, metadata: &ParquetMetaData) -> ParquetWriteResult {
+    ParquetWriteResult {
+        file_size,
+        split_offsets: collect_split_offsets(metadata),
+        column_stats: collect_iceberg_column_stats(metadata),
+    }
+}
+
+fn collect_split_offsets(metadata: &ParquetMetaData) -> Option<Vec<i64>> {
+    let mut offsets = Vec::with_capacity(metadata.row_groups().len());
+    for row_group in metadata.row_groups() {
+        if row_group.num_columns() == 0 {
+            continue;
+        }
+        let first_column = row_group.column(0);
+        let data_page_offset = first_column.data_page_offset();
+        let split_offset = match first_column.dictionary_page_offset() {
+            Some(dictionary_page_offset)
+                if dictionary_page_offset > 0 && dictionary_page_offset < data_page_offset =>
+            {
+                dictionary_page_offset
+            }
+            _ => data_page_offset,
+        };
+        offsets.push(split_offset);
+    }
+    (!offsets.is_empty()).then_some(offsets)
+}
+
+fn collect_iceberg_column_stats(metadata: &ParquetMetaData) -> Option<types::TIcebergColumnStats> {
+    let mut accumulators: BTreeMap<i32, ColumnStatsAccumulator> = BTreeMap::new();
+
+    for row_group in metadata.row_groups() {
+        for column in row_group.columns() {
+            let basic_info = column.column_descr().self_type().get_basic_info();
+            if !basic_info.has_id() {
+                continue;
+            }
+            let field_id = basic_info.id();
+            let acc = accumulators.entry(field_id).or_default();
+            acc.column_size += column.compressed_size();
+
+            let Some(stats) = column.statistics() else {
+                continue;
+            };
+            acc.has_statistics = true;
+            acc.value_count += column.num_values();
+            if let Some(null_count) = stats.null_count_opt() {
+                acc.null_value_count += null_count as i64;
+            }
+            if let Some(merged) = acc.merged_statistics.as_mut() {
+                merge_statistics(merged, stats);
+            } else {
+                acc.merged_statistics = Some(stats.clone());
+            }
+        }
+    }
+
+    if accumulators.is_empty() {
+        return None;
+    }
+
+    let mut column_sizes = BTreeMap::new();
+    let mut value_counts = BTreeMap::new();
+    let mut null_value_counts = BTreeMap::new();
+    let mut lower_bounds = BTreeMap::new();
+    let mut upper_bounds = BTreeMap::new();
+    let mut has_null_value_counts = false;
+    let mut has_bounds = false;
+
+    for (field_id, acc) in accumulators {
+        column_sizes.insert(field_id, acc.column_size);
+        if !acc.has_statistics {
+            continue;
+        }
+
+        value_counts.insert(field_id, acc.value_count);
+        null_value_counts.insert(field_id, acc.null_value_count);
+        has_null_value_counts = true;
+
+        if let Some(stats) = acc.merged_statistics.as_ref() {
+            if let Some(min) = stats.min_bytes_opt() {
+                lower_bounds.insert(field_id, min.to_vec());
+                has_bounds = true;
+            }
+            if let Some(max) = stats.max_bytes_opt() {
+                upper_bounds.insert(field_id, max.to_vec());
+                has_bounds = true;
+            }
+        }
+    }
+
+    Some(types::TIcebergColumnStats {
+        column_sizes: Some(column_sizes),
+        value_counts: (!value_counts.is_empty()).then_some(value_counts),
+        null_value_counts: has_null_value_counts.then_some(null_value_counts),
+        nan_value_counts: None,
+        lower_bounds: has_bounds.then_some(lower_bounds),
+        upper_bounds: has_bounds.then_some(upper_bounds),
+    })
+}
+
+fn merge_statistics(current: &mut Statistics, next: &Statistics) {
+    match (current, next) {
+        (Statistics::Boolean(cur), Statistics::Boolean(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::Int32(cur), Statistics::Int32(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::Int64(cur), Statistics::Int64(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::Int96(cur), Statistics::Int96(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::Float(cur), Statistics::Float(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::Double(cur), Statistics::Double(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::ByteArray(cur), Statistics::ByteArray(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        (Statistics::FixedLenByteArray(cur), Statistics::FixedLenByteArray(nxt)) => {
+            *cur = merge_typed_statistics(cur, nxt, PartialOrd::partial_cmp);
+        }
+        _ => {}
+    }
+}
+
+fn merge_typed_statistics<T, F>(
+    current: &ValueStatistics<T>,
+    next: &ValueStatistics<T>,
+    compare: F,
+) -> ValueStatistics<T>
+where
+    T: Clone + AsBytes,
+    F: Fn(&T, &T) -> Option<Ordering>,
+{
+    let min = choose_min(current.min_opt(), next.min_opt(), &compare);
+    let max = choose_max(current.max_opt(), next.max_opt(), &compare);
+    let null_count =
+        Some(current.null_count_opt().unwrap_or(0) + next.null_count_opt().unwrap_or(0));
+    let min_is_exact = match (current.min_opt(), next.min_opt()) {
+        (Some(_), Some(_)) => current.min_is_exact() && next.min_is_exact(),
+        (Some(_), None) => current.min_is_exact(),
+        (None, Some(_)) => next.min_is_exact(),
+        (None, None) => false,
+    };
+    let max_is_exact = match (current.max_opt(), next.max_opt()) {
+        (Some(_), Some(_)) => current.max_is_exact() && next.max_is_exact(),
+        (Some(_), None) => current.max_is_exact(),
+        (None, Some(_)) => next.max_is_exact(),
+        (None, None) => false,
+    };
+
+    ValueStatistics::new(min, max, None, null_count, false)
+        .with_backwards_compatible_min_max(
+            current.is_min_max_backwards_compatible() && next.is_min_max_backwards_compatible(),
+        )
+        .with_min_is_exact(min_is_exact)
+        .with_max_is_exact(max_is_exact)
+}
+
+fn choose_min<T, F>(left: Option<&T>, right: Option<&T>, compare: &F) -> Option<T>
+where
+    T: Clone,
+    F: Fn(&T, &T) -> Option<Ordering>,
+{
+    match (left, right) {
+        (Some(left), Some(right)) => match compare(left, right) {
+            Some(Ordering::Greater) => Some(right.clone()),
+            _ => Some(left.clone()),
+        },
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
+        (None, None) => None,
+    }
+}
+
+fn choose_max<T, F>(left: Option<&T>, right: Option<&T>, compare: &F) -> Option<T>
+where
+    T: Clone,
+    F: Fn(&T, &T) -> Option<Ordering>,
+{
+    match (left, right) {
+        (Some(left), Some(right)) => match compare(left, right) {
+            Some(Ordering::Less) => Some(right.clone()),
+            _ => Some(left.clone()),
+        },
+        (Some(left), None) => Some(left.clone()),
+        (None, Some(right)) => Some(right.clone()),
+        (None, None) => None,
+    }
 }
 
 fn map_parquet_compression(compression: types::TCompressionType) -> Result<Compression, String> {
@@ -972,12 +1185,16 @@ fn format_datetime(dt: chrono::NaiveDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{Array, ArrayRef, Int32Array, Int64Array};
+    use arrow::array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
 
-    use super::{align_arrays_to_schema, iceberg_partition_key_for_row};
+    use super::{align_arrays_to_schema, iceberg_partition_key_for_row, write_parquet_to_bytes};
 
     #[test]
     fn test_align_arrays_to_schema_casts_int64_to_int32() {
@@ -1031,5 +1248,79 @@ mod tests {
 
         assert_eq!(path, "p_year=1972/p_bucket=7/p_void=null/");
         assert_eq!(fingerprint, "001");
+    }
+
+    #[test]
+    fn test_write_parquet_to_bytes_collects_iceberg_metrics() {
+        let mut metadata = HashMap::new();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        )
+        .expect("record batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+
+        let (_bytes, write_result) =
+            write_parquet_to_bytes(Arc::clone(&schema), &batch, props).expect("write parquet");
+
+        let split_offsets = write_result.split_offsets.expect("split offsets");
+        assert_eq!(split_offsets.len(), 1);
+        let column_stats = write_result.column_stats.expect("column stats");
+        let value_counts = column_stats.value_counts.expect("value counts");
+        let lower_bounds = column_stats.lower_bounds.expect("lower bounds");
+        let upper_bounds = column_stats.upper_bounds.expect("upper bounds");
+
+        assert_eq!(value_counts.get(&1), Some(&2));
+        assert_eq!(
+            i64::from_le_bytes(
+                lower_bounds[&1]
+                    .as_slice()
+                    .try_into()
+                    .expect("lower bound bytes")
+            ),
+            1
+        );
+        assert_eq!(
+            i64::from_le_bytes(
+                upper_bounds[&1]
+                    .as_slice()
+                    .try_into()
+                    .expect("upper bound bytes")
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn test_write_parquet_to_bytes_counts_null_rows_once() {
+        let mut metadata = HashMap::new();
+        metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true).with_metadata(metadata),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![Option::<i64>::None]))],
+        )
+        .expect("record batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+
+        let (_bytes, write_result) =
+            write_parquet_to_bytes(Arc::clone(&schema), &batch, props).expect("write parquet");
+
+        let column_stats = write_result.column_stats.expect("column stats");
+        let value_counts = column_stats.value_counts.expect("value counts");
+        let null_value_counts = column_stats.null_value_counts.expect("null value counts");
+
+        assert_eq!(value_counts.get(&1), Some(&1));
+        assert_eq!(null_value_counts.get(&1), Some(&1));
     }
 }

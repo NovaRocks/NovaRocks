@@ -1552,8 +1552,20 @@ fn align_batch_to_iceberg_schema(
 ) -> Result<RecordBatch, String> {
     let row_count = batch.num_rows();
     let batch_schema = batch.schema();
-    let mut columns = Vec::with_capacity(output_schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
     for target in output_schema.fields() {
+        if target.name() == "___count___" {
+            if target.data_type() != &DataType::Boolean {
+                return Err(format!(
+                    "iceberg virtual count column expects Boolean type, got {:?}",
+                    target.data_type()
+                ));
+            }
+            let count_array: ArrayRef =
+                Arc::new(arrow::array::BooleanArray::from(vec![true; row_count]));
+            columns.push(count_array);
+            continue;
+        }
         if let Some(source_idx) =
             find_matching_field_index(batch_schema.fields(), target.as_ref(), case_sensitive)?
         {

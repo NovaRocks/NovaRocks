@@ -158,7 +158,7 @@ impl ScanConnector for IcebergConnector {
     fn create_scan_node(&self, cfg: ScanConfig) -> Result<ScanNode, String> {
         match cfg {
             ScanConfig::IcebergMetadata(cfg) => Ok(ScanNode::new(Arc::new(
-                iceberg::IcebergMetadataScanOp::new(cfg),
+                iceberg::IcebergMetadataScanOp::new(cfg)?,
             ))),
             _ => Err(format!(
                 "unsupported scan config for connector {}",

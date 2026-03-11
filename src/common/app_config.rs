@@ -109,6 +109,9 @@ pub struct NovaRocksConfig {
     pub runtime: RuntimeConfig,
 
     #[serde(default)]
+    pub iceberg: IcebergConfig,
+
+    #[serde(default)]
     pub debug: DebugConfig,
 
     #[serde(default)]
@@ -145,10 +148,29 @@ impl Default for NovaRocksConfig {
             sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
             runtime: RuntimeConfig::default(),
+            iceberg: IcebergConfig::default(),
             debug: DebugConfig::default(),
             jdbc: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+pub struct IcebergConfig {
+    #[serde(default = "default_enable_embedded_jvm")]
+    pub enable_embedded_jvm: bool,
+}
+
+fn default_enable_embedded_jvm() -> bool {
+    false
+}
+
+impl Default for IcebergConfig {
+    fn default() -> Self {
+        Self {
+            enable_embedded_jvm: default_enable_embedded_jvm(),
         }
     }
 }
@@ -773,7 +795,7 @@ impl std::fmt::Debug for JdbcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{NovaRocksConfig, RuntimeConfig};
+    use super::{IcebergConfig, NovaRocksConfig, RuntimeConfig};
 
     #[test]
     fn test_server_priority_networks_default_is_empty() {
@@ -893,5 +915,29 @@ data_runtime_max_blocking_threads = 99
         assert_eq!(runtime.actual_data_runtime_threads(), expected);
         runtime.data_runtime_worker_threads = 3;
         assert_eq!(runtime.actual_data_runtime_threads(), 3);
+    }
+
+    #[test]
+    fn test_iceberg_embedded_jvm_defaults_to_disabled() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+"#,
+        )
+        .expect("parse config");
+        assert!(!cfg.iceberg.enable_embedded_jvm);
+        assert!(!IcebergConfig::default().enable_embedded_jvm);
+    }
+
+    #[test]
+    fn test_iceberg_embedded_jvm_can_be_enabled() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[iceberg]
+enable_embedded_jvm = true
+"#,
+        )
+        .expect("parse config");
+        assert!(cfg.iceberg.enable_embedded_jvm);
     }
 }

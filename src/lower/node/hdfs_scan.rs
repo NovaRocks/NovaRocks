@@ -21,8 +21,7 @@ use crate::common::ids::SlotId;
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType, build_projected_output_schema,
-    cache_iceberg_object_store_config_for_paths, lookup_iceberg_object_store_config_for_path,
-    lookup_iceberg_table_location, snapshot_iceberg_table_locations,
+    ensure_embedded_jvm_enabled, lookup_iceberg_table_location, snapshot_iceberg_table_locations,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::ParquetReadCachePolicy;
@@ -513,6 +512,9 @@ pub(crate) fn lower_hdfs_scan_node(
             node.node_id
         ));
     }
+    if iceberg_metadata_table_type.is_some() {
+        ensure_embedded_jvm_enabled(&format!("HDFS_SCAN_NODE node_id={}", node.node_id))?;
+    }
     let is_iceberg_metadata_scan = iceberg_metadata_table_type.is_some();
     let mut ranges: Vec<FileScanRange> = Vec::new();
     let mut iceberg_metadata_ranges: Vec<IcebergMetadataScanRange> = Vec::new();
@@ -574,7 +576,10 @@ pub(crate) fn lower_hdfs_scan_node(
                     node.node_id
                 ));
             };
-            iceberg_metadata_ranges.push(IcebergMetadataScanRange { path });
+            iceberg_metadata_ranges.push(IcebergMetadataScanRange {
+                path,
+                serialized_split: hdfs_range.serialized_split.clone().unwrap_or_default(),
+            });
             continue;
         }
         if hdfs_range.use_paimon_jni_reader.unwrap_or(false) {
@@ -772,24 +777,14 @@ pub(crate) fn lower_hdfs_scan_node(
             .unwrap_or(4096)
             .max(1);
         let output_columns = output_slots_from_layout(&out_layout, &slot_info_map)?;
-        let cloud_props = hdfs
-            .cloud_configuration
-            .as_ref()
-            .and_then(|c| c.cloud_properties.as_ref());
-        let object_store_config =
-            resolve_cloud_object_store_config(cloud_props, &[]).or_else(|| {
-                iceberg_metadata_ranges
-                    .iter()
-                    .find_map(|range| lookup_iceberg_object_store_config_for_path(&range.path))
-            });
         let cfg = IcebergMetadataScanConfig {
             metadata_table_type,
             serialized_table: hdfs.serialized_table.clone().unwrap_or_default(),
+            serialized_predicate: hdfs.serialized_predicate.clone().unwrap_or_default(),
             load_column_stats: hdfs.load_column_stats.unwrap_or(false),
             ranges: iceberg_metadata_ranges,
             batch_size,
             output_columns,
-            object_store_config,
             profile_label: Some(format!("hdfs_scan_node_id={}", node.node_id)),
         };
         let scan = connectors
@@ -914,9 +909,6 @@ pub(crate) fn lower_hdfs_scan_node(
         .as_ref()
         .and_then(|c| c.cloud_properties.as_ref());
     let object_store_config = resolve_cloud_object_store_config(cloud_props, &ranges);
-    if let Some(cfg) = object_store_config.as_ref() {
-        cache_iceberg_object_store_config_for_paths(cfg, ranges.iter().map(|r| r.path.as_str()));
-    }
     let iceberg_table_locations = snapshot_iceberg_table_locations();
     let row_position_ranges = row_position_spec.as_ref().map(|_| ranges.clone());
     let cfg = HdfsScanConfig {

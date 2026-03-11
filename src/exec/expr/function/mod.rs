@@ -33,6 +33,7 @@ mod struct_fn;
 mod variant;
 
 // Re-export function implementations
+pub(crate) use array::compare_values_with_null;
 pub use array::eval_array_function;
 pub use array::eval_array_map;
 pub use bit::eval_bit_function;
