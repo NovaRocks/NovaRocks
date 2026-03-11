@@ -136,7 +136,9 @@ fn json_summary<T: thrift::protocol::TSerializable>(v: &T) -> String {
 
 fn build_backend_for_finish_task() -> Result<types::TBackend, String> {
     let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-    let host = network::advertise_host()?;
+    let host = disk_report::latest_backend_host()
+        .filter(|host| !host.trim().is_empty())
+        .unwrap_or(network::advertise_host()?);
     Ok(types::TBackend::new(
         host,
         cfg.server.be_port as i32,
@@ -833,10 +835,10 @@ mod tests {
     use thrift::transport::{TBufferChannel, TIoChannel};
 
     use super::{
-        BackendServiceConfig, execute_backend_task, finish_task_report_times_for_error,
-        start_backend_service, stop_backend_service,
+        BackendServiceConfig, build_backend_for_finish_task, execute_backend_task,
+        finish_task_report_times_for_error, start_backend_service, stop_backend_service,
     };
-    use crate::{agent_service, descriptors, types};
+    use crate::{agent_service, descriptors, service::disk_report, types};
 
     fn backend_test_guard() -> &'static Mutex<()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1030,6 +1032,21 @@ mod tests {
             "create_tablet failed: something failed",
         );
         assert_eq!(reports, 1);
+    }
+
+    #[test]
+    fn build_backend_for_finish_task_prefers_cached_backend_host() {
+        let _guard = backend_test_guard()
+            .lock()
+            .expect("lock backend test guard");
+        disk_report::set_backend_host_for_test(Some("127.0.0.1"));
+
+        let backend = build_backend_for_finish_task().expect("build finish_task backend");
+        assert_eq!(backend.host, "127.0.0.1");
+        assert_eq!(backend.be_port, 9060);
+        assert_eq!(backend.http_port, 8040);
+
+        disk_report::set_backend_host_for_test(None);
     }
 
     #[test]

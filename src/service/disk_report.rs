@@ -32,6 +32,7 @@ use crate::{master_service, status_code, types};
 struct ReportState {
     fe_addr: Option<types::TNetworkAddress>,
     fe_http_port: Option<i32>,
+    backend_host: Option<String>,
     in_flight: bool,
     reported: bool,
 }
@@ -148,6 +149,7 @@ pub(crate) fn maybe_report_disks(
     fe_http_port: Option<i32>,
 ) {
     let mut guard = state().lock().expect("disk report state lock");
+    guard.backend_host = Some(backend_host.clone());
     if let Some(port) = fe_http_port.filter(|port| *port > 0) {
         guard.fe_http_port = Some(port);
     }
@@ -188,4 +190,15 @@ pub(crate) fn maybe_report_disks(
 pub(crate) fn latest_fe_addr() -> Option<types::TNetworkAddress> {
     let guard = state().lock().ok()?;
     guard.fe_addr.clone()
+}
+
+pub(crate) fn latest_backend_host() -> Option<String> {
+    let guard = state().lock().ok()?;
+    guard.backend_host.clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_backend_host_for_test(host: Option<&str>) {
+    let mut guard = state().lock().expect("disk report state lock");
+    guard.backend_host = host.map(str::to_string);
 }

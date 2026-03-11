@@ -49,6 +49,10 @@ struct HeartbeatHandler {
     start_time: SystemTime,
 }
 
+fn backend_host_for_fe(advertise_host: &str, _fe_backend_ip: Option<&str>) -> String {
+    advertise_host.to_string()
+}
+
 impl HeartbeatHandler {
     fn new(config: HeartbeatConfig) -> Self {
         Self {
@@ -77,16 +81,12 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
         if let Some(id) = master_info.backend_id {
             backend_id_store::set_backend_id(id);
         }
-        let mut backend_host = master_info
-            .backend_ip
-            .clone()
-            .unwrap_or_else(|| self.config.advertise_host.clone());
-        if backend_host.trim().is_empty() {
-            backend_host = self.config.advertise_host.clone();
-        }
         disk_report::maybe_report_disks(
             &master_info.network_address,
-            backend_host,
+            backend_host_for_fe(
+                &self.config.advertise_host,
+                master_info.backend_ip.as_deref(),
+            ),
             self.config.be_port,
             self.config.http_port,
             master_info.http_port,
@@ -170,4 +170,21 @@ pub fn start_heartbeat_server(config: HeartbeatConfig) -> Result<(), String> {
 pub fn stop_heartbeat_server() {
     // Keep heartbeat implementation aligned with the proven TServer path.
     // Process shutdown will terminate the background heartbeat thread.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backend_host_for_fe;
+
+    #[test]
+    fn backend_host_for_fe_ignores_fe_backend_ip_when_advertise_host_is_resolved() {
+        let backend_host = backend_host_for_fe("10.0.0.9", Some("127.0.0.1"));
+        assert_eq!(backend_host, "10.0.0.9");
+    }
+
+    #[test]
+    fn backend_host_for_fe_keeps_detected_host_when_no_explicit_host_is_configured() {
+        let backend_host = backend_host_for_fe("192.168.20.152", None);
+        assert_eq!(backend_host, "192.168.20.152");
+    }
 }
