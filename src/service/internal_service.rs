@@ -25,7 +25,7 @@ use crate::exec::chunk::Chunk;
 use crate::novarocks_logging::{error, info, warn};
 
 use crate::common::app_config;
-use crate::common::config::{debug_exec_batch_plan_json, http_port};
+use crate::common::config::debug_exec_batch_plan_json;
 use crate::common::ids::SlotId;
 use crate::common::thrift::{
     thrift_binary_deserialize, thrift_compact_serialize, thrift_named_json,
@@ -93,76 +93,91 @@ fn choose_nonempty_str<'a>(primary: Option<&'a str>, fallback: Option<&'a str>) 
     }
 }
 
-// Normalize internal BE-to-BE addresses so they always use the configured gRPC/http_port.
-// This keeps internal transport independent from FE brpc port conventions and lets us
-// switch protocols/ports later without touching execution logic.
-fn normalize_internal_addresses(
-    exec_params: &mut internal_service::TPlanFragmentExecParams,
-    fragment: Option<&mut planner::TPlanFragment>,
+fn validate_network_address(
+    addr: Option<&types::TNetworkAddress>,
+    missing_msg: &str,
+    field_name: &str,
 ) -> Result<(), String> {
-    let port = http_port() as i32;
-    let normalize_nodes_info = |nodes_info: &mut descriptors::TNodesInfo| -> Result<(), String> {
-        for node in nodes_info.nodes.iter_mut() {
-            if node.host.is_empty() {
-                return Err("nodes_info hostname is empty".to_string());
-            }
-            node.async_internal_port = port;
-        }
-        Ok(())
-    };
-    let normalize_destinations =
-        |dests: &mut [data_sinks::TPlanFragmentDestination]| -> Result<(), String> {
-            for dest in dests {
-                let addr = dest
-                    .brpc_server
-                    .as_mut()
-                    .or_else(|| dest.deprecated_server.as_mut())
-                    .ok_or_else(|| "missing destination address".to_string())?;
-                if addr.hostname.is_empty() {
-                    return Err("destination hostname is empty".to_string());
-                }
-                addr.port = port;
-            }
-            Ok(())
-        };
-    if let Some(dests) = exec_params.destinations.as_mut() {
-        normalize_destinations(dests)?;
+    let addr = addr.ok_or_else(|| missing_msg.to_string())?;
+    if addr.hostname.is_empty() {
+        return Err(format!("{field_name} hostname is empty"));
     }
-    if let Some(params) = exec_params.runtime_filter_params.as_mut() {
-        if let Some(id_to_probers) = params.id_to_prober_params.as_mut() {
-            for probers in id_to_probers.values_mut() {
-                for prober in probers {
-                    let addr = prober
-                        .fragment_instance_address
-                        .as_mut()
-                        .ok_or_else(|| "missing runtime filter prober address".to_string())?;
-                    if addr.hostname.is_empty() {
-                        return Err("runtime filter prober hostname is empty".to_string());
-                    }
-                    addr.port = port;
+    if addr.port <= 0 {
+        return Err(format!("{field_name} port must be positive"));
+    }
+    Ok(())
+}
+
+fn validate_nodes_info(nodes_info: &descriptors::TNodesInfo, field_name: &str) -> Result<(), String> {
+    for (idx, node) in nodes_info.nodes.iter().enumerate() {
+        if node.host.is_empty() {
+            return Err(format!("{field_name}[{idx}] host is empty"));
+        }
+        if node.async_internal_port <= 0 {
+            return Err(format!(
+                "{field_name}[{idx}] async_internal_port must be positive"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_destinations(
+    dests: &[data_sinks::TPlanFragmentDestination],
+    field_name: &str,
+) -> Result<(), String> {
+    for (idx, dest) in dests.iter().enumerate() {
+        validate_network_address(
+            dest.brpc_server.as_ref().or_else(|| dest.deprecated_server.as_ref()),
+            "missing destination address",
+            &format!("{field_name}[{idx}]"),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_internal_addresses(
+    exec_params: &internal_service::TPlanFragmentExecParams,
+    fragment: Option<&planner::TPlanFragment>,
+) -> Result<(), String> {
+    if let Some(dests) = exec_params.destinations.as_ref() {
+        validate_destinations(dests, "destinations")?;
+    }
+    if let Some(params) = exec_params.runtime_filter_params.as_ref() {
+        if let Some(id_to_probers) = params.id_to_prober_params.as_ref() {
+            for (filter_id, probers) in id_to_probers {
+                for (idx, prober) in probers.iter().enumerate() {
+                    validate_network_address(
+                        prober.fragment_instance_address.as_ref(),
+                        "missing runtime filter prober address",
+                        &format!(
+                            "runtime_filter_params.id_to_prober_params[{filter_id}][{idx}].fragment_instance_address"
+                        ),
+                    )?;
                 }
             }
         }
     }
     if let Some(fragment) = fragment {
-        if let Some(plan) = fragment.plan.as_mut() {
-            for node in plan.nodes.iter_mut() {
-                if let Some(fetch) = node.fetch_node.as_mut() {
-                    if let Some(nodes_info) = fetch.nodes_info.as_mut() {
-                        normalize_nodes_info(nodes_info)?;
+        if let Some(plan) = fragment.plan.as_ref() {
+            for node in &plan.nodes {
+                if let Some(fetch) = node.fetch_node.as_ref() {
+                    if let Some(nodes_info) = fetch.nodes_info.as_ref() {
+                        validate_nodes_info(nodes_info, "fetch.nodes_info")?;
                     }
                 }
-                if let Some(join) = node.hash_join_node.as_mut() {
-                    if let Some(filters) = join.build_runtime_filters.as_mut() {
-                        for desc in filters {
-                            if let Some(merge_nodes) = desc.runtime_filter_merge_nodes.as_mut() {
-                                for addr in merge_nodes {
-                                    if addr.hostname.is_empty() {
-                                        return Err(
-                                            "runtime filter merge hostname is empty".to_string()
-                                        );
-                                    }
-                                    addr.port = port;
+                if let Some(join) = node.hash_join_node.as_ref() {
+                    if let Some(filters) = join.build_runtime_filters.as_ref() {
+                        for (filter_idx, desc) in filters.iter().enumerate() {
+                            if let Some(merge_nodes) = desc.runtime_filter_merge_nodes.as_ref() {
+                                for (node_idx, addr) in merge_nodes.iter().enumerate() {
+                                    validate_network_address(
+                                        Some(addr),
+                                        "missing runtime filter merge address",
+                                        &format!(
+                                            "hash_join.build_runtime_filters[{filter_idx}].runtime_filter_merge_nodes[{node_idx}]"
+                                        ),
+                                    )?;
                                 }
                             }
                         }
@@ -170,40 +185,34 @@ fn normalize_internal_addresses(
                 }
             }
         }
-        if let Some(sink) = fragment.output_sink.as_mut() {
+        if let Some(sink) = fragment.output_sink.as_ref() {
             match sink.type_ {
                 data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK => {
-                    let Some(multi) = sink.multi_cast_stream_sink.as_mut() else {
+                    let Some(multi) = sink.multi_cast_stream_sink.as_ref() else {
                         return Err(
                             "MULTI_CAST_DATA_STREAM_SINK missing multi_cast_stream_sink payload"
                                 .to_string(),
                         );
                     };
-                    for dests in multi.destinations.iter_mut() {
-                        normalize_destinations(dests)?;
+                    for (idx, dests) in multi.destinations.iter().enumerate() {
+                        validate_destinations(
+                            dests,
+                            &format!("multi_cast_stream_sink.destinations[{idx}]"),
+                        )?;
                     }
                 }
                 data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK => {
-                    let Some(split) = sink.split_stream_sink.as_mut() else {
+                    let Some(split) = sink.split_stream_sink.as_ref() else {
                         return Err(
                             "SPLIT_DATA_STREAM_SINK missing split_stream_sink payload".to_string()
                         );
                     };
-                    if let Some(destinations) = split.destinations.as_mut() {
-                        for dests in destinations.iter_mut() {
-                            normalize_destinations(dests)?;
-                        }
-                    }
-                }
-                data_sinks::TDataSinkType::OLAP_TABLE_SINK => {
-                    if let Some(olap) = sink.olap_table_sink.as_mut() {
-                        normalize_nodes_info(&mut olap.nodes_info)?;
-                    }
-                }
-                data_sinks::TDataSinkType::SCHEMA_TABLE_SINK => {
-                    if let Some(schema) = sink.schema_table_sink.as_mut() {
-                        if let Some(nodes_info) = schema.nodes_info.as_mut() {
-                            normalize_nodes_info(nodes_info)?;
+                    if let Some(destinations) = split.destinations.as_ref() {
+                        for (idx, dests) in destinations.iter().enumerate() {
+                            validate_destinations(
+                                dests,
+                                &format!("split_stream_sink.destinations[{idx}]"),
+                            )?;
                         }
                     }
                 }
@@ -1252,9 +1261,9 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         let group_execution_scan_dop = one.group_execution_scan_dop;
         let query_opts = query_opts.cloned();
         let mut exec_params = exec_params.clone();
-        let mut fragment = fragment.clone();
+        let fragment = fragment.clone();
         backfill_per_node_scan_ranges(&mut exec_params);
-        normalize_internal_addresses(&mut exec_params, Some(&mut fragment))?;
+        validate_internal_addresses(&exec_params, Some(&fragment))?;
         if let Some(params) = exec_params.runtime_filter_params.clone() {
             let _ = mgr.set_runtime_filter_params(query_id, params);
         }
@@ -1402,9 +1411,9 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let group_execution_scan_dop = one.group_execution_scan_dop;
 
     let mut params = params.clone();
-    let mut fragment = fragment.clone();
+    let fragment = fragment.clone();
     backfill_per_node_scan_ranges(&mut params);
-    normalize_internal_addresses(&mut params, Some(&mut fragment))?;
+    validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
         let _ = mgr.set_runtime_filter_params(query_id, rf_params);
     }
@@ -1484,9 +1493,9 @@ pub(crate) fn execute_plan_fragment_sync(
     let pipeline_dop = resolve_pipeline_dop(&one);
     let group_execution_scan_dop = one.group_execution_scan_dop;
     let mut params = params.clone();
-    let mut fragment = fragment.clone();
+    let fragment = fragment.clone();
     backfill_per_node_scan_ranges(&mut params);
-    normalize_internal_addresses(&mut params, Some(&mut fragment))?;
+    validate_internal_addresses(&params, Some(&fragment))?;
     if let Some(rf_params) = params.runtime_filter_params.clone() {
         let _ = mgr.set_runtime_filter_params(query_id, rf_params);
     }
@@ -1549,5 +1558,315 @@ pub fn cancel(finst_id: UniqueId) {
     // Fallback cleanup for detached/unknown finst that cannot be mapped to a query context.
     if query_id.is_none() {
         mgr.unregister_finst(finst_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::validate_internal_addresses;
+    use crate::{data_sinks, descriptors, exprs, internal_service, partitions, plan_nodes, planner, runtime_filter, types};
+
+    fn unique_id(hi: i64, lo: i64) -> types::TUniqueId {
+        types::TUniqueId::new(hi, lo)
+    }
+
+    fn address(host: &str, port: i32) -> types::TNetworkAddress {
+        types::TNetworkAddress::new(host.to_string(), port)
+    }
+
+    fn exec_params(
+        destination: Option<types::TNetworkAddress>,
+        prober: Option<types::TNetworkAddress>,
+    ) -> internal_service::TPlanFragmentExecParams {
+        internal_service::TPlanFragmentExecParams {
+            query_id: unique_id(1, 2),
+            fragment_instance_id: unique_id(3, 4),
+            per_node_scan_ranges: BTreeMap::new(),
+            per_exch_num_senders: BTreeMap::new(),
+            destinations: Some(vec![data_sinks::TPlanFragmentDestination::new(
+                unique_id(5, 6),
+                None::<types::TNetworkAddress>,
+                destination,
+                None::<i32>,
+            )]),
+            sender_id: None,
+            num_senders: None,
+            send_query_statistics_with_every_batch: None,
+            use_vectorized: None,
+            runtime_filter_params: Some(runtime_filter::TRuntimeFilterParams {
+                id_to_prober_params: Some(BTreeMap::from([(
+                    7,
+                    vec![runtime_filter::TRuntimeFilterProberParams {
+                        fragment_instance_id: None,
+                        fragment_instance_address: prober,
+                    }],
+                )])),
+                runtime_filter_builder_number: None,
+                runtime_filter_max_size: None,
+                skew_join_runtime_filters: None,
+            }),
+            instances_number: None,
+            enable_exchange_pass_through: None,
+            node_to_per_driver_seq_scan_ranges: None,
+            enable_exchange_perf: None,
+            pipeline_sink_dop: None,
+            report_when_finish: None,
+            exec_debug_options: None,
+        }
+    }
+
+    fn plan_node(
+        node_id: i32,
+        node_type: plan_nodes::TPlanNodeType,
+        hash_join_node: Option<plan_nodes::THashJoinNode>,
+        fetch_node: Option<plan_nodes::TFetchNode>,
+    ) -> plan_nodes::TPlanNode {
+        plan_nodes::TPlanNode::new(
+            node_id,
+            node_type,
+            0,
+            -1,
+            Vec::new(),
+            Vec::new(),
+            None::<Vec<exprs::TExpr>>,
+            false,
+            None::<plan_nodes::TPlanNodeCommon>,
+            hash_join_node,
+            None::<plan_nodes::TAggregationNode>,
+            None::<plan_nodes::TSortNode>,
+            None::<plan_nodes::TMergeNode>,
+            None::<plan_nodes::TExchangeNode>,
+            None::<plan_nodes::TMySQLScanNode>,
+            None::<plan_nodes::TOlapScanNode>,
+            None::<plan_nodes::TFileScanNode>,
+            None::<plan_nodes::TSchemaScanNode>,
+            None::<plan_nodes::TMetaScanNode>,
+            None::<plan_nodes::TAnalyticNode>,
+            None::<plan_nodes::TUnionNode>,
+            None::<plan_nodes::TBackendResourceProfile>,
+            None::<plan_nodes::TEsScanNode>,
+            None::<plan_nodes::TRepeatNode>,
+            None::<plan_nodes::TAssertNumRowsNode>,
+            None::<plan_nodes::TIntersectNode>,
+            None::<plan_nodes::TExceptNode>,
+            None::<plan_nodes::TMergeJoinNode>,
+            None::<plan_nodes::TRawValuesNode>,
+            None::<bool>,
+            None::<plan_nodes::THdfsScanNode>,
+            None::<plan_nodes::TProjectNode>,
+            None::<plan_nodes::TTableFunctionNode>,
+            None::<Vec<runtime_filter::TRuntimeFilterDescription>>,
+            None::<plan_nodes::TDecodeNode>,
+            None::<std::collections::BTreeSet<types::TPlanNodeId>>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<plan_nodes::TJDBCScanNode>,
+            None::<plan_nodes::TConnectorScanNode>,
+            None::<plan_nodes::TCrossJoinNode>,
+            None::<plan_nodes::TLakeScanNode>,
+            None::<plan_nodes::TNestLoopJoinNode>,
+            None::<plan_nodes::TStarRocksScanNode>,
+            None::<plan_nodes::TStreamScanNode>,
+            None::<plan_nodes::TStreamJoinNode>,
+            None::<plan_nodes::TStreamAggregationNode>,
+            None::<plan_nodes::TSelectNode>,
+            fetch_node,
+            None::<plan_nodes::TLookUpNode>,
+            None::<plan_nodes::TBenchmarkScanNode>,
+        )
+    }
+
+    fn fragment(fetch_port: i32, merge_port: i32) -> planner::TPlanFragment {
+        let fetch_node = plan_nodes::TFetchNode::new(
+            Some(8),
+            None::<BTreeMap<types::TTupleId, descriptors::TRowPositionDescriptor>>,
+            Some(descriptors::TNodesInfo::new(
+                1,
+                vec![descriptors::TNodeInfo::new(
+                    1,
+                    0,
+                    "fetch-host".to_string(),
+                    fetch_port,
+                )],
+            )),
+        );
+        let hash_join_node = plan_nodes::THashJoinNode {
+            join_op: plan_nodes::TJoinOp::INNER_JOIN,
+            eq_join_conjuncts: Vec::new(),
+            other_join_conjuncts: None,
+            is_push_down: None,
+            add_probe_filters: None,
+            is_rewritten_from_not_in: None,
+            sql_join_predicates: None,
+            sql_predicates: None,
+            build_runtime_filters: Some(vec![runtime_filter::TRuntimeFilterDescription {
+                filter_id: Some(7),
+                build_expr: None,
+                expr_order: None,
+                plan_node_id_to_target_expr: None,
+                has_remote_targets: None,
+                bloom_filter_size: None,
+                runtime_filter_merge_nodes: Some(vec![address("merge-host", merge_port)]),
+                build_join_mode: None,
+                sender_finst_id: None,
+                build_plan_node_id: None,
+                broadcast_grf_senders: None,
+                broadcast_grf_destinations: None,
+                bucketseq_to_instance: None,
+                plan_node_id_to_partition_by_exprs: None,
+                filter_type: None,
+                layout: None,
+                build_from_group_execution: None,
+                is_broad_cast_join_in_skew: None,
+                skew_shuffle_filter_id: None,
+            }]),
+            build_runtime_filters_from_planner: None,
+            distribution_mode: None,
+            partition_exprs: None,
+            output_columns: None,
+            interpolate_passthrough: None,
+            late_materialization: None,
+            enable_partition_hash_join: None,
+            is_skew_join: None,
+            common_slot_map: None,
+            asof_join_condition: None,
+        };
+        planner::TPlanFragment {
+            plan: Some(plan_nodes::TPlan::new(vec![
+                plan_node(
+                    10,
+                    plan_nodes::TPlanNodeType::FETCH_NODE,
+                    None,
+                    Some(fetch_node),
+                ),
+                plan_node(
+                    11,
+                    plan_nodes::TPlanNodeType::HASH_JOIN_NODE,
+                    Some(hash_join_node),
+                    None,
+                ),
+            ])),
+            output_exprs: None,
+            output_sink: None,
+            partition: partitions::TDataPartition::new(
+                partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<exprs::TExpr>>,
+                None::<Vec<partitions::TRangePartition>>,
+                None::<Vec<partitions::TBucketProperty>>,
+            ),
+            min_reservation_bytes: None,
+            initial_reservation_total_claims: None,
+            query_global_dicts: None,
+            load_global_dicts: None,
+            cache_param: None,
+            query_global_dict_exprs: None,
+            group_execution_param: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_internal_addresses_preserves_plan_ports() {
+        let exec_params = exec_params(
+            Some(address("dest-host", 9030)),
+            Some(address("prober-host", 9040)),
+        );
+        let fragment = fragment(9050, 9060);
+
+        validate_internal_addresses(&exec_params, Some(&fragment))
+            .expect("validate internal addresses");
+
+        assert_eq!(
+            exec_params
+                .destinations
+                .as_ref()
+                .expect("destinations")[0]
+                .brpc_server
+                .as_ref()
+                .expect("destination addr")
+                .port,
+            9030
+        );
+        assert_eq!(
+            exec_params
+                .runtime_filter_params
+                .as_ref()
+                .expect("runtime filter params")
+                .id_to_prober_params
+                .as_ref()
+                .expect("probers")[&7][0]
+                .fragment_instance_address
+                .as_ref()
+                .expect("prober addr")
+                .port,
+            9040
+        );
+        assert_eq!(
+            fragment
+                .plan
+                .as_ref()
+                .expect("plan")
+                .nodes[0]
+                .fetch_node
+                .as_ref()
+                .expect("fetch node")
+                .nodes_info
+                .as_ref()
+                .expect("nodes_info")
+                .nodes[0]
+                .async_internal_port,
+            9050
+        );
+        assert_eq!(
+            fragment
+                .plan
+                .as_ref()
+                .expect("plan")
+                .nodes[1]
+                .hash_join_node
+                .as_ref()
+                .expect("hash join")
+                .build_runtime_filters
+                .as_ref()
+                .expect("runtime filters")[0]
+                .runtime_filter_merge_nodes
+                .as_ref()
+                .expect("merge nodes")[0]
+                .port,
+            9060
+        );
+    }
+
+    #[test]
+    fn test_validate_internal_addresses_rejects_missing_or_invalid_fields() {
+        let missing_dest = exec_params(None, Some(address("prober-host", 9040)));
+        let err = validate_internal_addresses(&missing_dest, None).expect_err("missing destination");
+        assert!(err.contains("missing destination address"));
+
+        let empty_host = exec_params(
+            Some(address("", 9030)),
+            Some(address("prober-host", 9040)),
+        );
+        let err = validate_internal_addresses(&empty_host, None).expect_err("empty host");
+        assert!(err.contains("hostname is empty"));
+
+        let bad_fetch_port = fragment(0, 9060);
+        let err = validate_internal_addresses(
+            &exec_params(
+                Some(address("dest-host", 9030)),
+                Some(address("prober-host", 9040)),
+            ),
+            Some(&bad_fetch_port),
+        )
+        .expect_err("invalid fetch port");
+        assert!(err.contains("async_internal_port must be positive"));
+
+        let bad_prober_port = exec_params(
+            Some(address("dest-host", 9030)),
+            Some(address("prober-host", 0)),
+        );
+        let err = validate_internal_addresses(&bad_prober_port, None).expect_err("invalid prober port");
+        assert!(err.contains("port must be positive"));
     }
 }

@@ -26,14 +26,11 @@ use tonic::service::Routes;
 use tonic::transport::Server;
 
 use crate::common::config::{http_port, starlet_port};
-use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
 use crate::connector::starrocks::starmgr;
 use crate::novarocks_logging::{error, info, warn};
-use crate::runtime::exchange;
-use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
-use crate::runtime::query_context::{QueryId, query_context_manager, query_expire_durations};
 use crate::runtime::starlet_shard_registry;
+use crate::service::internal_rpc;
 use crate::service::{load_tracking_http, stream_load_http};
 
 pub use crate::service::grpc_proto as proto;
@@ -92,35 +89,32 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     }
                 };
 
-                let payload = req.payload;
-                let payload_size = payload.len();
-                let decode_start = std::time::Instant::now();
-                let chunks = match exchange::decode_chunks(&payload) {
-                    Ok(v) => v,
-                    Err(e) => {
+                let result =
+                    internal_rpc::handle_transmit_chunk(proto::starrocks::PTransmitChunkParams {
+                        finst_id: Some(proto::starrocks::PUniqueId {
+                            hi: req.finst_id_hi,
+                            lo: req.finst_id_lo,
+                        }),
+                        node_id: Some(req.node_id),
+                        sender_id: Some(req.sender_id),
+                        be_number: Some(req.be_number),
+                        eos: Some(req.eos),
+                        sequence: Some(req.sequence),
+                        chunks: vec![proto::starrocks::ChunkPb {
+                            data: Some(req.payload),
+                            data_size: Some(0),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    });
+                if let Some(status) = result.status.as_ref() {
+                    if status.status_code != 0 {
                         let _ = tx
-                            .send(Err(tonic::Status::invalid_argument(format!(
-                                "exchange decode failed: {e}"
-                            ))))
+                            .send(Err(tonic::Status::internal(status.error_msgs.join("; "))))
                             .await;
                         break;
                     }
-                };
-                let decode_ns = decode_start.elapsed().as_nanos() as u128;
-
-                exchange::push_chunks_with_stats(
-                    exchange::ExchangeKey {
-                        finst_id_hi: req.finst_id_hi,
-                        finst_id_lo: req.finst_id_lo,
-                        node_id: req.node_id,
-                    },
-                    req.sender_id,
-                    req.be_number,
-                    chunks,
-                    req.eos,
-                    payload_size,
-                    decode_ns,
-                );
+                }
 
                 let ack = proto::novarocks::ExchangeResponse {
                     ack_sequence: req.sequence,
@@ -158,241 +152,18 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         request: tonic::Request<proto::starrocks::PTransmitRuntimeFilterParams>,
     ) -> Result<tonic::Response<proto::starrocks::PTransmitRuntimeFilterResult>, tonic::Status>
     {
-        let params = request.get_ref();
-        let Some(filter_id) = params.filter_id else {
-            let mut response = proto::starrocks::PTransmitRuntimeFilterResult {
-                status: Some(proto::starrocks::StatusPb {
-                    status_code: 1,
-                    error_msgs: vec!["missing filter_id for transmit_runtime_filter".to_string()],
-                }),
-                filter_id: Some(0),
-            };
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-            }
-            return Ok(tonic::Response::new(response));
-        };
-        let mut response = proto::starrocks::PTransmitRuntimeFilterResult {
-            status: Some(proto::starrocks::StatusPb {
-                status_code: 0,
-                error_msgs: Vec::new(),
-            }),
-            filter_id: Some(filter_id),
-        };
-
-        let Some(query_id) = params.query_id.as_ref() else {
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status
-                    .error_msgs
-                    .push("missing query_id for transmit_runtime_filter".to_string());
-            }
-            return Ok(tonic::Response::new(response));
-        };
-        let query_id = QueryId {
-            hi: query_id.hi,
-            lo: query_id.lo,
-        };
-
-        let Some(payload) = params.data.as_ref() else {
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status.error_msgs.push(format!(
-                    "missing runtime filter payload: query_id={} filter_id={}",
-                    query_id, filter_id
-                ));
-            }
-            return Ok(tonic::Response::new(response));
-        };
-
-        if payload.is_empty() {
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status.error_msgs.push(format!(
-                    "runtime filter payload is empty: query_id={} filter_id={}",
-                    query_id, filter_id
-                ));
-            }
-            return Ok(tonic::Response::new(response));
-        }
-
-        let is_partial = params.is_partial.unwrap_or(false);
-        if is_partial {
-            let Some(worker) =
-                query_context_manager().get_or_create_runtime_filter_worker(query_id)
-            else {
-                let (delivery_expire, query_expire) = query_expire_durations(None);
-                let _ = query_context_manager().ensure_context(
-                    query_id,
-                    false,
-                    delivery_expire,
-                    query_expire,
-                );
-                let _ = query_context_manager().enqueue_pending_runtime_filter(
-                    query_id,
-                    filter_id,
-                    params.build_be_number.unwrap_or(0),
-                    payload.to_vec(),
-                );
-                return Ok(tonic::Response::new(response));
-            };
-            let build_be_number = params.build_be_number.unwrap_or(0);
-            if let Err(err) = worker.receive_partial(filter_id, payload, build_be_number) {
-                warn!(
-                    "receive_partial_runtime_filter failed: query_id={} filter_id={} err={}",
-                    query_id, filter_id, err
-                );
-                if let Some(status) = response.status.as_mut() {
-                    status.status_code = 1;
-                    status.error_msgs.push(err);
-                }
-            }
-            return Ok(tonic::Response::new(response));
-        }
-
-        let Some(hub) = query_context_manager().get_runtime_filter_hub(query_id) else {
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status.error_msgs.push(format!(
-                    "runtime filter hub not found: query_id={}",
-                    query_id
-                ));
-            }
-            return Ok(tonic::Response::new(response));
-        };
-
-        if let Err(err) = hub.receive_remote_filter(filter_id, payload) {
-            warn!(
-                "receive_remote_filter failed: query_id={} filter_id={} err={}",
-                query_id, filter_id, err
-            );
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status.error_msgs.push(err);
-            }
-        }
-        Ok(tonic::Response::new(response))
+        Ok(tonic::Response::new(
+            internal_rpc::handle_transmit_runtime_filter(request.into_inner()),
+        ))
     }
 
     async fn lookup(
         &self,
         request: tonic::Request<proto::starrocks::PLookUpRequest>,
     ) -> Result<tonic::Response<proto::starrocks::PLookUpResponse>, tonic::Status> {
-        let req = request.into_inner();
-        let mut response = proto::starrocks::PLookUpResponse {
-            status: Some(proto::starrocks::StatusPb {
-                status_code: 0,
-                error_msgs: Vec::new(),
-            }),
-            columns: Vec::new(),
-        };
-
-        let Some(query_id) = req.query_id.as_ref() else {
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status
-                    .error_msgs
-                    .push("missing query_id for lookup".to_string());
-            }
-            return Ok(tonic::Response::new(response));
-        };
-        let query_id = QueryId {
-            hi: query_id.hi,
-            lo: query_id.lo,
-        };
-        let Some(tuple_id) = req.request_tuple_id else {
-            if let Some(status) = response.status.as_mut() {
-                status.status_code = 1;
-                status
-                    .error_msgs
-                    .push("missing request_tuple_id for lookup".to_string());
-            }
-            return Ok(tonic::Response::new(response));
-        };
-
-        let mut request_columns = HashMap::new();
-        for col in req.request_columns {
-            let Some(slot_id) = col.slot_id else {
-                if let Some(status) = response.status.as_mut() {
-                    status.status_code = 1;
-                    status
-                        .error_msgs
-                        .push("lookup request column missing slot_id".to_string());
-                }
-                return Ok(tonic::Response::new(response));
-            };
-            if col.data.as_ref().map_or(true, |data| data.is_empty()) {
-                if let Some(status) = response.status.as_mut() {
-                    status.status_code = 1;
-                    status
-                        .error_msgs
-                        .push(format!("lookup request column {} missing data", slot_id));
-                }
-                return Ok(tonic::Response::new(response));
-            }
-            let slot_id = match SlotId::try_from(slot_id) {
-                Ok(v) => v,
-                Err(err) => {
-                    if let Some(status) = response.status.as_mut() {
-                        status.status_code = 1;
-                        status.error_msgs.push(err);
-                    }
-                    return Ok(tonic::Response::new(response));
-                }
-            };
-            let data = match col.data.as_ref() {
-                Some(v) => v,
-                None => {
-                    if let Some(status) = response.status.as_mut() {
-                        status.status_code = 1;
-                        status
-                            .error_msgs
-                            .push(format!("lookup request column {} missing data", slot_id));
-                    }
-                    return Ok(tonic::Response::new(response));
-                }
-            };
-            let array = match decode_column_ipc(data) {
-                Ok(arr) => arr,
-                Err(err) => {
-                    if let Some(status) = response.status.as_mut() {
-                        status.status_code = 1;
-                        status.error_msgs.push(err);
-                    }
-                    return Ok(tonic::Response::new(response));
-                }
-            };
-            request_columns.insert(slot_id, array);
-        }
-
-        match execute_lookup_request(query_id, tuple_id, request_columns) {
-            Ok(columns) => {
-                for (slot_id, array) in columns {
-                    let data = match encode_column_ipc(&array) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            if let Some(status) = response.status.as_mut() {
-                                status.status_code = 1;
-                                status.error_msgs.push(err);
-                            }
-                            return Ok(tonic::Response::new(response));
-                        }
-                    };
-                    response.columns.push(proto::starrocks::PColumn {
-                        slot_id: Some(slot_id.as_u32() as i32),
-                        data_size: Some(data.len() as i64),
-                        data: Some(data),
-                    });
-                }
-            }
-            Err(err) => {
-                if let Some(status) = response.status.as_mut() {
-                    status.status_code = 1;
-                    status.error_msgs.push(err);
-                }
-            }
-        }
-        Ok(tonic::Response::new(response))
+        Ok(tonic::Response::new(internal_rpc::handle_lookup(
+            request.into_inner(),
+        )))
     }
 }
 

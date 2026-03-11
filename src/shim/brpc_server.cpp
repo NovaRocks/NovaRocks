@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <functional>
 #include <iomanip>
@@ -190,6 +191,150 @@ std::string take_rust_buf_string(NovaRocksRustBuf* buf) {
         buf->len = 0;
     }
     return out;
+}
+
+void init_compat_buf(NovaRocksRustBuf* buf) {
+    if (buf == nullptr) {
+        return;
+    }
+    buf->ptr = nullptr;
+    buf->len = 0;
+}
+
+void write_compat_buf(const std::string& bytes, NovaRocksRustBuf* out) {
+    if (out == nullptr) {
+        return;
+    }
+    init_compat_buf(out);
+    if (bytes.empty()) {
+        return;
+    }
+    auto* ptr = static_cast<uint8_t*>(std::malloc(bytes.size()));
+    if (ptr == nullptr) {
+        return;
+    }
+    std::memcpy(ptr, bytes.data(), bytes.size());
+    out->ptr = ptr;
+    out->len = bytes.size();
+}
+
+using RustUnaryRpcFn = int32_t (*)(const uint8_t*, size_t, NovaRocksRustBuf*, NovaRocksRustBuf*);
+
+template <typename Request, typename Response>
+bool invoke_rust_unary_rpc(const Request& request,
+                           Response* response,
+                           RustUnaryRpcFn func,
+                           const char* rpc_name,
+                           std::string* err) {
+    if (response == nullptr) {
+        if (err != nullptr) {
+            *err = std::string(rpc_name) + " response is null";
+        }
+        return false;
+    }
+
+    std::string request_bytes;
+    if (!request.SerializeToString(&request_bytes)) {
+        if (err != nullptr) {
+            *err = std::string("serialize ") + rpc_name + " request failed";
+        }
+        return false;
+    }
+
+    NovaRocksRustBuf resp_buf{nullptr, 0};
+    NovaRocksRustBuf err_buf{nullptr, 0};
+    int32_t rc = func(reinterpret_cast<const uint8_t*>(request_bytes.data()),
+                      request_bytes.size(),
+                      &resp_buf,
+                      &err_buf);
+    std::string rust_err = take_rust_buf_string(&err_buf);
+    if (rc != 0) {
+        take_rust_buf_string(&resp_buf);
+        if (err != nullptr) {
+            *err = rust_err.empty() ? std::string("rust ") + rpc_name + " failed" : rust_err;
+        }
+        return false;
+    }
+    if (resp_buf.ptr == nullptr || resp_buf.len == 0) {
+        response->Clear();
+        take_rust_buf_string(&resp_buf);
+        return true;
+    }
+    bool ok = response->ParseFromArray(resp_buf.ptr, static_cast<int>(resp_buf.len));
+    take_rust_buf_string(&resp_buf);
+    if (!ok) {
+        if (err != nullptr) {
+            *err = std::string("parse ") + rpc_name + " response from rust buffer failed";
+        }
+        return false;
+    }
+    return true;
+}
+
+template <typename Request, typename Response>
+int32_t invoke_internal_brpc_client(
+        const char* host,
+        uint16_t port,
+        const uint8_t* ptr,
+        size_t len,
+        NovaRocksRustBuf* out_resp,
+        NovaRocksRustBuf* out_err,
+        const char* rpc_name,
+        void (starrocks::PInternalService_Stub::*method)(
+                google::protobuf::RpcController*,
+                const Request*,
+                Response*,
+                google::protobuf::Closure*),
+        const std::function<void(brpc::Controller*, const Request&)>& configure = nullptr) {
+    init_compat_buf(out_resp);
+    init_compat_buf(out_err);
+
+    if (host == nullptr || host[0] == '\0') {
+        write_compat_buf(std::string(rpc_name) + " destination host is empty", out_err);
+        return 2;
+    }
+    if (port == 0) {
+        write_compat_buf(std::string(rpc_name) + " destination port must be positive", out_err);
+        return 2;
+    }
+    if (ptr == nullptr) {
+        write_compat_buf(std::string(rpc_name) + " request ptr is null", out_err);
+        return 2;
+    }
+
+    Request request;
+    if (!request.ParseFromArray(ptr, static_cast<int>(len))) {
+        write_compat_buf(std::string("decode ") + rpc_name + " request failed", out_err);
+        return 2;
+    }
+
+    brpc::Channel channel;
+    std::string endpoint = std::string(host) + ":" + std::to_string(port);
+    if (channel.Init(endpoint.c_str(), nullptr) != 0) {
+        write_compat_buf(std::string(rpc_name) + " channel init failed: " + endpoint, out_err);
+        return 1;
+    }
+
+    starrocks::PInternalService_Stub stub(&channel);
+    brpc::Controller cntl;
+    cntl.set_timeout_ms(600000);
+    if (configure) {
+        configure(&cntl, request);
+    }
+    Response response;
+    (stub.*method)(&cntl, &request, &response, nullptr);
+    if (cntl.Failed()) {
+        write_compat_buf(std::string(rpc_name) + " request failed: " + cntl.ErrorText(), out_err);
+        return 1;
+    }
+
+    std::string response_bytes;
+    if (!response.SerializeToString(&response_bytes)) {
+        write_compat_buf(std::string("serialize ") + rpc_name + " response failed", out_err);
+        return 1;
+    }
+    write_compat_buf(response_bytes, out_resp);
+    return 0;
 }
 
 class InternalServiceImpl final : public starrocks::PInternalService {
@@ -408,7 +553,109 @@ public:
         status_ok(response->mutable_status());
     }
 
+    void transmit_chunk(google::protobuf::RpcController* controller,
+                        const starrocks::PTransmitChunkParams* request,
+                        starrocks::PTransmitChunkResult* response,
+                        google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing transmit_chunk request/response");
+            }
+            cntl->SetFailed("missing transmit_chunk request/response");
+            return;
+        }
+
+        std::string err;
+        if (!invoke_transmit_chunk(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            cntl->SetFailed(err);
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+    }
+
+    void transmit_runtime_filter(google::protobuf::RpcController* controller,
+                                 const starrocks::PTransmitRuntimeFilterParams* request,
+                                 starrocks::PTransmitRuntimeFilterResult* response,
+                                 google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing transmit_runtime_filter request/response");
+            }
+            cntl->SetFailed("missing transmit_runtime_filter request/response");
+            return;
+        }
+
+        std::string err;
+        if (!invoke_transmit_runtime_filter(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            cntl->SetFailed(err);
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+    }
+
+    void lookup(google::protobuf::RpcController* controller,
+                const starrocks::PLookUpRequest* request,
+                starrocks::PLookUpResponse* response,
+                google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing lookup request/response");
+            }
+            cntl->SetFailed("missing lookup request/response");
+            return;
+        }
+
+        std::string err;
+        if (!invoke_lookup(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            cntl->SetFailed(err);
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+    }
+
 private:
+    static bool invoke_transmit_chunk(const starrocks::PTransmitChunkParams& request,
+                                      starrocks::PTransmitChunkResult* response,
+                                      std::string* err) {
+        return invoke_rust_unary_rpc(
+                request, response, novarocks_rs_transmit_chunk, "transmit_chunk", err);
+    }
+
+    static bool invoke_transmit_runtime_filter(
+            const starrocks::PTransmitRuntimeFilterParams& request,
+            starrocks::PTransmitRuntimeFilterResult* response,
+            std::string* err) {
+        return invoke_rust_unary_rpc(request,
+                                     response,
+                                     novarocks_rs_transmit_runtime_filter,
+                                     "transmit_runtime_filter",
+                                     err);
+    }
+
+    static bool invoke_lookup(const starrocks::PLookUpRequest& request,
+                              starrocks::PLookUpResponse* response,
+                              std::string* err) {
+        return invoke_rust_unary_rpc(request, response, novarocks_rs_lookup, "lookup", err);
+    }
+
     NovaRocksCompatConfig cfg_;
 };
 
@@ -1510,6 +1757,68 @@ std::unique_ptr<LakeServiceImpl> g_lake_service;
 std::atomic<bool> g_brpc_started{false};
 
 } // namespace
+
+int32_t novarocks_compat_transmit_chunk(const char* host,
+                                        uint16_t port,
+                                        const uint8_t* ptr,
+                                        size_t len,
+                                        NovaRocksRustBuf* out_resp,
+                                        NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PTransmitChunkParams,
+                                       starrocks::PTransmitChunkResult>(
+            host,
+            port,
+            ptr,
+            len,
+            out_resp,
+            out_err,
+            "transmit_chunk",
+            &starrocks::PInternalService_Stub::transmit_chunk);
+}
+
+int32_t novarocks_compat_transmit_runtime_filter(const char* host,
+                                                 uint16_t port,
+                                                 const uint8_t* ptr,
+                                                 size_t len,
+                                                 NovaRocksRustBuf* out_resp,
+                                                 NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PTransmitRuntimeFilterParams,
+                                       starrocks::PTransmitRuntimeFilterResult>(
+            host,
+            port,
+            ptr,
+            len,
+            out_resp,
+            out_err,
+            "transmit_runtime_filter",
+            &starrocks::PInternalService_Stub::transmit_runtime_filter,
+            [](brpc::Controller* cntl, const starrocks::PTransmitRuntimeFilterParams& request) {
+                if (request.has_transmit_timeout_ms()) {
+                    cntl->set_timeout_ms(request.transmit_timeout_ms());
+                }
+            });
+}
+
+int32_t novarocks_compat_lookup(const char* host,
+                                uint16_t port,
+                                const uint8_t* ptr,
+                                size_t len,
+                                NovaRocksRustBuf* out_resp,
+                                NovaRocksRustBuf* out_err) {
+    return invoke_internal_brpc_client<starrocks::PLookUpRequest, starrocks::PLookUpResponse>(
+            host,
+            port,
+            ptr,
+            len,
+            out_resp,
+            out_err,
+            "lookup",
+            &starrocks::PInternalService_Stub::lookup);
+}
+
+void novarocks_compat_free_buf(uint8_t* ptr, size_t /*len*/) {
+    std::free(ptr);
+}
 
 int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* err) {
     if (cfg == nullptr) {
