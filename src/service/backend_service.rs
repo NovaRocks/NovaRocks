@@ -35,6 +35,7 @@ use thrift::transport::{
     TWriteTransportFactory,
 };
 
+use crate::common::network;
 use crate::common::thrift::thrift_named_json;
 use crate::connector::starrocks::lake::{
     create_lake_tablet_from_req, execute_alter_tablet_task,
@@ -135,10 +136,7 @@ fn json_summary<T: thrift::protocol::TSerializable>(v: &T) -> String {
 
 fn build_backend_for_finish_task() -> Result<types::TBackend, String> {
     let cfg = novarocks_app_config().map_err(|e| e.to_string())?;
-    let mut host = cfg.server.host.trim().to_string();
-    if host.is_empty() || host == "0.0.0.0" {
-        host = "127.0.0.1".to_string();
-    }
+    let host = network::advertise_host()?;
     Ok(types::TBackend::new(
         host,
         cfg.server.be_port as i32,

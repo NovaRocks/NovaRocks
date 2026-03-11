@@ -18,8 +18,8 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, LargeBinaryArray, LargeStringArray,
-    StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, BinaryBuilder, LargeBinaryArray, LargeStringArray, StringArray,
+    StructArray,
 };
 use arrow::datatypes::{DataType, Field};
 use arrow_buffer::i256;
@@ -28,9 +28,7 @@ use crate::exec::node::aggregate::AggFunction;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array,
-};
+use super::common::{AggScalarValue, build_scalar_array, compare_scalar_values, scalar_from_array};
 
 pub(super) struct MinMaxNAgg;
 
@@ -87,7 +85,10 @@ impl AggregateFunction for MinMaxNAgg {
             kind,
             output_type,
             intermediate_type,
-            input_arg_type: func.types.as_ref().and_then(|sig| sig.input_arg_type.clone()),
+            input_arg_type: func
+                .types
+                .as_ref()
+                .and_then(|sig| sig.input_arg_type.clone()),
             count_all: false,
         })
     }
@@ -224,8 +225,7 @@ impl AggregateFunction for MinMaxNAgg {
             DataType::List(_) => {
                 let mut values = Vec::with_capacity(group_states.len());
                 for &base in group_states {
-                    let state =
-                        unsafe { &*((base as *mut u8).add(offset) as *const MinMaxNState) };
+                    let state = unsafe { &*((base as *mut u8).add(offset) as *const MinMaxNState) };
                     let list = state.values.iter().cloned().map(Some).collect::<Vec<_>>();
                     values.push(Some(AggScalarValue::List(list)));
                 }
@@ -296,18 +296,18 @@ fn push_value(
         return Ok(());
     }
     state.values.push(value);
-    state.values.sort_by(|left, right| {
-        compare_scalar_values(left, right).unwrap_or(Ordering::Equal)
-    });
+    state
+        .values
+        .sort_by(|left, right| compare_scalar_values(left, right).unwrap_or(Ordering::Equal));
     if !keep_smallest {
         state.values.reverse();
     }
     if state.values.len() > state.limit {
         state.values.truncate(state.limit);
     }
-    state.values.sort_by(|left, right| {
-        compare_scalar_values(left, right).unwrap_or(Ordering::Equal)
-    });
+    state
+        .values
+        .sort_by(|left, right| compare_scalar_values(left, right).unwrap_or(Ordering::Equal));
     Ok(())
 }
 
@@ -415,7 +415,8 @@ fn encode_scalar(out: &mut Vec<u8>, value: &AggScalarValue) -> Result<(), String
         }
         AggScalarValue::Utf8(v) => {
             out.push(4);
-            let len = u32::try_from(v.len()).map_err(|_| "min_n/max_n utf8 length overflow".to_string())?;
+            let len = u32::try_from(v.len())
+                .map_err(|_| "min_n/max_n utf8 length overflow".to_string())?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(v.as_bytes());
         }
@@ -434,7 +435,8 @@ fn encode_scalar(out: &mut Vec<u8>, value: &AggScalarValue) -> Result<(), String
         AggScalarValue::Decimal256(v) => {
             out.push(11);
             let text = v.to_string();
-            let len = u32::try_from(text.len()).map_err(|_| "min_n/max_n decimal256 length overflow".to_string())?;
+            let len = u32::try_from(text.len())
+                .map_err(|_| "min_n/max_n decimal256 length overflow".to_string())?;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(text.as_bytes());
         }

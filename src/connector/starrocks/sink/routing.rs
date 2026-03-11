@@ -93,7 +93,7 @@ pub(crate) fn build_sink_routing(
             "OLAP_TABLE_SINK cannot resolve routing index for schema_id={schema_id}"
         ));
     }
-    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs)
+    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs, None)
 }
 
 pub(crate) fn build_sink_routing_for_index_id(
@@ -101,6 +101,7 @@ pub(crate) fn build_sink_routing_for_index_id(
     index_id: i64,
     schema_id: i64,
     output_exprs: Option<&[exprs::TExpr]>,
+    session_time_zone: Option<&str>,
 ) -> Result<SinkRouting, String> {
     if index_id <= 0 {
         return Err(format!(
@@ -109,7 +110,13 @@ pub(crate) fn build_sink_routing_for_index_id(
     }
     let mut candidate_index_ids = HashSet::new();
     candidate_index_ids.insert(index_id);
-    build_sink_routing_with_candidates(sink, schema_id, candidate_index_ids, output_exprs)
+    build_sink_routing_with_candidates(
+        sink,
+        schema_id,
+        candidate_index_ids,
+        output_exprs,
+        session_time_zone,
+    )
 }
 
 fn build_sink_routing_with_candidates(
@@ -117,6 +124,7 @@ fn build_sink_routing_with_candidates(
     schema_id: i64,
     candidate_index_ids: HashSet<i64>,
     output_exprs: Option<&[exprs::TExpr]>,
+    session_time_zone: Option<&str>,
 ) -> Result<SinkRouting, String> {
     let table_name = sink
         .table_name
@@ -165,7 +173,13 @@ fn build_sink_routing_with_candidates(
     }
 
     let partition_map = collect_tablet_partition_map(&sink.partition, &sink.location)?;
-    let row_routing = build_row_routing_plan(sink, schema_id, &candidate_index_ids, output_exprs)?;
+    let row_routing = build_row_routing_plan(
+        sink,
+        schema_id,
+        &candidate_index_ids,
+        output_exprs,
+        session_time_zone,
+    )?;
 
     let mut commit_infos = Vec::with_capacity(row_routing.tablet_ids.len());
     for tablet_id in &row_routing.tablet_ids {
@@ -202,6 +216,7 @@ fn build_row_routing_plan(
     schema_id: i64,
     candidate_index_ids: &HashSet<i64>,
     output_exprs: Option<&[exprs::TExpr]>,
+    session_time_zone: Option<&str>,
 ) -> Result<RowRoutingPlan, String> {
     let visible_partitions = sink
         .partition
@@ -235,8 +250,12 @@ fn build_row_routing_plan(
     }
     let routing_partitions = visible_partitions;
 
-    let mut partition_key_source =
-        build_partition_key_source(sink, slot_name_overrides, slot_id_overrides)?;
+    let mut partition_key_source = build_partition_key_source(
+        sink,
+        session_time_zone,
+        slot_name_overrides,
+        slot_id_overrides,
+    )?;
     let mut partition_key_len = partition_key_source_len(&partition_key_source);
 
     let has_any_in_keys = routing_partitions

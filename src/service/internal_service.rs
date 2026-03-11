@@ -945,6 +945,7 @@ fn spawn_exec_fragment(
     desc_tbl: Option<descriptors::TDescriptorTable>,
     exec_params: internal_service::TPlanFragmentExecParams,
     query_opts: Option<internal_service::TQueryOptions>,
+    session_time_zone: Option<String>,
     pipeline_dop: i32,
     group_execution_scan_dop: Option<i32>,
     db_name: Option<String>,
@@ -984,6 +985,7 @@ fn spawn_exec_fragment(
                 desc_tbl.as_ref(),
                 Some(&exec_params),
                 query_opts,
+                session_time_zone.as_deref(),
                 pipeline_dop,
                 group_execution_scan_dop,
                 db_name.as_deref(),
@@ -1150,6 +1152,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         let last_query_id = query_globals
             .and_then(|g| g.last_query_id.as_deref())
             .map(|s| s.to_string());
+        let session_time_zone = query_globals.and_then(|g| g.time_zone.clone());
 
         let Some(exec_params) = params else {
             continue;
@@ -1260,6 +1263,7 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
             desc_tbl.clone(),
             exec_params,
             query_opts,
+            session_time_zone,
             pipeline_dop,
             group_execution_scan_dop,
             db_name.map(|s| s.to_string()),
@@ -1329,6 +1333,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
     let last_query_id = query_globals
         .and_then(|g| g.last_query_id.as_deref())
         .map(|s| s.to_string());
+    let session_time_zone = query_globals.and_then(|g| g.time_zone.clone());
     let (delivery_expire, query_expire) = query_expire_durations(query_opts);
     let mgr = query_context_manager();
     let require_existing = one
@@ -1408,6 +1413,7 @@ pub fn submit_exec_plan_fragment(thrift_bytes: &[u8]) -> Result<(), String> {
         desc_tbl.clone(),
         params,
         one.query_options.clone(),
+        session_time_zone,
         pipeline_dop,
         group_execution_scan_dop,
         one.db_name.clone(),
@@ -1450,6 +1456,7 @@ pub(crate) fn execute_plan_fragment_sync(
     let query_opts = one.query_options.as_ref();
     let query_globals = one.query_globals.as_ref();
     let last_query_id = query_globals.and_then(|g| g.last_query_id.as_deref());
+    let session_time_zone = query_globals.and_then(|g| g.time_zone.as_deref());
     let (delivery_expire, query_expire) = query_expire_durations(query_opts);
     let mgr = query_context_manager();
     let require_existing = one
@@ -1489,6 +1496,7 @@ pub(crate) fn execute_plan_fragment_sync(
         desc_tbl.as_ref(),
         Some(&params),
         query_opts,
+        session_time_zone,
         pipeline_dop,
         group_execution_scan_dop,
         one.db_name.as_deref(),

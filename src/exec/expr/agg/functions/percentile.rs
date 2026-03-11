@@ -20,7 +20,9 @@ use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 use crate::common::percentile;
-use crate::exec::expr::agg::functions::common::{AggScalarValue, build_scalar_array, scalar_from_array};
+use crate::exec::expr::agg::functions::common::{
+    AggScalarValue, build_scalar_array, scalar_from_array,
+};
 use crate::exec::expr::function::object::percentile_functions::{
     numeric_value_at, payload_bytes_at,
 };
@@ -416,7 +418,10 @@ impl AggregateFunction for PercentileAgg {
         match kind {
             AggKind::PercentileUnion
             | AggKind::PercentileApprox
-            | AggKind::PercentileApproxWeighted => (std::mem::size_of::<*mut u8>(), std::mem::align_of::<*mut u8>()),
+            | AggKind::PercentileApproxWeighted => (
+                std::mem::size_of::<*mut u8>(),
+                std::mem::align_of::<*mut u8>(),
+            ),
             other => unreachable!("unexpected percentile agg kind: {:?}", other),
         }
     }
@@ -446,13 +451,14 @@ impl AggregateFunction for PercentileAgg {
     fn init_state(&self, spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             match &spec.kind {
-                AggKind::PercentileApproxWeighted => {
-                    std::ptr::write(
-                        ptr as *mut *mut percentile::PercentileState,
-                        std::ptr::null_mut(),
-                    )
-                }
-                _ => std::ptr::write(ptr as *mut *mut percentile::PercentileState, std::ptr::null_mut()),
+                AggKind::PercentileApproxWeighted => std::ptr::write(
+                    ptr as *mut *mut percentile::PercentileState,
+                    std::ptr::null_mut(),
+                ),
+                _ => std::ptr::write(
+                    ptr as *mut *mut percentile::PercentileState,
+                    std::ptr::null_mut(),
+                ),
             }
         }
     }
@@ -483,9 +489,19 @@ impl AggregateFunction for PercentileAgg {
         match &spec.kind {
             AggKind::PercentileApproxWeighted => {
                 if let Some(struct_array) = array.as_any().downcast_ref::<StructArray>() {
-                    update_weighted_struct(struct_array, offset, state_ptrs, "percentile_approx_weighted")
+                    update_weighted_struct(
+                        struct_array,
+                        offset,
+                        state_ptrs,
+                        "percentile_approx_weighted",
+                    )
                 } else {
-                    merge_weighted_payload_array(array, offset, state_ptrs, "percentile_approx_weighted")
+                    merge_weighted_payload_array(
+                        array,
+                        offset,
+                        state_ptrs,
+                        "percentile_approx_weighted",
+                    )
                 }
             }
             AggKind::PercentileUnion | AggKind::PercentileApprox => {
@@ -510,10 +526,15 @@ impl AggregateFunction for PercentileAgg {
             return Err("percentile aggregate merge input type mismatch".to_string());
         };
         match &spec.kind {
-            AggKind::PercentileApproxWeighted => {
-                merge_weighted_payload_array(array, offset, state_ptrs, "percentile_approx_weighted_merge")
+            AggKind::PercentileApproxWeighted => merge_weighted_payload_array(
+                array,
+                offset,
+                state_ptrs,
+                "percentile_approx_weighted_merge",
+            ),
+            _ => {
+                merge_unweighted_payload_array(array, offset, state_ptrs, "percentile_approx_merge")
             }
-            _ => merge_unweighted_payload_array(array, offset, state_ptrs, "percentile_approx_merge"),
         }
     }
 

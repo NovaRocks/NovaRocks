@@ -145,6 +145,7 @@ pub(crate) fn execute_fragment(
     desc_tbl: Option<&descriptors::TDescriptorTable>,
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
     query_opts: Option<&internal_service::TQueryOptions>,
+    session_time_zone: Option<&str>,
     pipeline_dop: i32,
     _group_execution_scan_dop: Option<i32>,
     db_name: Option<&str>,
@@ -237,6 +238,7 @@ pub(crate) fn execute_fragment(
             })
             .unwrap_or(false);
         arena.set_allow_throw_exception(allow_throw_exception);
+        arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
         // Layout hints are used by scan nodes to decide which columns to materialize.
         //
         // For exchange fragments, pruning only by "local usage" is not correct because downstream
@@ -540,6 +542,7 @@ pub(crate) fn execute_fragment(
                     Some(&exec_plan),
                     Some(&lowered.layout),
                     last_query_id,
+                    session_time_zone,
                     fe_addr,
                 )?;
                 let _exec_timer = profiler

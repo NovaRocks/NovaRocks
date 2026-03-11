@@ -32,6 +32,7 @@ use thrift::protocol::{
 use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
 
 use crate::cache::DataCacheManager;
+use crate::common::network;
 use crate::common::types::UniqueId;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::{debug, warn};
@@ -476,15 +477,8 @@ fn build_tracking_url(query_id: QueryId) -> Option<String> {
         return None;
     }
     let cfg = novarocks_app_config().ok()?;
-    let mut host = cfg.server.host.trim().to_string();
-    if host.is_empty() || host == "0.0.0.0" {
-        host = "127.0.0.1".to_string();
-    } else if host == "::" || host == "[::]" {
-        host = "::1".to_string();
-    }
-    if host.contains(':') && !host.starts_with('[') {
-        host = format!("[{host}]");
-    }
+    let host = network::advertise_host().ok()?;
+    let host = network::format_host_for_url(&host);
     Some(format!(
         "http://{host}:{}/api/_load_tracking/{}/{}",
         cfg.server.http_port, query_id.hi, query_id.lo

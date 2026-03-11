@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use novarocks::common::network;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 use std::eprintln;
@@ -399,6 +400,8 @@ fn main() {
             };
 
             let server = &cfg.server;
+            let advertise_host =
+                network::advertise_host_for_server(server).expect("resolve advertise host");
 
             // Start NovaRocks gRPC servers first to guarantee Starlet endpoint is online
             // before heartbeat reports ports to FE.
@@ -407,6 +410,7 @@ fn main() {
             // Start Rust heartbeat service
             let heartbeat_cfg = novarocks::service::heartbeat_service::HeartbeatConfig {
                 host: server.host.clone(),
+                advertise_host: advertise_host.clone(),
                 heartbeat_port: server.heartbeat_port,
                 be_port: server.be_port,
                 brpc_port: server.brpc_port,
@@ -435,8 +439,9 @@ fn main() {
             novarocks::service::compat::start(&compat_cfg).expect("start compat");
 
             println!(
-                "novarocksd started (host={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
+                "novarocksd started (bind_host={}, advertise_host={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
                 compat_cfg.host,
+                advertise_host,
                 compat_cfg.heartbeat_port,
                 server.be_port,
                 compat_cfg.brpc_port,

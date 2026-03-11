@@ -150,13 +150,14 @@ pub(crate) fn resolve_slot_ids_by_names(
 
 pub(crate) fn build_partition_key_source(
     sink: &data_sinks::TOlapTableSink,
+    session_time_zone: Option<&str>,
     slot_name_overrides: Option<&HashMap<String, SlotId>>,
     slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
 ) -> Result<PartitionKeySource, String> {
     if let Some(exprs) = sink.partition.partition_exprs.as_ref()
         && !exprs.is_empty()
     {
-        let plan = lower_partition_expr_plan(exprs, slot_id_overrides)?;
+        let plan = lower_partition_expr_plan(exprs, session_time_zone, slot_id_overrides)?;
         return Ok(PartitionKeySource::Expr(Arc::new(plan)));
     }
 
@@ -195,9 +196,11 @@ pub(crate) fn build_partition_key_source(
 
 fn lower_partition_expr_plan(
     exprs: &[exprs::TExpr],
+    session_time_zone: Option<&str>,
     slot_id_overrides: Option<&HashMap<SlotId, SlotId>>,
 ) -> Result<PartitionExprPlan, String> {
     let mut arena = ExprArena::default();
+    arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
     let mut expr_ids = Vec::with_capacity(exprs.len());
     let empty_layout = Layout {
         order: Vec::new(),

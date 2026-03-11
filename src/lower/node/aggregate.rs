@@ -281,10 +281,7 @@ fn select_aggregate_inputs(
         }
         // FE may still keep constant arguments when building merge-stage aggregate calls.
         // These aggregates only consume the first intermediate state argument during merge.
-        "count_distinct"
-        | "multi_distinct_count"
-            if is_merge =>
-        {
+        "count_distinct" | "multi_distinct_count" if is_merge => {
             return select_first_for_merge(args, "count_distinct");
         }
         "ds_theta_count_distinct"

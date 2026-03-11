@@ -587,18 +587,22 @@ pub fn assert_date_function_logic(name: &str) {
             );
         }
         "from_unixtime" => {
-            let v = literal_i64(&mut arena, 1_000_000);
-            assert_eq!(
-                date_eval_ts(name, &arena, expr_ts, &[v], &chunk),
-                dt_micros("1970-01-01 00:00:01")
-            );
+            let v = literal_i64(&mut arena, 1);
+            let expected = Local
+                .timestamp_opt(1, 0)
+                .single()
+                .map(|dt| dt.naive_local().and_utc().timestamp_micros())
+                .unwrap();
+            assert_eq!(date_eval_ts(name, &arena, expr_ts, &[v], &chunk), expected);
         }
         "from_unixtime_ms" => {
             let v = literal_i64(&mut arena, 1000);
-            assert_eq!(
-                date_eval_ts(name, &arena, expr_ts, &[v], &chunk),
-                dt_micros("1970-01-01 00:00:01")
-            );
+            let expected = Local
+                .timestamp_opt(1, 0)
+                .single()
+                .map(|dt| dt.naive_local().and_utc().timestamp_micros())
+                .unwrap();
+            assert_eq!(date_eval_ts(name, &arena, expr_ts, &[v], &chunk), expected);
         }
         "hour_from_unixtime" => {
             let v = literal_i64(&mut arena, 5 * 3600);

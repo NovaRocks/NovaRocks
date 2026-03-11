@@ -150,6 +150,7 @@ impl OlapTableSinkFactory {
         exec_plan: Option<&ExecPlan>,
         layout: Option<&Layout>,
         last_query_id: Option<&str>,
+        session_time_zone: Option<&str>,
         fe_addr: Option<&types::TNetworkAddress>,
     ) -> Result<Self, String> {
         let mut sink = sink;
@@ -173,8 +174,14 @@ impl OlapTableSinkFactory {
             exec_plan,
             fe_addr,
         )?;
-        let output_projection =
-            build_output_projection_plan(&sink, output_exprs, layout, last_query_id, fe_addr)?;
+        let output_projection = build_output_projection_plan(
+            &sink,
+            output_exprs,
+            layout,
+            session_time_zone,
+            last_query_id,
+            fe_addr,
+        )?;
         // StarRocks routes and writes against the post-output_expr tuple slots.
         // Once we materialize output_exprs into sink schema slot ids, downstream slot resolution
         // must also use sink schema ids instead of original child slot refs.
@@ -184,8 +191,14 @@ impl OlapTableSinkFactory {
             output_exprs
         };
         let table_identity = build_lake_table_identity_with_schema_id(&sink, schema_id)?;
-        let auto_partition =
-            build_auto_partition_plan(&sink, &write_indexes, schema_id, routing_exprs, fe_addr)?;
+        let auto_partition = build_auto_partition_plan(
+            &sink,
+            &write_indexes,
+            schema_id,
+            routing_exprs,
+            session_time_zone,
+            fe_addr,
+        )?;
         let write_format = load_lake_data_write_format()?;
 
         let mut index_routings = Vec::with_capacity(write_indexes.len());
@@ -199,6 +212,7 @@ impl OlapTableSinkFactory {
                 index.index_id,
                 index.schema_id,
                 routing_exprs,
+                session_time_zone,
             )?;
             if routing.commit_infos.is_empty() {
                 return Err(format!(
@@ -512,6 +526,7 @@ fn build_auto_partition_plan(
     write_indexes: &[SinkWriteIndexSelection],
     schema_id: i64,
     output_exprs: Option<&[exprs::TExpr]>,
+    session_time_zone: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Option<AutomaticPartitionPlan>, String> {
     if !sink.partition.enable_automatic_partition.unwrap_or(false) {
@@ -549,8 +564,12 @@ fn build_auto_partition_plan(
     } else {
         Some(&output_expr_slot_id_overrides)
     };
-    let partition_key_source =
-        build_partition_key_source(sink, slot_name_overrides, slot_id_overrides)?;
+    let partition_key_source = build_partition_key_source(
+        sink,
+        session_time_zone,
+        slot_name_overrides,
+        slot_id_overrides,
+    )?;
     let partition_slot_ids = resolve_slot_ids_by_names(
         &sink.schema.slot_descs,
         &partition_column_names,
@@ -1225,6 +1244,7 @@ fn build_output_projection_plan(
     sink: &data_sinks::TOlapTableSink,
     output_exprs: Option<&[exprs::TExpr]>,
     layout: Option<&Layout>,
+    session_time_zone: Option<&str>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Option<SinkOutputProjectionPlan>, String> {
@@ -1250,6 +1270,7 @@ fn build_output_projection_plan(
     }
 
     let mut arena = ExprArena::default();
+    arena.set_session_time_zone(session_time_zone.map(|s| s.to_string()));
     let mut expr_ids = Vec::with_capacity(output_exprs.len());
     for expr in output_exprs {
         let expr_id = lower_t_expr(expr, &mut arena, layout, last_query_id, fe_addr)?;
