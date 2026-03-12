@@ -130,8 +130,8 @@ pub fn eval_if(
     let else_batch = arrow::compute::filter_record_batch(&chunk.batch, &else_mask)
         .map_err(|e| format!("if: failed to filter else-rows: {e}"))?;
 
-    let then_chunk = Chunk::new(then_batch);
-    let else_chunk = Chunk::new(else_batch);
+    let then_chunk = Chunk::new_like(then_batch, chunk);
+    let else_chunk = Chunk::new_like(else_batch, chunk);
 
     let then_small = arena.eval(then_expr, &then_chunk)?;
     let else_small = arena.eval(else_expr, &else_chunk)?;

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
+use crate::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprId;
 
 use super::ExecNode;
@@ -32,8 +33,13 @@ pub struct ProjectNode {
     pub exprs: Vec<ExprId>,
     /// Slot ids for each expr in `exprs` (including CSE and outputs), in evaluation order.
     pub expr_slot_ids: Vec<SlotId>,
+    /// Optional schema sidecar for expr slots in evaluation order.
+    pub expr_slot_schemas: Option<Vec<ChunkSlotSchema>>,
     /// If Some, only output these expr indices.
     pub output_indices: Option<Vec<usize>>,
     /// Slot ids for the physical output columns (matches post-output_indices order).
     pub output_slots: Vec<SlotId>,
+    /// Optional explicit output chunk schema. When present, downstream operators should prefer it
+    /// over reconstructing semantics from Arrow field metadata.
+    pub output_chunk_schema: Option<ChunkSchemaRef>,
 }

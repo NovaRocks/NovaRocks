@@ -25,7 +25,7 @@ use serde_json::Value;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp};
 use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
@@ -183,11 +183,8 @@ impl FileLoadScanOp {
         source_columns: Vec<Vec<Option<String>>>,
     ) -> Result<Chunk, String> {
         let mut fields = Vec::with_capacity(self.cfg.source_slot_ids.len());
-        for (idx, slot_id) in self.cfg.source_slot_ids.iter().enumerate() {
-            fields.push(field_with_slot_id(
-                Field::new(format!("src_col_{idx}"), DataType::Utf8, true),
-                *slot_id,
-            ));
+        for (idx, _) in self.cfg.source_slot_ids.iter().enumerate() {
+            fields.push(Field::new(format!("src_col_{idx}"), DataType::Utf8, true));
         }
         let arrays: Vec<ArrayRef> = source_columns
             .into_iter()
@@ -195,7 +192,7 @@ impl FileLoadScanOp {
             .collect();
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .map_err(|e| format!("FILE_SCAN build source record batch failed: {e}"))?;
-        Chunk::try_new(batch)
+        Chunk::try_new_with_slot_ids(batch, &self.cfg.source_slot_ids)
     }
 
     fn build_output_chunk(&self, source: &Chunk) -> Result<Option<Chunk>, String> {
@@ -235,7 +232,7 @@ impl FileLoadScanOp {
         }
 
         let mut fields = Vec::with_capacity(output_arrays.len());
-        for ((slot_id, name), array) in self
+        for ((_, name), array) in self
             .cfg
             .output_slot_ids
             .iter()
@@ -248,15 +245,15 @@ impl FileLoadScanOp {
                 .get(fields.len())
                 .cloned()
                 .unwrap_or_else(|| array.data_type().clone());
-            fields.push(field_with_slot_id(
-                Field::new(name.clone(), target_type, true),
-                *slot_id,
-            ));
+            fields.push(Field::new(name.clone(), target_type, true));
         }
 
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), output_arrays)
             .map_err(|e| format!("FILE_SCAN build output record batch failed: {e}"))?;
-        Ok(Some(Chunk::try_new(batch)?))
+        Ok(Some(Chunk::try_new_with_slot_ids(
+            batch,
+            &self.cfg.output_slot_ids,
+        )?))
     }
 }
 

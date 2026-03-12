@@ -156,13 +156,14 @@ impl TopNHeapKernel {
         let mut selected = self.heap.into_vec();
         selected.sort_unstable();
 
+        let source_chunk = selected[0].chunk.clone();
         let schema = selected[0].chunk.schema();
         let row_batches = selected
             .into_iter()
             .map(|entry| entry.chunk.batch.slice(entry.row_idx, 1))
             .collect::<Vec<_>>();
         let batch = concat_batches(&schema, &row_batches).map_err(|e| e.to_string())?;
-        let chunk = Chunk::try_new(batch).map_err(|e| e.to_string())?;
+        let chunk = Chunk::try_new_like(batch, &source_chunk).map_err(|e| e.to_string())?;
         Ok(Some(chunk))
     }
 }
@@ -184,7 +185,7 @@ pub(crate) fn sort_chunks_topn_heap(
         if keep == 0 {
             return Ok(None);
         }
-        return Chunk::try_new(batch.slice(0, keep))
+        return Chunk::try_new_like(batch.slice(0, keep), &chunks[0])
             .map(Some)
             .map_err(|e| e.to_string());
     }

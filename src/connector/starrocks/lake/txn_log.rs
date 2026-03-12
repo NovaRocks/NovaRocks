@@ -31,6 +31,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use prost::Message;
 
+use crate::common::ids::SlotId;
 use crate::connector::schema::{self, BeTabletWriteLoadLogRecord, BeTxnActiveRecord};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{
@@ -40,7 +41,7 @@ use crate::connector::starrocks::lake::delete_payload_codec::{
     decode_delete_keys_payload, encode_delete_keys_payload,
 };
 use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
-use crate::exec::chunk::field_slot_id;
+use crate::exec::chunk::Chunk;
 use crate::formats::starrocks::metadata::{
     StarRocksDeletePredicateRaw, StarRocksSegmentFile, StarRocksTabletSnapshot,
     load_bundle_segment_footers, load_tablet_snapshot,
@@ -67,9 +68,58 @@ use crate::service::grpc_client::proto::starrocks::{
     ColumnPb, CombinedTxnLogPb, KeysType, PUniqueId, RowsetMetadataPb, TableSchemaKeyPb,
     TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
 };
+pub(crate) fn append_lake_txn_log_with_chunk_rowset(
+    ctx: &TabletWriteContext,
+    chunk: &Chunk,
+    txn_id: i64,
+    driver_id: i32,
+    file_seq: u64,
+    write_format: StarRocksWriteFormat,
+    partition_id: i64,
+    load_id: Option<&PUniqueId>,
+) -> Result<(), String> {
+    let batch_slot_ids = slot_ids_from_chunk(chunk);
+    append_lake_txn_log_with_rowset_impl(
+        ctx,
+        &chunk.batch,
+        Some(&batch_slot_ids),
+        txn_id,
+        driver_id,
+        file_seq,
+        write_format,
+        partition_id,
+        load_id,
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn append_lake_txn_log_with_rowset(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
+    txn_id: i64,
+    driver_id: i32,
+    file_seq: u64,
+    write_format: StarRocksWriteFormat,
+    partition_id: i64,
+    load_id: Option<&PUniqueId>,
+) -> Result<(), String> {
+    let chunk = Chunk::try_new(batch.clone())?;
+    append_lake_txn_log_with_chunk_rowset(
+        ctx,
+        &chunk,
+        txn_id,
+        driver_id,
+        file_seq,
+        write_format,
+        partition_id,
+        load_id,
+    )
+}
+
+fn append_lake_txn_log_with_rowset_impl(
+    ctx: &TabletWriteContext,
+    batch: &RecordBatch,
+    batch_slot_ids: Option<&[Option<SlotId>]>,
     txn_id: i64,
     driver_id: i32,
     file_seq: u64,
@@ -126,7 +176,12 @@ pub(crate) fn append_lake_txn_log_with_rowset(
                 load_id: load_id.cloned(),
             },
         };
-        let write_routing = resolve_lake_batch_write_routing(ctx, batch, Some(&txn_log))?;
+        let write_routing = resolve_lake_batch_write_routing_with_slots(
+            ctx,
+            batch,
+            batch_slot_ids,
+            Some(&txn_log),
+        )?;
         let (mut incoming_rowset, incoming_dels) = match write_routing {
             LakeBatchWriteRouting::Empty => (
                 RowsetMetadataPb {
@@ -551,28 +606,55 @@ struct ParsedOpBatch {
     delete_row_indexes: Vec<u32>,
 }
 
+fn slot_ids_from_chunk(chunk: &Chunk) -> Vec<Option<SlotId>> {
+    chunk
+        .chunk_schema()
+        .slots()
+        .iter()
+        .map(|slot| Some(slot.slot_id()))
+        .collect::<Vec<_>>()
+}
+
+fn debug_batch_fields(batch: &RecordBatch, batch_slot_ids: &[Option<SlotId>]) -> Vec<String> {
+    batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            let slot = batch_slot_ids
+                .get(idx)
+                .and_then(|slot| *slot)
+                .map(|slot_id| slot_id.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            format!("{}:{}(slot={})", idx, field.name(), slot)
+        })
+        .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
 fn resolve_lake_batch_write_routing(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
     existing_txn_log: Option<&TxnLogPb>,
 ) -> Result<LakeBatchWriteRouting, String> {
+    let chunk = Chunk::try_new(batch.clone())?;
+    let slot_ids = slot_ids_from_chunk(&chunk);
+    resolve_lake_batch_write_routing_with_slots(ctx, batch, Some(&slot_ids), existing_txn_log)
+}
+
+fn resolve_lake_batch_write_routing_with_slots(
+    ctx: &TabletWriteContext,
+    batch: &RecordBatch,
+    batch_slot_ids: Option<&[Option<SlotId>]>,
+    existing_txn_log: Option<&TxnLogPb>,
+) -> Result<LakeBatchWriteRouting, String> {
     let is_primary_keys_table = is_primary_keys_table_for_write(&ctx.tablet_schema)?;
     let parsed_op = parse_op_batch(batch)?;
     if is_primary_keys_table {
-        let batch_fields = batch
-            .schema()
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(idx, field)| {
-                let slot = field_slot_id(field.as_ref())
-                    .ok()
-                    .flatten()
-                    .map(|slot_id| slot_id.to_string())
-                    .unwrap_or_else(|| "none".to_string());
-                format!("{}:{}(slot={})", idx, field.name(), slot)
-            })
-            .collect::<Vec<_>>();
+        let batch_fields = batch_slot_ids
+            .map(|slot_ids| debug_batch_fields(batch, slot_ids))
+            .unwrap_or_default();
         let parsed_summary = parsed_op
             .as_ref()
             .map(|parsed| {
@@ -599,7 +681,8 @@ fn resolve_lake_batch_write_routing(
             ));
         }
         let data_batch = materialize_non_primary_auto_increment_batch(ctx, batch)?;
-        let full_schema_batch = materialize_non_primary_full_schema_batch(ctx, &data_batch)?;
+        let full_schema_batch =
+            materialize_non_primary_full_schema_batch(ctx, &data_batch, batch_slot_ids)?;
         return Ok(LakeBatchWriteRouting::Upsert {
             data_batch: full_schema_batch,
         });
@@ -610,9 +693,16 @@ fn resolve_lake_batch_write_routing(
         Some(_) => strip_last_op_control_column(batch)?,
         None => batch.clone(),
     };
+    let data_slot_ids = match parsed_op.as_ref() {
+        Some(_) => {
+            batch_slot_ids.map(|slot_ids| slot_ids[..slot_ids.len().saturating_sub(1)].to_vec())
+        }
+        None => batch_slot_ids.map(|slot_ids| slot_ids.to_vec()),
+    };
     let mode = resolve_effective_partial_write_mode(ctx, data_batch.num_columns());
     if parsed_op.is_none() && data_batch.num_columns() < full_schema_col_count {
-        let schema_to_batch = resolve_schema_column_batch_indexes(ctx, &data_batch)?;
+        let schema_to_batch =
+            resolve_schema_column_batch_indexes(ctx, &data_batch, data_slot_ids.as_deref())?;
         let referenced_schema_indexes = schema_to_batch
             .iter()
             .enumerate()
@@ -635,12 +725,18 @@ fn resolve_lake_batch_write_routing(
     let has_upsert_rows = parsed_op
         .as_ref()
         .is_none_or(|parsed| parsed.summary.kind != OpBatchKind::DeleteOnly);
-    validate_partial_update_sort_key_conflict(ctx, &data_batch, has_upsert_rows)?;
+    validate_partial_update_sort_key_conflict(
+        ctx,
+        &data_batch,
+        data_slot_ids.as_deref(),
+        has_upsert_rows,
+    )?;
 
     let Some(parsed) = parsed_op else {
         return resolve_upsert_batch_for_mode(
             ctx,
             data_batch,
+            data_slot_ids.as_deref(),
             mode,
             existing_txn_log,
             full_schema_col_count,
@@ -649,7 +745,8 @@ fn resolve_lake_batch_write_routing(
 
     match parsed.summary.kind {
         OpBatchKind::DeleteOnly => {
-            let key_batch = project_batch_to_primary_key_columns(ctx, &data_batch)?;
+            let key_batch =
+                project_batch_to_primary_key_columns(ctx, &data_batch, data_slot_ids.as_deref())?;
             let preview = key_batch
                 .columns()
                 .iter()
@@ -709,6 +806,7 @@ fn resolve_lake_batch_write_routing(
         OpBatchKind::UpsertOnly => resolve_upsert_batch_for_mode(
             ctx,
             data_batch,
+            data_slot_ids.as_deref(),
             mode,
             existing_txn_log,
             full_schema_col_count,
@@ -716,10 +814,15 @@ fn resolve_lake_batch_write_routing(
         OpBatchKind::Mixed => {
             let upsert_source = take_batch_rows(&data_batch, &parsed.upsert_row_indexes)?;
             let delete_rows_batch = take_batch_rows(&data_batch, &parsed.delete_row_indexes)?;
-            let delete_key_batch = project_batch_to_primary_key_columns(ctx, &delete_rows_batch)?;
+            let delete_key_batch = project_batch_to_primary_key_columns(
+                ctx,
+                &delete_rows_batch,
+                data_slot_ids.as_deref(),
+            )?;
             let upsert_routing = resolve_upsert_batch_for_mode(
                 ctx,
                 upsert_source,
+                data_slot_ids.as_deref(),
                 mode,
                 existing_txn_log,
                 full_schema_col_count,
@@ -744,6 +847,7 @@ fn resolve_lake_batch_write_routing(
 fn validate_partial_update_sort_key_conflict(
     ctx: &TabletWriteContext,
     data_batch: &RecordBatch,
+    data_batch_slot_ids: Option<&[Option<SlotId>]>,
     has_upsert_rows: bool,
 ) -> Result<(), String> {
     if !has_upsert_rows {
@@ -766,7 +870,8 @@ fn validate_partial_update_sort_key_conflict(
     sort_key_idxes.sort_unstable();
     sort_key_idxes.dedup();
 
-    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, data_batch)?;
+    let schema_to_batch =
+        resolve_schema_column_batch_indexes(ctx, data_batch, data_batch_slot_ids)?;
     let referenced_columns = schema_to_batch
         .iter()
         .enumerate()
@@ -846,6 +951,7 @@ fn resolve_effective_partial_write_mode(
 fn resolve_upsert_batch_for_mode(
     ctx: &TabletWriteContext,
     data_batch: RecordBatch,
+    data_batch_slot_ids: Option<&[Option<SlotId>]>,
     mode: ResolvedPartialWriteMode,
     existing_txn_log: Option<&TxnLogPb>,
     full_schema_col_count: usize,
@@ -868,8 +974,13 @@ fn resolve_upsert_batch_for_mode(
                 if ctx.partial_update.merge_condition.is_none() {
                     return Ok(LakeBatchWriteRouting::Upsert { data_batch });
                 }
-                let materialized =
-                    materialize_partial_upsert_batch(ctx, &data_batch, mode, existing_txn_log)?;
+                let materialized = materialize_partial_upsert_batch(
+                    ctx,
+                    &data_batch,
+                    data_batch_slot_ids,
+                    mode,
+                    existing_txn_log,
+                )?;
                 info!(
                     target: "novarocks::sink",
                     table_id = ctx.table_id,
@@ -893,8 +1004,13 @@ fn resolve_upsert_batch_for_mode(
                     full_schema_col_count
                 ));
             }
-            let materialized =
-                materialize_partial_upsert_batch(ctx, &data_batch, mode, existing_txn_log)?;
+            let materialized = materialize_partial_upsert_batch(
+                ctx,
+                &data_batch,
+                data_batch_slot_ids,
+                mode,
+                existing_txn_log,
+            )?;
             if materialized.num_rows() == 0 {
                 Ok(LakeBatchWriteRouting::Empty)
             } else {
@@ -904,8 +1020,13 @@ fn resolve_upsert_batch_for_mode(
             }
         }
         ResolvedPartialWriteMode::ColumnUpsert | ResolvedPartialWriteMode::ColumnUpdate => {
-            let materialized =
-                materialize_partial_upsert_batch(ctx, &data_batch, mode, existing_txn_log)?;
+            let materialized = materialize_partial_upsert_batch(
+                ctx,
+                &data_batch,
+                data_batch_slot_ids,
+                mode,
+                existing_txn_log,
+            )?;
             if ctx.partial_update.merge_condition.is_some() {
                 info!(
                     target: "novarocks::sink",
@@ -981,6 +1102,7 @@ fn materialize_non_primary_auto_increment_batch(
 fn materialize_non_primary_full_schema_batch(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
+    batch_slot_ids: Option<&[Option<SlotId>]>,
 ) -> Result<RecordBatch, String> {
     let schema_col_count = ctx.tablet_schema.column.len();
     if schema_col_count == 0 {
@@ -999,7 +1121,7 @@ fn materialize_non_primary_full_schema_batch(
         return Ok(batch.clone());
     }
 
-    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch)?;
+    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch, batch_slot_ids)?;
     let mut projected_batch_indexes = Vec::with_capacity(schema_col_count);
     let mut used_batch_indexes = HashSet::with_capacity(schema_col_count);
     for (schema_idx, schema_col) in ctx.tablet_schema.column.iter().enumerate() {
@@ -1268,10 +1390,7 @@ fn strip_last_op_control_column(batch: &RecordBatch) -> Result<RecordBatch, Stri
         .take(op_index)
         .cloned()
         .collect::<Vec<_>>();
-    let projected_schema = std::sync::Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        projected_fields,
-        schema.metadata().clone(),
-    ));
+    let projected_schema = std::sync::Arc::new(arrow::datatypes::Schema::new(projected_fields));
     RecordBatch::try_new(projected_schema, projected_columns).map_err(|e| {
         format!(
             "build write batch without '{}' failed: {}",
@@ -1309,8 +1428,9 @@ fn take_batch_rows(batch: &RecordBatch, row_indexes: &[u32]) -> Result<RecordBat
 fn project_batch_to_primary_key_columns(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
+    batch_slot_ids: Option<&[Option<SlotId>]>,
 ) -> Result<RecordBatch, String> {
-    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch)?;
+    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch, batch_slot_ids)?;
     let key_schema_indexes = primary_key_schema_indexes(&ctx.tablet_schema)?;
     if key_schema_indexes.is_empty() {
         return Err(format!(
@@ -1328,21 +1448,9 @@ fn project_batch_to_primary_key_columns(
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("<key_{key_schema_idx}>"));
-                let available_fields = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, field)| {
-                        let slot = field_slot_id(field.as_ref())
-                            .ok()
-                            .flatten()
-                            .map(|slot_id| slot_id.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        format!("{}:{}(slot={})", idx, field.name(), slot)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let available_fields = batch_slot_ids
+                    .map(|slot_ids| debug_batch_fields(batch, slot_ids).join(", "))
+                    .unwrap_or_default();
                 let key_slot_binding = ctx
                     .partial_update
                     .schema_slot_bindings
@@ -1394,10 +1502,7 @@ fn project_batch_by_columns(
         projected_columns.push(array);
         projected_fields.push(field);
     }
-    let projected_schema = Arc::new(Schema::new_with_metadata(
-        projected_fields,
-        schema.metadata().clone(),
-    ));
+    let projected_schema = Arc::new(Schema::new(projected_fields));
     RecordBatch::try_new(projected_schema, projected_columns).map_err(|e| {
         format!(
             "build projected batch for {} failed: selected_columns={} error={}",
@@ -1427,16 +1532,28 @@ fn primary_key_schema_indexes(tablet_schema: &TabletSchemaPb) -> Result<Vec<usiz
 fn resolve_schema_column_batch_indexes(
     ctx: &TabletWriteContext,
     batch: &RecordBatch,
+    batch_slot_ids: Option<&[Option<SlotId>]>,
 ) -> Result<Vec<Option<usize>>, String> {
-    let mut slot_to_index = HashMap::new();
     let mut name_to_index = HashMap::new();
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         let normalized = normalize_identifier(field.name());
         if !normalized.is_empty() {
             name_to_index.entry(normalized).or_insert(idx);
         }
-        if let Some(slot_id) = field_slot_id(field.as_ref())? {
-            slot_to_index.entry(slot_id).or_insert(idx);
+    }
+    let mut slot_to_index = HashMap::new();
+    if let Some(slot_ids) = batch_slot_ids {
+        if slot_ids.len() != batch.num_columns() {
+            return Err(format!(
+                "schema slot id length mismatch: batch_columns={} slot_ids={}",
+                batch.num_columns(),
+                slot_ids.len()
+            ));
+        }
+        for (idx, slot_id) in slot_ids.iter().enumerate() {
+            if let Some(slot_id) = slot_id {
+                slot_to_index.entry(*slot_id).or_insert(idx);
+            }
         }
     }
 
@@ -1912,11 +2029,13 @@ fn load_delete_keys_from_del_file(
 fn materialize_partial_upsert_batch(
     ctx: &TabletWriteContext,
     data_batch: &RecordBatch,
+    data_batch_slot_ids: Option<&[Option<SlotId>]>,
     mode: ResolvedPartialWriteMode,
     existing_txn_log: Option<&TxnLogPb>,
 ) -> Result<RecordBatch, String> {
     let output_schema = build_tablet_output_schema(&ctx.tablet_schema)?;
-    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, data_batch)?;
+    let schema_to_batch =
+        resolve_schema_column_batch_indexes(ctx, data_batch, data_batch_slot_ids)?;
     let key_schema_indexes = primary_key_schema_indexes(&ctx.tablet_schema)?;
     let mut key_batch_indexes = Vec::with_capacity(key_schema_indexes.len());
     for key_schema_idx in &key_schema_indexes {

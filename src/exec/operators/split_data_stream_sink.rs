@@ -378,5 +378,5 @@ fn filter_chunk_by_mask(chunk: &Chunk, mask: &[bool]) -> Result<Option<Chunk>, S
     let predicate = BooleanArray::from(mask.to_vec());
     let filtered = filter_record_batch(&chunk.batch, &predicate)
         .map_err(|e| format!("split sink filter chunk failed: {e}"))?;
-    Ok(Some(Chunk::new(filtered)))
+    Ok(Some(Chunk::new_like(filtered, chunk)))
 }

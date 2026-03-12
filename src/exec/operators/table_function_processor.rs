@@ -37,7 +37,6 @@ use arrow::array::{
 };
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 use arrow_data::transform::MutableArrayData;
 
 use crate::common::ids::SlotId;
@@ -660,7 +659,7 @@ impl TableFunctionProcessorOperator {
         }
 
         let mut fields = Vec::with_capacity(self.output_slots.len());
-        for (idx, slot_id) in self.output_slots.iter().enumerate() {
+        for (idx, _slot_id) in self.output_slots.iter().enumerate() {
             let name = self
                 .output_schema
                 .fields()
@@ -678,15 +677,11 @@ impl TableFunctionProcessorOperator {
                 .ok_or_else(|| "table function output column missing".to_string())?
                 .data_type()
                 .clone();
-            let field = Field::new(name, dt, nullable);
-            fields.push(Arc::new(crate::exec::chunk::field_with_slot_id(
-                field, *slot_id,
-            )));
+            fields.push(Arc::new(Field::new(name, dt, nullable)));
         }
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, output_columns)
-            .map_err(|e| format!("table function build batch failed: {e}"))?;
-        Chunk::try_new(batch)
+        Chunk::try_new_with_schema_and_slot_ids(schema, output_columns, &self.output_slots)
+            .map_err(|e| format!("table function build batch failed: {e}"))
     }
 
     fn empty_output_chunk(&self) -> Result<Chunk, String> {
@@ -700,7 +695,7 @@ impl TableFunctionProcessorOperator {
 
         let mut fields = Vec::with_capacity(self.output_slots.len());
         let mut columns = Vec::with_capacity(self.output_slots.len());
-        for (idx, slot_id) in self.output_slots.iter().enumerate() {
+        for (idx, _slot_id) in self.output_slots.iter().enumerate() {
             let field = self
                 .output_schema
                 .fields()
@@ -708,9 +703,7 @@ impl TableFunctionProcessorOperator {
                 .ok_or_else(|| format!("table function output schema field {} missing", idx))?
                 .as_ref()
                 .clone();
-            fields.push(Arc::new(crate::exec::chunk::field_with_slot_id(
-                field, *slot_id,
-            )));
+            fields.push(Arc::new(field));
             columns.push(new_empty_array(
                 self.output_schema
                     .fields()
@@ -721,9 +714,8 @@ impl TableFunctionProcessorOperator {
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| format!("table function build empty batch failed: {e}"))?;
-        Chunk::try_new(batch)
+        Chunk::try_new_with_schema_and_slot_ids(schema, columns, &self.output_slots)
+            .map_err(|e| format!("table function build empty batch failed: {e}"))
     }
 
     fn int_like_arg_to_i128(

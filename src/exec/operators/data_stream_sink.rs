@@ -823,11 +823,14 @@ mod data_stream_sink_hash_partition {
                     new_columns.push(taken);
                 }
 
-                let new_batch =
-                    arrow::record_batch::RecordBatch::try_new(chunk.batch.schema(), new_columns)
-                        .map_err(|e| format!("Failed to create RecordBatch: {}", e))?;
+                let new_chunk = Chunk::try_new_with_schema_and_chunk_schema(
+                    chunk.batch.schema(),
+                    new_columns,
+                    chunk.chunk_schema_ref(),
+                )
+                .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
 
-                partition_chunks.push(Chunk::new(new_batch));
+                partition_chunks.push(new_chunk);
             }
         }
 
@@ -1042,6 +1045,7 @@ impl OperatorFactory for DataStreamSinkFactory {
             output_columns: self.output_columns.clone(),
             shared_sequence: Arc::clone(&self.shared_sequence),
             random_next: 0,
+            wire_meta_sent_per_dest: Vec::new(),
             pending_per_dest: Vec::new(),
             pending_bytes_per_dest: Vec::new(),
             pending_payloads_per_dest: Vec::new(),
@@ -1092,6 +1096,7 @@ struct DataStreamSinkOperator {
     output_columns: Vec<SlotId>,
     shared_sequence: Arc<AtomicI64>,
     random_next: usize,
+    wire_meta_sent_per_dest: Vec<bool>,
     pending_per_dest: Vec<VecDeque<Chunk>>,
     pending_bytes_per_dest: Vec<usize>,
     pending_payloads_per_dest: Vec<Option<PendingPayload>>,
@@ -1372,13 +1377,14 @@ impl DataStreamSinkOperator {
                             new_columns.push(taken);
                         }
 
-                        let new_batch = arrow::record_batch::RecordBatch::try_new(
+                        let new_chunk = Chunk::try_new_with_schema_and_chunk_schema(
                             chunk.batch.schema(),
                             new_columns,
+                            chunk.chunk_schema_ref(),
                         )
-                        .map_err(|e| format!("Failed to create RecordBatch: {}", e))?;
+                        .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
 
-                        per_dest_chunks.push(vec![Chunk::new(new_batch)]);
+                        per_dest_chunks.push(vec![new_chunk]);
                     }
                 }
                 Ok(per_dest_chunks)
@@ -1481,6 +1487,7 @@ impl DataStreamSinkOperator {
 
     fn transmit_partition(
         &mut self,
+        dest_idx: usize,
         dest: &data_sinks::TPlanFragmentDestination,
         chunks: &[Chunk],
         eos: bool,
@@ -1520,12 +1527,23 @@ impl DataStreamSinkOperator {
             projected_storage.as_slice()
         };
 
+        let include_slot_ids = !chunks.is_empty()
+            && !self
+                .wire_meta_sent_per_dest
+                .get(dest_idx)
+                .copied()
+                .unwrap_or(false);
         let encode_start = std::time::Instant::now();
-        let payload =
-            exchange::encode_chunks(chunks).map_err(|e| format!("failed to encode chunks: {e}"))?;
+        let payload = exchange::encode_chunks(chunks, include_slot_ids)
+            .map_err(|e| format!("failed to encode chunks: {e}"))?;
         let encode_ns = encode_start.elapsed().as_nanos() as u128;
         let payload_bytes = payload.len();
         let payload_capacity_bytes = payload.capacity().max(payload_bytes);
+        if include_slot_ids {
+            if let Some(sent) = self.wire_meta_sent_per_dest.get_mut(dest_idx) {
+                *sent = true;
+            }
+        }
 
         if let Some(profile) = self.profiles.as_ref() {
             profile.common.counter_add(
@@ -1570,6 +1588,7 @@ impl DataStreamSinkOperator {
         if self.pending_per_dest.len() == dest_count {
             return;
         }
+        self.wire_meta_sent_per_dest = vec![false; dest_count];
         self.pending_per_dest = (0..dest_count).map(|_| VecDeque::new()).collect();
         self.pending_bytes_per_dest = vec![0; dest_count];
         self.pending_payloads_per_dest = (0..dest_count).map(|_| None).collect();
@@ -1661,7 +1680,7 @@ impl DataStreamSinkOperator {
                 if chunks.is_empty() {
                     break;
                 }
-                match self.transmit_partition(dest, &chunks, false, allow_overflow)? {
+                match self.transmit_partition(i, dest, &chunks, false, allow_overflow)? {
                     PayloadEnqueue::Enqueued => {}
                     PayloadEnqueue::NoCapacity(payload) => {
                         self.pending_payloads_per_dest[i] = Some(payload);
@@ -1679,8 +1698,8 @@ impl DataStreamSinkOperator {
     fn send_eos(&mut self) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
-        for dest in dests.iter() {
-            match self.transmit_partition(dest, &[], true, true)? {
+        for (i, dest) in dests.iter().enumerate() {
+            match self.transmit_partition(i, dest, &[], true, true)? {
                 PayloadEnqueue::Enqueued => {}
                 PayloadEnqueue::NoCapacity(_) => {
                     return Err("exchange send EOS unexpectedly blocked".to_string());
@@ -1875,7 +1894,20 @@ fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk
     }
 
     let new_schema = Arc::new(arrow::datatypes::Schema::new(fields));
-    let batch = arrow::record_batch::RecordBatch::try_new(new_schema, cols)
-        .map_err(|e| format!("failed to build projected RecordBatch: {e}"))?;
-    Chunk::try_new(batch)
+    let projected_slots = slot_ids
+        .iter()
+        .map(|slot_id| {
+            chunk.chunk_schema().slot(*slot_id).cloned().ok_or_else(|| {
+                format!(
+                    "output_columns slot id {} missing from chunk schema",
+                    slot_id
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Chunk::try_new_with_schema_and_chunk_schema(
+        new_schema,
+        cols,
+        Arc::new(crate::exec::chunk::ChunkSchema::try_new(projected_slots)?),
+    )
 }

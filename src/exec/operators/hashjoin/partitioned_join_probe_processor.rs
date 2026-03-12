@@ -35,7 +35,7 @@ use arrow::datatypes::SchemaRef;
 use super::hash_join_probe_core::{HashJoinProbeCore, join_type_str};
 use super::partitioned_join_shared::PartitionedJoinSharedState;
 use crate::common::config::operator_buffer_chunks;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::join::JoinType;
 use crate::exec::pipeline::dependency::DependencyHandle;
@@ -54,8 +54,11 @@ pub struct PartitionedJoinProbeProcessorFactory {
     residual_predicate: Option<ExprId>,
     probe_is_left: bool,
     left_schema: SchemaRef,
+    left_chunk_schema: ChunkSchemaRef,
     right_schema: SchemaRef,
+    right_chunk_schema: ChunkSchemaRef,
     join_scope_schema: SchemaRef,
+    join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<PartitionedJoinSharedState>,
 }
 
@@ -67,8 +70,11 @@ impl PartitionedJoinProbeProcessorFactory {
         residual_predicate: Option<ExprId>,
         probe_is_left: bool,
         left_schema: SchemaRef,
+        left_chunk_schema: ChunkSchemaRef,
         right_schema: SchemaRef,
+        right_chunk_schema: ChunkSchemaRef,
         join_scope_schema: SchemaRef,
+        join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<PartitionedJoinSharedState>,
     ) -> Self {
         let node_id = parse_join_node_id_from_dep_key(state.dep_name(0));
@@ -81,8 +87,11 @@ impl PartitionedJoinProbeProcessorFactory {
             residual_predicate,
             probe_is_left,
             left_schema,
+            left_chunk_schema,
             right_schema,
+            right_chunk_schema,
             join_scope_schema,
+            join_scope_chunk_schema,
             state,
         }
     }
@@ -123,8 +132,11 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
                 self.residual_predicate,
                 self.probe_is_left,
                 Arc::clone(&self.left_schema),
+                Arc::clone(&self.left_chunk_schema),
                 Arc::clone(&self.right_schema),
+                Arc::clone(&self.right_chunk_schema),
                 Arc::clone(&self.join_scope_schema),
+                Arc::clone(&self.join_scope_chunk_schema),
             ),
             buffered_rows: 0,
             input_rows: 0,
@@ -428,7 +440,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, field_with_slot_id};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::join::JoinDistributionMode;
     use crate::exec::node::join::JoinType;
@@ -466,6 +478,10 @@ mod tests {
         let mut fields = left.fields().to_vec();
         fields.extend(right.fields().to_vec());
         Arc::new(Schema::new(fields))
+    }
+
+    fn chunk_schema_of(schema: &SchemaRef) -> ChunkSchemaRef {
+        Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"))
     }
 
     fn push_expect_consumed(op: &mut dyn ProcessorOperator, rt: &RuntimeState, chunk: Chunk) {
@@ -615,9 +631,12 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -702,9 +721,12 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -846,9 +868,12 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -957,9 +982,12 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1074,9 +1102,12 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1185,9 +1216,12 @@ mod tests {
             vec![probe_key],
             None,
             false,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1293,9 +1327,12 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1414,9 +1451,12 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1523,9 +1563,12 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1634,9 +1677,12 @@ mod tests {
             vec![probe_key],
             None,
             false,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1738,9 +1784,12 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 
@@ -1854,9 +1903,12 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            left_schema,
-            right_schema,
-            join_scope_schema,
+            Arc::clone(&left_schema),
+            chunk_schema_of(&left_schema),
+            Arc::clone(&right_schema),
+            chunk_schema_of(&right_schema),
+            Arc::clone(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema),
             Arc::clone(&join_state),
         );
 

@@ -24,7 +24,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum SchemaValue {
@@ -42,9 +42,13 @@ pub(crate) fn normalize_column_key(name: &str) -> String {
     name.trim().to_ascii_uppercase()
 }
 
-pub(crate) fn build_chunk(schema: SchemaRef, rows: &[SchemaRow]) -> Result<Chunk, String> {
+pub(crate) fn build_chunk(
+    schema: SchemaRef,
+    chunk_schema: ChunkSchemaRef,
+    rows: &[SchemaRow],
+) -> Result<Chunk, String> {
     if rows.is_empty() {
-        return Chunk::try_new(RecordBatch::new_empty(schema));
+        return Chunk::try_new_with_chunk_schema(RecordBatch::new_empty(schema), chunk_schema);
     }
 
     let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
@@ -217,5 +221,5 @@ pub(crate) fn build_chunk(schema: SchemaRef, rows: &[SchemaRow]) -> Result<Chunk
 
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|err| format!("build schema scan record batch failed: {}", err))?;
-    Chunk::try_new(batch)
+    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }

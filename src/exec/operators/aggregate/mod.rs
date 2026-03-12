@@ -33,7 +33,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
@@ -81,6 +81,7 @@ pub struct AggregateProcessorFactory {
     output_intermediate: bool,
     direct_input: bool,
     output_slots: Vec<SlotId>,
+    output_chunk_schema: Option<ChunkSchemaRef>,
 }
 
 impl AggregateProcessorFactory {
@@ -92,6 +93,7 @@ impl AggregateProcessorFactory {
         output_intermediate: bool,
         direct_input: bool,
         output_slots: Vec<SlotId>,
+        output_chunk_schema: Option<ChunkSchemaRef>,
     ) -> Self {
         let name = if node_id >= 0 {
             format!("AGGREGATE (id={node_id})")
@@ -106,6 +108,7 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_slots,
+            output_chunk_schema,
         }
     }
 }
@@ -136,6 +139,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             finished: false,
             output_schema: None,
             output_slots: self.output_slots.clone(),
+            output_chunk_schema: self.output_chunk_schema.clone(),
             profile_initialized: false,
             profiles: None,
             key_table_mem_tracker: None,
@@ -163,6 +167,7 @@ struct AggregateProcessorOperator {
     finished: bool,
     output_schema: Option<SchemaRef>,
     output_slots: Vec<SlotId>,
+    output_chunk_schema: Option<ChunkSchemaRef>,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
@@ -486,7 +491,15 @@ impl AggregateProcessorOperator {
                     .clone()
                     .unwrap_or_else(|| Arc::new(Schema::new(Vec::<Field>::new())));
                 let batch = RecordBatch::new_empty(schema);
-                return Ok(Some(Chunk::new(batch)));
+                let output_len = batch.num_columns();
+                if self.output_slots.len() < output_len {
+                    return Err(format!(
+                        "aggregate empty output missing slot ids: batch_columns={} output_slots={}",
+                        output_len,
+                        self.output_slots.len()
+                    ));
+                }
+                return Ok(Some(self.output_chunk_from_batch(batch)?));
             }
         }
 
@@ -526,7 +539,7 @@ impl AggregateProcessorOperator {
         }
         .map_err(|e| e.to_string())?;
         self.drop_group_states();
-        Ok(Some(Chunk::new(batch)))
+        Ok(Some(self.output_chunk_from_batch(batch)?))
     }
 }
 
@@ -733,10 +746,43 @@ impl AggregateProcessorOperator {
                 &kernels.entries,
                 self.output_intermediate,
                 &self.output_slots,
+                self.output_chunk_schema.as_ref(),
             )?);
         }
         self.initialized = true;
         Ok(())
+    }
+
+    fn output_chunk_from_batch(&self, batch: RecordBatch) -> Result<Chunk, String> {
+        let output_len = batch.num_columns();
+        if self.output_slots.len() < output_len {
+            return Err(format!(
+                "aggregate output slot count mismatch: batch_columns={} output_slots={}",
+                output_len,
+                self.output_slots.len()
+            ));
+        }
+        if let Some(schema) = self.output_chunk_schema.as_ref() {
+            let slot_schemas = self.output_slots[..output_len]
+                .iter()
+                .map(|slot_id| {
+                    schema.slot(*slot_id).cloned().ok_or_else(|| {
+                        format!(
+                            "aggregate explicit output chunk schema missing slot {}",
+                            slot_id
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Chunk::try_new_with_chunk_schema(
+                batch,
+                Arc::new(ChunkSchema::try_new(slot_schemas)?),
+            );
+        }
+        Ok(Chunk::new_with_slot_ids(
+            batch,
+            &self.output_slots[..output_len],
+        ))
     }
 
     fn expected_group_types(&self) -> Result<Vec<DataType>, String> {

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 use arrow::datatypes::DataType;
@@ -51,4 +52,5 @@ pub struct AggregateNode {
     /// Mixed merge/update aggregates are supported via per-function flags.
     pub input_is_intermediate: bool,
     pub output_slots: Vec<SlotId>,
+    pub output_chunk_schema: Option<ChunkSchemaRef>,
 }

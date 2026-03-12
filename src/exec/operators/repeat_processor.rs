@@ -30,15 +30,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, new_null_array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::lower::type_lowering::scalar_type_desc;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::types;
+use arrow::array::{Int64Array, new_null_array};
+use arrow::datatypes::{DataType, Field, Schema};
 
 /// Factory for repeat processors that expand rows for grouping-set style execution.
 pub struct RepeatProcessorFactory {
@@ -91,6 +91,7 @@ impl OperatorFactory for RepeatProcessorFactory {
             finished: false,
             emit_empty_once: false,
             output_schema: None,
+            output_chunk_schema: None,
         })
     }
 }
@@ -108,6 +109,7 @@ struct RepeatProcessorOperator {
     finished: bool,
     emit_empty_once: bool,
     output_schema: Option<Arc<Schema>>,
+    output_chunk_schema: Option<ChunkSchemaRef>,
 }
 
 impl Operator for RepeatProcessorOperator {
@@ -154,6 +156,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
             self.repeat_idx = 0;
             self.emit_empty_once = true;
             self.output_schema = None;
+            self.output_chunk_schema = None;
             return Ok(());
         }
 
@@ -166,24 +169,42 @@ impl ProcessorOperator for RepeatProcessorOperator {
 
         let mut fields =
             Vec::with_capacity(input_schema.fields().len() + self.grouping_slot_ids.len());
-        for input_field in input_schema.fields() {
-            let mut field = input_field.as_ref().clone();
-            if let Some(slot_id) = field_slot_id(input_field.as_ref())? {
-                if nullable_slot_ids.contains(&slot_id) && !field.is_nullable() {
-                    field = field.with_nullable(true);
-                }
-                field = field_with_slot_id(field, slot_id);
-            }
-            fields.push(Arc::new(field));
+        let mut slot_schemas =
+            Vec::with_capacity(input_schema.fields().len() + self.grouping_slot_ids.len());
+        for (idx, input_field) in input_schema.fields().iter().enumerate() {
+            let input_slot_schema = chunk.chunk_schema().slots().get(idx).ok_or_else(|| {
+                format!("repeat missing input chunk slot schema at index {}", idx)
+            })?;
+            let nullable = nullable_slot_ids.contains(&input_slot_schema.slot_id())
+                || input_field.is_nullable();
+            let field = input_field.as_ref().clone().with_nullable(nullable);
+            fields.push(Arc::new(field.clone()));
+            slot_schemas.push(ChunkSlotSchema::try_new(
+                input_slot_schema.slot_id(),
+                field.name().clone(),
+                nullable,
+                input_slot_schema.type_desc().cloned(),
+                input_slot_schema.unique_id(),
+            )?);
         }
         for (i, slot_id) in self.grouping_slot_ids.iter().enumerate() {
             if chunk.slot_id_to_index().contains_key(slot_id) {
                 return Err(format!("repeat cannot append existing slot id {}", slot_id));
             }
             let field = Field::new(format!("repeat_grouping_{i}"), DataType::Int64, true);
-            fields.push(Arc::new(field_with_slot_id(field, *slot_id)));
+            fields.push(Arc::new(field.clone()));
+            slot_schemas.push(ChunkSlotSchema::new(
+                *slot_id,
+                field.name().clone(),
+                true,
+                Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                None,
+            ));
         }
         self.output_schema = Some(Arc::new(Schema::new(fields)));
+        self.output_chunk_schema = Some(Arc::new(crate::exec::chunk::ChunkSchema::try_new(
+            slot_schemas,
+        )?));
 
         self.input = Some(chunk);
         self.repeat_idx = 0;
@@ -216,6 +237,9 @@ impl ProcessorOperator for RepeatProcessorOperator {
             .output_schema
             .as_ref()
             .ok_or_else(|| "repeat missing output schema; push_chunk was not called".to_string())?;
+        let output_chunk_schema = self.output_chunk_schema.as_ref().ok_or_else(|| {
+            "repeat missing output chunk schema; push_chunk was not called".to_string()
+        })?;
         let num_rows = chunk.len();
         let mut columns = chunk.batch.columns().to_vec();
 
@@ -242,9 +266,6 @@ impl ProcessorOperator for RepeatProcessorOperator {
             columns.push(Arc::new(arr) as _);
         }
 
-        let batch = RecordBatch::try_new(Arc::clone(schema), columns)
-            .map_err(|e| format!("repeat build batch failed: {e}"))?;
-
         self.repeat_idx += 1;
         if self.repeat_idx >= self.repeat_times {
             self.input = None;
@@ -252,7 +273,14 @@ impl ProcessorOperator for RepeatProcessorOperator {
                 self.finished = true;
             }
         }
-        Ok(Some(Chunk::new(batch)))
+        Ok(Some(
+            Chunk::try_new_with_schema_and_chunk_schema(
+                Arc::clone(schema),
+                columns,
+                Arc::clone(output_chunk_schema),
+            )
+            .map_err(|e| format!("repeat build batch failed: {e}"))?,
+        ))
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
@@ -300,11 +328,13 @@ impl RepeatProcessorOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::chunk::field_with_slot_id;
     use crate::runtime::runtime_state::RuntimeState;
 
     use arrow::array::Array;
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::SchemaRef;
+    use arrow::record_batch::RecordBatch;
 
     fn schema_for(slot_ids: &[SlotId]) -> SchemaRef {
         let mut fields = Vec::new();
@@ -336,6 +366,7 @@ mod tests {
             finished: false,
             emit_empty_once: false,
             output_schema: None,
+            output_chunk_schema: None,
         };
 
         let state = RuntimeState::default();

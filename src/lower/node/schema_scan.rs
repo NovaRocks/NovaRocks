@@ -22,11 +22,11 @@ use arrow::record_batch::RecordBatch;
 use crate::common::ids::SlotId;
 use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp, SchemaTable};
 use crate::descriptors;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::node::scan::ScanNode;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::lower::layout::{Layout, schema_for_layout};
+use crate::lower::layout::{Layout, chunk_schema_for_layout, schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
 use crate::{internal_service, plan_nodes, types};
@@ -69,18 +69,22 @@ pub(crate) fn lower_schema_scan_node(
         };
     }
 
-    let schema = if out_layout.order.is_empty() {
-        Arc::new(Schema::empty())
+    let chunk = if out_layout.order.is_empty() {
+        Chunk::new_with_chunk_schema(
+            RecordBatch::new_empty(Arc::new(Schema::empty())),
+            Arc::new(ChunkSchema::empty()),
+        )
     } else {
         let desc_tbl =
             desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
-        schema_for_layout(desc_tbl, out_layout)?
+        let schema = schema_for_layout(desc_tbl, out_layout)?;
+        let chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
+        Chunk::new_with_chunk_schema(RecordBatch::new_empty(schema), chunk_schema)
     };
     warn!(
         "SCHEMA_SCAN_NODE is lowered to empty values for table_name={} db={:?}",
         schema_scan.table_name, schema_scan.db
     );
-    let chunk = Chunk::new(RecordBatch::new_empty(schema));
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Values(ValuesNode {
@@ -131,6 +135,13 @@ fn lower_supported_schema_scan_node(
             desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
         schema_for_layout(desc_tbl, out_layout)?
     };
+    let output_chunk_schema = if out_layout.order.is_empty() {
+        Arc::new(ChunkSchema::empty())
+    } else {
+        let desc_tbl =
+            desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
+        chunk_schema_for_layout(desc_tbl, out_layout)?
+    };
     let output_slots = out_layout
         .order
         .iter()
@@ -146,6 +157,7 @@ fn lower_supported_schema_scan_node(
         table,
         context,
         output_schema,
+        output_chunk_schema,
         should_scan,
         fe_addr.cloned(),
     )))

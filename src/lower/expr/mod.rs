@@ -38,6 +38,7 @@ mod slot;
 mod subfield;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::datatypes::DataType;
 use std::collections::{BTreeMap, HashMap};
@@ -517,6 +518,11 @@ fn lower_expr_node_impl(
             return Err(format!("unsupported expr node type: {:?}", t));
         }
     };
+    if let Ok(field_schema) =
+        ChunkFieldSchema::try_from_type_desc("_expr", true, node.type_.clone())
+    {
+        arena.set_field_schema(id, field_schema);
+    }
     Ok(id)
 }
 

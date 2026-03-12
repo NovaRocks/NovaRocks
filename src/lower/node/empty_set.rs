@@ -23,7 +23,7 @@ use crate::descriptors;
 use crate::exec::chunk::Chunk;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::lower::layout::{Layout, schema_for_layout};
+use crate::lower::layout::{Layout, chunk_schema_for_layout, schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::plan_nodes;
 
@@ -33,14 +33,23 @@ pub(crate) fn lower_empty_set_node(
     out_layout: &Layout,
     desc_tbl: Option<&descriptors::TDescriptorTable>,
 ) -> Result<Lowered, String> {
-    let schema = if out_layout.order.is_empty() {
-        Arc::new(Schema::empty())
+    let (schema, chunk) = if out_layout.order.is_empty() {
+        let schema = Arc::new(Schema::empty());
+        let chunk = Chunk::new_with_chunk_schema(
+            RecordBatch::new_empty(schema.clone()),
+            Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+        );
+        (schema, chunk)
     } else {
         let desc_tbl =
             desc_tbl.ok_or_else(|| "EMPTY_SET_NODE requires desc_tbl for schema".to_string())?;
-        schema_for_layout(desc_tbl, out_layout)?
+        let schema = schema_for_layout(desc_tbl, out_layout)?;
+        let chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
+        let chunk =
+            Chunk::new_with_chunk_schema(RecordBatch::new_empty(schema.clone()), chunk_schema);
+        (schema, chunk)
     };
-    let chunk = Chunk::new(RecordBatch::new_empty(schema));
+    let _ = schema;
 
     Ok(Lowered {
         node: ExecNode {

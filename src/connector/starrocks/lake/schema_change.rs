@@ -39,7 +39,7 @@ use crate::connector::starrocks::lake::txn_log::{
     build_tablet_output_schema, load_rowset_batch_for_partial_update_with_delete_predicates,
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,
 };
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::formats::starrocks::metadata::{
     collect_delete_predicates, lake_rowset_visibility_version,
@@ -1144,6 +1144,7 @@ fn build_rollup_expr_input(
     let source_name_to_index = build_source_name_index_map(source_schema, "rollup source schema")?;
 
     let mut fields = Vec::new();
+    let mut slot_schemas = Vec::new();
     let mut arrays = Vec::new();
     let mut order = Vec::new();
     let mut seen_slots = HashSet::new();
@@ -1194,15 +1195,19 @@ fn build_rollup_expr_input(
                     source_batch.num_columns()
                 )
             })?;
-        let field = field_with_slot_id(
-            Field::new(
-                slot_name,
-                source_field.data_type().clone(),
-                slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
-            ),
-            slot_id,
+        let field = Field::new(
+            slot_name,
+            source_field.data_type().clone(),
+            slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
         );
         fields.push(field);
+        slot_schemas.push(ChunkSlotSchema::new(
+            slot_id,
+            slot_name,
+            slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
+            None,
+            None,
+        ));
         arrays.push(
             source_batch
                 .columns()
@@ -1234,12 +1239,14 @@ fn build_rollup_expr_input(
             rowset_idx, e
         )
     })?;
-    let chunk = Chunk::try_new(eval_batch).map_err(|e| {
-        format!(
-            "rollup failed to initialize expression input chunk: rowset_idx={} error={}",
-            rowset_idx, e
-        )
-    })?;
+    let chunk =
+        Chunk::try_new_with_chunk_schema(eval_batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
+            .map_err(|e| {
+                format!(
+                    "rollup failed to initialize expression input chunk: rowset_idx={} error={}",
+                    rowset_idx, e
+                )
+            })?;
     let index = order.iter().enumerate().map(|(i, key)| (*key, i)).collect();
     Ok(RollupExprInput {
         chunk,

@@ -31,6 +31,7 @@ pub(crate) use cast::cast_with_special_rules;
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::ChunkFieldSchema;
 use arrow::array::{ArrayRef, new_null_array};
 use arrow::datatypes::DataType;
 use arrow_buffer::i256;
@@ -135,6 +136,7 @@ pub enum ExprNode {
 pub struct ExprArena {
     nodes: Vec<ExprNode>,
     types: Vec<DataType>,
+    field_schemas: Vec<Option<ChunkFieldSchema>>,
     allow_throw_exception: bool,
     query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
     session_time_zone: Option<String>,
@@ -149,6 +151,7 @@ impl ExprArena {
         let id = ExprId(self.nodes.len());
         self.nodes.push(node);
         self.types.push(data_type);
+        self.field_schemas.push(None);
         id
     }
 
@@ -158,6 +161,18 @@ impl ExprArena {
 
     pub fn data_type(&self, id: ExprId) -> Option<&DataType> {
         self.types.get(id.0)
+    }
+
+    pub fn set_field_schema(&mut self, id: ExprId, field_schema: ChunkFieldSchema) {
+        if let Some(slot) = self.field_schemas.get_mut(id.0) {
+            *slot = Some(field_schema);
+        }
+    }
+
+    pub fn field_schema(&self, id: ExprId) -> Option<&ChunkFieldSchema> {
+        self.field_schemas
+            .get(id.0)
+            .and_then(|schema| schema.as_ref())
     }
 
     pub fn set_allow_throw_exception(&mut self, allow: bool) {

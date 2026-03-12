@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use crate::common::ids::SlotId;
 use crate::descriptors;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 use crate::exec::row_position::RowPositionDescriptor;
 
@@ -29,10 +30,15 @@ pub struct FetchNode {
     pub row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub nodes_info: Option<descriptors::TNodesInfo>,
     pub output_slots: Vec<SlotId>,
+    pub output_chunk_schema: ChunkSchemaRef,
 }
 
 impl FetchNode {
     pub fn output_slots(&self) -> &[SlotId] {
         &self.output_slots
+    }
+
+    pub fn output_chunk_schema(&self) -> ChunkSchemaRef {
+        self.output_chunk_schema.clone()
     }
 }

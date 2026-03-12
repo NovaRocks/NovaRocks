@@ -142,7 +142,7 @@ impl ProcessorOperator for FilterProcessorOperator {
         let filtered_batch = filter_record_batch(&chunk.batch, filter_mask)
             .map_err(|e| format!("Filter failed: {}", e))?;
 
-        self.pending_output = Some(Chunk::new(filtered_batch));
+        self.pending_output = Some(Chunk::new_like(filtered_batch, &chunk));
         Ok(())
     }
 

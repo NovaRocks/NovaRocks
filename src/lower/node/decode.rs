@@ -26,12 +26,12 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout, slot_arrow_type_lookup};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::{data, descriptors, exprs, plan_nodes, types};
@@ -461,20 +461,24 @@ fn derive_query_global_dict_expr(
     let mut fields = Vec::with_capacity(slot_inputs.len());
     let mut columns = Vec::with_capacity(slot_inputs.len());
     for (slot_id, data_type) in &slot_inputs {
-        let slot_id_u32 =
-            u32::try_from(*slot_id).map_err(|_| format!("slot id {} overflows u32", slot_id))?;
-        let slot = SlotId::new(slot_id_u32);
-        let field = field_with_slot_id(
-            Field::new(format!("slot_{}", slot_id), data_type.clone(), true),
-            slot,
-        );
+        let field = Field::new(format!("slot_{}", slot_id), data_type.clone(), true);
         fields.push(field);
         columns.push(build_slot_array_for_dict_entries(data_type, &dict_entries)?);
     }
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|e| format!("failed to build dict expr input batch: {}", e))?;
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(
+        batch,
+        &slot_inputs
+            .iter()
+            .map(|(slot_id, _)| {
+                let slot_id_u32 = u32::try_from(*slot_id)
+                    .map_err(|_| format!("slot id {} overflows u32", slot_id))?;
+                Ok(SlotId::new(slot_id_u32))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    );
 
     let mut arena = ExprArena::default();
     let mapped_expr_id = lower_t_expr(
@@ -504,25 +508,25 @@ fn derive_query_global_dict_expr(
     Ok(Some(derived))
 }
 
-fn slot_type_map(
-    desc_tbl: Option<&descriptors::TDescriptorTable>,
-) -> HashMap<types::TSlotId, DataType> {
-    let mut out = HashMap::new();
-    let Some(desc_tbl) = desc_tbl else {
-        return out;
-    };
-    let Some(slot_descs) = desc_tbl.slot_descriptors.as_ref() else {
-        return out;
-    };
-    for slot in slot_descs {
-        let (Some(slot_id), Some(slot_type)) = (slot.id, slot.slot_type.as_ref()) else {
-            continue;
-        };
-        if let Some(data_type) = arrow_type_from_desc(slot_type) {
-            out.insert(slot_id, data_type);
-        }
+fn resolve_layout_slot_tuple_id(
+    layout: &Layout,
+    slot_id: types::TSlotId,
+    context: &str,
+) -> Result<types::TTupleId, String> {
+    let mut matches = layout
+        .order
+        .iter()
+        .filter_map(|(tuple_id, layout_slot_id)| (*layout_slot_id == slot_id).then_some(*tuple_id));
+    let tuple_id = matches
+        .next()
+        .ok_or_else(|| format!("{context} missing slot_id={slot_id} in layout"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "{context} ambiguous slot_id={} across multiple tuples",
+            slot_id
+        ));
     }
-    out
+    Ok(tuple_id)
 }
 
 fn supports_dict_decode_input_type(data_type: &DataType) -> bool {
@@ -562,7 +566,10 @@ pub(crate) fn lower_decode_node(
         return Ok(child);
     }
 
-    let slot_types = slot_type_map(desc_tbl);
+    let desc_tbl = desc_tbl
+        .ok_or_else(|| "DECODE_NODE requires descriptor table for output schema".to_string())?;
+    let slot_types = slot_arrow_type_lookup(desc_tbl)?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
     // Output slot id -> encoded dict slot id.
     let mut decode_input_slots = HashMap::with_capacity(dict_id_to_string_ids.len());
     for (dict_slot_id, string_slot_id) in dict_id_to_string_ids {
@@ -571,12 +578,17 @@ pub(crate) fn lower_decode_node(
 
     let mut exprs = Vec::with_capacity(out_layout.order.len());
     let mut expr_slot_ids = Vec::with_capacity(out_layout.order.len());
-    for (_tuple_id, output_slot_id) in &out_layout.order {
+    for (output_tuple_id, output_slot_id) in &out_layout.order {
         let output_slot = SlotId::try_from(*output_slot_id)?;
         let output_type = slot_types
-            .get(output_slot_id)
+            .get(&(*output_tuple_id, *output_slot_id))
             .cloned()
-            .unwrap_or(DataType::Utf8);
+            .ok_or_else(|| {
+                format!(
+                    "DECODE_NODE missing output slot type for tuple_id={} slot_id={}",
+                    output_tuple_id, output_slot_id
+                )
+            })?;
         let expr_id = if let Some(encoded_slot_id) = decode_input_slots.get(output_slot_id) {
             let dict_values = query_global_dict_map.get(encoded_slot_id).ok_or_else(|| {
                 format!(
@@ -585,10 +597,17 @@ pub(crate) fn lower_decode_node(
                 )
             })?;
             let encoded_slot = SlotId::try_from(*encoded_slot_id)?;
+            let encoded_tuple_id =
+                resolve_layout_slot_tuple_id(&child.layout, *encoded_slot_id, "DECODE_NODE")?;
             let encoded_type = slot_types
-                .get(encoded_slot_id)
+                .get(&(encoded_tuple_id, *encoded_slot_id))
                 .cloned()
-                .unwrap_or(DataType::Int32);
+                .ok_or_else(|| {
+                    format!(
+                        "DECODE_NODE missing encoded slot type for tuple_id={} slot_id={}",
+                        encoded_tuple_id, encoded_slot_id
+                    )
+                })?;
             let encoded_expr = arena.push_typed(ExprNode::SlotId(encoded_slot), encoded_type);
             if arena
                 .data_type(encoded_expr)
@@ -623,12 +642,14 @@ pub(crate) fn lower_decode_node(
                 is_subordinate: false,
                 exprs,
                 expr_slot_ids,
+                expr_slot_schemas: None,
                 output_indices: Some(output_indices),
                 output_slots: out_layout
                     .order
                     .iter()
                     .map(|(_, slot_id)| SlotId::try_from(*slot_id))
                     .collect::<Result<Vec<_>, _>>()?,
+                output_chunk_schema: Some(output_chunk_schema),
             }),
         },
         layout: out_layout,

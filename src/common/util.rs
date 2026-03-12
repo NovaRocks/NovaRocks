@@ -27,11 +27,9 @@ use chrono::{DateTime, Datelike, NaiveDate};
 use std::cmp::Ordering;
 
 use crate::common::largeint;
+use crate::exec::chunk::ChunkFieldSchema;
 use crate::exec::variant::VariantValue;
 use crate::types;
-
-const FIELD_META_PRIMITIVE_TYPE: &str = "novarocks.primitive_type";
-const FIELD_META_PRIMITIVE_JSON: &str = "JSON";
 
 fn format_date32_for_mysql(days: i32) -> String {
     let Some(date) = NaiveDate::from_num_days_from_ce_opt(719163 + days) else {
@@ -55,17 +53,28 @@ fn is_opaque_binary_primitive(primitive: types::TPrimitiveType) -> bool {
         || primitive == types::TPrimitiveType::PERCENTILE
 }
 
-pub(crate) fn mysql_text_row_from_arrays(
-    columns: &[ArrayRef],
-    row: usize,
-) -> Result<Vec<u8>, String> {
-    mysql_text_row_from_arrays_with_primitives(columns, row, None)
+fn effective_primitive_type(
+    primitive: types::TPrimitiveType,
+    field_schema: Option<&ChunkFieldSchema>,
+) -> types::TPrimitiveType {
+    if primitive != types::TPrimitiveType::INVALID_TYPE {
+        primitive
+    } else {
+        field_schema
+            .and_then(|schema| schema.primitive_type())
+            .unwrap_or(types::TPrimitiveType::INVALID_TYPE)
+    }
+}
+
+fn effective_json_semantic(json_semantic: bool, field_schema: Option<&ChunkFieldSchema>) -> bool {
+    json_semantic || field_schema.is_some_and(|schema| schema.json_semantic())
 }
 
 pub(crate) fn mysql_text_row_from_arrays_with_primitives(
     columns: &[ArrayRef],
     row: usize,
     primitive_types: Option<&[types::TPrimitiveType]>,
+    field_schemas: Option<&[ChunkFieldSchema]>,
 ) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     for (idx, col) in columns.iter().enumerate() {
@@ -73,10 +82,14 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
             out.push(0xFB);
             continue;
         }
-        let primitive = primitive_types
-            .and_then(|prims| prims.get(idx))
-            .copied()
-            .unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+        let field_schema = field_schemas.and_then(|schemas| schemas.get(idx));
+        let primitive = effective_primitive_type(
+            primitive_types
+                .and_then(|prims| prims.get(idx))
+                .copied()
+                .unwrap_or(types::TPrimitiveType::INVALID_TYPE),
+            field_schema,
+        );
         match col.data_type() {
             DataType::Null => out.push(0xFB),
             DataType::Boolean => {
@@ -238,7 +251,7 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
                 {
                     let value = largeint::i128_from_be_bytes(arr.value(row))?;
                     append_lenenc_string(&mut out, value.to_string().as_bytes());
-                } else if renders_mysql_null_for_primitive(primitive) {
+                } else if is_opaque_binary_primitive(primitive) {
                     out.push(0xFB);
                 } else {
                     append_lenenc_string(&mut out, arr.value(row));
@@ -260,7 +273,7 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
             | DataType::LargeList(_)
             | DataType::Map(_, _)
             | DataType::Struct(_) => {
-                let value = format_mysql_container_value(col, row)?;
+                let value = format_mysql_container_value_with_schema(col, row, field_schema)?;
                 append_lenenc_string(&mut out, value.as_bytes());
             }
             other => {
@@ -279,21 +292,33 @@ pub(crate) fn http_json_row_from_arrays_with_primitives(
     row: usize,
     primitive_types: Option<&[types::TPrimitiveType]>,
     json_semantics: Option<&[bool]>,
+    field_schemas: Option<&[ChunkFieldSchema]>,
 ) -> Result<Vec<u8>, String> {
     let mut out = String::from("{\"data\":[");
     for (idx, col) in columns.iter().enumerate() {
         if idx > 0 {
             out.push(',');
         }
-        let primitive = primitive_types
-            .and_then(|prims| prims.get(idx))
-            .copied()
-            .unwrap_or(types::TPrimitiveType::INVALID_TYPE);
+        let field_schema = field_schemas.and_then(|schemas| schemas.get(idx));
+        let primitive = effective_primitive_type(
+            primitive_types
+                .and_then(|prims| prims.get(idx))
+                .copied()
+                .unwrap_or(types::TPrimitiveType::INVALID_TYPE),
+            field_schema,
+        );
         let json_semantic = json_semantics
             .and_then(|flags| flags.get(idx))
             .copied()
             .unwrap_or(false);
-        append_http_json_value(&mut out, col, row, primitive, json_semantic)?;
+        append_http_json_value_with_schema(
+            &mut out,
+            col,
+            row,
+            primitive,
+            json_semantic,
+            field_schema,
+        )?;
     }
     out.push_str("]}\n");
     Ok(out.into_bytes())
@@ -306,17 +331,21 @@ fn append_http_json_quoted(out: &mut String, value: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn append_http_json_value(
+fn append_http_json_value_with_schema(
     out: &mut String,
     col: &ArrayRef,
     row: usize,
     primitive: types::TPrimitiveType,
     json_semantic: bool,
+    field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<(), String> {
     if col.is_null(row) {
         out.push_str("null");
         return Ok(());
     }
+
+    let primitive = effective_primitive_type(primitive, field_schema);
+    let json_semantic = effective_json_semantic(json_semantic, field_schema);
 
     match col.data_type() {
         DataType::Null => out.push_str("null"),
@@ -491,7 +520,7 @@ fn append_http_json_value(
             {
                 let value = largeint::i128_from_be_bytes(arr.value(row))?;
                 append_http_json_quoted(out, &value.to_string())?;
-            } else if renders_mysql_null_for_primitive(primitive) {
+            } else if is_opaque_binary_primitive(primitive) {
                 out.push_str("null");
             } else {
                 append_http_json_quoted(out, &String::from_utf8_lossy(arr.value(row)))?;
@@ -521,18 +550,19 @@ fn append_http_json_value(
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = arr.values();
-            let item_is_json = list_item_json_semantic(arr.data_type());
+            let item_schema = field_schema.and_then(|schema| schema.list_item());
             out.push('[');
             for idx in start..end {
                 if idx > start {
                     out.push(',');
                 }
-                append_http_json_value(
+                append_http_json_value_with_schema(
                     out,
                     &values,
                     idx,
                     types::TPrimitiveType::INVALID_TYPE,
-                    item_is_json,
+                    false,
+                    item_schema,
                 )?;
             }
             out.push(']');
@@ -546,18 +576,19 @@ fn append_http_json_value(
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = arr.values();
-            let item_is_json = list_item_json_semantic(arr.data_type());
+            let item_schema = field_schema.and_then(|schema| schema.list_item());
             out.push('[');
             for idx in start..end {
                 if idx > start {
                     out.push(',');
                 }
-                append_http_json_value(
+                append_http_json_value_with_schema(
                     out,
                     &values,
                     idx,
                     types::TPrimitiveType::INVALID_TYPE,
-                    item_is_json,
+                    false,
+                    item_schema,
                 )?;
             }
             out.push(']');
@@ -572,7 +603,8 @@ fn append_http_json_value(
             let end = offsets[row + 1] as usize;
             let keys = arr.keys();
             let values = arr.values();
-            let value_is_json = map_value_json_semantic(arr.data_type());
+            let key_schema = field_schema.and_then(|schema| schema.map_key());
+            let value_schema = field_schema.and_then(|schema| schema.map_value());
             let mut entry_indices: Vec<usize> = (start..end).collect();
             if !matches!(keys.data_type(), DataType::Utf8) {
                 sort_map_entry_indices(keys, &mut entry_indices)?;
@@ -582,14 +614,18 @@ fn append_http_json_value(
                 if idx > 0 {
                     out.push(',');
                 }
-                append_http_json_quoted(out, &http_json_object_key(keys, entry_idx)?)?;
+                append_http_json_quoted(
+                    out,
+                    &http_json_object_key_with_schema(keys, entry_idx, key_schema)?,
+                )?;
                 out.push(':');
-                append_http_json_value(
+                append_http_json_value_with_schema(
                     out,
                     &values,
                     entry_idx,
                     types::TPrimitiveType::INVALID_TYPE,
-                    value_is_json,
+                    false,
+                    value_schema,
                 )?;
             }
             out.push('}');
@@ -607,15 +643,13 @@ fn append_http_json_value(
                 }
                 append_http_json_quoted(out, field.name())?;
                 out.push(':');
-                append_http_json_value(
+                append_http_json_value_with_schema(
                     out,
                     &arr.column(idx),
                     row,
                     types::TPrimitiveType::INVALID_TYPE,
-                    field
-                        .metadata()
-                        .get(FIELD_META_PRIMITIVE_TYPE)
-                        .is_some_and(|v| v == FIELD_META_PRIMITIVE_JSON),
+                    false,
+                    field_schema.and_then(|schema| schema.struct_child(idx)),
                 )?;
             }
             out.push('}');
@@ -630,7 +664,11 @@ fn append_http_json_value(
     Ok(())
 }
 
-fn http_json_object_key(keys: &ArrayRef, row: usize) -> Result<String, String> {
+fn http_json_object_key_with_schema(
+    keys: &ArrayRef,
+    row: usize,
+    field_schema: Option<&ChunkFieldSchema>,
+) -> Result<String, String> {
     if keys.is_null(row) {
         return Err("map key should not be null in HTTP JSON row".to_string());
     }
@@ -778,12 +816,13 @@ fn http_json_object_key(keys: &ArrayRef, row: usize) -> Result<String, String> {
         }
         _ => {
             let mut rendered = String::new();
-            append_http_json_value(
+            append_http_json_value_with_schema(
                 &mut rendered,
                 keys,
                 row,
                 types::TPrimitiveType::INVALID_TYPE,
                 false,
+                field_schema,
             )?;
             Ok(rendered.trim_matches('"').to_string())
         }
@@ -791,9 +830,20 @@ fn http_json_object_key(keys: &ArrayRef, row: usize) -> Result<String, String> {
 }
 
 fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, String> {
+    format_mysql_container_value_with_schema(col, row, None)
+}
+
+fn format_mysql_container_value_with_schema(
+    col: &ArrayRef,
+    row: usize,
+    field_schema: Option<&ChunkFieldSchema>,
+) -> Result<String, String> {
     if col.is_null(row) {
         return Ok("null".to_string());
     }
+    let primitive = field_schema
+        .and_then(|schema| schema.primitive_type())
+        .unwrap_or(types::TPrimitiveType::INVALID_TYPE);
     match col.data_type() {
         DataType::Null => Ok("null".to_string()),
         DataType::Boolean => {
@@ -920,6 +970,9 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
             Ok(format_decimal256(arr.value(row), *scale))
         }
         DataType::Binary => {
+            if is_opaque_binary_primitive(primitive) {
+                return Ok("null".to_string());
+            }
             let arr = col
                 .as_any()
                 .downcast_ref::<BinaryArray>()
@@ -933,9 +986,13 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
                 .as_any()
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-            if *width == largeint::LARGEINT_BYTE_WIDTH {
+            if primitive == types::TPrimitiveType::LARGEINT
+                || *width == largeint::LARGEINT_BYTE_WIDTH
+            {
                 let value = largeint::i128_from_be_bytes(arr.value(row))?;
                 Ok(value.to_string())
+            } else if is_opaque_binary_primitive(primitive) {
+                Ok("null".to_string())
             } else {
                 Ok(quote_mysql_container_string(&String::from_utf8_lossy(
                     arr.value(row),
@@ -960,16 +1017,24 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = arr.values();
-            let item_is_json = list_item_json_semantic(arr.data_type());
+            let item_schema = field_schema.and_then(|schema| schema.list_item());
             let mut out = String::from("[");
             for i in start..end {
                 if i > start {
                     out.push(',');
                 }
-                if item_is_json {
-                    out.push_str(&format_mysql_container_json_value(&values, i)?);
+                if item_schema.is_some_and(|schema| schema.json_semantic()) {
+                    out.push_str(&format_mysql_container_json_value_with_schema(
+                        &values,
+                        i,
+                        item_schema,
+                    )?);
                 } else {
-                    out.push_str(&format_mysql_container_value(&values, i)?);
+                    out.push_str(&format_mysql_container_value_with_schema(
+                        &values,
+                        i,
+                        item_schema,
+                    )?);
                 }
             }
             out.push(']');
@@ -984,16 +1049,24 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
             let start = offsets[row] as usize;
             let end = offsets[row + 1] as usize;
             let values = arr.values();
-            let item_is_json = list_item_json_semantic(arr.data_type());
+            let item_schema = field_schema.and_then(|schema| schema.list_item());
             let mut out = String::from("[");
             for i in start..end {
                 if i > start {
                     out.push(',');
                 }
-                if item_is_json {
-                    out.push_str(&format_mysql_container_json_value(&values, i)?);
+                if item_schema.is_some_and(|schema| schema.json_semantic()) {
+                    out.push_str(&format_mysql_container_json_value_with_schema(
+                        &values,
+                        i,
+                        item_schema,
+                    )?);
                 } else {
-                    out.push_str(&format_mysql_container_value(&values, i)?);
+                    out.push_str(&format_mysql_container_value_with_schema(
+                        &values,
+                        i,
+                        item_schema,
+                    )?);
                 }
             }
             out.push(']');
@@ -1009,7 +1082,8 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
             let end = offsets[row + 1] as usize;
             let keys = arr.keys();
             let values = arr.values();
-            let map_value_is_json = map_value_json_semantic(arr.data_type());
+            let key_schema = field_schema.and_then(|schema| schema.map_key());
+            let value_schema = field_schema.and_then(|schema| schema.map_value());
             let mut out = String::from("{");
             let mut entry_indices: Vec<usize> = (start..end).collect();
             if !matches!(keys.data_type(), DataType::Utf8) {
@@ -1019,11 +1093,11 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
                 if idx > 0 {
                     out.push(',');
                 }
-                let key = format_mysql_container_value(keys, entry_idx)?;
-                let value = if map_value_is_json {
-                    format_mysql_container_json_value(values, entry_idx)?
+                let key = format_mysql_container_value_with_schema(keys, entry_idx, key_schema)?;
+                let value = if value_schema.is_some_and(|schema| schema.json_semantic()) {
+                    format_mysql_container_json_value_with_schema(values, entry_idx, value_schema)?
                 } else {
-                    format_mysql_container_value(values, entry_idx)?
+                    format_mysql_container_value_with_schema(values, entry_idx, value_schema)?
                 };
                 out.push_str(&key);
                 out.push(':');
@@ -1046,7 +1120,11 @@ fn format_mysql_container_value(col: &ArrayRef, row: usize) -> Result<String, St
                 out.push_str(&quote_mysql_container_string(field.name()));
                 out.push(':');
                 let child = arr.column(idx);
-                out.push_str(&format_mysql_container_value(child, row)?);
+                out.push_str(&format_mysql_container_value_with_schema(
+                    child,
+                    row,
+                    field_schema.and_then(|schema| schema.struct_child(idx)),
+                )?);
             }
             out.push('}');
             Ok(out)
@@ -1249,33 +1327,11 @@ fn quote_mysql_json_container_string(value: &str) -> String {
     out
 }
 
-fn map_value_json_semantic(data_type: &DataType) -> bool {
-    let DataType::Map(entries, _) = data_type else {
-        return false;
-    };
-    let DataType::Struct(fields) = entries.data_type() else {
-        return false;
-    };
-    let Some(value_field) = fields.get(1) else {
-        return false;
-    };
-    value_field
-        .metadata()
-        .get(FIELD_META_PRIMITIVE_TYPE)
-        .is_some_and(|v| v == FIELD_META_PRIMITIVE_JSON)
-}
-
-fn list_item_json_semantic(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::List(item) | DataType::LargeList(item) => item
-            .metadata()
-            .get(FIELD_META_PRIMITIVE_TYPE)
-            .is_some_and(|v| v == FIELD_META_PRIMITIVE_JSON),
-        _ => false,
-    }
-}
-
-fn format_mysql_container_json_value(col: &ArrayRef, row: usize) -> Result<String, String> {
+fn format_mysql_container_json_value_with_schema(
+    col: &ArrayRef,
+    row: usize,
+    field_schema: Option<&ChunkFieldSchema>,
+) -> Result<String, String> {
     if col.is_null(row) {
         return Ok("null".to_string());
     }
@@ -1298,7 +1354,7 @@ fn format_mysql_container_json_value(col: &ArrayRef, row: usize) -> Result<Strin
                 &text.unwrap_or_else(|_| "null".to_string()),
             ))
         }
-        _ => format_mysql_container_value(col, row),
+        _ => format_mysql_container_value_with_schema(col, row, field_schema),
     }
 }
 
@@ -1471,9 +1527,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{format_timestamp, http_json_row_from_arrays_with_primitives};
-    use arrow::array::{ArrayRef, Int32Array, StringArray};
-    use arrow::datatypes::TimeUnit;
+    use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
+    use arrow::datatypes::{DataType, Field, TimeUnit};
 
+    use crate::exec::chunk::ChunkFieldSchema;
     use crate::types;
 
     #[test]
@@ -1500,6 +1557,7 @@ mod tests {
             0,
             Some(&[types::TPrimitiveType::INT]),
             None,
+            None,
         )
         .expect("http json row");
         assert_eq!(String::from_utf8(row).unwrap(), "{\"data\":[1]}\n");
@@ -1513,8 +1571,59 @@ mod tests {
             0,
             Some(&[types::TPrimitiveType::JSON]),
             None,
+            None,
         )
         .expect("http json row");
         assert_eq!(String::from_utf8(row).unwrap(), "{\"data\":[{\"a\":1}]}\n");
+    }
+
+    #[test]
+    fn http_json_row_uses_nested_field_schema_for_json_children() {
+        let columns = vec![Arc::new(StructArray::new(
+            vec![Arc::new(Field::new("payload", DataType::Utf8, true))].into(),
+            vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
+            None,
+        )) as ArrayRef];
+        let field_schema = ChunkFieldSchema::try_from_type_desc(
+            "col",
+            true,
+            types::TTypeDesc::new(vec![
+                types::TTypeNode::new(
+                    types::TTypeNodeType::STRUCT,
+                    None,
+                    Some(vec![types::TStructField::new(
+                        Some("payload".to_string()),
+                        None,
+                        None,
+                        None,
+                    )]),
+                    None,
+                ),
+                types::TTypeNode::new(
+                    types::TTypeNodeType::SCALAR,
+                    Some(types::TScalarType::new(
+                        types::TPrimitiveType::JSON,
+                        None,
+                        None,
+                        None,
+                    )),
+                    None,
+                    None,
+                ),
+            ]),
+        )
+        .expect("field schema");
+        let row = http_json_row_from_arrays_with_primitives(
+            &columns,
+            0,
+            None,
+            None,
+            Some(&[field_schema]),
+        )
+        .expect("http json row");
+        assert_eq!(
+            String::from_utf8(row).unwrap(),
+            "{\"data\":[{\"payload\":{\"a\":1}}]}\n"
+        );
     }
 }

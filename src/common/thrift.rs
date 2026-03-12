@@ -59,6 +59,27 @@ pub(crate) fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> Resul
     T::read_from_in_protocol(&mut prot).map_err(|e| e.to_string())
 }
 
+pub(crate) fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
+    const INITIAL_CAPACITY: usize = 256;
+    const MAX_CAPACITY: usize = 64 * 1024;
+
+    let mut capacity = INITIAL_CAPACITY;
+    loop {
+        let channel = TBufferChannel::with_capacity(0, capacity);
+        let (_, w) = channel.split().map_err(|e| e.to_string())?;
+        let mut protocol = TBinaryOutputProtocol::new(w, true);
+        match value.write_to_out_protocol(&mut protocol) {
+            Ok(()) => return Ok(protocol.transport.write_bytes()),
+            Err(e) => {
+                if capacity >= MAX_CAPACITY {
+                    return Err(e.to_string());
+                }
+                capacity = (capacity.saturating_mul(2)).min(MAX_CAPACITY);
+            }
+        }
+    }
+}
+
 pub(crate) fn thrift_serialize_result_batch(batch: &data::TResultBatch) -> Vec<u8> {
     let capacity = estimate_result_batch_bytes(batch);
     let channel = TBufferChannel::with_capacity(0, capacity);

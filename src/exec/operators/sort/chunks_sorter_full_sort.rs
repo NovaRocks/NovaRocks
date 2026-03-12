@@ -52,10 +52,12 @@ impl ChunksSorter for ChunksSorterFullSort {
             return Ok(None);
         }
         if self.order_by.is_empty() {
-            return Chunk::try_new(batch).map(Some).map_err(|e| e.to_string());
+            return Chunk::try_new_like(batch, &chunks[0])
+                .map(Some)
+                .map_err(|e| e.to_string());
         }
 
-        let chunk = Chunk::new(batch.clone());
+        let chunk = Chunk::new_like(batch.clone(), &chunks[0]);
         let mut sort_columns = Vec::with_capacity(self.order_by.len());
         for sort_expr in &self.order_by {
             let values = self
@@ -80,6 +82,8 @@ impl ChunksSorter for ChunksSorterFullSort {
             .map_err(|e| e.to_string())?;
         let sorted = arrow::record_batch::RecordBatch::try_new(batch.schema(), columns)
             .map_err(|e| e.to_string())?;
-        Chunk::try_new(sorted).map(Some).map_err(|e| e.to_string())
+        Chunk::try_new_like(sorted, &chunks[0])
+            .map(Some)
+            .map_err(|e| e.to_string())
     }
 }

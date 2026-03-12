@@ -17,8 +17,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
-
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeScanTabletRef, LakeTableIdentity, find_cached_table_identity_names,
@@ -31,11 +29,11 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
-    Layout, find_tuple_descriptor, layout_for_row_tuples, layout_from_slot_ids, schema_for_layout,
-    schema_for_tuple,
+    Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
+    layout_for_row_tuples, layout_from_slot_ids, schema_for_layout, schema_for_tuple,
+    slot_arrow_type_lookup,
 };
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
-use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
@@ -120,7 +118,9 @@ pub(crate) fn lower_lake_scan_node(
     }
 
     let schema = schema_for_layout(desc_tbl, &scan_layout)?;
+    let scan_output_chunk_schema = chunk_schema_for_layout(desc_tbl, &scan_layout)?;
     let required_schema = schema_for_tuple(desc_tbl, tuple_id)?;
+    let required_chunk_schema = chunk_schema_for_tuple(desc_tbl, tuple_id)?;
     let slot_ids = scan_layout
         .order
         .iter()
@@ -361,7 +361,9 @@ pub(crate) fn lower_lake_scan_node(
         ranges,
         has_more,
         required_schema,
+        required_chunk_schema,
         schema,
+        output_chunk_schema: scan_output_chunk_schema,
         slot_ids,
         query_global_dicts: build_scan_query_global_dicts(&output_slots, query_global_dict_map)?,
         limit,
@@ -400,17 +402,8 @@ pub(crate) fn lower_lake_scan_node(
         return Ok(scan_lowered);
     }
 
-    let mut slot_types = HashMap::<types::TSlotId, DataType>::new();
-    if let Some(slot_descs) = desc_tbl.slot_descriptors.as_ref() {
-        for s in slot_descs {
-            let (Some(slot_id), Some(slot_type)) = (s.id, s.slot_type.as_ref()) else {
-                continue;
-            };
-            if let Some(data_type) = arrow_type_from_desc(slot_type) {
-                slot_types.insert(slot_id, data_type);
-            }
-        }
-    }
+    let slot_types = slot_arrow_type_lookup(desc_tbl)?;
+    let projected_output_chunk_schema = chunk_schema_for_layout(desc_tbl, &original_out_layout)?;
 
     let mut exprs = Vec::with_capacity(original_out_layout.order.len());
     let mut expr_slot_ids = Vec::with_capacity(original_out_layout.order.len());
@@ -421,10 +414,17 @@ pub(crate) fn lower_lake_scan_node(
             .unwrap_or(*output_slot_id);
         let source_slot = SlotId::try_from(source_slot_id)?;
         let output_slot = SlotId::try_from(*output_slot_id)?;
+        let source_tuple_id =
+            resolve_layout_slot_tuple_id(&scan_lowered.layout, source_slot_id, "LAKE_SCAN_NODE")?;
         let data_type = slot_types
-            .get(&source_slot_id)
+            .get(&(source_tuple_id, source_slot_id))
             .cloned()
-            .unwrap_or(DataType::Utf8);
+            .ok_or_else(|| {
+                format!(
+                    "LAKE_SCAN_NODE missing source slot type for tuple_id={} slot_id={}",
+                    source_tuple_id, source_slot_id
+                )
+            })?;
         let expr = arena.push_typed(ExprNode::SlotId(source_slot), data_type);
         exprs.push(expr);
         expr_slot_ids.push(output_slot);
@@ -439,16 +439,39 @@ pub(crate) fn lower_lake_scan_node(
                 is_subordinate: true,
                 exprs,
                 expr_slot_ids,
+                expr_slot_schemas: None,
                 output_indices: Some(output_indices),
                 output_slots: original_out_layout
                     .order
                     .iter()
                     .map(|(_, slot_id)| SlotId::try_from(*slot_id))
                     .collect::<Result<Vec<_>, _>>()?,
+                output_chunk_schema: Some(projected_output_chunk_schema),
             }),
         },
         layout: original_out_layout,
     })
+}
+
+fn resolve_layout_slot_tuple_id(
+    layout: &Layout,
+    slot_id: types::TSlotId,
+    context: &str,
+) -> Result<types::TTupleId, String> {
+    let mut matches = layout
+        .order
+        .iter()
+        .filter_map(|(tuple_id, layout_slot_id)| (*layout_slot_id == slot_id).then_some(*tuple_id));
+    let tuple_id = matches
+        .next()
+        .ok_or_else(|| format!("{context} missing slot_id={slot_id} in layout"))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "{context} ambiguous slot_id={} across multiple tuples",
+            slot_id
+        ));
+    }
+    Ok(tuple_id)
 }
 
 pub(crate) fn load_lake_catalog() -> Result<String, String> {

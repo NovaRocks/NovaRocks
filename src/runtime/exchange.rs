@@ -15,19 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
+use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::{Chunk, field_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::debug;
 use crate::runtime::mem_tracker::MemTracker;
 
@@ -52,6 +53,9 @@ const EXCHANGE_LOCK_WAIT_WARN: Duration = Duration::from_millis(200);
 const EXCHANGE_LOCK_HOLD_WARN: Duration = Duration::from_millis(200);
 const EXCHANGE_NOT_READY_LOG_EVERY: u64 = 1024;
 const EXCHANGE_READY_LOG_EVERY: u64 = 4096;
+const EXCHANGE_PAYLOAD_MAGIC: &[u8; 4] = b"NRX1";
+const EXCHANGE_PAYLOAD_VERSION: u8 = 1;
+const EXCHANGE_PAYLOAD_FLAG_SLOT_IDS: u8 = 0x01;
 
 static EXCHANGE_NOT_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static EXCHANGE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -91,9 +95,50 @@ fn is_key_canceled(key: &ExchangeKey) -> bool {
     guard.contains_key(key)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExchangeWireMeta {
+    slot_ids_by_index: Vec<SlotId>,
+}
+
+impl ExchangeWireMeta {
+    fn from_chunks(chunks: &[Chunk]) -> Result<Option<Self>, String> {
+        let Some(first) = chunks.first() else {
+            return Ok(None);
+        };
+        let slot_ids_by_index = first
+            .chunk_schema()
+            .slots()
+            .iter()
+            .map(|slot| slot.slot_id())
+            .collect::<Vec<_>>();
+        for (idx, chunk) in chunks.iter().enumerate().skip(1) {
+            let slot_ids = chunk
+                .chunk_schema()
+                .slots()
+                .iter()
+                .map(|slot| slot.slot_id())
+                .collect::<Vec<_>>();
+            if slot_ids != slot_ids_by_index {
+                return Err(format!(
+                    "exchange wire slot id mismatch at chunk index {}: expected={:?} actual={:?}",
+                    idx, slot_ids_by_index, slot_ids
+                ));
+            }
+        }
+        Ok(Some(Self { slot_ids_by_index }))
+    }
+}
+
+struct DecodedExchangePayload<'a> {
+    wire_meta: Option<ExchangeWireMeta>,
+    arrow_payload: &'a [u8],
+}
+
 #[derive(Default)]
 struct ReceiverState {
     expected_senders: usize,
+    expected_chunk_schema: Option<ChunkSchemaRef>,
+    sender_wire_meta: HashMap<(i32, i32), ExchangeWireMeta>,
     finished: HashSet<(i32, i32)>, // (sender_id, be_number)
     chunks: VecDeque<Chunk>,
     recv_request_count: u128,
@@ -200,6 +245,34 @@ pub fn set_expected_senders(key: ExchangeKey, expected_senders: usize) {
         );
     }
     r.cv.notify_all();
+}
+
+pub fn register_expected_chunk_schema(
+    key: ExchangeKey,
+    expected_senders: usize,
+    chunk_schema: ChunkSchemaRef,
+) -> Result<(), String> {
+    if is_key_canceled(&key) {
+        return Err("exchange canceled".to_string());
+    }
+    let receiver = get_or_create(key);
+    let mut st = receiver.mu.lock().expect("exchange receiver lock");
+    st.expected_senders = st.expected_senders.max(expected_senders);
+    match st.expected_chunk_schema.as_ref() {
+        Some(existing) if existing.as_ref() != chunk_schema.as_ref() => {
+            return Err(format!(
+                "exchange expected chunk schema mismatch: finst={} node_id={}",
+                key.finst_uuid(),
+                key.node_id
+            ));
+        }
+        Some(_) => {}
+        None => {
+            st.expected_chunk_schema = Some(chunk_schema);
+        }
+    }
+    receiver.cv.notify_all();
+    Ok(())
 }
 
 pub fn ensure_receiver_mem_tracker(
@@ -681,32 +754,133 @@ pub fn snapshot_receiver_state(key: ExchangeKey) -> Option<ExchangeReceiverSnaps
     })
 }
 
-fn exchange_schema_compatible(expected: &SchemaRef, actual: &SchemaRef) -> Result<bool, String> {
-    if expected.fields().len() != actual.fields().len() {
+fn encode_exchange_payload_envelope(
+    arrow_payload: &[u8],
+    wire_meta: Option<&ExchangeWireMeta>,
+) -> Vec<u8> {
+    if arrow_payload.is_empty() {
+        return Vec::new();
+    }
+    let slot_id_bytes = wire_meta
+        .map(|meta| {
+            meta.slot_ids_by_index
+                .len()
+                .saturating_mul(std::mem::size_of::<u32>())
+        })
+        .unwrap_or(0);
+    let mut out = Vec::with_capacity(
+        EXCHANGE_PAYLOAD_MAGIC.len() + 2 + 4 + slot_id_bytes + arrow_payload.len(),
+    );
+    out.extend_from_slice(EXCHANGE_PAYLOAD_MAGIC);
+    out.push(EXCHANGE_PAYLOAD_VERSION);
+    out.push(if wire_meta.is_some() {
+        EXCHANGE_PAYLOAD_FLAG_SLOT_IDS
+    } else {
+        0
+    });
+    let slot_count = wire_meta
+        .map(|meta| meta.slot_ids_by_index.len() as u32)
+        .unwrap_or(0);
+    out.extend_from_slice(&slot_count.to_le_bytes());
+    if let Some(meta) = wire_meta {
+        for slot_id in &meta.slot_ids_by_index {
+            out.extend_from_slice(&slot_id.as_u32().to_le_bytes());
+        }
+    }
+    out.extend_from_slice(arrow_payload);
+    out
+}
+
+fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePayload<'_>, String> {
+    if bytes.is_empty() {
+        return Ok(DecodedExchangePayload {
+            wire_meta: None,
+            arrow_payload: bytes,
+        });
+    }
+    if bytes.len() < EXCHANGE_PAYLOAD_MAGIC.len()
+        || &bytes[..EXCHANGE_PAYLOAD_MAGIC.len()] != EXCHANGE_PAYLOAD_MAGIC
+    {
+        return Ok(DecodedExchangePayload {
+            wire_meta: None,
+            arrow_payload: bytes,
+        });
+    }
+
+    let mut cursor = Cursor::new(&bytes[EXCHANGE_PAYLOAD_MAGIC.len()..]);
+    let mut version = [0u8; 1];
+    cursor
+        .read_exact(&mut version)
+        .map_err(|e| format!("failed to read exchange payload version: {e}"))?;
+    if version[0] != EXCHANGE_PAYLOAD_VERSION {
+        return Err(format!(
+            "unsupported exchange payload version: expected={} actual={}",
+            EXCHANGE_PAYLOAD_VERSION, version[0]
+        ));
+    }
+
+    let mut flags = [0u8; 1];
+    cursor
+        .read_exact(&mut flags)
+        .map_err(|e| format!("failed to read exchange payload flags: {e}"))?;
+
+    let mut slot_count_bytes = [0u8; 4];
+    cursor
+        .read_exact(&mut slot_count_bytes)
+        .map_err(|e| format!("failed to read exchange payload slot count: {e}"))?;
+    let slot_count = u32::from_le_bytes(slot_count_bytes) as usize;
+
+    let wire_meta = if flags[0] & EXCHANGE_PAYLOAD_FLAG_SLOT_IDS != 0 {
+        let mut slot_ids_by_index = Vec::with_capacity(slot_count);
+        for idx in 0..slot_count {
+            let mut slot_bytes = [0u8; 4];
+            cursor.read_exact(&mut slot_bytes).map_err(|e| {
+                format!(
+                    "failed to read exchange payload slot id at index {}: {e}",
+                    idx
+                )
+            })?;
+            slot_ids_by_index.push(SlotId::new(u32::from_le_bytes(slot_bytes)));
+        }
+        Some(ExchangeWireMeta { slot_ids_by_index })
+    } else {
+        if slot_count != 0 {
+            return Err(format!(
+                "exchange payload slot count must be zero without slot-id flag, got {}",
+                slot_count
+            ));
+        }
+        None
+    };
+    let payload_offset = EXCHANGE_PAYLOAD_MAGIC.len() + cursor.position() as usize;
+    Ok(DecodedExchangePayload {
+        wire_meta,
+        arrow_payload: &bytes[payload_offset..],
+    })
+}
+
+fn exchange_schema_compatible(expected: &Chunk, actual: &Chunk) -> Result<bool, String> {
+    if expected.schema().fields().len() != actual.schema().fields().len() {
+        return Ok(false);
+    }
+    if expected.chunk_schema().slots().len() != actual.chunk_schema().slots().len() {
         return Ok(false);
     }
 
-    for (idx, (expected_field, actual_field)) in expected
+    for ((expected_field, actual_field), (expected_slot, actual_slot)) in expected
+        .schema()
         .fields()
         .iter()
-        .zip(actual.fields().iter())
-        .enumerate()
+        .zip(actual.schema().fields().iter())
+        .zip(
+            expected
+                .chunk_schema()
+                .slots()
+                .iter()
+                .zip(actual.chunk_schema().slots().iter()),
+        )
     {
-        let expected_slot = field_slot_id(expected_field.as_ref())?.ok_or_else(|| {
-            format!(
-                "exchange expected schema field missing slot id at index {} (name={})",
-                idx,
-                expected_field.name()
-            )
-        })?;
-        let actual_slot = field_slot_id(actual_field.as_ref())?.ok_or_else(|| {
-            format!(
-                "exchange actual schema field missing slot id at index {} (name={})",
-                idx,
-                actual_field.name()
-            )
-        })?;
-        if expected_slot != actual_slot
+        if expected_slot.slot_id() != actual_slot.slot_id()
             || expected_field.data_type() != actual_field.data_type()
             || expected_field.is_nullable() != actual_field.is_nullable()
         {
@@ -717,8 +891,7 @@ fn exchange_schema_compatible(expected: &SchemaRef, actual: &SchemaRef) -> Resul
     Ok(true)
 }
 
-/// Encode chunks to Arrow IPC stream format
-pub fn encode_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
+fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     if chunks.is_empty() {
         return Ok(vec![]);
     }
@@ -730,11 +903,11 @@ pub fn encode_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     let mut batches = Vec::with_capacity(chunks.len());
     batches.push(chunks[0].batch.clone());
     for (i, c) in chunks.iter().enumerate().skip(1) {
-        if c.schema().as_ref() == schema.as_ref() {
+        if c.schema().as_ref() == schema.as_ref() && c.chunk_schema() == chunks[0].chunk_schema() {
             batches.push(c.batch.clone());
             continue;
         }
-        if !exchange_schema_compatible(&schema, &c.schema())? {
+        if !exchange_schema_compatible(&chunks[0], c)? {
             return Err(format!(
                 "exchange encode schema mismatch at chunk index {}: expected={:?} actual={:?}",
                 i,
@@ -767,8 +940,7 @@ pub fn encode_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
-/// Decode chunks from Arrow IPC stream format
-pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
+fn decode_arrow_ipc_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, String> {
     if bytes.is_empty() {
         return Ok(vec![]);
     }
@@ -777,7 +949,7 @@ pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
     let reader = StreamReader::try_new(&mut cursor, None)
         .map_err(|e| format!("failed to create Arrow IPC reader: {e}"))?;
 
-    let mut chunks = Vec::new();
+    let mut batches = Vec::new();
     let mut expected_schema: Option<arrow::datatypes::SchemaRef> = None;
     for batch_result in reader {
         let batch = batch_result.map_err(|e| format!("failed to read batch: {e}"))?;
@@ -792,10 +964,161 @@ pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
         } else {
             expected_schema = Some(batch.schema());
         }
+        batches.push(batch);
+    }
+
+    Ok(batches)
+}
+
+fn chunk_schema_for_wire_meta(
+    expected_chunk_schema: &ChunkSchemaRef,
+    batch: &RecordBatch,
+    wire_meta: &ExchangeWireMeta,
+) -> Result<ChunkSchemaRef, String> {
+    if wire_meta.slot_ids_by_index.len() != batch.num_columns() {
+        return Err(format!(
+            "exchange wire slot id count mismatch: batch_columns={} slot_ids={}",
+            batch.num_columns(),
+            wire_meta.slot_ids_by_index.len()
+        ));
+    }
+    let mut slots = Vec::with_capacity(batch.num_columns());
+    let batch_schema = batch.schema();
+    for (idx, slot_id) in wire_meta.slot_ids_by_index.iter().enumerate() {
+        let expected_slot = expected_chunk_schema.slot(*slot_id).ok_or_else(|| {
+            format!(
+                "exchange wire slot id {} not found in expected chunk schema at index {}",
+                slot_id, idx
+            )
+        })?;
+        let field = batch_schema.field(idx);
+        if field.is_nullable() != expected_slot.nullable() {
+            return Err(format!(
+                "exchange decoded nullable mismatch at index {} for slot {}: batch={} expected={}",
+                idx,
+                slot_id,
+                field.is_nullable(),
+                expected_slot.nullable()
+            ));
+        }
+        if let Some(type_desc) = expected_slot.type_desc() {
+            if let Some(expected_arrow_type) = arrow_type_from_desc(type_desc) {
+                if field.data_type() != &expected_arrow_type {
+                    return Err(format!(
+                        "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?}",
+                        idx,
+                        slot_id,
+                        field.data_type(),
+                        expected_arrow_type
+                    ));
+                }
+            }
+        }
+        slots.push(ChunkSlotSchema::try_new(
+            *slot_id,
+            field.name().clone(),
+            field.is_nullable(),
+            expected_slot.type_desc().cloned(),
+            expected_slot.unique_id(),
+        )?);
+    }
+    Ok(Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?))
+}
+
+/// Encode chunks to exchange payload format.
+pub fn encode_chunks(chunks: &[Chunk], include_slot_ids: bool) -> Result<Vec<u8>, String> {
+    let arrow_payload = encode_arrow_ipc_chunks(chunks)?;
+    let wire_meta = if include_slot_ids {
+        ExchangeWireMeta::from_chunks(chunks)?
+    } else {
+        None
+    };
+    Ok(encode_exchange_payload_envelope(
+        &arrow_payload,
+        wire_meta.as_ref(),
+    ))
+}
+
+#[cfg(test)]
+/// Decode chunks from exchange payload format using field metadata on the Arrow schema.
+///
+/// This remains as a compatibility helper for code paths/tests that still operate on
+/// self-describing Arrow batches. Exchange runtime should use `decode_chunks_for_sender`.
+pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
+    let decoded = decode_exchange_payload_envelope(bytes)?;
+    let batches = decode_arrow_ipc_batches(decoded.arrow_payload)?;
+    let mut chunks = Vec::new();
+    for batch in batches {
         let chunk = Chunk::try_new(batch)?;
         chunks.push(chunk);
     }
+    Ok(chunks)
+}
 
+pub fn decode_chunks_for_sender(
+    key: ExchangeKey,
+    sender_id: i32,
+    be_number: i32,
+    bytes: &[u8],
+) -> Result<Vec<Chunk>, String> {
+    let decoded = decode_exchange_payload_envelope(bytes)?;
+    if decoded.arrow_payload.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let receiver = get_or_create(key);
+    let expected_chunk_schema;
+    let wire_meta;
+    {
+        let mut st = receiver.mu.lock().expect("exchange receiver lock");
+        if let Some(meta) = decoded.wire_meta {
+            match st.sender_wire_meta.get(&(sender_id, be_number)) {
+                Some(existing) if existing != &meta => {
+                    return Err(format!(
+                        "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender_id={} be_number={}",
+                        key.finst_uuid(),
+                        key.node_id,
+                        sender_id,
+                        be_number
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    st.sender_wire_meta
+                        .insert((sender_id, be_number), meta.clone());
+                }
+            }
+            wire_meta = meta;
+        } else {
+            wire_meta = st
+                .sender_wire_meta
+                .get(&(sender_id, be_number))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "exchange wire meta missing before first data chunk: finst={} node_id={} sender_id={} be_number={}",
+                        key.finst_uuid(),
+                        key.node_id,
+                        sender_id,
+                        be_number
+                    )
+                })?;
+        }
+        expected_chunk_schema = st.expected_chunk_schema.clone().ok_or_else(|| {
+            format!(
+                "exchange expected chunk schema not registered: finst={} node_id={}",
+                key.finst_uuid(),
+                key.node_id
+            )
+        })?;
+    }
+
+    let batches = decode_arrow_ipc_batches(decoded.arrow_payload)?;
+    let mut chunks = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let chunk_schema = chunk_schema_for_wire_meta(&expected_chunk_schema, &batch, &wire_meta)?;
+        chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
+    }
     Ok(chunks)
 }
 
@@ -807,7 +1130,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use super::{decode_chunks, encode_chunks};
+    use super::{
+        ExchangeKey, cancel_exchange_key, decode_chunks, decode_chunks_for_sender, encode_chunks,
+        register_expected_chunk_schema,
+    };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::{Chunk, field_with_slot_id};
 
@@ -828,10 +1154,22 @@ mod tests {
         Chunk::try_new(batch).expect("chunk")
     }
 
+    fn exchange_test_chunk_without_metadata(last_name: &str) -> Chunk {
+        let chunk = exchange_test_chunk(last_name);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v1", DataType::Int32, true),
+            Field::new("v2", DataType::Int32, true),
+            Field::new("k1", DataType::Int32, true),
+            Field::new(last_name, DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, chunk.batch.columns().to_vec()).expect("batch");
+        Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref()).expect("chunk")
+    }
+
     #[test]
     fn encode_chunks_normalizes_field_name_only_schema_differences() {
         let chunks = vec![exchange_test_chunk("_cse_0"), exchange_test_chunk("_cse_2")];
-        let bytes = encode_chunks(&chunks).expect("encode");
+        let bytes = encode_chunks(&chunks, true).expect("encode");
         let decoded = decode_chunks(&bytes).expect("decode");
 
         assert_eq!(decoded.len(), 2);
@@ -857,7 +1195,44 @@ mod tests {
         let second = Chunk::try_new(RecordBatch::try_new(schema, columns).expect("record batch"))
             .expect("chunk");
 
-        let err = encode_chunks(&[first, second]).expect_err("should reject mismatched slot id");
+        let err =
+            encode_chunks(&[first, second], true).expect_err("should reject mismatched slot id");
         assert!(err.contains("exchange encode schema mismatch"));
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_uses_slot_id_map_without_field_metadata() {
+        let key = ExchangeKey {
+            finst_id_hi: 99,
+            finst_id_lo: 100,
+            node_id: 7,
+        };
+
+        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let first = exchange_test_chunk_without_metadata("_cse_0");
+        let first_bytes = encode_chunks(&[first], true).expect("encode first");
+        let first_decoded =
+            decode_chunks_for_sender(key, 3, 1, &first_bytes).expect("decode first");
+        assert_eq!(first_decoded.len(), 1);
+        assert_eq!(
+            first_decoded[0].chunk_schema().slots()[3].slot_id(),
+            SlotId::new(32)
+        );
+        assert_eq!(first_decoded[0].schema().field(3).name(), "_cse_0");
+
+        let second = exchange_test_chunk_without_metadata("_cse_2");
+        let second_bytes = encode_chunks(&[second], false).expect("encode second");
+        let second_decoded =
+            decode_chunks_for_sender(key, 3, 1, &second_bytes).expect("decode second");
+        assert_eq!(second_decoded.len(), 1);
+        assert_eq!(
+            second_decoded[0].chunk_schema().slots()[3].slot_id(),
+            SlotId::new(32)
+        );
+        assert_eq!(second_decoded[0].schema().field(3).name(), "_cse_2");
+
+        cancel_exchange_key(key);
     }
 }

@@ -3,14 +3,14 @@ use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::fe_v2_meta::fetch_table_schema_for_lake_scan;
 use crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift;
-use crate::exec::chunk::field_slot_id;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::formats::starrocks::cache as native_cache;
 use crate::formats::starrocks::data::build_native_record_batch;
 use crate::formats::starrocks::metadata::{
     StarRocksTabletSnapshot, load_bundle_segment_footers, load_tablet_snapshot,
 };
 use crate::formats::starrocks::plan::{
-    FIELD_META_STARROCKS_COLUMN_ID, FIELD_META_STARROCKS_DEFAULT_VALUE, build_native_read_plan,
+    StarRocksOutputColumnHint, build_native_read_plan_with_output_hints,
 };
 use crate::formats::starrocks::writer::read_bundle_parquet_snapshot_if_any;
 use crate::novarocks_logging::{info, warn};
@@ -18,7 +18,7 @@ use arrow::array::{Array, ArrayRef, Int32Builder, LargeStringArray, ListArray, S
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::op::{LakeScanSchemaMeta, QueryGlobalDictEncodeMap};
@@ -31,31 +31,44 @@ pub(super) struct StarRocksNativeReader {
 
 const NATIVE_BATCH_CACHE_MAX_ROWS: u64 = 200_000;
 
-fn schema_signature(schema: &SchemaRef) -> String {
-    schema
+fn schema_signature_with_hints(
+    schema: &SchemaRef,
+    chunk_schema: &ChunkSchemaRef,
+    output_column_hints: &[StarRocksOutputColumnHint],
+) -> Result<String, String> {
+    if schema.fields().len() != chunk_schema.slots().len() {
+        return Err(format!(
+            "schema/chunk schema length mismatch while building signature: fields={} slots={}",
+            schema.fields().len(),
+            chunk_schema.slots().len()
+        ));
+    }
+    if schema.fields().len() != output_column_hints.len() {
+        return Err(format!(
+            "schema/output column hint length mismatch while building signature: fields={} hints={}",
+            schema.fields().len(),
+            output_column_hints.len()
+        ));
+    }
+    Ok(schema
         .fields()
         .iter()
-        .map(|field| {
-            let metadata = if field.metadata().is_empty() {
-                String::new()
-            } else {
-                let ordered = field
-                    .metadata()
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str()))
-                    .collect::<BTreeMap<_, _>>();
-                format!("{ordered:?}")
-            };
+        .zip(chunk_schema.slots().iter())
+        .zip(output_column_hints.iter())
+        .map(|((field, slot), hint)| {
             format!(
-                "{}:{:?}:{}:{}",
+                "{}:{:?}:{}:slot={}:slot_uid={:?}:plan_uid={:?}:default={:?}",
                 field.name(),
                 field.data_type(),
                 field.is_nullable(),
-                metadata
+                slot.slot_id(),
+                slot.unique_id(),
+                hint.schema_unique_id,
+                hint.fallback_default_literal
             )
         })
         .collect::<Vec<_>>()
-        .join("|")
+        .join("|"))
 }
 
 fn maybe_refresh_snapshot_schema_for_lake_scan(
@@ -116,28 +129,14 @@ impl StarRocksNativeReader {
         storage_path: &str,
         version: i64,
         required_schema: SchemaRef,
+        required_chunk_schema: ChunkSchemaRef,
         output_schema: SchemaRef,
+        output_chunk_schema: ChunkSchemaRef,
         query_global_dicts: QueryGlobalDictEncodeMap,
         min_max_predicates: Vec<MinMaxPredicate>,
         object_store_profile: Option<&ObjectStoreProfile>,
         lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {
-        let use_batch_cache = query_global_dicts.is_empty();
-        let output_schema_sig = schema_signature(&output_schema);
-        if use_batch_cache {
-            if let Some(batch) = native_cache::native_batch_cache_get(
-                storage_path,
-                tablet_id,
-                version,
-                &output_schema_sig,
-            ) {
-                return Ok(Self {
-                    tablet_id,
-                    version,
-                    next_batch: Some(batch),
-                });
-            }
-        }
         let snapshot = match load_tablet_snapshot(
             tablet_id,
             version,
@@ -162,6 +161,33 @@ impl StarRocksNativeReader {
         };
         let physical_snapshot = snapshot.clone();
         let snapshot = maybe_refresh_snapshot_schema_for_lake_scan(&snapshot, lake_schema_meta)?;
+        let output_column_hints = build_output_column_hints(
+            &snapshot,
+            &required_chunk_schema,
+            &output_schema,
+            &output_chunk_schema,
+            lake_schema_meta,
+        )?;
+        let use_batch_cache = query_global_dicts.is_empty();
+        let output_schema_sig = schema_signature_with_hints(
+            &output_schema,
+            &output_chunk_schema,
+            &output_column_hints,
+        )?;
+        if use_batch_cache {
+            if let Some(batch) = native_cache::native_batch_cache_get(
+                storage_path,
+                tablet_id,
+                version,
+                &output_schema_sig,
+            ) {
+                return Ok(Self {
+                    tablet_id,
+                    version,
+                    next_batch: Some(batch),
+                });
+            }
+        }
         eprintln!(
             "[DEBUG] starrocks native reader snapshot tablet_id={} requested_version={} metadata_path={} total_num_rows={} rowset_count={} segment_count={}",
             tablet_id,
@@ -180,20 +206,22 @@ impl StarRocksNativeReader {
             snapshot.rowset_count,
             snapshot.segment_files.len()
         );
-        let output_schema_for_plan = enrich_output_schema_with_lake_hints(
-            &snapshot,
-            &required_schema,
-            &output_schema,
-            lake_schema_meta,
-        )?;
+        let _ = required_schema;
+        let output_schema_for_plan = output_schema.clone();
         let (scan_schema, has_dict_encoded_output) = build_scan_schema_for_global_dict_encoding(
             &output_schema_for_plan,
+            &output_chunk_schema,
             &query_global_dicts,
         )?;
         let cacheable_small_snapshot = snapshot.total_num_rows <= NATIVE_BATCH_CACHE_MAX_ROWS;
         if let Some(batch) = read_bundle_parquet_snapshot_if_any(&snapshot, scan_schema.clone())? {
             let batch = if has_dict_encoded_output {
-                encode_batch_with_query_global_dicts(batch, &output_schema, &query_global_dicts)?
+                encode_batch_with_query_global_dicts(
+                    batch,
+                    &output_schema,
+                    &output_chunk_schema,
+                    &query_global_dicts,
+                )?
             } else {
                 batch
             };
@@ -224,10 +252,11 @@ impl StarRocksNativeReader {
         }
         let segment_footers =
             load_bundle_segment_footers(&snapshot, storage_path, object_store_profile)?;
-        let plan = build_native_read_plan(
+        let plan = build_native_read_plan_with_output_hints(
             &snapshot,
             &segment_footers,
             &scan_schema,
+            &output_column_hints,
             Some(&physical_snapshot.tablet_schema),
         )?;
         if let Some(first_footer) = segment_footers.first() {
@@ -278,7 +307,12 @@ impl StarRocksNativeReader {
             )
         })?;
         let batch = if has_dict_encoded_output {
-            encode_batch_with_query_global_dicts(batch, &output_schema, &query_global_dicts)?
+            encode_batch_with_query_global_dicts(
+                batch,
+                &output_schema,
+                &output_chunk_schema,
+                &query_global_dicts,
+            )?
         } else {
             batch
         };
@@ -332,30 +366,29 @@ fn normalize_column_name(value: &str) -> String {
 }
 
 fn build_required_schema_unique_id_map(
-    required_schema: &SchemaRef,
+    required_chunk_schema: &ChunkSchemaRef,
 ) -> Result<HashMap<String, u32>, String> {
     let mut out = HashMap::new();
-    for field in required_schema.fields() {
-        let Some(raw_unique_id) = field.metadata().get(FIELD_META_STARROCKS_COLUMN_ID) else {
+    for slot in required_chunk_schema.slots() {
+        let Some(raw_unique_id) = slot.unique_id() else {
             continue;
         };
-        let unique_id = raw_unique_id.parse::<u32>().map_err(|e| {
+        let unique_id = u32::try_from(raw_unique_id).map_err(|_| {
             format!(
-                "invalid required_schema column unique_id metadata: field={} key={} value={} error={}",
-                field.name(),
-                FIELD_META_STARROCKS_COLUMN_ID,
-                raw_unique_id,
-                e
+                "invalid required chunk schema unique_id: slot={} field={} unique_id={}",
+                slot.slot_id(),
+                slot.name(),
+                raw_unique_id
             )
         })?;
         if unique_id == 0 {
             return Err(format!(
-                "invalid required_schema column unique_id metadata (zero): field={} key={}",
-                field.name(),
-                FIELD_META_STARROCKS_COLUMN_ID
+                "invalid required chunk schema unique_id (zero): slot={} field={}",
+                slot.slot_id(),
+                slot.name()
             ));
         }
-        out.insert(normalize_column_name(field.name()), unique_id);
+        out.insert(normalize_column_name(slot.name()), unique_id);
     }
     Ok(out)
 }
@@ -395,13 +428,21 @@ fn build_lake_schema_column_hints(
     Ok(out)
 }
 
-fn enrich_output_schema_with_lake_hints(
+fn build_output_column_hints(
     snapshot: &StarRocksTabletSnapshot,
-    required_schema: &SchemaRef,
+    required_chunk_schema: &ChunkSchemaRef,
     output_schema: &SchemaRef,
+    output_chunk_schema: &ChunkSchemaRef,
     lake_schema_meta: Option<&LakeScanSchemaMeta>,
-) -> Result<SchemaRef, String> {
-    let required_unique_ids = build_required_schema_unique_id_map(required_schema)?;
+) -> Result<Vec<StarRocksOutputColumnHint>, String> {
+    if output_schema.fields().len() != output_chunk_schema.slots().len() {
+        return Err(format!(
+            "output schema/chunk schema length mismatch while building lake hints: fields={} slots={}",
+            output_schema.fields().len(),
+            output_chunk_schema.slots().len()
+        ));
+    }
+    let required_unique_ids = build_required_schema_unique_id_map(required_chunk_schema)?;
     let snapshot_schema_columns = snapshot
         .tablet_schema
         .column
@@ -433,9 +474,6 @@ fn enrich_output_schema_with_lake_hints(
             missing_output_columns.insert(normalized_name);
         }
     }
-    if missing_output_columns.is_empty() {
-        return Ok(output_schema.clone());
-    }
     let lake_hints = if let Some(meta) = lake_schema_meta {
         let fe_schema = fetch_table_schema_for_lake_scan(
             meta.fe_addr.as_ref(),
@@ -456,86 +494,59 @@ fn enrich_output_schema_with_lake_hints(
         HashMap::new()
     };
 
-    let mut changed = false;
-    let mut fields = Vec::with_capacity(output_schema.fields().len());
-    for field_ref in output_schema.fields() {
+    let mut out = Vec::with_capacity(output_schema.fields().len());
+    for (field_ref, slot) in output_schema
+        .fields()
+        .iter()
+        .zip(output_chunk_schema.slots().iter())
+    {
         let field = field_ref.as_ref();
         let normalized_name = normalize_column_name(field.name());
         let is_missing_in_snapshot = missing_output_columns.contains(&normalized_name);
 
-        let mut metadata = field.metadata().clone();
-        let mut changed_this_field = false;
-        if !metadata.contains_key(FIELD_META_STARROCKS_COLUMN_ID) {
-            if let Some(unique_id) =
-                required_unique_ids
+        let schema_unique_id = slot
+            .unique_id()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .or_else(|| required_unique_ids.get(&normalized_name).copied())
+            .or_else(|| {
+                lake_hints
                     .get(&normalized_name)
-                    .copied()
-                    .or_else(|| {
-                        lake_hints
-                            .get(&normalized_name)
-                            .and_then(|hint| hint.unique_id)
-                    })
-            {
-                metadata.insert(
-                    FIELD_META_STARROCKS_COLUMN_ID.to_string(),
-                    unique_id.to_string(),
-                );
-                changed_this_field = true;
-            }
-        }
-        if is_missing_in_snapshot
-            && !metadata.contains_key(FIELD_META_STARROCKS_DEFAULT_VALUE)
-            && let Some(default_value) = lake_hints
+                    .and_then(|hint| hint.unique_id)
+            });
+        let fallback_default_literal = if is_missing_in_snapshot {
+            lake_hints
                 .get(&normalized_name)
                 .and_then(|hint| hint.default_value.clone())
-        {
-            metadata.insert(
-                FIELD_META_STARROCKS_DEFAULT_VALUE.to_string(),
-                default_value,
-            );
-            changed_this_field = true;
-        }
+        } else {
+            None
+        };
 
         if is_missing_in_snapshot {
-            let has_unique_id = metadata
-                .get(FIELD_META_STARROCKS_COLUMN_ID)
-                .and_then(|raw| raw.parse::<u32>().ok())
-                .is_some_and(|v| v > 0);
-            if !has_unique_id {
+            if schema_unique_id.is_none() {
                 return Err(format!(
-                    "lake output column is missing unique_id metadata while tablet snapshot lacks this column: tablet_id={} version={} output_column={} metadata_key={}",
+                    "lake output column is missing unique_id hint while tablet snapshot lacks this column: tablet_id={} version={} output_column={}",
                     snapshot.tablet_id,
                     snapshot.version,
-                    field.name(),
-                    FIELD_META_STARROCKS_COLUMN_ID
+                    field.name()
                 ));
             }
-            if !field.is_nullable() && !metadata.contains_key(FIELD_META_STARROCKS_DEFAULT_VALUE) {
+            if !field.is_nullable() && fallback_default_literal.is_none() {
                 return Err(format!(
-                    "lake output column is non-nullable without default value while tablet snapshot lacks this column: tablet_id={} version={} output_column={} metadata_key={}",
+                    "lake output column is non-nullable without default value while tablet snapshot lacks this column: tablet_id={} version={} output_column={}",
                     snapshot.tablet_id,
                     snapshot.version,
-                    field.name(),
-                    FIELD_META_STARROCKS_DEFAULT_VALUE
+                    field.name()
                 ));
             }
         }
 
-        if changed_this_field {
-            changed = true;
-            fields.push(Arc::new(field.clone().with_metadata(metadata)));
-        } else {
-            fields.push(field_ref.clone());
-        }
+        out.push(StarRocksOutputColumnHint {
+            schema_unique_id,
+            fallback_default_literal,
+        });
     }
-
-    if !changed {
-        return Ok(output_schema.clone());
-    }
-    Ok(Arc::new(Schema::new_with_metadata(
-        fields,
-        output_schema.metadata().clone(),
-    )))
+    Ok(out)
 }
 
 fn should_treat_missing_tablet_metadata_as_empty(
@@ -584,26 +595,36 @@ fn is_integer_dict_code_type(data_type: &DataType) -> bool {
 
 fn build_scan_schema_for_global_dict_encoding(
     output_schema: &SchemaRef,
+    output_chunk_schema: &ChunkSchemaRef,
     query_global_dicts: &QueryGlobalDictEncodeMap,
 ) -> Result<(SchemaRef, bool), String> {
     if query_global_dicts.is_empty() {
         return Ok((output_schema.clone(), false));
     }
+    if output_schema.fields().len() != output_chunk_schema.slots().len() {
+        return Err(format!(
+            "output schema/chunk schema length mismatch while building dict scan schema: fields={} slots={}",
+            output_schema.fields().len(),
+            output_chunk_schema.slots().len()
+        ));
+    }
     let mut fields = Vec::with_capacity(output_schema.fields().len());
     let mut changed = false;
-    for field_ref in output_schema.fields() {
+    for (field_ref, slot) in output_schema
+        .fields()
+        .iter()
+        .zip(output_chunk_schema.slots().iter())
+    {
         let field = field_ref.as_ref();
-        let slot_id = field_slot_id(field)?;
-        let needs_dict_encode = slot_id
-            .and_then(|slot| query_global_dicts.get(&slot))
-            .is_some();
+        let slot_id = slot.slot_id();
+        let needs_dict_encode = query_global_dicts.get(&slot_id).is_some();
         if needs_dict_encode {
             if let Some(scan_type) = dict_scan_data_type_for_output(field.data_type()) {
                 changed = true;
                 info!(
                     "starrocks native dict scan type rewrite: field={} slot_id={:?} output_type={:?} scan_type={:?}",
                     field.name(),
-                    slot_id,
+                    Some(slot_id),
                     field.data_type(),
                     scan_type
                 );
@@ -613,7 +634,7 @@ fn build_scan_schema_for_global_dict_encoding(
             info!(
                 "starrocks native dict scan type rewrite skipped: field={} slot_id={:?} output_type={:?}",
                 field.name(),
-                slot_id,
+                Some(slot_id),
                 field.data_type()
             );
         }
@@ -622,16 +643,14 @@ fn build_scan_schema_for_global_dict_encoding(
     if !changed {
         return Ok((output_schema.clone(), false));
     }
-    let scan_schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        output_schema.metadata().clone(),
-    ));
+    let scan_schema = Arc::new(Schema::new(fields));
     Ok((scan_schema, true))
 }
 
 fn encode_batch_with_query_global_dicts(
     scan_batch: RecordBatch,
     output_schema: &SchemaRef,
+    output_chunk_schema: &ChunkSchemaRef,
     query_global_dicts: &QueryGlobalDictEncodeMap,
 ) -> Result<RecordBatch, String> {
     if query_global_dicts.is_empty() {
@@ -644,14 +663,22 @@ fn encode_batch_with_query_global_dicts(
             output_schema.fields().len()
         ));
     }
+    if output_schema.fields().len() != output_chunk_schema.slots().len() {
+        return Err(format!(
+            "output schema/chunk schema length mismatch while dict-encoding native batch: fields={} slots={}",
+            output_schema.fields().len(),
+            output_chunk_schema.slots().len()
+        ));
+    }
     let mut arrays = Vec::with_capacity(scan_batch.num_columns());
-    for (idx, field_ref) in output_schema.fields().iter().enumerate() {
+    for ((idx, field_ref), slot) in output_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .zip(output_chunk_schema.slots().iter())
+    {
         let output_field = field_ref.as_ref();
-        let slot_id = field_slot_id(output_field)?;
-        let Some(slot_id) = slot_id else {
-            arrays.push(scan_batch.column(idx).clone());
-            continue;
-        };
+        let slot_id = slot.slot_id();
         let Some(dict_map) = query_global_dicts.get(&slot_id) else {
             arrays.push(scan_batch.column(idx).clone());
             continue;
@@ -753,7 +780,10 @@ fn encode_utf8_column_to_dict_ids(
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryGlobalDictEncodeMap, encode_batch_with_query_global_dicts, schema_signature};
+    use super::{
+        QueryGlobalDictEncodeMap, StarRocksOutputColumnHint, encode_batch_with_query_global_dicts,
+        schema_signature_with_hints,
+    };
     use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -761,20 +791,40 @@ mod tests {
     use std::sync::Arc;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 
     #[test]
     fn schema_signature_distinguishes_slot_metadata() {
-        let schema_a = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v2", DataType::Utf8, false),
-            SlotId::new(2),
-        )]));
-        let schema_b = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v2", DataType::Utf8, false),
-            SlotId::new(4),
-        )]));
-        let sig_a = schema_signature(&schema_a);
-        let sig_b = schema_signature(&schema_b);
+        let schema_a = Arc::new(Schema::new(vec![Field::new("v2", DataType::Utf8, false)]));
+        let schema_b = Arc::new(Schema::new(vec![Field::new("v2", DataType::Utf8, false)]));
+        let chunk_schema_a = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(2),
+                "v2",
+                false,
+                None,
+                None,
+            )])
+            .expect("chunk schema a"),
+        );
+        let chunk_schema_b = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(4),
+                "v2",
+                false,
+                None,
+                None,
+            )])
+            .expect("chunk schema b"),
+        );
+        let hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: None,
+            fallback_default_literal: None,
+        }];
+        let sig_a =
+            schema_signature_with_hints(&schema_a, &chunk_schema_a, &hints).expect("signature a");
+        let sig_b =
+            schema_signature_with_hints(&schema_b, &chunk_schema_b, &hints).expect("signature b");
         assert_ne!(
             sig_a, sig_b,
             "slot metadata must be part of cache signature"
@@ -783,14 +833,18 @@ mod tests {
 
     #[test]
     fn encode_batch_with_query_global_dicts_maps_utf8_to_ids() {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v1", DataType::Int32, true),
-            SlotId::new(7),
-        )]));
-        let scan_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v1", DataType::Utf8, true),
-            SlotId::new(7),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Utf8, true)]));
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(7),
+                "v1",
+                true,
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
         let scan_batch = RecordBatch::try_new(
             scan_schema,
             vec![Arc::new(StringArray::from(vec![
@@ -806,7 +860,8 @@ mod tests {
         dict_map.insert(SlotId::new(7), Arc::new(dict_values));
 
         let encoded =
-            encode_batch_with_query_global_dicts(scan_batch, &schema, &dict_map).expect("encode");
+            encode_batch_with_query_global_dicts(scan_batch, &schema, &chunk_schema, &dict_map)
+                .expect("encode");
         let values = encoded
             .column(0)
             .as_any()

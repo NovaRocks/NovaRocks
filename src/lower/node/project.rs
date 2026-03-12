@@ -22,9 +22,12 @@ use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::debug;
 
+use crate::descriptors;
 use crate::exprs;
 use crate::lower::expr::{lower_t_expr, lower_t_expr_with_common_slot_map};
-use crate::lower::layout::{Layout, layout_from_slot_ids};
+use crate::lower::layout::{
+    Layout, chunk_schema_for_layout, chunk_slot_schemas_for_layout, layout_from_slot_ids,
+};
 use crate::lower::node::Lowered;
 use crate::{plan_nodes, types};
 
@@ -40,6 +43,7 @@ pub(crate) fn lower_project_node(
     node: &plan_nodes::TPlanNode,
     mut out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: &descriptors::TDescriptorTable,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
@@ -215,6 +219,21 @@ pub(crate) fn lower_project_node(
         expr_slot_ids.push(SlotId::try_from(slot_id)?);
     }
 
+    let output_slots = out_layout
+        .order
+        .iter()
+        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let expr_slot_layout = layout_from_slot_ids(
+        output_tuple_id,
+        expr_slot_ids
+            .iter()
+            .map(|slot_id| i32::try_from(slot_id.as_u32()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "project expr slot id overflow".to_string())?,
+    );
+    let expr_slot_schemas = chunk_slot_schemas_for_layout(desc_tbl, &expr_slot_layout)?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
     // output_indices = [num_common, num_common+1, ..., exprs.len()-1]
     let output_indices: Vec<usize> = (num_common..exprs.len()).collect();
 
@@ -226,12 +245,10 @@ pub(crate) fn lower_project_node(
                 is_subordinate: false,
                 exprs,
                 expr_slot_ids,
+                expr_slot_schemas: Some(expr_slot_schemas),
                 output_indices: Some(output_indices),
-                output_slots: out_layout
-                    .order
-                    .iter()
-                    .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                    .collect::<Result<Vec<_>, _>>()?,
+                output_slots: output_slots.clone(),
+                output_chunk_schema: Some(output_chunk_schema),
             }),
         },
         layout: out_layout,

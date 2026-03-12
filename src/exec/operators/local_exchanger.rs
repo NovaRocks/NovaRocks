@@ -38,7 +38,7 @@ use crate::common::config::{
     local_exchange_buffer_mem_limit_per_driver, local_exchange_max_buffered_rows,
 };
 use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::operators::data_stream_sink::{
     partition_chunk_by_hash, partition_chunk_by_hash_arrays,
@@ -84,6 +84,7 @@ struct LocalExchangerState {
 #[derive(Debug, Clone)]
 struct SpillFileEntry {
     schema: SchemaRef,
+    chunk_schema: ChunkSchemaRef,
     file: SpillFile,
 }
 
@@ -616,6 +617,7 @@ impl LocalExchanger {
                 continue;
             }
             let schema = input.chunks[0].schema();
+            let chunk_schema = input.chunks[0].chunk_schema_ref();
             match spill_state
                 .spiller
                 .spill_chunks(schema.clone(), &input.chunks)
@@ -623,7 +625,14 @@ impl LocalExchanger {
                 Ok(file) => {
                     spilled_rows = spilled_rows.saturating_add(input.rows);
                     spilled_bytes = spilled_bytes.saturating_add(input.bytes);
-                    spilled_files.push((input.partition, SpillFileEntry { schema, file }));
+                    spilled_files.push((
+                        input.partition,
+                        SpillFileEntry {
+                            schema,
+                            chunk_schema,
+                            file,
+                        },
+                    ));
                 }
                 Err(err) => {
                     warn!(
@@ -712,9 +721,11 @@ impl LocalExchanger {
         queue_tracker: Option<Arc<MemTracker>>,
     ) -> Result<(), String> {
         let start = Instant::now();
-        let result = spill_state
-            .spiller
-            .restore_chunks(entry.schema.clone(), &entry.file);
+        let result = spill_state.spiller.restore_chunks(
+            entry.schema.clone(),
+            entry.chunk_schema.clone(),
+            &entry.file,
+        );
         match result {
             Ok(chunks) => {
                 let mut restore_rows = 0u64;

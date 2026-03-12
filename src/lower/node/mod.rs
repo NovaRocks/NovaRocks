@@ -362,14 +362,29 @@ fn lower_node_with_children(
     // For execution output layouts we should align with the node's declared output tuple id when available.
     if node.node_type == plan_nodes::TPlanNodeType::AGGREGATION_NODE {
         if let Some(agg) = node.agg_node.as_ref() {
-            let output_tuple_id = agg.output_tuple_id;
-            out_layout = layout_for_row_tuples(&[output_tuple_id], tuple_slots);
+            let tuple_id = if agg.need_finalize {
+                agg.output_tuple_id
+            } else {
+                agg.intermediate_tuple_id
+            };
+            out_layout = layout_for_row_tuples(&[tuple_id], tuple_slots);
+        }
+    }
+    if node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE {
+        if let Some(exchange) = node.exchange_node.as_ref() {
+            out_layout = layout_for_row_tuples(&exchange.input_row_tuples, tuple_slots);
         }
     }
     let mut lowered = match node.node_type {
         t if t == plan_nodes::TPlanNodeType::EXCHANGE_NODE => lower_exchange_node(
             children,
             node,
+            desc_tbl.ok_or_else(|| {
+                format!(
+                    "EXCHANGE_NODE missing descriptor table for node_id={}",
+                    node.node_id
+                )
+            })?,
             exec_params,
             arena,
             &out_layout,
@@ -395,11 +410,14 @@ fn lower_node_with_children(
                 ));
             }
             let child = children.into_iter().next().expect("child");
+            let desc_tbl =
+                desc_tbl.ok_or_else(|| "PROJECT_NODE requires descriptor table".to_string())?;
             lower_project_node(
                 child,
                 node,
                 out_layout,
                 arena,
+                desc_tbl,
                 global_common_slot_map,
                 last_query_id,
                 fe_addr,
@@ -422,15 +440,33 @@ fn lower_node_with_children(
                 query_global_dict_map,
             )?
         }
-        t if t == plan_nodes::TPlanNodeType::UNION_NODE => {
-            lower_union_node(children, node, out_layout, arena, last_query_id, fe_addr)?
-        }
-        t if t == plan_nodes::TPlanNodeType::INTERSECT_NODE => {
-            lower_intersect_node(children, node, out_layout, arena, last_query_id, fe_addr)?
-        }
-        t if t == plan_nodes::TPlanNodeType::EXCEPT_NODE => {
-            lower_except_node(children, node, out_layout, arena, last_query_id, fe_addr)?
-        }
+        t if t == plan_nodes::TPlanNodeType::UNION_NODE => lower_union_node(
+            children,
+            node,
+            out_layout,
+            arena,
+            desc_tbl,
+            last_query_id,
+            fe_addr,
+        )?,
+        t if t == plan_nodes::TPlanNodeType::INTERSECT_NODE => lower_intersect_node(
+            children,
+            node,
+            out_layout,
+            arena,
+            desc_tbl,
+            last_query_id,
+            fe_addr,
+        )?,
+        t if t == plan_nodes::TPlanNodeType::EXCEPT_NODE => lower_except_node(
+            children,
+            node,
+            out_layout,
+            arena,
+            desc_tbl,
+            last_query_id,
+            fe_addr,
+        )?,
         t if t == plan_nodes::TPlanNodeType::EMPTY_SET_NODE => {
             lower_empty_set_node(node, &out_layout, desc_tbl)?
         }
@@ -450,7 +486,7 @@ fn lower_node_with_children(
             lower_schema_scan_node(node, &out_layout, desc_tbl, exec_params, fe_addr)?
         }
         t if t == plan_nodes::TPlanNodeType::FETCH_NODE => {
-            lower_fetch_node(children, node, out_layout)?
+            lower_fetch_node(children, node, out_layout, desc_tbl)?
         }
         t if t == plan_nodes::TPlanNodeType::MYSQL_SCAN_NODE => {
             lower_mysql_scan_node(node, desc_tbl, tuple_slots, query_opts, connectors)?
@@ -532,6 +568,7 @@ fn lower_node_with_children(
                 child,
                 node,
                 arena,
+                desc_tbl,
                 query_opts,
                 &out_layout,
                 last_query_id,
@@ -550,9 +587,15 @@ fn lower_node_with_children(
         t if t == plan_nodes::TPlanNodeType::ASSERT_NUM_ROWS_NODE => {
             lower_assert_num_rows_node(children, node, &mut out_layout)?
         }
-        t if t == plan_nodes::TPlanNodeType::SORT_NODE => {
-            lower_sort_node(children, node, arena, out_layout, last_query_id, fe_addr)?
-        }
+        t if t == plan_nodes::TPlanNodeType::SORT_NODE => lower_sort_node(
+            children,
+            node,
+            arena,
+            out_layout,
+            desc_tbl,
+            last_query_id,
+            fe_addr,
+        )?,
         t if t == plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE => {
             if children.len() != 1 {
                 return Err(format!(

@@ -76,7 +76,12 @@ pub(crate) fn handle_transmit_chunk(
     };
 
     let decode_start = std::time::Instant::now();
-    let chunks = match exchange::decode_chunks(payload) {
+    let key = exchange::ExchangeKey {
+        finst_id_hi: finst_id.hi,
+        finst_id_lo: finst_id.lo,
+        node_id,
+    };
+    let chunks = match exchange::decode_chunks_for_sender(key, sender_id, be_number, payload) {
         Ok(v) => v,
         Err(err) => {
             response.status = Some(error_status(format!("exchange decode failed: {err}")));
@@ -86,11 +91,7 @@ pub(crate) fn handle_transmit_chunk(
     let decode_ns = decode_start.elapsed().as_nanos();
 
     exchange::push_chunks_with_stats(
-        exchange::ExchangeKey {
-            finst_id_hi: finst_id.hi,
-            finst_id_lo: finst_id.lo,
-            node_id,
-        },
+        key,
         sender_id,
         be_number,
         chunks,
@@ -431,7 +432,9 @@ mod tests {
         )
         .expect("record batch");
         let chunk = Chunk::try_new(batch).expect("chunk");
-        let payload = exchange::encode_chunks(&[chunk]).expect("encode chunks");
+        exchange::register_expected_chunk_schema(key, 1, chunk.chunk_schema_ref())
+            .expect("register expected chunk schema");
+        let payload = exchange::encode_chunks(&[chunk], true).expect("encode chunks");
 
         let response = handle_transmit_chunk(proto::starrocks::PTransmitChunkParams {
             finst_id: Some(finst_id),

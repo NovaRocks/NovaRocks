@@ -19,8 +19,9 @@ use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode}
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::common::ids::SlotId;
+use crate::descriptors;
 use crate::lower::expr::{lower_expr_node, lower_t_expr};
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 
@@ -32,6 +33,7 @@ pub(crate) fn lower_aggregate_node(
     child: Lowered,
     node: &plan_nodes::TPlanNode,
     arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     query_opts: Option<&crate::internal_service::TQueryOptions>,
     out_layout: &Layout,
     last_query_id: Option<&str>,
@@ -116,6 +118,15 @@ pub(crate) fn lower_aggregate_node(
         functions.push(func);
     }
     let input_is_intermediate = functions.iter().all(|f| f.input_is_intermediate);
+    let output_slots = out_layout
+        .order
+        .iter()
+        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let desc_tbl = desc_tbl.ok_or_else(|| {
+        "aggregate node lowering requires descriptor table for output chunk schema".to_string()
+    })?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
 
     Ok(Lowered {
         node: ExecNode {
@@ -126,11 +137,8 @@ pub(crate) fn lower_aggregate_node(
                 functions,
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
-                output_slots: out_layout
-                    .order
-                    .iter()
-                    .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                    .collect::<Result<Vec<_>, _>>()?,
+                output_slots,
+                output_chunk_schema: Some(output_chunk_schema),
             }),
         },
         layout: out_layout.clone(),

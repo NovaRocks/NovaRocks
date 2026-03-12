@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::common::ids::SlotId;
 use crate::connector::MinMaxPredicate;
 use crate::connector::starrocks::object_store_profile::ObjectStoreProfile;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
@@ -62,7 +62,9 @@ pub struct StarRocksScanConfig {
     pub ranges: Vec<StarRocksScanRange>,
     pub has_more: bool,
     pub required_schema: SchemaRef,
+    pub required_chunk_schema: ChunkSchemaRef,
     pub schema: SchemaRef,
+    pub output_chunk_schema: ChunkSchemaRef,
     pub slot_ids: Vec<SlotId>,
     pub query_global_dicts: QueryGlobalDictEncodeMap,
     pub limit: Option<usize>,
@@ -310,6 +312,7 @@ enum ScanBatch {
 struct StarRocksScanner {
     reader: StarRocksNativeReader,
     output_schema: SchemaRef,
+    output_chunk_schema: ChunkSchemaRef,
 }
 
 impl StarRocksScanner {
@@ -319,17 +322,10 @@ impl StarRocksScanner {
         range: StarRocksScanRange,
     ) -> Result<Self, String> {
         let output_slot_meta = cfg
-            .schema
-            .fields()
+            .output_chunk_schema
+            .slots()
             .iter()
-            .map(|f| {
-                (
-                    f.name().to_string(),
-                    f.metadata()
-                        .get(crate::exec::chunk::FIELD_META_SLOT_ID)
-                        .cloned(),
-                )
-            })
+            .map(|slot| (slot.name().to_string(), slot.slot_id()))
             .collect::<Vec<_>>();
         info!(
             "StarRocksScanner::open tablet_id={} cfg.slot_ids={:?} output_slot_meta={:?} query_global_dict_slots={:?}",
@@ -368,7 +364,9 @@ impl StarRocksScanner {
             &storage_path,
             version,
             cfg.required_schema.clone(),
+            cfg.required_chunk_schema.clone(),
             cfg.schema.clone(),
+            cfg.output_chunk_schema.clone(),
             cfg.query_global_dicts.clone(),
             cfg.min_max_predicates.clone(),
             ctx.object_store_profile.as_ref(),
@@ -378,6 +376,7 @@ impl StarRocksScanner {
         Ok(Self {
             reader,
             output_schema: cfg.schema.clone(),
+            output_chunk_schema: cfg.output_chunk_schema.clone(),
         })
     }
 
@@ -387,7 +386,8 @@ impl StarRocksScanner {
             None => Ok(ScanBatch::Eos),
             Some(batch) => {
                 let rows = batch.num_rows();
-                let chunk = Chunk::try_new(batch)?;
+                let chunk =
+                    Chunk::try_new_with_chunk_schema(batch, self.output_chunk_schema.clone())?;
                 let bytes = chunk.logical_bytes();
                 Ok(ScanBatch::Chunk(chunk, rows, bytes))
             }
@@ -515,11 +515,23 @@ fn resolve_object_store_profile<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
     fn mock_scan_config(profile_label: Option<String>) -> StarRocksScanConfig {
         let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int64, true)]));
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(1),
+                "c1",
+                true,
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        );
         StarRocksScanConfig {
             db_name: None,
             table_name: None,
@@ -527,7 +539,9 @@ mod tests {
             ranges: Vec::new(),
             has_more: false,
             required_schema: schema.clone(),
+            required_chunk_schema: chunk_schema.clone(),
             schema,
+            output_chunk_schema: chunk_schema,
             slot_ids: Vec::new(),
             query_global_dicts: HashMap::new(),
             limit: None,

@@ -21,7 +21,8 @@ use arrow::compute::concat;
 use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::descriptors;
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::union_all::UnionAllNode;
@@ -29,7 +30,7 @@ use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::{Layout, layout_from_slot_ids};
+use crate::lower::layout::{Layout, chunk_schema_for_layout, layout_from_slot_ids};
 use crate::lower::node::Lowered;
 use crate::{plan_nodes, types};
 
@@ -39,6 +40,7 @@ pub(crate) fn lower_union_node(
     node: &plan_nodes::TPlanNode,
     mut out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
@@ -61,6 +63,11 @@ pub(crate) fn lower_union_node(
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
         .collect::<Result<Vec<_>, _>>()?;
+    let output_chunk_schema = if let Some(desc_tbl) = desc_tbl {
+        Some(chunk_schema_for_layout(desc_tbl, &out_layout)?)
+    } else {
+        None
+    };
 
     let mut inputs = Vec::new();
 
@@ -125,8 +132,10 @@ pub(crate) fn lower_union_node(
                     is_subordinate: true,
                     exprs,
                     expr_slot_ids: output_slots.clone(),
+                    expr_slot_schemas: None,
                     output_indices: None,
                     output_slots: output_slots.clone(),
+                    output_chunk_schema: output_chunk_schema.clone(),
                 }),
             });
         }
@@ -157,7 +166,10 @@ fn empty_chunk_with_rows(row_count: usize) -> Result<Chunk, String> {
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
     let batch =
         RecordBatch::try_new_with_options(schema, vec![], &options).map_err(|e| e.to_string())?;
-    Ok(Chunk::new(batch))
+    Ok(Chunk::new_with_chunk_schema(
+        batch,
+        Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+    ))
 }
 
 fn normalize_const_array(array: &ArrayRef, expected_type: &DataType) -> Result<ArrayRef, String> {
@@ -365,10 +377,7 @@ fn chunk_from_const_arrays(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for (idx, col) in columns.iter().enumerate() {
         let array = concat_const_column(col)?;
-        let field = field_with_slot_id(
-            Field::new(format!("col_{idx}"), array.data_type().clone(), true),
-            slot_ids[idx],
-        );
+        let field = Field::new(format!("col_{idx}"), array.data_type().clone(), true);
         fields.push(field);
         arrays.push(array);
     }
@@ -381,7 +390,7 @@ fn chunk_from_const_arrays(
         RecordBatch::try_new(schema, arrays)
     }
     .map_err(|e| e.to_string())?;
-    Ok(Chunk::new(batch))
+    Ok(Chunk::new_with_slot_ids(batch, slot_ids))
 }
 
 #[cfg(test)]
@@ -475,7 +484,7 @@ mod tests {
             index: HashMap::new(),
         };
 
-        let err = lower_union_node(children, &node, out_layout, &mut arena, None, None)
+        let err = lower_union_node(children, &node, out_layout, &mut arena, None, None, None)
             .expect_err("missing result_expr_lists must fail");
         assert!(err.contains("requires result_expr_lists"));
     }
@@ -490,7 +499,7 @@ mod tests {
             index: HashMap::new(),
         };
 
-        let err = lower_union_node(children, &node, out_layout, &mut arena, None, None)
+        let err = lower_union_node(children, &node, out_layout, &mut arena, None, None, None)
             .expect_err("result_expr_lists child-count mismatch must fail");
         assert!(err.contains("result_expr_lists size mismatch"));
     }

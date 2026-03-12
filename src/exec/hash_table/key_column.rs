@@ -29,7 +29,7 @@ use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 
 use crate::common::ids::SlotId;
 use crate::common::largeint;
-use crate::exec::chunk::field_with_slot_id;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::agg::AggKernelEntry;
 
 use super::key_builder::{
@@ -1065,25 +1065,56 @@ pub(crate) fn build_output_schema_from_kernels(
     kernels: &[AggKernelEntry],
     output_intermediate: bool,
     output_slots: &[SlotId],
+    output_chunk_schema: Option<&ChunkSchemaRef>,
 ) -> Result<SchemaRef, String> {
     let mut fields: Vec<Field> = Vec::with_capacity(key_columns.len() + kernels.len());
+    let mut chunk_slots = Vec::with_capacity(key_columns.len() + kernels.len());
     for (idx, col) in key_columns.iter().enumerate() {
-        let mut field = Field::new(format!("group_{}", idx), col.data_type(), true);
-        if let Some(slot_id) = output_slots.get(idx) {
-            field = field_with_slot_id(field, *slot_id);
-        }
+        let slot_id = output_slots.get(idx).copied().ok_or_else(|| {
+            format!(
+                "aggregate output slot count mismatch: missing group slot at index {}",
+                idx
+            )
+        })?;
+        let slot_schema = output_chunk_schema.and_then(|schema| schema.slot(slot_id));
+        let field = slot_schema
+            .map(|schema| Field::new(schema.name(), col.data_type(), schema.nullable()))
+            .unwrap_or_else(|| Field::new(format!("group_{}", idx), col.data_type(), true));
+        let chunk_slot = slot_schema.cloned().unwrap_or_else(|| {
+            ChunkSlotSchema::new(slot_id, field.name(), field.is_nullable(), None, None)
+        });
         fields.push(field);
+        chunk_slots.push(chunk_slot);
     }
     for (idx, kernel) in kernels.iter().enumerate() {
-        let mut field = Field::new(
-            format!("agg_{}", idx),
-            kernel.output_type(output_intermediate),
-            true,
-        );
-        if let Some(slot_id) = output_slots.get(key_columns.len() + idx) {
-            field = field_with_slot_id(field, *slot_id);
-        }
+        let slot_idx = key_columns.len() + idx;
+        let slot_id = output_slots.get(slot_idx).copied().ok_or_else(|| {
+            format!(
+                "aggregate output slot count mismatch: missing agg slot at index {}",
+                slot_idx
+            )
+        })?;
+        let slot_schema = output_chunk_schema.and_then(|schema| schema.slot(slot_id));
+        let field = slot_schema
+            .map(|schema| {
+                Field::new(
+                    schema.name(),
+                    kernel.output_type(output_intermediate),
+                    schema.nullable(),
+                )
+            })
+            .unwrap_or_else(|| {
+                Field::new(
+                    format!("agg_{}", idx),
+                    kernel.output_type(output_intermediate),
+                    true,
+                )
+            });
+        let chunk_slot = slot_schema.cloned().unwrap_or_else(|| {
+            ChunkSlotSchema::new(slot_id, field.name(), field.is_nullable(), None, None)
+        });
         fields.push(field);
+        chunk_slots.push(chunk_slot);
     }
     // StarRocks FE may include extra materialized slots in the output tuple (e.g. intermediate /
     // passthrough slots) that are not part of the final operator output schema we construct here.
@@ -1095,5 +1126,6 @@ pub(crate) fn build_output_schema_from_kernels(
             fields.len()
         ));
     }
+    let _chunk_schema = ChunkSchema::try_new(chunk_slots)?;
     Ok(Arc::new(Schema::new(fields)))
 }

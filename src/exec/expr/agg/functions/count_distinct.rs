@@ -759,6 +759,7 @@ mod tests {
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_slots: vec![SlotId::new(1), SlotId::new(2)],
+                    output_chunk_schema: None,
                 }),
             },
         };

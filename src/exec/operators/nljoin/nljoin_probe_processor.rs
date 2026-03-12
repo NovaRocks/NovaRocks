@@ -36,7 +36,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
 use super::nljoin_shared::NlJoinSharedState;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::nljoin::NestedLoopJoinType;
 use crate::exec::operators::hashjoin::join_probe_utils::{
@@ -54,8 +54,11 @@ pub struct NlJoinProbeProcessorFactory {
     join_conjunct: Option<ExprId>,
     probe_is_left: bool,
     left_schema: SchemaRef,
+    left_chunk_schema: ChunkSchemaRef,
     right_schema: SchemaRef,
+    right_chunk_schema: ChunkSchemaRef,
     join_scope_schema: SchemaRef,
+    join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<NlJoinSharedState>,
 }
 
@@ -66,8 +69,11 @@ impl NlJoinProbeProcessorFactory {
         join_conjunct: Option<ExprId>,
         probe_is_left: bool,
         left_schema: SchemaRef,
+        left_chunk_schema: ChunkSchemaRef,
         right_schema: SchemaRef,
+        right_chunk_schema: ChunkSchemaRef,
         join_scope_schema: SchemaRef,
+        join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<NlJoinSharedState>,
     ) -> Self {
         let node_id = state.node_id();
@@ -83,8 +89,11 @@ impl NlJoinProbeProcessorFactory {
             join_conjunct,
             probe_is_left,
             left_schema,
+            left_chunk_schema,
             right_schema,
+            right_chunk_schema,
             join_scope_schema,
+            join_scope_chunk_schema,
             state,
         }
     }
@@ -103,8 +112,11 @@ impl OperatorFactory for NlJoinProbeProcessorFactory {
             join_conjunct: self.join_conjunct,
             probe_is_left: self.probe_is_left,
             left_schema: Arc::clone(&self.left_schema),
+            left_chunk_schema: Arc::clone(&self.left_chunk_schema),
             right_schema: Arc::clone(&self.right_schema),
+            right_chunk_schema: Arc::clone(&self.right_chunk_schema),
             join_scope_schema: Arc::clone(&self.join_scope_schema),
+            join_scope_chunk_schema: Arc::clone(&self.join_scope_chunk_schema),
             state: Arc::clone(&self.state),
             build_loaded: false,
             build_batches: Arc::new(Vec::new()),
@@ -132,8 +144,11 @@ struct NlJoinProbeProcessorOperator {
     join_conjunct: Option<ExprId>,
     probe_is_left: bool,
     left_schema: SchemaRef,
+    left_chunk_schema: ChunkSchemaRef,
     right_schema: SchemaRef,
+    right_chunk_schema: ChunkSchemaRef,
     join_scope_schema: SchemaRef,
+    join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<NlJoinSharedState>,
 
     build_loaded: bool,
@@ -326,6 +341,22 @@ impl ProcessorOperator for NlJoinProbeProcessorOperator {
 }
 
 impl NlJoinProbeProcessorOperator {
+    fn chunk_from_batch_by_schema(&self, batch: RecordBatch) -> Result<Chunk, String> {
+        let chunk_schema = if batch.schema().as_ref() == self.join_scope_schema.as_ref() {
+            Arc::clone(&self.join_scope_chunk_schema)
+        } else if batch.schema().as_ref() == self.left_schema.as_ref() {
+            Arc::clone(&self.left_chunk_schema)
+        } else if batch.schema().as_ref() == self.right_schema.as_ref() {
+            Arc::clone(&self.right_chunk_schema)
+        } else {
+            return Err(format!(
+                "nljoin batch schema does not match left/right/join scope schemas: {:?}",
+                batch.schema()
+            ));
+        };
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema)
+    }
+
     fn is_done(&self) -> bool {
         match self.join_type {
             NestedLoopJoinType::LeftOuter
@@ -347,19 +378,28 @@ impl NlJoinProbeProcessorOperator {
     }
 
     fn empty_progress_chunk(&self) -> Chunk {
-        let schema = match self.join_type {
+        let (schema, chunk_schema) = match self.join_type {
             NestedLoopJoinType::LeftSemi
             | NestedLoopJoinType::LeftAnti
             | NestedLoopJoinType::NullAwareLeftAnti => {
                 if self.probe_is_left {
-                    Arc::clone(&self.left_schema)
+                    (
+                        Arc::clone(&self.left_schema),
+                        Arc::clone(&self.left_chunk_schema),
+                    )
                 } else {
-                    Arc::clone(&self.right_schema)
+                    (
+                        Arc::clone(&self.right_schema),
+                        Arc::clone(&self.right_chunk_schema),
+                    )
                 }
             }
-            _ => Arc::clone(&self.join_scope_schema),
+            _ => (
+                Arc::clone(&self.join_scope_schema),
+                Arc::clone(&self.join_scope_chunk_schema),
+            ),
         };
-        Chunk::new(RecordBatch::new_empty(schema))
+        Chunk::new_with_chunk_schema(RecordBatch::new_empty(schema), chunk_schema)
     }
 
     fn ensure_build_loaded(&mut self) -> Result<(), String> {
@@ -466,7 +506,7 @@ impl NlJoinProbeProcessorOperator {
             if batch.num_rows() == 0 {
                 continue;
             }
-            return Ok(Some(Chunk::new(batch)));
+            return Ok(Some(self.chunk_from_batch_by_schema(batch)?));
         }
     }
 
@@ -552,7 +592,7 @@ impl NlJoinProbeProcessorOperator {
         if filtered.num_rows() == 0 {
             return Ok(None);
         }
-        Ok(Some(Chunk::new(filtered)))
+        Ok(Some(self.chunk_from_batch_by_schema(filtered)?))
     }
 
     fn read_outer(&mut self, chunk_size: usize) -> Result<Option<Chunk>, String> {
@@ -575,7 +615,7 @@ impl NlJoinProbeProcessorOperator {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    return Ok(Some(Chunk::new(batch)));
+                    return Ok(Some(self.chunk_from_batch_by_schema(batch)?));
                 }
                 OuterPhase::EmitUnmatchedProbe => {
                     let Some(batch) = self.emit_unmatched_probe_chunk(chunk_size)? else {
@@ -588,7 +628,7 @@ impl NlJoinProbeProcessorOperator {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    return Ok(Some(Chunk::new(batch)));
+                    return Ok(Some(self.chunk_from_batch_by_schema(batch)?));
                 }
                 OuterPhase::ProbeBuild => {}
             }
@@ -673,7 +713,7 @@ impl NlJoinProbeProcessorOperator {
             if filtered.num_rows() == 0 {
                 continue;
             }
-            return Ok(Some(Chunk::new(filtered)));
+            return Ok(Some(self.chunk_from_batch_by_schema(filtered)?));
         }
     }
 
@@ -863,7 +903,7 @@ impl NlJoinProbeProcessorOperator {
         }
 
         let matched_mask = if let Some(pred) = self.join_conjunct {
-            let chunk = Chunk::new(batch.clone());
+            let chunk = self.chunk_from_batch_by_schema(batch.clone())?;
             let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
             mask_arr
                 .as_any()
@@ -1077,7 +1117,7 @@ impl NlJoinProbeProcessorOperator {
                 continue;
             };
 
-            let joined_chunk = Chunk::new(batch);
+            let joined_chunk = self.chunk_from_batch_by_schema(batch)?;
             let key_masks = self.eval_conjunct_masks(&joined_chunk, key_conjuncts)?;
             let residual_masks = self.eval_conjunct_masks(&joined_chunk, residual_conjuncts)?;
 
@@ -1130,7 +1170,7 @@ impl NlJoinProbeProcessorOperator {
 
             let mask_arr = self
                 .arena
-                .eval(pred, &Chunk::new(batch))
+                .eval(pred, &self.chunk_from_batch_by_schema(batch)?)
                 .map_err(|e| e.to_string())?;
             let mask = mask_arr
                 .as_any()
@@ -1161,7 +1201,7 @@ impl NlJoinProbeProcessorOperator {
             return Ok(batch);
         };
 
-        let chunk = Chunk::new(batch);
+        let chunk = self.chunk_from_batch_by_schema(batch)?;
         let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
         let mask = mask_arr
             .as_any()

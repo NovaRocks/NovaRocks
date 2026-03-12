@@ -21,7 +21,7 @@ use arrow::array::ArrayRef;
 use base64::Engine;
 use thrift::OrderedFloat;
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkFieldSchema};
 use crate::novarocks_logging::{error, info, warn};
 
 use crate::common::app_config;
@@ -38,10 +38,7 @@ use crate::common::util::{
 };
 use crate::lower::cache_iceberg_table_locations;
 use crate::lower::fragment::execute_fragment;
-use crate::lower::type_lowering::{
-    FIELD_META_PRIMITIVE_JSON, FIELD_META_PRIMITIVE_TYPE, primitive_type_from_desc,
-    primitive_type_from_field,
-};
+use crate::lower::type_lowering::primitive_type_from_desc;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
@@ -410,12 +407,49 @@ fn primitives_for_output_exprs(
 
 fn primitives_for_chunk_fields(chunk: &Chunk) -> Vec<types::TPrimitiveType> {
     chunk
-        .schema()
-        .fields()
+        .chunk_schema()
+        .slots()
         .iter()
-        .map(|field| {
-            primitive_type_from_field(field).unwrap_or(types::TPrimitiveType::INVALID_TYPE)
+        .map(|slot| {
+            slot.primitive_type()
+                .unwrap_or(types::TPrimitiveType::INVALID_TYPE)
         })
+        .collect()
+}
+
+fn field_schemas_for_output_exprs(
+    output_exprs: &[exprs::TExpr],
+) -> Result<Vec<ChunkFieldSchema>, String> {
+    let mut out = Vec::with_capacity(output_exprs.len());
+    for (col_idx, e) in output_exprs.iter().enumerate() {
+        let root = e
+            .nodes
+            .get(0)
+            .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
+        out.push(ChunkFieldSchema::try_from_type_desc(
+            format!("col_{col_idx}"),
+            true,
+            root.type_.clone(),
+        )?);
+    }
+    Ok(out)
+}
+
+fn field_schemas_for_chunk_fields(chunk: &Chunk) -> Vec<ChunkFieldSchema> {
+    chunk
+        .chunk_schema()
+        .slots()
+        .iter()
+        .map(|slot| slot.field_schema().clone())
+        .collect()
+}
+
+fn json_semantics_for_chunk_fields(chunk: &Chunk) -> Vec<bool> {
+    chunk
+        .chunk_schema()
+        .slots()
+        .iter()
+        .map(|slot| slot.primitive_type() == Some(types::TPrimitiveType::JSON))
         .collect()
 }
 
@@ -832,9 +866,14 @@ fn build_statistic_fetch_result(
     for chunk in chunks {
         let columns = columns_for_output_exprs(chunk, output_exprs)?;
         let primitives = primitives_for_output_exprs(output_exprs)?;
+        let field_schemas = field_schemas_for_output_exprs(output_exprs)?;
         for row in 0..chunk.len() {
-            let mysql_row =
-                mysql_text_row_from_arrays_with_primitives(&columns, row, Some(&primitives))?;
+            let mysql_row = mysql_text_row_from_arrays_with_primitives(
+                &columns,
+                row,
+                Some(&primitives),
+                Some(&field_schemas),
+            )?;
             let fields = parse_lenenc_fields(&mysql_row, columns.len())?;
             let version = field_required_i32(&fields, 0, "version")?;
             let row_sd = rows_to_statistic_data(version, &fields)?;
@@ -871,34 +910,28 @@ fn build_http_json_fetch_result(
         if let Some(output_exprs) = output_exprs.filter(|v| !v.is_empty()) {
             let columns = columns_for_output_exprs(chunk, output_exprs)?;
             let primitives = primitives_for_output_exprs(output_exprs)?;
+            let field_schemas = field_schemas_for_output_exprs(output_exprs)?;
             for row in 0..chunk.len() {
                 batch.rows.push(http_json_row_from_arrays_with_primitives(
                     &columns,
                     row,
                     Some(&primitives),
                     None,
+                    Some(&field_schemas),
                 )?);
             }
         } else {
             let columns = chunk.columns();
             let primitives = primitives_for_chunk_fields(chunk);
-            let json_semantics = chunk
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| {
-                    field
-                        .metadata()
-                        .get(FIELD_META_PRIMITIVE_TYPE)
-                        .is_some_and(|value| value == FIELD_META_PRIMITIVE_JSON)
-                })
-                .collect::<Vec<_>>();
+            let json_semantics = json_semantics_for_chunk_fields(chunk);
+            let field_schemas = field_schemas_for_chunk_fields(chunk);
             for row in 0..chunk.len() {
                 batch.rows.push(http_json_row_from_arrays_with_primitives(
                     columns,
                     row,
                     Some(&primitives),
                     Some(&json_semantics),
+                    Some(&field_schemas),
                 )?);
             }
         }
@@ -946,17 +979,27 @@ fn build_fetch_result(
         if let Some(output_exprs) = output_exprs.filter(|v| !v.is_empty()) {
             let columns = columns_for_output_exprs(chunk, output_exprs)?;
             let primitives = primitives_for_output_exprs(output_exprs)?;
+            let field_schemas = field_schemas_for_output_exprs(output_exprs)?;
             for row in 0..chunk.len() {
-                let bytes =
-                    mysql_text_row_from_arrays_with_primitives(&columns, row, Some(&primitives))?;
+                let bytes = mysql_text_row_from_arrays_with_primitives(
+                    &columns,
+                    row,
+                    Some(&primitives),
+                    Some(&field_schemas),
+                )?;
                 batch.rows.push(bytes);
             }
         } else {
             let columns = chunk.columns();
             let primitives = primitives_for_chunk_fields(chunk);
+            let field_schemas = field_schemas_for_chunk_fields(chunk);
             for row in 0..chunk.len() {
-                let bytes =
-                    mysql_text_row_from_arrays_with_primitives(columns, row, Some(&primitives))?;
+                let bytes = mysql_text_row_from_arrays_with_primitives(
+                    columns,
+                    row,
+                    Some(&primitives),
+                    Some(&field_schemas),
+                )?;
                 batch.rows.push(bytes);
             }
         }

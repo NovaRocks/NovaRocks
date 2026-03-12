@@ -65,7 +65,7 @@ pub(crate) fn sort_chunks_topn(
         if keep == 0 {
             return Ok(None);
         }
-        return Chunk::try_new(batch.slice(0, keep))
+        return Chunk::try_new_like(batch.slice(0, keep), &chunks[0])
             .map(Some)
             .map_err(|e| e.to_string());
     }
@@ -127,7 +127,9 @@ pub(crate) fn sort_chunks_rank(
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        return Chunk::try_new(batch).map(Some).map_err(|e| e.to_string());
+        return Chunk::try_new_like(batch, &chunks[0])
+            .map(Some)
+            .map_err(|e| e.to_string());
     }
 
     let Some(boundary_chunk) = sort_chunks_topn(arena, order_by, rank_limit, chunks)? else {
@@ -181,7 +183,9 @@ pub(crate) fn sort_chunks_dense_rank(
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        return Chunk::try_new(batch).map(Some).map_err(|e| e.to_string());
+        return Chunk::try_new_like(batch, &chunks[0])
+            .map(Some)
+            .map_err(|e| e.to_string());
     }
 
     let sorted = sort_chunks_by_order(arena, order_by, chunks)?;
@@ -311,10 +315,10 @@ fn sort_chunks_by_order(
     let batches = chunks.iter().map(|c| c.batch.clone()).collect::<Vec<_>>();
     let batch = concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
     if batch.num_rows() == 0 || order_by.is_empty() {
-        return Chunk::try_new(batch).map_err(|e| e.to_string());
+        return Chunk::try_new_like(batch, &chunks[0]).map_err(|e| e.to_string());
     }
 
-    let key_chunk = Chunk::new(batch.clone());
+    let key_chunk = Chunk::new_like(batch.clone(), &chunks[0]);
     let key_columns = eval_order_by_columns(arena, order_by, &key_chunk)?;
     let sort_columns = build_sort_columns(order_by, &key_columns);
     let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| e.to_string())?;
@@ -325,7 +329,7 @@ fn sort_chunks_by_order(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     let sorted_batch = RecordBatch::try_new(batch.schema(), columns).map_err(|e| e.to_string())?;
-    Chunk::try_new(sorted_batch).map_err(|e| e.to_string())
+    Chunk::try_new_like(sorted_batch, &chunks[0]).map_err(|e| e.to_string())
 }
 
 fn filter_chunk_by_boundary(
@@ -366,7 +370,7 @@ fn filter_chunk_by_boundary(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
     let filtered = RecordBatch::try_new(chunk.schema(), columns).map_err(|e| e.to_string())?;
-    Chunk::try_new(filtered)
+    Chunk::try_new_like(filtered, chunk)
         .map(Some)
         .map_err(|e| e.to_string())
 }
