@@ -67,18 +67,6 @@ impl Chunk {
         }
     }
 
-    #[cfg(test)]
-    pub fn try_new(batch: RecordBatch) -> Result<Self, String> {
-        let chunk_schema = Arc::new(ChunkSchema::from_arrow_schema(batch.schema().as_ref())?);
-        Self::try_new_with_chunk_schema(batch, chunk_schema)
-    }
-
-    #[cfg(test)]
-    pub fn try_new_strict(batch: RecordBatch) -> Result<Self, String> {
-        let chunk_schema = Arc::new(ChunkSchema::from_arrow_schema(batch.schema().as_ref())?);
-        Self::try_new_with_chunk_schema(batch, chunk_schema)
-    }
-
     pub fn try_new_with_chunk_schema(
         batch: RecordBatch,
         chunk_schema: ChunkSchemaRef,
@@ -91,14 +79,6 @@ impl Chunk {
         })
     }
 
-    #[cfg(test)]
-    pub fn new(batch: RecordBatch) -> Self {
-        match Self::try_new(batch) {
-            Ok(v) => v,
-            Err(e) => panic!("{e}"),
-        }
-    }
-
     pub fn new_with_chunk_schema(batch: RecordBatch, chunk_schema: ChunkSchemaRef) -> Self {
         match Self::try_new_with_chunk_schema(batch, chunk_schema) {
             Ok(v) => v,
@@ -107,23 +87,9 @@ impl Chunk {
     }
 
     pub fn try_new_with_slot_ids(batch: RecordBatch, slot_ids: &[SlotId]) -> Result<Self, String> {
-        if batch.num_columns() != slot_ids.len() {
-            return Err(format!(
-                "chunk slot id length mismatch: batch_columns={} slot_ids={}",
-                batch.num_columns(),
-                slot_ids.len()
-            ));
-        }
-        let slots = batch
-            .schema()
-            .fields()
-            .iter()
-            .zip(slot_ids.iter())
-            .map(|(field, slot_id)| {
-                ChunkSchema::slot_schema_from_arrow_field(*slot_id, field.as_ref())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Self::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(slots)?))
+        let chunk_schema =
+            ChunkSchema::try_from_schema_and_slot_ids(batch.schema().as_ref(), slot_ids)?;
+        Self::try_new_with_chunk_schema(batch, Arc::new(chunk_schema))
     }
 
     pub fn new_with_slot_ids(batch: RecordBatch, slot_ids: &[SlotId]) -> Self {

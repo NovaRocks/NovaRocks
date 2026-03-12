@@ -262,7 +262,7 @@ mod tests {
         let data: Vec<i32> = (0..rows as i32).collect();
         let array = Arc::new(Int32Array::from(data)) as _;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn run_ok(

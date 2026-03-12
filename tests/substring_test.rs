@@ -19,7 +19,7 @@
 /// Tests verify that SUBSTRING properly extracts substrings from strings
 /// and aligns with StarRocks BE's substring behavior.
 use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::{Chunk, field_with_slot_id};
+use novarocks::exec::chunk::Chunk;
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue, function::FunctionKind};
 
 use arrow::array::{Array, StringArray};
@@ -29,13 +29,10 @@ use std::sync::Arc;
 
 /// Helper function to create a test chunk with a dummy column
 fn create_test_chunk() -> Chunk {
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = arrow::array::Int64Array::from(vec![1]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    Chunk::new(batch)
+    Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
 }
 
 /// Helper function to test substring with 3 arguments
@@ -245,13 +242,10 @@ fn test_substring_multiple_rows() {
     );
 
     // Create chunk with 3 rows
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = arrow::array::Int64Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
     let result = arena.eval(func_id, &chunk).unwrap();
     let str_array = result.as_any().downcast_ref::<StringArray>().unwrap();

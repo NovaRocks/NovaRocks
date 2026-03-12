@@ -144,7 +144,7 @@ mod tests {
         let schema = Arc::new(Schema::empty());
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(schema, vec![], &options).expect("batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[])
     }
 
     #[allow(dead_code)]
@@ -197,7 +197,7 @@ mod tests {
         )]));
         let col0 = Arc::new(Int64Array::from(vec![Some(0), Some(7), None, Some(-2)]));
         let batch = RecordBatch::try_new(schema, vec![col0]).expect("batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(0)]);
 
         let array = arena.eval(id, &chunk).expect("eval");
         let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();

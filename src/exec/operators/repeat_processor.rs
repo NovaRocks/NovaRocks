@@ -351,7 +351,7 @@ mod tests {
         let a = Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as _;
         let b = Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as _;
         let batch = RecordBatch::try_new(schema, vec![a, b]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let mut op = RepeatProcessorOperator {
             name: "Repeat".to_string(),

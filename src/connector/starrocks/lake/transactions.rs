@@ -29,7 +29,7 @@ use crate::connector::starrocks::lake::abort_executor::abort_one_tablet;
 use crate::connector::starrocks::lake::abort_policy::should_skip_abort_cleanup;
 use crate::connector::starrocks::lake::applier::apply_txn_log_to_metadata;
 use crate::connector::starrocks::lake::context::{
-    TabletRuntimeEntry, get_tablet_runtime, remove_tablet_runtime, update_tablet_runtime_schema,
+    TabletRuntimeEntry, cache_tablet_runtime, get_tablet_runtime, remove_tablet_runtime,
     with_txn_log_append_lock,
 };
 use crate::connector::starrocks::lake::replay_policy::{
@@ -2443,11 +2443,14 @@ fn get_runtime_for_publish(
         &root_path,
         object_store_profile.as_ref(),
     ) {
-        return Ok(TabletRuntimeEntry {
-            root_path,
-            schema: snapshot.tablet_schema,
-            s3_config,
-        });
+        return cache_tablet_runtime(
+            tablet_id,
+            TabletRuntimeEntry {
+                root_path,
+                schema: snapshot.tablet_schema,
+                s3_config,
+            },
+        );
     }
 
     let metadata = load_tablet_metadata_with_missing_page_policy(
@@ -2463,11 +2466,14 @@ fn get_runtime_for_publish(
         )
     })?;
     let schema = schema_from_metadata(tablet_id, recovery_version, &metadata)?;
-    Ok(TabletRuntimeEntry {
-        root_path,
-        schema,
-        s3_config,
-    })
+    cache_tablet_runtime(
+        tablet_id,
+        TabletRuntimeEntry {
+            root_path,
+            schema,
+            s3_config,
+        },
+    )
 }
 
 fn publish_one_tablet(
@@ -2722,7 +2728,14 @@ fn publish_one_tablet(
         None
     };
     let persisted_schema = schema_from_metadata(tablet_id, new_version, &state.metadata)?;
-    update_tablet_runtime_schema(tablet_id, &persisted_schema)?;
+    cache_tablet_runtime(
+        tablet_id,
+        TabletRuntimeEntry {
+            root_path: state.root_path.clone(),
+            schema: persisted_schema.clone(),
+            s3_config: runtime.s3_config.clone(),
+        },
+    )?;
     Ok(PublishOneTabletOutput {
         root_path: state.root_path,
         schema: persisted_schema,
@@ -3066,12 +3079,14 @@ mod tests {
         abort_txn, delete_tablet, drop_table, get_tablet_stats, parse_txn_vlog_file_name,
         publish_log_version, publish_log_version_batch, publish_version, vacuum,
     };
+    use crate::common::ids::SlotId;
     use crate::connector::starrocks::lake::context::{
         TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::{
         append_lake_txn_log_with_rowset, txn_log::write_txn_log_file,
     };
+    use crate::exec::chunk::{Chunk, field_with_slot_id};
     use crate::formats::starrocks::writer::StarRocksWriteFormat;
     use crate::formats::starrocks::writer::bundle_meta::{
         load_tablet_metadata_at_version, write_bundle_meta_file, write_initial_meta_file,
@@ -3336,15 +3351,19 @@ mod tests {
         }
     }
 
-    fn pk_mixed_batch_with_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> RecordBatch {
+    fn slot_field(name: &str, data_type: DataType, nullable: bool, slot_id: u32) -> Field {
+        field_with_slot_id(Field::new(name, data_type, nullable), SlotId::new(slot_id))
+    }
+
+    fn pk_mixed_batch_with_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Int8, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("v1", DataType::Int64, true, 2),
+            slot_field("__op", DataType::Int8, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -3352,7 +3371,8 @@ mod tests {
                 Arc::new(Int8Array::from(ops)),
             ],
         )
-        .expect("build mixed primary key batch")
+        .expect("build mixed primary key batch");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
     fn pk_composite_mixed_batch_with_op(
@@ -3360,17 +3380,17 @@ mod tests {
         k2: Vec<i32>,
         values: Vec<i64>,
         ops: Vec<i8>,
-    ) -> RecordBatch {
+    ) -> Chunk {
         assert_eq!(k1.len(), k2.len());
         assert_eq!(k1.len(), values.len());
         assert_eq!(k1.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Utf8, false),
-            Field::new("k2", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Int8, false),
+            slot_field("k1", DataType::Utf8, false, 1),
+            slot_field("k2", DataType::Int32, false, 2),
+            slot_field("v1", DataType::Int64, true, 3),
+            slot_field("__op", DataType::Int8, false, 4),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(k1)),
@@ -3379,7 +3399,16 @@ mod tests {
                 Arc::new(Int8Array::from(ops)),
             ],
         )
-        .expect("build composite mixed primary key batch")
+        .expect("build composite mixed primary key batch");
+        Chunk::new_with_slot_ids(
+            batch,
+            &[
+                SlotId::new(1),
+                SlotId::new(2),
+                SlotId::new(3),
+                SlotId::new(4),
+            ],
+        )
     }
 
     fn test_rowset(segment_name: &str, row_count: i64, data_size: i64) -> RowsetMetadataPb {

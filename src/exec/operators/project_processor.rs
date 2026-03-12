@@ -597,7 +597,10 @@ mod tests {
         )
         .expect("build input batch");
         let output = op
-            .process_one(Chunk::new(batch))
+            .process_one(Chunk::new_with_slot_ids(
+                batch,
+                &[SlotId::new(17), SlotId::new(18)],
+            ))
             .expect("project should succeed")
             .expect("project output");
 

@@ -374,7 +374,7 @@ mod tests {
         )]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[slot_id])
     }
 
     fn chunk_of_two(
@@ -392,11 +392,14 @@ mod tests {
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[k_slot_id, v_slot_id])
     }
 
-    fn chunk_schema_of(schema: &Arc<Schema>) -> ChunkSchemaRef {
-        Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"))
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+                .expect("chunk schema"),
+        )
     }
 
     fn append_pairs(chunk: Chunk, pairs: &mut Vec<(i32, i32)>) {
@@ -463,11 +466,11 @@ mod tests {
             None,
             true,
             Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
+            chunk_schema_of(&left_schema, &[SlotId::new(1)]),
             Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
+            chunk_schema_of(&right_schema, &[SlotId::new(2)]),
             Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&join_scope_schema, &[SlotId::new(1), SlotId::new(2)]),
             Arc::clone(&join_state),
         );
 
@@ -575,11 +578,14 @@ mod tests {
             None,
             true,
             Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
+            chunk_schema_of(&left_schema, &[SlotId::new(1), SlotId::new(2)]),
             Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
+            chunk_schema_of(&right_schema, &[SlotId::new(3)]),
             Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            ),
             Arc::clone(&join_state),
         );
 
@@ -676,11 +682,19 @@ mod tests {
             Some(residual),
             true,
             Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
+            chunk_schema_of(&left_schema, &[SlotId::new(1), SlotId::new(2)]),
             Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
+            chunk_schema_of(&right_schema, &[SlotId::new(3), SlotId::new(4)]),
             Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(
+                &join_scope_schema,
+                &[
+                    SlotId::new(1),
+                    SlotId::new(2),
+                    SlotId::new(3),
+                    SlotId::new(4),
+                ],
+            ),
             Arc::clone(&join_state),
         );
 

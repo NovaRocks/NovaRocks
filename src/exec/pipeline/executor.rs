@@ -213,8 +213,11 @@ mod tests {
 
     use super::execute_plan_with_pipeline;
 
-    fn chunk_schema_of(schema: &Arc<Schema>) -> ChunkSchemaRef {
-        Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"))
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        Arc::new(
+            ChunkSchema::try_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+                .expect("chunk schema"),
+        )
     }
 
     #[test]
@@ -226,7 +229,7 @@ mod tests {
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3, 3, 3])) as arrow::array::ArrayRef;
         let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8, 9])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -342,24 +345,27 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: Chunk::new_with_slot_ids(left_batch, &[SlotId::new(1)]),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: Chunk::new_with_slot_ids(right_batch, &[SlotId::new(2)]),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::Inner,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema),
+                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
                     left_schema,
-                    right_chunk_schema: chunk_schema_of(&right_schema),
+                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
                     right_schema,
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                     join_scope_schema,
                 }),
             },
@@ -444,24 +450,27 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: Chunk::new_with_slot_ids(left_batch, &[SlotId::new(1)]),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: Chunk::new_with_slot_ids(right_batch, &[SlotId::new(2)]),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::LeftOuter,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema),
+                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
                     left_schema,
-                    right_chunk_schema: chunk_schema_of(&right_schema),
+                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
                     right_schema,
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                     join_scope_schema,
                 }),
             },
@@ -552,24 +561,27 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: Chunk::new_with_slot_ids(left_batch, &[SlotId::new(1)]),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: Chunk::new_with_slot_ids(right_batch, &[SlotId::new(2)]),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::FullOuter,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema),
+                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
                     left_schema,
-                    right_chunk_schema: chunk_schema_of(&right_schema),
+                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
                     right_schema,
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                     join_scope_schema,
                 }),
             },
@@ -665,24 +677,44 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: Chunk::new_with_slot_ids(
+                                left_batch,
+                                &[SlotId::new(1), SlotId::new(2)],
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: Chunk::new_with_slot_ids(
+                                right_batch,
+                                &[SlotId::new(3), SlotId::new(4)],
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::LeftOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
-                    left_chunk_schema: chunk_schema_of(&left_schema),
+                    left_chunk_schema: chunk_schema_of(
+                        &left_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                     left_schema: Arc::clone(&left_schema),
-                    right_chunk_schema: chunk_schema_of(&right_schema),
+                    right_chunk_schema: chunk_schema_of(
+                        &right_schema,
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
                     right_schema: Arc::clone(&right_schema),
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[
+                            SlotId::new(1),
+                            SlotId::new(2),
+                            SlotId::new(3),
+                            SlotId::new(4),
+                        ],
+                    ),
                     join_scope_schema,
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -807,24 +839,44 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: Chunk::new_with_slot_ids(
+                                left_batch,
+                                &[SlotId::new(1), SlotId::new(2)],
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: Chunk::new_with_slot_ids(
+                                right_batch,
+                                &[SlotId::new(3), SlotId::new(4)],
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::RightOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
-                    left_chunk_schema: chunk_schema_of(&left_schema),
+                    left_chunk_schema: chunk_schema_of(
+                        &left_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                     left_schema: Arc::clone(&left_schema),
-                    right_chunk_schema: chunk_schema_of(&right_schema),
+                    right_chunk_schema: chunk_schema_of(
+                        &right_schema,
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
                     right_schema: Arc::clone(&right_schema),
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[
+                            SlotId::new(1),
+                            SlotId::new(2),
+                            SlotId::new(3),
+                            SlotId::new(4),
+                        ],
+                    ),
                     join_scope_schema,
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -933,24 +985,44 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: Chunk::new_with_slot_ids(
+                                left_batch,
+                                &[SlotId::new(1), SlotId::new(2)],
+                            ),
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: Chunk::new_with_slot_ids(
+                                right_batch,
+                                &[SlotId::new(3), SlotId::new(4)],
+                            ),
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::FullOuter,
                     distribution_mode: JoinDistributionMode::Broadcast,
-                    left_chunk_schema: chunk_schema_of(&left_schema),
+                    left_chunk_schema: chunk_schema_of(
+                        &left_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                     left_schema: Arc::clone(&left_schema),
-                    right_chunk_schema: chunk_schema_of(&right_schema),
+                    right_chunk_schema: chunk_schema_of(
+                        &right_schema,
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
                     right_schema: Arc::clone(&right_schema),
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[
+                            SlotId::new(1),
+                            SlotId::new(2),
+                            SlotId::new(3),
+                            SlotId::new(4),
+                        ],
+                    ),
                     join_scope_schema,
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -1032,7 +1104,8 @@ mod tests {
         let o = Arc::new(Int32Array::from(vec![1, 1, 2, 1, 2])) as arrow::array::ArrayRef;
         let v = Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k, o, v]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk =
+            Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]);
 
         let mut arena = ExprArena::default();
         let k_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1158,7 +1231,7 @@ mod tests {
         let c1 = Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef;
         let sum_state = Arc::new(Int64Array::from(vec![30_i64, 5_i64])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![c1, sum_state]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let mut arena = ExprArena::default();
         let c1_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);

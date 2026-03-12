@@ -20,8 +20,6 @@ use std::sync::Arc;
 use crate::common::ids::SlotId;
 use crate::lower::type_lowering::primitive_type_from_desc;
 use crate::types;
-#[cfg(test)]
-use arrow::datatypes::Schema;
 use arrow::datatypes::{DataType, Field};
 use arrow::record_batch::RecordBatch;
 
@@ -353,11 +351,6 @@ impl ChunkSchema {
         }
     }
 
-    #[cfg(test)]
-    pub fn from_arrow_schema(schema: &Schema) -> Result<Self, String> {
-        Self::from_arrow_schema_legacy(schema)
-    }
-
     pub fn slots(&self) -> &[ChunkSlotSchema] {
         &self.slots
     }
@@ -369,6 +362,26 @@ impl ChunkSchema {
         ChunkSlotSchema::from_field(slot_id, field, None)
     }
 
+    pub fn try_from_schema_and_slot_ids(
+        schema: &arrow::datatypes::Schema,
+        slot_ids: &[SlotId],
+    ) -> Result<Self, String> {
+        if schema.fields().len() != slot_ids.len() {
+            return Err(format!(
+                "chunk schema slot id length mismatch: schema_fields={} slot_ids={}",
+                schema.fields().len(),
+                slot_ids.len()
+            ));
+        }
+        let slots = schema
+            .fields()
+            .iter()
+            .zip(slot_ids.iter().copied())
+            .map(|(field, slot_id)| Self::slot_schema_from_arrow_field(slot_id, field.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new(slots)
+    }
+
     pub fn slot(&self, slot_id: SlotId) -> Option<&ChunkSlotSchema> {
         self.index_by_slot
             .get(&slot_id)
@@ -377,28 +390,6 @@ impl ChunkSchema {
 
     pub fn index_by_slot(&self) -> &HashMap<SlotId, usize> {
         &self.index_by_slot
-    }
-
-    #[cfg(test)]
-    fn from_arrow_schema_legacy(schema: &Schema) -> Result<Self, String> {
-        let mut slots = Vec::with_capacity(schema.fields().len());
-        for (idx, field) in schema.fields().iter().enumerate() {
-            let slot_id = test_slot_id_from_field(field.as_ref())?.ok_or_else(|| {
-                format!(
-                    "missing test slot id in chunk schema field at index {} (name={})",
-                    idx,
-                    field.name()
-                )
-            })?;
-            slots.push(ChunkSlotSchema::try_new(
-                slot_id,
-                field.name(),
-                field.is_nullable(),
-                None,
-                None,
-            )?);
-        }
-        Self::try_new(slots)
     }
 }
 
@@ -428,22 +419,4 @@ pub(super) fn validate_chunk_schema_against_batch(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn test_slot_id_from_field(field: &Field) -> Result<Option<SlotId>, String> {
-    let debug = format!("{field:?}");
-    let Some(start) = debug.find("dict_id: ") else {
-        return Ok(None);
-    };
-    let start = start + "dict_id: ".len();
-    let rest = &debug[start..];
-    let end = rest.find([',', '}']).unwrap_or(rest.len());
-    let raw = rest[..end].trim();
-    let parsed = raw
-        .parse::<i64>()
-        .map_err(|e| format!("parse test slot id from field debug failed: {}", e))?;
-    let as_u32 = u32::try_from(parsed)
-        .map_err(|_| format!("test slot id out of range in field debug: {}", parsed))?;
-    Ok(Some(SlotId::new(as_u32)))
 }

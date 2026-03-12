@@ -610,7 +610,7 @@ mod tests {
             SlotId::new(1),
         )];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![map]).unwrap();
-        (Chunk::new(batch), map_type)
+        (Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]), map_type)
     }
 
     fn build_lambda_identity_map(arena: &mut ExprArena) -> ExprId {

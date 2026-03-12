@@ -59,6 +59,7 @@ pub(crate) fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> Resul
     T::read_from_in_protocol(&mut prot).map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Result<Vec<u8>, String> {
     const INITIAL_CAPACITY: usize = 256;
     const MAX_CAPACITY: usize = 64 * 1024;

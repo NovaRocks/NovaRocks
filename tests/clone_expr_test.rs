@@ -19,7 +19,7 @@
 /// Tests verify that CloneExpr properly creates independent column copies
 /// and aligns with StarRocks BE's CloneExpr behavior.
 use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::{Chunk, field_with_slot_id};
+use novarocks::exec::chunk::Chunk;
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 
 use arrow::array::{Array, Int64Array};
@@ -38,13 +38,10 @@ fn test_clone_expr_eval_basic() {
     let clone_id = arena.push_typed(ExprNode::Clone(child_id), DataType::Int64);
 
     // Create a test chunk
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = Int64Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
     // Evaluate the Clone expression
     let result = arena.eval(clone_id, &chunk);
@@ -73,13 +70,10 @@ fn test_clone_expr_with_arithmetic() {
     let clone_id = arena.push_typed(ExprNode::Clone(add_id), DataType::Int64);
 
     // Create test chunk
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = Int64Array::from(vec![1]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
     // Evaluate
     let result = arena.eval(clone_id, &chunk).unwrap();
@@ -104,13 +98,10 @@ fn test_clone_expr_independence() {
     let ref2_id = arena.push_typed(ExprNode::Clone(base_id), DataType::Int64);
 
     // Create test chunk
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = Int64Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
     // Evaluate both references
     let result1 = arena.eval(ref1_id, &chunk).unwrap();
@@ -137,13 +128,10 @@ fn test_clone_expr_with_null() {
     let clone_id = arena.push_typed(ExprNode::Clone(null_id), DataType::Null);
 
     // Create test chunk
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = Int64Array::from(vec![1]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
     // Evaluate
     let result = arena.eval(clone_id, &chunk);
@@ -169,13 +157,10 @@ fn test_nested_clone_expr() {
     let clone2_id = arena.push_typed(ExprNode::Clone(clone1_id), DataType::Int64);
 
     // Create test chunk
-    let schema = Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
-    )]);
+    let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = Int64Array::from(vec![1, 2]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new(batch);
+    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
     // Evaluate nested clone
     let result = arena.eval(clone2_id, &chunk).unwrap();

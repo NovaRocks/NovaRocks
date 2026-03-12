@@ -417,7 +417,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![field]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId(1)]);
 
         let arr = arena.eval(expr, &chunk).unwrap();
         assert_eq!(arr.data_type(), &DataType::Utf8);

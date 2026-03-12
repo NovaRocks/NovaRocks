@@ -2025,17 +2025,39 @@ fn align_chunk_to_schema_slot_bindings(
     let mut aligned_fields = Vec::new();
     let mut aligned_slots = Vec::new();
     let mut aligned_data_indexes = Vec::new();
+    let mut aligned_slot_ids = HashSet::new();
+    let mut next_synthetic_slot_id = u32::MAX;
+    let mut assign_slot_id = |preferred: SlotId| {
+        if aligned_slot_ids.insert(preferred) {
+            return preferred;
+        }
+        loop {
+            let synthetic = SlotId::new(next_synthetic_slot_id);
+            next_synthetic_slot_id = next_synthetic_slot_id.saturating_sub(1);
+            if aligned_slot_ids.insert(synthetic) {
+                return synthetic;
+            }
+        }
+    };
     for slot_id in schema_slot_bindings.iter().copied().flatten() {
         let Some(idx) = slot_to_data_index.get(&slot_id).copied() else {
             continue;
         };
         // Keep duplicated schema bindings (e.g. INSERT ... SELECT k1, k1, v)
-        // so non-primary key writes preserve full target column count.
+        // so non-primary key writes preserve full target column count. ChunkSchema
+        // still requires unique slot ids, so duplicated copies get synthetic ids.
         aligned_data_indexes.push(idx);
         let slot = &chunk.chunk_schema().slots()[idx];
+        let aligned_slot_id = assign_slot_id(slot.slot_id());
         aligned_columns.push(chunk.batch.column(idx).clone());
-        aligned_fields.push(chunk.batch.schema().field(idx).clone());
-        aligned_slots.push(slot.clone());
+        aligned_fields.push(chunk.batch.schema().field(idx).as_ref().clone());
+        aligned_slots.push(ChunkSlotSchema::new(
+            aligned_slot_id,
+            slot.name(),
+            slot.nullable(),
+            slot.type_desc().cloned(),
+            slot.unique_id(),
+        ));
     }
     let resolved_op_index = if let Some(slot_id) = op_slot_id {
         if let Some(op_idx) = slot_to_op_index.get(&slot_id).copied() {
@@ -2070,11 +2092,12 @@ fn align_chunk_to_schema_slot_bindings(
         let op_already_selected = aligned_data_indexes.contains(&op_idx);
         if !op_already_selected {
             let op_slot = &chunk.chunk_schema().slots()[op_idx];
+            let aligned_slot_id = assign_slot_id(op_slot.slot_id());
             aligned_columns.push(chunk.batch.column(op_idx).clone());
             let op_field = chunk.batch.schema().field(op_idx).as_ref().clone();
             aligned_fields.push(op_field.with_name(LOAD_OP_COLUMN.to_string()));
             aligned_slots.push(ChunkSlotSchema::new(
-                op_slot.slot_id(),
+                aligned_slot_id,
                 LOAD_OP_COLUMN,
                 op_slot.nullable(),
                 op_slot.type_desc().cloned(),
@@ -2102,12 +2125,11 @@ fn align_chunk_to_schema_slot_bindings(
 
 #[cfg(test)]
 fn align_batch_to_schema_slot_bindings(
-    batch: &RecordBatch,
+    chunk: &Chunk,
     schema_slot_bindings: &[Option<SlotId>],
     op_slot_id: Option<SlotId>,
 ) -> Result<RecordBatch, String> {
-    let chunk = Chunk::try_new(batch.clone())?;
-    Ok(align_chunk_to_schema_slot_bindings(&chunk, schema_slot_bindings, op_slot_id)?.batch)
+    Ok(align_chunk_to_schema_slot_bindings(chunk, schema_slot_bindings, op_slot_id)?.batch)
 }
 
 #[cfg(test)]
@@ -2145,6 +2167,7 @@ mod tests {
     use crate::connector::starrocks::sink::routing::RowRoutingPlan;
     use crate::descriptors::{TOlapTableIndexTablets, TOlapTablePartition, TTabletLocation};
     use crate::exec::chunk::Chunk;
+    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::formats::starrocks::writer::{StarRocksWriteFormat, layout::txn_log_file_path};
@@ -2153,7 +2176,6 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
-    use crate::testutil::chunk::field_with_slot_id;
     use crate::types;
 
     fn test_tablet_schema() -> TabletSchemaPb {
@@ -2350,7 +2372,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build record batch");
-        Chunk::try_new(batch).expect("build chunk")
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn pk_mixed_op_chunk(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
@@ -2370,12 +2392,13 @@ mod tests {
             ],
         )
         .expect("build primary key mixed op record batch");
-        Chunk::try_new(batch).expect("build chunk")
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn slot_bound_batch_with_op(include_op: bool) -> RecordBatch {
+    fn slot_bound_batch_with_op(include_op: bool) -> Chunk {
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut slot_ids = Vec::new();
         for slot in 1_u32..=6 {
             fields.push(field_with_slot_id(
                 Field::new(format!("c{slot}"), DataType::Int64, false),
@@ -2385,6 +2408,7 @@ mod tests {
                 slot as i64,
                 slot as i64 + 100,
             ])));
+            slot_ids.push(SlotId::new(slot));
         }
         if include_op {
             fields.push(field_with_slot_id(
@@ -2392,9 +2416,11 @@ mod tests {
                 SlotId::new(9),
             ));
             columns.push(Arc::new(Int8Array::from(vec![0_i8, 1_i8])));
+            slot_ids.push(SlotId::new(9));
         }
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("build slot-bound record batch")
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("build slot-bound record batch");
+        Chunk::new_with_slot_ids(batch, &slot_ids)
     }
 
     fn recursive_cte_schema_slot_bindings() -> Vec<Option<SlotId>> {
@@ -2932,9 +2958,10 @@ mod tests {
         );
     }
 
-    fn slot_bound_batch_with_unnamed_op_slot() -> RecordBatch {
+    fn slot_bound_batch_with_unnamed_op_slot() -> Chunk {
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut slot_ids = Vec::new();
         for slot in 1_u32..=6 {
             fields.push(field_with_slot_id(
                 Field::new(format!("c{slot}"), DataType::Int64, false),
@@ -2944,14 +2971,17 @@ mod tests {
                 slot as i64,
                 slot as i64 + 100,
             ])));
+            slot_ids.push(SlotId::new(slot));
         }
         fields.push(field_with_slot_id(
             Field::new("col_7", DataType::Int8, false),
             SlotId::new(9),
         ));
         columns.push(Arc::new(Int8Array::from(vec![0_i8, 1_i8])));
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("build slot-bound record batch with unnamed op slot")
+        slot_ids.push(SlotId::new(9));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("build slot-bound record batch with unnamed op slot");
+        Chunk::new_with_slot_ids(batch, &slot_ids)
     }
 
     #[test]
@@ -3405,6 +3435,7 @@ mod tests {
             ],
         )
         .expect("build batch");
+        let batch = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let aligned = align_batch_to_schema_slot_bindings(
             &batch,
@@ -3490,7 +3521,7 @@ mod tests {
             ],
         )
         .expect("build partition value batch");
-        let chunk = Chunk::try_new(batch).expect("build chunk");
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(9), SlotId::new(0)]);
 
         let values = super::collect_partition_values_from_chunk(
             &chunk,

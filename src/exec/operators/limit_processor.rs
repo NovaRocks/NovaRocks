@@ -211,7 +211,7 @@ mod tests {
             ],
         )
         .expect("build record batch");
-        Chunk::try_new(batch).expect("build chunk")
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
     }
 
     fn chunk_values(chunk: &Chunk) -> Vec<i32> {

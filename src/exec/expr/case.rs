@@ -207,7 +207,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("c0", DataType::Int32, true), slot);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[slot])
     }
 
     #[test]

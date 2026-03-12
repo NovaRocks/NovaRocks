@@ -279,7 +279,7 @@ mod tests {
             SlotId::new(1),
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
         let schema = Arc::new(Schema::empty());
         let options = RecordBatchOptions::new().with_row_count(Some(1));
         let batch = RecordBatch::try_new_with_options(schema, vec![], &options).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[]);
 
         let mut arena = ExprArena::default();
         let cond = arena.push_typed(

@@ -731,7 +731,7 @@ mod tests {
         let vals =
             Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8, 9, 9])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);

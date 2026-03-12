@@ -289,7 +289,11 @@ mod tests {
             field_with_slot_id(Field::new("b", b_type.clone(), true), SlotId::new(2)),
         ];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![a, b]).unwrap();
-        (Chunk::new(batch), a_type, b_type)
+        (
+            Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]),
+            a_type,
+            b_type,
+        )
     }
 
     #[test]

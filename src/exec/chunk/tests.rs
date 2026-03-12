@@ -26,12 +26,12 @@ use crate::lower::type_lowering::scalar_type_desc;
 use crate::types::TPrimitiveType;
 
 #[test]
-fn strict_requires_chunk_schema_metadata() {
+fn try_new_with_slot_ids_requires_explicit_slot_ids() {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
         .expect("record batch");
-    let err = Chunk::try_new_strict(batch).expect_err("expected strict error");
-    assert!(err.contains("novarocks.chunk.slot_ids"), "err={}", err);
+    let err = Chunk::try_new_with_slot_ids(batch, &[]).expect_err("expected explicit slot ids");
+    assert!(err.contains("slot id length mismatch"), "err={}", err);
 }
 
 #[test]

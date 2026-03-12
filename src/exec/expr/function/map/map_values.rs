@@ -67,7 +67,7 @@ mod tests {
         let map_type = map.data_type().clone();
         let field = field_with_slot_id(Field::new("m", map_type.clone(), true), SlotId::new(1));
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![map]).unwrap();
-        (Chunk::new(batch), map_type)
+        (Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]), map_type)
     }
 
     #[test]

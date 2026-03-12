@@ -924,7 +924,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -944,7 +944,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -964,7 +964,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -985,7 +985,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -1005,7 +1005,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -1025,7 +1025,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("j", DataType::Utf8, true), SlotId::new(1));
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![json_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, DataType::Utf8);

@@ -683,7 +683,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let out = arena.eval(lowered, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();

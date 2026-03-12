@@ -209,7 +209,11 @@ mod tests {
             field_with_slot_id(Field::new("m2", map2_type.clone(), true), SlotId::new(2)),
         ];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![map1, map2]).unwrap();
-        (Chunk::new(batch), map1_type, map2_type)
+        (
+            Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]),
+            map1_type,
+            map2_type,
+        )
     }
 
     #[test]

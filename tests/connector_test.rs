@@ -95,6 +95,7 @@ fn test_iceberg_connector_module() {
         datacache: DataCacheManager::instance().external_context(test_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some("connector_smoke".to_string()),
+        iceberg_output_schema: None,
     };
     let config = novarocks::novarocks_connector_iceberg::HdfsScanConfig {
         ranges: vec![novarocks::connector::FileScanRange {

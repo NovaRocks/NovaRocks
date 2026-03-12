@@ -224,7 +224,7 @@ mod tests {
         )]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     #[test]

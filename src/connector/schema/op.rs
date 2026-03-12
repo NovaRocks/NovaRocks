@@ -738,8 +738,13 @@ mod tests {
             field_with_slot_id(Field::new("LABEL", DataType::Utf8, true), SlotId::new(2)),
             field_with_slot_id(Field::new("TXN_ID", DataType::Int64, false), SlotId::new(1)),
         ]));
-        let chunk_schema =
-            Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"));
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_from_schema_and_slot_ids(
+                schema.as_ref(),
+                &[SlotId::new(2), SlotId::new(1)],
+            )
+            .expect("chunk schema"),
+        );
         let op = SchemaScanOp::new(
             SchemaTable::Be(BeSchemaTable::TabletWriteLog),
             ctx("be_tablet_write_log"),

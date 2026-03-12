@@ -524,7 +524,8 @@ mod tests {
         ];
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![col1, col2, col3]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk =
+            Chunk::new_with_slot_ids(batch, &[SlotId::new(10), SlotId::new(11), SlotId::new(12)]);
 
         let result = arena.eval(func, &chunk).unwrap();
         let list = result.as_any().downcast_ref::<ListArray>().unwrap();

@@ -95,7 +95,7 @@ pub(crate) fn append_lake_txn_log_with_chunk_rowset(
 #[cfg(test)]
 pub(crate) fn append_lake_txn_log_with_rowset(
     ctx: &TabletWriteContext,
-    batch: &RecordBatch,
+    chunk: &Chunk,
     txn_id: i64,
     driver_id: i32,
     file_seq: u64,
@@ -103,10 +103,9 @@ pub(crate) fn append_lake_txn_log_with_rowset(
     partition_id: i64,
     load_id: Option<&PUniqueId>,
 ) -> Result<(), String> {
-    let chunk = Chunk::try_new(batch.clone())?;
     append_lake_txn_log_with_chunk_rowset(
         ctx,
-        &chunk,
+        chunk,
         txn_id,
         driver_id,
         file_seq,
@@ -635,12 +634,16 @@ fn debug_batch_fields(batch: &RecordBatch, batch_slot_ids: &[Option<SlotId>]) ->
 #[cfg(test)]
 fn resolve_lake_batch_write_routing(
     ctx: &TabletWriteContext,
-    batch: &RecordBatch,
+    chunk: &Chunk,
     existing_txn_log: Option<&TxnLogPb>,
 ) -> Result<LakeBatchWriteRouting, String> {
-    let chunk = Chunk::try_new(batch.clone())?;
-    let slot_ids = slot_ids_from_chunk(&chunk);
-    resolve_lake_batch_write_routing_with_slots(ctx, batch, Some(&slot_ids), existing_txn_log)
+    let slot_ids = slot_ids_from_chunk(chunk);
+    resolve_lake_batch_write_routing_with_slots(
+        ctx,
+        &chunk.batch,
+        Some(&slot_ids),
+        existing_txn_log,
+    )
 }
 
 fn resolve_lake_batch_write_routing_with_slots(
@@ -3359,6 +3362,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{TabletWriteContext, append_lake_txn_log_with_rowset, read_txn_log_if_exists};
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{Chunk, field_with_slot_id};
     use crate::formats::starrocks::metadata::{
         collect_delete_predicates, lake_rowset_visibility_version,
     };
@@ -3409,6 +3414,10 @@ mod tests {
             compression_level: None,
             id: Some(schema_id),
         }
+    }
+
+    fn slot_field(name: &str, data_type: DataType, nullable: bool, slot_id: u32) -> Field {
+        field_with_slot_id(Field::new(name, data_type, nullable), SlotId::new(slot_id))
     }
 
     fn test_context(
@@ -3835,17 +3844,23 @@ mod tests {
         }
     }
 
-    fn one_column_batch(values: Vec<i64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int64, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
-            .expect("build record batch")
+    fn one_column_batch(values: Vec<i64>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![slot_field(
+            "c1",
+            DataType::Int64,
+            false,
+            1,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
+            .expect("build record batch");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn dup_auto_increment_batch(c1_values: Vec<i64>, id_values: Vec<Option<i64>>) -> RecordBatch {
         assert_eq!(c1_values.len(), id_values.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("c1", DataType::Int64, false),
-            Field::new("id", DataType::Int64, true),
+            slot_field("c1", DataType::Int64, false, 1),
+            slot_field("id", DataType::Int64, true, 2),
         ]));
         RecordBatch::try_new(
             schema,
@@ -3857,19 +3872,15 @@ mod tests {
         .expect("build auto-increment duplicate-key batch")
     }
 
-    fn rollup_source_batch(
-        k1_values: Vec<i32>,
-        k2_values: Vec<i32>,
-        v1_values: Vec<i64>,
-    ) -> RecordBatch {
+    fn rollup_source_batch(k1_values: Vec<i32>, k2_values: Vec<i32>, v1_values: Vec<i64>) -> Chunk {
         assert_eq!(k1_values.len(), k2_values.len());
         assert_eq!(k1_values.len(), v1_values.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("k2", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("k2", DataType::Int32, false, 2),
+            slot_field("v1", DataType::Int64, true, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(k1_values)),
@@ -3877,23 +3888,31 @@ mod tests {
                 Arc::new(Int64Array::from(v1_values)),
             ],
         )
-        .expect("build rollup source batch")
+        .expect("build rollup source batch");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn rollup_source_batch_missing_value(k1_values: Vec<i32>, k2_values: Vec<i32>) -> RecordBatch {
+    fn rollup_source_batch_missing_value(k1_values: Vec<i32>, k2_values: Vec<i32>) -> Chunk {
         assert_eq!(k1_values.len(), k2_values.len());
+        let extra_values = k2_values
+            .iter()
+            .map(|v| v.saturating_add(1000))
+            .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("k2", DataType::Int32, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("k2", DataType::Int32, false, 2),
+            slot_field("k3", DataType::Int32, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(k1_values)),
                 Arc::new(Int32Array::from(k2_values)),
+                Arc::new(Int32Array::from(extra_values)),
             ],
         )
-        .expect("build rollup source batch without value column")
+        .expect("build rollup source batch with extra columns but without value column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
     fn test_duplicate_key_full_schema_tablet_schema(schema_id: i64) -> TabletSchemaPb {
@@ -4018,14 +4037,14 @@ mod tests {
         }
     }
 
-    fn duplicate_key_full_schema_repeated_expr_batch() -> RecordBatch {
+    fn duplicate_key_full_schema_repeated_expr_batch() -> Chunk {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("generate_series", DataType::Utf8, true),
-            Field::new("generate_series", DataType::Utf8, false),
-            Field::new("generate_series", DataType::Int32, true),
-            Field::new("generate_series", DataType::Int32, false),
+            slot_field("generate_series", DataType::Utf8, true, 1),
+            slot_field("generate_series", DataType::Utf8, false, 2),
+            slot_field("generate_series", DataType::Int32, true, 3),
+            slot_field("generate_series", DataType::Int32, false, 4),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(vec![Some("1"), Some("2")])),
@@ -4034,40 +4053,56 @@ mod tests {
                 Arc::new(Int32Array::from(vec![1, 2])),
             ],
         )
-        .expect("build duplicate-key full-schema batch with repeated expression names")
+        .expect("build duplicate-key full-schema batch with repeated expression names");
+        Chunk::new_with_slot_ids(
+            batch,
+            &[
+                SlotId::new(1),
+                SlotId::new(2),
+                SlotId::new(3),
+                SlotId::new(4),
+            ],
+        )
     }
 
-    fn pk_key_only_batch(keys: Vec<i32>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Int32, false)]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(keys))])
-            .expect("build key-only record batch")
+    fn pk_key_only_batch(keys: Vec<i32>) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![slot_field(
+            "k1",
+            DataType::Int32,
+            false,
+            1,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(keys))])
+            .expect("build key-only record batch");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
-    fn pk_delete_batch_with_op(keys: Vec<i32>) -> RecordBatch {
+    fn pk_delete_batch_with_op(keys: Vec<i32>) -> Chunk {
         let row_count = keys.len();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("__op", DataType::Int8, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("__op", DataType::Int8, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
                 Arc::new(Int8Array::from(vec![super::OP_TYPE_DELETE; row_count])),
             ],
         )
-        .expect("build delete record batch with explicit op column")
+        .expect("build delete record batch with explicit op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(3)])
     }
 
-    fn pk_upsert_batch_with_op(keys: Vec<i32>, values: Vec<i64>) -> RecordBatch {
+    fn pk_upsert_batch_with_op(keys: Vec<i32>, values: Vec<i64>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         let row_count = keys.len();
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Int8, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("v1", DataType::Int64, true, 2),
+            slot_field("__op", DataType::Int8, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -4075,18 +4110,19 @@ mod tests {
                 Arc::new(Int8Array::from(vec![super::OP_TYPE_UPSERT; row_count])),
             ],
         )
-        .expect("build upsert record batch with explicit op column")
+        .expect("build upsert record batch with explicit op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn pk_mixed_batch_with_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> RecordBatch {
+    fn pk_mixed_batch_with_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Int8, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("v1", DataType::Int64, true, 2),
+            slot_field("__op", DataType::Int8, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -4094,22 +4130,19 @@ mod tests {
                 Arc::new(Int8Array::from(ops)),
             ],
         )
-        .expect("build mixed record batch with explicit op column")
+        .expect("build mixed record batch with explicit op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn pk_batch_with_nullable_op(
-        keys: Vec<i32>,
-        values: Vec<i64>,
-        ops: Vec<Option<i8>>,
-    ) -> RecordBatch {
+    fn pk_batch_with_nullable_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<Option<i8>>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Int8, true),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("v1", DataType::Int64, true, 2),
+            slot_field("__op", DataType::Int8, true, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -4117,18 +4150,19 @@ mod tests {
                 Arc::new(Int8Array::from(ops)),
             ],
         )
-        .expect("build batch with nullable op column")
+        .expect("build batch with nullable op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn pk_batch_with_int32_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i32>) -> RecordBatch {
+    fn pk_batch_with_int32_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i32>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Int32, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("v1", DataType::Int64, true, 2),
+            slot_field("__op", DataType::Int32, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -4136,18 +4170,19 @@ mod tests {
                 Arc::new(Int32Array::from(ops)),
             ],
         )
-        .expect("build batch with int32 op column")
+        .expect("build batch with int32 op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn pk_batch_with_float64_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<f64>) -> RecordBatch {
+    fn pk_batch_with_float64_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<f64>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("v1", DataType::Int64, true),
-            Field::new("__op", DataType::Float64, false),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("v1", DataType::Int64, true, 2),
+            slot_field("__op", DataType::Float64, false, 3),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -4155,18 +4190,19 @@ mod tests {
                 Arc::new(Float64Array::from(ops)),
             ],
         )
-        .expect("build batch with float64 op column")
+        .expect("build batch with float64 op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
     }
 
-    fn pk_batch_with_non_last_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> RecordBatch {
+    fn pk_batch_with_non_last_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Int32, false),
-            Field::new("__op", DataType::Int8, false),
-            Field::new("v1", DataType::Int64, true),
+            slot_field("k1", DataType::Int32, false, 1),
+            slot_field("__op", DataType::Int8, false, 3),
+            slot_field("v1", DataType::Int64, true, 2),
         ]));
-        RecordBatch::try_new(
+        let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int32Array::from(keys)),
@@ -4174,17 +4210,28 @@ mod tests {
                 Arc::new(Int64Array::from(values)),
             ],
         )
-        .expect("build batch with non-last op column")
+        .expect("build batch with non-last op column");
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(3), SlotId::new(2)])
     }
 
     fn pk_bigint_key_only_batch(keys: Vec<i64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Int64, false)]));
+        let schema = Arc::new(Schema::new(vec![slot_field(
+            "k1",
+            DataType::Int64,
+            false,
+            1,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(keys))])
             .expect("build bigint key-only batch")
     }
 
     fn pk_string_key_only_batch(keys: Vec<&str>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("k1", DataType::Utf8, false)]));
+        let schema = Arc::new(Schema::new(vec![slot_field(
+            "k1",
+            DataType::Utf8,
+            false,
+            1,
+        )]));
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(keys))])
             .expect("build string key-only batch")
     }
@@ -4192,8 +4239,8 @@ mod tests {
     fn pk_composite_key_only_batch(k1: Vec<&str>, k2: Vec<i32>) -> RecordBatch {
         assert_eq!(k1.len(), k2.len());
         let schema = Arc::new(Schema::new(vec![
-            Field::new("k1", DataType::Utf8, false),
-            Field::new("k2", DataType::Int32, false),
+            slot_field("k1", DataType::Utf8, false, 1),
+            slot_field("k2", DataType::Int32, false, 2),
         ]));
         RecordBatch::try_new(
             schema,

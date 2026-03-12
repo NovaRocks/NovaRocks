@@ -432,7 +432,7 @@ mod tests {
             SlotId::new(1),
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn literal_i64(arena: &mut ExprArena, v: i64) -> ExprId {

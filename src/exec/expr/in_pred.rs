@@ -395,7 +395,7 @@ mod tests {
             SlotId::new(1),
         )]));
         let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let mut arena = ExprArena::default();
         let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), ts_type.clone());

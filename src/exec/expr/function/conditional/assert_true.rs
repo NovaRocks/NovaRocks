@@ -115,7 +115,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![field]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(values))]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     #[test]

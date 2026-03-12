@@ -186,7 +186,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("c1", data_type, true), SlotId(1));
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId(1)])
     }
 
     #[test]

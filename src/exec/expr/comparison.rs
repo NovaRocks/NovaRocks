@@ -1261,7 +1261,7 @@ mod tests {
             SlotId::new(1),
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn create_test_chunk_i64_nullable(left: Vec<Option<i64>>, right: Vec<Option<i64>>) -> Chunk {
@@ -1272,7 +1272,7 @@ mod tests {
             field_with_slot_id(Field::new("r", DataType::Int64, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
     }
 
     fn create_test_chunk_bool(l: Vec<Option<bool>>, r: Vec<Option<bool>>) -> Chunk {
@@ -1283,7 +1283,7 @@ mod tests {
             field_with_slot_id(Field::new("r", DataType::Boolean, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![l, r]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
     }
 
     fn create_test_chunk_list_i64(left: ListArray, right: ListArray, list_type: DataType) -> Chunk {
@@ -1294,7 +1294,7 @@ mod tests {
             field_with_slot_id(Field::new("r", list_type, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
     }
 
     fn create_test_chunk_struct_i32(
@@ -1309,7 +1309,7 @@ mod tests {
             field_with_slot_id(Field::new("r", struct_type, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
     }
 
     fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {
@@ -1345,7 +1345,7 @@ mod tests {
             field_with_slot_id(Field::new("r", map_type, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
     }
 
     #[test]
@@ -1518,7 +1518,7 @@ mod tests {
                 ),
             ]));
             let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-            Chunk::new(batch)
+            Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)])
         };
 
         let out = arena.eval(expr, &chunk).unwrap();
@@ -1556,7 +1556,7 @@ mod tests {
             field_with_slot_id(Field::new("r", DataType::Utf8, true), SlotId::new(2)),
         ]));
         let batch = RecordBatch::try_new(schema, vec![ts_arr, str_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
 
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();

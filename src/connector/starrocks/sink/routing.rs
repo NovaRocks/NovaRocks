@@ -1021,7 +1021,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::sink::partition_key::{PartitionKeySource, PartitionSlotRef};
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::{data_sinks, descriptors, exprs, types};
 
     fn build_test_schema() -> descriptors::TOlapTableSchemaParam {
@@ -1146,19 +1146,19 @@ mod tests {
     }
 
     fn build_test_chunk(values: Vec<i64>) -> Chunk {
-        let field = field_with_slot_id(Field::new("k", DataType::Int64, false), SlotId::new(1));
+        let field = Field::new("k", DataType::Int64, false);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build test batch");
-        Chunk::try_new(batch).expect("build chunk")
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn build_test_chunk_with_slot(slot_id: SlotId, values: Vec<i64>) -> Chunk {
-        let field = field_with_slot_id(Field::new("k", DataType::Int64, false), slot_id);
+        let field = Field::new("k", DataType::Int64, false);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build test batch");
-        Chunk::try_new(batch).expect("build chunk")
+        Chunk::new_with_slot_ids(batch, &[slot_id])
     }
 
     fn create_dummy_type() -> types::TTypeDesc {

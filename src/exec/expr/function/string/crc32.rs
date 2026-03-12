@@ -129,7 +129,7 @@ mod tests {
         let field = field_with_slot_id(Field::new("c1", DataType::Utf8, true), SlotId(1));
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![input]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId(1)]);
 
         let out = eval_crc32(&arena, arg, &[arg], &chunk).expect("eval crc32");
         let out = out

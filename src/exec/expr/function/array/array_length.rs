@@ -160,7 +160,7 @@ mod tests {
             SlotId::new(1),
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
 
         let out = eval_array_length(&arena, expr, &[cast_expr], &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Int64Array>().unwrap();

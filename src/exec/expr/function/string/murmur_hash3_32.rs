@@ -175,7 +175,10 @@ mod tests {
             field_with_slot_id(Field::new("c1", DataType::Utf8, true), SlotId(1)),
             field_with_slot_id(Field::new("c2", DataType::Utf8, true), SlotId(2)),
         ]));
-        let chunk = Chunk::new(RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch"));
+        let chunk = Chunk::new_with_slot_ids(
+            RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch"),
+            &[SlotId(1), SlotId(2)],
+        );
 
         let out_single = eval_murmur_hash3_32(&arena, arg0, &[arg0], &chunk).expect("eval single");
         let out_single = out_single
@@ -207,7 +210,10 @@ mod tests {
             field_with_slot_id(Field::new("c1", DataType::Utf8, true), SlotId(1)),
             field_with_slot_id(Field::new("c2", DataType::Utf8, true), SlotId(2)),
         ]));
-        let chunk = Chunk::new(RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch"));
+        let chunk = Chunk::new_with_slot_ids(
+            RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch"),
+            &[SlotId(1), SlotId(2)],
+        );
 
         let out = eval_murmur_hash3_32(&arena, arg0, &[arg0, arg1], &chunk).expect("eval");
         let out = out

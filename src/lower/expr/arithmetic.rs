@@ -178,7 +178,7 @@ mod tests {
         let schema = Arc::new(Schema::empty());
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(schema, vec![], &options).expect("batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[])
     }
 
     fn eval_scalar_array(arena: &ExprArena, id: ExprId, chunk: &Chunk) -> ArrayRef {
@@ -306,7 +306,7 @@ mod tests {
         let col0 = Arc::new(Int64Array::from(vec![Some(10)]));
         let col1 = Arc::new(Int64Array::from(vec![Some(20)]));
         let batch = RecordBatch::try_new(schema, vec![col0, col1]).expect("batch");
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(0), SlotId::new(1)]);
         let array = eval_scalar_array(&arena, id, &chunk);
         let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
         assert!(!arr.is_null(0));

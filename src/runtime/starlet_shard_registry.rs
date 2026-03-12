@@ -293,7 +293,7 @@ pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
     TEST_GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("lock starlet shard registry test guard")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

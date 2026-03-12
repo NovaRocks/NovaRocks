@@ -431,7 +431,7 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
         )
         .expect("record batch");
-        let chunk = Chunk::try_new(batch).expect("chunk");
+        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
         exchange::register_expected_chunk_schema(key, 1, chunk.chunk_schema_ref())
             .expect("register expected chunk schema");
         let payload = exchange::encode_chunks(&[chunk], true).expect("encode chunks");

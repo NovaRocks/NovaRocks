@@ -1057,17 +1057,22 @@ pub fn encode_chunks(chunks: &[Chunk], include_slot_ids: bool) -> Result<Vec<u8>
 }
 
 #[cfg(test)]
-/// Decode chunks from exchange payload format using field metadata on the Arrow schema.
-///
-/// This remains as a compatibility helper for code paths/tests that still operate on
-/// self-describing Arrow batches. Exchange runtime should use `decode_chunks_for_sender`.
 pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
-    let decoded = decode_exchange_payload_envelope(bytes)?;
-    let batches = decode_arrow_ipc_batches(decoded.arrow_payload)?;
-    let mut chunks = Vec::new();
+    let DecodedExchangePayload {
+        wire_meta,
+        arrow_payload,
+    } = decode_exchange_payload_envelope(bytes)?;
+    let wire_meta = wire_meta.ok_or_else(|| "exchange wire meta missing".to_string())?;
+    let batches = decode_arrow_ipc_batches(arrow_payload)?;
+    let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
-        let chunk = Chunk::try_new(batch)?;
-        chunks.push(chunk);
+        let chunk_schema = Arc::new(
+            crate::exec::chunk::ChunkSchema::try_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &wire_meta.slot_ids_by_index,
+            )?,
+        );
+        chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
     }
     Ok(chunks)
 }
@@ -1187,14 +1192,21 @@ mod tests {
         register_expected_chunk_schema,
     };
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSlotSchema, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSlotSchema};
+
+    const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
+        SlotId::new(33),
+        SlotId::new(34),
+        SlotId::new(31),
+        SlotId::new(32),
+    ];
 
     fn exchange_test_chunk(last_name: &str) -> Chunk {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("v1", DataType::Int32, true), SlotId::new(33)),
-            field_with_slot_id(Field::new("v2", DataType::Int32, true), SlotId::new(34)),
-            field_with_slot_id(Field::new("k1", DataType::Int32, true), SlotId::new(31)),
-            field_with_slot_id(Field::new(last_name, DataType::Utf8, true), SlotId::new(32)),
+            Field::new("v1", DataType::Int32, true),
+            Field::new("v2", DataType::Int32, true),
+            Field::new("k1", DataType::Int32, true),
+            Field::new(last_name, DataType::Utf8, true),
         ]));
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int32Array::from(vec![Some(1)])),
@@ -1203,7 +1215,7 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("x")])),
         ];
         let batch = RecordBatch::try_new(schema, columns).expect("record batch");
-        Chunk::try_new(batch).expect("chunk")
+        Chunk::new_with_slot_ids(batch, &EXCHANGE_TEST_SLOT_IDS)
     }
 
     fn exchange_test_chunk_without_metadata(last_name: &str) -> Chunk {
@@ -1285,10 +1297,10 @@ mod tests {
     fn encode_chunks_rejects_slot_id_mismatch() {
         let first = exchange_test_chunk("_cse_0");
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("v1", DataType::Int32, true), SlotId::new(33)),
-            field_with_slot_id(Field::new("v2", DataType::Int32, true), SlotId::new(34)),
-            field_with_slot_id(Field::new("k1", DataType::Int32, true), SlotId::new(31)),
-            field_with_slot_id(Field::new("_cse_2", DataType::Utf8, true), SlotId::new(99)),
+            Field::new("v1", DataType::Int32, true),
+            Field::new("v2", DataType::Int32, true),
+            Field::new("k1", DataType::Int32, true),
+            Field::new("_cse_2", DataType::Utf8, true),
         ]));
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Int32Array::from(vec![Some(1)])),
@@ -1296,8 +1308,15 @@ mod tests {
             Arc::new(Int32Array::from(vec![Some(3)])),
             Arc::new(StringArray::from(vec![Some("x")])),
         ];
-        let second = Chunk::try_new(RecordBatch::try_new(schema, columns).expect("record batch"))
-            .expect("chunk");
+        let second = Chunk::new_with_slot_ids(
+            RecordBatch::try_new(schema, columns).expect("record batch"),
+            &[
+                SlotId::new(33),
+                SlotId::new(34),
+                SlotId::new(31),
+                SlotId::new(99),
+            ],
+        );
 
         let err =
             encode_chunks(&[first, second], true).expect_err("should reject mismatched slot id");

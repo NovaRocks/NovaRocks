@@ -877,7 +877,10 @@ mod tests {
             )]));
             let array = Arc::new(Int32Array::from(self.values.clone())) as arrow::array::ArrayRef;
             let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| e.to_string())?;
-            Ok(Box::new(std::iter::once(Ok(Chunk::new(batch)))))
+            Ok(Box::new(std::iter::once(Ok(Chunk::new_with_slot_ids(
+                batch,
+                &[SlotId::new(1)],
+            )))))
         }
 
         fn build_morsels(&self) -> Result<ScanMorsels, String> {
@@ -903,7 +906,7 @@ mod tests {
         )]));
         let array = Arc::new(Int32Array::from(vec![v])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("build test batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     #[test]

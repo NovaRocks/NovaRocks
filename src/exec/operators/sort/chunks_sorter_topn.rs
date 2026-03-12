@@ -393,7 +393,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("record batch");
-        Chunk::new(batch)
+        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
     }
 
     fn single_key_order_by(asc: bool, nulls_first: bool) -> (ExprArena, Vec<SortExpression>) {

@@ -297,10 +297,16 @@ mod tests {
         )
         .unwrap();
         let chunks = vec![
-            Chunk::try_new(batch1).unwrap(),
-            Chunk::try_new(batch2).unwrap(),
+            Chunk::new_with_slot_ids(batch1, &[SlotId::new(1), SlotId::new(2)]),
+            Chunk::new_with_slot_ids(batch2, &[SlotId::new(1), SlotId::new(2)]),
         ];
-        let chunk_schema = Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).unwrap());
+        let chunk_schema = Arc::new(
+            ChunkSchema::try_from_schema_and_slot_ids(
+                schema.as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .unwrap(),
+        );
 
         let temp = tempdir().unwrap();
         let storage = SpillStorageConfig {
