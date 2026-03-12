@@ -42,7 +42,6 @@ pub(crate) enum BeSchemaTable {
     Tablets,
     Threads,
     Bvars,
-    Metrics,
     Unsupported(String),
 }
 
@@ -63,7 +62,6 @@ impl BeSchemaTable {
             "be_tablets" => Self::Tablets,
             "be_threads" => Self::Threads,
             "be_bvars" => Self::Bvars,
-            "be_metrics" => Self::Metrics,
             _ => Self::Unsupported(normalized),
         })
     }
@@ -80,7 +78,6 @@ impl BeSchemaTable {
             Self::Tablets => "be_tablets",
             Self::Threads => "be_threads",
             Self::Bvars => "be_bvars",
-            Self::Metrics => "be_metrics",
             Self::Unsupported(name) => name.as_str(),
         }
     }

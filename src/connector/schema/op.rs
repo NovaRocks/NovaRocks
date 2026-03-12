@@ -320,7 +320,6 @@ impl SchemaScanOp {
             SchemaTable::Be(BeSchemaTable::Tablets) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Threads) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Bvars) => Vec::new(),
-            SchemaTable::Be(BeSchemaTable::Metrics) => build_be_metric_rows(),
             SchemaTable::Be(BeSchemaTable::Unsupported(_)) => Vec::new(),
         };
 
@@ -331,39 +330,6 @@ impl SchemaScanOp {
         }
         Ok(rows)
     }
-}
-
-fn build_be_metric_rows() -> Vec<SchemaRow> {
-    const METRIC_NAMES: [&str; 3] = [
-        "pipe_connector_scan_execution_time",
-        "pipe_driver_execution_time",
-        "pipe_scan_execution_time",
-    ];
-    const LABELS: [&str; 3] = [
-        "workload_type=load",
-        "workload_type=query",
-        "workload_type=unknown",
-    ];
-
-    let be_id = backend_id::backend_id().unwrap_or(-1);
-    let mut rows = Vec::with_capacity(METRIC_NAMES.len() * LABELS.len());
-    for metric_name in METRIC_NAMES {
-        for labels in LABELS {
-            let mut row = SchemaRow::new();
-            row.insert(normalize_column_key("BE_ID"), SchemaValue::Int64(be_id));
-            row.insert(
-                normalize_column_key("NAME"),
-                SchemaValue::Utf8(metric_name.to_string()),
-            );
-            row.insert(
-                normalize_column_key("LABELS"),
-                SchemaValue::Utf8(labels.to_string()),
-            );
-            row.insert(normalize_column_key("VALUE"), SchemaValue::Int64(0));
-            rows.push(row);
-        }
-    }
-    rows
 }
 
 fn build_be_config_rows() -> Result<Vec<SchemaRow>, String> {

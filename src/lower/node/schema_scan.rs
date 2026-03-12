@@ -110,7 +110,6 @@ fn schema_table_requires_scan_ranges(table: &SchemaTable) -> bool {
                 | BeSchemaTable::Tablets
                 | BeSchemaTable::Threads
                 | BeSchemaTable::Bvars
-                | BeSchemaTable::Metrics
         )
     )
 }
@@ -369,7 +368,6 @@ mod tests {
             "be_txns",
             "be_compactions",
             "be_bvars",
-            "be_metrics",
         ];
         for table_name in table_names {
             let node = schema_scan_plan_node(table_name);

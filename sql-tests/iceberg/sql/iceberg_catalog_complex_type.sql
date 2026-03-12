@@ -1,16 +1,6 @@
 -- @order_sensitive=true
 -- Validate Iceberg complex-type readback and nested-field pruning explain text.
 -- query 1
-CREATE EXTERNAL CATALOG iceberg_cat_${uuid0}
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "${iceberg_catalog_type}",
-  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}",
-  "aws.s3.access_key" = "${oss_ak}",
-  "aws.s3.secret_key" = "${oss_sk}",
-  "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.enable_path_style_access" = "true"
-);
 CREATE DATABASE iceberg_cat_${uuid0}.iceberg_db_${uuid0};
 CREATE TABLE iceberg_cat_${uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} (
   name ARRAY<STRUCT<
@@ -34,4 +24,3 @@ FROM iceberg_cat_${uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0};
 SET catalog default_catalog;
 DROP TABLE iceberg_cat_${uuid0}.iceberg_db_${uuid0}.ice_tbl_${uuid0} FORCE;
 DROP DATABASE iceberg_cat_${uuid0}.iceberg_db_${uuid0};
-DROP CATALOG iceberg_cat_${uuid0};

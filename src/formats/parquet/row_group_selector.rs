@@ -213,6 +213,14 @@ fn check_max_satisfies_ge(
             }
         }
         Statistics::FixedLenByteArray(s) => {
+            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
+                if let Some(max) = s
+                    .max_opt()
+                    .and_then(|max| decode_signed_be_i128(max.data()))
+                {
+                    return Ok(max >= v);
+                }
+            }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
             };
@@ -292,6 +300,14 @@ fn check_min_satisfies_le(
             }
         }
         Statistics::FixedLenByteArray(s) => {
+            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
+                if let Some(min) = s
+                    .min_opt()
+                    .and_then(|min| decode_signed_be_i128(min.data()))
+                {
+                    return Ok(min <= v);
+                }
+            }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
             };
@@ -371,6 +387,14 @@ fn check_max_satisfies_gt(
             }
         }
         Statistics::FixedLenByteArray(s) => {
+            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
+                if let Some(max) = s
+                    .max_opt()
+                    .and_then(|max| decode_signed_be_i128(max.data()))
+                {
+                    return Ok(max > v);
+                }
+            }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
             };
@@ -450,6 +474,14 @@ fn check_min_satisfies_lt(
             }
         }
         Statistics::FixedLenByteArray(s) => {
+            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
+                if let Some(min) = s
+                    .min_opt()
+                    .and_then(|min| decode_signed_be_i128(min.data()))
+                {
+                    return Ok(min < v);
+                }
+            }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
             };
@@ -461,6 +493,25 @@ fn check_min_satisfies_lt(
         }
         _ => Ok(true),
     }
+}
+
+fn fixed_len_predicate_value_as_i128(value: &MinMaxPredicateValue) -> Option<i128> {
+    match value {
+        MinMaxPredicateValue::Decimal128 { value, .. } => Some(*value),
+        MinMaxPredicateValue::FixedLenByteArray(bytes) => decode_signed_be_i128(bytes),
+        _ => None,
+    }
+}
+
+fn decode_signed_be_i128(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let fill = if bytes[0] & 0x80 != 0 { 0xFF } else { 0x00 };
+    let mut buf = [fill; 16];
+    let start = buf.len().saturating_sub(bytes.len());
+    buf[start..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf))
 }
 
 fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
@@ -477,4 +528,53 @@ fn row_group_start_offset(row_group: &RowGroupMetaData) -> Option<u64> {
         });
     }
     start
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::data_type::{ByteArray, FixedLenByteArray};
+    use parquet::file::statistics::ValueStatistics;
+
+    #[test]
+    fn fixed_len_decimal_stats_compare_numerically_with_binary_literal_width_mismatch() {
+        let stats = Statistics::FixedLenByteArray(ValueStatistics::new(
+            Some(FixedLenByteArray::from(ByteArray::from(vec![
+                0x00, 0x00, 0x00, 0x00,
+            ]))),
+            Some(FixedLenByteArray::from(ByteArray::from(vec![
+                0x00, 0x00, 0x4d, 0xf4,
+            ]))),
+            None,
+            None,
+            false,
+        ));
+        let predicate = MinMaxPredicateValue::FixedLenByteArray(vec![0; 16]);
+
+        assert!(check_max_satisfies_gt(&stats, &predicate).expect("compare fixed-len stats"));
+        assert!(check_min_satisfies_le(&stats, &predicate).expect("compare fixed-len stats"));
+    }
+
+    #[test]
+    fn fixed_len_decimal_stats_compare_numerically_with_decimal_literal() {
+        let stats = Statistics::FixedLenByteArray(ValueStatistics::new(
+            Some(FixedLenByteArray::from(ByteArray::from(vec![
+                0x00, 0x00, 0x00, 0x00,
+            ]))),
+            Some(FixedLenByteArray::from(ByteArray::from(vec![
+                0x00, 0x00, 0x4d, 0xf4,
+            ]))),
+            None,
+            None,
+            false,
+        ));
+        let predicate = MinMaxPredicateValue::Decimal128 {
+            value: 0,
+            precision: 7,
+            scale: 2,
+        };
+
+        assert!(check_max_satisfies_gt(&stats, &predicate).expect("compare decimal stats"));
+        assert!(!check_min_satisfies_lt(&stats, &predicate).expect("compare decimal stats"));
+    }
 }

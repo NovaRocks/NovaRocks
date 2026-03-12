@@ -904,7 +904,10 @@ impl PipelineDriver {
                     *made_progress = true;
                 }
                 Err(err) => {
-                    return Err(err);
+                    return Err(format!(
+                        "pipeline push into operator {} (edge {} -> {}) failed: {}",
+                        downstream_name, e, downstream_idx, err
+                    ));
                 }
             }
         }
@@ -1024,7 +1027,10 @@ impl PipelineDriver {
             let maybe = match maybe {
                 Ok(value) => value,
                 Err(err) => {
-                    return Err(err);
+                    return Err(format!(
+                        "pipeline pull from operator {} (edge {} -> {}) failed: {}",
+                        upstream_name, upstream_idx, e, err
+                    ));
                 }
             };
             if let Some(mut chunk) = maybe {
@@ -1109,7 +1115,10 @@ impl PipelineDriver {
                 counters.operator_total_time.add(elapsed_ns);
             }
             if let Err(err) = result {
-                return Err(err);
+                return Err(format!(
+                    "pipeline set_finishing on operator {} (idx {}) failed: {}",
+                    op_name, idx, err
+                ));
             }
             debug!(
                 "Driver set_finishing: driver_id={} op_idx={} op_name={} success. edge_closed[{}]={}",

@@ -970,6 +970,27 @@ impl KeyColumn {
             KeyColumn::Complex { data_type, .. } => data_type.clone(),
         }
     }
+
+    pub(crate) fn has_nulls(&self) -> bool {
+        match self {
+            KeyColumn::Int8 { nulls, .. }
+            | KeyColumn::Int16 { nulls, .. }
+            | KeyColumn::Int32 { nulls, .. }
+            | KeyColumn::Int64 { nulls, .. }
+            | KeyColumn::Float32 { nulls, .. }
+            | KeyColumn::Float64 { nulls, .. }
+            | KeyColumn::Boolean { nulls, .. }
+            | KeyColumn::Utf8 { nulls, .. }
+            | KeyColumn::Date32 { nulls, .. }
+            | KeyColumn::Timestamp { nulls, .. }
+            | KeyColumn::Decimal128 { nulls, .. }
+            | KeyColumn::Decimal256 { nulls, .. }
+            | KeyColumn::LargeIntBinary { nulls, .. }
+            | KeyColumn::Complex { nulls, .. } => nulls.iter().any(|valid| *valid == 0),
+            KeyColumn::ListUtf8 { values } => values.iter().any(|value| value.is_none()),
+            KeyColumn::ListInt32 { values } => values.iter().any(|value| value.is_none()),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1066,6 +1087,7 @@ pub(crate) fn build_output_schema_from_kernels(
     output_intermediate: bool,
     output_slots: &[SlotId],
     output_chunk_schema: Option<&ChunkSchemaRef>,
+    group_key_nullable: Option<&[bool]>,
 ) -> Result<SchemaRef, String> {
     let mut fields: Vec<Field> = Vec::with_capacity(key_columns.len() + kernels.len());
     let mut chunk_slots = Vec::with_capacity(key_columns.len() + kernels.len());
@@ -1077,12 +1099,26 @@ pub(crate) fn build_output_schema_from_kernels(
             )
         })?;
         let slot_schema = output_chunk_schema.and_then(|schema| schema.slot(slot_id));
+        let runtime_nullable = group_key_nullable
+            .and_then(|nullable| nullable.get(idx).copied())
+            .unwrap_or_else(|| col.has_nulls());
+        let nullable = slot_schema
+            .map(|schema| schema.nullable() || runtime_nullable)
+            .unwrap_or(true);
         let field = slot_schema
-            .map(|schema| Field::new(schema.name(), col.data_type(), schema.nullable()))
+            .map(|schema| Field::new(schema.name(), col.data_type(), nullable))
             .unwrap_or_else(|| Field::new(format!("group_{}", idx), col.data_type(), true));
-        let chunk_slot = slot_schema.cloned().unwrap_or_else(|| {
+        let chunk_slot = if let Some(schema) = slot_schema {
+            ChunkSlotSchema::try_new(
+                slot_id,
+                field.name(),
+                nullable,
+                schema.type_desc().cloned(),
+                schema.unique_id(),
+            )?
+        } else {
             ChunkSlotSchema::new(slot_id, field.name(), field.is_nullable(), None, None)
-        });
+        };
         fields.push(field);
         chunk_slots.push(chunk_slot);
     }
@@ -1128,4 +1164,45 @@ pub(crate) fn build_output_schema_from_kernels(
     }
     let _chunk_schema = ChunkSchema::try_new(chunk_slots)?;
     Ok(Arc::new(Schema::new(fields)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KeyColumn, build_output_schema_from_kernels};
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::types::TPrimitiveType;
+    use std::sync::Arc;
+
+    #[test]
+    fn build_output_schema_marks_nullable_group_keys_when_runtime_keys_contain_nulls() {
+        let key_columns = vec![KeyColumn::Int8 {
+            values: vec![0, 1],
+            nulls: vec![0, 1],
+        }];
+        let output_slots = vec![SlotId::new(13)];
+        let output_chunk_schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                SlotId::new(13),
+                "col_5_13",
+                false,
+                Some(scalar_type_desc(TPrimitiveType::TINYINT)),
+                None,
+            )])
+            .expect("chunk schema"),
+        );
+
+        let schema = build_output_schema_from_kernels(
+            &key_columns,
+            &[],
+            false,
+            &output_slots,
+            Some(&output_chunk_schema),
+            None,
+        )
+        .expect("output schema");
+
+        assert!(schema.field(0).is_nullable());
+    }
 }

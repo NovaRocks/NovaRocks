@@ -40,7 +40,7 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use crate::exec::node::nljoin::NestedLoopJoinType;
 use crate::exec::operators::hashjoin::join_probe_utils::{
-    build_join_batch, build_left_with_null_right, build_null_left_with_right,
+    build_join_batch, build_left_with_null_right, build_null_left_with_right, schema_is_compatible,
 };
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -342,16 +342,17 @@ impl ProcessorOperator for NlJoinProbeProcessorOperator {
 
 impl NlJoinProbeProcessorOperator {
     fn chunk_from_batch_by_schema(&self, batch: RecordBatch) -> Result<Chunk, String> {
-        let chunk_schema = if batch.schema().as_ref() == self.join_scope_schema.as_ref() {
+        let batch_schema = batch.schema();
+        let chunk_schema = if schema_is_compatible(&batch_schema, &self.join_scope_schema) {
             Arc::clone(&self.join_scope_chunk_schema)
-        } else if batch.schema().as_ref() == self.left_schema.as_ref() {
+        } else if schema_is_compatible(&batch_schema, &self.left_schema) {
             Arc::clone(&self.left_chunk_schema)
-        } else if batch.schema().as_ref() == self.right_schema.as_ref() {
+        } else if schema_is_compatible(&batch_schema, &self.right_schema) {
             Arc::clone(&self.right_chunk_schema)
         } else {
             return Err(format!(
                 "nljoin batch schema does not match left/right/join scope schemas: {:?}",
-                batch.schema()
+                batch_schema
             ));
         };
         Chunk::try_new_with_chunk_schema(batch, chunk_schema)

@@ -20,10 +20,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
+use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
@@ -882,7 +884,6 @@ fn exchange_schema_compatible(expected: &Chunk, actual: &Chunk) -> Result<bool, 
     {
         if expected_slot.slot_id() != actual_slot.slot_id()
             || expected_field.data_type() != actual_field.data_type()
-            || expected_field.is_nullable() != actual_field.is_nullable()
         {
             return Ok(false);
         }
@@ -891,31 +892,56 @@ fn exchange_schema_compatible(expected: &Chunk, actual: &Chunk) -> Result<bool, 
     Ok(true)
 }
 
+fn merged_exchange_schema(chunks: &[Chunk]) -> Result<SchemaRef, String> {
+    let first = chunks
+        .first()
+        .ok_or_else(|| "exchange chunks must not be empty".to_string())?;
+    let mut fields = first
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+
+    for (chunk_idx, chunk) in chunks.iter().enumerate().skip(1) {
+        if !exchange_schema_compatible(first, chunk)? {
+            return Err(format!(
+                "exchange encode schema mismatch at chunk index {}: expected={:?} actual={:?}",
+                chunk_idx,
+                first.schema(),
+                chunk.schema()
+            ));
+        }
+        for (field_idx, actual_field) in chunk.schema().fields().iter().enumerate() {
+            let merged = fields.get_mut(field_idx).ok_or_else(|| {
+                format!(
+                    "exchange merged schema missing field {} for chunk index {}",
+                    field_idx, chunk_idx
+                )
+            })?;
+            if actual_field.is_nullable() && !merged.is_nullable() {
+                *merged = merged.clone().with_nullable(true);
+            }
+        }
+    }
+
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     if chunks.is_empty() {
         return Ok(vec![]);
     }
 
     let mut buffer = Vec::new();
-
-    // Use the schema from the first chunk.
-    let schema = chunks[0].schema();
+    let schema = merged_exchange_schema(chunks)?;
     let mut batches = Vec::with_capacity(chunks.len());
-    batches.push(chunks[0].batch.clone());
-    for (i, c) in chunks.iter().enumerate().skip(1) {
-        if c.schema().as_ref() == schema.as_ref() && c.chunk_schema() == chunks[0].chunk_schema() {
-            batches.push(c.batch.clone());
+    for (i, chunk) in chunks.iter().enumerate() {
+        if chunk.schema().as_ref() == schema.as_ref() {
+            batches.push(chunk.batch.clone());
             continue;
         }
-        if !exchange_schema_compatible(&chunks[0], c)? {
-            return Err(format!(
-                "exchange encode schema mismatch at chunk index {}: expected={:?} actual={:?}",
-                i,
-                schema,
-                c.schema()
-            ));
-        }
-        let normalized = RecordBatch::try_new(Arc::clone(&schema), c.batch.columns().to_vec())
+        let normalized = RecordBatch::try_new(Arc::clone(&schema), chunk.batch.columns().to_vec())
             .map_err(|e| {
                 format!(
                     "failed to normalize exchange chunk schema at index {}: {e}",
@@ -992,15 +1018,6 @@ fn chunk_schema_for_wire_meta(
             )
         })?;
         let field = batch_schema.field(idx);
-        if field.is_nullable() != expected_slot.nullable() {
-            return Err(format!(
-                "exchange decoded nullable mismatch at index {} for slot {}: batch={} expected={}",
-                idx,
-                slot_id,
-                field.is_nullable(),
-                expected_slot.nullable()
-            ));
-        }
         if let Some(type_desc) = expected_slot.type_desc() {
             if let Some(expected_arrow_type) = arrow_type_from_desc(type_desc) {
                 if field.data_type() != &expected_arrow_type {
@@ -1061,8 +1078,11 @@ pub fn decode_chunks_for_sender(
     be_number: i32,
     bytes: &[u8],
 ) -> Result<Vec<Chunk>, String> {
-    let decoded = decode_exchange_payload_envelope(bytes)?;
-    if decoded.arrow_payload.is_empty() {
+    let DecodedExchangePayload {
+        wire_meta: decoded_wire_meta,
+        arrow_payload,
+    } = decode_exchange_payload_envelope(bytes)?;
+    if arrow_payload.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -1070,8 +1090,10 @@ pub fn decode_chunks_for_sender(
     let expected_chunk_schema;
     let wire_meta;
     {
+        let wait_start = Instant::now();
+        let wait_timeout = Duration::from_millis(exchange_wait_ms());
         let mut st = receiver.mu.lock().expect("exchange receiver lock");
-        if let Some(meta) = decoded.wire_meta {
+        if let Some(meta) = decoded_wire_meta {
             match st.sender_wire_meta.get(&(sender_id, be_number)) {
                 Some(existing) if existing != &meta => {
                     return Err(format!(
@@ -1104,16 +1126,45 @@ pub fn decode_chunks_for_sender(
                     )
                 })?;
         }
-        expected_chunk_schema = st.expected_chunk_schema.clone().ok_or_else(|| {
-            format!(
-                "exchange expected chunk schema not registered: finst={} node_id={}",
-                key.finst_uuid(),
-                key.node_id
-            )
-        })?;
+        loop {
+            if let Some(schema) = st.expected_chunk_schema.clone() {
+                expected_chunk_schema = schema;
+                break;
+            }
+            if st.canceled {
+                return Err("exchange canceled".to_string());
+            }
+            let elapsed = wait_start.elapsed();
+            if elapsed >= wait_timeout {
+                return Err(format!(
+                    "exchange expected chunk schema not registered: finst={} node_id={}",
+                    key.finst_uuid(),
+                    key.node_id
+                ));
+            }
+            let remain = wait_timeout - elapsed;
+            let wait_step = remain.min(EXCHANGE_WAIT_LOG_INTERVAL);
+            let (next, wait_res) = receiver
+                .cv
+                .wait_timeout(st, wait_step)
+                .map_err(|_| "exchange wait poisoned".to_string())?;
+            st = next;
+            if wait_res.timed_out() && wait_step < remain {
+                let elapsed_after = wait_start.elapsed();
+                debug!(
+                    "exchange decode waiting for schema: finst={} node_id={} sender_id={} be_number={} elapsed={:?} remain={:?}",
+                    key.finst_uuid(),
+                    key.node_id,
+                    sender_id,
+                    be_number,
+                    elapsed_after,
+                    wait_timeout.saturating_sub(elapsed_after)
+                );
+            }
+        }
     }
 
-    let batches = decode_arrow_ipc_batches(decoded.arrow_payload)?;
+    let batches = decode_arrow_ipc_batches(arrow_payload)?;
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
         let chunk_schema = chunk_schema_for_wire_meta(&expected_chunk_schema, &batch, &wire_meta)?;
@@ -1125,6 +1176,7 @@ pub fn decode_chunks_for_sender(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1135,7 +1187,7 @@ mod tests {
         register_expected_chunk_schema,
     };
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSlotSchema, field_with_slot_id};
 
     fn exchange_test_chunk(last_name: &str) -> Chunk {
         let schema = Arc::new(Schema::new(vec![
@@ -1175,6 +1227,58 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].schema(), decoded[1].schema());
         assert_eq!(decoded[0].schema().field(3).name(), "_cse_0");
+    }
+
+    #[test]
+    fn encode_chunks_normalizes_runtime_nullable_widening() {
+        let key = ExchangeKey {
+            finst_id_hi: 299,
+            finst_id_lo: 300,
+            node_id: 27,
+        };
+        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let strict = exchange_test_chunk("_cse_0");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v1", DataType::Int32, true),
+            Field::new("v2", DataType::Int32, true),
+            Field::new("k1", DataType::Int32, true),
+            Field::new("_cse_0", DataType::Utf8, true),
+        ]));
+        let widened = RecordBatch::try_new(schema, strict.batch.columns().to_vec()).expect("batch");
+        let widened_chunk_schema = Arc::new(
+            crate::exec::chunk::ChunkSchema::try_new(
+                widened
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(strict.chunk_schema().slots().iter())
+                    .map(|(field, slot)| {
+                        ChunkSlotSchema::try_new(
+                            slot.slot_id(),
+                            field.name(),
+                            field.is_nullable(),
+                            slot.type_desc().cloned(),
+                            slot.unique_id(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("slot schemas"),
+            )
+            .expect("chunk schema"),
+        );
+        let widened =
+            Chunk::try_new_with_chunk_schema(widened, widened_chunk_schema).expect("chunk");
+
+        let bytes = encode_chunks(&[strict, widened], true).expect("encode");
+        let decoded = decode_chunks_for_sender(key, 3, 1, &bytes).expect("decode widened payload");
+
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].schema().field(3).is_nullable());
+        assert!(decoded[1].schema().field(3).is_nullable());
+
+        cancel_exchange_key(key);
     }
 
     #[test]
@@ -1232,6 +1336,82 @@ mod tests {
             SlotId::new(32)
         );
         assert_eq!(second_decoded[0].schema().field(3).name(), "_cse_2");
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_accepts_runtime_nullable_widening() {
+        let key = ExchangeKey {
+            finst_id_hi: 199,
+            finst_id_lo: 200,
+            node_id: 17,
+        };
+        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let strict = exchange_test_chunk_without_metadata("_cse_0");
+        let widened_schema = Arc::new(Schema::new(vec![
+            Field::new("v1", DataType::Int32, true),
+            Field::new("v2", DataType::Int32, true),
+            Field::new("k1", DataType::Int32, true),
+            Field::new("_cse_0", DataType::Utf8, true),
+        ]));
+        let widened =
+            RecordBatch::try_new(widened_schema, strict.batch.columns().to_vec()).expect("batch");
+        let widened_chunk_schema = Arc::new(
+            crate::exec::chunk::ChunkSchema::try_new(
+                widened
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(strict.chunk_schema().slots().iter())
+                    .map(|(field, slot)| {
+                        ChunkSlotSchema::try_new(
+                            slot.slot_id(),
+                            field.name(),
+                            field.is_nullable(),
+                            slot.type_desc().cloned(),
+                            slot.unique_id(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("slot schemas"),
+            )
+            .expect("chunk schema"),
+        );
+        let widened =
+            Chunk::try_new_with_chunk_schema(widened, widened_chunk_schema).expect("chunk");
+
+        let payload = encode_chunks(&[widened], true).expect("encode");
+        let decoded = decode_chunks_for_sender(key, 3, 1, &payload).expect("decode widened chunk");
+
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].schema().field(3).is_nullable());
+        assert!(decoded[0].chunk_schema().slots()[3].nullable());
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn decode_chunks_for_sender_waits_for_schema_registration() {
+        let key = ExchangeKey {
+            finst_id_hi: 201,
+            finst_id_lo: 202,
+            node_id: 19,
+        };
+        let payload = encode_chunks(&[exchange_test_chunk("_cse_0")], true).expect("encode");
+        let decode_key = key;
+        let handle = std::thread::spawn(move || {
+            decode_chunks_for_sender(decode_key, 7, 1, &payload).expect("decode after wait")
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
+        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let decoded = handle.join().expect("join decode thread");
+        assert_eq!(decoded.len(), 1);
 
         cancel_exchange_key(key);
     }

@@ -33,7 +33,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
@@ -140,6 +140,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             output_schema: None,
             output_slots: self.output_slots.clone(),
             output_chunk_schema: self.output_chunk_schema.clone(),
+            observed_group_key_nullable: vec![false; self.group_by.len()],
             profile_initialized: false,
             profiles: None,
             key_table_mem_tracker: None,
@@ -168,6 +169,7 @@ struct AggregateProcessorOperator {
     output_schema: Option<SchemaRef>,
     output_slots: Vec<SlotId>,
     output_chunk_schema: Option<ChunkSchemaRef>,
+    observed_group_key_nullable: Vec<bool>,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
@@ -231,6 +233,27 @@ impl AggregateProcessorOperator {
         }
     }
 
+    fn rebuild_output_schema(&mut self, group_key_nullable: Option<&[bool]>) -> Result<(), String> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
+        let key_columns = self
+            .key_table
+            .as_ref()
+            .map(|table| table.key_columns())
+            .unwrap_or(&[]);
+        self.output_schema = Some(build_output_schema_from_kernels(
+            key_columns,
+            &kernels.entries,
+            self.output_intermediate,
+            &self.output_slots,
+            self.output_chunk_schema.as_ref(),
+            group_key_nullable,
+        )?);
+        Ok(())
+    }
+
     fn process(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
         if self.finished {
             return Ok(None);
@@ -245,6 +268,8 @@ impl AggregateProcessorOperator {
         let agg_arrays = self.eval_agg_arrays(&chunk)?;
 
         self.ensure_data_initialized(&group_arrays, &agg_arrays)
+            .map_err(|e| e.to_string())?;
+        self.refresh_output_schema_for_group_arrays(&group_arrays)
             .map_err(|e| e.to_string())?;
 
         if chunk.is_empty() {
@@ -480,6 +505,28 @@ impl AggregateProcessorOperator {
 
         if !self.initialized {
             return Err("aggregate operator not prepared".to_string());
+        }
+
+        if !self.group_by.is_empty() {
+            let observed = self
+                .key_table
+                .as_ref()
+                .map(|table| {
+                    table
+                        .key_columns()
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, col)| {
+                            self.observed_group_key_nullable
+                                .get(idx)
+                                .copied()
+                                .unwrap_or(false)
+                                || col.has_nulls()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| self.observed_group_key_nullable.clone());
+            self.rebuild_output_schema(Some(&observed))?;
         }
 
         if self.group_states.is_empty() {
@@ -735,22 +782,47 @@ impl AggregateProcessorOperator {
 
         let kernels = agg::build_kernel_set(&self.functions, &expected_agg_types)?;
         self.kernels = Some(kernels);
-        if let Some(kernels) = self.kernels.as_ref() {
-            let key_columns = self
-                .key_table
-                .as_ref()
-                .map(|table| table.key_columns())
-                .unwrap_or(&[]);
-            self.output_schema = Some(build_output_schema_from_kernels(
-                key_columns,
-                &kernels.entries,
-                self.output_intermediate,
-                &self.output_slots,
-                self.output_chunk_schema.as_ref(),
-            )?);
+        if self.kernels.is_some() {
+            self.rebuild_output_schema(None)?;
         }
         self.initialized = true;
         Ok(())
+    }
+
+    fn refresh_output_schema_for_group_arrays(
+        &mut self,
+        group_arrays: &[ArrayRef],
+    ) -> Result<(), String> {
+        if self.group_by.is_empty() {
+            return Ok(());
+        }
+        let group_key_nullable: Vec<bool> = group_arrays
+            .iter()
+            .map(|array| array.null_count() > 0)
+            .collect();
+        if self.observed_group_key_nullable.len() != group_key_nullable.len() {
+            self.observed_group_key_nullable = vec![false; group_key_nullable.len()];
+        }
+        let mut changed = false;
+        for (observed, current) in self
+            .observed_group_key_nullable
+            .iter_mut()
+            .zip(group_key_nullable.iter())
+        {
+            let next = *observed || *current;
+            changed |= next != *observed;
+            *observed = next;
+        }
+        if !changed
+            && !self
+                .observed_group_key_nullable
+                .iter()
+                .any(|nullable| *nullable)
+        {
+            return Ok(());
+        }
+        let observed = self.observed_group_key_nullable.clone();
+        self.rebuild_output_schema(Some(&observed))
     }
 
     fn output_chunk_from_batch(&self, batch: RecordBatch) -> Result<Chunk, String> {
@@ -763,15 +835,25 @@ impl AggregateProcessorOperator {
             ));
         }
         if let Some(schema) = self.output_chunk_schema.as_ref() {
+            let batch_schema = batch.schema();
             let slot_schemas = self.output_slots[..output_len]
                 .iter()
-                .map(|slot_id| {
-                    schema.slot(*slot_id).cloned().ok_or_else(|| {
+                .enumerate()
+                .map(|(idx, slot_id)| {
+                    let slot_schema = schema.slot(*slot_id).ok_or_else(|| {
                         format!(
                             "aggregate explicit output chunk schema missing slot {}",
                             slot_id
                         )
-                    })
+                    })?;
+                    let field = batch_schema.field(idx);
+                    ChunkSlotSchema::try_new(
+                        *slot_id,
+                        field.name(),
+                        field.is_nullable(),
+                        slot_schema.type_desc().cloned(),
+                        slot_schema.unique_id(),
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             return Chunk::try_new_with_chunk_schema(

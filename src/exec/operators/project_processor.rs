@@ -414,9 +414,16 @@ impl ProjectProcessorOperator {
                 .as_ref()
                 .and_then(|schema| schema.slot(*slot_id).cloned())
                 .or_else(|| self.declared_slot_schema(*slot_id));
+            let runtime_nullable = array.null_count() > 0;
             let base = declared_output_slot_schema
                 .as_ref()
-                .map(|schema| field_from_slot_schema(schema, array.data_type()))
+                .map(|schema| {
+                    Field::new(
+                        schema.name(),
+                        array.data_type().clone(),
+                        schema.nullable() || runtime_nullable,
+                    )
+                })
                 .or_else(|| {
                     working_chunk
                         .slot_id_to_index()
@@ -441,16 +448,35 @@ impl ProjectProcessorOperator {
             })
             .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(fields));
+        let output_chunk_schema = if let Some(explicit) = self.output_chunk_schema.as_ref() {
+            let slot_schemas = schema
+                .fields()
+                .iter()
+                .zip(self.output_slots.iter())
+                .map(|(field, slot_id)| {
+                    let slot_schema = explicit.slot(*slot_id).ok_or_else(|| {
+                        format!(
+                            "project explicit output chunk schema missing slot {}",
+                            slot_id
+                        )
+                    })?;
+                    ChunkSlotSchema::try_new(
+                        *slot_id,
+                        field.name(),
+                        field.is_nullable(),
+                        slot_schema.type_desc().cloned(),
+                        slot_schema.unique_id(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Self::build_chunk_schema(slot_schemas)?
+        } else {
+            Self::build_chunk_schema(output_slot_schemas)?
+        };
 
         Ok(Some(
-            Chunk::try_new_with_schema_and_chunk_schema(
-                schema,
-                final_columns,
-                self.output_chunk_schema
-                    .clone()
-                    .unwrap_or(Self::build_chunk_schema(output_slot_schemas)?),
-            )
-            .map_err(|e| format!("Failed to create output batch: {}", e))?,
+            Chunk::try_new_with_schema_and_chunk_schema(schema, final_columns, output_chunk_schema)
+                .map_err(|e| format!("Failed to create output batch: {}", e))?,
         ))
     }
 

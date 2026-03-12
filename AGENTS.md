@@ -285,13 +285,13 @@ StarRocks FE
 Unified runner under `sql-tests`:
 
 ```bash
-cargo run --manifest-path sql-tests/Cargo.toml --bin sql-tests -- --suite <suite> --mode <verify|record|diff>
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite <suite> --mode <verify|record|diff>
 ```
 
 Example:
 
 ```bash
-cargo run --manifest-path sql-tests/Cargo.toml --bin sql-tests -- --suite write-path --mode verify
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite write-path --mode verify
 ```
 
 ---
