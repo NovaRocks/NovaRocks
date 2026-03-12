@@ -43,6 +43,12 @@ use crate::exec::hash_table::key_builder::{
 };
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 
+pub(crate) fn schema_is_compatible(actual: &SchemaRef, expected: &SchemaRef) -> bool {
+    actual.as_ref() == expected.as_ref()
+        || actual.as_ref().contains(expected.as_ref())
+        || expected.as_ref().contains(actual.as_ref())
+}
+
 /// Produce cross-join output rows by combining each left row with all right rows.
 pub(crate) fn cross_join_chunk(
     left: &Chunk,

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use arrow::array::{
@@ -299,10 +299,7 @@ fn chunk_from_builders(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(builders.len());
     for (idx, builder) in builders.into_iter().enumerate() {
         let array = finish_column(builder, row_count)?;
-        let field = field_with_slot_id(
-            Field::new(format!("col_{idx}"), array.data_type().clone(), true),
-            slot_ids[idx],
-        );
+        let field = Field::new(format!("col_{idx}"), array.data_type().clone(), true);
         fields.push(field);
         arrays.push(array);
     }
@@ -315,7 +312,7 @@ fn chunk_from_builders(
         RecordBatch::try_new(schema, arrays)
     }
     .map_err(|e| e.to_string())?;
-    Ok(Chunk::new(batch))
+    Ok(Chunk::new_with_slot_ids(batch, slot_ids))
 }
 
 fn finish_column(builder: ColumnBuilder, row_count: usize) -> Result<ArrayRef, String> {

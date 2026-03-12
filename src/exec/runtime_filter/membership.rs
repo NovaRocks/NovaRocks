@@ -257,7 +257,7 @@ impl RuntimeMembershipFilter {
             let filtered_batch =
                 filter_record_batch(&current_chunk.batch, &mask).map_err(|e| e.to_string())?;
             let filtered_array = filter(&current_array, &mask).map_err(|e| e.to_string())?;
-            current_chunk = Chunk::new(filtered_batch);
+            current_chunk = Chunk::new_like(filtered_batch, &current_chunk);
             current_array = filtered_array;
         }
         match self {

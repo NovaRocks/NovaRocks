@@ -20,7 +20,8 @@ use crate::common::ids::SlotId;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
-    Layout, layout_for_row_tuples, layout_from_slot_ids, schema_for_layout, schema_for_tuple,
+    Layout, chunk_schema_for_layout, chunk_schema_for_tuple, layout_for_row_tuples,
+    layout_from_slot_ids, schema_for_layout, schema_for_tuple,
 };
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::novarocks_connectors::{
@@ -78,7 +79,9 @@ pub(crate) fn lower_starrocks_scan_node(
         )
     })?;
     let schema = schema_for_layout(desc_tbl, &out_layout)?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
     let required_schema = schema_for_tuple(desc_tbl, tuple_id)?;
+    let required_chunk_schema = chunk_schema_for_tuple(desc_tbl, tuple_id)?;
 
     let slot_ids = out_layout
         .order
@@ -177,7 +180,9 @@ pub(crate) fn lower_starrocks_scan_node(
         ranges,
         has_more,
         required_schema,
+        required_chunk_schema,
         schema,
+        output_chunk_schema,
         slot_ids,
         query_global_dicts: std::collections::HashMap::new(),
         limit,

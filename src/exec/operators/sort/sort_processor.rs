@@ -30,7 +30,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::operators::sort::normalize_sort_key_array;
@@ -200,6 +200,7 @@ struct SortProcessorOperator {
 #[derive(Debug)]
 struct SpillRun {
     schema: SchemaRef,
+    chunk_schema: ChunkSchemaRef,
     file: SpillFile,
 }
 
@@ -566,11 +567,13 @@ impl SortProcessorOperator {
         let start = Instant::now();
         let run = self.build_sorted_run(&self.buffered)?;
         let schema = run.schema();
+        let run_chunk_schema = run.chunk_schema_ref();
         let run_rows = self.buffered_rows.max(0);
         let run_bytes = self.buffered_bytes.max(0);
         let spill_file = spill.spiller.spill_chunks(schema.clone(), &[run])?;
         spill.runs.push(SpillRun {
             schema,
+            chunk_schema: run_chunk_schema,
             file: spill_file,
         });
         if let Some(profile) = spill.profile.as_ref() {
@@ -694,7 +697,10 @@ impl SortProcessorOperator {
 
         let mut stream = spill.spiller.open_stream(run.schema.clone(), &run.file)?;
         while let Some(batch) = stream.next_batch()? {
-            let chunk = Chunk::try_new(batch).map_err(|e| e.to_string())?;
+            let source = candidate.as_ref().ok_or_else(|| {
+                "sort spill merge expected candidate chunk before restore".to_string()
+            })?;
+            let chunk = Chunk::try_new_like(batch, source).map_err(|e| e.to_string())?;
             restore_rows = restore_rows.saturating_add(chunk.len() as i64);
             restore_bytes = restore_bytes
                 .saturating_add(i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX));
@@ -742,7 +748,8 @@ impl SortProcessorOperator {
 
         let mut stream = spill.spiller.open_stream(run.schema.clone(), &run.file)?;
         while let Some(batch) = stream.next_batch()? {
-            let chunk = Chunk::try_new(batch).map_err(|e| e.to_string())?;
+            let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&run.chunk_schema))
+                .map_err(|e| e.to_string())?;
             restore_rows = restore_rows.saturating_add(chunk.len() as i64);
             restore_bytes = restore_bytes
                 .saturating_add(i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX));
@@ -771,7 +778,7 @@ impl SortProcessorOperator {
         if let Some(cutoff_base) = self.topn_cutoff_base() {
             if cutoff_base == 0 {
                 let empty = arrow::record_batch::RecordBatch::new_empty(chunks[0].schema());
-                return Chunk::try_new(empty).map_err(|e| e.to_string());
+                return Chunk::try_new_like(empty, &chunks[0]).map_err(|e| e.to_string());
             }
             return self
                 .sort_chunks_for_topn_mode(chunks)?
@@ -825,9 +832,9 @@ impl SortProcessorOperator {
                 len - self.offset
             };
             let sliced = batch.slice(self.offset, take_len);
-            return Ok(Some(Chunk::new(sliced)));
+            return Ok(Some(Chunk::new_like(sliced, &chunks[0])));
         }
-        let indices = self.sort_indices(&batch)?;
+        let indices = self.sort_indices(&batch, &chunks[0])?;
         let len = indices.len();
         if self.offset >= len {
             return Ok(None);
@@ -839,7 +846,7 @@ impl SortProcessorOperator {
         };
         let sliced_indices = indices.slice(self.offset, take_len);
         let sorted_batch = self.take_batch(&batch, sliced_indices.as_ref())?;
-        Ok(Some(Chunk::new(sorted_batch)))
+        Ok(Some(Chunk::new_like(sorted_batch, &chunks[0])))
     }
 
     /// Build final output for `RANK`/`DENSE_RANK` topn semantics.
@@ -870,12 +877,12 @@ impl SortProcessorOperator {
         }
         if self.order_by.is_empty() {
             // Without order-by keys all rows belong to one peer group (rank = 1).
-            return Ok(Some(Chunk::new(batch)));
+            return Ok(Some(Chunk::new_like(batch, &chunks[0])));
         }
 
-        let indices = self.sort_indices(&batch)?;
+        let indices = self.sort_indices(&batch, &chunks[0])?;
         let sorted_batch = self.take_batch(&batch, indices.as_ref())?;
-        let key_columns = self.eval_order_by_columns(&sorted_batch)?;
+        let key_columns = self.eval_order_by_columns(&sorted_batch, &chunks[0])?;
         let key_rows = self.convert_sort_keys_to_rows(&key_columns)?;
         let cutoff = rank_like_cutoff(
             self.topn_type,
@@ -886,7 +893,10 @@ impl SortProcessorOperator {
         if cutoff == 0 {
             return Ok(None);
         }
-        Ok(Some(Chunk::new(sorted_batch.slice(0, cutoff))))
+        Ok(Some(Chunk::new_like(
+            sorted_batch.slice(0, cutoff),
+            &chunks[0],
+        )))
     }
 
     fn concat_batches_for_chunks(
@@ -901,8 +911,9 @@ impl SortProcessorOperator {
     fn sort_indices(
         &self,
         batch: &arrow::record_batch::RecordBatch,
+        source: &Chunk,
     ) -> Result<arrow::array::ArrayRef, String> {
-        let key_columns = self.eval_order_by_columns(batch)?;
+        let key_columns = self.eval_order_by_columns(batch, source)?;
         let sort_columns = self.build_sort_columns(&key_columns);
         let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| e.to_string())?;
         Ok(std::sync::Arc::new(indices))
@@ -911,8 +922,9 @@ impl SortProcessorOperator {
     fn eval_order_by_columns(
         &self,
         batch: &arrow::record_batch::RecordBatch,
+        source: &Chunk,
     ) -> Result<Vec<ArrayRef>, String> {
-        let chunk = Chunk::new(batch.clone());
+        let chunk = Chunk::new_like(batch.clone(), source);
         let mut columns = Vec::with_capacity(self.order_by.len());
         for sort_expr in &self.order_by {
             let values = self

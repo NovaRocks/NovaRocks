@@ -324,12 +324,7 @@ pub(crate) fn lower_hdfs_scan_node(
         if parent != tuple_id {
             continue;
         }
-        let name = crate::lower::layout::slot_name_from_desc(s).ok_or_else(|| {
-            format!(
-                "missing column name for slot_id={id} tuple_id={:?}",
-                s.parent
-            )
-        })?;
+        let name = crate::lower::layout::slot_display_name_from_desc(s);
         let primitive =
             primitive_type_from_desc(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
         let arrow_type = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
@@ -370,10 +365,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
             row_source_slot = Some(slot_id);
-            row_source_field = Some(crate::exec::chunk::field_with_slot_id(
-                arrow::datatypes::Field::new(name, arrow_type, nullable),
-                slot_id,
-            ));
+            row_source_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
         if crate::exec::row_position::is_scan_range_id(&name) {
@@ -384,10 +376,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
             scan_range_slot = Some(slot_id);
-            scan_range_field = Some(crate::exec::chunk::field_with_slot_id(
-                arrow::datatypes::Field::new(name, arrow_type, nullable),
-                slot_id,
-            ));
+            scan_range_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
         if crate::exec::row_position::is_row_id(&name) {
@@ -398,10 +387,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
             row_id_slot = Some(slot_id);
-            row_id_field = Some(crate::exec::chunk::field_with_slot_id(
-                arrow::datatypes::Field::new(name, arrow_type, nullable),
-                slot_id,
-            ));
+            row_id_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
 

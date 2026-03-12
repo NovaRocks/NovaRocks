@@ -30,8 +30,7 @@
 
 use super::dispatch::ScanDispatchState;
 use super::types::{PushResult, ScanAsyncState, ScanRuntimeFilterProbe};
-use crate::exec::chunk::Chunk;
-use crate::exec::chunk::field_slot_id;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
@@ -42,9 +41,11 @@ use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
     filter_chunk_by_membership_filters_with_exprs,
 };
+use crate::lower::type_lowering::scalar_type_desc;
 use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
+use crate::types;
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::Schema;
@@ -408,7 +409,7 @@ impl ScanAsyncRunner {
         if filtered_batch.num_rows() == 0 {
             return Ok(None);
         }
-        Ok(Some(Chunk::new(filtered_batch)))
+        Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
     fn build_row_position_state(
@@ -462,42 +463,67 @@ impl ScanAsyncRunner {
         let row_id_array = Arc::new(Int64Array::from(row_id_values)) as ArrayRef;
 
         let mut field_map = HashMap::new();
-        for field in chunk.schema().fields() {
-            if let Some(slot_id) = field_slot_id(field)? {
-                field_map.insert(slot_id, field.clone());
-            }
+        let chunk_schema = chunk.schema();
+        for (idx, slot_schema) in chunk.chunk_schema().slots().iter().enumerate() {
+            let field = chunk_schema.field(idx);
+            field_map.insert(slot_schema.slot_id(), (field, slot_schema.clone()));
         }
 
         let mut fields = Vec::with_capacity(self.scan.output_slots().len());
         let mut columns = Vec::with_capacity(self.scan.output_slots().len());
+        let mut slot_schemas = Vec::with_capacity(self.scan.output_slots().len());
         for slot_id in self.scan.output_slots() {
             if *slot_id == state.spec.row_source_slot {
                 fields.push(state.spec.row_source_field.clone());
                 columns.push(row_source_array.clone());
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    state.spec.row_source_field.name().clone(),
+                    state.spec.row_source_field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::INT)),
+                    None,
+                ));
                 continue;
             }
             if *slot_id == state.spec.scan_range_slot {
                 fields.push(state.spec.scan_range_field.clone());
                 columns.push(scan_range_array.clone());
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    state.spec.scan_range_field.name().clone(),
+                    state.spec.scan_range_field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::INT)),
+                    None,
+                ));
                 continue;
             }
             if *slot_id == state.spec.row_id_slot {
                 fields.push(state.spec.row_id_field.clone());
                 columns.push(row_id_array.clone());
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    state.spec.row_id_field.name().clone(),
+                    state.spec.row_id_field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    None,
+                ));
                 continue;
             }
-            let field = field_map
+            let (field, slot_schema) = field_map
                 .get(slot_id)
                 .ok_or_else(|| format!("missing field for slot_id {} in scan chunk", slot_id))?;
             let column = chunk.column_by_slot_id(*slot_id)?;
             fields.push(field.as_ref().clone());
             columns.push(column);
+            slot_schemas.push(slot_schema.clone());
         }
 
         let schema = Arc::new(Schema::new(fields));
-        let batch = arrow::record_batch::RecordBatch::try_new(schema, columns)
-            .map_err(|e| e.to_string())?;
-        Chunk::try_new(batch)
+        Chunk::try_new_with_schema_and_chunk_schema(
+            schema,
+            columns,
+            Arc::new(ChunkSchema::try_new(slot_schemas)?),
+        )
     }
 
     fn maybe_log_stall(&mut self, mode: &str) {

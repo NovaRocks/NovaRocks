@@ -8,13 +8,13 @@ This suite targets the locally supported Iceberg scope:
 Recommended invocation:
 
 ```bash
-cargo run --manifest-path sql-tests/Cargo.toml --bin sql-tests -- \
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
   --suite iceberg \
-  --config dev/test/conf/sr.conf \
+  --config tests/sql-test-runner/conf/sr.conf \
   --mode verify
 ```
 
-Required config variables follow the StarRocks `dev/test/conf/sr.conf` style:
+Required config variables follow the local `tests/sql-test-runner/conf/sr.conf` style:
 - `iceberg_catalog_type`
 - `iceberg_catalog_warehouse`
 - `oss_ak`

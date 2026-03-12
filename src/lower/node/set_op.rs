@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
+use crate::descriptors;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::set_op::{SetOpKind, SetOpNode};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exprs;
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::{Layout, layout_from_slot_ids};
+use crate::lower::layout::{Layout, chunk_schema_for_layout, layout_from_slot_ids};
 use crate::lower::node::Lowered;
 use crate::{plan_nodes, types};
 
@@ -30,6 +31,7 @@ pub(crate) fn lower_intersect_node(
     node: &plan_nodes::TPlanNode,
     out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
@@ -41,6 +43,7 @@ pub(crate) fn lower_intersect_node(
         node,
         out_layout,
         arena,
+        desc_tbl,
         last_query_id,
         fe_addr,
         intersect.tuple_id,
@@ -55,6 +58,7 @@ pub(crate) fn lower_except_node(
     node: &plan_nodes::TPlanNode,
     out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
@@ -66,6 +70,7 @@ pub(crate) fn lower_except_node(
         node,
         out_layout,
         arena,
+        desc_tbl,
         last_query_id,
         fe_addr,
         except.tuple_id,
@@ -80,6 +85,7 @@ fn lower_distinct_set_node(
     node: &plan_nodes::TPlanNode,
     mut out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
     tuple_id: types::TTupleId,
@@ -114,6 +120,11 @@ fn lower_distinct_set_node(
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
         .collect::<Result<Vec<_>, _>>()?;
+    let output_chunk_schema = if let Some(desc_tbl) = desc_tbl {
+        Some(chunk_schema_for_layout(desc_tbl, &out_layout)?)
+    } else {
+        None
+    };
 
     let mut inputs = Vec::with_capacity(children.len());
     for (child, expr_list) in children.into_iter().zip(result_expr_lists.iter()) {
@@ -134,8 +145,10 @@ fn lower_distinct_set_node(
                 is_subordinate: true,
                 exprs,
                 expr_slot_ids: output_slots.clone(),
+                expr_slot_schemas: None,
                 output_indices: None,
                 output_slots: output_slots.clone(),
+                output_chunk_schema: output_chunk_schema.clone(),
             }),
         });
     }

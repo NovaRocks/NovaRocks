@@ -16,11 +16,7 @@
 // under the License.
 use crate::types;
 use arrow::datatypes::{DataType, Field, TimeUnit};
-use std::collections::HashMap;
 use std::sync::Arc;
-
-pub(crate) const FIELD_META_PRIMITIVE_TYPE: &str = "novarocks.primitive_type";
-pub(crate) const FIELD_META_PRIMITIVE_JSON: &str = "JSON";
 
 /// Extract primitive type from TExprNode.
 pub(crate) fn primitive_type_from_node(
@@ -43,6 +39,15 @@ pub(crate) fn primitive_type_from_desc(desc: &types::TTypeDesc) -> Option<types:
     }
     let scalar = first.scalar_type.as_ref()?;
     Some(scalar.type_)
+}
+
+pub(crate) fn scalar_type_desc(primitive: types::TPrimitiveType) -> types::TTypeDesc {
+    types::TTypeDesc::new(vec![types::TTypeNode::new(
+        types::TTypeNodeType::SCALAR,
+        types::TScalarType::new(primitive, None, None, None),
+        None,
+        None,
+    )])
 }
 
 /// Convert TPrimitiveType to Arrow DataType when precision/scale is not required.
@@ -198,29 +203,8 @@ fn arrow_field_from_nodes_with_name(
     name: &str,
     nullable: bool,
 ) -> Option<Field> {
-    let child_node = types.get(*cursor)?;
     let data_type = arrow_type_from_nodes(types, cursor)?;
-    let mut field = Field::new(name, data_type, nullable);
-    if let Some(metadata) = primitive_field_metadata(child_node) {
-        field = field.with_metadata(metadata);
-    }
-    Some(field)
-}
-
-fn primitive_field_metadata(node: &types::TTypeNode) -> Option<HashMap<String, String>> {
-    if node.type_ != types::TTypeNodeType::SCALAR {
-        return None;
-    }
-    let scalar = node.scalar_type.as_ref()?;
-    if scalar.type_ != types::TPrimitiveType::JSON {
-        return None;
-    }
-    let mut metadata = HashMap::new();
-    metadata.insert(
-        FIELD_META_PRIMITIVE_TYPE.to_string(),
-        FIELD_META_PRIMITIVE_JSON.to_string(),
-    );
-    Some(metadata)
+    Some(Field::new(name, data_type, nullable))
 }
 
 // Keeping `decimal_params_from_desc` for potential future use when we need

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{Array, ArrayRef, ListArray, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
@@ -201,6 +201,7 @@ pub fn eval_array_map(
 
     let mut fields: Vec<Field> = Vec::new();
     let mut columns: Vec<ArrayRef> = Vec::new();
+    let mut slot_ids = Vec::new();
     let mut seen: HashSet<SlotId> = HashSet::new();
 
     for (idx, slot_id) in lambda_args.iter().enumerate() {
@@ -208,10 +209,12 @@ pub fn eval_array_map(
             return Err(format!("duplicate lambda argument slot id: {}", slot_id));
         }
         let col = flat_args[idx].clone();
-        fields.push(field_with_slot_id(
-            Field::new(format!("lambda_arg_{idx}"), col.data_type().clone(), true),
-            *slot_id,
+        fields.push(Field::new(
+            format!("lambda_arg_{idx}"),
+            col.data_type().clone(),
+            true,
         ));
+        slot_ids.push(*slot_id);
         columns.push(col);
     }
 
@@ -219,18 +222,16 @@ pub fn eval_array_map(
         if !seen.insert(slot_id) {
             return Err(format!("lambda captured slot id conflicts: {}", slot_id));
         }
-        fields.push(field_with_slot_id(
-            Field::new(
-                format!("lambda_capture_{slot_id}"),
-                col.data_type().clone(),
-                true,
-            ),
-            slot_id,
+        fields.push(Field::new(
+            format!("lambda_capture_{slot_id}"),
+            col.data_type().clone(),
+            true,
         ));
+        slot_ids.push(slot_id);
         columns.push(col);
     }
 
-    let mut lambda_chunk = build_chunk_from_columns(&fields, &columns)?;
+    let mut lambda_chunk = build_chunk_from_columns(&fields, &columns, &slot_ids)?;
 
     for (idx, (slot_id, expr_id)) in common_sub_exprs.iter().enumerate() {
         if !seen.insert(*slot_id) {
@@ -247,16 +248,14 @@ pub fn eval_array_map(
                 col.len()
             ));
         }
-        fields.push(field_with_slot_id(
-            Field::new(
-                format!("lambda_common_{idx}"),
-                col.data_type().clone(),
-                true,
-            ),
-            *slot_id,
+        fields.push(Field::new(
+            format!("lambda_common_{idx}"),
+            col.data_type().clone(),
+            true,
         ));
+        slot_ids.push(*slot_id);
         columns.push(col);
-        lambda_chunk = build_chunk_from_columns(&fields, &columns)?;
+        lambda_chunk = build_chunk_from_columns(&fields, &columns, &slot_ids)?;
     }
 
     let result = arena.eval(lambda_body, &lambda_chunk)?;
@@ -447,15 +446,20 @@ fn replicate_captured_columns(
     Ok(out)
 }
 
-fn build_chunk_from_columns(fields: &[Field], columns: &[ArrayRef]) -> Result<Chunk, String> {
+fn build_chunk_from_columns(
+    fields: &[Field],
+    columns: &[ArrayRef],
+    slot_ids: &[SlotId],
+) -> Result<Chunk, String> {
     let schema = Arc::new(Schema::new(fields.to_vec()));
     let batch = RecordBatch::try_new(schema, columns.to_vec()).map_err(|e| e.to_string())?;
-    Chunk::try_new(batch)
+    Chunk::try_new_with_slot_ids(batch, slot_ids)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{ArrayRef, Int64Array, Int64Builder, ListBuilder};
     use arrow::datatypes::DataType;

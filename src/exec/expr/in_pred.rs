@@ -325,7 +325,10 @@ fn empty_chunk_with_rows(row_count: usize) -> Result<Chunk, String> {
     let options = RecordBatchOptions::new().with_row_count(Some(row_count));
     let batch = arrow::array::RecordBatch::try_new_with_options(schema, vec![], &options)
         .map_err(|e| e.to_string())?;
-    Ok(Chunk::new(batch))
+    Ok(Chunk::new_with_chunk_schema(
+        batch,
+        Arc::new(crate::exec::chunk::ChunkSchema::empty()),
+    ))
 }
 
 #[cfg(test)]

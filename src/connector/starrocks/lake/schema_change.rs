@@ -36,11 +36,14 @@ use crate::connector::starrocks::lake::context::{
 };
 use crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift;
 use crate::connector::starrocks::lake::txn_log::{
-    build_tablet_output_schema, load_rowset_batch_for_partial_update,
+    build_tablet_output_schema, load_rowset_batch_for_partial_update_with_delete_predicates,
     parse_default_literal_to_singleton_array, read_txn_log_if_exists, write_txn_log_file,
 };
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
+use crate::formats::starrocks::metadata::{
+    collect_delete_predicates, lake_rowset_visibility_version,
+};
 use crate::formats::starrocks::writer::bundle_meta::{
     empty_tablet_metadata, load_tablet_metadata_at_version, write_initial_meta_file,
     write_standalone_meta_file,
@@ -254,10 +257,17 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
     }
 
     let source_output_schema = build_tablet_output_schema(&base_read_schema)?;
+    let base_delete_predicates = collect_delete_predicates(&base_metadata)?;
     let mut rewritten_rowsets = Vec::with_capacity(base_metadata.rowsets.len());
     for (rowset_idx, source_rowset) in base_metadata.rowsets.iter().enumerate() {
-        let source_batch =
-            load_rowset_batch_for_partial_update(&base_ctx, source_rowset, &source_output_schema)?;
+        let rowset_visibility_version = lake_rowset_visibility_version(source_rowset, rowset_idx)?;
+        let source_batch = load_rowset_batch_for_partial_update_with_delete_predicates(
+            &base_ctx,
+            source_rowset,
+            rowset_visibility_version,
+            &base_delete_predicates,
+            &source_output_schema,
+        )?;
         let transformed = transform_rowset_batch(
             &source_batch,
             &base_read_schema,
@@ -1134,6 +1144,7 @@ fn build_rollup_expr_input(
     let source_name_to_index = build_source_name_index_map(source_schema, "rollup source schema")?;
 
     let mut fields = Vec::new();
+    let mut slot_schemas = Vec::new();
     let mut arrays = Vec::new();
     let mut order = Vec::new();
     let mut seen_slots = HashSet::new();
@@ -1184,15 +1195,19 @@ fn build_rollup_expr_input(
                     source_batch.num_columns()
                 )
             })?;
-        let field = field_with_slot_id(
-            Field::new(
-                slot_name,
-                source_field.data_type().clone(),
-                slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
-            ),
-            slot_id,
+        let field = Field::new(
+            slot_name,
+            source_field.data_type().clone(),
+            slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
         );
         fields.push(field);
+        slot_schemas.push(ChunkSlotSchema::new(
+            slot_id,
+            slot_name,
+            slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
+            None,
+            None,
+        ));
         arrays.push(
             source_batch
                 .columns()
@@ -1224,12 +1239,14 @@ fn build_rollup_expr_input(
             rowset_idx, e
         )
     })?;
-    let chunk = Chunk::try_new(eval_batch).map_err(|e| {
-        format!(
-            "rollup failed to initialize expression input chunk: rowset_idx={} error={}",
-            rowset_idx, e
-        )
-    })?;
+    let chunk =
+        Chunk::try_new_with_chunk_schema(eval_batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
+            .map_err(|e| {
+                format!(
+                    "rollup failed to initialize expression input chunk: rowset_idx={} error={}",
+                    rowset_idx, e
+                )
+            })?;
     let index = order.iter().enumerate().map(|(i, key)| (*key, i)).collect();
     Ok(RollupExprInput {
         chunk,
@@ -1495,10 +1512,12 @@ fn write_rewritten_rowset(
             id: None,
             overlapped: source_rowset.overlapped.or(Some(false)),
             segments: Vec::new(),
-            num_rows: source_rowset.num_rows.or(Some(0)),
+            num_rows: Some(0),
             data_size: Some(0),
-            delete_predicate: source_rowset.delete_predicate.clone(),
-            num_dels: source_rowset.num_dels.or(Some(0)),
+            // Rewritten rowsets materialize post-delete visible rows, so they must not
+            // carry over source delete predicates or delete counters again.
+            delete_predicate: None,
+            num_dels: Some(0),
             segment_size: Vec::new(),
             max_compact_input_rowset_id: source_rowset.max_compact_input_rowset_id,
             version: None,
@@ -1543,8 +1562,9 @@ fn write_rewritten_rowset(
         segments: vec![data_file_name],
         num_rows: Some(sorted_batch.num_rows() as i64),
         data_size: Some(segment_size as i64),
-        delete_predicate: source_rowset.delete_predicate.clone(),
-        num_dels: source_rowset.num_dels.or(Some(0)),
+        // Delete predicates are applied while reading source rowsets for rewrite.
+        delete_predicate: None,
+        num_dels: Some(0),
         segment_size: vec![segment_size],
         max_compact_input_rowset_id: source_rowset.max_compact_input_rowset_id,
         version: None,

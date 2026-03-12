@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use crate::common::ids::SlotId;
 use crate::descriptors;
-use crate::exec::chunk::field_with_slot_id;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exprs;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::planner;
@@ -43,8 +44,7 @@ pub(crate) fn schema_for_layout(
         .as_ref()
         .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
 
-    let mut info: HashMap<(types::TTupleId, types::TSlotId), (String, DataType, bool)> =
-        HashMap::new();
+    let mut info: HashMap<(types::TTupleId, types::TSlotId), Field> = HashMap::new();
     for s in slot_descs {
         let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
         else {
@@ -52,26 +52,19 @@ pub(crate) fn schema_for_layout(
         };
         let dt = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
             .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
-        let name = s
-            .col_name
-            .clone()
-            .unwrap_or_else(|| format!("col_{parent}_{id}"));
+        let name = slot_display_name_from_desc(s);
         let nullable = s.is_nullable.unwrap_or(true);
-        info.insert((parent, id), (name, dt, nullable));
+        info.insert((parent, id), Field::new(name, dt, nullable));
     }
 
     let mut fields = Vec::with_capacity(layout.order.len());
     for (idx, (tuple_id, slot_id)) in layout.order.iter().enumerate() {
-        let (name, dt, nullable) = info.get(&(*tuple_id, *slot_id)).ok_or_else(|| {
+        let field = info.get(&(*tuple_id, *slot_id)).ok_or_else(|| {
             format!(
                 "missing slot descriptor for layout column {idx}: tuple_id={tuple_id} slot_id={slot_id}"
             )
         })?;
-        let slot_id = SlotId::try_from(*slot_id)?;
-        fields.push(field_with_slot_id(
-            Field::new(name, dt.clone(), *nullable),
-            slot_id,
-        ));
+        fields.push(field.clone());
     }
 
     Ok(SchemaRef::new(Schema::new(fields)))
@@ -98,24 +91,10 @@ pub(crate) fn schema_for_tuple(
         }
         let dt = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
             .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
-        let name = s
-            .col_name
-            .clone()
-            .unwrap_or_else(|| format!("col_{parent}_{id}"));
+        let name = slot_display_name_from_desc(s);
         let nullable = s.is_nullable.unwrap_or(true);
 
-        let mut field = Field::new(name, dt, nullable);
-        if let Some(unique_id) = s.col_unique_id.filter(|v| *v > 0) {
-            let mut meta = field.metadata().clone();
-            meta.insert(
-                "starrocks.format.column.id".to_string(),
-                unique_id.to_string(),
-            );
-            field = field.with_metadata(meta);
-        }
-
-        let slot_id = SlotId::try_from(id)?;
-        fields.push(field_with_slot_id(field, slot_id));
+        fields.push(Field::new(name, dt, nullable));
     }
 
     if fields.is_empty() {
@@ -125,6 +104,133 @@ pub(crate) fn schema_for_tuple(
     }
 
     Ok(SchemaRef::new(Schema::new(fields)))
+}
+
+fn chunk_slot_schema_lookup(
+    desc_tbl: &descriptors::TDescriptorTable,
+) -> Result<HashMap<(types::TTupleId, types::TSlotId), ChunkSlotSchema>, String> {
+    let slot_descs = desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
+
+    let mut by_tuple_slot = HashMap::with_capacity(slot_descs.len());
+    for s in slot_descs {
+        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
+        else {
+            continue;
+        };
+        let slot_id = SlotId::try_from(id)?;
+        let name = slot_display_name_from_desc(s);
+        let nullable = s.is_nullable.unwrap_or(true);
+        let unique_id = s.col_unique_id.filter(|v| *v > 0);
+        let key = (parent, id);
+        let schema =
+            ChunkSlotSchema::new(slot_id, name, nullable, Some(slot_type.clone()), unique_id);
+        if by_tuple_slot.insert(key, schema).is_some() {
+            return Err(format!(
+                "duplicate slot descriptor for tuple_id={} slot_id={}",
+                parent, id
+            ));
+        }
+    }
+    Ok(by_tuple_slot)
+}
+
+pub(crate) fn slot_arrow_type_lookup(
+    desc_tbl: &descriptors::TDescriptorTable,
+) -> Result<HashMap<(types::TTupleId, types::TSlotId), DataType>, String> {
+    let slot_descs = desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
+
+    let mut by_tuple_slot = HashMap::with_capacity(slot_descs.len());
+    for s in slot_descs {
+        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
+        else {
+            continue;
+        };
+        let data_type = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
+            .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
+        if by_tuple_slot.insert((parent, id), data_type).is_some() {
+            return Err(format!(
+                "duplicate slot descriptor for tuple_id={} slot_id={}",
+                parent, id
+            ));
+        }
+    }
+    Ok(by_tuple_slot)
+}
+
+pub(crate) fn chunk_slot_schemas_for_layout(
+    desc_tbl: &descriptors::TDescriptorTable,
+    layout: &Layout,
+) -> Result<Vec<ChunkSlotSchema>, String> {
+    let by_tuple_slot = chunk_slot_schema_lookup(desc_tbl)?;
+    let mut out = Vec::with_capacity(layout.order.len());
+    for (idx, (tuple_id, slot_id)) in layout.order.iter().enumerate() {
+        let schema = by_tuple_slot
+            .get(&(*tuple_id, *slot_id))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "missing slot descriptor for layout column {}: tuple_id={} slot_id={}",
+                    idx, tuple_id, slot_id
+                )
+            })?;
+        out.push(schema);
+    }
+    Ok(out)
+}
+
+pub(crate) fn chunk_schema_for_tuple(
+    desc_tbl: &descriptors::TDescriptorTable,
+    tuple_id: types::TTupleId,
+) -> Result<ChunkSchemaRef, String> {
+    let slot_descs = desc_tbl
+        .slot_descriptors
+        .as_ref()
+        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
+
+    let mut slots = Vec::new();
+    for s in slot_descs {
+        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
+        else {
+            continue;
+        };
+        if parent != tuple_id {
+            continue;
+        }
+        let slot_id = SlotId::try_from(id)?;
+        let name = slot_display_name_from_desc(s);
+        let nullable = s.is_nullable.unwrap_or(true);
+        let unique_id = s.col_unique_id.filter(|v| *v > 0);
+        slots.push(ChunkSlotSchema::new(
+            slot_id,
+            name,
+            nullable,
+            Some(slot_type.clone()),
+            unique_id,
+        ));
+    }
+
+    if slots.is_empty() {
+        return Err(format!(
+            "missing slot descriptors for tuple_id={tuple_id} when building required chunk schema"
+        ));
+    }
+
+    Ok(Arc::new(ChunkSchema::try_new(slots)?))
+}
+
+pub(crate) fn chunk_schema_for_layout(
+    desc_tbl: &descriptors::TDescriptorTable,
+    layout: &Layout,
+) -> Result<ChunkSchemaRef, String> {
+    Ok(Arc::new(ChunkSchema::try_new(
+        chunk_slot_schemas_for_layout(desc_tbl, layout)?,
+    )?))
 }
 
 pub(crate) fn infer_tuple_slot_order(
@@ -328,6 +434,17 @@ pub(crate) fn slot_name_from_desc(desc: &descriptors::TSlotDescriptor) -> Option
         return Some(name.clone());
     }
     None
+}
+
+pub(crate) fn slot_display_name_from_desc(desc: &descriptors::TSlotDescriptor) -> String {
+    if let Some(name) = slot_name_from_desc(desc) {
+        return name;
+    }
+    match (desc.parent, desc.id) {
+        (Some(parent), Some(id)) => format!("col_{parent}_{id}"),
+        (_, Some(id)) => format!("col_{id}"),
+        _ => "col_unknown".to_string(),
+    }
 }
 
 pub(crate) fn resolve_jdbc_table<'a>(
@@ -620,8 +737,8 @@ pub(crate) fn reorder_tuple_slots(
     let mut slot_names = HashMap::new();
     if let Some(slots) = &desc.slot_descriptors {
         for s in slots {
-            if let (Some(sid), Some(name)) = (s.id, &s.col_name) {
-                slot_names.insert(sid, name.clone());
+            if let (Some(parent), Some(sid), Some(name)) = (s.parent, s.id, &s.col_name) {
+                slot_names.insert((parent, sid), name.clone());
             }
         }
     }
@@ -630,7 +747,7 @@ pub(crate) fn reorder_tuple_slots(
         if let Some(table_id) = tuple_to_table.get(tuple_id) {
             if let Some(col_order) = table_columns.get(table_id) {
                 slots.sort_by_key(|sid| {
-                    if let Some(name) = slot_names.get(sid) {
+                    if let Some(name) = slot_names.get(&(*tuple_id, *sid)) {
                         col_order
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(name))
@@ -641,5 +758,217 @@ pub(crate) fn reorder_tuple_slots(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Layout, chunk_schema_for_layout, chunk_slot_schemas_for_layout, slot_arrow_type_lookup,
+        slot_display_name_from_desc, slot_name_from_desc,
+    };
+    use crate::descriptors;
+    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::types::TPrimitiveType;
+    use arrow::datatypes::DataType;
+
+    fn slot_desc(
+        parent: Option<i32>,
+        id: Option<i32>,
+        col_name: Option<&str>,
+        col_physical_name: Option<&str>,
+    ) -> descriptors::TSlotDescriptor {
+        descriptors::TSlotDescriptor {
+            id,
+            parent,
+            slot_type: None,
+            column_pos: None,
+            byte_offset: None,
+            null_indicator_byte: None,
+            null_indicator_bit: None,
+            col_name: col_name.map(ToString::to_string),
+            slot_idx: None,
+            is_materialized: None,
+            is_output_column: None,
+            is_nullable: Some(true),
+            col_unique_id: None,
+            col_physical_name: col_physical_name.map(ToString::to_string),
+        }
+    }
+
+    #[test]
+    fn slot_name_prefers_explicit_names() {
+        let desc = slot_desc(
+            Some(3),
+            Some(7),
+            Some("logical_name"),
+            Some("physical_name"),
+        );
+        assert_eq!(slot_name_from_desc(&desc), Some("logical_name".to_string()));
+
+        let desc = slot_desc(Some(3), Some(7), Some(""), Some("physical_name"));
+        assert_eq!(
+            slot_name_from_desc(&desc),
+            Some("physical_name".to_string())
+        );
+    }
+
+    #[test]
+    fn slot_name_falls_back_to_synthetic_name() {
+        let desc = slot_desc(Some(3), Some(7), None, None);
+        assert_eq!(slot_name_from_desc(&desc), None);
+        assert_eq!(slot_display_name_from_desc(&desc), "col_3_7");
+
+        let desc = slot_desc(None, Some(7), None, None);
+        assert_eq!(slot_name_from_desc(&desc), None);
+        assert_eq!(slot_display_name_from_desc(&desc), "col_7");
+    }
+
+    #[test]
+    fn chunk_schema_for_layout_keeps_tuple_scoped_slot_descriptors() {
+        let desc_tbl = descriptors::TDescriptorTable::new(
+            vec![
+                descriptors::TSlotDescriptor {
+                    id: Some(5),
+                    parent: Some(2),
+                    slot_type: Some(scalar_type_desc(TPrimitiveType::BIGINT)),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: Some("count_col".to_string()),
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(false),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                },
+                descriptors::TSlotDescriptor {
+                    id: Some(6),
+                    parent: Some(2),
+                    slot_type: Some(scalar_type_desc(TPrimitiveType::VARBINARY)),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: None,
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(true),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                },
+                descriptors::TSlotDescriptor {
+                    id: Some(5),
+                    parent: Some(3),
+                    slot_type: Some(scalar_type_desc(TPrimitiveType::BIGINT)),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: Some("count_col_final".to_string()),
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(false),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                },
+                descriptors::TSlotDescriptor {
+                    id: Some(6),
+                    parent: Some(3),
+                    slot_type: Some(scalar_type_desc(TPrimitiveType::HLL)),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: None,
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(true),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                },
+            ],
+            vec![],
+            vec![],
+            false,
+        );
+        let layout = Layout {
+            order: vec![(2, 5), (2, 6)],
+            index: std::collections::HashMap::from([((2, 5), 0), ((2, 6), 1)]),
+        };
+
+        let slot_schemas =
+            chunk_slot_schemas_for_layout(&desc_tbl, &layout).expect("layout chunk slot schemas");
+        assert_eq!(slot_schemas.len(), 2);
+        assert_eq!(slot_schemas[0].name(), "count_col");
+        assert_eq!(
+            slot_schemas[1]
+                .type_desc()
+                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
+            Some(TPrimitiveType::VARBINARY)
+        );
+
+        let chunk_schema =
+            chunk_schema_for_layout(&desc_tbl, &layout).expect("layout chunk schema");
+        assert_eq!(chunk_schema.slots()[0].slot_id().as_u32(), 5);
+        assert_eq!(chunk_schema.slots()[1].slot_id().as_u32(), 6);
+        assert_eq!(
+            chunk_schema.slots()[1]
+                .type_desc()
+                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
+            Some(TPrimitiveType::VARBINARY)
+        );
+    }
+
+    #[test]
+    fn slot_arrow_type_lookup_keeps_tuple_scoped_slot_types() {
+        let desc_tbl = descriptors::TDescriptorTable::new(
+            vec![
+                descriptors::TSlotDescriptor {
+                    id: Some(7),
+                    parent: Some(2),
+                    slot_type: Some(scalar_type_desc(TPrimitiveType::VARBINARY)),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: Some("count_col".to_string()),
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(false),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                },
+                descriptors::TSlotDescriptor {
+                    id: Some(7),
+                    parent: Some(3),
+                    slot_type: Some(scalar_type_desc(TPrimitiveType::BIGINT)),
+                    column_pos: None,
+                    byte_offset: None,
+                    null_indicator_byte: None,
+                    null_indicator_bit: None,
+                    col_name: Some("count_col_final".to_string()),
+                    slot_idx: None,
+                    is_materialized: None,
+                    is_output_column: None,
+                    is_nullable: Some(false),
+                    col_unique_id: None,
+                    col_physical_name: None,
+                },
+            ],
+            vec![],
+            vec![],
+            false,
+        );
+
+        let lookup = slot_arrow_type_lookup(&desc_tbl).expect("slot arrow type lookup");
+        assert_eq!(lookup.get(&(2, 7)), Some(&DataType::Binary));
+        assert_eq!(lookup.get(&(3, 7)), Some(&DataType::Int64));
     }
 }

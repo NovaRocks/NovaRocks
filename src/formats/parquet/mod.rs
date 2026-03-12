@@ -50,7 +50,7 @@ use std::sync::Arc;
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::exec::variant::VariantValue;
@@ -954,7 +954,7 @@ impl Iterator for ParquetScanIter {
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }
-                    return Some(Ok(Chunk::new(batch)));
+                    return Some(Ok(Chunk::new_with_slot_ids(batch, &self.cfg.slot_ids)));
                 }
                 Some(Err(e)) => {
                     self.reader = None;
@@ -1588,7 +1588,7 @@ fn align_batch_to_iceberg_schema(
 fn reorder_batch(cfg: &ParquetScanConfig, batch: RecordBatch) -> Result<RecordBatch, String> {
     if let Some(output_schema) = cfg.iceberg_output_schema.as_ref() {
         let batch = align_batch_to_iceberg_schema(output_schema, batch, cfg.case_sensitive)?;
-        return attach_slot_ids_to_batch(cfg, batch);
+        return validate_batch_slot_count(cfg, batch);
     }
 
     let batch_schema = batch.schema();
@@ -1611,7 +1611,7 @@ fn reorder_batch(cfg: &ParquetScanConfig, batch: RecordBatch) -> Result<RecordBa
                     }
                 });
             if matches {
-                return attach_slot_ids_to_batch(cfg, batch);
+                return validate_batch_slot_count(cfg, batch);
             }
         }
 
@@ -1654,13 +1654,13 @@ fn reorder_batch(cfg: &ParquetScanConfig, batch: RecordBatch) -> Result<RecordBa
         let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
         let batch = RecordBatch::try_new(new_schema, new_columns)
             .map_err(|e: arrow::error::ArrowError| e.to_string())?;
-        return attach_slot_ids_to_batch(cfg, batch);
+        return validate_batch_slot_count(cfg, batch);
     }
 
-    attach_slot_ids_to_batch(cfg, batch)
+    validate_batch_slot_count(cfg, batch)
 }
 
-fn attach_slot_ids_to_batch(
+fn validate_batch_slot_count(
     cfg: &ParquetScanConfig,
     batch: RecordBatch,
 ) -> Result<RecordBatch, String> {
@@ -1683,29 +1683,7 @@ fn attach_slot_ids_to_batch(
         ));
     }
 
-    let schema = batch.schema();
-    let mut already_aligned = true;
-    for (f, slot_id) in schema.fields().iter().zip(cfg.slot_ids.iter()) {
-        let input_slot_id = field_slot_id(f.as_ref())?;
-        if input_slot_id != Some(*slot_id) {
-            already_aligned = false;
-            break;
-        }
-    }
-    if already_aligned {
-        return Ok(batch);
-    }
-
-    let mut new_fields = Vec::with_capacity(schema.fields().len());
-    for (f, slot_id) in schema.fields().iter().zip(cfg.slot_ids.iter()) {
-        new_fields.push(Arc::new(field_with_slot_id((**f).clone(), *slot_id)));
-    }
-    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        new_fields,
-        schema.metadata().clone(),
-    ));
-    RecordBatch::try_new(new_schema, batch.columns().to_vec())
-        .map_err(|e: arrow::error::ArrowError| e.to_string())
+    Ok(batch)
 }
 
 fn convert_variant_columns(

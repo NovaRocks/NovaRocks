@@ -26,12 +26,6 @@ use novarocks::common::types::UniqueId;
 use novarocks::novarocks_config;
 use novarocks::novarocks_logging;
 
-// SSB test data helper
-pub mod ssb;
-
-// Re-export for convenience
-pub use ssb::SSBTestData;
-
 /// Test configuration for integration tests.
 pub struct TestConfig {
     /// Temporary directory for test artifacts

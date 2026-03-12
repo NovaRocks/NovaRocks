@@ -17,7 +17,7 @@
 use crate::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
-use crate::lower::layout::{Layout, schema_for_layout};
+use crate::lower::layout::{Layout, chunk_schema_for_layout, schema_for_layout};
 use crate::lower::node::Lowered;
 
 use crate::{descriptors, plan_nodes};
@@ -49,8 +49,11 @@ pub(crate) fn lower_cross_join_node(
         return Err("CROSS_JOIN_NODE requires desc_tbl for schema".to_string());
     };
     let left_schema = schema_for_layout(desc_tbl, &left.layout)?;
+    let left_chunk_schema = chunk_schema_for_layout(desc_tbl, &left.layout)?;
     let right_schema = schema_for_layout(desc_tbl, &right.layout)?;
+    let right_chunk_schema = chunk_schema_for_layout(desc_tbl, &right.layout)?;
     let join_scope_schema = schema_for_layout(desc_tbl, &layout)?;
+    let join_scope_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout)?;
 
     Ok(Lowered {
         node: ExecNode {
@@ -61,8 +64,11 @@ pub(crate) fn lower_cross_join_node(
                 join_type: NestedLoopJoinType::Cross,
                 join_conjunct: None,
                 left_schema,
+                left_chunk_schema,
                 right_schema,
+                right_chunk_schema,
                 join_scope_schema,
+                join_scope_chunk_schema,
             }),
         },
         layout,

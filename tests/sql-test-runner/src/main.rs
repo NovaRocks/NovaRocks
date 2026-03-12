@@ -18,6 +18,8 @@ struct SuiteConfig {
     default_catalog: String,
     default_db: String,
     verify_default: bool,
+    init_sql: Option<PathBuf>,
+    cleanup_sql: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -56,6 +58,14 @@ struct QueryExecution {
     rows: Vec<Vec<String>>,
     text_output: String,
     elapsed: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct SuiteHook {
+    path: PathBuf,
+    sql: String,
+    catalog: Option<String>,
+    db: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -121,12 +131,6 @@ struct Cli {
     password: Option<String>,
 
     #[arg(long)]
-    catalog: Option<String>,
-
-    #[arg(long)]
-    db: Option<String>,
-
-    #[arg(long)]
     ref_mysql: Option<String>,
 
     #[arg(long)]
@@ -140,12 +144,6 @@ struct Cli {
 
     #[arg(long)]
     ref_password: Option<String>,
-
-    #[arg(long)]
-    ref_catalog: Option<String>,
-
-    #[arg(long)]
-    ref_db: Option<String>,
 
     #[arg(long)]
     query_timeout: Option<u64>,
@@ -215,8 +213,8 @@ fn strip_optional_quotes(raw: &str) -> String {
 
 fn detect_default_config(base_dir: &Path) -> Option<PathBuf> {
     let sr_conf = base_dir
-        .join("dev")
-        .join("test")
+        .join("tests")
+        .join("sql-test-runner")
         .join("conf")
         .join("sr.conf");
     sr_conf.exists().then_some(sr_conf)
@@ -296,6 +294,50 @@ fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
     Ok(config)
 }
 
+fn insert_placeholder_default(
+    variables: &mut HashMap<String, String>,
+    key: &str,
+    value: impl Into<String>,
+) {
+    let should_insert = variables
+        .get(key)
+        .map(|existing| existing.trim().is_empty())
+        .unwrap_or(true);
+    if should_insert {
+        variables.insert(key.to_string(), value.into());
+    }
+}
+
+fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
+    if suite_name != "iceberg" {
+        return;
+    }
+
+    // Keep the local Iceberg suite aligned with bootstrap defaults so it runs
+    // out of the box against the standard MinIO-backed test environment.
+    insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
+    insert_placeholder_default(
+        variables,
+        "iceberg_catalog_warehouse",
+        env_or_default("CATALOG_WAREHOUSE_URI", "s3://novarocks/iceberg-catalog"),
+    );
+    insert_placeholder_default(
+        variables,
+        "oss_ak",
+        env_or_default("MINIO_ROOT_USER", "admin"),
+    );
+    insert_placeholder_default(
+        variables,
+        "oss_sk",
+        env_or_default("MINIO_ROOT_PASSWORD", "admin123"),
+    );
+    insert_placeholder_default(
+        variables,
+        "oss_endpoint",
+        env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"),
+    );
+}
+
 fn placeholder_variables(
     runner_config: &RunnerConfig,
     suite_name: &str,
@@ -307,6 +349,7 @@ fn placeholder_variables(
     let run_id = format!("sqlt_{:x}_{}", nanos, std::process::id());
 
     let mut variables = runner_config.values.clone();
+    apply_suite_placeholder_defaults(&mut variables, suite_name);
     variables.insert("run_id".to_string(), run_id.clone());
     variables.insert("suite".to_string(), suite_name.to_string());
     for idx in 0..10 {
@@ -338,40 +381,7 @@ fn substitute_placeholders(
     Ok(substituted)
 }
 
-fn detect_local_target_port(base_dir: &Path) -> Result<Option<String>> {
-    let fe_conf = base_dir.join("dev").join("fe").join("conf").join("fe.conf");
-    if !fe_conf.exists() {
-        return Ok(None);
-    }
-
-    let content = fs::read_to_string(&fe_conf)
-        .with_context(|| format!("read failed: {}", fe_conf.display()))?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "query_port" {
-            continue;
-        }
-        let port = value.trim();
-        if port.is_empty() {
-            break;
-        }
-        return Ok(Some(port.to_string()));
-    }
-
-    Ok(None)
-}
-
-fn resolve_target_port(
-    cli_port: Option<&str>,
-    base_dir: &Path,
-    runner_config: &RunnerConfig,
-) -> Result<String> {
+fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig) -> Result<String> {
     if let Some(port) = cli_port.filter(|v| !v.trim().is_empty()) {
         return Ok(port.trim().to_string());
     }
@@ -385,12 +395,25 @@ fn resolve_target_port(
     {
         return Ok(port.trim().to_string());
     }
-    if let Some(port) = detect_local_target_port(base_dir)? {
-        return Ok(port);
+    bail!(
+        "target port is not set; provide --port or STARUST_TEST_PORT, or configure tests/sql-test-runner/conf/sr.conf with [cluster].port"
+    );
+}
+
+fn resolve_repo_root() -> Result<PathBuf> {
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    loop {
+        if dir.join("sql-tests").is_dir() && dir.join("Cargo.toml").is_file() {
+            return Ok(dir);
+        }
+        if !dir.pop() {
+            break;
+        }
     }
     bail!(
-        "target port is not set; provide --port or STARUST_TEST_PORT, or configure dev/fe/conf/fe.conf with query_port"
-    );
+        "failed to resolve repo root from manifest directory {}",
+        env!("CARGO_MANIFEST_DIR")
+    )
 }
 
 fn resolve_reference_port(
@@ -469,7 +492,7 @@ fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             }
             "catalog" => {
                 bail!(
-                    "@catalog metadata is no longer supported; use runner --catalog/--ref-catalog options"
+                    "@catalog metadata is no longer supported; use suite init.sql metadata instead"
                 );
             }
             "tags" => {
@@ -629,6 +652,92 @@ fn load_sql_queries_from_file(
     Ok(cases)
 }
 
+fn parse_suite_hook_meta(
+    lines: &[String],
+    meta_re: &Regex,
+) -> Result<(Option<String>, Option<String>)> {
+    let mut catalog = None;
+    let mut db = None;
+    for line in lines {
+        let Some((key, raw_value)) = parse_meta_line(line, meta_re) else {
+            continue;
+        };
+        match key.as_str() {
+            "catalog" => catalog = Some(raw_value),
+            "db" => db = Some(raw_value),
+            other => {
+                bail!(
+                    "unsupported suite hook metadata key '{}'; only @catalog and @db are allowed",
+                    other
+                );
+            }
+        }
+    }
+    Ok((catalog, db))
+}
+
+fn extract_suite_hook(
+    lines: &[String],
+    meta_re: &Regex,
+) -> Result<(Option<String>, Option<String>, String)> {
+    let mut preface_meta_lines: Vec<String> = Vec::new();
+    let mut sql_lines: Vec<String> = Vec::new();
+    let mut started = false;
+
+    for line in lines {
+        let stripped = line.trim();
+        if !started {
+            if stripped.is_empty() {
+                continue;
+            }
+            if stripped.starts_with("--") {
+                preface_meta_lines.push(line.clone());
+                continue;
+            }
+            started = true;
+        }
+        sql_lines.push(line.trim_end().to_string());
+    }
+
+    let (catalog, db) = parse_suite_hook_meta(&preface_meta_lines, meta_re)?;
+    let sql = sql_lines.join("\n").trim().to_string();
+    Ok((catalog, db, sql))
+}
+
+fn load_suite_hook(
+    hook_path: Option<&Path>,
+    meta_re: &Regex,
+    variables: &HashMap<String, String>,
+) -> Result<Option<SuiteHook>> {
+    let Some(path) = hook_path else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
+    let content = substitute_placeholders(
+        &content,
+        variables,
+        &format!("{}: placeholder substitution", path.display()),
+    )?;
+    let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
+    let (catalog, db, sql) = extract_suite_hook(&lines, meta_re)
+        .with_context(|| format!("{}: invalid suite hook metadata", path.display()))?;
+    if sql.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(SuiteHook {
+        path: path.to_path_buf(),
+        sql,
+        catalog,
+        db,
+    }))
+}
+
 fn load_expected_result(result_path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
     let content = match fs::read_to_string(result_path) {
         Ok(c) => c,
@@ -689,7 +798,11 @@ fn split_row(line: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_expected_result, write_result_file};
+    use super::{
+        extract_suite_hook, is_transient_iceberg_commit_error, load_expected_result,
+        substitute_placeholders, write_result_file,
+    };
+    use regex::Regex;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -727,6 +840,35 @@ mod tests {
         assert!(loaded.0.is_empty());
         assert!(loaded.1.is_empty());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn transient_iceberg_commit_error_matches_missing_metadata() {
+        let message = "ERROR 1064 (HY000) at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
+        assert!(is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn transient_iceberg_commit_error_ignores_regular_failures() {
+        let message =
+            "ERROR 5904 (42000) at line 10: Warehouse default_warehouse is not available.";
+        assert!(!is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn suite_hook_extracts_catalog_override_and_sql() {
+        let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").expect("meta regex");
+        let raw = "-- @catalog=iceberg_cat_${uuid0}\n-- @db=tpch\nCREATE EXTERNAL CATALOG `iceberg_cat_${uuid0}`;";
+        let variables =
+            std::collections::HashMap::from([("uuid0".to_string(), "abc123".to_string())]);
+        let substituted =
+            substitute_placeholders(raw, &variables, "test suite hook").expect("substitute");
+        let lines: Vec<String> = substituted.lines().map(ToString::to_string).collect();
+        let (catalog, db, sql) = extract_suite_hook(&lines, &meta_re).expect("extract hook");
+
+        assert_eq!(catalog.as_deref(), Some("iceberg_cat_abc123"));
+        assert_eq!(db.as_deref(), Some("tpch"));
+        assert_eq!(sql, "CREATE EXTERNAL CATALOG `iceberg_cat_abc123`;");
     }
 }
 
@@ -1047,59 +1189,16 @@ fn run_mysql_sql(conn: &ConnectionConfig, sql: &str, skip_column_names: bool) ->
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-const DEFAULT_TEST_CATALOG: &str = "sql_test_catalog";
-
-fn catalog_exists(conn: &ConnectionConfig, catalog_name: &str) -> Result<bool> {
-    let mut check_conn = conn.clone();
-    check_conn.catalog = None;
-    check_conn.db = None;
-    let output = run_mysql_sql(&check_conn, "SHOW CATALOGS;", false)?;
-    let (_, rows) = parse_output(&output);
-    Ok(rows
-        .iter()
-        .any(|row| row.first().is_some_and(|name| name == catalog_name)))
-}
-
-fn create_target_catalog_if_missing(
+fn execute_suite_hook(
     conn: &ConnectionConfig,
-    base_dir: &Path,
-    catalog_name: &str,
+    query_timeout: u64,
+    hook: &SuiteHook,
+    label: &str,
 ) -> Result<()> {
-    if catalog_exists(conn, catalog_name)? {
-        return Ok(());
-    }
-    if catalog_name != DEFAULT_TEST_CATALOG {
-        bail!(
-            "target catalog '{}' does not exist; only '{}' can be auto-created",
-            catalog_name,
-            DEFAULT_TEST_CATALOG
-        );
-    }
-
-    let warehouse_path = base_dir.join("sql-tests").join(".sql_test_catalog");
-    fs::create_dir_all(&warehouse_path).with_context(|| {
-        format!(
-            "failed to create warehouse dir: {}",
-            warehouse_path.display()
-        )
-    })?;
-    let warehouse_uri = format!("file://{}", warehouse_path.display());
-    let create_sql = format!(
-        "CREATE EXTERNAL CATALOG IF NOT EXISTS `{}` PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\");",
-        catalog_name, warehouse_uri
-    );
-    run_mysql_sql(conn, &create_sql, true)?;
+    let sql = build_statements(&hook.sql, query_timeout, None, None);
+    run_mysql_sql(conn, &sql, true)
+        .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
     Ok(())
-}
-
-fn ensure_reference_catalog_exists(conn: &ConnectionConfig, catalog_name: &str) -> Result<()> {
-    if catalog_exists(conn, catalog_name)? {
-        return Ok(());
-    }
-    bail!(
-        "reference catalog '{}' does not exist; please create it on the reference StarRocks cluster and rerun",
-        catalog_name
-    );
 }
 
 fn execute_query(
@@ -1107,7 +1206,6 @@ fn execute_query(
     query_timeout: u64,
     sql: &str,
 ) -> (bool, Option<QueryExecution>, String) {
-    let started = Instant::now();
     let full_sql = build_statements(
         sql,
         query_timeout,
@@ -1115,46 +1213,66 @@ fn execute_query(
         conn.db.as_deref(),
     );
 
-    let output = match Command::new(&conn.mysql)
-        .arg(format!("-h{}", conn.host))
-        .arg(format!("-P{}", conn.port))
-        .arg(format!("-u{}", conn.user))
-        .arg("--batch")
-        .arg("--raw")
-        .arg("--default-character-set=utf8mb4")
-        .args(
-            conn.password
-                .as_deref()
-                .filter(|password| !password.is_empty())
-                .map(|password| vec![format!("-p{}", password)])
-                .unwrap_or_default(),
-        )
-        .arg("-e")
-        .arg(full_sql)
-        .output()
-    {
-        Ok(out) => out,
-        Err(exc) => {
-            let elapsed = started.elapsed();
-            return (
-                false,
-                None,
-                format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
-            );
-        }
-    };
+    const MAX_TRANSIENT_ATTEMPTS: usize = 2;
+    const TRANSIENT_RETRY_DELAY_MS: u64 = 300;
 
-    let elapsed = started.elapsed();
-    if !output.status.success() {
+    for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+        let started = Instant::now();
+        let output = match Command::new(&conn.mysql)
+            .arg(format!("-h{}", conn.host))
+            .arg(format!("-P{}", conn.port))
+            .arg(format!("-u{}", conn.user))
+            .arg("--batch")
+            .arg("--raw")
+            .arg("--default-character-set=utf8mb4")
+            .args(
+                conn.password
+                    .as_deref()
+                    .filter(|password| !password.is_empty())
+                    .map(|password| vec![format!("-p{}", password)])
+                    .unwrap_or_default(),
+            )
+            .arg("-e")
+            .arg(&full_sql)
+            .output()
+        {
+            Ok(out) => out,
+            Err(exc) => {
+                let elapsed = started.elapsed();
+                return (
+                    false,
+                    None,
+                    format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
+                );
+            }
+        };
+
+        let elapsed = started.elapsed();
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let (header, rows) = parse_output(&stdout);
+            let execution = QueryExecution {
+                text_output: render_output(&header, &rows),
+                header,
+                rows,
+                elapsed,
+            };
+            return (true, Some(execution), String::new());
+        }
+
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let message = if !stderr.is_empty() { stderr } else { stdout };
+        if attempt + 1 < MAX_TRANSIENT_ATTEMPTS && is_transient_iceberg_commit_error(&message) {
+            std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
+            continue;
+        }
+
         let clipped = if message.len() > 500 {
             message[..500].to_string()
         } else {
             message
         };
-
         return (
             false,
             None,
@@ -1162,15 +1280,11 @@ fn execute_query(
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let (header, rows) = parse_output(&stdout);
-    let execution = QueryExecution {
-        text_output: render_output(&header, &rows),
-        header,
-        rows,
-        elapsed,
-    };
-    (true, Some(execution), String::new())
+    (
+        false,
+        None,
+        "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
+    )
 }
 
 fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
@@ -1180,6 +1294,13 @@ fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
     actual
         .to_ascii_lowercase()
         .contains(&expected_substring.to_ascii_lowercase())
+}
+
+fn is_transient_iceberg_commit_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("metadata file for version")
+        && lower.contains("is missing under")
+        && lower.contains("/metadata")
 }
 
 fn parse_query_list(value: Option<&str>) -> HashSet<String> {
@@ -1210,10 +1331,8 @@ fn suite_default_db(suite_name: &str) -> String {
 }
 
 fn suite_default_catalog(suite_name: &str) -> String {
-    match suite_name {
-        "iceberg" => "default_catalog".to_string(),
-        _ => DEFAULT_TEST_CATALOG.to_string(),
-    }
+    let _ = suite_name;
+    "default_catalog".to_string()
 }
 
 fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>> {
@@ -1247,6 +1366,14 @@ fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>>
             default_catalog: suite_default_catalog(&name),
             default_db: suite_default_db(&name),
             verify_default: true,
+            init_sql: path
+                .join("init.sql")
+                .exists()
+                .then(|| path.join("init.sql")),
+            cleanup_sql: path
+                .join("cleanup.sql")
+                .exists()
+                .then(|| path.join("cleanup.sql")),
         };
         suite_configs.insert(name, config);
     }
@@ -1363,10 +1490,7 @@ fn mode_name(mode: Mode) -> &'static str {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let base_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(Path::to_path_buf)
-        .context("failed to resolve repo root from sql-tests manifest path")?;
+    let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
 
@@ -1406,9 +1530,25 @@ fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| suite.sql_glob.clone());
 
-    let target_db_default = cli.db.clone().unwrap_or_else(|| suite.default_db.clone());
-    let ref_db_default = cli
-        .ref_db
+    let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
+    let marker_re = Regex::new(r"(?i)^--\s*query\s+\d+(?:\s+.*)?$")?;
+    let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
+    let suite_init_hook =
+        load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
+            .with_context(|| format!("failed to load suite init hook for {}", suite.name))?;
+    let suite_cleanup_hook =
+        load_suite_hook(suite.cleanup_sql.as_deref(), &meta_re, &placeholder_vars)
+            .with_context(|| format!("failed to load suite cleanup hook for {}", suite.name))?;
+
+    let suite_catalog_override = suite_init_hook
+        .as_ref()
+        .and_then(|hook| hook.catalog.clone());
+    let suite_db_override = suite_init_hook.as_ref().and_then(|hook| hook.db.clone());
+
+    let target_db_default = suite_db_override
+        .clone()
+        .unwrap_or_else(|| suite.default_db.clone());
+    let ref_db_default = suite_db_override
         .clone()
         .unwrap_or_else(|| suite.default_db.clone());
 
@@ -1420,18 +1560,14 @@ fn main() -> Result<()> {
     });
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
-    let target_port = resolve_target_port(cli.port.as_deref(), &base_dir, &runner_config)?;
+    let target_port = resolve_target_port(cli.port.as_deref(), &runner_config)?;
     let reference_port =
         resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
-    let target_catalog_name = cli
-        .catalog
+    let target_catalog_name = suite_catalog_override
         .clone()
-        .or_else(|| env_optional("STARUST_TEST_CATALOG"))
         .unwrap_or_else(|| suite.default_catalog.clone());
-    let reference_catalog_name = cli
-        .ref_catalog
+    let reference_catalog_name = suite_catalog_override
         .clone()
-        .or_else(|| env_optional("STARUST_REF_CATALOG"))
         .unwrap_or_else(|| suite.default_catalog.clone());
 
     let target_conn_base = ConnectionConfig {
@@ -1465,14 +1601,6 @@ fn main() -> Result<()> {
         },
     };
 
-    create_target_catalog_if_missing(&target_conn_base, &base_dir, &target_catalog_name)
-        .with_context(|| {
-            format!(
-                "failed to ensure target catalog '{}' on {}:{}",
-                target_catalog_name, target_conn_base.host, target_conn_base.port
-            )
-        })?;
-
     let reference_conn_base = ConnectionConfig {
         mysql: cli
             .ref_mysql
@@ -1501,18 +1629,6 @@ fn main() -> Result<()> {
         },
     };
 
-    if cli.mode == Mode::Diff
-        || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
-    {
-        ensure_reference_catalog_exists(&reference_conn_base, &reference_catalog_name)
-            .with_context(|| {
-                format!(
-                    "failed to ensure reference catalog '{}' on {}:{}",
-                    reference_catalog_name, reference_conn_base.host, reference_conn_base.port
-                )
-            })?;
-    }
-
     println!("{}", "=".repeat(72));
     println!("📋 {} correctness runner", suite.name.to_uppercase());
     println!("{}", "=".repeat(72));
@@ -1538,6 +1654,18 @@ fn main() -> Result<()> {
     if cli.mode == Mode::Verify {
         println!("verify_enabled={}", verify_enabled);
     }
+    if let Some(hook) = suite_init_hook.as_ref() {
+        println!("suite_init={}", hook.path.display());
+        if let Some(catalog) = hook.catalog.as_deref() {
+            println!("suite_env.catalog={}", catalog);
+        }
+        if let Some(db) = hook.db.as_deref() {
+            println!("suite_env.db={}", db);
+        }
+    }
+    if let Some(hook) = suite_cleanup_hook.as_ref() {
+        println!("suite_cleanup={}", hook.path.display());
+    }
     println!("{}", "=".repeat(72));
 
     if !sql_dir.exists() {
@@ -1557,10 +1685,6 @@ fn main() -> Result<()> {
 
     let only_set = parse_query_list(cli.only.as_deref());
     let skip_set = parse_query_list(cli.skip.as_deref());
-
-    let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
-    let marker_re = Regex::new(r"(?i)^--\s*query\s+\d+(?:\s+.*)?$")?;
-    let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
 
     let mut cases: Vec<QueryCase> = Vec::new();
     let mut failed_query_ids: Vec<String> = Vec::new();
@@ -1652,6 +1776,54 @@ fn main() -> Result<()> {
         if let Some(dir) = &result_dir {
             fs::create_dir_all(dir)
                 .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
+        }
+    }
+
+    let target_admin_conn = ConnectionConfig {
+        catalog: None,
+        db: None,
+        ..target_conn_base.clone()
+    };
+    let reference_admin_conn = ConnectionConfig {
+        catalog: None,
+        db: None,
+        ..reference_conn_base.clone()
+    };
+
+    if let Some(hook) = suite_init_hook.as_ref() {
+        println!("running suite init on target: {}", hook.path.display());
+        if let Err(exc) = execute_suite_hook(&target_admin_conn, query_timeout, hook, "target") {
+            if let Some(cleanup) = suite_cleanup_hook.as_ref() {
+                let _ = execute_suite_hook(
+                    &target_admin_conn,
+                    query_timeout,
+                    cleanup,
+                    "target cleanup after init failure",
+                );
+            }
+            return Err(exc);
+        }
+        if reference_required {
+            println!("running suite init on reference: {}", hook.path.display());
+            if let Err(exc) =
+                execute_suite_hook(&reference_admin_conn, query_timeout, hook, "reference")
+            {
+                if let Some(cleanup) = suite_cleanup_hook.as_ref() {
+                    let _ = execute_suite_hook(
+                        &reference_admin_conn,
+                        query_timeout,
+                        cleanup,
+                        "reference cleanup after init failure",
+                    );
+                    let _ = execute_suite_hook(
+                        &target_admin_conn,
+                        query_timeout,
+                        cleanup,
+                        "target cleanup after init failure",
+                    );
+                }
+                return Err(exc);
+            }
         }
     }
 
@@ -2084,6 +2256,25 @@ fn main() -> Result<()> {
         );
     }
 
+    let mut cleanup_errors = Vec::new();
+    if let Some(hook) = suite_cleanup_hook.as_ref() {
+        println!("\nrunning suite cleanup on target: {}", hook.path.display());
+        if let Err(exc) = execute_suite_hook(&target_admin_conn, query_timeout, hook, "target") {
+            cleanup_errors.push(exc.to_string());
+        }
+        if reference_required {
+            println!(
+                "running suite cleanup on reference: {}",
+                hook.path.display()
+            );
+            if let Err(exc) =
+                execute_suite_hook(&reference_admin_conn, query_timeout, hook, "reference")
+            {
+                cleanup_errors.push(exc.to_string());
+            }
+        }
+    }
+
     println!("\n{}", "=".repeat(72));
     println!("summary ({}, mode={})", suite.name, mode_name(cli.mode));
     println!("{}", "=".repeat(72));
@@ -2104,9 +2295,15 @@ fn main() -> Result<()> {
             println!("  {}", id);
         }
     }
+    if !cleanup_errors.is_empty() {
+        println!("\ncleanup errors:");
+        for err in &cleanup_errors {
+            println!("  {}", err);
+        }
+    }
     println!("{}", "=".repeat(72));
 
-    if failed > 0 {
+    if failed > 0 || !cleanup_errors.is_empty() {
         std::process::exit(1);
     }
 

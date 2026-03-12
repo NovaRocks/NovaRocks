@@ -32,11 +32,10 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::{Array, ArrayRef, Int32Array, UInt32Array};
 use arrow::compute::{concat, take};
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::descriptors;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
@@ -53,6 +52,7 @@ pub struct FetchProcessorFactory {
     row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     nodes_info: Option<descriptors::TNodesInfo>,
     output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
 }
 
 impl FetchProcessorFactory {
@@ -62,6 +62,7 @@ impl FetchProcessorFactory {
         row_pos_descs: HashMap<i32, RowPositionDescriptor>,
         nodes_info: Option<descriptors::TNodesInfo>,
         output_slots: Vec<SlotId>,
+        output_chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
             name: format!("FETCH (id={})", node_id),
@@ -70,6 +71,7 @@ impl FetchProcessorFactory {
             row_pos_descs,
             nodes_info,
             output_slots,
+            output_chunk_schema,
         }
     }
 }
@@ -87,6 +89,7 @@ impl OperatorFactory for FetchProcessorFactory {
             row_pos_descs: self.row_pos_descs.clone(),
             nodes_info: self.nodes_info.clone(),
             output_slots: self.output_slots.clone(),
+            output_chunk_schema: self.output_chunk_schema.clone(),
             pending_output: None,
             finishing: false,
             output_schema: None,
@@ -101,6 +104,7 @@ struct FetchProcessor {
     row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     nodes_info: Option<descriptors::TNodesInfo>,
     output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     pending_output: Option<Chunk>,
     finishing: bool,
     output_schema: Option<SchemaRef>,
@@ -159,8 +163,9 @@ impl FetchProcessor {
             .ok_or_else(|| "descriptor table missing for fetch".to_string())?;
         let output_schema = self
             .output_schema
-            .get_or_insert(schema_for_slots(&desc_tbl, &self.output_slots)?)
+            .get_or_insert(schema_for_chunk_schema(&self.output_chunk_schema)?)
             .clone();
+        let output_chunk_schema = self.output_chunk_schema.clone();
 
         let mut fetched_columns: HashMap<SlotId, ArrayRef> = HashMap::new();
         for (tuple_id, row_pos_desc) in &self.row_pos_descs {
@@ -250,9 +255,11 @@ impl FetchProcessor {
                 return Err(format!("missing output slot {}", slot));
             }
         }
-        let batch =
-            RecordBatch::try_new(output_schema, output_columns).map_err(|e| e.to_string())?;
-        Chunk::try_new(batch)
+        Chunk::try_new_with_schema_and_chunk_schema(
+            output_schema,
+            output_columns,
+            output_chunk_schema,
+        )
     }
 
     fn is_local_backend(&self, backend_id: i32) -> Result<bool, String> {
@@ -321,6 +328,7 @@ impl FetchProcessor {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use super::FetchProcessor;
     use crate::common::ids::SlotId;
@@ -364,6 +372,7 @@ mod tests {
             pending_output: None,
             finishing: false,
             output_schema: None,
+            output_chunk_schema: Arc::new(crate::exec::chunk::ChunkSchema::empty()),
         };
 
         let result = processor.lookup_remote(QueryId { hi: 1, lo: 2 }, 3, &HashMap::new(), 9);
@@ -420,34 +429,19 @@ fn find_node(
         .find(|node| node.id == backend_id as i64)
 }
 
-fn schema_for_slots(
-    desc_tbl: &descriptors::TDescriptorTable,
-    slots: &[SlotId],
-) -> Result<SchemaRef, String> {
-    let slot_descs = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut map: HashMap<SlotId, (Field, bool)> = HashMap::new();
-    for s in slot_descs {
-        let (Some(id), Some(slot_type)) = (s.id, s.slot_type.as_ref()) else {
-            continue;
-        };
-        let Some(name) = crate::lower::layout::slot_name_from_desc(s) else {
-            continue;
-        };
-        let dt = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
-            .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
-        let nullable = s.is_nullable.unwrap_or(true);
-        let field = field_with_slot_id(Field::new(name, dt, nullable), SlotId::try_from(id)?);
-        map.insert(SlotId::try_from(id)?, (field, nullable));
-    }
-    let mut fields = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let (field, _) = map
-            .get(slot)
-            .ok_or_else(|| format!("missing slot descriptor for slot {}", slot))?;
-        fields.push(field.clone());
+fn schema_for_chunk_schema(chunk_schema: &ChunkSchemaRef) -> Result<SchemaRef, String> {
+    let mut fields = Vec::with_capacity(chunk_schema.slots().len());
+    for slot in chunk_schema.slots() {
+        let data_type = slot
+            .type_desc()
+            .and_then(crate::lower::type_lowering::arrow_type_from_desc)
+            .ok_or_else(|| {
+                format!(
+                    "fetch output chunk schema missing or unsupported type for slot {}",
+                    slot.slot_id()
+                )
+            })?;
+        fields.push(Field::new(slot.name(), data_type, slot.nullable()));
     }
     Ok(SchemaRef::new(Schema::new(fields)))
 }

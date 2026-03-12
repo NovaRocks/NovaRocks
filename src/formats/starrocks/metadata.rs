@@ -32,7 +32,8 @@ use crate::formats::starrocks::cache::{segment_footer_cache_get, segment_footer_
 use crate::formats::starrocks::segment::{StarRocksSegmentFooter, decode_segment_footer};
 use crate::runtime::global_async_runtime::data_runtime;
 use crate::service::grpc_client::proto::starrocks::{
-    BundleTabletMetadataPb, DelvecPagePb, KeysType, PagePointerPb, TabletMetadataPb, TabletSchemaPb,
+    BundleTabletMetadataPb, DelvecPagePb, KeysType, PagePointerPb, RowsetMetadataPb,
+    TabletMetadataPb, TabletSchemaPb,
 };
 
 const METADATA_DIR: &str = "meta";
@@ -619,115 +620,9 @@ fn collect_segment_files(
     metadata: &TabletMetadataPb,
 ) -> Result<(Vec<StarRocksSegmentFile>, Vec<StarRocksDeletePredicateRaw>), String> {
     let mut files = Vec::new();
-    let mut delete_predicates = Vec::new();
+    let delete_predicates = collect_delete_predicates(metadata)?;
     for (rowset_index, rowset) in metadata.rowsets.iter().enumerate() {
-        // Keep lake-tablet semantics in StarRocks BE:
-        // - delete predicate version key is rowset index, not delete_predicate.version.
-        // - rowset scan applies delete predicates with version >= current rowset index.
-        let rowset_version = i64::try_from(rowset_index).map_err(|_| {
-            format!(
-                "rowset index overflow while deriving delete visibility version: rowset_id={:?}, rowset_index={}",
-                rowset.id, rowset_index
-            )
-        })?;
-        if rowset_version < 0 {
-            return Err(format!(
-                "invalid rowset version in tablet metadata: rowset_id={:?}, version={}",
-                rowset.id, rowset_version
-            ));
-        }
-
-        if let Some(delete_predicate) = rowset.delete_predicate.as_ref() {
-            delete_predicates.push(StarRocksDeletePredicateRaw {
-                version: rowset_version,
-                // Lake reader in StarRocks BE does not use sub_predicates.
-                sub_predicates: Vec::new(),
-                in_predicates: delete_predicate
-                    .in_predicates
-                    .iter()
-                    .map(|p| {
-                        let column_name = p
-                            .column_name
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .ok_or_else(|| {
-                                format!(
-                                    "delete in predicate column_name is missing: rowset_id={:?}, version={}",
-                                    rowset.id, rowset_version
-                                )
-                            })?;
-                        Ok(StarRocksInPredicateRaw {
-                            column_name: column_name.to_string(),
-                            is_not_in: p.is_not_in.unwrap_or(false),
-                            values: p.values.clone(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-                binary_predicates: delete_predicate
-                    .binary_predicates
-                    .iter()
-                    .map(|p| {
-                        let column_name = p
-                            .column_name
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .ok_or_else(|| {
-                                format!(
-                                    "delete binary predicate column_name is missing: rowset_id={:?}, version={}",
-                                    rowset.id, rowset_version
-                                )
-                            })?;
-                        let op = p.op.as_deref().map(str::trim).filter(|v| !v.is_empty()).ok_or_else(
-                            || {
-                                format!(
-                                    "delete binary predicate op is missing: rowset_id={:?}, version={}, column_name={}",
-                                    rowset.id, rowset_version, column_name
-                                )
-                            },
-                        )?;
-                        let value = p
-                            .value
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .ok_or_else(|| {
-                                format!(
-                                    "delete binary predicate value is missing: rowset_id={:?}, version={}, column_name={}, op={}",
-                                    rowset.id, rowset_version, column_name, op
-                                )
-                            })?;
-                        Ok(StarRocksBinaryPredicateRaw {
-                            column_name: column_name.to_string(),
-                            op: op.to_string(),
-                            value: value.to_string(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-                is_null_predicates: delete_predicate
-                    .is_null_predicates
-                    .iter()
-                    .map(|p| {
-                        let column_name = p
-                            .column_name
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .ok_or_else(|| {
-                                format!(
-                                    "delete is-null predicate column_name is missing: rowset_id={:?}, version={}",
-                                    rowset.id, rowset_version
-                                )
-                            })?;
-                        Ok(StarRocksIsNullPredicateRaw {
-                            column_name: column_name.to_string(),
-                            is_not_null: p.is_not_null.unwrap_or(false),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            });
-        }
+        let rowset_version = lake_rowset_visibility_version(rowset, rowset_index)?;
 
         if !rowset.segment_size.is_empty() && rowset.segment_size.len() != rowset.segments.len() {
             return Err(format!(
@@ -814,6 +709,133 @@ fn collect_segment_files(
         }
     }
     Ok((files, delete_predicates))
+}
+
+pub(crate) fn lake_rowset_visibility_version(
+    rowset: &RowsetMetadataPb,
+    rowset_index: usize,
+) -> Result<i64, String> {
+    // Keep lake-tablet semantics in StarRocks BE:
+    // - delete predicate version key is rowset index, not delete_predicate.version.
+    // - rowset scan applies delete predicates with version >= current rowset index.
+    let rowset_version = i64::try_from(rowset_index).map_err(|_| {
+        format!(
+            "rowset index overflow while deriving delete visibility version: rowset_id={:?}, rowset_index={}",
+            rowset.id, rowset_index
+        )
+    })?;
+    if rowset_version < 0 {
+        return Err(format!(
+            "invalid rowset version in tablet metadata: rowset_id={:?}, version={}",
+            rowset.id, rowset_version
+        ));
+    }
+    Ok(rowset_version)
+}
+
+pub(crate) fn collect_delete_predicates(
+    metadata: &TabletMetadataPb,
+) -> Result<Vec<StarRocksDeletePredicateRaw>, String> {
+    let mut delete_predicates = Vec::new();
+    for (rowset_index, rowset) in metadata.rowsets.iter().enumerate() {
+        let rowset_version = lake_rowset_visibility_version(rowset, rowset_index)?;
+        let Some(delete_predicate) = rowset.delete_predicate.as_ref() else {
+            continue;
+        };
+        delete_predicates.push(StarRocksDeletePredicateRaw {
+            version: rowset_version,
+            // Lake reader in StarRocks BE does not use sub_predicates.
+            sub_predicates: Vec::new(),
+            in_predicates: delete_predicate
+                .in_predicates
+                .iter()
+                .map(|p| {
+                    let column_name = p
+                        .column_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "delete in predicate column_name is missing: rowset_id={:?}, version={}",
+                                rowset.id, rowset_version
+                            )
+                        })?;
+                    Ok(StarRocksInPredicateRaw {
+                        column_name: column_name.to_string(),
+                        is_not_in: p.is_not_in.unwrap_or(false),
+                        values: p.values.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            binary_predicates: delete_predicate
+                .binary_predicates
+                .iter()
+                .map(|p| {
+                    let column_name = p
+                        .column_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "delete binary predicate column_name is missing: rowset_id={:?}, version={}",
+                                rowset.id, rowset_version
+                            )
+                        })?;
+                    let op = p
+                        .op
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "delete binary predicate op is missing: rowset_id={:?}, version={}, column_name={}",
+                                rowset.id, rowset_version, column_name
+                            )
+                        })?;
+                    let value = p
+                        .value
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "delete binary predicate value is missing: rowset_id={:?}, version={}, column_name={}, op={}",
+                                rowset.id, rowset_version, column_name, op
+                            )
+                        })?;
+                    Ok(StarRocksBinaryPredicateRaw {
+                        column_name: column_name.to_string(),
+                        op: op.to_string(),
+                        value: value.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            is_null_predicates: delete_predicate
+                .is_null_predicates
+                .iter()
+                .map(|p| {
+                    let column_name = p
+                        .column_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "delete is-null predicate column_name is missing: rowset_id={:?}, version={}",
+                                rowset.id, rowset_version
+                            )
+                        })?;
+                    Ok(StarRocksIsNullPredicateRaw {
+                        column_name: column_name.to_string(),
+                        is_not_null: p.is_not_null.unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        });
+    }
+    Ok(delete_predicates)
 }
 
 fn collect_delvec_meta(metadata: &TabletMetadataPb) -> Result<StarRocksDelvecMetaRaw, String> {

@@ -23,6 +23,7 @@ use arrow::datatypes::SchemaRef;
 use chrono::NaiveDateTime;
 use regex::Regex;
 
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use crate::novarocks_config::config as novarocks_app_config;
@@ -45,6 +46,7 @@ pub(crate) struct SchemaScanOp {
     table: SchemaTable,
     context: SchemaScanContext,
     output_schema: SchemaRef,
+    output_chunk_schema: ChunkSchemaRef,
     should_scan: bool,
     fe_addr: Option<types::TNetworkAddress>,
 }
@@ -54,6 +56,7 @@ impl SchemaScanOp {
         table: SchemaTable,
         context: SchemaScanContext,
         output_schema: SchemaRef,
+        output_chunk_schema: ChunkSchemaRef,
         should_scan: bool,
         fe_addr: Option<types::TNetworkAddress>,
     ) -> Self {
@@ -61,6 +64,7 @@ impl SchemaScanOp {
             table,
             context,
             output_schema,
+            output_chunk_schema,
             should_scan,
             fe_addr,
         }
@@ -316,7 +320,6 @@ impl SchemaScanOp {
             SchemaTable::Be(BeSchemaTable::Tablets) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Threads) => Vec::new(),
             SchemaTable::Be(BeSchemaTable::Bvars) => Vec::new(),
-            SchemaTable::Be(BeSchemaTable::Metrics) => build_be_metric_rows(),
             SchemaTable::Be(BeSchemaTable::Unsupported(_)) => Vec::new(),
         };
 
@@ -327,39 +330,6 @@ impl SchemaScanOp {
         }
         Ok(rows)
     }
-}
-
-fn build_be_metric_rows() -> Vec<SchemaRow> {
-    const METRIC_NAMES: [&str; 3] = [
-        "pipe_connector_scan_execution_time",
-        "pipe_driver_execution_time",
-        "pipe_scan_execution_time",
-    ];
-    const LABELS: [&str; 3] = [
-        "workload_type=load",
-        "workload_type=query",
-        "workload_type=unknown",
-    ];
-
-    let be_id = backend_id::backend_id().unwrap_or(-1);
-    let mut rows = Vec::with_capacity(METRIC_NAMES.len() * LABELS.len());
-    for metric_name in METRIC_NAMES {
-        for labels in LABELS {
-            let mut row = SchemaRow::new();
-            row.insert(normalize_column_key("BE_ID"), SchemaValue::Int64(be_id));
-            row.insert(
-                normalize_column_key("NAME"),
-                SchemaValue::Utf8(metric_name.to_string()),
-            );
-            row.insert(
-                normalize_column_key("LABELS"),
-                SchemaValue::Utf8(labels.to_string()),
-            );
-            row.insert(normalize_column_key("VALUE"), SchemaValue::Int64(0));
-            rows.push(row);
-        }
-    }
-    rows
 }
 
 fn build_be_config_rows() -> Result<Vec<SchemaRow>, String> {
@@ -672,7 +642,11 @@ impl ScanOp for SchemaScanOp {
 
         let mut chunks = Vec::new();
         for batch_rows in rows.chunks(DEFAULT_CHUNK_ROWS.max(1)) {
-            let chunk = build_chunk(Arc::clone(&self.output_schema), batch_rows)?;
+            let chunk = build_chunk(
+                Arc::clone(&self.output_schema),
+                Arc::clone(&self.output_chunk_schema),
+                batch_rows,
+            )?;
             chunks.push(chunk);
         }
 
@@ -702,7 +676,7 @@ mod tests {
 
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
+    use crate::exec::chunk::{ChunkSchema, field_with_slot_id};
 
     fn ctx(table_name: &str) -> SchemaScanContext {
         SchemaScanContext {
@@ -764,10 +738,13 @@ mod tests {
             field_with_slot_id(Field::new("LABEL", DataType::Utf8, true), SlotId::new(2)),
             field_with_slot_id(Field::new("TXN_ID", DataType::Int64, false), SlotId::new(1)),
         ]));
+        let chunk_schema =
+            Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"));
         let op = SchemaScanOp::new(
             SchemaTable::Be(BeSchemaTable::TabletWriteLog),
             ctx("be_tablet_write_log"),
             schema,
+            chunk_schema,
             true,
             None,
         );

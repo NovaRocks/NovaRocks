@@ -183,7 +183,7 @@ impl LocalRuntimeFilterSet {
 
         let mask = BooleanArray::from(keep);
         let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
-        Ok(Some(Chunk::new(filtered_batch)))
+        Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 }
 

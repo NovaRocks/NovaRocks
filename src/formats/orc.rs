@@ -27,7 +27,7 @@ use orc_rust::schema::RootDataType;
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::fs::coalesce_policy::AdaptiveCoalesceController;
@@ -231,7 +231,7 @@ impl Iterator for OrcScanIter {
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }
-                    return Some(Ok(Chunk::new(batch)));
+                    return Some(Ok(Chunk::new_with_slot_ids(batch, &self.cfg.slot_ids)));
                 }
                 Some(Err(e)) => {
                     self.reader = None;
@@ -432,10 +432,10 @@ fn reorder_orc_batch(
     let new_schema = Arc::new(Schema::new(new_fields));
     let batch = RecordBatch::try_new(new_schema, new_columns)
         .map_err(|e: arrow::error::ArrowError| e.to_string())?;
-    attach_slot_ids_to_batch(cfg, batch)
+    validate_batch_slot_count(cfg, batch)
 }
 
-fn attach_slot_ids_to_batch(
+fn validate_batch_slot_count(
     cfg: &OrcScanConfig,
     batch: RecordBatch,
 ) -> Result<RecordBatch, String> {
@@ -458,29 +458,7 @@ fn attach_slot_ids_to_batch(
         ));
     }
 
-    let schema = batch.schema();
-    let mut already_aligned = true;
-    for (f, slot_id) in schema.fields().iter().zip(cfg.slot_ids.iter()) {
-        let input_slot_id = field_slot_id(f.as_ref())?;
-        if input_slot_id != Some(*slot_id) {
-            already_aligned = false;
-            break;
-        }
-    }
-    if already_aligned {
-        return Ok(batch);
-    }
-
-    let mut new_fields = Vec::with_capacity(schema.fields().len());
-    for (f, slot_id) in schema.fields().iter().zip(cfg.slot_ids.iter()) {
-        new_fields.push(Arc::new(field_with_slot_id((**f).clone(), *slot_id)));
-    }
-    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(
-        new_fields,
-        schema.metadata().clone(),
-    ));
-    RecordBatch::try_new(new_schema, batch.columns().to_vec())
-        .map_err(|e: arrow::error::ArrowError| e.to_string())
+    Ok(batch)
 }
 
 #[cfg(test)]

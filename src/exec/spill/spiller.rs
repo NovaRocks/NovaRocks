@@ -24,6 +24,7 @@ use arrow::datatypes::SchemaRef;
 
 use crate::common::config;
 use crate::exec::chunk::Chunk;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::spill::block_manager::{
     BlockHeader, BlockMeta, MessageIndexEntry, write_block_header, write_block_index,
 };
@@ -200,12 +201,16 @@ impl Spiller {
     pub fn restore_chunks(
         &self,
         schema: SchemaRef,
+        chunk_schema: ChunkSchemaRef,
         file: &SpillFile,
     ) -> Result<Vec<Chunk>, String> {
         let mut stream = SpillStream::open(&file.path, schema)?;
         let mut out = Vec::new();
         while let Some(batch) = stream.next_batch()? {
-            out.push(Chunk::try_new(batch)?);
+            out.push(Chunk::try_new_with_chunk_schema(
+                batch,
+                Arc::clone(&chunk_schema),
+            )?);
         }
         Ok(out)
     }
@@ -257,7 +262,7 @@ fn resolve_codec(default_codec: SpillCodec, spill_encode_level: Option<i32>) -> 
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
+    use crate::exec::chunk::{ChunkSchema, field_with_slot_id};
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -295,6 +300,7 @@ mod tests {
             Chunk::try_new(batch1).unwrap(),
             Chunk::try_new(batch2).unwrap(),
         ];
+        let chunk_schema = Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).unwrap());
 
         let temp = tempdir().unwrap();
         let storage = SpillStorageConfig {
@@ -306,7 +312,9 @@ mod tests {
         let spiller = Spiller::new_with_storage(storage, SpillCodec::None).unwrap();
 
         let spill_file = spiller.spill_chunks(schema.clone(), &chunks).unwrap();
-        let restored = spiller.restore_chunks(schema, &spill_file).unwrap();
+        let restored = spiller
+            .restore_chunks(schema, chunk_schema, &spill_file)
+            .unwrap();
 
         assert_eq!(restored.len(), 2);
         assert_eq!(restored[0].len(), 3);

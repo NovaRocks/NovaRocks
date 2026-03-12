@@ -82,8 +82,13 @@ impl ExchangeSourceFactory {
         node: ExchangeSourceNode,
         runtime_filter_hub: Arc<RuntimeFilterHub>,
         arena: Arc<ExprArena>,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let name = node.profile_name();
+        exchange::register_expected_chunk_schema(
+            node.key,
+            node.expected_senders,
+            node.expected_chunk_schema(),
+        )?;
         let runtime_filter_specs = node.runtime_filter_specs().to_vec();
         let runtime_filter_exprs = runtime_filter_specs
             .iter()
@@ -94,7 +99,7 @@ impl ExchangeSourceFactory {
             runtime_filter_hub.register_probe_specs(node.key.node_id, &runtime_filter_specs);
         }
         let local_rf_waiting_set = node.local_rf_waiting_set().to_vec();
-        Self {
+        Ok(Self {
             name,
             node,
             runtime_filter_specs,
@@ -103,7 +108,7 @@ impl ExchangeSourceFactory {
             local_rf_waiting_set,
             runtime_filter_hub,
             arena,
-        }
+        })
     }
 
     fn local_rf_deps(&self) -> Vec<crate::exec::pipeline::dependency::DependencyHandle> {

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::largeint;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkFieldSchema};
 use crate::exec::expr::decimal::pow10_i256;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
@@ -40,9 +40,6 @@ use crate::exec::variant::{
     variant_to_time_micros,
 };
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-const FIELD_META_PRIMITIVE_TYPE: &str = "novarocks.primitive_type";
-const FIELD_META_PRIMITIVE_JSON: &str = "JSON";
-
 fn date32_to_date_literal(days: i32) -> Result<i32, String> {
     let date = NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
         .ok_or_else(|| format!("invalid Date32 value {days}"))?;
@@ -1165,14 +1162,8 @@ fn cast_timestamp_to_utf8_array(
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
 
-fn field_has_json_semantics(field: Option<&Field>) -> bool {
-    let Some(field) = field else {
-        return false;
-    };
-    field
-        .metadata()
-        .get(FIELD_META_PRIMITIVE_TYPE)
-        .is_some_and(|v| v == FIELD_META_PRIMITIVE_JSON)
+fn field_has_json_semantics(field_schema: Option<&ChunkFieldSchema>) -> bool {
+    field_schema.is_some_and(ChunkFieldSchema::json_semantic)
 }
 
 fn format_json_value_for_cast(value: &JsonValue, out: &mut String) -> Result<(), String> {
@@ -1280,6 +1271,7 @@ fn json_number_to_integral_string(value: &serde_json::Number) -> Option<String> 
 fn cast_json_values_to_list(
     values: &[Option<JsonValue>],
     target_field: Arc<Field>,
+    target_field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<ArrayRef, String> {
     let mut flat_values = Vec::<Option<JsonValue>>::new();
     let mut offsets = Vec::with_capacity(values.len() + 1);
@@ -1312,7 +1304,7 @@ fn cast_json_values_to_list(
     let cast_values = cast_json_values_to_target(
         &flat_values,
         target_field.data_type(),
-        Some(target_field.as_ref()),
+        target_field_schema.and_then(ChunkFieldSchema::list_item),
     )?;
     let out = ListArray::new(
         target_field,
@@ -1326,6 +1318,7 @@ fn cast_json_values_to_list(
 fn cast_json_values_to_struct(
     values: &[Option<JsonValue>],
     target_fields: Fields,
+    target_field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<ArrayRef, String> {
     let field_count = target_fields.len();
     let mut field_values = vec![Vec::<Option<JsonValue>>::with_capacity(values.len()); field_count];
@@ -1359,7 +1352,7 @@ fn cast_json_values_to_struct(
         casted_fields.push(cast_json_values_to_target(
             &field_values[idx],
             field.data_type(),
-            Some(field.as_ref()),
+            target_field_schema.and_then(|schema| schema.struct_child(idx)),
         )?);
     }
     let out = StructArray::new(target_fields, casted_fields, struct_nulls.finish());
@@ -1370,6 +1363,7 @@ fn cast_json_values_to_map(
     values: &[Option<JsonValue>],
     entries_field: Arc<Field>,
     ordered: bool,
+    target_field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<ArrayRef, String> {
     let DataType::Struct(entry_fields) = entries_field.data_type() else {
         return Err("CAST MAP target entries field must be STRUCT".to_string());
@@ -1414,7 +1408,7 @@ fn cast_json_values_to_map(
     let casted_values = cast_json_values_to_target(
         &value_values,
         value_field.data_type(),
-        Some(value_field.as_ref()),
+        target_field_schema.and_then(ChunkFieldSchema::map_value),
     )?;
     let entries = StructArray::new(entry_fields.clone(), vec![casted_keys, casted_values], None);
     let map = MapArray::new(
@@ -1430,11 +1424,11 @@ fn cast_json_values_to_map(
 fn cast_json_values_to_target(
     values: &[Option<JsonValue>],
     target_type: &DataType,
-    target_field: Option<&Field>,
+    target_field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<ArrayRef, String> {
     match target_type {
         DataType::Utf8 => {
-            let json_semantic = field_has_json_semantics(target_field);
+            let json_semantic = field_has_json_semantics(target_field_schema);
             let mut builder = StringBuilder::new();
             for value in values {
                 match value {
@@ -1450,12 +1444,14 @@ fn cast_json_values_to_target(
             }
             Ok(Arc::new(builder.finish()) as ArrayRef)
         }
-        DataType::List(target_field) => cast_json_values_to_list(values, target_field.clone()),
+        DataType::List(target_field) => {
+            cast_json_values_to_list(values, target_field.clone(), target_field_schema)
+        }
         DataType::Struct(target_fields) => {
-            cast_json_values_to_struct(values, target_fields.clone())
+            cast_json_values_to_struct(values, target_fields.clone(), target_field_schema)
         }
         DataType::Map(entries_field, ordered) => {
-            cast_json_values_to_map(values, entries_field.clone(), *ordered)
+            cast_json_values_to_map(values, entries_field.clone(), *ordered, target_field_schema)
         }
         _ => {
             let mut scalar_strings = Vec::with_capacity(values.len());
@@ -1483,13 +1479,17 @@ fn cast_json_values_to_target(
     }
 }
 
-fn cast_utf8_json_to_target(array: &ArrayRef, target_type: &DataType) -> Result<ArrayRef, String> {
+fn cast_utf8_json_to_target(
+    array: &ArrayRef,
+    target_type: &DataType,
+    target_field_schema: Option<&ChunkFieldSchema>,
+) -> Result<ArrayRef, String> {
     let arr = array
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
     let parsed = parse_utf8_json_rows(arr);
-    cast_json_values_to_target(&parsed, target_type, None)
+    cast_json_values_to_target(&parsed, target_type, target_field_schema)
 }
 
 fn cast_struct_to_struct(array: &ArrayRef, target_fields: &Fields) -> Result<ArrayRef, String> {
@@ -1660,6 +1660,14 @@ pub(crate) fn cast_with_special_rules(
     array: &ArrayRef,
     target_type: &DataType,
 ) -> Result<ArrayRef, String> {
+    cast_with_special_rules_with_field_schema(array, target_type, None)
+}
+
+fn cast_with_special_rules_with_field_schema(
+    array: &ArrayRef,
+    target_type: &DataType,
+    target_field_schema: Option<&ChunkFieldSchema>,
+) -> Result<ArrayRef, String> {
     if array.data_type() == target_type {
         return Ok(array.clone());
     }
@@ -1826,14 +1834,18 @@ pub(crate) fn cast_with_special_rules(
             cast_largeint_binary_to_boolean(array)
         }
         (DataType::Utf8, DataType::List(target_field)) => {
-            if let Some(out) = try_cast_utf8_json_array_to_list(array, target_field.clone())? {
+            if let Some(out) = try_cast_utf8_json_array_to_list(
+                array,
+                target_field.clone(),
+                target_field_schema.and_then(ChunkFieldSchema::list_item),
+            )? {
                 Ok(out)
             } else {
                 cast(array.as_ref(), target_type).map_err(|e| e.to_string())
             }
         }
         (DataType::Utf8, DataType::Struct(_)) | (DataType::Utf8, DataType::Map(_, _)) => {
-            cast_utf8_json_to_target(array, target_type)
+            cast_utf8_json_to_target(array, target_type, target_field_schema)
         }
         (DataType::List(_), DataType::List(target_field)) => {
             let list = array
@@ -1848,7 +1860,11 @@ pub(crate) fn cast_with_special_rules(
                 // Preserve all-null list literals while adapting the target item type.
                 arrow::array::new_null_array(target_field.data_type(), list.values().len())
             } else {
-                cast_with_special_rules(&list.values(), target_field.data_type())?
+                cast_with_special_rules_with_field_schema(
+                    &list.values(),
+                    target_field.data_type(),
+                    target_field_schema.and_then(ChunkFieldSchema::list_item),
+                )?
             };
             let out = ListArray::new(
                 target_field.clone(),
@@ -1982,6 +1998,7 @@ fn cast_boolean_to_decimal256_array(
 fn try_cast_utf8_json_array_to_list(
     child_array: &ArrayRef,
     target_field: Arc<Field>,
+    target_field_schema: Option<&ChunkFieldSchema>,
 ) -> Result<Option<ArrayRef>, String> {
     let arr = child_array
         .as_any()
@@ -2052,7 +2069,11 @@ fn try_cast_utf8_json_array_to_list(
     let cast_values = if string_values.data_type() == target_field.data_type() {
         string_values
     } else {
-        cast_with_special_rules(&string_values, target_field.data_type())?
+        cast_with_special_rules_with_field_schema(
+            &string_values,
+            target_field.data_type(),
+            target_field_schema,
+        )?
     };
     let out = ListArray::new(
         target_field.clone(),
@@ -2752,6 +2773,7 @@ pub fn eval(
         .data_type(cast_expr)
         .ok_or_else(|| "CAST missing target data type".to_string())?
         .clone();
+    let target_field_schema = arena.field_schema(cast_expr);
 
     let child_array = arena.eval(child, chunk)?;
     if child_array.data_type() == &target_type {
@@ -2988,13 +3010,15 @@ pub fn eval(
         });
     }
 
-    let casted = cast_with_special_rules(&child_array, &target_type).map_err(|e| {
-        format!(
-            "CAST failed: from {:?} to {:?}: {e}",
-            child_array.data_type(),
-            target_type
-        )
-    })?;
+    let casted =
+        cast_with_special_rules_with_field_schema(&child_array, &target_type, target_field_schema)
+            .map_err(|e| {
+                format!(
+                    "CAST failed: from {:?} to {:?}: {e}",
+                    child_array.data_type(),
+                    target_type
+                )
+            })?;
     if arena.allow_throw_exception() {
         if let Some(value) = first_float_to_int_overflow_value(&child_array, &casted, &target_type)?
         {
@@ -3539,11 +3563,15 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::common::largeint;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{
+        Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema, field_with_slot_id,
+    };
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::types;
     use arrow::array::{
         ArrayRef, Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Int8Array, Int32Array,
-        Int64Array, StructArray,
+        Int64Array, StringArray, StructArray,
     };
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -3557,6 +3585,28 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
         Chunk::new(batch)
+    }
+
+    fn json_struct_type_desc() -> types::TTypeDesc {
+        types::TTypeDesc::new(vec![
+            types::TTypeNode {
+                type_: types::TTypeNodeType::STRUCT,
+                scalar_type: None,
+                struct_fields: Some(vec![types::TStructField::new(
+                    Some("a".to_string()),
+                    None::<String>,
+                    None::<i32>,
+                    None::<String>,
+                )]),
+                is_named: None,
+            },
+            types::TTypeNode::new(
+                types::TTypeNodeType::SCALAR,
+                types::TScalarType::new(types::TPrimitiveType::JSON, None, None, None),
+                None,
+                None,
+            ),
+        ])
     }
 
     fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
@@ -3597,6 +3647,48 @@ mod tests {
         assert!(out.is_null(2));
         assert!(out.is_null(3));
         assert!(out.is_null(4));
+    }
+
+    #[test]
+    fn test_cast_json_to_struct_uses_expr_field_schema_for_nested_json() {
+        let schema = Arc::new(Schema::new(vec![Field::new("src", DataType::Utf8, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec![Some("{\"a\":\"x\"}")])) as ArrayRef],
+        )
+        .expect("batch");
+        let chunk = Chunk::new_with_chunk_schema(
+            batch,
+            Arc::new(
+                ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+                    SlotId::new(1),
+                    "src",
+                    true,
+                    Some(scalar_type_desc(types::TPrimitiveType::VARCHAR)),
+                    None,
+                )])
+                .expect("chunk schema"),
+            ),
+        );
+
+        let mut arena = ExprArena::default();
+        let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let target_type = DataType::Struct(vec![Field::new("a", DataType::Utf8, true)].into());
+        let cast_expr = arena.push_typed(ExprNode::Cast(child), target_type);
+        arena.set_field_schema(
+            cast_expr,
+            ChunkFieldSchema::try_from_type_desc("out", true, json_struct_type_desc())
+                .expect("field schema"),
+        );
+
+        let out = eval(&arena, cast_expr, child, &chunk).expect("cast");
+        let out = out.as_any().downcast_ref::<StructArray>().expect("struct");
+        let values = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string");
+        assert_eq!(values.value(0), "\"x\"");
     }
 
     #[test]

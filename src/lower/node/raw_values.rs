@@ -21,7 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
@@ -51,13 +51,14 @@ pub(crate) fn lower_raw_values_node(
             .map(|(_, slot)| *slot)
             .ok_or_else(|| "RAW_VALUES_NODE missing output slot id".to_string())?;
         let slot_id = SlotId::try_from(slot_id)?;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col_0", DataType::Int64, true),
-            slot_id,
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col_0",
+            DataType::Int64,
+            true,
         )]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(array) as _]).map_err(|e| e.to_string())?;
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[slot_id]);
         return Ok(Lowered {
             node: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {
@@ -75,13 +76,10 @@ pub(crate) fn lower_raw_values_node(
             .map(|(_, slot)| *slot)
             .ok_or_else(|| "RAW_VALUES_NODE missing output slot id".to_string())?;
         let slot_id = SlotId::try_from(slot_id)?;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col_0", DataType::Utf8, true),
-            slot_id,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col_0", DataType::Utf8, true)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(array) as _]).map_err(|e| e.to_string())?;
-        let chunk = Chunk::new(batch);
+        let chunk = Chunk::new_with_slot_ids(batch, &[slot_id]);
         return Ok(Lowered {
             node: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {
@@ -94,7 +92,8 @@ pub(crate) fn lower_raw_values_node(
     }
 
     let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-    let chunk = Chunk::new(batch);
+    let chunk =
+        Chunk::new_with_chunk_schema(batch, Arc::new(crate::exec::chunk::ChunkSchema::empty()));
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Values(ValuesNode {

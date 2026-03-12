@@ -448,8 +448,10 @@ fn build_pipeline_for_node(
             is_subordinate,
             exprs,
             expr_slot_ids,
+            expr_slot_schemas,
             output_indices,
             output_slots,
+            output_chunk_schema,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
             build
@@ -461,8 +463,10 @@ fn build_pipeline_for_node(
                     Arc::clone(&ctx.arena),
                     exprs.clone(),
                     expr_slot_ids.clone(),
+                    expr_slot_schemas.clone(),
                     output_indices.clone(),
                     output_slots.clone(),
+                    output_chunk_schema.clone(),
                 )));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -653,6 +657,7 @@ fn build_pipeline_for_node(
             need_finalize,
             input_is_intermediate: _input_is_intermediate,
             output_slots,
+            output_chunk_schema,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
 
@@ -696,6 +701,7 @@ fn build_pipeline_for_node(
                         true,
                         false,
                         output_slots.clone(),
+                        output_chunk_schema.clone(),
                     )));
 
                 if output_slots.len() < group_by.len() {
@@ -730,6 +736,7 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_slots.clone(),
+                        output_chunk_schema.clone(),
                     )));
                 return Ok(build);
             }
@@ -747,6 +754,7 @@ fn build_pipeline_for_node(
                     true,
                     false,
                     output_slots.clone(),
+                    output_chunk_schema.clone(),
                 ));
                 build.pipeline.factories.push(local_factory);
 
@@ -788,6 +796,7 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_slots.clone(),
+                        output_chunk_schema.clone(),
                     )));
 
                 let mut extra_pipelines = build.extra_pipelines;
@@ -808,6 +817,7 @@ fn build_pipeline_for_node(
                 !*need_finalize,
                 false,
                 output_slots.clone(),
+                output_chunk_schema.clone(),
             ));
 
             if *need_finalize && dop > 1 {
@@ -863,8 +873,11 @@ fn build_pipeline_for_node(
             join_type,
             distribution_mode,
             left_schema,
+            left_chunk_schema,
             right_schema,
+            right_chunk_schema,
             join_scope_schema,
+            join_scope_chunk_schema,
             probe_keys,
             build_keys,
             eq_null_safe,
@@ -912,8 +925,11 @@ fn build_pipeline_for_node(
                         *residual_predicate,
                         probe_is_left,
                         Arc::clone(left_schema),
+                        Arc::clone(left_chunk_schema),
                         Arc::clone(right_schema),
+                        Arc::clone(right_chunk_schema),
                         Arc::clone(join_scope_schema),
+                        Arc::clone(join_scope_chunk_schema),
                         Arc::clone(&join_state),
                     ),
                 ));
@@ -1005,8 +1021,11 @@ fn build_pipeline_for_node(
                     *residual_predicate,
                     probe_is_left,
                     Arc::clone(left_schema),
+                    Arc::clone(left_chunk_schema),
                     Arc::clone(right_schema),
+                    Arc::clone(right_chunk_schema),
                     Arc::clone(join_scope_schema),
+                    Arc::clone(join_scope_chunk_schema),
                     Arc::clone(&join_state),
                 ),
             ));
@@ -1047,8 +1066,11 @@ fn build_pipeline_for_node(
             join_type,
             join_conjunct,
             left_schema,
+            left_chunk_schema,
             right_schema,
+            right_chunk_schema,
             join_scope_schema,
+            join_scope_chunk_schema,
         }) => {
             let probe_is_left = *join_type != NestedLoopJoinType::RightOuter;
             let (probe_child, build_child) = if probe_is_left {
@@ -1078,8 +1100,11 @@ fn build_pipeline_for_node(
                     *join_conjunct,
                     probe_is_left,
                     Arc::clone(left_schema),
+                    Arc::clone(left_chunk_schema),
                     Arc::clone(right_schema),
+                    Arc::clone(right_chunk_schema),
                     Arc::clone(join_scope_schema),
+                    Arc::clone(join_scope_chunk_schema),
                     Arc::clone(&state),
                 )));
 
@@ -1174,7 +1199,7 @@ fn build_pipeline_for_node(
                 node.clone(),
                 Arc::clone(&ctx.runtime_filter_hub),
                 Arc::clone(&ctx.arena),
-            ));
+            )?);
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -1216,6 +1241,7 @@ fn build_pipeline_for_node(
                     fetch.row_pos_descs.clone(),
                     fetch.nodes_info.clone(),
                     fetch.output_slots.clone(),
+                    fetch.output_chunk_schema(),
                 )));
             Ok(PipelineBuildResult {
                 pipeline: child_build.pipeline,
@@ -1300,6 +1326,7 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_slots: vec![SlotId::new(1), SlotId::new(2)],
+                output_chunk_schema: None,
             }),
         };
 
@@ -1321,6 +1348,7 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_slots: vec![SlotId::new(1), SlotId::new(2)],
+                output_chunk_schema: None,
             }),
         };
 
@@ -1383,6 +1411,7 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: true,
                 output_slots: vec![SlotId::new(1), SlotId::new(2)],
+                output_chunk_schema: None,
             }),
         };
 
@@ -1446,6 +1475,7 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: false,
                 output_slots: vec![SlotId::new(1), SlotId::new(2)],
+                output_chunk_schema: None,
             }),
         };
 

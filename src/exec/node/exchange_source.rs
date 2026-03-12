@@ -17,6 +17,7 @@
 use std::time::Duration;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::RuntimeFilterProbeSpec;
 use crate::runtime::exchange::ExchangeKey;
 
@@ -27,6 +28,7 @@ pub struct ExchangeSourceNode {
     pub timeout: Duration,
     pub runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     pub output_slots: Vec<SlotId>,
+    pub expected_chunk_schema: ChunkSchemaRef,
     pub local_rf_waiting_set: Vec<i32>,
 }
 
@@ -36,6 +38,7 @@ impl ExchangeSourceNode {
         expected_senders: usize,
         timeout: Duration,
         output_slots: Vec<SlotId>,
+        expected_chunk_schema: ChunkSchemaRef,
     ) -> Self {
         Self {
             key,
@@ -43,6 +46,7 @@ impl ExchangeSourceNode {
             timeout,
             runtime_filter_specs: Vec::new(),
             output_slots,
+            expected_chunk_schema,
             local_rf_waiting_set: Vec::new(),
         }
     }
@@ -57,6 +61,10 @@ impl ExchangeSourceNode {
 
     pub fn output_slots(&self) -> &[SlotId] {
         &self.output_slots
+    }
+
+    pub fn expected_chunk_schema(&self) -> ChunkSchemaRef {
+        self.expected_chunk_schema.clone()
     }
 
     pub fn local_rf_waiting_set(&self) -> &[i32] {

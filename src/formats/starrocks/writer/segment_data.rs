@@ -947,10 +947,7 @@ fn align_batch_columns_to_schema_for_native_writer(
         aligned_fields.push(batch.schema().field(idx).clone());
     }
 
-    let aligned_schema = Arc::new(Schema::new_with_metadata(
-        aligned_fields,
-        batch.schema().metadata().clone(),
-    ));
+    let aligned_schema = Arc::new(Schema::new(aligned_fields));
     RecordBatch::try_new(aligned_schema, aligned_columns).map_err(|e| {
         format!("build schema-aligned record batch for native segment writer failed: {e}")
     })

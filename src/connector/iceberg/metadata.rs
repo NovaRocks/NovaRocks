@@ -29,7 +29,7 @@ use serde::Deserialize;
 
 use super::{ensure_embedded_jvm_enabled, jvm::scan_metadata};
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
 use crate::runtime::profile::RuntimeProfile;
@@ -90,27 +90,34 @@ pub struct IcebergMetadataScanConfig {
 pub struct IcebergMetadataScanOp {
     cfg: IcebergMetadataScanConfig,
     output_schema: SchemaRef,
+    output_chunk_schema: Arc<ChunkSchema>,
 }
 
 impl IcebergMetadataScanOp {
     pub fn new(cfg: IcebergMetadataScanConfig) -> Result<Self, String> {
         ensure_embedded_jvm_enabled("Iceberg metadata scan")?;
-        let fields: Vec<_> = cfg
+        let fields = cfg
             .output_columns
             .iter()
             .map(|col| {
-                Arc::new(field_with_slot_id(
-                    Field::new(
-                        &col.name,
-                        normalize_metadata_output_type(&col.data_type),
-                        col.nullable,
-                    ),
-                    col.slot_id,
+                Arc::new(Field::new(
+                    &col.name,
+                    normalize_metadata_output_type(&col.data_type),
+                    col.nullable,
                 ))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let chunk_schema = Arc::new(ChunkSchema::try_new(
+            cfg.output_columns
+                .iter()
+                .map(|col| {
+                    ChunkSlotSchema::try_new(col.slot_id, &col.name, col.nullable, None, None)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?);
         Ok(Self {
             output_schema: Arc::new(Schema::new(fields)),
+            output_chunk_schema: chunk_schema,
             cfg,
         })
     }
@@ -195,6 +202,7 @@ impl ScanOp for IcebergMetadataScanOp {
                     &rows,
                     &self.cfg.output_columns,
                     &self.output_schema,
+                    &self.output_chunk_schema,
                     self.cfg.batch_size,
                     false,
                     self.cfg.load_column_stats,
@@ -206,6 +214,7 @@ impl ScanOp for IcebergMetadataScanOp {
                     &rows,
                     &self.cfg.output_columns,
                     &self.output_schema,
+                    &self.output_chunk_schema,
                     self.cfg.batch_size,
                     true,
                     self.cfg.load_column_stats,
@@ -217,6 +226,7 @@ impl ScanOp for IcebergMetadataScanOp {
                     &rows,
                     &self.cfg.output_columns,
                     &self.output_schema,
+                    &self.output_chunk_schema,
                     self.cfg.batch_size,
                 )?
             }
@@ -485,6 +495,7 @@ fn build_file_chunks(
     rows: &[FileMetadataRow],
     output_columns: &[IcebergMetadataOutputColumn],
     output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
     batch_size: usize,
     logical_metadata: bool,
     load_column_stats: bool,
@@ -498,13 +509,20 @@ fn build_file_chunks(
         .map(|column| build_file_array(column, rows, logical_metadata, load_column_stats))
         .collect::<Result<Vec<_>, _>>()?;
 
-    build_chunks(output_schema, arrays, rows.len(), batch_size)
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
 }
 
 fn build_manifest_chunks(
     rows: &[ManifestMetadataRow],
     output_columns: &[IcebergMetadataOutputColumn],
     output_schema: &SchemaRef,
+    output_chunk_schema: &Arc<ChunkSchema>,
     batch_size: usize,
 ) -> Result<Vec<Chunk>, String> {
     if rows.is_empty() {
@@ -516,11 +534,18 @@ fn build_manifest_chunks(
         .map(|column| build_manifest_array(column, rows))
         .collect::<Result<Vec<_>, _>>()?;
 
-    build_chunks(output_schema, arrays, rows.len(), batch_size)
+    build_chunks(
+        output_schema,
+        output_chunk_schema,
+        arrays,
+        rows.len(),
+        batch_size,
+    )
 }
 
 fn build_chunks(
     schema: &SchemaRef,
+    chunk_schema: &Arc<ChunkSchema>,
     arrays: Vec<ArrayRef>,
     row_count: usize,
     batch_size: usize,
@@ -540,14 +565,20 @@ fn build_chunks(
 
     let batch_size = batch_size.max(1);
     if row_count <= batch_size {
-        return Ok(vec![Chunk::new(batch)]);
+        return Ok(vec![Chunk::new_with_chunk_schema(
+            batch,
+            Arc::clone(chunk_schema),
+        )]);
     }
 
     let mut chunks = Vec::new();
     let mut offset = 0usize;
     while offset < row_count {
         let len = (row_count - offset).min(batch_size);
-        chunks.push(Chunk::new(batch.slice(offset, len)));
+        chunks.push(Chunk::new_with_chunk_schema(
+            batch.slice(offset, len),
+            Arc::clone(chunk_schema),
+        ));
         offset += len;
     }
     Ok(chunks)

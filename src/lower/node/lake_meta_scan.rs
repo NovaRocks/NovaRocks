@@ -44,7 +44,8 @@ use crate::formats::starrocks::metadata::{
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
 use crate::lower::layout::{
-    Layout, find_tuple_descriptor, layout_for_row_tuples, layout_from_slot_ids, schema_for_layout,
+    Layout, chunk_schema_for_layout, find_tuple_descriptor, layout_for_row_tuples,
+    layout_from_slot_ids, schema_for_layout,
 };
 use crate::lower::node::Lowered;
 use crate::runtime::query_context::QueryId;
@@ -566,7 +567,8 @@ pub(crate) fn lower_lake_meta_scan_node(
 
     let batch = RecordBatch::try_new(output_schema, columns)
         .map_err(|e| format!("LAKE_META_SCAN_NODE build output batch failed: {}", e))?;
-    let chunk = Chunk::try_new(batch)?;
+    let chunk =
+        Chunk::try_new_with_chunk_schema(batch, chunk_schema_for_layout(desc_tbl, &out_layout)?)?;
 
     Ok(Lowered {
         node: ExecNode {
@@ -634,11 +636,7 @@ fn rewrite_meta_output_schema(
                 field_ref.data_type().clone()
             }
         };
-        let mut rewritten = Field::new(field_ref.name(), data_type, true);
-        if !field_ref.metadata().is_empty() {
-            rewritten = rewritten.with_metadata(field_ref.metadata().clone());
-        }
-        fields.push(rewritten);
+        fields.push(Field::new(field_ref.name(), data_type, true));
     }
     Ok(Arc::new(Schema::new(fields)))
 }

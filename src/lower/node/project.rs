@@ -15,18 +15,88 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::ExprArena;
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::novarocks_logging::debug;
 
+use crate::descriptors;
 use crate::exprs;
 use crate::lower::expr::{lower_t_expr, lower_t_expr_with_common_slot_map};
-use crate::lower::layout::{Layout, layout_from_slot_ids};
+use crate::lower::layout::{Layout, layout_from_slot_ids, slot_display_name_from_desc};
 use crate::lower::node::Lowered;
 use crate::{plan_nodes, types};
+
+fn project_slot_schema_from_desc(
+    desc_tbl: &descriptors::TDescriptorTable,
+    tuple_id: types::TTupleId,
+    slot_id: types::TSlotId,
+) -> Result<Option<ChunkSlotSchema>, String> {
+    let Some(slot_descs) = desc_tbl.slot_descriptors.as_ref() else {
+        return Ok(None);
+    };
+    let Some(desc) = slot_descs
+        .iter()
+        .find(|desc| desc.parent == Some(tuple_id) && desc.id == Some(slot_id))
+    else {
+        return Ok(None);
+    };
+    let slot_id = SlotId::try_from(slot_id)?;
+    let name = slot_display_name_from_desc(desc);
+    let nullable = desc.is_nullable.unwrap_or(true);
+    let unique_id = desc.col_unique_id.filter(|v| *v > 0);
+    Ok(Some(ChunkSlotSchema::new(
+        slot_id,
+        name,
+        nullable,
+        desc.slot_type.clone(),
+        unique_id,
+    )))
+}
+
+fn project_slot_schema_from_expr(
+    desc_tbl: &descriptors::TDescriptorTable,
+    tuple_id: types::TTupleId,
+    slot_id: types::TSlotId,
+    expr: &exprs::TExpr,
+) -> Result<ChunkSlotSchema, String> {
+    if let Some(schema) = project_slot_schema_from_desc(desc_tbl, tuple_id, slot_id)? {
+        return Ok(schema);
+    }
+    let root = expr
+        .nodes
+        .first()
+        .ok_or_else(|| format!("project expr for slot_id={} has no root node", slot_id))?;
+    Ok(ChunkSlotSchema::new(
+        SlotId::try_from(slot_id)?,
+        format!("_expr_{}", slot_id),
+        root.is_nullable.unwrap_or(true),
+        Some(root.type_.clone()),
+        None,
+    ))
+}
+
+fn project_output_chunk_schema(
+    expr_slot_schemas: &[ChunkSlotSchema],
+    output_indices: &[usize],
+) -> Result<ChunkSchemaRef, String> {
+    let mut output_schemas = Vec::with_capacity(output_indices.len());
+    for &idx in output_indices {
+        let slot_schema = expr_slot_schemas.get(idx).cloned().ok_or_else(|| {
+            format!(
+                "project output index {} out of range for expr_slot_schemas={}",
+                idx,
+                expr_slot_schemas.len()
+            )
+        })?;
+        output_schemas.push(slot_schema);
+    }
+    Ok(Arc::new(ChunkSchema::try_new(output_schemas)?))
+}
 
 /// Lower a PROJECT_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -40,6 +110,7 @@ pub(crate) fn lower_project_node(
     node: &plan_nodes::TPlanNode,
     mut out_layout: Layout,
     arena: &mut ExprArena,
+    desc_tbl: &descriptors::TDescriptorTable,
     global_common_slot_map: &BTreeMap<types::TSlotId, exprs::TExpr>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
@@ -168,6 +239,7 @@ pub(crate) fn lower_project_node(
 
     let mut exprs = Vec::new();
     let mut expr_slot_ids: Vec<SlotId> = Vec::new();
+    let mut expr_slot_schemas = Vec::new();
 
     // Step 1: Lower common expressions and add to exprs.
     // These are evaluated first so outputs can reference their slots.
@@ -183,6 +255,12 @@ pub(crate) fn lower_project_node(
             )?;
             exprs.push(expr_id);
             expr_slot_ids.push(SlotId::try_from(slot_id)?);
+            expr_slot_schemas.push(project_slot_schema_from_expr(
+                desc_tbl,
+                output_tuple_id,
+                slot_id,
+                texpr,
+            )?);
         }
     }
     let num_common = exprs.len();
@@ -213,10 +291,22 @@ pub(crate) fn lower_project_node(
         };
         exprs.push(expr_id);
         expr_slot_ids.push(SlotId::try_from(slot_id)?);
+        expr_slot_schemas.push(project_slot_schema_from_expr(
+            desc_tbl,
+            output_tuple_id,
+            slot_id,
+            texpr,
+        )?);
     }
 
+    let output_slots = out_layout
+        .order
+        .iter()
+        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
+        .collect::<Result<Vec<_>, _>>()?;
     // output_indices = [num_common, num_common+1, ..., exprs.len()-1]
     let output_indices: Vec<usize> = (num_common..exprs.len()).collect();
+    let output_chunk_schema = project_output_chunk_schema(&expr_slot_schemas, &output_indices)?;
 
     Ok(Lowered {
         node: ExecNode {
@@ -226,14 +316,86 @@ pub(crate) fn lower_project_node(
                 is_subordinate: false,
                 exprs,
                 expr_slot_ids,
+                expr_slot_schemas: Some(expr_slot_schemas),
                 output_indices: Some(output_indices),
-                output_slots: out_layout
-                    .order
-                    .iter()
-                    .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                    .collect::<Result<Vec<_>, _>>()?,
+                output_slots: output_slots.clone(),
+                output_chunk_schema: Some(output_chunk_schema),
             }),
         },
         layout: out_layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_output_chunk_schema;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSlotSchema;
+    use crate::types::{TPrimitiveType, TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
+
+    fn scalar_type_desc(ty: TPrimitiveType) -> TTypeDesc {
+        TTypeDesc::new(vec![TTypeNode {
+            type_: TTypeNodeType::SCALAR,
+            scalar_type: Some(TScalarType::new(ty, None, None, None)),
+            struct_fields: None,
+            is_named: None,
+        }])
+    }
+
+    #[test]
+    fn project_output_chunk_schema_keeps_common_expr_slots_without_descriptors() {
+        let expr_slot_schemas = vec![
+            ChunkSlotSchema::new(
+                SlotId::new(128),
+                "_expr_128",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::BOOLEAN)),
+                None,
+            ),
+            ChunkSlotSchema::new(
+                SlotId::new(129),
+                "_expr_129",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::BOOLEAN)),
+                None,
+            ),
+            ChunkSlotSchema::new(
+                SlotId::new(5),
+                "ss_customer_sk",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::INT)),
+                None,
+            ),
+            ChunkSlotSchema::new(
+                SlotId::new(61),
+                "cs_bill_customer_sk",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::INT)),
+                None,
+            ),
+            ChunkSlotSchema::new(
+                SlotId::new(128),
+                "_expr_128",
+                true,
+                Some(scalar_type_desc(TPrimitiveType::BOOLEAN)),
+                None,
+            ),
+        ];
+
+        let output_chunk_schema =
+            project_output_chunk_schema(&expr_slot_schemas, &[2, 3, 4]).expect("output schema");
+
+        let slots = output_chunk_schema.slots();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[0].slot_id().as_u32(), 5);
+        assert_eq!(slots[1].slot_id().as_u32(), 61);
+        assert_eq!(slots[2].slot_id().as_u32(), 128);
+        assert_eq!(slots[2].name(), "_expr_128");
+        assert_eq!(
+            slots[2]
+                .type_desc()
+                .and_then(crate::lower::type_lowering::primitive_type_from_desc),
+            Some(TPrimitiveType::BOOLEAN)
+        );
+    }
 }

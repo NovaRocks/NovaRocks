@@ -66,8 +66,6 @@ const STARROCKS_TYPE_DECIMAL256: &str = "DECIMAL256";
 const STARROCKS_TYPE_ARRAY: &str = "ARRAY";
 const STARROCKS_TYPE_MAP: &str = "MAP";
 const STARROCKS_TYPE_STRUCT: &str = "STRUCT";
-pub(crate) const FIELD_META_STARROCKS_COLUMN_ID: &str = "starrocks.format.column.id";
-pub(crate) const FIELD_META_STARROCKS_DEFAULT_VALUE: &str = "starrocks.format.column.default_value";
 const SUPPORTED_SCHEMA_TYPES: [&str; 30] = [
     STARROCKS_TYPE_TINYINT,
     STARROCKS_TYPE_SMALLINT,
@@ -422,10 +420,39 @@ struct SchemaColumnLookup<'a> {
     by_unique_id: HashMap<u32, &'a ColumnPb>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StarRocksOutputColumnHint {
+    pub schema_unique_id: Option<u32>,
+    pub fallback_default_literal: Option<String>,
+}
+
 pub fn build_native_read_plan(
     snapshot: &StarRocksTabletSnapshot,
     segment_footers: &[StarRocksSegmentFooter],
     output_schema: &SchemaRef,
+    source_tablet_schema: Option<&TabletSchemaPb>,
+) -> Result<StarRocksNativeReadPlan, String> {
+    let output_column_hints = vec![
+        StarRocksOutputColumnHint {
+            schema_unique_id: None,
+            fallback_default_literal: None,
+        };
+        output_schema.fields().len()
+    ];
+    build_native_read_plan_with_output_hints(
+        snapshot,
+        segment_footers,
+        output_schema,
+        &output_column_hints,
+        source_tablet_schema,
+    )
+}
+
+pub fn build_native_read_plan_with_output_hints(
+    snapshot: &StarRocksTabletSnapshot,
+    segment_footers: &[StarRocksSegmentFooter],
+    output_schema: &SchemaRef,
+    output_column_hints: &[StarRocksOutputColumnHint],
     source_tablet_schema: Option<&TabletSchemaPb>,
 ) -> Result<StarRocksNativeReadPlan, String> {
     if segment_footers.len() != snapshot.segment_files.len() {
@@ -433,6 +460,13 @@ pub fn build_native_read_plan(
             "segment footer count mismatch: snapshot_segments={}, segment_footers={}",
             snapshot.segment_files.len(),
             segment_footers.len()
+        ));
+    }
+    if output_column_hints.len() != output_schema.fields().len() {
+        return Err(format!(
+            "output column hint count mismatch: schema_fields={} hints={}",
+            output_schema.fields().len(),
+            output_column_hints.len()
         ));
     }
 
@@ -453,6 +487,7 @@ pub fn build_native_read_plan(
     let projected_columns = build_projected_columns(
         snapshot,
         output_schema,
+        output_column_hints,
         &current_lookup,
         source_tablet_schema,
     )?;
@@ -511,6 +546,7 @@ pub fn build_native_read_plan(
         let segment_projected_columns = build_projected_columns(
             snapshot,
             output_schema,
+            output_column_hints,
             &current_lookup,
             segment_source_schema,
         )?;
@@ -712,6 +748,7 @@ fn build_source_schema_lookup<'a>(
 fn build_projected_columns(
     snapshot: &StarRocksTabletSnapshot,
     output_schema: &SchemaRef,
+    output_column_hints: &[StarRocksOutputColumnHint],
     current_lookup: &SchemaColumnLookup<'_>,
     source_tablet_schema: Option<&TabletSchemaPb>,
 ) -> Result<Vec<StarRocksNativeColumnPlan>, String> {
@@ -720,12 +757,13 @@ fn build_projected_columns(
     for (idx, field) in output_schema.fields().iter().enumerate() {
         let output_name = field.name().trim();
         let normalized_name = normalize_column_name(output_name);
-        let output_field_unique_id = output_field_unique_id_from_metadata(
-            field.as_ref(),
-            snapshot.tablet_id,
-            snapshot.version,
-            output_name,
-        )?;
+        let output_hint = output_column_hints.get(idx).ok_or_else(|| {
+            format!(
+                "missing output column hint for projected column: tablet_id={}, version={}, output_field={}, output_index={}",
+                snapshot.tablet_id, snapshot.version, output_name, idx
+            )
+        })?;
+        let output_field_unique_id = output_hint.schema_unique_id;
         let schema_col_from_unique_id = output_field_unique_id
             .and_then(|unique_id| current_lookup.by_unique_id.get(&unique_id).copied());
         let schema_col_from_name = current_lookup.by_name.get(&normalized_name).copied();
@@ -735,7 +773,7 @@ fn build_projected_columns(
             if let Some(expected_unique_id) = output_field_unique_id {
                 let name_col_unique_id = u32::try_from(schema_col.unique_id).map_err(|_| {
                     format!(
-                        "invalid column unique_id in tablet schema while matching output field metadata: tablet_id={}, version={}, output_field={}, unique_id={}",
+                        "invalid column unique_id in tablet schema while matching output column hint: tablet_id={}, version={}, output_field={}, unique_id={}",
                         snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
                     )
                 })?;
@@ -911,11 +949,7 @@ fn build_projected_columns(
                 (schema, schema_unique_id, None, true, None, true)
             } else {
                 let (schema, schema_unique_id, fallback_default_literal, fallback_is_nullable) =
-                    build_missing_output_schema_column_plan(
-                        snapshot.tablet_id,
-                        snapshot.version,
-                        field.as_ref(),
-                    )?;
+                    build_missing_output_schema_column_plan(snapshot, field.as_ref(), output_hint)?;
                 (
                     schema,
                     schema_unique_id,
@@ -927,11 +961,7 @@ fn build_projected_columns(
             }
         } else {
             let (schema, schema_unique_id, fallback_default_literal, fallback_is_nullable) =
-                build_missing_output_schema_column_plan(
-                    snapshot.tablet_id,
-                    snapshot.version,
-                    field.as_ref(),
-                )?;
+                build_missing_output_schema_column_plan(snapshot, field.as_ref(), output_hint)?;
             (
                 schema,
                 schema_unique_id,
@@ -985,69 +1015,31 @@ fn projected_can_fill_missing_values(
         || projected.fallback_is_nullable
 }
 
-fn output_field_unique_id_from_metadata(
-    output_field: &Field,
-    tablet_id: i64,
-    version: i64,
-    output_name: &str,
-) -> Result<Option<u32>, String> {
-    let Some(raw_unique_id) = output_field.metadata().get(FIELD_META_STARROCKS_COLUMN_ID) else {
-        return Ok(None);
-    };
-    let unique_id = raw_unique_id.parse::<u32>().map_err(|e| {
-        format!(
-            "invalid output field unique_id metadata: tablet_id={}, version={}, output_field={}, metadata_key={}, metadata_value={}, error={}",
-            tablet_id,
-            version,
-            output_name,
-            FIELD_META_STARROCKS_COLUMN_ID,
-            raw_unique_id,
-            e
-        )
-    })?;
-    if unique_id == 0 {
-        return Err(format!(
-            "invalid output field unique_id metadata (zero): tablet_id={}, version={}, output_field={}, metadata_key={}",
-            tablet_id, version, output_name, FIELD_META_STARROCKS_COLUMN_ID
-        ));
-    }
-    Ok(Some(unique_id))
-}
-
 fn build_missing_output_schema_column_plan(
-    tablet_id: i64,
-    version: i64,
+    snapshot: &StarRocksTabletSnapshot,
     output_field: &Field,
+    output_hint: &StarRocksOutputColumnHint,
 ) -> Result<(StarRocksNativeSchemaColumnPlan, u32, Option<String>, bool), String> {
     let output_name = output_field.name().trim();
-    let metadata = output_field.metadata();
-    let raw_unique_id = metadata
-        .get(FIELD_META_STARROCKS_COLUMN_ID)
-        .ok_or_else(|| {
-            format!(
-                "output column not found in tablet schema and missing unique_id metadata: tablet_id={}, version={}, output_field={}, metadata_key={}",
-                tablet_id, version, output_name, FIELD_META_STARROCKS_COLUMN_ID
-            )
-        })?;
-    let schema_unique_id = raw_unique_id.parse::<u32>().map_err(|e| {
+    let schema_unique_id = output_hint.schema_unique_id.ok_or_else(|| {
         format!(
-            "invalid output column unique_id metadata: tablet_id={}, version={}, output_field={}, metadata_key={}, metadata_value={}, error={}",
-            tablet_id, version, output_name, FIELD_META_STARROCKS_COLUMN_ID, raw_unique_id, e
+            "output column not found in tablet schema and missing unique_id hint: tablet_id={}, version={}, output_field={}",
+            snapshot.tablet_id, snapshot.version, output_name
         )
     })?;
     if schema_unique_id == 0 {
         return Err(format!(
-            "invalid output column unique_id metadata (zero): tablet_id={}, version={}, output_field={}, metadata_key={}",
-            tablet_id, version, output_name, FIELD_META_STARROCKS_COLUMN_ID
+            "invalid output column unique_id hint (zero): tablet_id={}, version={}, output_field={}",
+            snapshot.tablet_id, snapshot.version, output_name
         ));
     }
 
-    let fallback_default_literal = metadata.get(FIELD_META_STARROCKS_DEFAULT_VALUE).cloned();
+    let fallback_default_literal = output_hint.fallback_default_literal.clone();
     let fallback_is_nullable = output_field.is_nullable();
     if fallback_default_literal.is_none() && !fallback_is_nullable {
         return Err(format!(
-            "output column not found in tablet schema and cannot be backfilled (non-nullable without default): tablet_id={}, version={}, output_field={}, metadata_key={}",
-            tablet_id, version, output_name, FIELD_META_STARROCKS_DEFAULT_VALUE
+            "output column not found in tablet schema and cannot be backfilled (non-nullable without default): tablet_id={}, version={}, output_field={}",
+            snapshot.tablet_id, snapshot.version, output_name
         ));
     }
 
@@ -1055,8 +1047,8 @@ fn build_missing_output_schema_column_plan(
         synthetic_schema_type_from_output_arrow_type(output_field.data_type()).ok_or_else(|| {
             format!(
                 "unsupported output field type for missing tablet schema column: tablet_id={}, version={}, output_field={}, output_type={:?}",
-                tablet_id,
-                version,
+                snapshot.tablet_id,
+                snapshot.version,
                 output_name,
                 output_field.data_type()
             )
@@ -2773,24 +2765,22 @@ mod tests {
     }
 
     #[test]
-    fn allow_missing_output_column_with_field_metadata_default() {
+    fn allow_missing_output_column_with_hint_default() {
         let snapshot = build_snapshot_with_columns(vec![build_column(1, "c1", "BIGINT")]);
         let footers = vec![build_footer(10, &[1]), build_footer(20, &[1])];
-        let mut field = Field::new("c2", DataType::Int64, false);
-        field = field.with_metadata(
-            [
-                (FIELD_META_STARROCKS_COLUMN_ID.to_string(), "2".to_string()),
-                (
-                    FIELD_META_STARROCKS_DEFAULT_VALUE.to_string(),
-                    "7".to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let output_schema = Arc::new(Schema::new(vec![field]));
-        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
-            .expect("build read plan");
+        let output_schema = Arc::new(Schema::new(vec![Field::new("c2", DataType::Int64, false)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(2),
+            fallback_default_literal: Some("7".to_string()),
+        }];
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         assert_eq!(plan.projected_columns[0].schema_unique_id, 2);
         assert_eq!(
@@ -2802,21 +2792,25 @@ mod tests {
     }
 
     #[test]
-    fn prefer_output_field_unique_id_metadata_over_name_match() {
+    fn prefer_output_field_unique_id_hint_over_name_match() {
         let snapshot = build_snapshot_with_columns(vec![
             build_column(1, "k1", "BIGINT"),
             build_column(2, "v0", "INT"),
         ]);
         let footers = vec![build_footer(10, &[1]), build_footer(20, &[1])];
-        let mut field = Field::new("v0", DataType::Utf8, true);
-        field = field.with_metadata(
-            [(FIELD_META_STARROCKS_COLUMN_ID.to_string(), "4".to_string())]
-                .into_iter()
-                .collect(),
-        );
-        let output_schema = Arc::new(Schema::new(vec![field]));
-        let plan = build_native_read_plan(&snapshot, &footers, &output_schema, None)
-            .expect("build read plan");
+        let output_schema = Arc::new(Schema::new(vec![Field::new("v0", DataType::Utf8, true)]));
+        let output_hints = vec![StarRocksOutputColumnHint {
+            schema_unique_id: Some(4),
+            fallback_default_literal: None,
+        }];
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            None,
+        )
+        .expect("build read plan");
         assert_eq!(plan.projected_columns.len(), 1);
         assert_eq!(plan.projected_columns[0].schema_unique_id, 4);
         assert_eq!(plan.projected_columns[0].schema_type, "VARCHAR");

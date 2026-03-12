@@ -197,7 +197,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, field_with_slot_id};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::analytic::{
@@ -212,6 +212,10 @@ mod tests {
     use crate::runtime::runtime_state::RuntimeState;
 
     use super::execute_plan_with_pipeline;
+
+    fn chunk_schema_of(schema: &Arc<Schema>) -> ChunkSchemaRef {
+        Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"))
+    }
 
     #[test]
     fn group_by_sum_is_correct_with_dop_2() {
@@ -250,6 +254,7 @@ mod tests {
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_slots: vec![SlotId::new(1), SlotId::new(2)],
+                    output_chunk_schema: None,
                 }),
             },
         };
@@ -350,8 +355,11 @@ mod tests {
                     node_id: 1,
                     join_type: NestedLoopJoinType::Inner,
                     join_conjunct: Some(pred),
+                    left_chunk_schema: chunk_schema_of(&left_schema),
                     left_schema,
+                    right_chunk_schema: chunk_schema_of(&right_schema),
                     right_schema,
+                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
                     join_scope_schema,
                 }),
             },
@@ -449,8 +457,11 @@ mod tests {
                     node_id: 1,
                     join_type: NestedLoopJoinType::LeftOuter,
                     join_conjunct: Some(pred),
+                    left_chunk_schema: chunk_schema_of(&left_schema),
                     left_schema,
+                    right_chunk_schema: chunk_schema_of(&right_schema),
                     right_schema,
+                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
                     join_scope_schema,
                 }),
             },
@@ -554,8 +565,11 @@ mod tests {
                     node_id: 1,
                     join_type: NestedLoopJoinType::FullOuter,
                     join_conjunct: Some(pred),
+                    left_chunk_schema: chunk_schema_of(&left_schema),
                     left_schema,
+                    right_chunk_schema: chunk_schema_of(&right_schema),
                     right_schema,
+                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
                     join_scope_schema,
                 }),
             },
@@ -664,8 +678,11 @@ mod tests {
                     node_id: 1,
                     join_type: JoinType::LeftOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
+                    left_chunk_schema: chunk_schema_of(&left_schema),
                     left_schema: Arc::clone(&left_schema),
+                    right_chunk_schema: chunk_schema_of(&right_schema),
                     right_schema: Arc::clone(&right_schema),
+                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
                     join_scope_schema,
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -803,8 +820,11 @@ mod tests {
                     node_id: 1,
                     join_type: JoinType::RightOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
+                    left_chunk_schema: chunk_schema_of(&left_schema),
                     left_schema: Arc::clone(&left_schema),
+                    right_chunk_schema: chunk_schema_of(&right_schema),
                     right_schema: Arc::clone(&right_schema),
+                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
                     join_scope_schema,
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -926,8 +946,11 @@ mod tests {
                     node_id: 1,
                     join_type: JoinType::FullOuter,
                     distribution_mode: JoinDistributionMode::Broadcast,
+                    left_chunk_schema: chunk_schema_of(&left_schema),
                     left_schema: Arc::clone(&left_schema),
+                    right_chunk_schema: chunk_schema_of(&right_schema),
                     right_schema: Arc::clone(&right_schema),
+                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
                     join_scope_schema,
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
@@ -1175,6 +1198,7 @@ mod tests {
                     need_finalize: true,
                     input_is_intermediate: false,
                     output_slots: vec![SlotId::new(3), SlotId::new(4)],
+                    output_chunk_schema: None,
                 }),
             },
         };

@@ -19,7 +19,7 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -167,11 +167,13 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S>
         let schema = Arc::new(Schema::new(
             out_arrays
                 .iter()
-                .zip(self.output_slots.iter())
                 .enumerate()
-                .map(|(idx, (arr, slot))| {
-                    let field = Field::new(format!("col_{}", idx), arr.data_type().clone(), true);
-                    Arc::new(field_with_slot_id(field, *slot))
+                .map(|(idx, arr)| {
+                    Arc::new(Field::new(
+                        format!("col_{}", idx),
+                        arr.data_type().clone(),
+                        true,
+                    ))
                 })
                 .collect::<Vec<_>>(),
         ));
@@ -184,7 +186,7 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S>
         }
         .map_err(|e| e.to_string())?;
 
-        Ok(Some(Chunk::new(batch)))
+        Ok(Some(Chunk::new_with_slot_ids(batch, &self.output_slots)))
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {

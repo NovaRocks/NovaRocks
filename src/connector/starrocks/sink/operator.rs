@@ -39,7 +39,9 @@ use crate::connector::starrocks::fe_v2_meta::{
 };
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
-use crate::connector::starrocks::lake::{TabletWriteContext, append_lake_txn_log_with_rowset};
+use crate::connector::starrocks::lake::{
+    TabletWriteContext, append_lake_txn_log_with_chunk_rowset,
+};
 use crate::connector::starrocks::sink::factory::{
     OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, SinkIndexWritePlan, TabletWriteTarget,
     create_automatic_partitions,
@@ -52,7 +54,7 @@ use crate::connector::starrocks::sink::partition_key::{
 use crate::connector::starrocks::sink::routing::{
     RowRejectReason, RowRoutingPlan, route_chunk_rows,
 };
-use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::novarocks_logging::{debug, info};
@@ -234,10 +236,10 @@ impl OlapSinkFinalizeSharedState {
 struct TabletBufferedState {
     partition_id: i64,
     context: TabletWriteContext,
-    request_batches: Vec<RecordBatch>,
+    request_batches: Vec<Chunk>,
     request_rows: usize,
     request_bytes: usize,
-    memtable_batches: Vec<RecordBatch>,
+    memtable_batches: Vec<Chunk>,
     memtable_rows: usize,
     memtable_bytes: usize,
 }
@@ -256,11 +258,9 @@ impl TabletBufferedState {
         }
     }
 
-    fn push_request_batch(&mut self, batch: RecordBatch) {
-        self.request_rows = self.request_rows.saturating_add(batch.num_rows());
-        self.request_bytes = self
-            .request_bytes
-            .saturating_add(batch.get_array_memory_size());
+    fn push_request_batch(&mut self, batch: Chunk) {
+        self.request_rows = self.request_rows.saturating_add(batch.len());
+        self.request_bytes = self.request_bytes.saturating_add(batch.estimated_bytes());
         self.request_batches.push(batch);
     }
 
@@ -268,8 +268,8 @@ impl TabletBufferedState {
         self.request_rows >= row_threshold || self.request_bytes >= bytes_threshold
     }
 
-    fn take_request_batch(&mut self) -> Result<Option<RecordBatch>, String> {
-        let Some(batch) = concat_buffered_batches(&mut self.request_batches)? else {
+    fn take_request_batch(&mut self) -> Result<Option<Chunk>, String> {
+        let Some(batch) = concat_buffered_chunks(&mut self.request_batches)? else {
             return Ok(None);
         };
         self.request_rows = 0;
@@ -277,11 +277,9 @@ impl TabletBufferedState {
         Ok(Some(batch))
     }
 
-    fn push_memtable_batch(&mut self, batch: RecordBatch) {
-        self.memtable_rows = self.memtable_rows.saturating_add(batch.num_rows());
-        self.memtable_bytes = self
-            .memtable_bytes
-            .saturating_add(batch.get_array_memory_size());
+    fn push_memtable_batch(&mut self, batch: Chunk) {
+        self.memtable_rows = self.memtable_rows.saturating_add(batch.len());
+        self.memtable_bytes = self.memtable_bytes.saturating_add(batch.estimated_bytes());
         self.memtable_batches.push(batch);
     }
 
@@ -289,8 +287,8 @@ impl TabletBufferedState {
         self.memtable_bytes >= bytes_threshold
     }
 
-    fn take_memtable_batch(&mut self) -> Result<Option<RecordBatch>, String> {
-        let Some(batch) = concat_buffered_batches(&mut self.memtable_batches)? else {
+    fn take_memtable_batch(&mut self) -> Result<Option<Chunk>, String> {
+        let Some(batch) = concat_buffered_chunks(&mut self.memtable_batches)? else {
             return Ok(None);
         };
         self.memtable_rows = 0;
@@ -299,7 +297,7 @@ impl TabletBufferedState {
     }
 }
 
-fn concat_buffered_batches(batches: &mut Vec<RecordBatch>) -> Result<Option<RecordBatch>, String> {
+fn concat_buffered_chunks(batches: &mut Vec<Chunk>) -> Result<Option<Chunk>, String> {
     if batches.is_empty() {
         return Ok(None);
     }
@@ -310,10 +308,21 @@ fn concat_buffered_batches(batches: &mut Vec<RecordBatch>) -> Result<Option<Reco
         .first()
         .map(|batch| batch.schema())
         .ok_or_else(|| "OLAP_TABLE_SINK buffered batches unexpectedly empty".to_string())?;
-    let merged = concat_batches(&schema, batches.as_slice())
+    let chunk_schema = batches
+        .first()
+        .map(|batch| batch.chunk_schema_ref())
+        .ok_or_else(|| "OLAP_TABLE_SINK buffered chunks unexpectedly empty".to_string())?;
+    let merged_batches = batches
+        .iter()
+        .map(|chunk| chunk.batch.clone())
+        .collect::<Vec<_>>();
+    let merged = concat_batches(&schema, merged_batches.as_slice())
         .map_err(|e| format!("OLAP_TABLE_SINK concat buffered batches failed: {e}"))?;
     batches.clear();
-    Ok(Some(merged))
+    Ok(Some(Chunk::try_new_with_chunk_schema(
+        merged,
+        chunk_schema,
+    )?))
 }
 
 #[derive(Debug)]
@@ -553,7 +562,7 @@ impl OlapTableSinkOperator {
         tablet_id: i64,
         partition_id: i64,
         context: &TabletWriteContext,
-        batch: &RecordBatch,
+        batch: &Chunk,
     ) -> Result<(), String> {
         let file_seq = self.file_seq;
         self.file_seq = self.file_seq.saturating_add(1);
@@ -570,7 +579,7 @@ impl OlapTableSinkOperator {
             }
         }
 
-        append_lake_txn_log_with_rowset(
+        append_lake_txn_log_with_chunk_rowset(
             context,
             batch,
             self.plan.txn_id,
@@ -767,18 +776,16 @@ impl OlapTableSinkOperator {
             };
             if !self.auto_partition_debug_logged {
                 let field_summary = chunk
-                    .batch
-                    .schema()
-                    .fields()
+                    .chunk_schema()
+                    .slots()
                     .iter()
                     .enumerate()
-                    .map(|(idx, field)| {
-                        let slot_id = field_slot_id(field.as_ref())
-                            .ok()
-                            .flatten()
-                            .map(|slot| slot.to_string())
-                            .unwrap_or_else(|| "none".to_string());
-                        format!("{idx}:{}(slot={slot_id})", field.name())
+                    .map(|(idx, slot)| {
+                        format!(
+                            "{idx}:{}(slot={})",
+                            chunk.schema().field(idx).name(),
+                            slot.slot_id()
+                        )
                     })
                     .collect::<Vec<_>>();
                 info!(
@@ -1148,6 +1155,7 @@ impl OlapTableSinkOperator {
 
         let mut projected_columns = Vec::with_capacity(projection.expr_ids.len());
         let mut projected_fields = Vec::with_capacity(projection.expr_ids.len());
+        let mut projected_slots = Vec::with_capacity(projection.expr_ids.len());
         for (idx, expr_id) in projection.expr_ids.iter().enumerate() {
             let projected = projection.arena.eval(*expr_id, chunk).map_err(|e| {
                 format!(
@@ -1161,21 +1169,23 @@ impl OlapTableSinkOperator {
                 .get(idx)
                 .cloned()
                 .unwrap_or_else(|| format!("col_{idx}"));
-            let field = field_with_slot_id(
-                Field::new(field_name, projected.data_type().clone(), true),
+            projected_slots.push(ChunkSlotSchema::new(
                 slot_id,
-            );
-            projected_fields.push(field);
+                field_name.clone(),
+                true,
+                None,
+                None,
+            ));
+            projected_fields.push(Field::new(field_name, projected.data_type().clone(), true));
             projected_columns.push(projected);
         }
-        let projected_schema = Arc::new(Schema::new_with_metadata(
-            projected_fields,
-            chunk.schema().metadata().clone(),
-        ));
-        let projected_batch = RecordBatch::try_new(projected_schema, projected_columns)
-            .map_err(|e| format!("OLAP_TABLE_SINK build projected output batch failed: {e}"))?;
-        Chunk::try_new(projected_batch)
-            .map_err(|e| format!("OLAP_TABLE_SINK build projected output chunk failed: {e}"))
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+        Chunk::try_new_with_schema_and_chunk_schema(
+            projected_schema,
+            projected_columns,
+            Arc::new(ChunkSchema::try_new(projected_slots)?),
+        )
+        .map_err(|e| format!("OLAP_TABLE_SINK build projected output chunk failed: {e}"))
     }
 }
 
@@ -1315,65 +1325,40 @@ impl OlapTableSinkOperator {
                                     tablet_id, index_plan.index_id
                                 )
                             })?;
-                        let routed_batch = if row_indices.len() == sink_chunk.len() {
-                            sink_chunk.batch.clone()
+                        let routed_chunk = if row_indices.len() == sink_chunk.len() {
+                            sink_chunk.clone()
                         } else {
-                            take_batch_rows(&sink_chunk.batch, &row_indices)?
+                            take_chunk_rows(&sink_chunk, &row_indices)?
                         };
                         let is_primary_keys_table = target.context.tablet_schema.keys_type
                             == Some(KeysType::PrimaryKeys as i32);
-                        let routed_batch = match align_batch_to_schema_slot_bindings(
-                            &routed_batch,
+                        let routed_chunk = match align_chunk_to_schema_slot_bindings(
+                            &routed_chunk,
                             &index_plan.schema_slot_bindings,
                             index_plan.op_slot_id,
                         ) {
-                            Ok(aligned_batch)
+                            Ok(aligned_chunk)
                                 if !is_primary_keys_table
-                                    && aligned_batch.num_columns() < routed_batch.num_columns() =>
+                                    && aligned_chunk.batch.num_columns()
+                                        < routed_chunk.batch.num_columns() =>
                             {
-                                let batch_fields = routed_batch
-                                    .schema()
-                                    .fields()
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, field)| {
-                                        let slot_id = field_slot_id(field.as_ref())
-                                            .ok()
-                                            .flatten()
-                                            .map(|slot| slot.to_string())
-                                            .unwrap_or_else(|| "none".to_string());
-                                        format!("{idx}:{}(slot={slot_id})", field.name())
-                                    })
-                                    .collect::<Vec<_>>();
+                                let batch_fields = debug_chunk_fields(&routed_chunk);
                                 info!(
                                     target: "novarocks::sink",
                                     table_id = self.plan.table_id,
                                     index_id = index_plan.index_id,
                                     schema_id = index_plan.schema_id,
                                     tablet_id = target.tablet_id,
-                                    original_columns = routed_batch.num_columns(),
-                                    aligned_columns = aligned_batch.num_columns(),
+                                    original_columns = routed_chunk.batch.num_columns(),
+                                    aligned_columns = aligned_chunk.batch.num_columns(),
                                     batch_fields = ?batch_fields,
                                     "OLAP_TABLE_SINK skip write-slot alignment for non-primary key batch because alignment dropped columns"
                                 );
-                                routed_batch
+                                routed_chunk
                             }
-                            Ok(aligned_batch) => aligned_batch,
+                            Ok(aligned_chunk) => aligned_chunk,
                             Err(err) if !is_primary_keys_table => {
-                                let batch_fields = routed_batch
-                                    .schema()
-                                    .fields()
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(idx, field)| {
-                                        let slot_id = field_slot_id(field.as_ref())
-                                            .ok()
-                                            .flatten()
-                                            .map(|slot| slot.to_string())
-                                            .unwrap_or_else(|| "none".to_string());
-                                        format!("{idx}:{}(slot={slot_id})", field.name())
-                                    })
-                                    .collect::<Vec<_>>();
+                                let batch_fields = debug_chunk_fields(&routed_chunk);
                                 info!(
                                     target: "novarocks::sink",
                                     table_id = self.plan.table_id,
@@ -1381,16 +1366,16 @@ impl OlapTableSinkOperator {
                                     schema_id = index_plan.schema_id,
                                     tablet_id = target.tablet_id,
                                     error = %err,
-                                    original_columns = routed_batch.num_columns(),
+                                    original_columns = routed_chunk.batch.num_columns(),
                                     batch_fields = ?batch_fields,
                                     "OLAP_TABLE_SINK skip write-slot alignment for non-primary key batch because alignment failed"
                                 );
-                                routed_batch
+                                routed_chunk
                             }
                             Err(err) => return Err(err),
                         };
                         let filtered_batch = filter_rows_for_tablet_schema(
-                            &routed_batch,
+                            &routed_chunk.batch,
                             &target.context.tablet_schema,
                         )?;
                         if plan_idx == 0 {
@@ -1401,8 +1386,14 @@ impl OlapTableSinkOperator {
                             flush_tracking_logs
                                 .extend(filtered_batch.tracking_logs.iter().cloned());
                         }
-                        let routed_batch = filtered_batch.batch;
-                        if routed_batch.num_rows() == 0 {
+                        let routed_chunk = if filtered_batch.batch.num_rows() == routed_chunk.len()
+                        {
+                            routed_chunk
+                        } else {
+                            let filtered_schema = routed_chunk.chunk_schema_ref();
+                            Chunk::try_new_with_chunk_schema(filtered_batch.batch, filtered_schema)?
+                        };
+                        if routed_chunk.len() == 0 {
                             continue;
                         }
                         if !buffered_by_tablet.contains_key(&tablet_id) {
@@ -1426,7 +1417,7 @@ impl OlapTableSinkOperator {
                                 tablet_id, buffer.partition_id, target.partition_id
                             ));
                         }
-                        buffer.push_request_batch(routed_batch);
+                        buffer.push_request_batch(routed_chunk);
                         if buffer.should_seal_request_batch(
                             request_rows_threshold,
                             request_bytes_threshold,
@@ -1658,10 +1649,10 @@ fn collect_partition_values_from_chunk(
 
     let mut slot_to_index = HashMap::<SlotId, usize>::new();
     let mut name_to_index = HashMap::<String, usize>::new();
-    for (idx, field) in chunk.batch.schema().fields().iter().enumerate() {
-        if let Some(slot_id) = field_slot_id(field.as_ref())? {
-            slot_to_index.entry(slot_id).or_insert(idx);
-        }
+    let schema = chunk.batch.schema();
+    for (idx, slot_schema) in chunk.chunk_schema().slots().iter().enumerate() {
+        slot_to_index.entry(slot_schema.slot_id()).or_insert(idx);
+        let field = schema.field(idx);
         let normalized_name = field.name().trim().to_ascii_lowercase();
         if !normalized_name.is_empty() {
             name_to_index.entry(normalized_name).or_insert(idx);
@@ -1996,29 +1987,43 @@ fn take_batch_rows(batch: &RecordBatch, row_indices: &[u32]) -> Result<RecordBat
     })
 }
 
-fn align_batch_to_schema_slot_bindings(
-    batch: &RecordBatch,
+fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> {
+    let batch = take_batch_rows(&chunk.batch, row_indices)?;
+    Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref())
+}
+
+fn debug_chunk_fields(chunk: &Chunk) -> Vec<String> {
+    chunk
+        .chunk_schema()
+        .slots()
+        .iter()
+        .enumerate()
+        .map(|(idx, slot)| format!("{idx}:{}(slot={})", slot.name(), slot.slot_id()))
+        .collect::<Vec<_>>()
+}
+
+fn align_chunk_to_schema_slot_bindings(
+    chunk: &Chunk,
     schema_slot_bindings: &[Option<SlotId>],
     op_slot_id: Option<SlotId>,
-) -> Result<RecordBatch, String> {
+) -> Result<Chunk, String> {
     if schema_slot_bindings.is_empty() && op_slot_id.is_none() {
-        return Ok(batch.clone());
+        return Ok(chunk.clone());
     }
 
     let mut slot_to_data_index = HashMap::new();
     let mut slot_to_op_index = HashMap::new();
-    for (idx, field) in batch.schema().fields().iter().enumerate() {
-        if let Some(slot_id) = field_slot_id(field.as_ref())? {
-            if field.name() == LOAD_OP_COLUMN {
-                slot_to_op_index.entry(slot_id).or_insert(idx);
-            } else {
-                slot_to_data_index.entry(slot_id).or_insert(idx);
-            }
+    for (idx, slot) in chunk.chunk_schema().slots().iter().enumerate() {
+        if slot.name() == LOAD_OP_COLUMN {
+            slot_to_op_index.entry(slot.slot_id()).or_insert(idx);
+        } else {
+            slot_to_data_index.entry(slot.slot_id()).or_insert(idx);
         }
     }
 
     let mut aligned_columns = Vec::new();
     let mut aligned_fields = Vec::new();
+    let mut aligned_slots = Vec::new();
     let mut aligned_data_indexes = Vec::new();
     for slot_id in schema_slot_bindings.iter().copied().flatten() {
         let Some(idx) = slot_to_data_index.get(&slot_id).copied() else {
@@ -2027,8 +2032,10 @@ fn align_batch_to_schema_slot_bindings(
         // Keep duplicated schema bindings (e.g. INSERT ... SELECT k1, k1, v)
         // so non-primary key writes preserve full target column count.
         aligned_data_indexes.push(idx);
-        aligned_columns.push(batch.column(idx).clone());
-        aligned_fields.push(batch.schema().field(idx).clone());
+        let slot = &chunk.chunk_schema().slots()[idx];
+        aligned_columns.push(chunk.batch.column(idx).clone());
+        aligned_fields.push(chunk.batch.schema().field(idx).clone());
+        aligned_slots.push(slot.clone());
     }
     let resolved_op_index = if let Some(slot_id) = op_slot_id {
         if let Some(op_idx) = slot_to_op_index.get(&slot_id).copied() {
@@ -2050,38 +2057,57 @@ fn align_batch_to_schema_slot_bindings(
             }
         }
     } else {
-        batch
-            .schema()
-            .fields()
+        chunk
+            .chunk_schema()
+            .slots()
             .iter()
             .enumerate()
-            .find_map(|(idx, field)| (field.name() == LOAD_OP_COLUMN).then_some(idx))
+            .find_map(|(idx, slot)| (slot.name() == LOAD_OP_COLUMN).then_some(idx))
     };
     if let Some(op_idx) = resolved_op_index {
         // Keep schema-slot aligned output order (including duplicated slots),
         // but append __op at most once to preserve control-column semantics.
         let op_already_selected = aligned_data_indexes.contains(&op_idx);
         if !op_already_selected {
-            aligned_columns.push(batch.column(op_idx).clone());
-            let op_field = batch.schema().field(op_idx).as_ref().clone();
+            let op_slot = &chunk.chunk_schema().slots()[op_idx];
+            aligned_columns.push(chunk.batch.column(op_idx).clone());
+            let op_field = chunk.batch.schema().field(op_idx).as_ref().clone();
             aligned_fields.push(op_field.with_name(LOAD_OP_COLUMN.to_string()));
+            aligned_slots.push(ChunkSlotSchema::new(
+                op_slot.slot_id(),
+                LOAD_OP_COLUMN,
+                op_slot.nullable(),
+                op_slot.type_desc().cloned(),
+                op_slot.unique_id(),
+            ));
         }
     }
     if aligned_columns.is_empty() {
         return Err(format!(
             "OLAP_TABLE_SINK cannot align routed batch with schema slot bindings: batch_columns={} schema_slot_bindings={} op_slot_id={:?}",
-            batch.num_columns(),
+            chunk.batch.num_columns(),
             schema_slot_bindings.len(),
             op_slot_id
         ));
     }
 
-    let aligned_schema = Arc::new(Schema::new_with_metadata(
-        aligned_fields,
-        batch.schema().metadata().clone(),
-    ));
-    RecordBatch::try_new(aligned_schema, aligned_columns)
-        .map_err(|e| format!("OLAP_TABLE_SINK build write-slot aligned batch failed: {e}"))
+    let aligned_schema = Arc::new(Schema::new(aligned_fields));
+    let aligned_batch = RecordBatch::try_new(aligned_schema, aligned_columns)
+        .map_err(|e| format!("OLAP_TABLE_SINK build write-slot aligned batch failed: {e}"))?;
+    Chunk::try_new_with_chunk_schema(
+        aligned_batch,
+        Arc::new(ChunkSchema::try_new(aligned_slots)?),
+    )
+}
+
+#[cfg(test)]
+fn align_batch_to_schema_slot_bindings(
+    batch: &RecordBatch,
+    schema_slot_bindings: &[Option<SlotId>],
+    op_slot_id: Option<SlotId>,
+) -> Result<RecordBatch, String> {
+    let chunk = Chunk::try_new(batch.clone())?;
+    Ok(align_chunk_to_schema_slot_bindings(&chunk, schema_slot_bindings, op_slot_id)?.batch)
 }
 
 #[cfg(test)]
@@ -2118,7 +2144,7 @@ mod tests {
     };
     use crate::connector::starrocks::sink::routing::RowRoutingPlan;
     use crate::descriptors::{TOlapTableIndexTablets, TOlapTablePartition, TTabletLocation};
-    use crate::exec::chunk::{Chunk, field_slot_id, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::pipeline::operator::ProcessorOperator;
     use crate::formats::starrocks::writer::{StarRocksWriteFormat, layout::txn_log_file_path};
@@ -2127,6 +2153,7 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
+    use crate::testutil::chunk::field_with_slot_id;
     use crate::types;
 
     fn test_tablet_schema() -> TabletSchemaPb {
@@ -2982,9 +3009,12 @@ mod tests {
         assert_eq!(projected.batch.num_columns(), 2);
         assert_eq!(projected.batch.schema().field(1).name(), LOAD_OP_COLUMN);
         assert_eq!(
-            field_slot_id(projected.batch.schema().field(1).as_ref())
-                .expect("read op slot id")
-                .expect("op slot id"),
+            projected
+                .chunk_schema()
+                .slots()
+                .get(1)
+                .expect("op slot schema")
+                .slot_id(),
             SlotId::new(8)
         );
         let op_array = projected

@@ -74,31 +74,44 @@ struct SlotMeta {
 
 fn build_slot_meta_map(
     desc_tbl: &descriptors::TDescriptorTable,
+    tuple_id: i32,
+    slots: &[SlotId],
 ) -> Result<HashMap<SlotId, SlotMeta>, String> {
     let slot_descs = desc_tbl
         .slot_descriptors
         .as_ref()
         .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-    let mut map = HashMap::new();
+    let mut desc_by_tuple_slot = HashMap::new();
     for s in slot_descs {
-        let (Some(id), Some(slot_type)) = (s.id, s.slot_type.as_ref()) else {
+        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
+        else {
             continue;
         };
-        let Some(name) = crate::lower::layout::slot_name_from_desc(s) else {
+        if parent != tuple_id {
             continue;
-        };
+        }
         let primitive =
             primitive_type_from_desc(slot_type).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
         let arrow_type = arrow_type_from_desc(slot_type)
-            .ok_or_else(|| format!("unsupported slot_type for slot_id={id}"))?;
-        map.insert(
-            SlotId::try_from(id)?,
+            .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
+        let slot_id = SlotId::try_from(id)?;
+        desc_by_tuple_slot.insert(
+            slot_id,
             SlotMeta {
-                name,
+                name: crate::lower::layout::slot_display_name_from_desc(s),
                 primitive,
                 arrow_type,
             },
         );
+    }
+
+    let mut map = HashMap::with_capacity(slots.len());
+    for slot in slots {
+        let meta = desc_by_tuple_slot
+            .get(slot)
+            .cloned()
+            .ok_or_else(|| format!("missing slot meta for tuple_id={} slot {}", tuple_id, slot))?;
+        map.insert(*slot, meta);
     }
     Ok(map)
 }
@@ -187,8 +200,8 @@ pub(crate) fn execute_lookup_request(
     let cache_options = mgr
         .cache_options(query_id)
         .ok_or_else(|| "cache options missing for lookup".to_string())?;
-    let slot_meta = build_slot_meta_map(&desc_tbl)?;
     let lookup_slots = lookup_output_slots(&desc_tbl, tuple_id, &row_pos_desc)?;
+    let slot_meta = build_slot_meta_map(&desc_tbl, tuple_id, &lookup_slots)?;
 
     let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
     if fetch_ref_slots.len() != 2 {

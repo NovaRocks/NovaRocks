@@ -28,8 +28,6 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::common::ids::SlotId;
-use crate::exec::chunk::field_slot_id;
 use crate::formats::starrocks::metadata::StarRocksTabletSnapshot;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 
@@ -165,47 +163,24 @@ fn align_batch_to_output_schema(
 ) -> Result<RecordBatch, String> {
     let mut name_to_index: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    let mut slot_id_to_index: std::collections::HashMap<SlotId, usize> =
-        std::collections::HashMap::new();
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         let normalized_name = normalize_column_name(field.name());
         if !normalized_name.is_empty() {
             name_to_index.entry(normalized_name).or_insert(idx);
         }
-        if let Ok(Some(slot_id)) = field_slot_id(field.as_ref()) {
-            slot_id_to_index.entry(slot_id).or_insert(idx);
-        } else if let Some(slot_id) = parse_slot_id_from_field_name(field.name()) {
-            slot_id_to_index.entry(slot_id).or_insert(idx);
-        }
     }
 
     let mut arrays = Vec::with_capacity(output_schema.fields().len());
     for (idx, field) in output_schema.fields().iter().enumerate() {
-        let source_idx = if let Some(named_idx) =
-            name_to_index.get(&normalize_column_name(field.name()))
-        {
-            *named_idx
-        } else if let Some(slot_id) = field_slot_id(field.as_ref()).map_err(|e| {
-            format!(
-                "parse output field slot id failed: output_name={} error={e}",
-                field.name()
-            )
-        })? {
-            *slot_id_to_index.get(&slot_id).ok_or_else(|| {
+        let source_idx = *name_to_index
+            .get(&normalize_column_name(field.name()))
+            .ok_or_else(|| {
                 format!(
-                    "parquet output column '{}' (slot_id={}) not found in source schema by name/slot_id; source_fields={}",
+                    "parquet output column '{}' not found in source schema by normalized name; source_fields={}",
                     field.name(),
-                    slot_id,
                     debug_schema_fields(batch.schema().as_ref())
                 )
-            })?
-        } else {
-            return Err(format!(
-                "parquet output column '{}' not found in source schema by name and output has no slot_id metadata; source_fields={}",
-                field.name(),
-                debug_schema_fields(batch.schema().as_ref())
-            ));
-        };
+            })?;
         let src = batch.column(source_idx).clone();
         let out = if src.data_type() == field.data_type() {
             src
@@ -235,28 +210,12 @@ fn normalize_column_name(name: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn parse_slot_id_from_field_name(name: &str) -> Option<SlotId> {
-    let trimmed = name.trim().trim_matches('`').trim_matches('"');
-    trimmed.parse::<SlotId>().ok()
-}
-
 fn debug_schema_fields(schema: &arrow::datatypes::Schema) -> String {
     schema
         .fields()
         .iter()
         .enumerate()
-        .map(|(idx, field)| {
-            let slot = field
-                .metadata()
-                .get(crate::exec::chunk::FIELD_META_SLOT_ID)
-                .cloned()
-                .unwrap_or_else(|| "<none>".to_string());
-            format!(
-                "#{idx}:{}:{:?}:slot={slot}",
-                field.name(),
-                field.data_type()
-            )
-        })
+        .map(|(idx, field)| format!("#{idx}:{}:{:?}", field.name(), field.data_type()))
         .collect::<Vec<_>>()
         .join(", ")
 }

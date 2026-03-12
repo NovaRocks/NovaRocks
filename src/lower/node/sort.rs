@@ -21,8 +21,9 @@ use crate::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::common::ids::SlotId;
+use crate::descriptors;
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 
 use crate::{exprs, plan_nodes, types};
@@ -33,6 +34,7 @@ pub(crate) fn lower_sort_node(
     node: &plan_nodes::TPlanNode,
     arena: &mut ExprArena,
     out_layout: Layout,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
@@ -59,6 +61,7 @@ pub(crate) fn lower_sort_node(
         arena,
         &out_layout,
         node.node_id,
+        desc_tbl,
         sort,
         last_query_id,
         fe_addr,
@@ -205,6 +208,7 @@ fn normalize_sort_input(
     arena: &mut ExprArena,
     out_layout: &Layout,
     node_id: i32,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     sort: &plan_nodes::TSortNode,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
@@ -220,6 +224,7 @@ fn normalize_sort_input(
             sort,
             &effective_out_layout,
             node_id,
+            desc_tbl,
             last_query_id,
             fe_addr,
         )?;
@@ -265,12 +270,18 @@ fn normalize_sort_input(
                 .iter()
                 .map(|(_, slot_id)| SlotId::try_from(*slot_id))
                 .collect::<Result<Vec<_>, _>>()?,
+            expr_slot_schemas: None,
             output_indices: None,
             output_slots: effective_out_layout
                 .order
                 .iter()
                 .map(|(_, slot_id)| SlotId::try_from(*slot_id))
                 .collect::<Result<Vec<_>, _>>()?,
+            output_chunk_schema: if let Some(desc_tbl) = desc_tbl {
+                Some(chunk_schema_for_layout(desc_tbl, &effective_out_layout)?)
+            } else {
+                None
+            },
         }),
     };
 
@@ -289,6 +300,7 @@ fn build_sort_tuple_projection(
     sort: &plan_nodes::TSortNode,
     out_layout: &Layout,
     node_id: i32,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
 ) -> Result<Lowered, String> {
@@ -397,8 +409,14 @@ fn build_sort_tuple_projection(
             is_subordinate: true,
             exprs,
             expr_slot_ids: output_slots.clone(),
+            expr_slot_schemas: None,
             output_indices: None,
             output_slots,
+            output_chunk_schema: if let Some(desc_tbl) = desc_tbl {
+                Some(chunk_schema_for_layout(desc_tbl, out_layout)?)
+            } else {
+                None
+            },
         }),
     };
 
@@ -627,6 +645,7 @@ mod tests {
             layout,
             None,
             None,
+            None,
         )
     }
 
@@ -647,6 +666,7 @@ mod tests {
             &node,
             &mut arena,
             layout,
+            None,
             None,
             None,
         )
@@ -675,6 +695,7 @@ mod tests {
             &node,
             &mut arena,
             layout,
+            None,
             None,
             None,
         )

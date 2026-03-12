@@ -27,10 +27,10 @@ use crate::runtime::query_context::{QueryId, query_context_manager};
 
 use crate::common::config::exchange_wait_ms;
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::runtime::exchange;
-use crate::{internal_service, plan_nodes, types};
+use crate::{descriptors, internal_service, plan_nodes, types};
 
 /// Lower an EXCHANGE_NODE plan node to a `Lowered` ExecNode.
 ///
@@ -38,6 +38,7 @@ use crate::{internal_service, plan_nodes, types};
 pub(crate) fn lower_exchange_node(
     children: Vec<Lowered>,
     node: &plan_nodes::TPlanNode,
+    desc_tbl: &descriptors::TDescriptorTable,
     exec_params: Option<&internal_service::TPlanFragmentExecParams>,
     arena: &mut ExprArena,
     out_layout: &Layout,
@@ -91,6 +92,7 @@ pub(crate) fn lower_exchange_node(
             .iter()
             .map(|(_, slot_id)| SlotId::try_from(*slot_id))
             .collect::<Result<Vec<_>, _>>()?;
+        let expected_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
         let mut out = ExecNode {
             kind: ExecNodeKind::ExchangeSource(
                 ExchangeSourceNode::new(
@@ -98,6 +100,7 @@ pub(crate) fn lower_exchange_node(
                     expected,
                     Duration::from_millis(exchange_timeout_ms),
                     output_slots,
+                    expected_chunk_schema,
                 )
                 .with_local_rf_waiting_set(local_rf_waiting_set(node)),
             ),
@@ -293,6 +296,36 @@ mod tests {
         }
     }
 
+    fn single_slot_desc_tbl(tuple_id: i32, slot_id: i32) -> descriptors::TDescriptorTable {
+        descriptors::TDescriptorTable::new(
+            Some(vec![descriptors::TSlotDescriptor::new(
+                Some(slot_id),
+                Some(tuple_id),
+                Some(dummy_type_desc()),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some("c1".to_string()),
+                Some(0),
+                Some(true),
+                Some(true),
+                Some(true),
+                None::<i32>,
+                None::<String>,
+            )]),
+            vec![descriptors::TTupleDescriptor::new(
+                Some(tuple_id),
+                Some(8),
+                Some(1),
+                None::<types::TTableId>,
+                Some(1),
+            )],
+            None::<Vec<descriptors::TTableDescriptor>>,
+            None::<bool>,
+        )
+    }
+
     fn exchange_plan_node(sort_info: plan_nodes::TSortInfo) -> plan_nodes::TPlanNode {
         let mut node =
             crate::lower::node::test_plan_node(11, plan_nodes::TPlanNodeType::EXCHANGE_NODE, 0);
@@ -342,11 +375,13 @@ mod tests {
         };
         let node = exchange_plan_node(sort_info);
         let params = exchange_exec_params(node.node_id);
+        let desc_tbl = single_slot_desc_tbl(0, 1);
         let mut arena = ExprArena::default();
 
         let err = lower_exchange_node(
             vec![],
             &node,
+            &desc_tbl,
             Some(&params),
             &mut arena,
             &out_layout,

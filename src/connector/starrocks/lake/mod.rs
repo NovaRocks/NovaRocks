@@ -39,4 +39,6 @@ pub(crate) use transactions::{
     abort_txn, delete_data, delete_tablet, drop_table, get_tablet_stats, publish_log_version,
     publish_log_version_batch, publish_version, vacuum,
 };
+pub(crate) use txn_log::append_lake_txn_log_with_chunk_rowset;
+#[cfg(test)]
 pub(crate) use txn_log::append_lake_txn_log_with_rowset;
