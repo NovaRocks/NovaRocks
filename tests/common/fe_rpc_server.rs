@@ -47,6 +47,7 @@ type Handler = Box<
         + Sync,
 >;
 
+#[allow(dead_code)]
 pub struct FakeFeRpcServer {
     addr: types::TNetworkAddress,
     accepts: Arc<AtomicUsize>,
@@ -54,6 +55,7 @@ pub struct FakeFeRpcServer {
     join: Option<JoinHandle<()>>,
 }
 
+#[allow(dead_code)]
 impl FakeFeRpcServer {
     pub fn start(close_first_n: usize, handler: Handler) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake FE RPC server");

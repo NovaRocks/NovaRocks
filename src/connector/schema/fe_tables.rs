@@ -1324,6 +1324,7 @@ fn build_task_run_row(info: &frontend_service::TTaskRunInfo) -> SchemaRow {
     put_ts_seconds_positive(&mut row, "FINISH_TIME", info.finish_time);
     put_opt_str(&mut row, "STATE", info.state.as_deref());
     put_opt_str(&mut row, "CATALOG", info.catalog.as_deref());
+    put_opt_str(&mut row, "WAREHOUSE", info.warehouse.as_deref());
     put_opt_str(&mut row, "DATABASE", info.database.as_deref());
     put_opt_str(&mut row, "DEFINITION", info.definition.as_deref());
     put_ts_seconds_positive(&mut row, "EXPIRE_TIME", info.expire_time);

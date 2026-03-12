@@ -32,9 +32,7 @@ use crate::frontend_service::{
 use crate::plan_nodes::TFileFormatType;
 use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
-use crate::service::frontend_rpc::{
-    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
-};
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::internal_service;
 use crate::status::TStatus;
 use crate::status_code::TStatusCode;
@@ -526,31 +524,20 @@ fn ensure_ok_status(status: &TStatus) -> Result<(), ApiError> {
     }
 }
 
-fn with_frontend_client<T>(
-    f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-) -> Result<T, ApiError> {
+fn with_frontend_client<T, F>(f: F) -> Result<T, ApiError>
+where
+    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+{
     let fe_addr = disk_report::latest_fe_addr().ok_or_else(|| {
         ApiError::new(
             TStatusCode::INTERNAL_ERROR,
             "missing FE address (heartbeat not established yet)",
         )
     })?;
-    let mut f = Some(f);
     FrontendRpcManager::shared()
-        .call_with_options(
-            FrontendRpcKind::Control,
-            &fe_addr,
-            FrontendRpcCallOptions {
-                transport_retries: 0,
-            },
-            |client| {
-                f.take()
-                    .expect("stream load FE RPC closure is consumed once per request")(
-                    client
-                )
-                .map_err(FrontendRpcError::from_message_guess)
-            },
-        )
+        .call(FrontendRpcKind::Control, &fe_addr, move |client| {
+            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
+        })
         .map_err(|e| ApiError::new(TStatusCode::THRIFT_RPC_ERROR, e.to_string()))
 }
 

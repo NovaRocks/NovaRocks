@@ -59,9 +59,7 @@ use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry;
 use crate::service::disk_report;
-use crate::service::frontend_rpc::{
-    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
-};
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
 use crate::status_code;
 use crate::{data_sinks, descriptors, exprs, types};
@@ -760,26 +758,14 @@ fn resolve_frontend_addr(
     fe_addr.cloned().or_else(disk_report::latest_fe_addr)
 }
 
-fn with_frontend_client<T>(
-    fe_addr: &types::TNetworkAddress,
-    f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-) -> Result<T, String> {
-    let mut f = Some(f);
+fn with_frontend_client<T, F>(fe_addr: &types::TNetworkAddress, f: F) -> Result<T, String>
+where
+    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+{
     FrontendRpcManager::shared()
-        .call_with_options(
-            FrontendRpcKind::Control,
-            fe_addr,
-            FrontendRpcCallOptions {
-                transport_retries: 0,
-            },
-            |client| {
-                f.take()
-                    .expect("createPartition FE RPC closure is consumed once per request")(
-                    client
-                )
-                .map_err(FrontendRpcError::from_message_guess)
-            },
-        )
+        .call(FrontendRpcKind::Control, fe_addr, move |client| {
+            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
+        })
         .map_err(|err| err.to_string())
 }
 
@@ -1786,10 +1772,21 @@ fn collect_required_tablets(partition: &descriptors::TOlapTablePartitionParam) -
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::resolve_write_slot_bindings;
     use crate::common::ids::SlotId;
+    use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::{data_sinks, descriptors, exprs, types};
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn test_sink_with_aliased_agg_slots() -> data_sinks::TOlapTableSink {
         data_sinks::TOlapTableSink {
@@ -2174,5 +2171,53 @@ mod tests {
             ]
         );
         assert_eq!(op_slot_id, None);
+    }
+
+    #[test]
+    fn create_automatic_partitions_retries_end_of_file() {
+        test_clear_shared_host_pools();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = Arc::clone(&calls);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "createPartition" => {
+                    let _req: crate::frontend_service::TCreatePartitionRequest =
+                        read_struct_arg(i_prot)?;
+                    if calls_for_server.fetch_add(1, Ordering::AcqRel) == 0 {
+                        return Ok(ServerAction::Close);
+                    }
+                    let response = crate::frontend_service::TCreatePartitionResult {
+                        status: Some(crate::status::TStatus::new(
+                            crate::status_code::TStatusCode::OK,
+                            None,
+                        )),
+                        partitions: None,
+                        tablets: None,
+                        nodes: None,
+                    };
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+
+        let response = super::create_automatic_partitions(
+            server.addr(),
+            1,
+            2,
+            10,
+            vec![vec!["2025-01-01".to_string()]],
+        )
+        .expect("createPartition retries after EOF");
+
+        assert_eq!(
+            response.status.map(|status| status.status_code),
+            Some(crate::status_code::TStatusCode::OK)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(server.accepts() >= 2);
+        test_clear_shared_host_pools();
     }
 }
