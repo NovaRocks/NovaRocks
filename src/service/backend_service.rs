@@ -16,7 +16,7 @@
 // under the License.
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -25,14 +25,13 @@ use std::time::{Duration, Instant};
 
 use threadpool::ThreadPool;
 use thrift::protocol::{
-    TBinaryInputProtocol, TBinaryInputProtocolFactory, TBinaryOutputProtocol,
-    TBinaryOutputProtocolFactory, TInputProtocolFactory, TOutputProtocolFactory,
+    TBinaryInputProtocolFactory, TBinaryOutputProtocolFactory, TInputProtocolFactory,
+    TOutputProtocolFactory,
 };
 use thrift::server::TProcessor;
 use thrift::transport::{
-    TBufferedReadTransport, TBufferedReadTransportFactory, TBufferedWriteTransport,
-    TBufferedWriteTransportFactory, TIoChannel, TReadTransportFactory, TTcpChannel,
-    TWriteTransportFactory,
+    TBufferedReadTransportFactory, TBufferedWriteTransportFactory, TIoChannel,
+    TReadTransportFactory, TTcpChannel, TWriteTransportFactory,
 };
 
 use crate::common::network;
@@ -42,10 +41,10 @@ use crate::connector::starrocks::lake::{
     execute_update_tablet_meta_info_task as execute_lake_update_tablet_meta_info_task,
 };
 use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_table;
-use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::master_service;
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::runtime::starlet_shard_registry;
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::{disk_report, stream_load};
 use crate::{
     agent_service,
@@ -153,25 +152,6 @@ fn send_finish_task(
     let fe_addr = disk_report::latest_fe_addr().ok_or_else(|| {
         "missing FE address for finish_task (heartbeat not received yet)".to_string()
     })?;
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| format!("invalid FE address for finish_task: {e}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("connect FE finish_task failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel
-        .split()
-        .map_err(|e| format!("split thrift channel for finish_task failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-
     let report_version = next_report_version();
     let request = master_service::TFinishTaskRequest::new(
         build_backend_for_finish_task()?,
@@ -201,12 +181,18 @@ fn send_finish_task(
         req = %json_summary(&request),
         "BackendService.finish_task sending request"
     );
-    let result = client.finish_task(request).map_err(|e| {
-        format!(
-            "FE finish_task rpc failed for signature={}: {e}",
-            task.signature
-        )
-    })?;
+    let result = FrontendRpcManager::shared()
+        .call(FrontendRpcKind::Control, &fe_addr, |client| {
+            client
+                .finish_task(request.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|e| {
+            format!(
+                "FE finish_task rpc failed for signature={}: {e}",
+                task.signature
+            )
+        })?;
     if result.status.status_code != TStatusCode::OK {
         return Err(format!(
             "FE finish_task returned non-OK for signature={}: {:?}",
