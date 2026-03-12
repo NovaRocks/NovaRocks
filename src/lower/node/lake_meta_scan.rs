@@ -35,7 +35,7 @@ use crate::connector::starrocks::fe_v2_meta::{
 use crate::connector::starrocks::{
     ObjectStoreProfile, build_native_object_store_profile_from_properties,
 };
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::starrocks::metadata::{
@@ -44,7 +44,7 @@ use crate::formats::starrocks::metadata::{
 use crate::formats::starrocks::plan::build_native_read_plan;
 use crate::formats::starrocks::reader::build_native_record_batch;
 use crate::lower::layout::{
-    Layout, chunk_schema_for_layout, find_tuple_descriptor, layout_for_row_tuples,
+    Layout, chunk_slot_schemas_for_layout, find_tuple_descriptor, layout_for_row_tuples,
     layout_from_slot_ids, schema_for_layout,
 };
 use crate::lower::node::Lowered;
@@ -565,10 +565,10 @@ pub(crate) fn lower_lake_meta_scan_node(
         columns.push(array);
     }
 
+    let output_chunk_schema = chunk_schema_for_meta_output(desc_tbl, &out_layout, &output_schema)?;
     let batch = RecordBatch::try_new(output_schema, columns)
         .map_err(|e| format!("LAKE_META_SCAN_NODE build output batch failed: {}", e))?;
-    let chunk =
-        Chunk::try_new_with_chunk_schema(batch, chunk_schema_for_layout(desc_tbl, &out_layout)?)?;
+    let chunk = Chunk::try_new_with_chunk_schema(batch, output_chunk_schema)?;
 
     Ok(Lowered {
         node: ExecNode {
@@ -639,6 +639,43 @@ fn rewrite_meta_output_schema(
         fields.push(Field::new(field_ref.name(), data_type, true));
     }
     Ok(Arc::new(Schema::new(fields)))
+}
+
+fn rewrite_chunk_slots_for_output_schema(
+    base_slots: Vec<ChunkSlotSchema>,
+    output_schema: &Arc<Schema>,
+) -> Result<Vec<ChunkSlotSchema>, String> {
+    if base_slots.len() != output_schema.fields().len() {
+        return Err(format!(
+            "LAKE_META_SCAN_NODE output chunk schema size mismatch: base_slots={} output_fields={}",
+            base_slots.len(),
+            output_schema.fields().len()
+        ));
+    }
+
+    base_slots
+        .into_iter()
+        .zip(output_schema.fields().iter())
+        .map(|(slot, field)| {
+            ChunkSlotSchema::try_new_with_field(
+                slot.slot_id(),
+                field.as_ref().clone(),
+                None,
+                slot.unique_id(),
+            )
+        })
+        .collect()
+}
+
+fn chunk_schema_for_meta_output(
+    desc_tbl: &descriptors::TDescriptorTable,
+    out_layout: &Layout,
+    output_schema: &Arc<Schema>,
+) -> Result<Arc<ChunkSchema>, String> {
+    let base_slots = chunk_slot_schemas_for_layout(desc_tbl, out_layout)?;
+    Ok(Arc::new(ChunkSchema::try_new(
+        rewrite_chunk_slots_for_output_schema(base_slots, output_schema)?,
+    )?))
 }
 
 fn resolve_meta_i64_min_max_metric(
@@ -1429,8 +1466,15 @@ fn parse_metric_name(raw_metric: &str) -> Result<MetaMetricKind, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::datatypes::{DataType, Field, Schema};
+
     use super::MetaMetricKind;
     use super::parse_metric_name;
+    use super::rewrite_chunk_slots_for_output_schema;
+    use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSlotSchema;
 
     #[test]
     fn parse_rows_metric() {
@@ -1477,5 +1521,30 @@ mod tests {
     fn reject_unsupported_metric_prefix() {
         let err = parse_metric_name("median_c1").expect_err("unsupported metric should fail");
         assert!(err.contains("not supported"), "err={err}");
+    }
+
+    #[test]
+    fn rewrite_chunk_slots_tracks_runtime_output_type() {
+        let base_slots = vec![ChunkSlotSchema::new_with_field(
+            SlotId::new(7),
+            Field::new("c8", DataType::Utf8, true),
+            None,
+            Some(99),
+        )];
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "c8",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]));
+
+        let rewritten =
+            rewrite_chunk_slots_for_output_schema(base_slots, &output_schema).expect("rewrite");
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(rewritten[0].slot_id(), SlotId::new(7));
+        assert_eq!(rewritten[0].unique_id(), Some(99));
+        assert_eq!(
+            rewritten[0].data_type(),
+            &DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
+        );
     }
 }
