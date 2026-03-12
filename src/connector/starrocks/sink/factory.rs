@@ -22,9 +22,7 @@
 //! - Construct sink operator instances.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -32,11 +30,6 @@ use arrow::array::{
 };
 use arrow::datatypes::DataType;
 use chrono::NaiveDate;
-use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
-use thrift::transport::{
-    ReadHalf as TReadHalf, TBufferedReadTransport, TBufferedWriteTransport, TIoChannel,
-    TTcpChannel, WriteHalf as TWriteHalf,
-};
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
@@ -58,7 +51,7 @@ use crate::exec::node::{ExecNodeKind, ExecPlan};
 use crate::exec::pipeline::operator::Operator;
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::frontend_service::{self, FrontendServiceSyncClient, TFrontendServiceSyncClient};
+use crate::frontend_service::{self, TFrontendServiceSyncClient};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::Layout;
@@ -66,11 +59,13 @@ use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry;
 use crate::service::disk_report;
+use crate::service::frontend_rpc::{
+    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
+};
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
 use crate::status_code;
 use crate::{data_sinks, descriptors, exprs, types};
 
-const FE_AUTOMATIC_PARTITION_TIMEOUT_SECS: u64 = 60;
 const LOAD_OP_COLUMN: &str = "__op";
 pub(crate) const STARROCKS_DEFAULT_PARTITION_VALUE: &str = "__STARROCKS_DEFAULT_PARTITION__";
 
@@ -769,32 +764,23 @@ fn with_frontend_client<T>(
     fe_addr: &types::TNetworkAddress,
     f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
 ) -> Result<T, String> {
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| format!("invalid FE address: {e}"))?;
-    let stream = TcpStream::connect_timeout(
-        &addr,
-        Duration::from_secs(FE_AUTOMATIC_PARTITION_TIMEOUT_SECS),
-    )
-    .map_err(|e| format!("connect FE failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(
-        FE_AUTOMATIC_PARTITION_TIMEOUT_SECS,
-    )));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(
-        FE_AUTOMATIC_PARTITION_TIMEOUT_SECS,
-    )));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan): (TReadHalf<TTcpChannel>, TWriteHalf<TTcpChannel>) = channel
-        .split()
-        .map_err(|e| format!("split FE thrift channel failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-    f(&mut client)
+    let mut f = Some(f);
+    FrontendRpcManager::shared()
+        .call_with_options(
+            FrontendRpcKind::Control,
+            fe_addr,
+            FrontendRpcCallOptions {
+                transport_retries: 0,
+            },
+            |client| {
+                f.take()
+                    .expect("createPartition FE RPC closure is consumed once per request")(
+                    client
+                )
+                .map_err(FrontendRpcError::from_message_guess)
+            },
+        )
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn create_automatic_partitions(

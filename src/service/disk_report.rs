@@ -17,15 +17,10 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::hash::{Hash, Hasher};
-use std::net::{SocketAddr, TcpStream};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
-use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
-use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
-
-use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::novarocks_logging::{debug, warn};
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::{master_service, status_code, types};
 
 #[derive(Debug, Default)]
@@ -82,24 +77,6 @@ fn send_report(
     be_port: u16,
     http_port: u16,
 ) -> Result<(), String> {
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| format!("invalid FE address: {e}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("connect FE failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel
-        .split()
-        .map_err(|e| format!("split thrift channel failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-
     let backend = types::TBackend::new(backend_host, be_port as i32, http_port as i32);
 
     let root_path = default_storage_path();
@@ -133,8 +110,13 @@ fn send_report(
         None,
     );
 
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-    let result = client.report(request).map_err(|e| e.to_string())?;
+    let result = FrontendRpcManager::shared()
+        .call(FrontendRpcKind::Control, fe_addr, |client| {
+            client
+                .report(request.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|e| e.to_string())?;
     if result.status.status_code != status_code::TStatusCode::OK {
         return Err(format!("FE returned error: {:?}", result.status));
     }

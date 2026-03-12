@@ -16,20 +16,13 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
 
-use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
-use thrift::transport::{
-    ReadHalf as TReadHalf, TBufferedReadTransport, TBufferedWriteTransport, TIoChannel,
-    TTcpChannel, WriteHalf as TWriteHalf,
+use crate::frontend_service::TFrontendServiceSyncClient;
+use crate::service::frontend_rpc::{
+    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
 };
-
-use crate::frontend_service::{FrontendServiceSyncClient, TFrontendServiceSyncClient};
 use crate::{frontend_service, status_code, types};
-
-const FE_AUTO_INCREMENT_TIMEOUT_SECS: u64 = 20;
 
 #[derive(Clone, Copy, Debug)]
 struct AutoIncrementInterval {
@@ -48,26 +41,23 @@ fn with_frontend_client<T>(
     fe_addr: &types::TNetworkAddress,
     f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
 ) -> Result<T, String> {
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| format!("invalid FE address for auto increment: {e}"))?;
-    let stream =
-        TcpStream::connect_timeout(&addr, Duration::from_secs(FE_AUTO_INCREMENT_TIMEOUT_SECS))
-            .map_err(|e| format!("connect FE failed for auto increment: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(FE_AUTO_INCREMENT_TIMEOUT_SECS)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(FE_AUTO_INCREMENT_TIMEOUT_SECS)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan): (TReadHalf<TTcpChannel>, TWriteHalf<TTcpChannel>) = channel
-        .split()
-        .map_err(|e| format!("split FE thrift channel failed for auto increment: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-    f(&mut client)
+    let mut f = Some(f);
+    FrontendRpcManager::shared()
+        .call_with_options(
+            FrontendRpcKind::Control,
+            fe_addr,
+            FrontendRpcCallOptions {
+                transport_retries: 0,
+            },
+            |client| {
+                f.take()
+                    .expect("auto increment FE RPC closure is consumed once per request")(
+                    client
+                )
+                .map_err(FrontendRpcError::from_message_guess)
+            },
+        )
+        .map_err(|err| err.to_string())
 }
 
 fn request_new_interval(

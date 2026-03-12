@@ -94,6 +94,7 @@ fn maybe_refresh_snapshot_schema_for_lake_scan(
         meta.schema_id,
         Some(snapshot.tablet_id),
         meta.query_id.clone(),
+        None,
     )
     .map_err(|e| {
         format!(
@@ -426,6 +427,48 @@ fn build_lake_schema_column_hints(
     Ok(out)
 }
 
+fn build_lake_schema_column_hints_from_pb(
+    schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+) -> Result<HashMap<String, LakeSchemaColumnHint>, String> {
+    let mut out = HashMap::new();
+    for column in &schema.column {
+        let Some(name) = column.name.as_deref() else {
+            continue;
+        };
+        let normalized_name = normalize_column_name(name);
+        if normalized_name.is_empty() {
+            continue;
+        }
+        let unique_id = match column.unique_id {
+            v if v > 0 => Some(u32::try_from(v).map_err(|_| {
+                format!(
+                    "invalid local tablet schema unique_id for column '{}': {}",
+                    name, v
+                )
+            })?),
+            _ => None,
+        };
+        let default_value = column
+            .default_value
+            .as_ref()
+            .map(|value| String::from_utf8_lossy(value).into_owned());
+        let hint = LakeSchemaColumnHint {
+            unique_id,
+            default_value,
+        };
+        if let Some(existing) = out.get(&normalized_name)
+            && existing != &hint
+        {
+            return Err(format!(
+                "duplicated local tablet schema column with mismatched metadata: column_name={}",
+                name
+            ));
+        }
+        out.insert(normalized_name, hint);
+    }
+    Ok(out)
+}
+
 fn build_output_column_hints(
     snapshot: &StarRocksTabletSnapshot,
     required_chunk_schema: &ChunkSchemaRef,
@@ -473,21 +516,27 @@ fn build_output_column_hints(
         }
     }
     let lake_hints = if let Some(meta) = lake_schema_meta {
-        let fe_schema = fetch_table_schema_for_lake_scan(
-            meta.fe_addr.as_ref(),
-            meta.db_id,
-            meta.table_id,
-            meta.schema_id,
-            Some(snapshot.tablet_id),
-            meta.query_id.clone(),
-        )
-        .map_err(|e| {
-            format!(
-                "fetch FE table schema for lake scan failed: db_id={} table_id={} schema_id={} error={}",
-                meta.db_id, meta.table_id, meta.schema_id, e
+        let snapshot_schema_id = snapshot.tablet_schema.id.unwrap_or(0);
+        if snapshot_schema_id == meta.schema_id {
+            build_lake_schema_column_hints_from_pb(&snapshot.tablet_schema)?
+        } else {
+            let fe_schema = fetch_table_schema_for_lake_scan(
+                meta.fe_addr.as_ref(),
+                meta.db_id,
+                meta.table_id,
+                meta.schema_id,
+                Some(snapshot.tablet_id),
+                meta.query_id.clone(),
+                None,
             )
-        })?;
-        build_lake_schema_column_hints(&fe_schema)?
+            .map_err(|e| {
+                format!(
+                    "fetch FE table schema for lake scan failed: db_id={} table_id={} schema_id={} error={}",
+                    meta.db_id, meta.table_id, meta.schema_id, e
+                )
+            })?;
+            build_lake_schema_column_hints(&fe_schema)?
+        }
     } else {
         HashMap::new()
     };

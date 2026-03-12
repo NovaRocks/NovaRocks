@@ -15,20 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpStream};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
-
-use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
-use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
 
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::connector::starrocks::starmgr;
-use crate::frontend_service::{self, FrontendServiceSyncClient, TFrontendServiceSyncClient};
+use crate::connector::starrocks::table_schema_service;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::starlet_shard_registry;
-use crate::service::disk_report;
-use crate::status_code;
 use crate::types;
 
 #[derive(Clone, Debug)]
@@ -65,7 +58,6 @@ pub(crate) struct LakeTabletPartitionRef {
 static TABLE_IDENTITY_NAME_CACHE: OnceLock<Mutex<HashMap<String, (String, String)>>> =
     OnceLock::new();
 
-const FE_META_FETCH_TIMEOUT_SECS: u64 = 5;
 fn table_identity_name_cache() -> &'static Mutex<HashMap<String, (String, String)>> {
     TABLE_IDENTITY_NAME_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -327,12 +319,6 @@ fn collect_missing_tablet_ids(
     missing
 }
 
-fn resolve_frontend_addr(
-    fe_addr: Option<&types::TNetworkAddress>,
-) -> Option<types::TNetworkAddress> {
-    fe_addr.cloned().or_else(disk_report::latest_fe_addr)
-}
-
 pub(crate) fn fetch_table_schema_for_lake_scan(
     fe_addr: Option<&types::TNetworkAddress>,
     db_id: i64,
@@ -340,76 +326,17 @@ pub(crate) fn fetch_table_schema_for_lake_scan(
     schema_id: i64,
     tablet_id: Option<i64>,
     query_id: Option<types::TUniqueId>,
+    local_schema: Option<&crate::agent_service::TTabletSchema>,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
-    if schema_id <= 0 {
-        return Err(format!(
-            "invalid schema_id for FE getTableSchema: db_id={} table_id={} schema_id={}",
-            db_id, table_id, schema_id
-        ));
-    }
-    let query_id = query_id.ok_or_else(|| {
-        format!(
-            "missing query_id for FE getTableSchema scan request: db_id={} table_id={} schema_id={}",
-            db_id, table_id, schema_id
-        )
-    })?;
-    let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
-        "missing FE address for getTableSchema (coord is absent and heartbeat cache is empty)"
-            .to_string()
-    })?;
-
-    let request = frontend_service::TBatchGetTableSchemaRequest {
-        requests: Some(vec![frontend_service::TGetTableSchemaRequest {
-            schema_meta: Some(crate::plan_nodes::TTableSchemaMeta {
-                db_id: Some(db_id),
-                table_id: Some(table_id),
-                schema_id: Some(schema_id),
-            }),
-            source: Some(frontend_service::TTableSchemaRequestSource::SCAN),
-            tablet_id,
-            query_id: Some(query_id),
-            txn_id: None,
-        }]),
-    };
-
-    let response = with_frontend_client(&fe_addr, |client| {
-        client
-            .get_table_schema(request)
-            .map_err(|e| format!("FE getTableSchema rpc failed: {e}"))
-    })?;
-    let status = response
-        .status
-        .as_ref()
-        .ok_or_else(|| "FE getTableSchema returned empty top-level status".to_string())?;
-    if status.status_code != status_code::TStatusCode::OK {
-        return Err(format!(
-            "FE getTableSchema returned non-OK top-level status: {:?}",
-            status
-        ));
-    }
-
-    let mut responses = response.responses.unwrap_or_default();
-    if responses.len() != 1 {
-        return Err(format!(
-            "FE getTableSchema returned unexpected response count: expected=1 actual={}",
-            responses.len()
-        ));
-    }
-    let item = responses
-        .pop()
-        .ok_or_else(|| "FE getTableSchema returned empty responses".to_string())?;
-    let item_status = item
-        .status
-        .as_ref()
-        .ok_or_else(|| "FE getTableSchema response item missing status".to_string())?;
-    if item_status.status_code != status_code::TStatusCode::OK {
-        return Err(format!(
-            "FE getTableSchema response item returned non-OK: {:?}",
-            item_status
-        ));
-    }
-    item.schema
-        .ok_or_else(|| "FE getTableSchema response item missing schema".to_string())
+    table_schema_service::fetch_table_schema_for_lake_scan(
+        fe_addr,
+        db_id,
+        table_id,
+        schema_id,
+        tablet_id,
+        query_id,
+        local_schema,
+    )
 }
 
 fn normalize_storage_path(path: &str) -> Option<String> {
@@ -419,31 +346,6 @@ fn normalize_storage_path(path: &str) -> Option<String> {
     } else {
         Some(normalized.to_string())
     }
-}
-
-fn with_frontend_client<T>(
-    fe_addr: &types::TNetworkAddress,
-    f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-) -> Result<T, String> {
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| format!("invalid FE address: {e}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(FE_META_FETCH_TIMEOUT_SECS))
-        .map_err(|e| format!("connect FE failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(FE_META_FETCH_TIMEOUT_SECS)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(FE_META_FETCH_TIMEOUT_SECS)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel
-        .split()
-        .map_err(|e| format!("split FE thrift channel failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-    f(&mut client)
 }
 
 fn paths_cover_refs(paths: &HashMap<i64, String>, refs: &[LakeTabletPartitionRef]) -> bool {

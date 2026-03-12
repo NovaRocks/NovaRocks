@@ -17,24 +17,24 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde_json::{Map, Value, json};
-use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
-use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
 
 use crate::frontend_service::{
-    FrontendServiceSyncClient, TFrontendServiceSyncClient, TLoadTxnBeginRequest,
-    TLoadTxnBeginResult, TLoadTxnCommitRequest, TLoadTxnCommitResult, TLoadTxnRollbackRequest,
-    TLoadTxnRollbackResult, TStreamLoadPutRequest, TStreamLoadPutResult,
+    TFrontendServiceSyncClient, TLoadTxnBeginRequest, TLoadTxnBeginResult, TLoadTxnCommitRequest,
+    TLoadTxnCommitResult, TLoadTxnRollbackRequest, TLoadTxnRollbackResult, TStreamLoadPutRequest,
+    TStreamLoadPutResult,
 };
 use crate::plan_nodes::TFileFormatType;
 use crate::runtime::{backend_id, sink_commit};
 use crate::service::disk_report;
+use crate::service::frontend_rpc::{
+    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
+};
 use crate::service::internal_service;
 use crate::status::TStatus;
 use crate::status_code::TStatusCode;
@@ -535,37 +535,23 @@ fn with_frontend_client<T>(
             "missing FE address (heartbeat not established yet)",
         )
     })?;
-    let addr: SocketAddr = format!("{}:{}", fe_addr.hostname, fe_addr.port)
-        .parse()
-        .map_err(|e| {
-            ApiError::new(
-                TStatusCode::THRIFT_RPC_ERROR,
-                format!("invalid FE address: {e}"),
-            )
-        })?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| {
-        ApiError::new(
-            TStatusCode::THRIFT_RPC_ERROR,
-            format!("connect FE failed: {e}"),
+    let mut f = Some(f);
+    FrontendRpcManager::shared()
+        .call_with_options(
+            FrontendRpcKind::Control,
+            &fe_addr,
+            FrontendRpcCallOptions {
+                transport_retries: 0,
+            },
+            |client| {
+                f.take()
+                    .expect("stream load FE RPC closure is consumed once per request")(
+                    client
+                )
+                .map_err(FrontendRpcError::from_message_guess)
+            },
         )
-    })?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel.split().map_err(|e| {
-        ApiError::new(
-            TStatusCode::THRIFT_RPC_ERROR,
-            format!("split FE thrift channel failed: {e}"),
-        )
-    })?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let o_prot = TBinaryOutputProtocol::new(o_trans, true);
-    let mut client = FrontendServiceSyncClient::new(i_prot, o_prot);
-    f(&mut client).map_err(|e| ApiError::new(TStatusCode::THRIFT_RPC_ERROR, e))
+        .map_err(|e| ApiError::new(TStatusCode::THRIFT_RPC_ERROR, e.to_string()))
 }
 
 fn random_unique_id() -> TUniqueId {

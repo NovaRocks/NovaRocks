@@ -403,6 +403,8 @@ fn main() {
             let advertise_host =
                 network::advertise_host_for_server(server).expect("resolve advertise host");
 
+            novarocks::service::frontend_rpc::init_frontend_rpc_manager();
+
             // Start NovaRocks gRPC servers first to guarantee Starlet endpoint is online
             // before heartbeat reports ports to FE.
             novarocks::start_grpc_server(server.host.as_str()).expect("start grpc server");

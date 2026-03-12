@@ -282,6 +282,38 @@ pub struct RuntimeConfig {
     pub scan_submit_fail_timeout_ms: u64,
     #[serde(default = "default_profile_report_interval")]
     pub profile_report_interval: i64,
+    #[serde(default = "default_fe_rpc_connect_timeout_ms")]
+    pub fe_rpc_connect_timeout_ms: u64,
+    #[serde(default = "default_fe_rpc_timeout_ms")]
+    pub fe_rpc_timeout_ms: u64,
+    #[serde(default = "default_fe_rpc_retry_interval_ms")]
+    pub fe_rpc_retry_interval_ms: u64,
+    #[serde(default = "default_fe_rpc_pool_max_idle_per_host")]
+    pub fe_rpc_pool_max_idle_per_host: usize,
+    #[serde(default = "default_fe_rpc_max_inflight_total")]
+    pub fe_rpc_max_inflight_total: usize,
+    #[serde(default = "default_fe_rpc_max_inflight_schema")]
+    pub fe_rpc_max_inflight_schema: usize,
+    #[serde(default = "default_fe_rpc_max_inflight_exec_status")]
+    pub fe_rpc_max_inflight_exec_status: usize,
+    #[serde(default = "default_fe_rpc_max_inflight_control")]
+    pub fe_rpc_max_inflight_control: usize,
+    #[serde(default = "default_fe_rpc_max_inflight_schema_query")]
+    pub fe_rpc_max_inflight_schema_query: usize,
+    #[serde(default = "default_table_schema_service_max_retries")]
+    pub table_schema_service_max_retries: usize,
+    #[serde(default = "default_table_schema_service_cache_capacity")]
+    pub table_schema_service_cache_capacity: u64,
+    #[serde(default = "default_exec_state_report_max_threads")]
+    pub exec_state_report_max_threads: usize,
+    #[serde(default = "default_priority_exec_state_report_max_threads")]
+    pub priority_exec_state_report_max_threads: usize,
+    #[serde(default = "default_report_exec_rpc_request_retry_num")]
+    pub report_exec_rpc_request_retry_num: usize,
+    #[serde(default = "default_report_exec_batch_flush_interval_ms")]
+    pub report_exec_batch_flush_interval_ms: u64,
+    #[serde(default = "default_report_exec_batch_max_size")]
+    pub report_exec_batch_max_size: usize,
     #[serde(default)]
     pub runtime_filter_scan_wait_time_ms_override: Option<i64>,
     #[serde(default)]
@@ -509,6 +541,70 @@ fn default_profile_report_interval() -> i64 {
     30
 }
 
+fn default_fe_rpc_connect_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_fe_rpc_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_fe_rpc_retry_interval_ms() -> u64 {
+    100
+}
+
+fn default_fe_rpc_pool_max_idle_per_host() -> usize {
+    10
+}
+
+fn default_fe_rpc_max_inflight_total() -> usize {
+    32
+}
+
+fn default_fe_rpc_max_inflight_schema() -> usize {
+    8
+}
+
+fn default_fe_rpc_max_inflight_exec_status() -> usize {
+    4
+}
+
+fn default_fe_rpc_max_inflight_control() -> usize {
+    4
+}
+
+fn default_fe_rpc_max_inflight_schema_query() -> usize {
+    4
+}
+
+fn default_table_schema_service_max_retries() -> usize {
+    3
+}
+
+fn default_table_schema_service_cache_capacity() -> u64 {
+    4_096
+}
+
+fn default_exec_state_report_max_threads() -> usize {
+    2
+}
+
+fn default_priority_exec_state_report_max_threads() -> usize {
+    2
+}
+
+fn default_report_exec_rpc_request_retry_num() -> usize {
+    10
+}
+
+fn default_report_exec_batch_flush_interval_ms() -> u64 {
+    50
+}
+
+fn default_report_exec_batch_max_size() -> usize {
+    32
+}
+
 fn default_object_storage_retry_log_summary_interval_ms() -> u64 {
     30_000
 }
@@ -549,6 +645,23 @@ impl Default for RuntimeConfig {
             scan_submit_fail_max: default_scan_submit_fail_max(),
             scan_submit_fail_timeout_ms: default_scan_submit_fail_timeout_ms(),
             profile_report_interval: default_profile_report_interval(),
+            fe_rpc_connect_timeout_ms: default_fe_rpc_connect_timeout_ms(),
+            fe_rpc_timeout_ms: default_fe_rpc_timeout_ms(),
+            fe_rpc_retry_interval_ms: default_fe_rpc_retry_interval_ms(),
+            fe_rpc_pool_max_idle_per_host: default_fe_rpc_pool_max_idle_per_host(),
+            fe_rpc_max_inflight_total: default_fe_rpc_max_inflight_total(),
+            fe_rpc_max_inflight_schema: default_fe_rpc_max_inflight_schema(),
+            fe_rpc_max_inflight_exec_status: default_fe_rpc_max_inflight_exec_status(),
+            fe_rpc_max_inflight_control: default_fe_rpc_max_inflight_control(),
+            fe_rpc_max_inflight_schema_query: default_fe_rpc_max_inflight_schema_query(),
+            table_schema_service_max_retries: default_table_schema_service_max_retries(),
+            table_schema_service_cache_capacity: default_table_schema_service_cache_capacity(),
+            exec_state_report_max_threads: default_exec_state_report_max_threads(),
+            priority_exec_state_report_max_threads: default_priority_exec_state_report_max_threads(
+            ),
+            report_exec_rpc_request_retry_num: default_report_exec_rpc_request_retry_num(),
+            report_exec_batch_flush_interval_ms: default_report_exec_batch_flush_interval_ms(),
+            report_exec_batch_max_size: default_report_exec_batch_max_size(),
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             object_storage: ObjectStorageConfig::default(),

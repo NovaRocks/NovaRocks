@@ -21,15 +21,7 @@
 //! and keeps this module focused on BE-initiated reports.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
-
-use thrift::protocol::{
-    TBinaryInputProtocol, TBinaryOutputProtocol, TFieldIdentifier, TInputProtocol,
-    TMessageIdentifier, TMessageType, TOutputProtocol, TSerializable, TStructIdentifier, TType,
-};
-use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChannel, TTcpChannel};
 
 use crate::cache::DataCacheManager;
 use crate::common::network;
@@ -41,6 +33,8 @@ use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::QueryId;
 use crate::runtime::sink_commit;
+use crate::service::exec_state_reporter::{self, ExecStateReportTask};
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::service::report_worker;
 use crate::{
     data_cache, frontend_service, internal_service, metrics, runtime_profile, status, status_code,
@@ -62,40 +56,8 @@ struct ReportInstance {
 
 static REPORT_REGISTRY: OnceLock<Mutex<HashMap<UniqueId, ReportInstance>>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReportSendOutcome {
-    Delivered,
-    QueryGone,
-}
-
 fn registry() -> &'static Mutex<HashMap<UniqueId, ReportInstance>> {
     REPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn read_frontend_result<T: TSerializable>(
-    i_prot: &mut dyn TInputProtocol,
-    call_name: &str,
-) -> Result<T, String> {
-    i_prot.read_struct_begin().map_err(|e| e.to_string())?;
-    let mut value: Option<T> = None;
-    loop {
-        let field = i_prot.read_field_begin().map_err(|e| e.to_string())?;
-        if field.field_type == TType::Stop {
-            break;
-        }
-        match field.id {
-            Some(0) => {
-                let parsed = T::read_from_in_protocol(i_prot).map_err(|e| e.to_string())?;
-                value = Some(parsed);
-            }
-            _ => {
-                i_prot.skip(field.field_type).map_err(|e| e.to_string())?;
-            }
-        }
-        i_prot.read_field_end().map_err(|e| e.to_string())?;
-    }
-    i_prot.read_struct_end().map_err(|e| e.to_string())?;
-    value.ok_or_else(|| format!("missing {} result", call_name))
 }
 
 pub(crate) fn register_instance(
@@ -110,6 +72,7 @@ pub(crate) fn register_instance(
     report_interval_ns: Option<i64>,
 ) {
     report_worker::ensure_started();
+    exec_state_reporter::ensure_started();
     let mut guard = registry().lock().expect("report registry lock");
     guard.insert(
         finst_id,
@@ -149,7 +112,7 @@ pub(crate) fn list_report_instances() -> Vec<(UniqueId, ReportInstanceSnapshot)>
         .collect()
 }
 
-fn mark_fe_query_gone(finst_id: UniqueId) {
+pub(crate) fn mark_fe_query_gone(finst_id: UniqueId) {
     if let Ok(mut guard) = registry().lock()
         && let Some(instance) = guard.get_mut(&finst_id)
     {
@@ -171,6 +134,16 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         sink_commit::unregister(finst_id);
         return;
     };
+    if instance.fe_query_gone {
+        debug!(
+            target: "novarocks::report",
+            finst_id = %finst_id,
+            query_id = %instance.query_id,
+            "skip final reportExecStatus because FE query is already gone"
+        );
+        sink_commit::unregister(finst_id);
+        return;
+    }
     let status = match error {
         Some(msg) => {
             status::TStatus::new(status_code::TStatusCode::INTERNAL_ERROR, Some(vec![msg]))
@@ -193,25 +166,12 @@ pub(crate) fn report_fragment_done(finst_id: UniqueId, error: Option<String>) {
         None,
         load_datacache_metrics,
     );
-    match send_report(&instance.coord, params) {
-        Ok(ReportSendOutcome::Delivered) => {}
-        Ok(ReportSendOutcome::QueryGone) => {
-            debug!(
-                target: "novarocks::report",
-                finst_id = %finst_id,
-                query_id = %instance.query_id,
-                "skip final reportExecStatus because FE query is already gone"
-            );
-        }
-        Err(e) => {
-            warn!(
-                target: "novarocks::report",
-                finst_id = %finst_id,
-                error = %e,
-                "reportExecStatus failed"
-            );
-        }
-    }
+    exec_state_reporter::enqueue_final(ExecStateReportTask {
+        finst_id,
+        query_id: instance.query_id,
+        coord: instance.coord.clone(),
+        params,
+    });
     sink_commit::unregister(finst_id);
 }
 
@@ -254,25 +214,18 @@ pub(crate) fn report_exec_state(finst_id: UniqueId) {
         None,
         load_datacache_metrics,
     );
-    match send_report(&instance.coord, params) {
-        Ok(ReportSendOutcome::Delivered) => {}
-        Ok(ReportSendOutcome::QueryGone) => {
-            mark_fe_query_gone(finst_id);
-            debug!(
-                target: "novarocks::report",
-                finst_id = %finst_id,
-                query_id = %instance.query_id,
-                "suppress future reportExecStatus because FE query is already gone"
-            );
-        }
-        Err(e) => {
-            warn!(
-                target: "novarocks::report",
-                finst_id = %finst_id,
-                error = %e,
-                "reportExecStatus failed"
-            );
-        }
+    if let Err(e) = exec_state_reporter::enqueue_non_final(ExecStateReportTask {
+        finst_id,
+        query_id: instance.query_id,
+        coord: instance.coord.clone(),
+        params,
+    }) {
+        warn!(
+            target: "novarocks::report",
+            finst_id = %finst_id,
+            error = %e,
+            "failed to enqueue reportExecStatus"
+        );
     }
 }
 
@@ -280,71 +233,14 @@ pub(crate) fn fetch_query_profile(
     coord: &types::TNetworkAddress,
     query_id: &str,
 ) -> Result<String, String> {
-    let addr: SocketAddr = format!("{}:{}", coord.hostname, coord.port)
-        .parse()
-        .map_err(|e| format!("invalid coord address: {e}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("connect FE failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_nodelay(true);
-
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel
-        .split()
-        .map_err(|e| format!("split thrift channel failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let mut i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let mut o_prot = TBinaryOutputProtocol::new(o_trans, true);
-
     let req = frontend_service::TGetProfileRequest::new(Some(vec![query_id.to_string()]));
-    let seq_id = 0;
-    o_prot
-        .write_message_begin(&TMessageIdentifier::new(
-            "getQueryProfile",
-            TMessageType::Call,
-            seq_id,
-        ))
-        .map_err(|e| e.to_string())?;
-    o_prot
-        .write_struct_begin(&TStructIdentifier::new("getQueryProfile_args"))
-        .map_err(|e| e.to_string())?;
-    o_prot
-        .write_field_begin(&TFieldIdentifier::new("request", TType::Struct, 1))
-        .map_err(|e| e.to_string())?;
-    req.write_to_out_protocol(&mut o_prot)
-        .map_err(|e| e.to_string())?;
-    o_prot.write_field_end().map_err(|e| e.to_string())?;
-    o_prot.write_field_stop().map_err(|e| e.to_string())?;
-    o_prot.write_struct_end().map_err(|e| e.to_string())?;
-    o_prot.write_message_end().map_err(|e| e.to_string())?;
-    o_prot.flush().map_err(|e| e.to_string())?;
-
-    let resp = i_prot.read_message_begin().map_err(|e| e.to_string())?;
-    match resp.message_type {
-        TMessageType::Reply => {}
-        TMessageType::Exception => {
-            let err = thrift::Error::read_application_error_from_in_protocol(&mut i_prot)
-                .map_err(|e| format!("read thrift exception failed: {e}"))?;
-            i_prot.read_message_end().map_err(|e| e.to_string())?;
-            return Err(format!("thrift exception: {err}"));
-        }
-        other => {
-            i_prot.read_message_end().map_err(|e| e.to_string())?;
-            return Err(format!("unexpected response type: {:?}", other));
-        }
-    }
-    if resp.name != "getQueryProfile" {
-        i_prot.read_message_end().map_err(|e| e.to_string())?;
-        return Err(format!("unexpected response name: {}", resp.name));
-    }
-
-    let result = read_frontend_result::<frontend_service::TGetProfileResponse>(
-        &mut i_prot,
-        "getQueryProfile",
-    )?;
-    i_prot.read_message_end().map_err(|e| e.to_string())?;
+    let result = FrontendRpcManager::shared()
+        .call(FrontendRpcKind::SchemaQuery, coord, |client| {
+            client
+                .get_query_profile(req.clone())
+                .map_err(FrontendRpcError::from_thrift)
+        })
+        .map_err(|e| format!("getQueryProfile RPC failed: {e}"))?;
 
     if let Some(status) = result.status {
         if status.status_code != status_code::TStatusCode::OK {
@@ -703,7 +599,7 @@ fn normalize_profile_tree_for_fe(tree: &mut runtime_profile::TRuntimeProfileTree
     }
 }
 
-fn is_query_gone_status(status: &status::TStatus) -> bool {
+pub(crate) fn is_query_gone_status(status: &status::TStatus) -> bool {
     status.status_code == status_code::TStatusCode::NOT_FOUND
         && status
             .error_msgs
@@ -715,93 +611,56 @@ fn is_query_gone_status(status: &status::TStatus) -> bool {
             .unwrap_or(false)
 }
 
-fn send_report(
-    coord: &types::TNetworkAddress,
-    params: frontend_service::TReportExecStatusParams,
-) -> Result<ReportSendOutcome, String> {
-    let addr: SocketAddr = format!("{}:{}", coord.hostname, coord.port)
-        .parse()
-        .map_err(|e| format!("invalid coord address: {e}"))?;
-    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| format!("connect FE failed: {e}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_nodelay(true);
+#[cfg(test)]
+pub(crate) fn test_insert_report_instance(finst_id: UniqueId, query_id: QueryId) {
+    let mut guard = registry().lock().expect("report registry lock");
+    guard.insert(
+        finst_id,
+        ReportInstance {
+            coord: types::TNetworkAddress::new("127.0.0.1".to_string(), 0),
+            backend_num: 1,
+            query_id,
+            enable_profile: false,
+            profiler: None,
+            mem_tracker: None,
+            query_mem_tracker: None,
+            report_interval_ns: None,
+            fe_query_gone: false,
+        },
+    );
+}
 
-    let channel = TTcpChannel::with_stream(stream);
-    let (i_chan, o_chan) = channel
-        .split()
-        .map_err(|e| format!("split thrift channel failed: {e}"))?;
-    let i_trans = TBufferedReadTransport::new(i_chan);
-    let o_trans = TBufferedWriteTransport::new(o_chan);
-    let mut i_prot = TBinaryInputProtocol::new(i_trans, true);
-    let mut o_prot = TBinaryOutputProtocol::new(o_trans, true);
-
-    let seq_id = 0;
-    o_prot
-        .write_message_begin(&TMessageIdentifier::new(
-            "reportExecStatus",
-            TMessageType::Call,
-            seq_id,
-        ))
-        .map_err(|e| e.to_string())?;
-    o_prot
-        .write_struct_begin(&TStructIdentifier::new("reportExecStatus_args"))
-        .map_err(|e| e.to_string())?;
-    o_prot
-        .write_field_begin(&TFieldIdentifier::new("params", TType::Struct, 1))
-        .map_err(|e| e.to_string())?;
-    params
-        .write_to_out_protocol(&mut o_prot)
-        .map_err(|e| e.to_string())?;
-    o_prot.write_field_end().map_err(|e| e.to_string())?;
-    o_prot.write_field_stop().map_err(|e| e.to_string())?;
-    o_prot.write_struct_end().map_err(|e| e.to_string())?;
-    o_prot.write_message_end().map_err(|e| e.to_string())?;
-    o_prot.flush().map_err(|e| e.to_string())?;
-
-    let resp = i_prot.read_message_begin().map_err(|e| e.to_string())?;
-    match resp.message_type {
-        TMessageType::Reply => {}
-        TMessageType::Exception => {
-            let err = thrift::Error::read_application_error_from_in_protocol(&mut i_prot)
-                .map_err(|e| format!("read thrift exception failed: {e}"))?;
-            i_prot.read_message_end().map_err(|e| e.to_string())?;
-            return Err(format!("thrift exception: {err}"));
-        }
-        other => {
-            i_prot.read_message_end().map_err(|e| e.to_string())?;
-            return Err(format!("unexpected response type: {:?}", other));
-        }
+#[cfg(test)]
+pub(crate) fn test_reset_report_registry() {
+    if let Ok(mut guard) = registry().lock() {
+        guard.clear();
     }
-    if resp.name != "reportExecStatus" {
-        i_prot.read_message_end().map_err(|e| e.to_string())?;
-        return Err(format!("unexpected response name: {}", resp.name));
-    }
+}
 
-    let result = read_frontend_result::<frontend_service::TReportExecStatusResult>(
-        &mut i_prot,
-        "reportExecStatus",
-    )?;
-    i_prot.read_message_end().map_err(|e| e.to_string())?;
+#[cfg(test)]
+pub(crate) fn test_is_fe_query_gone(finst_id: UniqueId) -> bool {
+    registry()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&finst_id).map(|instance| instance.fe_query_gone))
+        .unwrap_or(false)
+}
 
-    if let Some(status) = result.status {
-        if status.status_code == status_code::TStatusCode::OK {
-            return Ok(ReportSendOutcome::Delivered);
-        }
-        if is_query_gone_status(&status) {
-            return Ok(ReportSendOutcome::QueryGone);
-        }
-        if status.status_code != status_code::TStatusCode::OK {
-            return Err(format!("FE returned error: {:?}", status));
-        }
-    }
-    Ok(ReportSendOutcome::Delivered)
+#[cfg(test)]
+pub(crate) fn test_report_registry_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_query_gone_status;
+    use super::{
+        is_query_gone_status, mark_fe_query_gone, report_fragment_done,
+        test_insert_report_instance, test_reset_report_registry,
+    };
+    use crate::common::types::UniqueId;
+    use crate::runtime::query_context::QueryId;
+    use crate::service::exec_state_reporter;
     use crate::{status, status_code};
 
     #[test]
@@ -820,5 +679,24 @@ mod tests {
             Some(vec!["tablet not found".to_string()]),
         );
         assert!(!is_query_gone_status(&status));
+    }
+
+    #[test]
+    fn fragment_done_is_skipped_when_query_is_already_gone() {
+        let _guard = super::test_report_registry_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let finst_id = UniqueId { hi: 11, lo: 22 };
+        let query_id = QueryId { hi: 33, lo: 44 };
+        test_reset_report_registry();
+        exec_state_reporter::test_clear_shared_queues();
+        test_insert_report_instance(finst_id, query_id);
+
+        mark_fe_query_gone(finst_id);
+        report_fragment_done(finst_id, None);
+
+        assert_eq!(exec_state_reporter::test_priority_queue_len(), 0);
+        assert!(super::list_report_instances().is_empty());
+        test_reset_report_registry();
     }
 }
