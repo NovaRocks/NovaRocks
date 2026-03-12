@@ -520,15 +520,19 @@ mod tests {
     use crate::service::{fe_report, frontend_rpc};
     use crate::status;
     use crate::status_code;
-    use crate::testutil::fe_rpc_server::{
-        FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply,
-    };
     use crate::types;
 
     use super::{
         ExecStateReportTask, ExecStateReporter, ExecStateReporterSettings, NormalQueue,
         PriorityQueue, handle_batch_response, send_final_report_with, send_non_final_batch,
     };
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn ok_status() -> status::TStatus {
         status::TStatus::new(status_code::TStatusCode::OK, None)
@@ -699,7 +703,7 @@ mod tests {
                         status_list: Some(vec![ok_status(); req.params_list.len()]),
                     };
                     write_struct_reply(o_prot, method, seq, &response)?;
-                    Ok(ServerAction::Close)
+                    Ok(ServerAction::Continue)
                 }
                 other => panic!("unexpected FE RPC method: {other}"),
             }),

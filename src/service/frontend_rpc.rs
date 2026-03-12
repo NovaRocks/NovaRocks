@@ -727,12 +727,16 @@ mod tests {
     use crate::frontend_service;
     use crate::status;
     use crate::status_code;
-    use crate::testutil::fe_rpc_server::{
-        FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply,
-    };
     use crate::types;
 
     use super::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager, FrontendRpcSettings};
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn test_manager_settings() -> FrontendRpcSettings {
         FrontendRpcSettings {

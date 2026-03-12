@@ -1006,11 +1006,12 @@ mod tests {
             .lock()
             .expect("lock backend test guard");
         disk_report::set_backend_host_for_test(Some("127.0.0.1"));
+        let cfg = crate::novarocks_config::config().expect("load novarocks config");
 
         let backend = build_backend_for_finish_task().expect("build finish_task backend");
         assert_eq!(backend.host, "127.0.0.1");
-        assert_eq!(backend.be_port, 9060);
-        assert_eq!(backend.http_port, 8040);
+        assert_eq!(backend.be_port, cfg.server.be_port as i32);
+        assert_eq!(backend.http_port, cfg.server.http_port as i32);
 
         disk_report::set_backend_host_for_test(None);
     }

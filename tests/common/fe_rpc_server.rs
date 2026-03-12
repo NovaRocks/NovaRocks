@@ -29,6 +29,7 @@ use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport, TIoChan
 
 use crate::types;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerAction {
     Continue,
