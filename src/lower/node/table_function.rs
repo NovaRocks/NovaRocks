@@ -22,7 +22,7 @@ use crate::common::ids::SlotId;
 use crate::common::largeint;
 use crate::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::lower::layout::{Layout, schema_for_layout};
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::{descriptors, plan_nodes};
@@ -271,23 +271,10 @@ pub(crate) fn lower_table_function_node(
         }
     }
 
-    let schema = {
-        let desc_tbl =
-            desc_tbl.ok_or_else(|| "TABLE_FUNCTION_NODE missing descriptor table".to_string())?;
-        schema_for_layout(desc_tbl, &out_layout)?
-    };
-    let mut output_slots = Vec::with_capacity(out_layout.order.len());
-    for (_, slot_id) in out_layout.order.iter() {
-        output_slots.push(SlotId::try_from(*slot_id)?);
-    }
-
-    if schema.fields().len() != output_slots.len() {
-        return Err(format!(
-            "TABLE_FUNCTION_NODE output schema size mismatch: schema={} slots={}",
-            schema.fields().len(),
-            output_slots.len()
-        ));
-    }
+    let desc_tbl =
+        desc_tbl.ok_or_else(|| "TABLE_FUNCTION_NODE missing descriptor table".to_string())?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
+    let output_slots = output_chunk_schema.slot_ids().to_vec();
 
     let mut outer_map = HashMap::new();
     for slot in &outer_slots {
@@ -337,8 +324,7 @@ pub(crate) fn lower_table_function_node(
                 is_left_join,
                 param_types,
                 ret_types,
-                output_schema: schema,
-                output_slots,
+                output_chunk_schema,
                 output_slot_sources,
             }),
         },

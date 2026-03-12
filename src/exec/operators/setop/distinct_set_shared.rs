@@ -16,8 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use arrow::array::ArrayRef;
 
-use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_table::KeyTable;
 
@@ -47,16 +46,19 @@ struct DistinctSetInner<M> {
 #[derive(Clone)]
 pub(crate) struct DistinctSetSharedState<S: DistinctSetSemantics> {
     controller: SetOpStageController,
-    output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     inner: Arc<Mutex<DistinctSetInner<S::Marker>>>,
     _semantics: PhantomData<S>,
 }
 
 impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
-    pub(crate) fn new(controller: SetOpStageController, output_slots: Vec<SlotId>) -> Self {
+    pub(crate) fn new(
+        controller: SetOpStageController,
+        output_chunk_schema: ChunkSchemaRef,
+    ) -> Self {
         Self {
             controller,
-            output_slots,
+            output_chunk_schema,
             inner: Arc::new(Mutex::new(DistinctSetInner {
                 key_table: None,
                 markers: Vec::new(),
@@ -69,8 +71,8 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
         &self.controller
     }
 
-    pub(crate) fn output_slots(&self) -> &[SlotId] {
-        &self.output_slots
+    pub(crate) fn output_chunk_schema(&self) -> ChunkSchemaRef {
+        Arc::clone(&self.output_chunk_schema)
     }
 
     pub(crate) fn ingest_build(&self, chunk: &Chunk) -> Result<(), String> {

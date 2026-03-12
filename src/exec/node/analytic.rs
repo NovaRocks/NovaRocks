@@ -17,6 +17,7 @@
 use arrow::datatypes::DataType;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 
@@ -111,5 +112,5 @@ pub struct AnalyticNode {
     pub window: Option<WindowFrame>,
     /// Output column plan in final physical column order.
     pub output_columns: Vec<AnalyticOutputColumn>,
-    pub output_slots: Vec<SlotId>,
+    pub output_chunk_schema: ChunkSchemaRef,
 }

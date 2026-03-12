@@ -288,7 +288,7 @@ mod tests {
     use crate::cache::CacheOptions;
     use crate::common::ids::SlotId;
     use crate::descriptors;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprId;
     use crate::exec::node::RuntimeFilterProbeSpec;
     use crate::exec::node::scan::RowPositionScanConfig;
@@ -424,14 +424,19 @@ mod tests {
             node_id: 7,
         };
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![field_with_slot_id(
-                Field::new("v", DataType::Int32, false),
-                SlotId::new(1),
-            )])),
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
         )
         .expect("record batch");
-        let chunk = Chunk::try_new(batch).expect("chunk");
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
         exchange::register_expected_chunk_schema(key, 1, chunk.chunk_schema_ref())
             .expect("register expected chunk schema");
         let payload = exchange::encode_chunks(&[chunk], true).expect("encode chunks");

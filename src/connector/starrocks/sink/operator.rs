@@ -1169,21 +1169,20 @@ impl OlapTableSinkOperator {
                 .get(idx)
                 .cloned()
                 .unwrap_or_else(|| format!("col_{idx}"));
-            projected_slots.push(ChunkSlotSchema::new(
+            let field = Field::new(field_name, projected.data_type().clone(), true);
+            projected_slots.push(ChunkSlotSchema::new_with_field(
                 slot_id,
-                field_name.clone(),
-                true,
+                field.clone(),
                 None,
                 None,
             ));
-            projected_fields.push(Field::new(field_name, projected.data_type().clone(), true));
+            projected_fields.push(field);
             projected_columns.push(projected);
         }
-        let projected_schema = Arc::new(Schema::new(projected_fields));
-        Chunk::try_new_with_schema_and_chunk_schema(
-            projected_schema,
-            projected_columns,
+        let _ = projected_fields;
+        Chunk::try_new_with_columns(
             Arc::new(ChunkSchema::try_new(projected_slots)?),
+            projected_columns,
         )
         .map_err(|e| format!("OLAP_TABLE_SINK build projected output chunk failed: {e}"))
     }
@@ -2025,17 +2024,36 @@ fn align_chunk_to_schema_slot_bindings(
     let mut aligned_fields = Vec::new();
     let mut aligned_slots = Vec::new();
     let mut aligned_data_indexes = Vec::new();
+    let mut aligned_slot_ids = HashSet::new();
+    let mut next_synthetic_slot_id = u32::MAX;
+    let mut assign_slot_id = |preferred: SlotId| {
+        if aligned_slot_ids.insert(preferred) {
+            return preferred;
+        }
+        loop {
+            let synthetic = SlotId::new(next_synthetic_slot_id);
+            next_synthetic_slot_id = next_synthetic_slot_id.saturating_sub(1);
+            if aligned_slot_ids.insert(synthetic) {
+                return synthetic;
+            }
+        }
+    };
     for slot_id in schema_slot_bindings.iter().copied().flatten() {
         let Some(idx) = slot_to_data_index.get(&slot_id).copied() else {
             continue;
         };
         // Keep duplicated schema bindings (e.g. INSERT ... SELECT k1, k1, v)
-        // so non-primary key writes preserve full target column count.
+        // so non-primary key writes preserve full target column count. ChunkSchema
+        // still requires unique slot ids, so duplicated copies get synthetic ids.
         aligned_data_indexes.push(idx);
         let slot = &chunk.chunk_schema().slots()[idx];
+        let aligned_slot_id = assign_slot_id(slot.slot_id());
         aligned_columns.push(chunk.batch.column(idx).clone());
-        aligned_fields.push(chunk.batch.schema().field(idx).clone());
-        aligned_slots.push(slot.clone());
+        aligned_fields.push(chunk.batch.schema().field(idx).as_ref().clone());
+        aligned_slots.push(slot.with_field_and_slot_id(
+            aligned_slot_id,
+            chunk.batch.schema().field(idx).as_ref().clone(),
+        )?);
     }
     let resolved_op_index = if let Some(slot_id) = op_slot_id {
         if let Some(op_idx) = slot_to_op_index.get(&slot_id).copied() {
@@ -2070,16 +2088,12 @@ fn align_chunk_to_schema_slot_bindings(
         let op_already_selected = aligned_data_indexes.contains(&op_idx);
         if !op_already_selected {
             let op_slot = &chunk.chunk_schema().slots()[op_idx];
+            let aligned_slot_id = assign_slot_id(op_slot.slot_id());
             aligned_columns.push(chunk.batch.column(op_idx).clone());
             let op_field = chunk.batch.schema().field(op_idx).as_ref().clone();
-            aligned_fields.push(op_field.with_name(LOAD_OP_COLUMN.to_string()));
-            aligned_slots.push(ChunkSlotSchema::new(
-                op_slot.slot_id(),
-                LOAD_OP_COLUMN,
-                op_slot.nullable(),
-                op_slot.type_desc().cloned(),
-                op_slot.unique_id(),
-            ));
+            let renamed_op_field = op_field.with_name(LOAD_OP_COLUMN.to_string());
+            aligned_fields.push(renamed_op_field.clone());
+            aligned_slots.push(op_slot.with_field_and_slot_id(aligned_slot_id, renamed_op_field)?);
         }
     }
     if aligned_columns.is_empty() {
@@ -2102,12 +2116,11 @@ fn align_chunk_to_schema_slot_bindings(
 
 #[cfg(test)]
 fn align_batch_to_schema_slot_bindings(
-    batch: &RecordBatch,
+    chunk: &Chunk,
     schema_slot_bindings: &[Option<SlotId>],
     op_slot_id: Option<SlotId>,
 ) -> Result<RecordBatch, String> {
-    let chunk = Chunk::try_new(batch.clone())?;
-    Ok(align_chunk_to_schema_slot_bindings(&chunk, schema_slot_bindings, op_slot_id)?.batch)
+    Ok(align_chunk_to_schema_slot_bindings(chunk, schema_slot_bindings, op_slot_id)?.batch)
 }
 
 #[cfg(test)]
@@ -2153,7 +2166,6 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
-    use crate::testutil::chunk::field_with_slot_id;
     use crate::types;
 
     fn test_tablet_schema() -> TabletSchemaPb {
@@ -2344,22 +2356,27 @@ mod tests {
     }
 
     fn one_col_chunk(values: Vec<i64>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("c1", DataType::Int64, false),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build record batch");
-        Chunk::try_new(batch).expect("build chunk")
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_mixed_op_chunk(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
         assert_eq!(keys.len(), values.len());
         assert_eq!(keys.len(), ops.len());
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k1", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v1", DataType::Int64, true), SlotId::new(2)),
-            field_with_slot_id(Field::new("__op", DataType::Int8, false), SlotId::new(3)),
+            Field::new("k1", DataType::Int32, false),
+            Field::new("v1", DataType::Int64, true),
+            Field::new("__op", DataType::Int8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -2370,31 +2387,45 @@ mod tests {
             ],
         )
         .expect("build primary key mixed op record batch");
-        Chunk::try_new(batch).expect("build chunk")
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
-    fn slot_bound_batch_with_op(include_op: bool) -> RecordBatch {
+    fn slot_bound_batch_with_op(include_op: bool) -> Chunk {
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut slot_ids = Vec::new();
         for slot in 1_u32..=6 {
-            fields.push(field_with_slot_id(
-                Field::new(format!("c{slot}"), DataType::Int64, false),
-                SlotId::new(slot),
-            ));
+            fields.push(Field::new(format!("c{slot}"), DataType::Int64, false));
             columns.push(Arc::new(Int64Array::from(vec![
                 slot as i64,
                 slot as i64 + 100,
             ])));
+            slot_ids.push(SlotId::new(slot));
         }
         if include_op {
-            fields.push(field_with_slot_id(
-                Field::new(LOAD_OP_COLUMN, DataType::Int8, false),
-                SlotId::new(9),
-            ));
+            fields.push(Field::new(LOAD_OP_COLUMN, DataType::Int8, false));
             columns.push(Arc::new(Int8Array::from(vec![0_i8, 1_i8])));
+            slot_ids.push(SlotId::new(9));
         }
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("build slot-bound record batch")
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("build slot-bound record batch");
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &slot_ids,
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn recursive_cte_schema_slot_bindings() -> Vec<Option<SlotId>> {
@@ -2884,11 +2915,8 @@ mod tests {
             - 719_163;
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                field_with_slot_id(
-                    Field::new("event_day", DataType::Date32, false),
-                    SlotId::new(1),
-                ),
-                field_with_slot_id(Field::new("pv", DataType::Int64, false), SlotId::new(2)),
+                Field::new("event_day", DataType::Date32, false),
+                Field::new("pv", DataType::Int64, false),
             ])),
             vec![
                 Arc::new(Date32Array::from(vec![days])) as ArrayRef,
@@ -2907,9 +2935,9 @@ mod tests {
     fn filter_rows_for_tablet_schema_rejects_null_rows_with_tracking_log() {
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                field_with_slot_id(Field::new("k1", DataType::Int64, true), SlotId::new(1)),
-                field_with_slot_id(Field::new("k2", DataType::Int64, true), SlotId::new(2)),
-                field_with_slot_id(Field::new("k3", DataType::Int64, true), SlotId::new(3)),
+                Field::new("k1", DataType::Int64, true),
+                Field::new("k2", DataType::Int64, true),
+                Field::new("k3", DataType::Int64, true),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
@@ -2932,26 +2960,32 @@ mod tests {
         );
     }
 
-    fn slot_bound_batch_with_unnamed_op_slot() -> RecordBatch {
+    fn slot_bound_batch_with_unnamed_op_slot() -> Chunk {
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
+        let mut slot_ids = Vec::new();
         for slot in 1_u32..=6 {
-            fields.push(field_with_slot_id(
-                Field::new(format!("c{slot}"), DataType::Int64, false),
-                SlotId::new(slot),
-            ));
+            fields.push(Field::new(format!("c{slot}"), DataType::Int64, false));
             columns.push(Arc::new(Int64Array::from(vec![
                 slot as i64,
                 slot as i64 + 100,
             ])));
+            slot_ids.push(SlotId::new(slot));
         }
-        fields.push(field_with_slot_id(
-            Field::new("col_7", DataType::Int8, false),
-            SlotId::new(9),
-        ));
+        fields.push(Field::new("col_7", DataType::Int8, false));
         columns.push(Arc::new(Int8Array::from(vec![0_i8, 1_i8])));
-        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-            .expect("build slot-bound record batch with unnamed op slot")
+        slot_ids.push(SlotId::new(9));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .expect("build slot-bound record batch with unnamed op slot");
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &slot_ids,
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]
@@ -3394,8 +3428,8 @@ mod tests {
     #[test]
     fn align_batch_keeps_duplicate_slot_bindings() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("idx", DataType::Int64, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Utf8, false), SlotId::new(2)),
+            Field::new("idx", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -3405,6 +3439,15 @@ mod tests {
             ],
         )
         .expect("build batch");
+        let batch = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let aligned = align_batch_to_schema_slot_bindings(
             &batch,
@@ -3476,11 +3519,8 @@ mod tests {
     #[test]
     fn collect_partition_values_prefers_column_name_when_slot_binding_mismatches() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("ts", DataType::Utf8, true), SlotId::new(9)),
-            field_with_slot_id(
-                Field::new("original_ts", DataType::Utf8, true),
-                SlotId::new(0),
-            ),
+            Field::new("ts", DataType::Utf8, true),
+            Field::new("original_ts", DataType::Utf8, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -3490,7 +3530,15 @@ mod tests {
             ],
         )
         .expect("build partition value batch");
-        let chunk = Chunk::try_new(batch).expect("build chunk");
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(9), SlotId::new(0)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let values = super::collect_partition_values_from_chunk(
             &chunk,

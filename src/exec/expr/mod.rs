@@ -402,7 +402,7 @@ pub(crate) fn cast_array_to_target(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -413,11 +413,19 @@ mod tests {
         let mut arena = ExprArena::default();
         let expr = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Utf8);
 
-        let field = field_with_slot_id(Field::new("x", DataType::Int32, true), SlotId(1));
+        let field = Field::new("x", DataType::Int32, true);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let arr = arena.eval(expr, &chunk).unwrap();
         assert_eq!(arr.data_type(), &DataType::Utf8);

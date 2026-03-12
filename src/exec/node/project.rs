@@ -37,9 +37,8 @@ pub struct ProjectNode {
     pub expr_slot_schemas: Option<Vec<ChunkSlotSchema>>,
     /// If Some, only output these expr indices.
     pub output_indices: Option<Vec<usize>>,
-    /// Slot ids for the physical output columns (matches post-output_indices order).
-    pub output_slots: Vec<SlotId>,
-    /// Optional explicit output chunk schema. When present, downstream operators should prefer it
-    /// over reconstructing semantics from Arrow field metadata.
-    pub output_chunk_schema: Option<ChunkSchemaRef>,
+    /// Explicit output chunk schema in final physical column order.
+    pub output_chunk_schema: ChunkSchemaRef,
 }
+
+impl ProjectNode {}

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{Array, ArrayRef, ListArray, UInt32Array, new_empty_array};
 use arrow::compute::{concat, take};
@@ -452,14 +452,17 @@ fn build_chunk_from_columns(
     slot_ids: &[SlotId],
 ) -> Result<Chunk, String> {
     let schema = Arc::new(Schema::new(fields.to_vec()));
-    let batch = RecordBatch::try_new(schema, columns.to_vec()).map_err(|e| e.to_string())?;
-    Chunk::try_new_with_slot_ids(batch, slot_ids)
+    let batch =
+        RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|e| e.to_string())?;
+    Chunk::try_new_with_chunk_schema(
+        batch,
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)?,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{ArrayRef, Int64Array, Int64Builder, ListBuilder};
     use arrow::datatypes::DataType;
@@ -518,13 +521,21 @@ mod tests {
         let col3 = list_array_from_values(&[Some(4)]);
 
         let fields = vec![
-            field_with_slot_id(Field::new("a", list_type.clone(), true), SlotId::new(10)),
-            field_with_slot_id(Field::new("b", list_type.clone(), true), SlotId::new(11)),
-            field_with_slot_id(Field::new("c", list_type.clone(), true), SlotId::new(12)),
+            Field::new("a", list_type.clone(), true),
+            Field::new("b", list_type.clone(), true),
+            Field::new("c", list_type.clone(), true),
         ];
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![col1, col2, col3]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(10), SlotId::new(11), SlotId::new(12)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let result = arena.eval(func, &chunk).unwrap();
         let list = result.as_any().downcast_ref::<ListArray>().unwrap();

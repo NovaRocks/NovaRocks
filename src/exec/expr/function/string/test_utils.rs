@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, field_with_slot_id};
+use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -26,12 +26,21 @@ use super::eval_string_function;
 
 pub fn chunk_len_1() -> Chunk {
     let array = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
-    let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-        Field::new("dummy", DataType::Int64, false),
-        SlotId::new(1),
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "dummy",
+        DataType::Int64,
+        false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    Chunk::new(batch)
+    {
+        let batch = batch;
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
 }
 
 pub fn literal_i64(arena: &mut ExprArena, v: i64) -> ExprId {

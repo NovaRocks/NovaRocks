@@ -3563,9 +3563,7 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::common::largeint;
-    use crate::exec::chunk::{
-        Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema, field_with_slot_id,
-    };
+    use crate::exec::chunk::{Chunk, ChunkFieldSchema, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::lower::type_lowering::scalar_type_desc;
     use crate::types;
@@ -3579,12 +3577,21 @@ mod tests {
 
     fn chunk_len_1() -> Chunk {
         let array = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("dummy", DataType::Int64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dummy",
+            DataType::Int64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn json_struct_type_desc() -> types::TTypeDesc {

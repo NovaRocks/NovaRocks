@@ -32,8 +32,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
@@ -80,8 +79,7 @@ pub struct AggregateProcessorFactory {
     functions: Vec<AggFunction>,
     output_intermediate: bool,
     direct_input: bool,
-    output_slots: Vec<SlotId>,
-    output_chunk_schema: Option<ChunkSchemaRef>,
+    output_chunk_schema: ChunkSchemaRef,
 }
 
 impl AggregateProcessorFactory {
@@ -92,8 +90,7 @@ impl AggregateProcessorFactory {
         functions: Vec<AggFunction>,
         output_intermediate: bool,
         direct_input: bool,
-        output_slots: Vec<SlotId>,
-        output_chunk_schema: Option<ChunkSchemaRef>,
+        output_chunk_schema: ChunkSchemaRef,
     ) -> Self {
         let name = if node_id >= 0 {
             format!("AGGREGATE (id={node_id})")
@@ -107,7 +104,6 @@ impl AggregateProcessorFactory {
             functions,
             output_intermediate,
             direct_input,
-            output_slots,
             output_chunk_schema,
         }
     }
@@ -138,8 +134,7 @@ impl OperatorFactory for AggregateProcessorFactory {
             finalized: false,
             finished: false,
             output_schema: None,
-            output_slots: self.output_slots.clone(),
-            output_chunk_schema: self.output_chunk_schema.clone(),
+            output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             observed_group_key_nullable: vec![false; self.group_by.len()],
             profile_initialized: false,
             profiles: None,
@@ -167,8 +162,7 @@ struct AggregateProcessorOperator {
     finalized: bool,
     finished: bool,
     output_schema: Option<SchemaRef>,
-    output_slots: Vec<SlotId>,
-    output_chunk_schema: Option<ChunkSchemaRef>,
+    output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
@@ -247,8 +241,7 @@ impl AggregateProcessorOperator {
             key_columns,
             &kernels.entries,
             self.output_intermediate,
-            &self.output_slots,
-            self.output_chunk_schema.as_ref(),
+            &self.output_chunk_schema,
             group_key_nullable,
         )?);
         Ok(())
@@ -538,14 +531,6 @@ impl AggregateProcessorOperator {
                     .clone()
                     .unwrap_or_else(|| Arc::new(Schema::new(Vec::<Field>::new())));
                 let batch = RecordBatch::new_empty(schema);
-                let output_len = batch.num_columns();
-                if self.output_slots.len() < output_len {
-                    return Err(format!(
-                        "aggregate empty output missing slot ids: batch_columns={} output_slots={}",
-                        output_len,
-                        self.output_slots.len()
-                    ));
-                }
                 return Ok(Some(self.output_chunk_from_batch(batch)?));
             }
         }
@@ -648,15 +633,20 @@ impl ProcessorOperator for AggregateProcessorOperator {
 impl AggregateProcessorOperator {
     fn eval_group_by_arrays(&self, chunk: &Chunk) -> Result<Vec<ArrayRef>, String> {
         if self.direct_input {
-            if self.output_slots.len() < self.group_by.len() {
+            if self.output_chunk_schema.slot_ids().len() < self.group_by.len() {
                 return Err(format!(
                     "aggregate direct input missing group by slot ids: group_by={} output_slots={}",
                     self.group_by.len(),
-                    self.output_slots.len()
+                    self.output_chunk_schema.slot_ids().len()
                 ));
             }
             let mut arrays = Vec::with_capacity(self.group_by.len());
-            for slot_id in self.output_slots.iter().take(self.group_by.len()) {
+            for slot_id in self
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .take(self.group_by.len())
+            {
                 arrays.push(
                     chunk
                         .column_by_slot_id(*slot_id)
@@ -676,23 +666,27 @@ impl AggregateProcessorOperator {
     fn eval_agg_arrays(&self, chunk: &Chunk) -> Result<Vec<Option<ArrayRef>>, String> {
         if self.direct_input {
             let start = self.group_by.len();
-            if self.output_slots.len() < start + self.functions.len() {
+            if self.output_chunk_schema.slot_ids().len() < start + self.functions.len() {
                 return Err(format!(
                     "aggregate direct input missing aggregate slot ids: group_by={} functions={} output_slots={}",
                     self.group_by.len(),
                     self.functions.len(),
-                    self.output_slots.len()
+                    self.output_chunk_schema.slot_ids().len()
                 ));
             }
             let mut arrays = Vec::with_capacity(self.functions.len());
             for idx in 0..self.functions.len() {
-                let slot_id = *self.output_slots.get(start + idx).ok_or_else(|| {
-                    format!(
-                        "aggregate direct input missing slot id at index {} (output_slots={})",
-                        start + idx,
-                        self.output_slots.len()
-                    )
-                })?;
+                let slot_id = *self
+                    .output_chunk_schema
+                    .slot_ids()
+                    .get(start + idx)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate direct input missing slot id at index {} (output_slots={})",
+                            start + idx,
+                            self.output_chunk_schema.slot_ids().len()
+                        )
+                    })?;
                 arrays.push(Some(
                     chunk
                         .column_by_slot_id(slot_id)
@@ -827,33 +821,27 @@ impl AggregateProcessorOperator {
 
     fn output_chunk_from_batch(&self, batch: RecordBatch) -> Result<Chunk, String> {
         let output_len = batch.num_columns();
-        if self.output_slots.len() < output_len {
+        if self.output_chunk_schema.slot_ids().len() < output_len {
             return Err(format!(
                 "aggregate output slot count mismatch: batch_columns={} output_slots={}",
                 output_len,
-                self.output_slots.len()
+                self.output_chunk_schema.slot_ids().len()
             ));
         }
-        if let Some(schema) = self.output_chunk_schema.as_ref() {
+        {
             let batch_schema = batch.schema();
-            let slot_schemas = self.output_slots[..output_len]
+            let slot_schemas = self.output_chunk_schema.slot_ids()[..output_len]
                 .iter()
                 .enumerate()
                 .map(|(idx, slot_id)| {
-                    let slot_schema = schema.slot(*slot_id).ok_or_else(|| {
+                    let slot_schema = self.output_chunk_schema.slot(*slot_id).ok_or_else(|| {
                         format!(
                             "aggregate explicit output chunk schema missing slot {}",
                             slot_id
                         )
                     })?;
                     let field = batch_schema.field(idx);
-                    ChunkSlotSchema::try_new(
-                        *slot_id,
-                        field.name(),
-                        field.is_nullable(),
-                        slot_schema.type_desc().cloned(),
-                        slot_schema.unique_id(),
-                    )
+                    slot_schema.with_field_and_slot_id(*slot_id, field.as_ref().clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             return Chunk::try_new_with_chunk_schema(
@@ -861,10 +849,6 @@ impl AggregateProcessorOperator {
                 Arc::new(ChunkSchema::try_new(slot_schemas)?),
             );
         }
-        Ok(Chunk::new_with_slot_ids(
-            batch,
-            &self.output_slots[..output_len],
-        ))
     }
 
     fn expected_group_types(&self) -> Result<Vec<DataType>, String> {

@@ -26,8 +26,7 @@ use orc_rust::schema::RootDataType;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
-use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::fs::coalesce_policy::AdaptiveCoalesceController;
@@ -43,7 +42,7 @@ static ORC_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceCon
 #[derive(Clone, Debug)]
 pub struct OrcScanConfig {
     pub columns: Vec<String>,
-    pub slot_ids: Vec<SlotId>,
+    pub chunk_schema: ChunkSchemaRef,
     pub case_sensitive: bool,
     pub orc_use_column_names: bool,
     pub hive_column_names: Option<Vec<String>>,
@@ -231,7 +230,18 @@ impl Iterator for OrcScanIter {
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }
-                    return Some(Ok(Chunk::new_with_slot_ids(batch, &self.cfg.slot_ids)));
+                    let chunk_schema = match self.cfg.chunk_schema.with_fields_in_order(
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|field| field.as_ref().clone())
+                            .collect(),
+                    ) {
+                        Ok(schema) => Arc::new(schema),
+                        Err(e) => return Some(Err(e)),
+                    };
+                    return Some(Chunk::try_new_with_chunk_schema(batch, chunk_schema));
                 }
                 Some(Err(e)) => {
                     self.reader = None;
@@ -443,18 +453,18 @@ fn validate_batch_slot_count(
         return Ok(batch);
     }
 
-    if cfg.slot_ids.is_empty() {
+    if cfg.chunk_schema.slot_ids().is_empty() {
         return Err(format!(
-            "orc scan missing slot_ids for non-empty batch: num_columns={}",
+            "orc scan missing chunk schema for non-empty batch: num_columns={}",
             batch.num_columns()
         ));
     }
 
-    if batch.num_columns() != cfg.slot_ids.len() {
+    if batch.num_columns() != cfg.chunk_schema.slot_ids().len() {
         return Err(format!(
-            "orc scan output columns/slot_ids mismatch: num_columns={}, slot_ids={:?}",
+            "orc scan output columns/chunk schema mismatch: num_columns={}, slot_ids={:?}",
             batch.num_columns(),
-            cfg.slot_ids
+            cfg.chunk_schema.slot_ids()
         ));
     }
 

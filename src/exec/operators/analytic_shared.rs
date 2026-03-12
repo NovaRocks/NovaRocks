@@ -37,13 +37,12 @@ use arrow::array::{
 };
 use arrow::compute::kernels::zip::zip;
 use arrow::compute::{cast, concat, concat_batches, take};
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields};
 use arrow_buffer::OffsetBuffer;
 use arrow_buffer::i256;
 
 use crate::common::config::operator_buffer_chunks;
-use crate::common::ids::SlotId;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::agg::{
     AggScalarValue, AggStateArena, agg_scalar_from_array, build_agg_scalar_array, build_kernel_set,
     compare_agg_scalar_values,
@@ -78,7 +77,7 @@ pub(crate) struct AnalyticSharedState {
     functions: Vec<WindowFunctionSpec>,
     window: Option<WindowFrame>,
     output_columns: Vec<AnalyticOutputColumn>,
-    output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     buffer_limit: usize,
     observable: Arc<Observable>,
     label: String,
@@ -93,7 +92,7 @@ impl AnalyticSharedState {
         functions: Vec<WindowFunctionSpec>,
         window: Option<WindowFrame>,
         output_columns: Vec<AnalyticOutputColumn>,
-        output_slots: Vec<SlotId>,
+        output_chunk_schema: ChunkSchemaRef,
         node_id: i32,
     ) -> Self {
         let buffer_limit = operator_buffer_chunks().max(1);
@@ -117,7 +116,7 @@ impl AnalyticSharedState {
             functions,
             window,
             output_columns,
-            output_slots,
+            output_chunk_schema,
             buffer_limit,
             observable: Arc::new(Observable::new()),
             label,
@@ -247,13 +246,8 @@ impl AnalyticSharedState {
             func_outputs.push(out);
         }
 
-        let (output_schema, output_chunk_schema) = build_output_schema(
-            Arc::clone(&input_schema),
-            ordered_chunk.chunk_schema_ref(),
-            &self.output_columns,
-            &self.functions,
-            &self.output_slots,
-        )?;
+        let _ = input_schema;
+        let output_chunk_schema = Arc::clone(&self.output_chunk_schema);
 
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.output_columns.len());
         for col in &self.output_columns {
@@ -270,12 +264,8 @@ impl AnalyticSharedState {
             }
         }
         Ok(VecDeque::from(vec![
-            Chunk::try_new_with_schema_and_chunk_schema(
-                Arc::clone(&output_schema),
-                columns,
-                output_chunk_schema,
-            )
-            .map_err(|e| format!("build analytic output batch: {}", e))?,
+            Chunk::try_new_with_columns(output_chunk_schema, columns)
+                .map_err(|e| format!("build analytic output batch: {}", e))?,
         ]))
     }
 
@@ -295,90 +285,6 @@ impl AnalyticSharedState {
             .get_or_init(|| MemTracker::new_child(label, &root));
         Some(Arc::clone(tracker))
     }
-}
-
-fn build_output_schema(
-    input_schema: SchemaRef,
-    input_chunk_schema: ChunkSchemaRef,
-    output_columns: &[AnalyticOutputColumn],
-    functions: &[WindowFunctionSpec],
-    output_slots: &[SlotId],
-) -> Result<(SchemaRef, ChunkSchemaRef), String> {
-    if output_slots.len() != output_columns.len() {
-        return Err(format!(
-            "analytic output slot count mismatch: slots={} columns={}",
-            output_slots.len(),
-            output_columns.len()
-        ));
-    }
-    let in_fields = input_schema.fields();
-    let mut slot_to_input_idx = std::collections::HashMap::<SlotId, usize>::new();
-    for (idx, slot_schema) in input_chunk_schema.slots().iter().enumerate() {
-        let slot_id = slot_schema.slot_id();
-        if slot_to_input_idx.insert(slot_id, idx).is_some() {
-            return Err(format!(
-                "analytic input schema has duplicate slot_id={}, cannot build a stable mapping",
-                slot_id
-            ));
-        }
-    }
-    let mut fields: Vec<Field> = Vec::with_capacity(output_columns.len());
-    let mut slot_schemas: Vec<ChunkSlotSchema> = Vec::with_capacity(output_columns.len());
-    for (idx, col) in output_columns.iter().enumerate() {
-        let output_slot_id = output_slots[idx];
-        match *col {
-            AnalyticOutputColumn::InputSlotId(input_slot_id) => {
-                let input_idx =
-                    slot_to_input_idx
-                        .get(&input_slot_id)
-                        .copied()
-                        .ok_or_else(|| {
-                            format!(
-                                "analytic output refers to missing input slot_id={} in schema",
-                                input_slot_id
-                            )
-                        })?;
-                let f = in_fields.get(input_idx).ok_or_else(|| {
-                    format!("input schema field index out of range: {}", input_idx)
-                })?;
-                let field = (**f).clone();
-                fields.push(field);
-                let input_slot_schema =
-                    input_chunk_schema.slots().get(input_idx).ok_or_else(|| {
-                        format!(
-                            "missing analytic input chunk slot schema at index {}",
-                            input_idx
-                        )
-                    })?;
-                slot_schemas.push(ChunkSlotSchema::try_new(
-                    output_slot_id,
-                    f.name().clone(),
-                    f.is_nullable(),
-                    input_slot_schema.type_desc().cloned(),
-                    input_slot_schema.unique_id(),
-                )?);
-            }
-            AnalyticOutputColumn::Window(i) => {
-                let func = functions
-                    .get(i)
-                    .ok_or_else(|| format!("window function index out of range: {}", i))?;
-                let field = Field::new(format!("analytic_{}", i), func.return_type.clone(), true);
-                let field_name = field.name().clone();
-                fields.push(field);
-                slot_schemas.push(ChunkSlotSchema::try_new(
-                    output_slot_id,
-                    field_name,
-                    true,
-                    None,
-                    None,
-                )?);
-            }
-        }
-    }
-    Ok((
-        Arc::new(Schema::new(fields)),
-        Arc::new(ChunkSchema::try_new(slot_schemas)?),
-    ))
 }
 
 fn compute_partitions(keys: &[ArrayRef], rows: usize) -> Result<Vec<(usize, usize)>, String> {
@@ -473,12 +379,8 @@ fn reorder_chunk_by_partition_keys(chunk: &Chunk, keys: &[ArrayRef]) -> Result<C
         let reordered = take(column.as_ref(), idx_arr.as_ref(), None).map_err(|e| e.to_string())?;
         reordered_columns.push(reordered);
     }
-    Chunk::try_new_with_schema_and_chunk_schema(
-        chunk.batch.schema(),
-        reordered_columns,
-        chunk.chunk_schema_ref(),
-    )
-    .map_err(|e| format!("build reordered analytic batch: {}", e))
+    Chunk::try_new_with_columns(chunk.chunk_schema_ref(), reordered_columns)
+        .map_err(|e| format!("build reordered analytic batch: {}", e))
 }
 
 fn compare_rows_on_partition_keys(

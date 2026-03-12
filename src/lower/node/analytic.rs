@@ -26,7 +26,7 @@ use crate::exec::node::analytic::{
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::{lower_expr_node, lower_t_expr};
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::{exprs, plan_nodes, types};
@@ -36,6 +36,7 @@ pub(crate) fn lower_analytic_node(
     node: &plan_nodes::TPlanNode,
     arena: &mut ExprArena,
     out_layout: &Layout,
+    desc_tbl: &crate::descriptors::TDescriptorTable,
     tuple_slots: &HashMap<types::TTupleId, Vec<types::TSlotId>>,
     last_query_id: Option<&str>,
     fe_addr: Option<&types::TNetworkAddress>,
@@ -162,11 +163,7 @@ pub(crate) fn lower_analytic_node(
                 functions,
                 window,
                 output_columns,
-                output_slots: out_layout
-                    .order
-                    .iter()
-                    .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                    .collect::<Result<Vec<_>, _>>()?,
+                output_chunk_schema: chunk_schema_for_layout(desc_tbl, out_layout)?,
             }),
         },
         layout: out_layout.clone(),

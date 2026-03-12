@@ -262,7 +262,7 @@ fn resolve_codec(default_codec: SpillCodec, spill_encode_level: Option<i32>) -> 
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{ChunkSchema, field_with_slot_id};
+    use crate::exec::chunk::ChunkSchema;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -271,14 +271,8 @@ mod tests {
     #[test]
     fn spill_roundtrip_ipc_block() {
         let schema = SchemaRef::new(Schema::new(vec![
-            field_with_slot_id(
-                Field::new("a", arrow::datatypes::DataType::Int32, false),
-                SlotId::new(1),
-            ),
-            field_with_slot_id(
-                Field::new("b", arrow::datatypes::DataType::Utf8, true),
-                SlotId::new(2),
-            ),
+            Field::new("a", arrow::datatypes::DataType::Int32, false),
+            Field::new("b", arrow::datatypes::DataType::Utf8, true),
         ]));
         let batch1 = RecordBatch::try_new(
             schema.clone(),
@@ -297,10 +291,32 @@ mod tests {
         )
         .unwrap();
         let chunks = vec![
-            Chunk::try_new(batch1).unwrap(),
-            Chunk::try_new(batch2).unwrap(),
+            {
+                let batch = batch1;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1), SlotId::new(2)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            },
+            {
+                let batch = batch2;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1), SlotId::new(2)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            },
         ];
-        let chunk_schema = Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).unwrap());
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            schema.as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .unwrap();
 
         let temp = tempdir().unwrap();
         let storage = SpillStorageConfig {

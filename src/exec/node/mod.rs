@@ -192,24 +192,69 @@ fn expr_slot_ids(arena: &ExprArena, expr_id: ExprId) -> HashSet<SlotId> {
 
 fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
     match &node.kind {
-        ExecNodeKind::Project(ProjectNode { output_slots, .. }) => {
-            Some(output_slots.iter().copied().collect())
-        }
-        ExecNodeKind::Aggregate(AggregateNode { output_slots, .. }) => {
-            Some(output_slots.iter().copied().collect())
-        }
-        ExecNodeKind::Analytic(AnalyticNode { output_slots, .. }) => {
-            Some(output_slots.iter().copied().collect())
-        }
-        ExecNodeKind::SetOp(SetOpNode { output_slots, .. }) => {
-            Some(output_slots.iter().copied().collect())
-        }
-        ExecNodeKind::ExchangeSource(exchange) => {
-            Some(exchange.output_slots().iter().copied().collect())
-        }
-        ExecNodeKind::Scan(scan) => Some(scan.output_slots().iter().copied().collect()),
-        ExecNodeKind::Fetch(fetch) => Some(fetch.output_slots().iter().copied().collect()),
-        ExecNodeKind::LookUp(lookup) => Some(lookup.output_slots().iter().copied().collect()),
+        ExecNodeKind::Project(project) => Some(
+            project
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::Aggregate(aggregate) => Some(
+            aggregate
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::Analytic(analytic) => Some(
+            analytic
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::SetOp(set_op) => Some(
+            set_op
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::ExchangeSource(exchange) => Some(
+            exchange
+                .expected_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::Scan(scan) => Some(
+            scan.output_chunk_schema()
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::Fetch(fetch) => Some(
+            fetch
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
+        ExecNodeKind::LookUp(lookup) => Some(
+            lookup
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
         ExecNodeKind::AssertNumRows(AssertNumRowsNode { input, .. }) => {
             output_slots_for_node(input)
         }
@@ -217,9 +262,14 @@ fn output_slots_for_node(node: &ExecNode) -> Option<HashSet<SlotId>> {
         ExecNodeKind::Repeat(RepeatNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::Limit(LimitNode { input, .. }) => output_slots_for_node(input),
         ExecNodeKind::Sort(SortNode { input, .. }) => output_slots_for_node(input),
-        ExecNodeKind::TableFunction(TableFunctionNode { output_slots, .. }) => {
-            Some(output_slots.iter().copied().collect())
-        }
+        ExecNodeKind::TableFunction(table_function) => Some(
+            table_function
+                .output_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect(),
+        ),
         ExecNodeKind::UnionAll(UnionAllNode { inputs, .. }) => {
             inputs.first().and_then(output_slots_for_node)
         }
@@ -270,13 +320,7 @@ fn push_down_local_runtime_filters_inner(
             push_down_local_runtime_filters_inner(input, arena, &filtered);
         }
         ExecNodeKind::Values(_) => {}
-        ExecNodeKind::Project(ProjectNode {
-            input,
-            exprs,
-            output_indices,
-            output_slots,
-            ..
-        }) => {
+        ExecNodeKind::Project(project) => {
             if inherited.is_empty() {
                 return;
             }
@@ -286,14 +330,20 @@ fn push_down_local_runtime_filters_inner(
                 let Some(slot_id) = expr_slot_ref(arena, spec.expr_id) else {
                     continue;
                 };
-                let Some(pos) = output_slots.iter().position(|s| *s == slot_id) else {
+                let Some(pos) = project
+                    .output_chunk_schema
+                    .slot_ids()
+                    .iter()
+                    .position(|s| *s == slot_id)
+                else {
                     continue;
                 };
-                let expr_idx = output_indices
+                let expr_idx = project
+                    .output_indices
                     .as_ref()
                     .and_then(|indices| indices.get(pos).copied())
                     .unwrap_or(pos);
-                let Some(&new_expr_id) = exprs.get(expr_idx) else {
+                let Some(&new_expr_id) = project.exprs.get(expr_idx) else {
                     continue;
                 };
                 let mut next = spec.clone();
@@ -306,8 +356,8 @@ fn push_down_local_runtime_filters_inner(
                 }
                 rewritten.push(next);
             }
-            let filtered = filter_specs_for_child(arena, &rewritten, input);
-            push_down_local_runtime_filters_inner(input, arena, &filtered);
+            let filtered = filter_specs_for_child(arena, &rewritten, &project.input);
+            push_down_local_runtime_filters_inner(&mut project.input, arena, &filtered);
         }
         ExecNodeKind::Filter(FilterNode { input, .. }) => {
             let filtered = filter_specs_for_child(arena, inherited, input);
@@ -335,7 +385,12 @@ fn push_down_local_runtime_filters_inner(
             if inherited.is_empty() {
                 return;
             }
-            let output_slots: HashSet<SlotId> = exchange.output_slots().iter().copied().collect();
+            let output_slots: HashSet<SlotId> = exchange
+                .expected_chunk_schema
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect();
             let filtered = filter_specs_by_output_slots(arena, inherited, &output_slots);
             if filtered.is_empty() {
                 return;
@@ -354,7 +409,12 @@ fn push_down_local_runtime_filters_inner(
             if inherited.is_empty() {
                 return;
             }
-            let output_slots: HashSet<SlotId> = scan.output_slots().iter().copied().collect();
+            let output_slots: HashSet<SlotId> = scan
+                .output_chunk_schema()
+                .slot_ids()
+                .iter()
+                .copied()
+                .collect();
             let filtered = filter_specs_by_output_slots(arena, inherited, &output_slots);
             if filtered.is_empty() {
                 return;

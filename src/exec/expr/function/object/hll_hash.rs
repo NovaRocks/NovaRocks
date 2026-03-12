@@ -175,7 +175,7 @@ fn murmur_hash64a(data: &[u8], seed: u32) -> u64 {
 mod tests {
     use super::eval_hll_hash;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{ArrayRef, BinaryArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -183,10 +183,18 @@ mod tests {
     use std::sync::Arc;
 
     fn one_col_chunk(data_type: DataType, array: ArrayRef) -> Chunk {
-        let field = field_with_slot_id(Field::new("c1", data_type, true), SlotId(1));
+        let field = Field::new("c1", data_type, true);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

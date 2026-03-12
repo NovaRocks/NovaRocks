@@ -18,13 +18,16 @@
 
 use crate::common::TestConfig;
 use arrow::array::Array;
+use arrow::datatypes::{DataType, Field};
 use novarocks::cache::{CacheOptions, DataCacheManager};
 use novarocks::common::ids::SlotId;
 use novarocks::connector::{self, FileFormatConfig, ParquetScanConfig};
+use novarocks::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use novarocks::exec::node::scan::ScanOp;
 use novarocks::formats::parquet::ParquetReadCachePolicy;
 use novarocks::novarocks_connector_jdbc::{JdbcScanConfig, JdbcScanOp};
 use novarocks::types;
+use std::sync::Arc;
 
 mod common;
 
@@ -76,7 +79,15 @@ fn test_jdbc_connector_module() {
         columns: vec!["lo_orderkey".to_string()],
         filters: vec![],
         limit: Some(1),
-        slot_ids: vec![novarocks::common::ids::SlotId::new(1)],
+        chunk_schema: Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                novarocks::common::ids::SlotId::new(1),
+                Field::new("lo_orderkey", DataType::Int64, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        ),
     };
     let _op = novarocks::novarocks_connector_jdbc::JdbcScanOp::new(cfg.clone());
     assert_eq!(cfg.table, "lineorder");
@@ -86,7 +97,15 @@ fn test_jdbc_connector_module() {
 fn test_iceberg_connector_module() {
     let parquet_cfg = ParquetScanConfig {
         columns: vec!["col0".to_string()],
-        slot_ids: vec![novarocks::common::ids::SlotId::new(1)],
+        chunk_schema: Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                novarocks::common::ids::SlotId::new(1),
+                Field::new("col0", DataType::Int32, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        ),
         slot_types: vec![types::TPrimitiveType::INT],
         case_sensitive: false,
         enable_page_index: false,
@@ -95,6 +114,7 @@ fn test_iceberg_connector_module() {
         datacache: DataCacheManager::instance().external_context(test_cache_options()),
         cache_policy: ParquetReadCachePolicy::with_flags(false, false, None),
         profile_label: Some("connector_smoke".to_string()),
+        iceberg_output_schema: None,
     };
     let config = novarocks::novarocks_connector_iceberg::HdfsScanConfig {
         ranges: vec![novarocks::connector::FileScanRange {
@@ -145,7 +165,15 @@ fn test_jdbc_sqlite_scan_full_table() {
         columns: vec!["a".to_string()],
         filters: vec![],
         limit: None,
-        slot_ids: vec![SlotId::new(1)],
+        chunk_schema: Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("a", DataType::Int64, true),
+                None,
+                None,
+            )])
+            .expect("chunk schema"),
+        ),
     };
     let op = JdbcScanOp::new(cfg);
     let iter = op

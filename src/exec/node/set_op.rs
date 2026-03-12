@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 
 #[derive(Clone, Debug)]
@@ -28,5 +28,5 @@ pub struct SetOpNode {
     pub kind: SetOpKind,
     pub inputs: Vec<ExecNode>,
     pub node_id: i32,
-    pub output_slots: Vec<SlotId>,
+    pub output_chunk_schema: ChunkSchemaRef,
 }

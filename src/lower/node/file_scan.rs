@@ -25,13 +25,15 @@ use serde_json::Value;
 
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanNode, ScanOp};
 use crate::exec::node::{BoxedExecIter, ExecNode, ExecNodeKind};
 use crate::fs::scan_context::FileScanRange;
 use crate::lower::expr::lower_t_expr_with_common_slot_map;
-use crate::lower::layout::{Layout, layout_from_slot_ids, slot_name_from_desc};
+use crate::lower::layout::{
+    Layout, chunk_schema_for_layout, layout_from_slot_ids, slot_name_from_desc,
+};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::service::stream_load;
@@ -58,8 +60,8 @@ struct FileLoadScanConfig {
     ranges: Vec<FileScanRange>,
     has_more: bool,
     format_type: plan_nodes::TFileFormatType,
-    source_slot_ids: Vec<SlotId>,
-    output_slot_ids: Vec<SlotId>,
+    source_chunk_schema: ChunkSchemaRef,
+    output_chunk_schema: ChunkSchemaRef,
     output_field_names: Vec<String>,
     output_field_types: Vec<DataType>,
     output_exprs: Vec<ExprId>,
@@ -111,7 +113,7 @@ impl FileLoadScanOp {
             .from_path(path)
             .map_err(|e| format!("FILE_SCAN failed to open csv file `{path}`: {e}"))?;
 
-        let expected_columns = self.cfg.source_slot_ids.len();
+        let expected_columns = self.cfg.source_chunk_schema.slot_ids().len();
         let mut columns: Vec<Vec<Option<String>>> =
             (0..expected_columns).map(|_| Vec::new()).collect();
         for (record_idx, record) in reader.records().enumerate() {
@@ -148,7 +150,7 @@ impl FileLoadScanOp {
         let payload = std::fs::read_to_string(path)
             .map_err(|e| format!("FILE_SCAN failed to open json file `{path}`: {e}"))?;
         if payload.trim().is_empty() {
-            return Ok((0..self.cfg.source_slot_ids.len())
+            return Ok((0..self.cfg.source_chunk_schema.slot_ids().len())
                 .map(|_| Vec::new())
                 .collect());
         }
@@ -156,7 +158,7 @@ impl FileLoadScanOp {
         let rows = parse_json_rows(&payload, json.strip_outer_array)
             .map_err(|e| format!("FILE_SCAN failed to parse json file `{path}`: {e}"))?;
 
-        let expected_columns = self.cfg.source_slot_ids.len();
+        let expected_columns = self.cfg.source_chunk_schema.slot_ids().len();
         if json.jsonpaths.len() != expected_columns {
             return Err(format!(
                 "FILE_SCAN jsonpaths count mismatch in `{path}`: expected={} actual={}",
@@ -182,17 +184,13 @@ impl FileLoadScanOp {
         &self,
         source_columns: Vec<Vec<Option<String>>>,
     ) -> Result<Chunk, String> {
-        let mut fields = Vec::with_capacity(self.cfg.source_slot_ids.len());
-        for (idx, _) in self.cfg.source_slot_ids.iter().enumerate() {
-            fields.push(Field::new(format!("src_col_{idx}"), DataType::Utf8, true));
-        }
         let arrays: Vec<ArrayRef> = source_columns
             .into_iter()
             .map(|values| Arc::new(StringArray::from(values)) as ArrayRef)
             .collect();
-        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        let batch = RecordBatch::try_new(self.cfg.source_chunk_schema.arrow_schema_ref(), arrays)
             .map_err(|e| format!("FILE_SCAN build source record batch failed: {e}"))?;
-        Chunk::try_new_with_slot_ids(batch, &self.cfg.source_slot_ids)
+        Chunk::try_new_with_chunk_schema(batch, self.cfg.source_chunk_schema.clone())
     }
 
     fn build_output_chunk(&self, source: &Chunk) -> Result<Option<Chunk>, String> {
@@ -232,13 +230,7 @@ impl FileLoadScanOp {
         }
 
         let mut fields = Vec::with_capacity(output_arrays.len());
-        for ((_, name), array) in self
-            .cfg
-            .output_slot_ids
-            .iter()
-            .zip(self.cfg.output_field_names.iter())
-            .zip(output_arrays.iter())
-        {
+        for (name, array) in self.cfg.output_field_names.iter().zip(output_arrays.iter()) {
             let target_type = self
                 .cfg
                 .output_field_types
@@ -250,9 +242,9 @@ impl FileLoadScanOp {
 
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), output_arrays)
             .map_err(|e| format!("FILE_SCAN build output record batch failed: {e}"))?;
-        Ok(Some(Chunk::try_new_with_slot_ids(
+        Ok(Some(Chunk::try_new_with_chunk_schema(
             batch,
-            &self.cfg.output_slot_ids,
+            self.cfg.output_chunk_schema.clone(),
         )?))
     }
 }
@@ -535,12 +527,6 @@ pub(crate) fn lower_file_scan_node(
         .map(|slot_id| SlotId::try_from(*slot_id))
         .collect::<Result<_, _>>()?;
 
-    let output_slot_ids: Vec<SlotId> = out_layout
-        .order
-        .iter()
-        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<_, _>>()?;
-
     let expr_map = params.expr_of_dest_slot.as_ref().ok_or_else(|| {
         format!(
             "FILE_SCAN_NODE node_id={} missing expr_of_dest_slot in broker params",
@@ -594,6 +580,21 @@ pub(crate) fn lower_file_scan_node(
             .unwrap_or_else(|| format!("src_col_{}", source_slot_id.as_u32()));
         source_field_names.push(field_name);
     }
+    let source_chunk_schema = Arc::new(ChunkSchema::try_new(
+        source_slot_ids
+            .iter()
+            .copied()
+            .zip(source_field_names.iter())
+            .map(|(slot_id, field_name)| {
+                ChunkSlotSchema::new_with_field(
+                    slot_id,
+                    Field::new(field_name.clone(), DataType::Utf8, true),
+                    None,
+                    None,
+                )
+            })
+            .collect(),
+    )?);
 
     let mut output_field_names = Vec::with_capacity(out_layout.order.len());
     let mut output_field_types = Vec::with_capacity(out_layout.order.len());
@@ -675,13 +676,14 @@ pub(crate) fn lower_file_scan_node(
             }),
         )
     };
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
 
     let config = FileLoadScanConfig {
         ranges,
         has_more,
         format_type,
-        source_slot_ids,
-        output_slot_ids: output_slot_ids.clone(),
+        source_chunk_schema,
+        output_chunk_schema: output_chunk_schema.clone(),
         output_field_names,
         output_field_types,
         output_exprs,
@@ -696,7 +698,7 @@ pub(crate) fn lower_file_scan_node(
         Arc::new(arena.clone()),
     )))
     .with_node_id(node.node_id)
-    .with_output_slots(output_slot_ids)
+    .with_output_chunk_schema(output_chunk_schema)
     .with_limit(limit)
     .with_local_rf_waiting_set(local_rf_waiting_set(node));
 

@@ -909,7 +909,6 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::common::largeint;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Decimal128Array, FixedSizeBinaryArray, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -917,22 +916,40 @@ mod tests {
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Int64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::Int64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_float(values: Vec<f64>) -> Chunk {
         let array = Arc::new(Float64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Float64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::Float64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_two_decimals(
@@ -952,17 +969,19 @@ mod tests {
                 .expect("right decimal array"),
         ) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(
-                Field::new("left", DataType::Decimal128(precision, scale), true),
-                SlotId::new(1),
-            ),
-            field_with_slot_id(
-                Field::new("right", DataType::Decimal128(precision, scale), true),
-                SlotId::new(2),
-            ),
+            Field::new("left", DataType::Decimal128(precision, scale), true),
+            Field::new("right", DataType::Decimal128(precision, scale), true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left_arr, right_arr]).expect("batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

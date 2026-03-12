@@ -186,6 +186,26 @@ fn sync_runtime_to_shard_registry(tablet_id: i64, entry: &TabletRuntimeEntry) {
     )]);
 }
 
+pub(crate) fn cache_tablet_runtime(
+    tablet_id: i64,
+    entry: TabletRuntimeEntry,
+) -> Result<TabletRuntimeEntry, String> {
+    if tablet_id <= 0 {
+        return Err(format!(
+            "invalid tablet_id for runtime registry: {}",
+            tablet_id
+        ));
+    }
+    {
+        let mut guard = tablet_runtime_registry()
+            .lock()
+            .map_err(|_| "lock tablet runtime registry failed".to_string())?;
+        guard.insert(tablet_id, entry.clone());
+    }
+    sync_runtime_to_shard_registry(tablet_id, &entry);
+    Ok(entry)
+}
+
 pub(crate) fn register_tablet_runtime(ctx: &TabletWriteContext) -> Result<(), String> {
     if ctx.tablet_id <= 0 {
         return Err(format!(
@@ -233,13 +253,7 @@ pub(crate) fn register_tablet_runtime(ctx: &TabletWriteContext) -> Result<(), St
         schema: ctx.tablet_schema.clone(),
         s3_config,
     };
-    {
-        let mut guard = tablet_runtime_registry()
-            .lock()
-            .map_err(|_| "lock tablet runtime registry failed".to_string())?;
-        guard.insert(ctx.tablet_id, entry.clone());
-    }
-    sync_runtime_to_shard_registry(ctx.tablet_id, &entry);
+    cache_tablet_runtime(ctx.tablet_id, entry)?;
     Ok(())
 }
 

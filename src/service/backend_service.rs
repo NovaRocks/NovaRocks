@@ -831,13 +831,11 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol, TSerializable};
-    use thrift::transport::{TBufferChannel, TIoChannel};
-
     use super::{
         BackendServiceConfig, build_backend_for_finish_task, execute_backend_task,
         finish_task_report_times_for_error, start_backend_service, stop_backend_service,
     };
+    use crate::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
     use crate::{agent_service, descriptors, service::disk_report, types};
 
     fn backend_test_guard() -> &'static Mutex<()> {
@@ -955,24 +953,6 @@ mod tests {
         }
     }
 
-    fn thrift_binary_serialize<T: TSerializable>(value: &T) -> Vec<u8> {
-        let channel = TBufferChannel::with_capacity(0, 1024);
-        let (_, w) = channel.split().expect("split TBufferChannel");
-        let mut protocol = TBinaryOutputProtocol::new(w, true);
-        value
-            .write_to_out_protocol(&mut protocol)
-            .expect("thrift binary serialize");
-        protocol.transport.write_bytes()
-    }
-
-    fn thrift_binary_deserialize<T: TSerializable>(bytes: &[u8]) -> T {
-        let mut channel = TBufferChannel::with_capacity(bytes.len(), 1024);
-        channel.set_readable_bytes(bytes);
-        let (r, _) = channel.split().expect("split TBufferChannel");
-        let mut protocol = TBinaryInputProtocol::new(r, true);
-        T::read_from_in_protocol(&mut protocol).expect("thrift binary deserialize")
-    }
-
     #[test]
     fn execute_backend_task_fails_fast_for_alter_without_request() {
         let task = test_task(types::TTaskType::ALTER);
@@ -1073,8 +1053,9 @@ mod tests {
             Some(schema.clone()),
         );
 
-        let bytes = thrift_binary_serialize(&req);
-        let decoded: agent_service::TAlterTabletReqV2 = thrift_binary_deserialize(&bytes);
+        let bytes = thrift_binary_serialize(&req).expect("thrift binary serialize");
+        let decoded: agent_service::TAlterTabletReqV2 =
+            thrift_binary_deserialize(&bytes).expect("thrift binary deserialize");
         let decoded_schema = decoded
             .base_tablet_read_schema
             .expect("base_tablet_read_schema should be preserved");
@@ -1105,8 +1086,9 @@ mod tests {
             None::<agent_service::TTabletSchema>,
         );
 
-        let bytes = thrift_binary_serialize(&req);
-        let decoded: agent_service::TAlterTabletReqV2 = thrift_binary_deserialize(&bytes);
+        let bytes = thrift_binary_serialize(&req).expect("thrift binary serialize");
+        let decoded: agent_service::TAlterTabletReqV2 =
+            thrift_binary_deserialize(&bytes).expect("thrift binary deserialize");
         assert!(
             decoded.base_tablet_read_schema.is_none(),
             "base_tablet_read_schema should stay None when not provided"

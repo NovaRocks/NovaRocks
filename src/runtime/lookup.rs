@@ -27,6 +27,7 @@ use arrow::record_batch::RecordBatch;
 use crate::cache::DataCacheManager;
 use crate::common::ids::SlotId;
 use crate::descriptors;
+use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::formats::{
@@ -285,12 +286,30 @@ pub(crate) fn execute_lookup_request(
             .collect::<Result<Vec<_>, _>>()?;
 
         let columns = lookup_metas.iter().map(|m| m.name.clone()).collect();
-        let slot_ids = lookup_slots.clone();
         let slot_types = lookup_metas.iter().map(|m| m.primitive).collect();
+        let chunk_schema = Arc::new(ChunkSchema::try_new(
+            lookup_slots
+                .iter()
+                .copied()
+                .zip(lookup_metas.iter())
+                .map(|(slot_id, meta)| {
+                    ChunkSlotSchema::new_with_field(
+                        slot_id,
+                        arrow::datatypes::Field::new(
+                            meta.name.clone(),
+                            meta.arrow_type.clone(),
+                            true,
+                        ),
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+        )?);
 
         let parquet_cfg = ParquetScanConfig {
             columns,
-            slot_ids,
+            chunk_schema,
             slot_types,
             case_sensitive: scan_cfg.case_sensitive,
             enable_page_index: false,

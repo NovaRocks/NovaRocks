@@ -208,7 +208,6 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::ExprArena;
     use crate::exec::operators::local_exchanger::LocalExchangePartitionSpec;
     use crate::exec::operators::{LocalExchangeSinkFactory, LocalExchangeSourceFactory};
@@ -218,13 +217,18 @@ mod tests {
     use crate::exec::operators::local_exchanger::LocalExchanger;
 
     fn chunk_of(values: &[i32]) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v", DataType::Int32, false),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

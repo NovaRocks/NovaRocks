@@ -14,16 +14,12 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatchOptions, UInt32Array};
-use arrow::datatypes::{Field, Schema};
-use arrow::record_batch::RecordBatch;
-
-use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::runtime_state::RuntimeState;
+use arrow::array::{ArrayRef, UInt32Array};
 
 use super::distinct_set_shared::{DistinctSetSemantics, DistinctSetSharedState};
 
@@ -52,7 +48,7 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSourceFactory<S> {
         Box::new(DistinctSetSourceOperator::<S> {
             name: self.name.clone(),
             state: self.state.clone(),
-            output_slots: self.state.output_slots().to_vec(),
+            output_chunk_schema: self.state.output_chunk_schema(),
             prepared: false,
             finished: false,
             arrays: Vec::new(),
@@ -70,7 +66,7 @@ impl<S: DistinctSetSemantics> OperatorFactory for DistinctSetSourceFactory<S> {
 struct DistinctSetSourceOperator<S: DistinctSetSemantics> {
     name: String,
     state: DistinctSetSharedState<S>,
-    output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     prepared: bool,
     finished: bool,
     arrays: Vec<ArrayRef>,
@@ -155,38 +151,19 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S>
             out_arrays.push(taken);
         }
 
-        if self.output_slots.len() != out_arrays.len() {
+        if self.output_chunk_schema.slot_ids().len() != out_arrays.len() {
             return Err(format!(
                 "{}: slots={} cols={}",
                 S::SOURCE_SLOT_MISMATCH_PREFIX,
-                self.output_slots.len(),
+                self.output_chunk_schema.slot_ids().len(),
                 out_arrays.len()
             ));
         }
 
-        let schema = Arc::new(Schema::new(
-            out_arrays
-                .iter()
-                .enumerate()
-                .map(|(idx, arr)| {
-                    Arc::new(Field::new(
-                        format!("col_{}", idx),
-                        arr.data_type().clone(),
-                        true,
-                    ))
-                })
-                .collect::<Vec<_>>(),
-        ));
-
-        let batch = if out_arrays.is_empty() {
-            let options = RecordBatchOptions::new().with_row_count(Some(indices_ref.len()));
-            RecordBatch::try_new_with_options(schema, out_arrays, &options)
-        } else {
-            RecordBatch::try_new(schema, out_arrays)
-        }
-        .map_err(|e| e.to_string())?;
-
-        Ok(Some(Chunk::new_with_slot_ids(batch, &self.output_slots)))
+        Ok(Some(Chunk::try_new_with_columns(
+            Arc::clone(&self.output_chunk_schema),
+            out_arrays,
+        )?))
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {

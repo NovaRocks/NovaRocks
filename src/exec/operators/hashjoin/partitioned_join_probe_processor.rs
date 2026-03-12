@@ -30,8 +30,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
-
 use super::hash_join_probe_core::{HashJoinProbeCore, join_type_str};
 use super::partitioned_join_shared::PartitionedJoinSharedState;
 use crate::common::config::operator_buffer_chunks;
@@ -53,11 +51,8 @@ pub struct PartitionedJoinProbeProcessorFactory {
     probe_keys: Vec<ExprId>,
     residual_predicate: Option<ExprId>,
     probe_is_left: bool,
-    left_schema: SchemaRef,
     left_chunk_schema: ChunkSchemaRef,
-    right_schema: SchemaRef,
     right_chunk_schema: ChunkSchemaRef,
-    join_scope_schema: SchemaRef,
     join_scope_chunk_schema: ChunkSchemaRef,
     state: Arc<PartitionedJoinSharedState>,
 }
@@ -69,11 +64,8 @@ impl PartitionedJoinProbeProcessorFactory {
         probe_keys: Vec<ExprId>,
         residual_predicate: Option<ExprId>,
         probe_is_left: bool,
-        left_schema: SchemaRef,
         left_chunk_schema: ChunkSchemaRef,
-        right_schema: SchemaRef,
         right_chunk_schema: ChunkSchemaRef,
-        join_scope_schema: SchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<PartitionedJoinSharedState>,
     ) -> Self {
@@ -86,11 +78,8 @@ impl PartitionedJoinProbeProcessorFactory {
             probe_keys,
             residual_predicate,
             probe_is_left,
-            left_schema,
             left_chunk_schema,
-            right_schema,
             right_chunk_schema,
-            join_scope_schema,
             join_scope_chunk_schema,
             state,
         }
@@ -131,11 +120,8 @@ impl OperatorFactory for PartitionedJoinProbeProcessorFactory {
                 self.probe_keys.clone(),
                 self.residual_predicate,
                 self.probe_is_left,
-                Arc::clone(&self.left_schema),
                 Arc::clone(&self.left_chunk_schema),
-                Arc::clone(&self.right_schema),
                 Arc::clone(&self.right_chunk_schema),
-                Arc::clone(&self.join_scope_schema),
                 Arc::clone(&self.join_scope_chunk_schema),
             ),
             buffered_rows: 0,
@@ -440,7 +426,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::join::JoinDistributionMode;
     use crate::exec::node::join::JoinType;
@@ -459,18 +445,35 @@ mod tests {
     const LEFT_V_SLOT_ID: SlotId = SlotId::new(2);
     const RIGHT_K_SLOT_ID: SlotId = SlotId::new(3);
     const RIGHT_W_SLOT_ID: SlotId = SlotId::new(4);
+    const LEFT_K_SLOT_IDS: [SlotId; 1] = [LEFT_K_SLOT_ID];
+    const RIGHT_K_SLOT_IDS: [SlotId; 1] = [RIGHT_K_SLOT_ID];
+    const LEFT_KV_SLOT_IDS: [SlotId; 2] = [LEFT_K_SLOT_ID, LEFT_V_SLOT_ID];
+    const RIGHT_KV_SLOT_IDS: [SlotId; 2] = [RIGHT_K_SLOT_ID, RIGHT_W_SLOT_ID];
+    const JOIN_K_SLOT_IDS: [SlotId; 2] = [LEFT_K_SLOT_ID, RIGHT_K_SLOT_ID];
+    const JOIN_KV_SLOT_IDS: [SlotId; 4] = [
+        LEFT_K_SLOT_ID,
+        LEFT_V_SLOT_ID,
+        RIGHT_K_SLOT_ID,
+        RIGHT_W_SLOT_ID,
+    ];
 
-    fn schema_k(slot_id: SlotId, nullable: bool) -> SchemaRef {
-        Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("k", DataType::Int32, nullable),
-            slot_id,
+    fn schema_k(_slot_id: SlotId, nullable: bool) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            "k",
+            DataType::Int32,
+            nullable,
         )]))
     }
 
-    fn schema_kv(k_slot_id: SlotId, v_slot_id: SlotId, v_name: &str, nullable: bool) -> SchemaRef {
+    fn schema_kv(
+        _k_slot_id: SlotId,
+        _v_slot_id: SlotId,
+        v_name: &str,
+        nullable: bool,
+    ) -> SchemaRef {
         Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, nullable), k_slot_id),
-            field_with_slot_id(Field::new(v_name, DataType::Int32, nullable), v_slot_id),
+            Field::new("k", DataType::Int32, nullable),
+            Field::new(v_name, DataType::Int32, nullable),
         ]))
     }
 
@@ -480,8 +483,9 @@ mod tests {
         Arc::new(Schema::new(fields))
     }
 
-    fn chunk_schema_of(schema: &SchemaRef) -> ChunkSchemaRef {
-        Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"))
+    fn chunk_schema_of(schema: &SchemaRef, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
     }
 
     fn push_expect_consumed(op: &mut dyn ProcessorOperator, rt: &RuntimeState, chunk: Chunk) {
@@ -492,13 +496,18 @@ mod tests {
     }
 
     fn chunk_of(values: &[i32], k_slot_id: SlotId) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("k", DataType::Int32, false),
-            k_slot_id,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(values.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn chunk_of_two(
@@ -510,13 +519,21 @@ mod tests {
     ) -> Chunk {
         assert_eq!(k.len(), v.len());
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), k_slot_id),
-            field_with_slot_id(Field::new(v_name, DataType::Int32, false), v_slot_id),
+            Field::new("k", DataType::Int32, false),
+            Field::new(v_name, DataType::Int32, false),
         ]));
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id, v_slot_id],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn chunk_of_two_nullable(
@@ -528,13 +545,21 @@ mod tests {
     ) -> Chunk {
         assert_eq!(k.len(), v.len());
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, true), k_slot_id),
-            field_with_slot_id(Field::new(v_name, DataType::Int32, true), v_slot_id),
+            Field::new("k", DataType::Int32, true),
+            Field::new(v_name, DataType::Int32, true),
         ]));
         let k_arr = Arc::new(Int32Array::from(k.to_vec())) as arrow::array::ArrayRef;
         let v_arr = Arc::new(Int32Array::from(v.to_vec())) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k_arr, v_arr]).expect("record batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[k_slot_id, v_slot_id],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn append_quads(chunk: Chunk, out: &mut Vec<(i32, i32, i32, i32)>) {
@@ -631,12 +656,9 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_K_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_K_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_K_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -721,12 +743,9 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_K_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_K_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_K_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -868,12 +887,9 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -982,12 +998,9 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1102,12 +1115,9 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1216,12 +1226,9 @@ mod tests {
             vec![probe_key],
             None,
             false,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1327,12 +1334,9 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1451,12 +1455,9 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1563,12 +1564,9 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1677,12 +1675,9 @@ mod tests {
             vec![probe_key],
             None,
             false,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1784,12 +1779,9 @@ mod tests {
             vec![probe_key],
             None,
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 
@@ -1903,12 +1895,9 @@ mod tests {
             vec![probe_key],
             Some(residual),
             true,
-            Arc::clone(&left_schema),
-            chunk_schema_of(&left_schema),
-            Arc::clone(&right_schema),
-            chunk_schema_of(&right_schema),
-            Arc::clone(&join_scope_schema),
-            chunk_schema_of(&join_scope_schema),
+            chunk_schema_of(&left_schema, &LEFT_KV_SLOT_IDS),
+            chunk_schema_of(&right_schema, &RIGHT_KV_SLOT_IDS),
+            chunk_schema_of(&join_scope_schema, &JOIN_KV_SLOT_IDS),
             Arc::clone(&join_state),
         );
 

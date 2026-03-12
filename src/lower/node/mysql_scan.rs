@@ -16,9 +16,10 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
 use crate::exec::node::{ExecNode, ExecNodeKind};
-use crate::lower::layout::{layout_for_row_tuples, layout_for_tuple_columns, resolve_mysql_table};
+use crate::lower::layout::{
+    chunk_schema_for_layout, layout_for_row_tuples, layout_for_tuple_columns, resolve_mysql_table,
+};
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig};
 use crate::{descriptors, internal_service, plan_nodes, types};
@@ -59,13 +60,8 @@ pub(crate) fn lower_mysql_scan_node(
     }
 
     let tbl = resolve_mysql_table(desc_tbl, tuple_id)?;
-    let slot_ids = out_layout
-        .order
-        .iter()
-        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
-    let output_slots = slot_ids.clone();
     let limit = mysql.limit.and_then(|v| (v >= 0).then_some(v as usize));
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
     let cfg = JdbcScanConfig {
         jdbc_url: format!("mysql://{}:{}/{}", tbl.host, tbl.port, tbl.db),
         jdbc_user: Some(tbl.user.clone()),
@@ -74,14 +70,14 @@ pub(crate) fn lower_mysql_scan_node(
         columns: mysql.columns.clone(),
         filters: mysql.filters.clone(),
         limit,
-        slot_ids,
+        chunk_schema: output_chunk_schema.clone(),
     };
     let connector_io_tasks_per_scan_operator =
         query_opts.and_then(|opts| opts.connector_io_tasks_per_scan_operator);
     let scan = connectors
         .create_scan_node("mysql", ScanConfig::Jdbc(cfg))?
         .with_node_id(node.node_id)
-        .with_output_slots(output_slots)
+        .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_local_rf_waiting_set(local_rf_waiting_set(node));

@@ -251,18 +251,22 @@ mod tests {
     use std::sync::Arc;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::runtime::runtime_state::RuntimeState;
 
     fn make_chunk(rows: usize) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("c1", DataType::Int32, true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, true)]));
         let data: Vec<i32> = (0..rows as i32).collect();
         let array = Arc::new(Int32Array::from(data)) as _;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn run_ok(

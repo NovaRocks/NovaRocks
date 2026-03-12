@@ -186,7 +186,6 @@ impl ProcessorOperator for LimitProcessorOperator {
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -194,8 +193,8 @@ mod tests {
 
     fn make_chunk(start: i32, rows: usize) -> Chunk {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Utf8, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Utf8, false),
         ]));
         let mut keys = Vec::with_capacity(rows);
         let mut vals = Vec::with_capacity(rows);
@@ -211,7 +210,15 @@ mod tests {
             ],
         )
         .expect("build record batch");
-        Chunk::try_new(batch).expect("build chunk")
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn chunk_values(chunk: &Chunk) -> Vec<i32> {

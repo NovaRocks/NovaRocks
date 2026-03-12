@@ -14,9 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::DataType;
 
 use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::node::ExecNode;
 
 #[derive(Clone, Debug)]
@@ -37,7 +38,6 @@ pub struct TableFunctionNode {
     pub is_left_join: bool,
     pub param_types: Vec<DataType>,
     pub ret_types: Vec<DataType>,
-    pub output_schema: SchemaRef,
-    pub output_slots: Vec<SlotId>,
+    pub output_chunk_schema: ChunkSchemaRef,
     pub output_slot_sources: Vec<TableFunctionOutputSlot>,
 }

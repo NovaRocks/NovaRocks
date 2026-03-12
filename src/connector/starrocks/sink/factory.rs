@@ -683,7 +683,8 @@ fn extract_partition_value_from_exec_plan(
     }
 
     let output_pos = project
-        .output_slots
+        .output_chunk_schema
+        .slot_ids()
         .iter()
         .position(|slot| *slot == output_slot_id)?;
     let expr_idx = project

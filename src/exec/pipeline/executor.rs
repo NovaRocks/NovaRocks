@@ -197,7 +197,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::analytic::{
@@ -213,20 +213,29 @@ mod tests {
 
     use super::execute_plan_with_pipeline;
 
-    fn chunk_schema_of(schema: &Arc<Schema>) -> ChunkSchemaRef {
-        Arc::new(ChunkSchema::from_arrow_schema(schema.as_ref()).expect("chunk schema"))
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
     }
 
     #[test]
     fn group_by_sum_is_correct_with_dop_2() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3, 3, 3])) as arrow::array::ArrayRef;
         let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8, 9])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -253,8 +262,13 @@ mod tests {
                     }],
                     need_finalize: true,
                     input_is_intermediate: false,
-                    output_slots: vec![SlotId::new(1), SlotId::new(2)],
-                    output_chunk_schema: None,
+                    output_chunk_schema: chunk_schema_of(
+                        &Arc::new(Schema::new(vec![
+                            Field::new("k", DataType::Int32, false),
+                            Field::new("sum", DataType::Int64, true),
+                        ])),
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                 }),
             },
         };
@@ -310,25 +324,19 @@ mod tests {
 
     #[test]
     fn nljoin_inner_with_conjunct_is_correct() {
-        let left_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("a", DataType::Int32, false),
-            SlotId::new(1),
-        )]));
+        let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let left_arr = Arc::new(Int32Array::from(vec![1, 3])) as arrow::array::ArrayRef;
         let left_batch =
             RecordBatch::try_new(Arc::clone(&left_schema), vec![left_arr]).expect("left batch");
 
-        let right_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("b", DataType::Int32, false),
-            SlotId::new(2),
-        )]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
         let right_arr = Arc::new(Int32Array::from(vec![2, 4])) as arrow::array::ArrayRef;
         let right_batch =
             RecordBatch::try_new(Arc::clone(&right_schema), vec![right_arr]).expect("right batch");
 
         let join_scope_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("a", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("b", DataType::Int32, false), SlotId::new(2)),
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
         ]));
 
         let mut arena = ExprArena::default();
@@ -342,25 +350,45 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: {
+                                let batch = left_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(1)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: {
+                                let batch = right_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(2)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::Inner,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema),
-                    left_schema,
-                    right_chunk_schema: chunk_schema_of(&right_schema),
-                    right_schema,
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
-                    join_scope_schema,
+                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
+                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                 }),
             },
         };
@@ -412,25 +440,19 @@ mod tests {
 
     #[test]
     fn nljoin_left_outer_emits_null_extended_rows() {
-        let left_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("a", DataType::Int32, false),
-            SlotId::new(1),
-        )]));
+        let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let left_arr = Arc::new(Int32Array::from(vec![1, 3, 5])) as arrow::array::ArrayRef;
         let left_batch =
             RecordBatch::try_new(Arc::clone(&left_schema), vec![left_arr]).expect("left batch");
 
-        let right_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("b", DataType::Int32, false),
-            SlotId::new(2),
-        )]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
         let right_arr = Arc::new(Int32Array::from(vec![2, 4])) as arrow::array::ArrayRef;
         let right_batch =
             RecordBatch::try_new(Arc::clone(&right_schema), vec![right_arr]).expect("right batch");
 
         let join_scope_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("a", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("b", DataType::Int32, true), SlotId::new(2)),
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, true),
         ]));
 
         let mut arena = ExprArena::default();
@@ -444,25 +466,45 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: {
+                                let batch = left_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(1)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: {
+                                let batch = right_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(2)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::LeftOuter,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema),
-                    left_schema,
-                    right_chunk_schema: chunk_schema_of(&right_schema),
-                    right_schema,
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
-                    join_scope_schema,
+                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
+                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                 }),
             },
         };
@@ -522,23 +564,17 @@ mod tests {
 
     #[test]
     fn nljoin_full_outer_with_empty_left_emits_unmatched_build() {
-        let left_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("a", DataType::Int32, false),
-            SlotId::new(1),
-        )]));
+        let left_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let left_batch = RecordBatch::new_empty(Arc::clone(&left_schema));
 
-        let right_schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("b", DataType::Int32, false),
-            SlotId::new(2),
-        )]));
+        let right_schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int32, false)]));
         let right_arr = Arc::new(Int32Array::from(vec![2, 4])) as arrow::array::ArrayRef;
         let right_batch =
             RecordBatch::try_new(Arc::clone(&right_schema), vec![right_arr]).expect("right batch");
 
         let join_scope_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("a", DataType::Int32, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("b", DataType::Int32, false), SlotId::new(2)),
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, false),
         ]));
 
         let mut arena = ExprArena::default();
@@ -552,25 +588,45 @@ mod tests {
                 kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: {
+                                let batch = left_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(1)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: {
+                                let batch = right_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(2)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: NestedLoopJoinType::FullOuter,
                     join_conjunct: Some(pred),
-                    left_chunk_schema: chunk_schema_of(&left_schema),
-                    left_schema,
-                    right_chunk_schema: chunk_schema_of(&right_schema),
-                    right_schema,
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
-                    join_scope_schema,
+                    left_chunk_schema: chunk_schema_of(&left_schema, &[SlotId::new(1)]),
+                    right_chunk_schema: chunk_schema_of(&right_schema, &[SlotId::new(2)]),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
                 }),
             },
         };
@@ -628,8 +684,8 @@ mod tests {
     #[test]
     fn hash_left_outer_residual_treats_false_as_no_match() {
         let left_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let left_k = Arc::new(Int32Array::from(vec![1, 1, 2])) as arrow::array::ArrayRef;
         let left_v = Arc::new(Int32Array::from(vec![10, 20, 30])) as arrow::array::ArrayRef;
@@ -637,8 +693,8 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&left_schema), vec![left_k, left_v]).expect("left");
 
         let right_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(3)),
-            field_with_slot_id(Field::new("w", DataType::Int32, false), SlotId::new(4)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
         ]));
         let right_k = Arc::new(Int32Array::from(vec![1, 1, 3])) as arrow::array::ArrayRef;
         let right_w = Arc::new(Int32Array::from(vec![100, 5, 7])) as arrow::array::ArrayRef;
@@ -646,10 +702,10 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&right_schema), vec![right_k, right_w]).expect("right");
 
         let join_scope_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
-            field_with_slot_id(Field::new("k", DataType::Int32, true), SlotId::new(3)),
-            field_with_slot_id(Field::new("w", DataType::Int32, true), SlotId::new(4)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+            Field::new("k", DataType::Int32, true),
+            Field::new("w", DataType::Int32, true),
         ]));
 
         let mut arena = ExprArena::default();
@@ -665,25 +721,56 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: {
+                                let batch = left_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(1), SlotId::new(2)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: {
+                                let batch = right_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(3), SlotId::new(4)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::LeftOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
-                    left_chunk_schema: chunk_schema_of(&left_schema),
-                    left_schema: Arc::clone(&left_schema),
-                    right_chunk_schema: chunk_schema_of(&right_schema),
-                    right_schema: Arc::clone(&right_schema),
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
-                    join_scope_schema,
+                    left_chunk_schema: chunk_schema_of(
+                        &left_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
+                    right_chunk_schema: chunk_schema_of(
+                        &right_schema,
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[
+                            SlotId::new(1),
+                            SlotId::new(2),
+                            SlotId::new(3),
+                            SlotId::new(4),
+                        ],
+                    ),
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
@@ -773,8 +860,8 @@ mod tests {
     #[test]
     fn hash_right_outer_emits_unmatched_probe_rows() {
         let left_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let left_k = Arc::new(Int32Array::from(vec![1])) as arrow::array::ArrayRef;
         let left_v = Arc::new(Int32Array::from(vec![10])) as arrow::array::ArrayRef;
@@ -782,8 +869,8 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&left_schema), vec![left_k, left_v]).expect("left");
 
         let right_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(3)),
-            field_with_slot_id(Field::new("w", DataType::Int32, false), SlotId::new(4)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
         ]));
         let right_k = Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef;
         let right_w = Arc::new(Int32Array::from(vec![100, 200])) as arrow::array::ArrayRef;
@@ -791,10 +878,10 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&right_schema), vec![right_k, right_w]).expect("right");
 
         let join_scope_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, true), SlotId::new(2)),
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(3)),
-            field_with_slot_id(Field::new("w", DataType::Int32, false), SlotId::new(4)),
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("k", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
         ]));
 
         let mut arena = ExprArena::default();
@@ -807,25 +894,56 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: {
+                                let batch = left_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(1), SlotId::new(2)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: {
+                                let batch = right_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(3), SlotId::new(4)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::RightOuter,
                     distribution_mode: JoinDistributionMode::Partitioned,
-                    left_chunk_schema: chunk_schema_of(&left_schema),
-                    left_schema: Arc::clone(&left_schema),
-                    right_chunk_schema: chunk_schema_of(&right_schema),
-                    right_schema: Arc::clone(&right_schema),
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
-                    join_scope_schema,
+                    left_chunk_schema: chunk_schema_of(
+                        &left_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
+                    right_chunk_schema: chunk_schema_of(
+                        &right_schema,
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[
+                            SlotId::new(1),
+                            SlotId::new(2),
+                            SlotId::new(3),
+                            SlotId::new(4),
+                        ],
+                    ),
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
@@ -902,14 +1020,14 @@ mod tests {
     #[test]
     fn hash_full_outer_with_empty_left_emits_unmatched_build() {
         let left_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let left_batch = RecordBatch::new_empty(Arc::clone(&left_schema));
 
         let right_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(3)),
-            field_with_slot_id(Field::new("w", DataType::Int32, false), SlotId::new(4)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
         ]));
         let right_k = Arc::new(Int32Array::from(vec![1])) as arrow::array::ArrayRef;
         let right_w = Arc::new(Int32Array::from(vec![100])) as arrow::array::ArrayRef;
@@ -917,10 +1035,10 @@ mod tests {
             RecordBatch::try_new(Arc::clone(&right_schema), vec![right_k, right_w]).expect("right");
 
         let join_scope_schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, true), SlotId::new(2)),
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(3)),
-            field_with_slot_id(Field::new("w", DataType::Int32, false), SlotId::new(4)),
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
+            Field::new("k", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
         ]));
 
         let mut arena = ExprArena::default();
@@ -933,25 +1051,56 @@ mod tests {
                 kind: ExecNodeKind::Join(JoinNode {
                     left: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(left_batch),
+                            chunk: {
+                                let batch = left_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(1), SlotId::new(2)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     right: Box::new(ExecNode {
                         kind: ExecNodeKind::Values(ValuesNode {
-                            chunk: Chunk::new(right_batch),
+                            chunk: {
+                                let batch = right_batch;
+                                let chunk_schema =
+                                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                                        batch.schema().as_ref(),
+                                        &[SlotId::new(3), SlotId::new(4)],
+                                    )
+                                    .expect("chunk schema")
+                                ;
+                                Chunk::new_with_chunk_schema(batch, chunk_schema)
+                            },
                             node_id: 0,
                         }),
                     }),
                     node_id: 1,
                     join_type: JoinType::FullOuter,
                     distribution_mode: JoinDistributionMode::Broadcast,
-                    left_chunk_schema: chunk_schema_of(&left_schema),
-                    left_schema: Arc::clone(&left_schema),
-                    right_chunk_schema: chunk_schema_of(&right_schema),
-                    right_schema: Arc::clone(&right_schema),
-                    join_scope_chunk_schema: chunk_schema_of(&join_scope_schema),
-                    join_scope_schema,
+                    left_chunk_schema: chunk_schema_of(
+                        &left_schema,
+                        &[SlotId::new(1), SlotId::new(2)],
+                    ),
+                    right_chunk_schema: chunk_schema_of(
+                        &right_schema,
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
+                    join_scope_chunk_schema: chunk_schema_of(
+                        &join_scope_schema,
+                        &[
+                            SlotId::new(1),
+                            SlotId::new(2),
+                            SlotId::new(3),
+                            SlotId::new(4),
+                        ],
+                    ),
                     probe_keys: vec![key_left],
                     build_keys: vec![key_right],
                     eq_null_safe: vec![false],
@@ -1024,15 +1173,42 @@ mod tests {
     #[test]
     fn analytic_row_number_rank_sum_is_correct() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("o", DataType::Int32, false), SlotId::new(2)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(3)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("o", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let k = Arc::new(Int32Array::from(vec![1, 1, 1, 2, 2])) as arrow::array::ArrayRef;
         let o = Arc::new(Int32Array::from(vec![1, 1, 2, 1, 2])) as arrow::array::ArrayRef;
         let v = Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![k, o, v]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
+        let analytic_output_schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int32, false),
+            Field::new("o", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
+            Field::new("row_number", DataType::Int64, true),
+            Field::new("rank", DataType::Int64, true),
+            Field::new("sum", DataType::Int64, true),
+        ]));
+        let analytic_output_chunk_schema = chunk_schema_of(
+            &analytic_output_schema,
+            &[
+                SlotId::new(1),
+                SlotId::new(2),
+                SlotId::new(3),
+                SlotId::new(4),
+                SlotId::new(5),
+                SlotId::new(6),
+            ],
+        );
 
         let mut arena = ExprArena::default();
         let k_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1079,14 +1255,7 @@ mod tests {
                         AnalyticOutputColumn::Window(1),
                         AnalyticOutputColumn::Window(2),
                     ],
-                    output_slots: vec![
-                        SlotId::new(1),
-                        SlotId::new(2),
-                        SlotId::new(3),
-                        SlotId::new(4),
-                        SlotId::new(5),
-                        SlotId::new(6),
-                    ],
+                    output_chunk_schema: analytic_output_chunk_schema,
                 }),
             },
         };
@@ -1149,16 +1318,21 @@ mod tests {
     #[test]
     fn mixed_merge_and_update_aggregates_work() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("c1", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(
-                Field::new("sum_state", DataType::Int64, false),
-                SlotId::new(2),
-            ),
+            Field::new("c1", DataType::Int32, false),
+            Field::new("sum_state", DataType::Int64, false),
         ]));
         let c1 = Arc::new(Int32Array::from(vec![1, 2])) as arrow::array::ArrayRef;
         let sum_state = Arc::new(Int64Array::from(vec![30_i64, 5_i64])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![c1, sum_state]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let c1_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1197,8 +1371,13 @@ mod tests {
                     ],
                     need_finalize: true,
                     input_is_intermediate: false,
-                    output_slots: vec![SlotId::new(3), SlotId::new(4)],
-                    output_chunk_schema: None,
+                    output_chunk_schema: chunk_schema_of(
+                        &Arc::new(Schema::new(vec![
+                            Field::new("k", DataType::Int32, true),
+                            Field::new("sum", DataType::Int64, true),
+                        ])),
+                        &[SlotId::new(3), SlotId::new(4)],
+                    ),
                 }),
             },
         };

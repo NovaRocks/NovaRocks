@@ -712,7 +712,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::values::ValuesNode;
@@ -721,17 +721,37 @@ mod tests {
     use crate::exec::pipeline::executor::execute_plan_with_pipeline;
     use crate::runtime::runtime_state::RuntimeState;
 
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
+    }
+
     #[test]
     fn group_by_multi_distinct_count_is_correct_with_dop_2() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3, 3, 3, 3])) as arrow::array::ArrayRef;
         let vals =
             Arc::new(Int32Array::from(vec![10, 20, 5, 7, 8, 9, 9])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
+        let output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("cnt", DataType::Int64, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -758,8 +778,7 @@ mod tests {
                     }],
                     need_finalize: true,
                     input_is_intermediate: false,
-                    output_slots: vec![SlotId::new(1), SlotId::new(2)],
-                    output_chunk_schema: None,
+                    output_chunk_schema,
                 }),
             },
         };

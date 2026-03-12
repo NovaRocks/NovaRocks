@@ -902,7 +902,7 @@ pub fn eval_get_variant_time(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::function::variant::test_utils::{slot_id_expr, typed_null};
     use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
     use arrow::array::{
@@ -921,10 +921,18 @@ mod tests {
         let variant_arr =
             Arc::new(LargeBinaryArray::from(vec![Some(variant.as_slice())])) as ArrayRef;
         let variant_type = DataType::LargeBinary;
-        let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
+        let field = Field::new("v", variant_type.clone(), true);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -941,10 +949,18 @@ mod tests {
         let variant_arr =
             Arc::new(LargeBinaryArray::from(vec![Some(variant.as_slice())])) as ArrayRef;
         let variant_type = DataType::LargeBinary;
-        let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
+        let field = Field::new("v", variant_type.clone(), true);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -961,10 +977,18 @@ mod tests {
         let variant_arr =
             Arc::new(LargeBinaryArray::from(vec![Some(variant.as_slice())])) as ArrayRef;
         let variant_type = DataType::LargeBinary;
-        let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
+        let field = Field::new("v", variant_type.clone(), true);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -982,10 +1006,18 @@ mod tests {
         let variant_arr =
             Arc::new(LargeBinaryArray::from(vec![Some(variant.as_slice())])) as ArrayRef;
         let variant_type = DataType::LargeBinary;
-        let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
+        let field = Field::new("v", variant_type.clone(), true);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -1002,10 +1034,18 @@ mod tests {
         let variant_arr =
             Arc::new(LargeBinaryArray::from(vec![Some(variant.as_slice())])) as ArrayRef;
         let variant_type = DataType::LargeBinary;
-        let field = field_with_slot_id(Field::new("v", variant_type.clone(), true), SlotId::new(1));
+        let field = Field::new("v", variant_type.clone(), true);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, variant_type);
@@ -1022,10 +1062,18 @@ mod tests {
             Some("{\"name\":\"abc\",\"age\":23}"),
             Some("{\"age\":23}"),
         ])) as ArrayRef;
-        let field = field_with_slot_id(Field::new("j", DataType::Utf8, true), SlotId::new(1));
+        let field = Field::new("j", DataType::Utf8, true);
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![json_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg0 = slot_id_expr(&mut arena, 1, DataType::Utf8);

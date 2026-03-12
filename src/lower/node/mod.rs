@@ -474,7 +474,7 @@ fn lower_node_with_children(
             lower_raw_values_node(node, &mut out_layout)?
         }
         t if t == plan_nodes::TPlanNodeType::LOOKUP_NODE => {
-            lower_lookup_node(children, node, out_layout)?
+            lower_lookup_node(children, node, out_layout, desc_tbl)?
         }
         t if t == plan_nodes::TPlanNodeType::SCHEMA_SCAN_NODE => {
             if !children.is_empty() {
@@ -609,6 +609,12 @@ fn lower_node_with_children(
                 node,
                 arena,
                 &out_layout,
+                desc_tbl.ok_or_else(|| {
+                    format!(
+                        "ANALYTIC_EVAL_NODE node_id={} requires descriptor table",
+                        node.node_id
+                    )
+                })?,
                 tuple_slots,
                 last_query_id,
                 fe_addr,

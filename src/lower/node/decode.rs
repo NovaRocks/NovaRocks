@@ -26,7 +26,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
@@ -466,18 +466,19 @@ fn derive_query_global_dict_expr(
         columns.push(build_slot_array_for_dict_entries(data_type, &dict_entries)?);
     }
     let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema, columns)
+    let batch = RecordBatch::try_new(schema.clone(), columns)
         .map_err(|e| format!("failed to build dict expr input batch: {}", e))?;
-    let chunk = Chunk::new_with_slot_ids(
+    let slot_ids = slot_inputs
+        .iter()
+        .map(|(slot_id, _)| {
+            let slot_id_u32 = u32::try_from(*slot_id)
+                .map_err(|_| format!("slot id {} overflows u32", slot_id))?;
+            Ok(SlotId::new(slot_id_u32))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let chunk = Chunk::new_with_chunk_schema(
         batch,
-        &slot_inputs
-            .iter()
-            .map(|(slot_id, _)| {
-                let slot_id_u32 = u32::try_from(*slot_id)
-                    .map_err(|_| format!("slot id {} overflows u32", slot_id))?;
-                Ok(SlotId::new(slot_id_u32))
-            })
-            .collect::<Result<Vec<_>, String>>()?,
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)?,
     );
 
     let mut arena = ExprArena::default();
@@ -644,12 +645,7 @@ pub(crate) fn lower_decode_node(
                 expr_slot_ids,
                 expr_slot_schemas: None,
                 output_indices: Some(output_indices),
-                output_slots: out_layout
-                    .order
-                    .iter()
-                    .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                    .collect::<Result<Vec<_>, _>>()?,
-                output_chunk_schema: Some(output_chunk_schema),
+                output_chunk_schema,
             }),
         },
         layout: out_layout,

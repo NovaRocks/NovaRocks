@@ -21,7 +21,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::node::values::ValuesNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
@@ -56,9 +56,12 @@ pub(crate) fn lower_raw_values_node(
             DataType::Int64,
             true,
         )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(array) as _]).map_err(|e| e.to_string())?;
-        let chunk = Chunk::new_with_slot_ids(batch, &[slot_id]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array) as _])
+            .map_err(|e| e.to_string())?;
+        let chunk = Chunk::new_with_chunk_schema(
+            batch,
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[slot_id])?,
+        );
         return Ok(Lowered {
             node: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {
@@ -77,9 +80,12 @@ pub(crate) fn lower_raw_values_node(
             .ok_or_else(|| "RAW_VALUES_NODE missing output slot id".to_string())?;
         let slot_id = SlotId::try_from(slot_id)?;
         let schema = Arc::new(Schema::new(vec![Field::new("col_0", DataType::Utf8, true)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(array) as _]).map_err(|e| e.to_string())?;
-        let chunk = Chunk::new_with_slot_ids(batch, &[slot_id]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(array) as _])
+            .map_err(|e| e.to_string())?;
+        let chunk = Chunk::new_with_chunk_schema(
+            batch,
+            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[slot_id])?,
+        );
         return Ok(Lowered {
             node: ExecNode {
                 kind: ExecNodeKind::Values(ValuesNode {

@@ -21,7 +21,7 @@ use crate::descriptors;
 use crate::exec::node::lookup::LookUpNode;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::lower::layout::Layout;
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::plan_nodes;
 use crate::types;
@@ -75,6 +75,7 @@ pub(crate) fn lower_lookup_node(
     children: Vec<Lowered>,
     node: &plan_nodes::TPlanNode,
     out_layout: Layout,
+    desc_tbl: Option<&descriptors::TDescriptorTable>,
 ) -> Result<Lowered, String> {
     if !children.is_empty() {
         return Err(format!(
@@ -103,20 +104,12 @@ pub(crate) fn lower_lookup_node(
         }
     }
 
-    let mut output_slots = Vec::new();
-    let mut output_slots_by_tuple: HashMap<i32, Vec<SlotId>> = HashMap::new();
     let mut order = Vec::new();
     for (tuple_id, slot_id) in &out_layout.order {
         if row_pos_slots.contains(slot_id) {
             continue;
         }
         order.push((*tuple_id, *slot_id));
-        let slot = SlotId::try_from(*slot_id)?;
-        output_slots.push(slot);
-        output_slots_by_tuple
-            .entry(*tuple_id)
-            .or_default()
-            .push(slot);
     }
 
     let index = order
@@ -125,14 +118,20 @@ pub(crate) fn lower_lookup_node(
         .map(|(idx, key)| (*key, idx))
         .collect();
     let lookup_layout = Layout { order, index };
+    let desc_tbl = desc_tbl.ok_or_else(|| {
+        format!(
+            "LOOKUP_NODE node_id={} requires descriptor table",
+            node.node_id
+        )
+    })?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &lookup_layout)?;
 
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::LookUp(LookUpNode {
                 node_id: node.node_id,
                 row_pos_descs,
-                output_slots,
-                output_slots_by_tuple,
+                output_chunk_schema,
             }),
         },
         layout: lookup_layout,

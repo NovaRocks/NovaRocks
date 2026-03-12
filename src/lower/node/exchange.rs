@@ -16,7 +16,6 @@
 // under the License.
 use std::time::Duration;
 
-use crate::common::ids::SlotId;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::limit::LimitNode;
@@ -87,11 +86,6 @@ pub(crate) fn lower_exchange_node(
         };
         let exchange_timeout_ms = exchange_wait_ms();
 
-        let output_slots = out_layout
-            .order
-            .iter()
-            .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-            .collect::<Result<Vec<_>, _>>()?;
         let expected_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
         let mut out = ExecNode {
             kind: ExecNodeKind::ExchangeSource(
@@ -99,7 +93,6 @@ pub(crate) fn lower_exchange_node(
                     key,
                     expected,
                     Duration::from_millis(exchange_timeout_ms),
-                    output_slots,
                     expected_chunk_schema,
                 )
                 .with_local_rf_waiting_set(local_rf_waiting_set(node)),
@@ -214,18 +207,12 @@ fn build_sort_order_by(
 mod tests {
     use super::*;
     use crate::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
-    use crate::types::{TTypeDesc, TTypeNode, TTypeNodeType};
+    use crate::lower::type_lowering::scalar_type_desc;
+    use crate::types::{TPrimitiveType, TTypeDesc};
     use std::collections::{BTreeMap, HashMap};
 
     fn dummy_type_desc() -> TTypeDesc {
-        TTypeDesc {
-            types: Some(vec![TTypeNode {
-                type_: TTypeNodeType::SCALAR,
-                scalar_type: None,
-                struct_fields: None,
-                is_named: None,
-            }]),
-        }
+        scalar_type_desc(TPrimitiveType::INT)
     }
 
     fn default_expr_node() -> TExprNode {

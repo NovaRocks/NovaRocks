@@ -265,7 +265,6 @@ fn condition_array_to_bool_mask(array: &ArrayRef) -> Result<BooleanArray, String
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Int8Array, Int64Array, RecordBatchOptions};
     use arrow::datatypes::{Field, Schema};
@@ -274,12 +273,17 @@ mod tests {
 
     fn chunk_int64_nullable(values: Vec<Option<i64>>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("c0", DataType::Int64, true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]
@@ -336,7 +340,15 @@ mod tests {
         let schema = Arc::new(Schema::empty());
         let options = RecordBatchOptions::new().with_row_count(Some(1));
         let batch = RecordBatch::try_new_with_options(schema, vec![], &options).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let cond = arena.push_typed(

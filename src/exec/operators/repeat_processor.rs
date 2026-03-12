@@ -179,13 +179,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
                 || input_field.is_nullable();
             let field = input_field.as_ref().clone().with_nullable(nullable);
             fields.push(Arc::new(field.clone()));
-            slot_schemas.push(ChunkSlotSchema::try_new(
-                input_slot_schema.slot_id(),
-                field.name().clone(),
-                nullable,
-                input_slot_schema.type_desc().cloned(),
-                input_slot_schema.unique_id(),
-            )?);
+            slot_schemas.push(input_slot_schema.with_field(field.clone())?);
         }
         for (i, slot_id) in self.grouping_slot_ids.iter().enumerate() {
             if chunk.slot_id_to_index().contains_key(slot_id) {
@@ -233,7 +227,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
             return Ok(None);
         }
 
-        let schema = self
+        let _schema = self
             .output_schema
             .as_ref()
             .ok_or_else(|| "repeat missing output schema; push_chunk was not called".to_string())?;
@@ -274,12 +268,8 @@ impl ProcessorOperator for RepeatProcessorOperator {
             }
         }
         Ok(Some(
-            Chunk::try_new_with_schema_and_chunk_schema(
-                Arc::clone(schema),
-                columns,
-                Arc::clone(output_chunk_schema),
-            )
-            .map_err(|e| format!("repeat build batch failed: {e}"))?,
+            Chunk::try_new_with_columns(Arc::clone(output_chunk_schema), columns)
+                .map_err(|e| format!("repeat build batch failed: {e}"))?,
         ))
     }
 
@@ -328,7 +318,6 @@ impl RepeatProcessorOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::runtime::runtime_state::RuntimeState;
 
     use arrow::array::Array;
@@ -338,9 +327,9 @@ mod tests {
 
     fn schema_for(slot_ids: &[SlotId]) -> SchemaRef {
         let mut fields = Vec::new();
-        for (idx, slot_id) in slot_ids.iter().enumerate() {
+        for (idx, _slot_id) in slot_ids.iter().enumerate() {
             let field = Field::new(format!("c{idx}"), DataType::Int32, true);
-            fields.push(Arc::new(field_with_slot_id(field, *slot_id)));
+            fields.push(Arc::new(field));
         }
         Arc::new(Schema::new(fields))
     }
@@ -351,7 +340,15 @@ mod tests {
         let a = Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as _;
         let b = Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as _;
         let batch = RecordBatch::try_new(schema, vec![a, b]).expect("record batch");
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut op = RepeatProcessorOperator {
             name: "Repeat".to_string(),

@@ -7,7 +7,6 @@
 /sql-tests/target/
 /target
 /thirdparty/src
-/thirdparty/installed/
 /thirdparty/build/
 /.idea
 /dev
@@ -16,3 +15,4 @@
 /sql-tests/.sql_test_catalog
 /tools/target
 /tests/sql-test-runner/target
+thirdparty/installed

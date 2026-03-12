@@ -14,8 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanOp};
 use arrow::array::{
@@ -37,7 +36,7 @@ pub struct JdbcScanConfig {
     pub columns: Vec<String>,
     pub filters: Vec<String>,
     pub limit: Option<usize>,
-    pub slot_ids: Vec<SlotId>,
+    pub chunk_schema: ChunkSchemaRef,
 }
 
 #[derive(Clone, Debug)]
@@ -117,7 +116,7 @@ fn scan_sqlite_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
         }
         row_count += 1;
     }
-    let chunk = chunk_from_builders(builders, row_count, &cfg.slot_ids)?;
+    let chunk = chunk_from_builders(builders, row_count, &cfg.chunk_schema)?;
     Ok(Box::new(std::iter::once(Ok(chunk))))
 }
 
@@ -164,7 +163,7 @@ fn scan_mysql_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
         }
         row_count += 1;
     }
-    let chunk = chunk_from_builders(builders, row_count, &cfg.slot_ids)?;
+    let chunk = chunk_from_builders(builders, row_count, &cfg.chunk_schema)?;
     Ok(Box::new(std::iter::once(Ok(chunk))))
 }
 
@@ -286,13 +285,13 @@ fn append_utf8(builder: &mut ColumnBuilder, value: &str) {
 fn chunk_from_builders(
     builders: Vec<ColumnBuilder>,
     row_count: usize,
-    slot_ids: &[SlotId],
+    chunk_schema: &ChunkSchemaRef,
 ) -> Result<Chunk, String> {
-    if slot_ids.len() != builders.len() {
+    if chunk_schema.slot_ids().len() != builders.len() {
         return Err(format!(
-            "jdbc scan output columns/slot_ids mismatch: num_columns={} slot_ids={:?}",
+            "jdbc scan output columns/chunk schema mismatch: num_columns={} slot_ids={:?}",
             builders.len(),
-            slot_ids
+            chunk_schema.slot_ids()
         ));
     }
     let mut fields = Vec::with_capacity(builders.len());
@@ -304,7 +303,7 @@ fn chunk_from_builders(
         arrays.push(array);
     }
 
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new(fields.clone()));
     let batch = if arrays.is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         RecordBatch::try_new_with_options(schema, arrays, &options)
@@ -312,7 +311,8 @@ fn chunk_from_builders(
         RecordBatch::try_new(schema, arrays)
     }
     .map_err(|e| e.to_string())?;
-    Ok(Chunk::new_with_slot_ids(batch, slot_ids))
+    let chunk_schema = Arc::new(chunk_schema.with_fields_in_order(fields)?);
+    Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
 fn finish_column(builder: ColumnBuilder, row_count: usize) -> Result<ArrayRef, String> {

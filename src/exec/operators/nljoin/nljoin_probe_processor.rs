@@ -68,11 +68,8 @@ impl NlJoinProbeProcessorFactory {
         join_type: NestedLoopJoinType,
         join_conjunct: Option<ExprId>,
         probe_is_left: bool,
-        left_schema: SchemaRef,
         left_chunk_schema: ChunkSchemaRef,
-        right_schema: SchemaRef,
         right_chunk_schema: ChunkSchemaRef,
-        join_scope_schema: SchemaRef,
         join_scope_chunk_schema: ChunkSchemaRef,
         state: Arc<NlJoinSharedState>,
     ) -> Self {
@@ -88,11 +85,11 @@ impl NlJoinProbeProcessorFactory {
             join_type,
             join_conjunct,
             probe_is_left,
-            left_schema,
+            left_schema: left_chunk_schema.arrow_schema_ref(),
             left_chunk_schema,
-            right_schema,
+            right_schema: right_chunk_schema.arrow_schema_ref(),
             right_chunk_schema,
-            join_scope_schema,
+            join_scope_schema: join_scope_chunk_schema.arrow_schema_ref(),
             join_scope_chunk_schema,
             state,
         }
@@ -343,11 +340,14 @@ impl ProcessorOperator for NlJoinProbeProcessorOperator {
 impl NlJoinProbeProcessorOperator {
     fn chunk_from_batch_by_schema(&self, batch: RecordBatch) -> Result<Chunk, String> {
         let batch_schema = batch.schema();
-        let chunk_schema = if schema_is_compatible(&batch_schema, &self.join_scope_schema) {
+        let chunk_schema = if schema_is_compatible(
+            &batch_schema,
+            &self.join_scope_chunk_schema.arrow_schema_ref(),
+        ) {
             Arc::clone(&self.join_scope_chunk_schema)
-        } else if schema_is_compatible(&batch_schema, &self.left_schema) {
+        } else if schema_is_compatible(&batch_schema, &self.left_chunk_schema.arrow_schema_ref()) {
             Arc::clone(&self.left_chunk_schema)
-        } else if schema_is_compatible(&batch_schema, &self.right_schema) {
+        } else if schema_is_compatible(&batch_schema, &self.right_chunk_schema.arrow_schema_ref()) {
             Arc::clone(&self.right_chunk_schema)
         } else {
             return Err(format!(

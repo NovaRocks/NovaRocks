@@ -1245,7 +1245,6 @@ pub fn eval_not(arena: &ExprArena, child: ExprId, chunk: &Chunk) -> Result<Array
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprNode, LiteralValue};
     use arrow::array::{
         BooleanArray, Decimal128Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
@@ -1256,45 +1255,78 @@ mod tests {
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Int64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::Int64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_i64_nullable(left: Vec<Option<i64>>, right: Vec<Option<i64>>) -> Chunk {
         let left = Arc::new(Int64Array::from(left)) as ArrayRef;
         let right = Arc::new(Int64Array::from(right)) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("l", DataType::Int64, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("r", DataType::Int64, true), SlotId::new(2)),
+            Field::new("l", DataType::Int64, true),
+            Field::new("r", DataType::Int64, true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_bool(l: Vec<Option<bool>>, r: Vec<Option<bool>>) -> Chunk {
         let l = Arc::new(BooleanArray::from(l)) as ArrayRef;
         let r = Arc::new(BooleanArray::from(r)) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("l", DataType::Boolean, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("r", DataType::Boolean, true), SlotId::new(2)),
+            Field::new("l", DataType::Boolean, true),
+            Field::new("r", DataType::Boolean, true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![l, r]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_list_i64(left: ListArray, right: ListArray, list_type: DataType) -> Chunk {
         let left = Arc::new(left) as ArrayRef;
         let right = Arc::new(right) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("l", list_type.clone(), true), SlotId::new(1)),
-            field_with_slot_id(Field::new("r", list_type, true), SlotId::new(2)),
+            Field::new("l", list_type.clone(), true),
+            Field::new("r", list_type, true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_struct_i32(
@@ -1305,11 +1337,19 @@ mod tests {
         let left = Arc::new(left) as ArrayRef;
         let right = Arc::new(right) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("l", struct_type.clone(), true), SlotId::new(1)),
-            field_with_slot_id(Field::new("r", struct_type, true), SlotId::new(2)),
+            Field::new("l", struct_type.clone(), true),
+            Field::new("r", struct_type, true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_map_array(rows: &[Option<&[(i32, i64)]>]) -> MapArray {
@@ -1341,11 +1381,19 @@ mod tests {
         let left = Arc::new(left) as ArrayRef;
         let right = Arc::new(right) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("l", map_type.clone(), true), SlotId::new(1)),
-            field_with_slot_id(Field::new("r", map_type, true), SlotId::new(2)),
+            Field::new("l", map_type.clone(), true),
+            Field::new("r", map_type, true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-        Chunk::new(batch)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]
@@ -1508,17 +1556,20 @@ mod tests {
 
         let chunk = {
             let schema = Arc::new(Schema::new(vec![
-                field_with_slot_id(
-                    Field::new("l", DataType::Decimal128(7, 2), true),
-                    SlotId::new(1),
-                ),
-                field_with_slot_id(
-                    Field::new("r", DataType::Decimal128(4, 2), true),
-                    SlotId::new(2),
-                ),
+                Field::new("l", DataType::Decimal128(7, 2), true),
+                Field::new("r", DataType::Decimal128(4, 2), true),
             ]));
             let batch = RecordBatch::try_new(schema, vec![left, right]).unwrap();
-            Chunk::new(batch)
+            {
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1), SlotId::new(2)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            }
         };
 
         let out = arena.eval(expr, &chunk).unwrap();
@@ -1545,18 +1596,23 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Gt(l, r), DataType::Boolean);
 
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(
-                Field::new(
-                    "l",
-                    DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                    true,
-                ),
-                SlotId::new(1),
+            Field::new(
+                "l",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
             ),
-            field_with_slot_id(Field::new("r", DataType::Utf8, true), SlotId::new(2)),
+            Field::new("r", DataType::Utf8, true),
         ]));
         let batch = RecordBatch::try_new(schema, vec![ts_arr, str_arr]).unwrap();
-        let chunk = Chunk::new(batch);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
