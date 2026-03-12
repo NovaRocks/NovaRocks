@@ -61,7 +61,7 @@ pub fn eval_cardinality(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::function::map::eval_map_function;
     use crate::exec::expr::function::map::test_utils::{chunk_len_1, slot_id_expr, typed_null};
     use crate::exec::expr::{ExprNode, LiteralValue};
@@ -99,9 +99,17 @@ mod tests {
         builder.append(true).unwrap();
         let map = Arc::new(builder.finish()) as ArrayRef;
         let map_type = map.data_type().clone();
-        let field = field_with_slot_id(Field::new("m", map_type.clone(), true), SlotId::new(1));
+        let field = Field::new("m", map_type.clone(), true);
         let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![map]).unwrap();
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let arg = slot_id_expr(&mut arena, 1, map_type);

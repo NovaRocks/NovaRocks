@@ -530,7 +530,7 @@ fn lower_expr_node_impl(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exprs::{TExpr, TExprNode, TExprNodeType, TSlotRef};
     use crate::opcodes::TExprOpcode;
@@ -672,8 +672,8 @@ mod tests {
         );
 
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("c1", DataType::Boolean, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("c2", DataType::Boolean, true), SlotId::new(2)),
+            Field::new("c1", DataType::Boolean, true),
+            Field::new("c2", DataType::Boolean, true),
         ]));
         let batch = RecordBatch::try_new(
             schema,
@@ -683,7 +683,15 @@ mod tests {
             ],
         )
         .unwrap();
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let out = arena.eval(lowered, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();

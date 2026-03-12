@@ -175,7 +175,7 @@ pub fn eval_map_concat(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::function::map::eval_map_function;
     use crate::exec::expr::function::map::test_utils::{slot_id_expr, typed_null};
     use arrow::array::{ArrayRef, Int64Array, Int64Builder, MapBuilder};
@@ -205,12 +205,21 @@ mod tests {
         let map2_type = map2.data_type().clone();
 
         let fields = vec![
-            field_with_slot_id(Field::new("m1", map1_type.clone(), true), SlotId::new(1)),
-            field_with_slot_id(Field::new("m2", map2_type.clone(), true), SlotId::new(2)),
+            Field::new("m1", map1_type.clone(), true),
+            Field::new("m2", map2_type.clone(), true),
         ];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![map1, map2]).unwrap();
         (
-            Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]),
+            {
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1), SlotId::new(2)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            },
             map1_type,
             map2_type,
         )

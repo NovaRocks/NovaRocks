@@ -3086,7 +3086,7 @@ mod tests {
     use crate::connector::starrocks::lake::{
         append_lake_txn_log_with_rowset, txn_log::write_txn_log_file,
     };
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::formats::starrocks::writer::StarRocksWriteFormat;
     use crate::formats::starrocks::writer::bundle_meta::{
         load_tablet_metadata_at_version, write_bundle_meta_file, write_initial_meta_file,
@@ -3351,8 +3351,8 @@ mod tests {
         }
     }
 
-    fn slot_field(name: &str, data_type: DataType, nullable: bool, slot_id: u32) -> Field {
-        field_with_slot_id(Field::new(name, data_type, nullable), SlotId::new(slot_id))
+    fn slot_field(name: &str, data_type: DataType, nullable: bool, _slot_id: u32) -> Field {
+        Field::new(name, data_type, nullable)
     }
 
     fn pk_mixed_batch_with_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
@@ -3372,7 +3372,15 @@ mod tests {
             ],
         )
         .expect("build mixed primary key batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_composite_mixed_batch_with_op(
@@ -3400,15 +3408,20 @@ mod tests {
             ],
         )
         .expect("build composite mixed primary key batch");
-        Chunk::new_with_slot_ids(
-            batch,
-            &[
-                SlotId::new(1),
-                SlotId::new(2),
-                SlotId::new(3),
-                SlotId::new(4),
-            ],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[
+                    SlotId::new(1),
+                    SlotId::new(2),
+                    SlotId::new(3),
+                    SlotId::new(4),
+                ],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn test_rowset(segment_name: &str, row_count: i64, data_size: i64) -> RowsetMetadataPb {

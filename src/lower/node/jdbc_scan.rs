@@ -16,11 +16,10 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::layout::{
-    jdbc_conn_from_config, layout_for_row_tuples, layout_from_slot_ids, qualify_table_name,
-    resolve_jdbc_table, resolve_jdbc_table_by_name, tuple_slot_col_names,
+    chunk_schema_for_layout, jdbc_conn_from_config, layout_for_row_tuples, layout_from_slot_ids,
+    qualify_table_name, resolve_jdbc_table, resolve_jdbc_table_by_name, tuple_slot_col_names,
 };
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::novarocks_connectors::{ConnectorRegistry, JdbcScanConfig, ScanConfig};
@@ -116,12 +115,10 @@ pub(crate) fn lower_jdbc_scan_node(
     let connector_io_tasks_per_scan_operator =
         query_opts.and_then(|opts| opts.connector_io_tasks_per_scan_operator);
 
-    let slot_ids = out_layout
-        .order
-        .iter()
-        .map(|(_, slot)| SlotId::try_from(*slot))
-        .collect::<Result<Vec<_>, _>>()?;
-    let output_slots = slot_ids.clone();
+    let output_chunk_schema = chunk_schema_for_layout(
+        desc_tbl.ok_or_else(|| "JDBC_SCAN_NODE requires desc_tbl for chunk schema".to_string())?,
+        &out_layout,
+    )?;
     let cfg = JdbcScanConfig {
         jdbc_url,
         jdbc_user,
@@ -130,13 +127,13 @@ pub(crate) fn lower_jdbc_scan_node(
         columns,
         filters,
         limit,
-        slot_ids,
+        chunk_schema: output_chunk_schema.clone(),
     };
 
     let scan = connectors
         .create_scan_node("jdbc", ScanConfig::Jdbc(cfg))?
         .with_node_id(node.node_id)
-        .with_output_slots(output_slots)
+        .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_local_rf_waiting_set(local_rf_waiting_set(node));

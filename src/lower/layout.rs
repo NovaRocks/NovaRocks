@@ -70,42 +70,6 @@ pub(crate) fn schema_for_layout(
     Ok(SchemaRef::new(Schema::new(fields)))
 }
 
-/// Build an Arrow `SchemaRef` for all slots of a given tuple in descriptor table.
-pub(crate) fn schema_for_tuple(
-    desc_tbl: &descriptors::TDescriptorTable,
-    tuple_id: types::TTupleId,
-) -> Result<SchemaRef, String> {
-    let slot_descs = desc_tbl
-        .slot_descriptors
-        .as_ref()
-        .ok_or_else(|| "missing slot_descriptors in desc_tbl".to_string())?;
-
-    let mut fields = Vec::new();
-    for s in slot_descs {
-        let (Some(parent), Some(id), Some(slot_type)) = (s.parent, s.id, s.slot_type.as_ref())
-        else {
-            continue;
-        };
-        if parent != tuple_id {
-            continue;
-        }
-        let dt = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
-            .ok_or_else(|| format!("unsupported slot_type for tuple_id={parent} slot_id={id}"))?;
-        let name = slot_display_name_from_desc(s);
-        let nullable = s.is_nullable.unwrap_or(true);
-
-        fields.push(Field::new(name, dt, nullable));
-    }
-
-    if fields.is_empty() {
-        return Err(format!(
-            "missing slot descriptors for tuple_id={tuple_id} when building required schema"
-        ));
-    }
-
-    Ok(SchemaRef::new(Schema::new(fields)))
-}
-
 fn chunk_slot_schema_lookup(
     desc_tbl: &descriptors::TDescriptorTable,
 ) -> Result<HashMap<(types::TTupleId, types::TSlotId), ChunkSlotSchema>, String> {

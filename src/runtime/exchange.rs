@@ -28,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
-use crate::exec::chunk::{Chunk, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::novarocks_logging::debug;
@@ -1031,13 +1031,7 @@ fn chunk_schema_for_wire_meta(
                 }
             }
         }
-        slots.push(ChunkSlotSchema::try_new(
-            *slot_id,
-            field.name().clone(),
-            field.is_nullable(),
-            expected_slot.type_desc().cloned(),
-            expected_slot.unique_id(),
-        )?);
+        slots.push(expected_slot.with_field_and_slot_id(*slot_id, field.as_ref().clone())?);
     }
     Ok(Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?))
 }
@@ -1066,12 +1060,10 @@ pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
     let batches = decode_arrow_ipc_batches(arrow_payload)?;
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
-        let chunk_schema = Arc::new(
-            crate::exec::chunk::ChunkSchema::try_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &wire_meta.slot_ids_by_index,
-            )?,
-        );
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &wire_meta.slot_ids_by_index,
+        )?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
     }
     Ok(chunks)
@@ -1192,7 +1184,7 @@ mod tests {
         register_expected_chunk_schema,
     };
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSlotSchema};
+    use crate::exec::chunk::Chunk;
 
     const EXCHANGE_TEST_SLOT_IDS: [SlotId; 4] = [
         SlotId::new(33),
@@ -1215,7 +1207,15 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("x")])),
         ];
         let batch = RecordBatch::try_new(schema, columns).expect("record batch");
-        Chunk::new_with_slot_ids(batch, &EXCHANGE_TEST_SLOT_IDS)
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &EXCHANGE_TEST_SLOT_IDS,
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn exchange_test_chunk_without_metadata(last_name: &str) -> Chunk {
@@ -1266,15 +1266,7 @@ mod tests {
                     .fields()
                     .iter()
                     .zip(strict.chunk_schema().slots().iter())
-                    .map(|(field, slot)| {
-                        ChunkSlotSchema::try_new(
-                            slot.slot_id(),
-                            field.name(),
-                            field.is_nullable(),
-                            slot.type_desc().cloned(),
-                            slot.unique_id(),
-                        )
-                    })
+                    .map(|(field, slot)| slot.with_field(field.as_ref().clone()))
                     .collect::<Result<Vec<_>, _>>()
                     .expect("slot schemas"),
             )
@@ -1308,15 +1300,20 @@ mod tests {
             Arc::new(Int32Array::from(vec![Some(3)])),
             Arc::new(StringArray::from(vec![Some("x")])),
         ];
-        let second = Chunk::new_with_slot_ids(
-            RecordBatch::try_new(schema, columns).expect("record batch"),
-            &[
-                SlotId::new(33),
-                SlotId::new(34),
-                SlotId::new(31),
-                SlotId::new(99),
-            ],
-        );
+        let second = {
+            let batch = RecordBatch::try_new(schema, columns).expect("record batch");
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[
+                    SlotId::new(33),
+                    SlotId::new(34),
+                    SlotId::new(31),
+                    SlotId::new(99),
+                ],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let err =
             encode_chunks(&[first, second], true).expect_err("should reject mismatched slot id");
@@ -1385,15 +1382,7 @@ mod tests {
                     .fields()
                     .iter()
                     .zip(strict.chunk_schema().slots().iter())
-                    .map(|(field, slot)| {
-                        ChunkSlotSchema::try_new(
-                            slot.slot_id(),
-                            field.name(),
-                            field.is_nullable(),
-                            slot.type_desc().cloned(),
-                            slot.unique_id(),
-                        )
-                    })
+                    .map(|(field, slot)| slot.with_field(field.as_ref().clone()))
                     .collect::<Result<Vec<_>, _>>()
                     .expect("slot schemas"),
             )

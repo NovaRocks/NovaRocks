@@ -113,7 +113,7 @@ fn crc32_zlib(data: &[u8]) -> u32 {
 mod tests {
     use super::eval_crc32;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -126,10 +126,18 @@ mod tests {
         let arg = arena.push_typed(ExprNode::SlotId(SlotId(1)), DataType::Utf8);
 
         let input = Arc::new(StringArray::from(vec![Some("123"), Some("abc"), None])) as ArrayRef;
-        let field = field_with_slot_id(Field::new("c1", DataType::Utf8, true), SlotId(1));
+        let field = Field::new("c1", DataType::Utf8, true);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![input]).expect("record batch");
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId(1)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let out = eval_crc32(&arena, arg, &[arg], &chunk).expect("eval crc32");
         let out = out

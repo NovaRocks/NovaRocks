@@ -151,7 +151,6 @@ pub fn eval_coalesce(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -159,22 +158,32 @@ mod tests {
 
     fn create_test_chunk_int(values: Vec<Option<i64>>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Int64, true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_string(values: Vec<Option<String>>) -> Chunk {
         let array = Arc::new(StringArray::from_iter(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Utf8, true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

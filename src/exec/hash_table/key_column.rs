@@ -27,7 +27,6 @@ use arrow::compute::{concat, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 
-use crate::common::ids::SlotId;
 use crate::common::largeint;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use crate::exec::expr::agg::AggKernelEntry;
@@ -1085,10 +1084,10 @@ pub(crate) fn build_output_schema_from_kernels(
     key_columns: &[KeyColumn],
     kernels: &[AggKernelEntry],
     output_intermediate: bool,
-    output_slots: &[SlotId],
-    output_chunk_schema: Option<&ChunkSchemaRef>,
+    output_chunk_schema: &ChunkSchemaRef,
     group_key_nullable: Option<&[bool]>,
 ) -> Result<SchemaRef, String> {
+    let output_slots = output_chunk_schema.slot_ids();
     let mut fields: Vec<Field> = Vec::with_capacity(key_columns.len() + kernels.len());
     let mut chunk_slots = Vec::with_capacity(key_columns.len() + kernels.len());
     for (idx, col) in key_columns.iter().enumerate() {
@@ -1098,7 +1097,7 @@ pub(crate) fn build_output_schema_from_kernels(
                 idx
             )
         })?;
-        let slot_schema = output_chunk_schema.and_then(|schema| schema.slot(slot_id));
+        let slot_schema = output_chunk_schema.slot(slot_id);
         let runtime_nullable = group_key_nullable
             .and_then(|nullable| nullable.get(idx).copied())
             .unwrap_or_else(|| col.has_nulls());
@@ -1109,15 +1108,9 @@ pub(crate) fn build_output_schema_from_kernels(
             .map(|schema| Field::new(schema.name(), col.data_type(), nullable))
             .unwrap_or_else(|| Field::new(format!("group_{}", idx), col.data_type(), true));
         let chunk_slot = if let Some(schema) = slot_schema {
-            ChunkSlotSchema::try_new(
-                slot_id,
-                field.name(),
-                nullable,
-                schema.type_desc().cloned(),
-                schema.unique_id(),
-            )?
+            schema.with_field_and_slot_id(slot_id, field.clone())?
         } else {
-            ChunkSlotSchema::new(slot_id, field.name(), field.is_nullable(), None, None)
+            ChunkSlotSchema::new_with_field(slot_id, field.clone(), None, None)
         };
         fields.push(field);
         chunk_slots.push(chunk_slot);
@@ -1130,7 +1123,7 @@ pub(crate) fn build_output_schema_from_kernels(
                 slot_idx
             )
         })?;
-        let slot_schema = output_chunk_schema.and_then(|schema| schema.slot(slot_id));
+        let slot_schema = output_chunk_schema.slot(slot_id);
         let field = slot_schema
             .map(|schema| {
                 Field::new(
@@ -1146,9 +1139,11 @@ pub(crate) fn build_output_schema_from_kernels(
                     true,
                 )
             });
-        let chunk_slot = slot_schema.cloned().unwrap_or_else(|| {
-            ChunkSlotSchema::new(slot_id, field.name(), field.is_nullable(), None, None)
-        });
+        let chunk_slot = if let Some(schema) = slot_schema {
+            schema.with_field(field.clone())?
+        } else {
+            ChunkSlotSchema::new_with_field(slot_id, field.clone(), None, None)
+        };
         fields.push(field);
         chunk_slots.push(chunk_slot);
     }
@@ -1181,7 +1176,6 @@ mod tests {
             values: vec![0, 1],
             nulls: vec![0, 1],
         }];
-        let output_slots = vec![SlotId::new(13)];
         let output_chunk_schema = Arc::new(
             ChunkSchema::try_new(vec![ChunkSlotSchema::new(
                 SlotId::new(13),
@@ -1193,15 +1187,9 @@ mod tests {
             .expect("chunk schema"),
         );
 
-        let schema = build_output_schema_from_kernels(
-            &key_columns,
-            &[],
-            false,
-            &output_slots,
-            Some(&output_chunk_schema),
-            None,
-        )
-        .expect("output schema");
+        let schema =
+            build_output_schema_from_kernels(&key_columns, &[], false, &output_chunk_schema, None)
+                .expect("output schema");
 
         assert!(schema.field(0).is_nullable());
     }

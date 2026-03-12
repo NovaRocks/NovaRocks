@@ -30,8 +30,7 @@ use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
-    layout_for_row_tuples, layout_from_slot_ids, schema_for_layout, schema_for_tuple,
-    slot_arrow_type_lookup,
+    layout_for_row_tuples, layout_from_slot_ids, slot_arrow_type_lookup,
 };
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
 use crate::novarocks_config::config as novarocks_app_config;
@@ -117,20 +116,16 @@ pub(crate) fn lower_lake_scan_node(
             .collect();
     }
 
-    let schema = schema_for_layout(desc_tbl, &scan_layout)?;
     let scan_output_chunk_schema = chunk_schema_for_layout(desc_tbl, &scan_layout)?;
-    let required_schema = schema_for_tuple(desc_tbl, tuple_id)?;
     let required_chunk_schema = chunk_schema_for_tuple(desc_tbl, tuple_id)?;
-    let slot_ids = scan_layout
-        .order
-        .iter()
-        .map(|(_, s)| SlotId::try_from(*s))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !slot_ids.is_empty() && slot_ids.len() != schema.fields().len() {
+    let scan_output_schema = scan_output_chunk_schema.arrow_schema_ref();
+    if !scan_output_chunk_schema.slot_ids().is_empty()
+        && scan_output_chunk_schema.slot_ids().len() != scan_output_schema.fields().len()
+    {
         return Err(format!(
             "LAKE_SCAN_NODE output layout/schema mismatch: layout_len={}, schema_len={}",
-            slot_ids.len(),
-            schema.fields().len()
+            scan_output_chunk_schema.slot_ids().len(),
+            scan_output_schema.fields().len()
         ));
     }
 
@@ -353,19 +348,18 @@ pub(crate) fn lower_lake_scan_node(
         tablet_path_map.len()
     );
 
-    let output_slots = slot_ids.clone();
     let cfg = StarRocksScanConfig {
         db_name: normalize_optional_table_name(&db_name, "__unknown_db__"),
         table_name: normalize_optional_table_name(&table_name, "__unknown_table__"),
         properties,
         ranges,
         has_more,
-        required_schema,
         required_chunk_schema,
-        schema,
-        output_chunk_schema: scan_output_chunk_schema,
-        slot_ids,
-        query_global_dicts: build_scan_query_global_dicts(&output_slots, query_global_dict_map)?,
+        output_chunk_schema: scan_output_chunk_schema.clone(),
+        query_global_dicts: build_scan_query_global_dicts(
+            scan_output_chunk_schema.slot_ids(),
+            query_global_dict_map,
+        )?,
         limit,
         batch_size,
         query_timeout,
@@ -387,7 +381,7 @@ pub(crate) fn lower_lake_scan_node(
     let scan = connectors
         .create_scan_node("starrocks", ScanConfig::StarRocks(cfg))?
         .with_node_id(node.node_id)
-        .with_output_slots(output_slots)
+        .with_output_chunk_schema(scan_output_chunk_schema.clone())
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_local_rf_waiting_set(local_rf_waiting_set(node));
@@ -441,12 +435,7 @@ pub(crate) fn lower_lake_scan_node(
                 expr_slot_ids,
                 expr_slot_schemas: None,
                 output_indices: Some(output_indices),
-                output_slots: original_out_layout
-                    .order
-                    .iter()
-                    .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                    .collect::<Result<Vec<_>, _>>()?,
-                output_chunk_schema: Some(projected_output_chunk_schema),
+                output_chunk_schema: projected_output_chunk_schema,
             }),
         },
         layout: original_out_layout,

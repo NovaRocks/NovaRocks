@@ -253,7 +253,7 @@ fn resolve_output_type(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::function::map::eval_map_function;
     use crate::exec::expr::function::map::test_utils::{slot_id_expr, typed_null};
     use arrow::array::{
@@ -285,12 +285,21 @@ mod tests {
         let b_type = b.data_type().clone();
 
         let fields = vec![
-            field_with_slot_id(Field::new("a", a_type.clone(), true), SlotId::new(1)),
-            field_with_slot_id(Field::new("b", b_type.clone(), true), SlotId::new(2)),
+            Field::new("a", a_type.clone(), true),
+            Field::new("b", b_type.clone(), true),
         ];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![a, b]).unwrap();
         (
-            Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]),
+            {
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1), SlotId::new(2)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            },
             a_type,
             b_type,
         )

@@ -368,7 +368,7 @@ fn ensure_hash_on_input_slots(
 fn build_distinct_set_op_pipeline<S, MakeShared, MakeSink, MakeSource>(
     inputs: &[ExecNode],
     node_id: i32,
-    output_slots: &[crate::common::ids::SlotId],
+    output_chunk_schema: &crate::exec::chunk::ChunkSchemaRef,
     node_name: &'static str,
     controller_name: &'static str,
     ctx: &mut PipelineBuildContext,
@@ -378,7 +378,7 @@ fn build_distinct_set_op_pipeline<S, MakeShared, MakeSink, MakeSource>(
 ) -> Result<PipelineBuildResult, String>
 where
     S: Clone + 'static,
-    MakeShared: FnOnce(SetOpStageController, Vec<crate::common::ids::SlotId>) -> S,
+    MakeShared: FnOnce(SetOpStageController, crate::exec::chunk::ChunkSchemaRef) -> S,
     MakeSink: Fn(usize, S, i32) -> Box<dyn OperatorFactory>,
     MakeSource: Fn(S, i32) -> Box<dyn OperatorFactory>,
 {
@@ -396,7 +396,7 @@ where
         .map(|b| b.pipeline.dop as usize)
         .collect::<Vec<_>>();
     let controller = SetOpStageController::new(controller_name, stage_producers)?;
-    let shared = make_shared(controller, output_slots.to_vec());
+    let shared = make_shared(controller, Arc::clone(output_chunk_schema));
 
     let mut extra_pipelines = Vec::new();
     for (stage, mut child_build) in input_builds.into_iter().enumerate() {
@@ -450,7 +450,6 @@ fn build_pipeline_for_node(
             expr_slot_ids,
             expr_slot_schemas,
             output_indices,
-            output_slots,
             output_chunk_schema,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
@@ -465,7 +464,6 @@ fn build_pipeline_for_node(
                     expr_slot_ids.clone(),
                     expr_slot_schemas.clone(),
                     output_indices.clone(),
-                    output_slots.clone(),
                     output_chunk_schema.clone(),
                 )));
             build.stream = StreamDesc::any(build.pipeline.dop);
@@ -582,8 +580,7 @@ fn build_pipeline_for_node(
             is_left_join,
             param_types,
             ret_types,
-            output_schema,
-            output_slots,
+            output_chunk_schema,
             output_slot_sources,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
@@ -600,8 +597,7 @@ fn build_pipeline_for_node(
                     *is_left_join,
                     param_types.clone(),
                     ret_types.clone(),
-                    Arc::clone(output_schema),
-                    output_slots.clone(),
+                    Arc::clone(output_chunk_schema),
                     output_slot_sources.clone(),
                 )));
             build.stream = StreamDesc::any(build.pipeline.dop);
@@ -615,7 +611,7 @@ fn build_pipeline_for_node(
             functions,
             window,
             output_columns,
-            output_slots,
+            output_chunk_schema,
         }) => {
             let build = build_pipeline_for_node(input, ctx)?;
             let mut build = gather_to_one(build, ctx, *node_id);
@@ -627,7 +623,7 @@ fn build_pipeline_for_node(
                 functions.clone(),
                 window.clone(),
                 output_columns.clone(),
-                output_slots.clone(),
+                Arc::clone(output_chunk_schema),
                 *node_id,
             );
 
@@ -656,10 +652,10 @@ fn build_pipeline_for_node(
             functions,
             need_finalize,
             input_is_intermediate: _input_is_intermediate,
-            output_slots,
             output_chunk_schema,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
+            let output_slots = output_chunk_schema.slot_ids();
 
             let dop = build.pipeline.dop.max(1);
             let all_update = functions.iter().all(|f| !f.input_is_intermediate);
@@ -700,7 +696,6 @@ fn build_pipeline_for_node(
                         partial_functions,
                         true,
                         false,
-                        output_slots.clone(),
                         output_chunk_schema.clone(),
                     )));
 
@@ -735,7 +730,6 @@ fn build_pipeline_for_node(
                         merge_functions,
                         false,
                         true,
-                        output_slots.clone(),
                         output_chunk_schema.clone(),
                     )));
                 return Ok(build);
@@ -753,7 +747,6 @@ fn build_pipeline_for_node(
                     partial_functions,
                     true,
                     false,
-                    output_slots.clone(),
                     output_chunk_schema.clone(),
                 ));
                 build.pipeline.factories.push(local_factory);
@@ -795,7 +788,6 @@ fn build_pipeline_for_node(
                         merge_functions,
                         false,
                         true,
-                        output_slots.clone(),
                         output_chunk_schema.clone(),
                     )));
 
@@ -816,7 +808,6 @@ fn build_pipeline_for_node(
                 functions.clone(),
                 !*need_finalize,
                 false,
-                output_slots.clone(),
                 output_chunk_schema.clone(),
             ));
 
@@ -872,11 +863,8 @@ fn build_pipeline_for_node(
             node_id,
             join_type,
             distribution_mode,
-            left_schema,
             left_chunk_schema,
-            right_schema,
             right_chunk_schema,
-            join_scope_schema,
             join_scope_chunk_schema,
             probe_keys,
             build_keys,
@@ -924,11 +912,8 @@ fn build_pipeline_for_node(
                         probe_keys.clone(),
                         *residual_predicate,
                         probe_is_left,
-                        Arc::clone(left_schema),
                         Arc::clone(left_chunk_schema),
-                        Arc::clone(right_schema),
                         Arc::clone(right_chunk_schema),
-                        Arc::clone(join_scope_schema),
                         Arc::clone(join_scope_chunk_schema),
                         Arc::clone(&join_state),
                     ),
@@ -1020,11 +1005,8 @@ fn build_pipeline_for_node(
                     probe_keys.clone(),
                     *residual_predicate,
                     probe_is_left,
-                    Arc::clone(left_schema),
                     Arc::clone(left_chunk_schema),
-                    Arc::clone(right_schema),
                     Arc::clone(right_chunk_schema),
-                    Arc::clone(join_scope_schema),
                     Arc::clone(join_scope_chunk_schema),
                     Arc::clone(&join_state),
                 ),
@@ -1065,11 +1047,8 @@ fn build_pipeline_for_node(
             node_id,
             join_type,
             join_conjunct,
-            left_schema,
             left_chunk_schema,
-            right_schema,
             right_chunk_schema,
-            join_scope_schema,
             join_scope_chunk_schema,
         }) => {
             let probe_is_left = *join_type != NestedLoopJoinType::RightOuter;
@@ -1099,11 +1078,8 @@ fn build_pipeline_for_node(
                     *join_type,
                     *join_conjunct,
                     probe_is_left,
-                    Arc::clone(left_schema),
                     Arc::clone(left_chunk_schema),
-                    Arc::clone(right_schema),
                     Arc::clone(right_chunk_schema),
-                    Arc::clone(join_scope_schema),
                     Arc::clone(join_scope_chunk_schema),
                     Arc::clone(&state),
                 )));
@@ -1159,27 +1135,31 @@ fn build_pipeline_for_node(
             kind,
             inputs,
             node_id,
-            output_slots,
+            output_chunk_schema,
         }) => match kind {
             SetOpKind::Intersect => build_distinct_set_op_pipeline(
                 inputs,
                 *node_id,
-                output_slots,
+                output_chunk_schema,
                 "INTERSECT_NODE",
                 "intersect",
                 ctx,
-                |controller, slots| IntersectSharedState::new(controller, slots),
+                |controller, output_chunk_schema| {
+                    IntersectSharedState::new(controller, output_chunk_schema)
+                },
                 |stage, shared, id| Box::new(IntersectSinkFactory::new(stage, shared, id)),
                 |shared, id| Box::new(IntersectSourceFactory::new(shared, id)),
             ),
             SetOpKind::Except => build_distinct_set_op_pipeline(
                 inputs,
                 *node_id,
-                output_slots,
+                output_chunk_schema,
                 "EXCEPT_NODE",
                 "except",
                 ctx,
-                |controller, slots| ExceptSharedState::new(controller, slots),
+                |controller, output_chunk_schema| {
+                    ExceptSharedState::new(controller, output_chunk_schema)
+                },
                 |stage, shared, id| Box::new(ExceptSinkFactory::new(stage, shared, id)),
                 |shared, id| Box::new(ExceptSourceFactory::new(shared, id)),
             ),
@@ -1240,8 +1220,7 @@ fn build_pipeline_for_node(
                     fetch.target_node_id,
                     fetch.row_pos_descs.clone(),
                     fetch.nodes_info.clone(),
-                    fetch.output_slots.clone(),
-                    fetch.output_chunk_schema(),
+                    fetch.output_chunk_schema.clone(),
                 )));
             Ok(PipelineBuildResult {
                 pipeline: child_build.pipeline,
@@ -1281,7 +1260,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
     use crate::exec::node::values::ValuesNode;
@@ -1291,16 +1270,36 @@ mod tests {
 
     use super::build_pipeline_graph_for_exec_plan_with_dop;
 
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
+    }
+
     #[test]
     fn ensure_hash_dedups_redundant_shuffle_for_nested_group_by() {
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, false), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, false), SlotId::new(2)),
+            Field::new("k", DataType::Int32, false),
+            Field::new("v", DataType::Int32, false),
         ]));
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as arrow::array::ArrayRef;
         let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
+        let agg_output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, false),
+                Field::new("sum", DataType::Int64, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1325,8 +1324,7 @@ mod tests {
                 }],
                 need_finalize: true,
                 input_is_intermediate: false,
-                output_slots: vec![SlotId::new(1), SlotId::new(2)],
-                output_chunk_schema: None,
+                output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
             }),
         };
 
@@ -1347,8 +1345,7 @@ mod tests {
                 }],
                 need_finalize: true,
                 input_is_intermediate: false,
-                output_slots: vec![SlotId::new(1), SlotId::new(2)],
-                output_chunk_schema: None,
+                output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
             }),
         };
 
@@ -1378,13 +1375,28 @@ mod tests {
         // Regression for TPC-DS Q28: merge-serialize group-by aggregates must not emit duplicate
         // groups across drivers, otherwise downstream `count(key)` will over-count DISTINCT keys.
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, true), SlotId::new(2)),
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
         ]));
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as arrow::array::ArrayRef;
         let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
+        let agg_output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("sum", DataType::Int64, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1410,8 +1422,7 @@ mod tests {
                 // "merge serialize" style node: outputs intermediate, but still groups by keys.
                 need_finalize: false,
                 input_is_intermediate: true,
-                output_slots: vec![SlotId::new(1), SlotId::new(2)],
-                output_chunk_schema: None,
+                output_chunk_schema: agg_output_chunk_schema,
             }),
         };
 
@@ -1442,13 +1453,28 @@ mod tests {
         // must not emit duplicate group keys across drivers, otherwise upstream Sort+LIMIT can
         // return fewer than N distinct groups after downstream merge/finalize aggregation.
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("k", DataType::Int32, true), SlotId::new(1)),
-            field_with_slot_id(Field::new("v", DataType::Int32, true), SlotId::new(2)),
+            Field::new("k", DataType::Int32, true),
+            Field::new("v", DataType::Int32, true),
         ]));
         let keys = Arc::new(Int32Array::from(vec![1, 1, 2, 3])) as arrow::array::ArrayRef;
         let vals = Arc::new(Int32Array::from(vec![10, 20, 5, 7])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![keys, vals]).expect("record batch");
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
+        let agg_output_chunk_schema = chunk_schema_of(
+            &Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int32, true),
+                Field::new("sum", DataType::Int64, true),
+            ])),
+            &[SlotId::new(1), SlotId::new(2)],
+        );
 
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
@@ -1474,8 +1500,7 @@ mod tests {
                 // Outputs intermediate states to be merged/finalized downstream.
                 need_finalize: false,
                 input_is_intermediate: false,
-                output_slots: vec![SlotId::new(1), SlotId::new(2)],
-                output_chunk_schema: None,
+                output_chunk_schema: agg_output_chunk_schema,
             }),
         };
 

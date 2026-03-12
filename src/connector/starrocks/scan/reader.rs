@@ -128,15 +128,14 @@ impl StarRocksNativeReader {
         tablet_id: i64,
         storage_path: &str,
         version: i64,
-        required_schema: SchemaRef,
         required_chunk_schema: ChunkSchemaRef,
-        output_schema: SchemaRef,
         output_chunk_schema: ChunkSchemaRef,
         query_global_dicts: QueryGlobalDictEncodeMap,
         min_max_predicates: Vec<MinMaxPredicate>,
         object_store_profile: Option<&ObjectStoreProfile>,
         lake_schema_meta: Option<&LakeScanSchemaMeta>,
     ) -> Result<Self, String> {
+        let output_schema = output_chunk_schema.arrow_schema_ref();
         let snapshot = match load_tablet_snapshot(
             tablet_id,
             version,
@@ -206,7 +205,6 @@ impl StarRocksNativeReader {
             snapshot.rowset_count,
             snapshot.segment_files.len()
         );
-        let _ = required_schema;
         let output_schema_for_plan = output_schema.clone();
         let (scan_schema, has_dict_encoded_output) = build_scan_schema_for_global_dict_encoding(
             &output_schema_for_plan,
@@ -798,20 +796,18 @@ mod tests {
         let schema_a = Arc::new(Schema::new(vec![Field::new("v2", DataType::Utf8, false)]));
         let schema_b = Arc::new(Schema::new(vec![Field::new("v2", DataType::Utf8, false)]));
         let chunk_schema_a = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(2),
-                "v2",
-                false,
+                Field::new("v2", DataType::Utf8, false),
                 None,
                 None,
             )])
             .expect("chunk schema a"),
         );
         let chunk_schema_b = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(4),
-                "v2",
-                false,
+                Field::new("v2", DataType::Utf8, false),
                 None,
                 None,
             )])
@@ -836,10 +832,9 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Int32, true)]));
         let scan_schema = Arc::new(Schema::new(vec![Field::new("v1", DataType::Utf8, true)]));
         let chunk_schema = Arc::new(
-            ChunkSchema::try_new(vec![ChunkSlotSchema::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
                 SlotId::new(7),
-                "v1",
-                true,
+                Field::new("v1", DataType::Utf8, true),
                 None,
                 None,
             )])

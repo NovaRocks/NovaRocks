@@ -299,11 +299,6 @@ pub(crate) fn lower_project_node(
         )?);
     }
 
-    let output_slots = out_layout
-        .order
-        .iter()
-        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
     // output_indices = [num_common, num_common+1, ..., exprs.len()-1]
     let output_indices: Vec<usize> = (num_common..exprs.len()).collect();
     let output_chunk_schema = project_output_chunk_schema(&expr_slot_schemas, &output_indices)?;
@@ -318,8 +313,7 @@ pub(crate) fn lower_project_node(
                 expr_slot_ids,
                 expr_slot_schemas: Some(expr_slot_schemas),
                 output_indices: Some(output_indices),
-                output_slots: output_slots.clone(),
-                output_chunk_schema: Some(output_chunk_schema),
+                output_chunk_schema,
             }),
         },
         layout: out_layout,

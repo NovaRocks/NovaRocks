@@ -694,7 +694,6 @@ mod tests {
 
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::ExprArena;
     use crate::exec::node::scan::{ScanMorsel, ScanMorsels, ScanNode, ScanOp};
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -732,16 +731,19 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| "morsel index out of bounds".to_string())?;
 
-            let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-                Field::new("v", DataType::Int32, false),
-                SlotId::new(1),
-            )]));
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
             let array = Arc::new(Int32Array::from(data)) as arrow::array::ArrayRef;
             let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| e.to_string())?;
-            Ok(Box::new(std::iter::once(Ok(Chunk::new_with_slot_ids(
-                batch,
-                &[SlotId::new(1)],
-            )))))
+            Ok(Box::new(std::iter::once(Ok({
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            }))))
         }
 
         fn build_morsels(&self) -> Result<ScanMorsels, String> {

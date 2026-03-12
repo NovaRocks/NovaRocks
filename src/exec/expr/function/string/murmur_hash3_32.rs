@@ -156,7 +156,7 @@ fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {
 mod tests {
     use super::eval_murmur_hash3_32;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -172,13 +172,18 @@ mod tests {
         let c1 = Arc::new(StringArray::from(vec![Some("test1234567"), Some("hello")])) as ArrayRef;
         let c2 = Arc::new(StringArray::from(vec![Some("asdf213"), Some("world")])) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("c1", DataType::Utf8, true), SlotId(1)),
-            field_with_slot_id(Field::new("c2", DataType::Utf8, true), SlotId(2)),
+            Field::new("c1", DataType::Utf8, true),
+            Field::new("c2", DataType::Utf8, true),
         ]));
-        let chunk = Chunk::new_with_slot_ids(
-            RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch"),
-            &[SlotId(1), SlotId(2)],
-        );
+        let chunk = {
+            let batch = RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch");
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId(1), SlotId(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let out_single = eval_murmur_hash3_32(&arena, arg0, &[arg0], &chunk).expect("eval single");
         let out_single = out_single
@@ -207,13 +212,18 @@ mod tests {
         let c1 = Arc::new(StringArray::from(vec![Some("hello"), Some("hello")])) as ArrayRef;
         let c2 = Arc::new(StringArray::from(vec![None, Some("world")])) as ArrayRef;
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("c1", DataType::Utf8, true), SlotId(1)),
-            field_with_slot_id(Field::new("c2", DataType::Utf8, true), SlotId(2)),
+            Field::new("c1", DataType::Utf8, true),
+            Field::new("c2", DataType::Utf8, true),
         ]));
-        let chunk = Chunk::new_with_slot_ids(
-            RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch"),
-            &[SlotId(1), SlotId(2)],
-        );
+        let chunk = {
+            let batch = RecordBatch::try_new(schema, vec![c1, c2]).expect("record batch");
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId(1), SlotId(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let out = eval_murmur_hash3_32(&arena, arg0, &[arg0, arg1], &chunk).expect("eval");
         let out = out

@@ -128,11 +128,6 @@ pub(crate) fn lower_fetch_node(
         .collect();
     let fetch_layout = Layout { order, index };
 
-    let output_slots = fetch_layout
-        .order
-        .iter()
-        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
     let desc_tbl = desc_tbl.ok_or_else(|| {
         "FETCH_NODE requires descriptor table for output chunk schema".to_string()
     })?;
@@ -146,7 +141,6 @@ pub(crate) fn lower_fetch_node(
                 target_node_id,
                 row_pos_descs,
                 nodes_info: fetch.nodes_info.clone(),
-                output_slots,
                 output_chunk_schema,
             }),
         },

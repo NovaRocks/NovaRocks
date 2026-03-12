@@ -22,7 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 
 use crate::common::ids::SlotId;
 use crate::descriptors;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, cast_array_to_target};
 use crate::exec::node::project::ProjectNode;
 use crate::exec::node::union_all::UnionAllNode;
@@ -134,8 +134,9 @@ pub(crate) fn lower_union_node(
                     expr_slot_ids: output_slots.clone(),
                     expr_slot_schemas: None,
                     output_indices: None,
-                    output_slots: output_slots.clone(),
-                    output_chunk_schema: output_chunk_schema.clone(),
+                    output_chunk_schema: output_chunk_schema
+                        .clone()
+                        .expect("union lowering requires output chunk schema"),
                 }),
             });
         }
@@ -385,12 +386,15 @@ fn chunk_from_const_arrays(
     let schema = Arc::new(Schema::new(fields));
     let batch = if arrays.is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
-        RecordBatch::try_new_with_options(schema, arrays, &options)
+        RecordBatch::try_new_with_options(schema.clone(), arrays, &options)
     } else {
-        RecordBatch::try_new(schema, arrays)
+        RecordBatch::try_new(schema.clone(), arrays)
     }
     .map_err(|e| e.to_string())?;
-    Ok(Chunk::new_with_slot_ids(batch, slot_ids))
+    Chunk::try_new_with_chunk_schema(
+        batch,
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)?,
+    )
 }
 
 #[cfg(test)]

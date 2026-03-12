@@ -36,12 +36,12 @@ use arrow::array::{
     new_empty_array,
 };
 use arrow::compute::take;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field};
 use arrow_data::transform::MutableArrayData;
 
 use crate::common::ids::SlotId;
 use crate::common::largeint;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::expr::function::object::bitmap_common;
 use crate::exec::node::table_function::TableFunctionOutputSlot;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -59,8 +59,7 @@ pub struct TableFunctionProcessorFactory {
     is_left_join: bool,
     param_types: Vec<DataType>,
     ret_types: Vec<DataType>,
-    output_schema: SchemaRef,
-    output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     output_slot_sources: Vec<TableFunctionOutputSlot>,
 }
 
@@ -76,8 +75,7 @@ impl TableFunctionProcessorFactory {
         is_left_join: bool,
         param_types: Vec<DataType>,
         ret_types: Vec<DataType>,
-        output_schema: SchemaRef,
-        output_slots: Vec<SlotId>,
+        output_chunk_schema: ChunkSchemaRef,
         output_slot_sources: Vec<TableFunctionOutputSlot>,
     ) -> Self {
         let name = if node_id >= 0 {
@@ -95,8 +93,7 @@ impl TableFunctionProcessorFactory {
             is_left_join,
             param_types,
             ret_types,
-            output_schema,
-            output_slots,
+            output_chunk_schema,
             output_slot_sources,
         }
     }
@@ -118,8 +115,7 @@ impl OperatorFactory for TableFunctionProcessorFactory {
             is_left_join: self.is_left_join,
             param_types: self.param_types.clone(),
             ret_types: self.ret_types.clone(),
-            output_schema: Arc::clone(&self.output_schema),
-            output_slots: self.output_slots.clone(),
+            output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             output_slot_sources: self.output_slot_sources.clone(),
             output_chunk: None,
             output_offset: 0,
@@ -140,8 +136,7 @@ struct TableFunctionProcessorOperator {
     is_left_join: bool,
     param_types: Vec<DataType>,
     ret_types: Vec<DataType>,
-    output_schema: SchemaRef,
-    output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     output_slot_sources: Vec<TableFunctionOutputSlot>,
     output_chunk: Option<Chunk>,
     output_offset: usize,
@@ -267,17 +262,10 @@ impl TableFunctionProcessorOperator {
                 self.ret_types.len()
             ));
         }
-        if self.output_schema.fields().len() != self.output_slots.len() {
-            return Err(format!(
-                "table function output schema mismatch: schema={} slots={}",
-                self.output_schema.fields().len(),
-                self.output_slots.len()
-            ));
-        }
-        if self.output_slot_sources.len() != self.output_slots.len() {
+        if self.output_slot_sources.len() != self.output_chunk_schema.slot_ids().len() {
             return Err(format!(
                 "table function output mapping mismatch: slots={} sources={}",
-                self.output_slots.len(),
+                self.output_chunk_schema.slot_ids().len(),
                 self.output_slot_sources.len()
             ));
         }
@@ -640,7 +628,8 @@ impl TableFunctionProcessorOperator {
         outer_columns: HashMap<SlotId, ArrayRef>,
         result_columns: Vec<ArrayRef>,
     ) -> Result<Chunk, String> {
-        let mut output_columns: Vec<ArrayRef> = Vec::with_capacity(self.output_slots.len());
+        let mut output_columns: Vec<ArrayRef> =
+            Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
         for source in &self.output_slot_sources {
             match source {
                 TableFunctionOutputSlot::Outer { slot } => {
@@ -658,64 +647,40 @@ impl TableFunctionProcessorOperator {
             }
         }
 
-        let mut fields = Vec::with_capacity(self.output_slots.len());
-        for (idx, _slot_id) in self.output_slots.iter().enumerate() {
-            let name = self
-                .output_schema
-                .fields()
-                .get(idx)
-                .map(|f| f.name().clone())
-                .unwrap_or_else(|| format!("_tf_col_{idx}"));
-            let nullable = self
-                .output_schema
-                .fields()
-                .get(idx)
-                .map(|f| f.is_nullable())
-                .unwrap_or(true);
+        let mut fields = Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
+        for (idx, slot_id) in self.output_chunk_schema.slot_ids().iter().enumerate() {
+            let base_field = self
+                .output_chunk_schema
+                .slot(*slot_id)
+                .ok_or_else(|| format!("table function output slot {} missing", slot_id))?
+                .field();
             let dt = output_columns
                 .get(idx)
                 .ok_or_else(|| "table function output column missing".to_string())?
                 .data_type()
                 .clone();
-            fields.push(Arc::new(Field::new(name, dt, nullable)));
+            fields.push(Field::new(base_field.name(), dt, base_field.is_nullable()));
         }
-        let schema = Arc::new(Schema::new(fields));
-        Chunk::try_new_with_schema_and_slot_ids(schema, output_columns, &self.output_slots)
-            .map_err(|e| format!("table function build batch failed: {e}"))
+        Chunk::try_new_with_columns(
+            Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?),
+            output_columns,
+        )
+        .map_err(|e| format!("table function build batch failed: {e}"))
     }
 
     fn empty_output_chunk(&self) -> Result<Chunk, String> {
-        if self.output_schema.fields().len() != self.output_slots.len() {
-            return Err(format!(
-                "table function output schema mismatch: schema={} slots={}",
-                self.output_schema.fields().len(),
-                self.output_slots.len()
-            ));
+        let mut fields = Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
+        let mut columns = Vec::with_capacity(self.output_chunk_schema.slot_ids().len());
+        for slot in self.output_chunk_schema.slots() {
+            let field = slot.field().clone();
+            columns.push(new_empty_array(field.data_type()));
+            fields.push(field);
         }
-
-        let mut fields = Vec::with_capacity(self.output_slots.len());
-        let mut columns = Vec::with_capacity(self.output_slots.len());
-        for (idx, _slot_id) in self.output_slots.iter().enumerate() {
-            let field = self
-                .output_schema
-                .fields()
-                .get(idx)
-                .ok_or_else(|| format!("table function output schema field {} missing", idx))?
-                .as_ref()
-                .clone();
-            fields.push(Arc::new(field));
-            columns.push(new_empty_array(
-                self.output_schema
-                    .fields()
-                    .get(idx)
-                    .ok_or_else(|| format!("table function output schema field {} missing", idx))?
-                    .data_type(),
-            ));
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        Chunk::try_new_with_schema_and_slot_ids(schema, columns, &self.output_slots)
-            .map_err(|e| format!("table function build empty batch failed: {e}"))
+        Chunk::try_new_with_columns(
+            Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?),
+            columns,
+        )
+        .map_err(|e| format!("table function build empty batch failed: {e}"))
     }
 
     fn int_like_arg_to_i128(

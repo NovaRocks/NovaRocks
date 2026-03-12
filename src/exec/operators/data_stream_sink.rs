@@ -823,12 +823,8 @@ mod data_stream_sink_hash_partition {
                     new_columns.push(taken);
                 }
 
-                let new_chunk = Chunk::try_new_with_schema_and_chunk_schema(
-                    chunk.batch.schema(),
-                    new_columns,
-                    chunk.chunk_schema_ref(),
-                )
-                .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
+                let new_chunk = Chunk::try_new_with_columns(chunk.chunk_schema_ref(), new_columns)
+                    .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
 
                 partition_chunks.push(new_chunk);
             }
@@ -1377,12 +1373,9 @@ impl DataStreamSinkOperator {
                             new_columns.push(taken);
                         }
 
-                        let new_chunk = Chunk::try_new_with_schema_and_chunk_schema(
-                            chunk.batch.schema(),
-                            new_columns,
-                            chunk.chunk_schema_ref(),
-                        )
-                        .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
+                        let new_chunk =
+                            Chunk::try_new_with_columns(chunk.chunk_schema_ref(), new_columns)
+                                .map_err(|e| format!("Failed to create partition chunk: {}", e))?;
 
                         per_dest_chunks.push(vec![new_chunk]);
                     }
@@ -1905,9 +1898,9 @@ fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Chunk::try_new_with_schema_and_chunk_schema(
-        new_schema,
-        cols,
+    let _ = new_schema;
+    Chunk::try_new_with_columns(
         Arc::new(crate::exec::chunk::ChunkSchema::try_new(projected_slots)?),
+        cols,
     )
 }

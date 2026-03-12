@@ -1150,7 +1150,15 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build test batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn build_test_chunk_with_slot(slot_id: SlotId, values: Vec<i64>) -> Chunk {
@@ -1158,7 +1166,15 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build test batch");
-        Chunk::new_with_slot_ids(batch, &[slot_id])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[slot_id],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_dummy_type() -> types::TTypeDesc {

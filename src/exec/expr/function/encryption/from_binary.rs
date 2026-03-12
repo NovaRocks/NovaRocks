@@ -126,10 +126,7 @@ pub fn eval_from_binary(
 mod tests {
     use super::eval_from_binary;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
-    use crate::{
-        common::ids::SlotId,
-        exec::chunk::{Chunk, field_with_slot_id},
-    };
+    use crate::{common::ids::SlotId, exec::chunk::Chunk};
     use arrow::{
         array::{ArrayRef, BinaryArray, StringArray},
         datatypes::{DataType, Field, Schema},
@@ -139,12 +136,17 @@ mod tests {
 
     fn binary_chunk(values: Vec<Option<&[u8]>>) -> Chunk {
         let array = Arc::new(BinaryArray::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("b", DataType::Binary, true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Binary, true)]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

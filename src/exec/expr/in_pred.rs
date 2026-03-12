@@ -335,7 +335,6 @@ fn empty_chunk_with_rows(row_count: usize) -> Result<Chunk, String> {
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{
         Int32Builder, Int64Builder, MapArray, MapBuilder, MapFieldNames, RecordBatch,
@@ -390,12 +389,17 @@ mod tests {
             Some(1_672_531_193_000_000_i64),
             None,
         ])) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("dt", ts_type.clone(), true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("dt", ts_type.clone(), true)]));
         let batch = RecordBatch::try_new(schema, vec![values]).unwrap();
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let mut arena = ExprArena::default();
         let child = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), ts_type.clone());

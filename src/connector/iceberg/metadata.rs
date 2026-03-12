@@ -110,10 +110,11 @@ impl IcebergMetadataScanOp {
         let chunk_schema = Arc::new(ChunkSchema::try_new(
             cfg.output_columns
                 .iter()
-                .map(|col| {
-                    ChunkSlotSchema::try_new(col.slot_id, &col.name, col.nullable, None, None)
+                .zip(fields.iter())
+                .map(|(col, field)| {
+                    ChunkSlotSchema::new_with_field(col.slot_id, field.as_ref().clone(), None, None)
                 })
-                .collect::<Result<Vec<_>, _>>()?,
+                .collect(),
         )?);
         Ok(Self {
             output_schema: Arc::new(Schema::new(fields)),

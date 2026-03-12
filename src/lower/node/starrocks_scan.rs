@@ -16,12 +16,11 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
 use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, layout_for_row_tuples,
-    layout_from_slot_ids, schema_for_layout, schema_for_tuple,
+    layout_from_slot_ids,
 };
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::novarocks_connectors::{
@@ -78,21 +77,17 @@ pub(crate) fn lower_starrocks_scan_node(
             node.node_id
         )
     })?;
-    let schema = schema_for_layout(desc_tbl, &out_layout)?;
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
-    let required_schema = schema_for_tuple(desc_tbl, tuple_id)?;
     let required_chunk_schema = chunk_schema_for_tuple(desc_tbl, tuple_id)?;
+    let output_schema = output_chunk_schema.arrow_schema_ref();
 
-    let slot_ids = out_layout
-        .order
-        .iter()
-        .map(|(_, s)| SlotId::try_from(*s))
-        .collect::<Result<Vec<_>, _>>()?;
-    if !slot_ids.is_empty() && slot_ids.len() != schema.fields().len() {
+    if !output_chunk_schema.slot_ids().is_empty()
+        && output_chunk_schema.slot_ids().len() != output_schema.fields().len()
+    {
         return Err(format!(
             "STARROCKS_SCAN_NODE output layout/schema mismatch: layout_len={}, schema_len={}",
-            slot_ids.len(),
-            schema.fields().len()
+            output_chunk_schema.slot_ids().len(),
+            output_schema.fields().len()
         ));
     }
 
@@ -172,18 +167,14 @@ pub(crate) fn lower_starrocks_scan_node(
         );
     }
 
-    let output_slots = slot_ids.clone();
     let cfg = StarRocksScanConfig {
         db_name: sr.db_name.clone().filter(|s| !s.is_empty()),
         table_name: sr.table_name.clone().filter(|s| !s.is_empty()),
         properties: sr.properties.clone().unwrap_or_default(),
         ranges,
         has_more,
-        required_schema,
         required_chunk_schema,
-        schema,
-        output_chunk_schema,
-        slot_ids,
+        output_chunk_schema: output_chunk_schema.clone(),
         query_global_dicts: std::collections::HashMap::new(),
         limit,
         batch_size,
@@ -197,7 +188,7 @@ pub(crate) fn lower_starrocks_scan_node(
     let scan = connectors
         .create_scan_node("starrocks", ScanConfig::StarRocks(cfg))?
         .with_node_id(node.node_id)
-        .with_output_slots(output_slots)
+        .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_local_rf_waiting_set(local_rf_waiting_set(node));

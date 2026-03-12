@@ -329,7 +329,6 @@ mod tests {
     use super::*;
     use crate::common::ids::SlotId;
     use crate::common::largeint;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{FixedSizeBinaryArray, Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -337,22 +336,40 @@ mod tests {
 
     fn create_test_chunk_int(values: Vec<i64>) -> Chunk {
         let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Int64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::Int64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn create_test_chunk_float(values: Vec<f64>) -> Chunk {
         let array = Arc::new(Float64Array::from(values)) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("col0", DataType::Float64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col0",
+            DataType::Float64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

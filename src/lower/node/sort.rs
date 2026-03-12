@@ -272,16 +272,12 @@ fn normalize_sort_input(
                 .collect::<Result<Vec<_>, _>>()?,
             expr_slot_schemas: None,
             output_indices: None,
-            output_slots: effective_out_layout
-                .order
-                .iter()
-                .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-                .collect::<Result<Vec<_>, _>>()?,
-            output_chunk_schema: if let Some(desc_tbl) = desc_tbl {
-                Some(chunk_schema_for_layout(desc_tbl, &effective_out_layout)?)
-            } else {
-                None
-            },
+            output_chunk_schema: chunk_schema_for_layout(
+                desc_tbl.ok_or_else(|| {
+                    "SORT_NODE requires desc_tbl for projection chunk schema".to_string()
+                })?,
+                &effective_out_layout,
+            )?,
         }),
     };
 
@@ -411,12 +407,12 @@ fn build_sort_tuple_projection(
             expr_slot_ids: output_slots.clone(),
             expr_slot_schemas: None,
             output_indices: None,
-            output_slots,
-            output_chunk_schema: if let Some(desc_tbl) = desc_tbl {
-                Some(chunk_schema_for_layout(desc_tbl, out_layout)?)
-            } else {
-                None
-            },
+            output_chunk_schema: chunk_schema_for_layout(
+                desc_tbl.ok_or_else(|| {
+                    "SORT_NODE requires desc_tbl for tuple projection chunk schema".to_string()
+                })?,
+                out_layout,
+            )?,
         }),
     };
 

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, new_empty_array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field};
 
 use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -61,23 +61,13 @@ fn projected_slot_schema_from_existing(
     slot_id: SlotId,
     field: &Field,
 ) -> ChunkSlotSchema {
-    ChunkSlotSchema::new(
-        slot_id,
-        field.name().to_string(),
-        field.is_nullable(),
-        existing.type_desc().cloned(),
-        existing.unique_id(),
-    )
+    existing
+        .with_field_and_slot_id(slot_id, field.clone())
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn synthetic_slot_schema(slot_id: SlotId, field: &Field) -> ChunkSlotSchema {
-    ChunkSlotSchema::new(
-        slot_id,
-        field.name().to_string(),
-        field.is_nullable(),
-        None,
-        None,
-    )
+    ChunkSlotSchema::new_with_field(slot_id, field.clone(), None, None)
 }
 
 /// Factory for projection processors that evaluate expression lists into projected chunks.
@@ -88,8 +78,7 @@ pub struct ProjectProcessorFactory {
     expr_slot_ids: Vec<SlotId>,
     expr_slot_schemas: Option<Vec<ChunkSlotSchema>>,
     output_indices: Option<Vec<usize>>,
-    output_slots: Vec<SlotId>,
-    output_chunk_schema: Option<ChunkSchemaRef>,
+    output_chunk_schema: ChunkSchemaRef,
 }
 
 impl ProjectProcessorFactory {
@@ -101,8 +90,7 @@ impl ProjectProcessorFactory {
         expr_slot_ids: Vec<SlotId>,
         expr_slot_schemas: Option<Vec<ChunkSlotSchema>>,
         output_indices: Option<Vec<usize>>,
-        output_slots: Vec<SlotId>,
-        output_chunk_schema: Option<ChunkSchemaRef>,
+        output_chunk_schema: ChunkSchemaRef,
     ) -> Self {
         let mut name = if node_id >= 0 {
             format!("PROJECT (id={node_id})")
@@ -121,7 +109,6 @@ impl ProjectProcessorFactory {
             expr_slot_ids,
             expr_slot_schemas,
             output_indices,
-            output_slots,
             output_chunk_schema,
         }
     }
@@ -146,8 +133,7 @@ impl OperatorFactory for ProjectProcessorFactory {
                 .map(|schema| (schema.slot_id(), schema))
                 .collect(),
             output_indices: self.output_indices.clone(),
-            output_slots: self.output_slots.clone(),
-            output_chunk_schema: self.output_chunk_schema.clone(),
+            output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             pending_output: None,
             finishing: false,
             finished: false,
@@ -162,8 +148,7 @@ struct ProjectProcessorOperator {
     expr_slot_ids: Vec<SlotId>,
     expr_slot_schemas: HashMap<SlotId, ChunkSlotSchema>,
     output_indices: Option<Vec<usize>>,
-    output_slots: Vec<SlotId>,
-    output_chunk_schema: Option<ChunkSchemaRef>,
+    output_chunk_schema: ChunkSchemaRef,
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
@@ -230,21 +215,6 @@ impl ProjectProcessorOperator {
         self.expr_slot_schemas.get(&slot_id).cloned()
     }
 
-    fn output_slot_schema(
-        &self,
-        working_chunk: &Chunk,
-        slot_id: SlotId,
-        field: &Field,
-    ) -> ChunkSlotSchema {
-        self.output_chunk_schema
-            .as_ref()
-            .and_then(|schema| schema.slot(slot_id).cloned())
-            .or_else(|| self.declared_slot_schema(slot_id))
-            .or_else(|| working_chunk.chunk_schema().slot(slot_id).cloned())
-            .map(|schema| projected_slot_schema_from_existing(&schema, slot_id, field))
-            .unwrap_or_else(|| synthetic_slot_schema(slot_id, field))
-    }
-
     fn build_chunk_schema(slot_schemas: Vec<ChunkSlotSchema>) -> Result<ChunkSchemaRef, String> {
         Ok(Arc::new(ChunkSchema::try_new(slot_schemas)?))
     }
@@ -304,17 +274,13 @@ impl ProjectProcessorOperator {
                     .map(|schema| field_from_slot_schema(schema, data_type))
                     .unwrap_or_else(|| projected_field_from_existing(old_field, data_type));
                 fields[existing_idx] = Arc::new(replaced.clone());
-                let new_schema = Arc::new(Schema::new(fields));
                 let mut slot_schemas = working_chunk.chunk_schema().slots().to_vec();
                 slot_schemas[existing_idx] = preferred_slot_schema
                     .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &replaced))
                     .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &replaced));
-                working_chunk = Chunk::try_new_with_schema_and_chunk_schema(
-                    new_schema,
-                    columns,
-                    Self::build_chunk_schema(slot_schemas)?,
-                )
-                .map_err(|e| format!("Failed to replace chunk column: {}", e))?;
+                working_chunk =
+                    Chunk::try_new_with_columns(Self::build_chunk_schema(slot_schemas)?, columns)
+                        .map_err(|e| format!("Failed to replace chunk column: {}", e))?;
                 continue;
             }
 
@@ -348,7 +314,6 @@ impl ProjectProcessorOperator {
                 )
             };
             fields.push(Arc::new(field.clone()));
-            let new_schema = Arc::new(Schema::new(fields));
             let slot_schema = declared_slot_schema
                 .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &field))
                 .or_else(|| {
@@ -367,12 +332,9 @@ impl ProjectProcessorOperator {
             let mut slot_schemas = working_chunk.chunk_schema().slots().to_vec();
             slot_schemas.push(slot_schema);
 
-            working_chunk = Chunk::try_new_with_schema_and_chunk_schema(
-                new_schema,
-                columns,
-                Self::build_chunk_schema(slot_schemas)?,
-            )
-            .map_err(|e| format!("Failed to extend chunk: {}", e))?;
+            working_chunk =
+                Chunk::try_new_with_columns(Self::build_chunk_schema(slot_schemas)?, columns)
+                    .map_err(|e| format!("Failed to extend chunk: {}", e))?;
         }
 
         // Apply output_indices if specified (column pruning)
@@ -394,25 +356,25 @@ impl ProjectProcessorOperator {
         };
 
         // Infer schema from final columns
-        if self.output_slots.len() != final_columns.len() {
+        if self.output_chunk_schema.slot_ids().len() != final_columns.len() {
             return Err(format!(
                 "project output slots mismatch: slots={} columns={}",
-                self.output_slots.len(),
+                self.output_chunk_schema.slot_ids().len(),
                 final_columns.len()
             ));
         }
 
-        let mut fields: Vec<Arc<Field>> = Vec::with_capacity(final_columns.len());
+        let mut fields: Vec<Field> = Vec::with_capacity(final_columns.len());
         let working_schema = working_chunk.batch.schema();
         for (idx, (array, slot_id)) in final_columns
             .iter()
-            .zip(self.output_slots.iter())
+            .zip(self.output_chunk_schema.slot_ids().iter())
             .enumerate()
         {
             let declared_output_slot_schema = self
                 .output_chunk_schema
-                .as_ref()
-                .and_then(|schema| schema.slot(*slot_id).cloned())
+                .slot(*slot_id)
+                .cloned()
                 .or_else(|| self.declared_slot_schema(*slot_id));
             let runtime_nullable = array.null_count() > 0;
             let base = declared_output_slot_schema
@@ -438,44 +400,12 @@ impl ProjectProcessorOperator {
                 .unwrap_or_else(|| {
                     Field::new(format!("col_{}", idx), array.data_type().clone(), true)
                 });
-            fields.push(Arc::new(base));
+            fields.push(base);
         }
-        let output_slot_schemas = fields
-            .iter()
-            .zip(self.output_slots.iter())
-            .map(|(field, slot_id)| {
-                self.output_slot_schema(&working_chunk, *slot_id, field.as_ref())
-            })
-            .collect::<Vec<_>>();
-        let schema = Arc::new(Schema::new(fields));
-        let output_chunk_schema = if let Some(explicit) = self.output_chunk_schema.as_ref() {
-            let slot_schemas = schema
-                .fields()
-                .iter()
-                .zip(self.output_slots.iter())
-                .map(|(field, slot_id)| {
-                    let slot_schema = explicit.slot(*slot_id).ok_or_else(|| {
-                        format!(
-                            "project explicit output chunk schema missing slot {}",
-                            slot_id
-                        )
-                    })?;
-                    ChunkSlotSchema::try_new(
-                        *slot_id,
-                        field.name(),
-                        field.is_nullable(),
-                        slot_schema.type_desc().cloned(),
-                        slot_schema.unique_id(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Self::build_chunk_schema(slot_schemas)?
-        } else {
-            Self::build_chunk_schema(output_slot_schemas)?
-        };
+        let output_chunk_schema = Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?);
 
         Ok(Some(
-            Chunk::try_new_with_schema_and_chunk_schema(schema, final_columns, output_chunk_schema)
+            Chunk::try_new_with_columns(output_chunk_schema, final_columns)
                 .map_err(|e| format!("Failed to create output batch: {}", e))?,
         ))
     }
@@ -498,20 +428,19 @@ impl ProjectProcessorOperator {
             self.exprs.clone()
         };
 
-        if self.output_slots.len() != selected_exprs.len() {
+        if self.output_chunk_schema.slot_ids().len() != selected_exprs.len() {
             return Err(format!(
                 "project output slots mismatch on empty input: slots={} exprs={}",
-                self.output_slots.len(),
+                self.output_chunk_schema.slot_ids().len(),
                 selected_exprs.len()
             ));
         }
 
-        let mut fields: Vec<Arc<Field>> = Vec::with_capacity(selected_exprs.len());
+        let mut fields: Vec<Field> = Vec::with_capacity(selected_exprs.len());
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(selected_exprs.len());
-        let mut output_slot_schemas = Vec::with_capacity(selected_exprs.len());
         for (idx, (expr_id, slot_id)) in selected_exprs
             .iter()
-            .zip(self.output_slots.iter())
+            .zip(self.output_chunk_schema.slot_ids().iter())
             .enumerate()
         {
             let data_type = self
@@ -521,31 +450,20 @@ impl ProjectProcessorOperator {
                 .clone();
             let declared_slot_schema = self
                 .output_chunk_schema
-                .as_ref()
-                .and_then(|schema| schema.slot(*slot_id).cloned())
+                .slot(*slot_id)
+                .cloned()
                 .or_else(|| self.declared_slot_schema(*slot_id));
             let field = declared_slot_schema
                 .as_ref()
                 .map(|schema| field_from_slot_schema(schema, &data_type))
                 .unwrap_or_else(|| Field::new(format!("col_{}", idx), data_type.clone(), true));
-            output_slot_schemas.push(
-                declared_slot_schema
-                    .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &field))
-                    .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &field)),
-            );
-            fields.push(Arc::new(field));
+            fields.push(field);
             columns.push(new_empty_array(&data_type));
         }
 
-        let schema = Arc::new(Schema::new(fields));
-        Chunk::try_new_with_schema_and_chunk_schema(
-            schema,
-            columns,
-            self.output_chunk_schema
-                .clone()
-                .unwrap_or(Self::build_chunk_schema(output_slot_schemas)?),
-        )
-        .map_err(|e| format!("Failed to create empty output batch: {}", e))
+        let output_chunk_schema = Arc::new(self.output_chunk_schema.with_fields_in_order(fields)?);
+        Chunk::try_new_with_columns(output_chunk_schema, columns)
+            .map_err(|e| format!("Failed to create empty output batch: {}", e))
     }
 }
 
@@ -560,10 +478,15 @@ mod tests {
 
     use super::ProjectProcessorOperator;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::{ExprArena, ExprNode};
     use crate::lower::type_lowering::scalar_type_desc;
     use crate::types::TPrimitiveType;
+
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
+    }
 
     #[test]
     fn project_allows_overwriting_existing_slot_for_follow_up_exprs() {
@@ -578,8 +501,25 @@ mod tests {
             expr_slot_ids: vec![SlotId::new(17), SlotId::new(19)],
             expr_slot_schemas: HashMap::new(),
             output_indices: None,
-            output_slots: vec![SlotId::new(17), SlotId::new(19)],
-            output_chunk_schema: None,
+            output_chunk_schema: Arc::new(
+                ChunkSchema::try_new(vec![
+                    ChunkSlotSchema::new(
+                        SlotId::new(17),
+                        "s17",
+                        true,
+                        Some(scalar_type_desc(TPrimitiveType::INT)),
+                        None,
+                    ),
+                    ChunkSlotSchema::new(
+                        SlotId::new(19),
+                        "s19",
+                        true,
+                        Some(scalar_type_desc(TPrimitiveType::INT)),
+                        None,
+                    ),
+                ])
+                .expect("output chunk schema"),
+            ),
             pending_output: None,
             finishing: false,
             finished: false,
@@ -587,8 +527,8 @@ mod tests {
 
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
-                field_with_slot_id(Field::new("s17", DataType::Int32, true), SlotId::new(17)),
-                field_with_slot_id(Field::new("s18", DataType::Int32, true), SlotId::new(18)),
+                Field::new("s17", DataType::Int32, true),
+                Field::new("s18", DataType::Int32, true),
             ])),
             vec![
                 Arc::new(Int32Array::from(vec![1, 2])),
@@ -597,10 +537,16 @@ mod tests {
         )
         .expect("build input batch");
         let output = op
-            .process_one(Chunk::new_with_slot_ids(
-                batch,
-                &[SlotId::new(17), SlotId::new(18)],
-            ))
+            .process_one({
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(17), SlotId::new(18)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            })
             .expect("project should succeed")
             .expect("project output");
 
@@ -639,32 +585,22 @@ mod tests {
             expr_slot_ids: vec![output_slot],
             expr_slot_schemas: HashMap::from([(output_slot, output_slot_schema.clone())]),
             output_indices: None,
-            output_slots: vec![output_slot],
-            output_chunk_schema: Some(Arc::clone(&output_chunk_schema)),
+            output_chunk_schema: Arc::clone(&output_chunk_schema),
             pending_output: None,
             finishing: false,
             finished: false,
         };
 
         let input_batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![field_with_slot_id(
-                Field::new("in", DataType::Binary, true),
-                SlotId::new(1),
-            )])),
+            Arc::new(Schema::new(vec![Field::new("in", DataType::Binary, true)])),
             vec![Arc::new(BinaryArray::from(vec![Some(b"x".as_slice())]))],
         )
         .expect("input batch");
         let input_chunk = Chunk::new_with_chunk_schema(
             input_batch,
-            Arc::new(
-                ChunkSchema::try_new(vec![ChunkSlotSchema::new(
-                    SlotId::new(1),
-                    "in",
-                    true,
-                    None,
-                    None,
-                )])
-                .expect("input schema"),
+            chunk_schema_of(
+                &Arc::new(Schema::new(vec![Field::new("in", DataType::Binary, true)])),
+                &[SlotId::new(1)],
             ),
         );
 

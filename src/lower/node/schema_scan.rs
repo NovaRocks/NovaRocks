@@ -19,7 +19,6 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
-use crate::common::ids::SlotId;
 use crate::connector::schema::{BeSchemaTable, SchemaScanContext, SchemaScanOp, SchemaTable};
 use crate::descriptors;
 use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -127,13 +126,6 @@ fn lower_supported_schema_scan_node(
         .schema_scan_node
         .as_ref()
         .ok_or_else(|| "SCHEMA_SCAN_NODE missing schema_scan_node payload".to_string())?;
-    let output_schema = if out_layout.order.is_empty() {
-        Arc::new(Schema::empty())
-    } else {
-        let desc_tbl =
-            desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
-        schema_for_layout(desc_tbl, out_layout)?
-    };
     let output_chunk_schema = if out_layout.order.is_empty() {
         Arc::new(ChunkSchema::empty())
     } else {
@@ -141,11 +133,6 @@ fn lower_supported_schema_scan_node(
             desc_tbl.ok_or_else(|| "SCHEMA_SCAN_NODE requires desc_tbl for schema".to_string())?;
         chunk_schema_for_layout(desc_tbl, out_layout)?
     };
-    let output_slots = out_layout
-        .order
-        .iter()
-        .map(|(_, slot_id)| SlotId::try_from(*slot_id))
-        .collect::<Result<Vec<_>, _>>()?;
     let context = SchemaScanContext::from_thrift(schema_scan);
     let should_scan = if require_scan_ranges {
         schema_scan_selected_for_current_fragment(node.node_id, exec_params)?
@@ -155,13 +142,12 @@ fn lower_supported_schema_scan_node(
     let scan = ScanNode::new(Arc::new(SchemaScanOp::new(
         table,
         context,
-        output_schema,
-        output_chunk_schema,
+        output_chunk_schema.clone(),
         should_scan,
         fe_addr.cloned(),
     )))
     .with_node_id(node.node_id)
-    .with_output_slots(output_slots)
+    .with_output_chunk_schema(output_chunk_schema)
     .with_local_rf_waiting_set(local_rf_waiting_set(node));
     Ok(Lowered {
         node: ExecNode {

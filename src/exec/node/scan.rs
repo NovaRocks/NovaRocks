@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
-use crate::common::ids::SlotId;
 use crate::descriptors;
+use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::RowPositionSpec;
@@ -216,7 +216,7 @@ pub struct ScanNode {
     node_id: Option<i32>,
     runtime_filter_specs: Vec<RuntimeFilterProbeSpec>,
     conjunct_predicate: Option<ExprId>,
-    output_slots: Vec<SlotId>,
+    output_chunk_schema: ChunkSchemaRef,
     connector_io_tasks_per_scan_operator: Option<i32>,
     /// Scan-level limit for early termination optimization.
     /// When set, scan operators will stop reading new morsels after outputting this many rows.
@@ -235,7 +235,7 @@ impl ScanNode {
             node_id: None,
             runtime_filter_specs: Vec::new(),
             conjunct_predicate: None,
-            output_slots: Vec::new(),
+            output_chunk_schema: Arc::new(ChunkSchema::empty()),
             connector_io_tasks_per_scan_operator: None,
             limit: None,
             local_rf_waiting_set: Vec::new(),
@@ -256,8 +256,8 @@ impl ScanNode {
         self
     }
 
-    pub fn with_output_slots(mut self, output_slots: Vec<SlotId>) -> Self {
-        self.output_slots = output_slots;
+    pub fn with_output_chunk_schema(mut self, output_chunk_schema: ChunkSchemaRef) -> Self {
+        self.output_chunk_schema = output_chunk_schema;
         self
     }
 
@@ -312,8 +312,8 @@ impl ScanNode {
         &self.runtime_filter_specs
     }
 
-    pub fn output_slots(&self) -> &[SlotId] {
-        &self.output_slots
+    pub fn output_chunk_schema(&self) -> ChunkSchemaRef {
+        Arc::clone(&self.output_chunk_schema)
     }
 
     pub fn conjunct_predicate(&self) -> Option<ExprId> {

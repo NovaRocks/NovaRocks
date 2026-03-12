@@ -21,7 +21,7 @@ use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
     TimestampMicrosecondBuilder,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -43,10 +43,10 @@ pub(crate) fn normalize_column_key(name: &str) -> String {
 }
 
 pub(crate) fn build_chunk(
-    schema: SchemaRef,
     chunk_schema: ChunkSchemaRef,
     rows: &[SchemaRow],
 ) -> Result<Chunk, String> {
+    let schema = chunk_schema.arrow_schema_ref();
     if rows.is_empty() {
         return Chunk::try_new_with_chunk_schema(RecordBatch::new_empty(schema), chunk_schema);
     }

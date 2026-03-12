@@ -16,19 +16,12 @@
 // under the License.
 use std::collections::HashMap;
 
-use crate::common::ids::SlotId;
+use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::row_position::RowPositionDescriptor;
 
 #[derive(Clone, Debug)]
 pub struct LookUpNode {
     pub node_id: i32,
     pub row_pos_descs: HashMap<i32, RowPositionDescriptor>,
-    pub output_slots: Vec<SlotId>,
-    pub output_slots_by_tuple: HashMap<i32, Vec<SlotId>>,
-}
-
-impl LookUpNode {
-    pub fn output_slots(&self) -> &[SlotId] {
-        &self.output_slots
-    }
+    pub output_chunk_schema: ChunkSchemaRef,
 }

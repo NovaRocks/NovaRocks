@@ -3363,7 +3363,7 @@ mod tests {
 
     use super::{TabletWriteContext, append_lake_txn_log_with_rowset, read_txn_log_if_exists};
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::formats::starrocks::metadata::{
         collect_delete_predicates, lake_rowset_visibility_version,
     };
@@ -3416,8 +3416,8 @@ mod tests {
         }
     }
 
-    fn slot_field(name: &str, data_type: DataType, nullable: bool, slot_id: u32) -> Field {
-        field_with_slot_id(Field::new(name, data_type, nullable), SlotId::new(slot_id))
+    fn slot_field(name: &str, data_type: DataType, nullable: bool, _slot_id: u32) -> Field {
+        Field::new(name, data_type, nullable)
     }
 
     fn test_context(
@@ -3853,7 +3853,15 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))])
             .expect("build record batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn dup_auto_increment_batch(c1_values: Vec<i64>, id_values: Vec<Option<i64>>) -> RecordBatch {
@@ -3889,7 +3897,15 @@ mod tests {
             ],
         )
         .expect("build rollup source batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn rollup_source_batch_missing_value(k1_values: Vec<i32>, k2_values: Vec<i32>) -> Chunk {
@@ -3912,7 +3928,15 @@ mod tests {
             ],
         )
         .expect("build rollup source batch with extra columns but without value column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn test_duplicate_key_full_schema_tablet_schema(schema_id: i64) -> TabletSchemaPb {
@@ -4054,15 +4078,20 @@ mod tests {
             ],
         )
         .expect("build duplicate-key full-schema batch with repeated expression names");
-        Chunk::new_with_slot_ids(
-            batch,
-            &[
-                SlotId::new(1),
-                SlotId::new(2),
-                SlotId::new(3),
-                SlotId::new(4),
-            ],
-        )
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[
+                    SlotId::new(1),
+                    SlotId::new(2),
+                    SlotId::new(3),
+                    SlotId::new(4),
+                ],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_key_only_batch(keys: Vec<i32>) -> Chunk {
@@ -4074,7 +4103,15 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(keys))])
             .expect("build key-only record batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_delete_batch_with_op(keys: Vec<i32>) -> Chunk {
@@ -4091,7 +4128,15 @@ mod tests {
             ],
         )
         .expect("build delete record batch with explicit op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_upsert_batch_with_op(keys: Vec<i32>, values: Vec<i64>) -> Chunk {
@@ -4111,7 +4156,15 @@ mod tests {
             ],
         )
         .expect("build upsert record batch with explicit op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_mixed_batch_with_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
@@ -4131,7 +4184,15 @@ mod tests {
             ],
         )
         .expect("build mixed record batch with explicit op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_batch_with_nullable_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<Option<i8>>) -> Chunk {
@@ -4151,7 +4212,15 @@ mod tests {
             ],
         )
         .expect("build batch with nullable op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_batch_with_int32_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i32>) -> Chunk {
@@ -4171,7 +4240,15 @@ mod tests {
             ],
         )
         .expect("build batch with int32 op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_batch_with_float64_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<f64>) -> Chunk {
@@ -4191,7 +4268,15 @@ mod tests {
             ],
         )
         .expect("build batch with float64 op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(2), SlotId::new(3)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_batch_with_non_last_op(keys: Vec<i32>, values: Vec<i64>, ops: Vec<i8>) -> Chunk {
@@ -4211,7 +4296,15 @@ mod tests {
             ],
         )
         .expect("build batch with non-last op column");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1), SlotId::new(3), SlotId::new(2)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1), SlotId::new(3), SlotId::new(2)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn pk_bigint_key_only_batch(keys: Vec<i64>) -> RecordBatch {

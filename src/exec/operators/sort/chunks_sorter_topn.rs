@@ -379,7 +379,6 @@ fn filter_chunk_by_boundary(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -387,13 +386,18 @@ mod tests {
     use std::sync::Arc;
 
     fn make_chunk(values: Vec<Option<i32>>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v", DataType::Int32, true),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
             .expect("record batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     fn single_key_order_by(asc: bool, nulls_first: bool) -> (ExprArena, Vec<SortExpression>) {

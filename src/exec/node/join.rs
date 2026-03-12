@@ -19,7 +19,6 @@ use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
 use crate::types;
-use arrow::datatypes::SchemaRef;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JoinType {
@@ -56,14 +55,8 @@ pub struct JoinNode {
     pub node_id: i32,
     pub join_type: JoinType,
     pub distribution_mode: JoinDistributionMode,
-    /// Schema for the original left child output (plan order).
-    pub left_schema: SchemaRef,
     pub left_chunk_schema: ChunkSchemaRef,
-    /// Schema for the original right child output (plan order).
-    pub right_schema: SchemaRef,
     pub right_chunk_schema: ChunkSchemaRef,
-    /// Schema for the join-scope output (left then right, plan order).
-    pub join_scope_schema: SchemaRef,
     pub join_scope_chunk_schema: ChunkSchemaRef,
     pub probe_keys: Vec<ExprId>,
     pub build_keys: Vec<ExprId>,
@@ -72,4 +65,18 @@ pub struct JoinNode {
     pub eq_null_safe: Vec<bool>,
     pub residual_predicate: Option<ExprId>,
     pub runtime_filters: Vec<JoinRuntimeFilterSpec>,
+}
+
+impl JoinNode {
+    pub fn left_schema(&self) -> arrow::datatypes::SchemaRef {
+        self.left_chunk_schema.arrow_schema_ref()
+    }
+
+    pub fn right_schema(&self) -> arrow::datatypes::SchemaRef {
+        self.right_chunk_schema.arrow_schema_ref()
+    }
+
+    pub fn join_scope_schema(&self) -> arrow::datatypes::SchemaRef {
+        self.join_scope_chunk_schema.arrow_schema_ref()
+    }
 }

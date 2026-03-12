@@ -67,7 +67,7 @@ pub(crate) fn lower_compound_pred(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::ExprArena;
     use crate::exprs::{TExpr, TExprNode, TExprNodeType};
     use crate::lower::expr::lower_t_expr;
@@ -144,7 +144,15 @@ mod tests {
         let schema = Arc::new(Schema::empty());
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(schema, vec![], &options).expect("batch");
-        Chunk::new_with_slot_ids(batch, &[])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[allow(dead_code)]
@@ -191,13 +199,18 @@ mod tests {
 
         let id = lower_t_expr(&expr, &mut arena, &layout, None, None).expect("lower");
 
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("c0", DataType::Int64, true),
-            SlotId::new(0),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, true)]));
         let col0 = Arc::new(Int64Array::from(vec![Some(0), Some(7), None, Some(-2)]));
         let batch = RecordBatch::try_new(schema, vec![col0]).expect("batch");
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(0)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(0)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let array = arena.eval(id, &chunk).expect("eval");
         let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();

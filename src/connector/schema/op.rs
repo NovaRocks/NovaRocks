@@ -19,7 +19,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
 use chrono::NaiveDateTime;
 use regex::Regex;
 
@@ -45,7 +44,6 @@ const DEFAULT_CHUNK_ROWS: usize = 4096;
 pub(crate) struct SchemaScanOp {
     table: SchemaTable,
     context: SchemaScanContext,
-    output_schema: SchemaRef,
     output_chunk_schema: ChunkSchemaRef,
     should_scan: bool,
     fe_addr: Option<types::TNetworkAddress>,
@@ -55,7 +53,6 @@ impl SchemaScanOp {
     pub(crate) fn new(
         table: SchemaTable,
         context: SchemaScanContext,
-        output_schema: SchemaRef,
         output_chunk_schema: ChunkSchemaRef,
         should_scan: bool,
         fe_addr: Option<types::TNetworkAddress>,
@@ -63,7 +60,6 @@ impl SchemaScanOp {
         Self {
             table,
             context,
-            output_schema,
             output_chunk_schema,
             should_scan,
             fe_addr,
@@ -642,11 +638,7 @@ impl ScanOp for SchemaScanOp {
 
         let mut chunks = Vec::new();
         for batch_rows in rows.chunks(DEFAULT_CHUNK_ROWS.max(1)) {
-            let chunk = build_chunk(
-                Arc::clone(&self.output_schema),
-                Arc::clone(&self.output_chunk_schema),
-                batch_rows,
-            )?;
+            let chunk = build_chunk(Arc::clone(&self.output_chunk_schema), batch_rows)?;
             chunks.push(chunk);
         }
 
@@ -676,7 +668,7 @@ mod tests {
 
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{ChunkSchema, field_with_slot_id};
+    use crate::exec::chunk::ChunkSchema;
 
     fn ctx(table_name: &str) -> SchemaScanContext {
         SchemaScanContext {
@@ -735,20 +727,17 @@ mod tests {
         );
 
         let schema = Arc::new(Schema::new(vec![
-            field_with_slot_id(Field::new("LABEL", DataType::Utf8, true), SlotId::new(2)),
-            field_with_slot_id(Field::new("TXN_ID", DataType::Int64, false), SlotId::new(1)),
+            Field::new("LABEL", DataType::Utf8, true),
+            Field::new("TXN_ID", DataType::Int64, false),
         ]));
-        let chunk_schema = Arc::new(
-            ChunkSchema::try_from_schema_and_slot_ids(
-                schema.as_ref(),
-                &[SlotId::new(2), SlotId::new(1)],
-            )
-            .expect("chunk schema"),
-        );
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            schema.as_ref(),
+            &[SlotId::new(2), SlotId::new(1)],
+        )
+        .expect("chunk schema");
         let op = SchemaScanOp::new(
             SchemaTable::Be(BeSchemaTable::TabletWriteLog),
             ctx("be_tablet_write_log"),
-            schema,
             chunk_schema,
             true,
             None,

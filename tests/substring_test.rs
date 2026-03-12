@@ -32,7 +32,12 @@ fn create_test_chunk() -> Chunk {
     let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = arrow::array::Int64Array::from(vec![1]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+        batch.schema().as_ref(),
+        &[SlotId::new(1)],
+    )
+    .expect("chunk schema");
+    Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
 /// Helper function to test substring with 3 arguments
@@ -245,7 +250,12 @@ fn test_substring_multiple_rows() {
     let schema = Schema::new(vec![Field::new("dummy", DataType::Int64, false)]);
     let array = arrow::array::Int64Array::from(vec![1, 2, 3]);
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
-    let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
+    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+        batch.schema().as_ref(),
+        &[SlotId::new(1)],
+    )
+    .expect("chunk schema");
+    let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
 
     let result = arena.eval(func_id, &chunk).unwrap();
     let str_array = result.as_any().downcast_ref::<StringArray>().unwrap();

@@ -24,7 +24,7 @@ use crate::exec::node::join::{JoinDistributionMode, JoinNode, JoinRuntimeFilterS
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::lower::expr::lower_t_expr;
-use crate::lower::layout::{Layout, chunk_schema_for_layout, schema_for_layout};
+use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::novarocks_logging::warn;
 
@@ -405,11 +405,8 @@ pub(crate) fn lower_hash_join_node(
     let Some(desc_tbl) = desc_tbl else {
         return Err("HASH_JOIN_NODE requires desc_tbl for schema".to_string());
     };
-    let left_schema = schema_for_layout(desc_tbl, &left.layout)?;
     let left_chunk_schema = chunk_schema_for_layout(desc_tbl, &left.layout)?;
-    let right_schema = schema_for_layout(desc_tbl, &right.layout)?;
     let right_chunk_schema = chunk_schema_for_layout(desc_tbl, &right.layout)?;
-    let join_scope_schema = schema_for_layout(desc_tbl, &layout)?;
     let join_scope_chunk_schema = chunk_schema_for_layout(desc_tbl, &layout)?;
 
     Ok(Lowered {
@@ -420,11 +417,8 @@ pub(crate) fn lower_hash_join_node(
                 node_id: node.node_id,
                 join_type,
                 distribution_mode,
-                left_schema,
                 left_chunk_schema,
-                right_schema,
                 right_chunk_schema,
-                join_scope_schema,
                 join_scope_chunk_schema,
                 probe_keys,
                 build_keys,

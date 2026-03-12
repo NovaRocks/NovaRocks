@@ -105,17 +105,24 @@ fn resolve_error_message(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
 
     fn bool_chunk(values: Vec<Option<bool>>) -> Chunk {
-        let field = field_with_slot_id(Field::new("cond", DataType::Boolean, true), SlotId::new(1));
+        let field = Field::new("cond", DataType::Boolean, true);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(values))]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

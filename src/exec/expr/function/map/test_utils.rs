@@ -30,7 +30,15 @@ pub fn chunk_len_1() -> Chunk {
         false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+    {
+        let batch = batch;
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
 }
 
 pub fn slot_id_expr(arena: &mut ExprArena, slot: i32, data_type: DataType) -> ExprId {

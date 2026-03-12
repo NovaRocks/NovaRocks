@@ -48,7 +48,6 @@ use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::types;
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::Schema;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -469,10 +468,12 @@ impl ScanAsyncRunner {
             field_map.insert(slot_schema.slot_id(), (field, slot_schema.clone()));
         }
 
-        let mut fields = Vec::with_capacity(self.scan.output_slots().len());
-        let mut columns = Vec::with_capacity(self.scan.output_slots().len());
-        let mut slot_schemas = Vec::with_capacity(self.scan.output_slots().len());
-        for slot_id in self.scan.output_slots() {
+        let output_chunk_schema = self.scan.output_chunk_schema();
+        let output_slots = output_chunk_schema.slot_ids();
+        let mut fields = Vec::with_capacity(output_slots.len());
+        let mut columns = Vec::with_capacity(output_slots.len());
+        let mut slot_schemas = Vec::with_capacity(output_slots.len());
+        for slot_id in output_slots {
             if *slot_id == state.spec.row_source_slot {
                 fields.push(state.spec.row_source_field.clone());
                 columns.push(row_source_array.clone());
@@ -518,12 +519,8 @@ impl ScanAsyncRunner {
             slot_schemas.push(slot_schema.clone());
         }
 
-        let schema = Arc::new(Schema::new(fields));
-        Chunk::try_new_with_schema_and_chunk_schema(
-            schema,
-            columns,
-            Arc::new(ChunkSchema::try_new(slot_schemas)?),
-        )
+        let _ = fields;
+        Chunk::try_new_with_columns(Arc::new(ChunkSchema::try_new(slot_schemas)?), columns)
     }
 
     fn maybe_log_stall(&mut self, mode: &str) {
@@ -828,7 +825,7 @@ pub(super) fn run_scan_worker(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::{Chunk, ChunkSchema};
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::node::BoxedExecIter;
     use crate::exec::node::scan::{
@@ -840,6 +837,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
+
+    fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
+            .expect("chunk schema")
+    }
 
     #[derive(Clone)]
     struct EmptyScanOp;
@@ -871,16 +873,19 @@ mod tests {
             _profile: Option<crate::runtime::profile::RuntimeProfile>,
             _runtime_filters: Option<&RuntimeFilterContext>,
         ) -> Result<BoxedExecIter, String> {
-            let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-                Field::new("v", DataType::Int32, false),
-                SlotId::new(1),
-            )]));
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
             let array = Arc::new(Int32Array::from(self.values.clone())) as arrow::array::ArrayRef;
             let batch = RecordBatch::try_new(schema, vec![array]).map_err(|e| e.to_string())?;
-            Ok(Box::new(std::iter::once(Ok(Chunk::new_with_slot_ids(
-                batch,
-                &[SlotId::new(1)],
-            )))))
+            Ok(Box::new(std::iter::once(Ok({
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            }))))
         }
 
         fn build_morsels(&self) -> Result<ScanMorsels, String> {
@@ -900,13 +905,18 @@ mod tests {
     }
 
     fn single_value_chunk(v: i32) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("v", DataType::Int32, false),
-            SlotId::new(1),
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let array = Arc::new(Int32Array::from(vec![v])) as arrow::array::ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![array]).expect("build test batch");
-        Chunk::new_with_slot_ids(batch, &[SlotId::new(1)])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]
@@ -915,9 +925,10 @@ mod tests {
             Vec::new(),
             false,
         )));
+        let scan_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let scan = ScanNode::new(Arc::new(EmptyScanOp))
             .with_node_id(1)
-            .with_output_slots(vec![SlotId::new(1)]);
+            .with_output_chunk_schema(chunk_schema_of(&scan_schema, &[SlotId::new(1)]));
         let arena = Arc::new(ExprArena::default());
 
         let mut pending_runner = ScanAsyncRunner::new(
@@ -982,7 +993,10 @@ mod tests {
             values: vec![1, 3, 2, 4],
         }))
         .with_node_id(1)
-        .with_output_slots(vec![SlotId::new(1)])
+        .with_output_chunk_schema(chunk_schema_of(
+            &Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)])),
+            &[SlotId::new(1)],
+        ))
         .with_conjunct_predicate(Some(predicate));
         let morsels = scan.build_morsels().expect("build morsels");
         let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(

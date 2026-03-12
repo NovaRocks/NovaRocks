@@ -27,7 +27,8 @@ use crate::exec::node::{ExecNode, ExecNodeKind};
 use crate::formats::parquet::ParquetReadCachePolicy;
 use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
-    Layout, col_names_from_layout, find_tuple_descriptor, layout_from_slot_ids,
+    Layout, chunk_schema_for_layout, col_names_from_layout, find_tuple_descriptor,
+    layout_from_slot_ids,
 };
 use crate::lower::node::{Lowered, local_rf_waiting_set};
 use crate::lower::type_lowering::primitive_type_from_desc;
@@ -779,7 +780,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 crate::connector::ScanConfig::IcebergMetadata(cfg),
             )?
             .with_node_id(node.node_id)
-            .with_output_slots(slot_ids.clone())
+            .with_output_chunk_schema(chunk_schema_for_layout(desc_tbl, &out_layout)?)
             .with_limit(limit)
             .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
             .with_accept_empty_scan_ranges(true)
@@ -837,7 +838,6 @@ pub(crate) fn lower_hdfs_scan_node(
 
     debug!("HDFS_SCAN using batch_size: {:?}", batch_size);
 
-    let output_slots = slot_ids.clone();
     let external_datacache = DataCacheManager::instance().external_context(cache_options.clone());
     let (enable_file_metacache, enable_file_pagecache) =
         file_cache_flags_from_query_options(query_opts);
@@ -853,9 +853,10 @@ pub(crate) fn lower_hdfs_scan_node(
         .map(|iceberg| build_projected_output_schema(iceberg, &iceberg_projected_columns))
         .transpose()?
         .flatten();
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
-        slot_ids: data_slot_ids,
+        chunk_schema: output_chunk_schema.clone(),
         slot_types: data_slot_types,
         case_sensitive,
         enable_page_index,
@@ -872,7 +873,7 @@ pub(crate) fn lower_hdfs_scan_node(
     };
     let orc_cfg = OrcScanConfig {
         columns: parquet_cfg.columns.clone(),
-        slot_ids: parquet_cfg.slot_ids.clone(),
+        chunk_schema: parquet_cfg.chunk_schema.clone(),
         case_sensitive: parquet_cfg.case_sensitive,
         orc_use_column_names,
         hive_column_names,
@@ -923,7 +924,7 @@ pub(crate) fn lower_hdfs_scan_node(
     let scan = connectors
         .create_scan_node("hdfs", ScanConfig::Hdfs(cfg))?
         .with_node_id(node.node_id)
-        .with_output_slots(output_slots)
+        .with_output_chunk_schema(output_chunk_schema)
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
         .with_accept_empty_scan_ranges(true)

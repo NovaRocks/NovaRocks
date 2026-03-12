@@ -196,7 +196,7 @@ fn condition_array_to_bool(array: &ArrayRef) -> Result<BooleanArray, String> {
 #[cfg(test)]
 mod tests {
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::{Chunk, field_with_slot_id};
+    use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -204,10 +204,18 @@ mod tests {
     use std::sync::Arc;
 
     fn make_i32_chunk(slot: SlotId, values: Vec<Option<i32>>) -> Chunk {
-        let field = field_with_slot_id(Field::new("c0", DataType::Int32, true), slot);
+        let field = Field::new("c0", DataType::Int32, true);
         let schema = Arc::new(Schema::new(vec![field]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap();
-        Chunk::new_with_slot_ids(batch, &[slot])
+        {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[slot],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        }
     }
 
     #[test]

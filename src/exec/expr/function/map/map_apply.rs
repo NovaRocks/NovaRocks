@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{Array, ArrayRef, MapArray, UInt32Array, make_array, new_empty_array};
 use arrow::compute::{cast, concat, take};
@@ -565,14 +565,17 @@ fn build_chunk_from_columns(
     slot_ids: &[SlotId],
 ) -> Result<Chunk, String> {
     let schema = Arc::new(Schema::new(fields.to_vec()));
-    let batch = RecordBatch::try_new(schema, columns.to_vec()).map_err(|e| e.to_string())?;
-    Chunk::try_new_with_slot_ids(batch, slot_ids)
+    let batch =
+        RecordBatch::try_new(schema.clone(), columns.to_vec()).map_err(|e| e.to_string())?;
+    Chunk::try_new_with_chunk_schema(
+        batch,
+        ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)?,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::function::map::eval_map_function;
     use crate::exec::expr::function::map::test_utils::{slot_id_expr, typed_null};
     use arrow::array::{ArrayRef, Int64Array, Int64Builder, MapBuilder};
@@ -605,12 +608,21 @@ mod tests {
         b.append(true).unwrap();
         let map = Arc::new(b.finish()) as ArrayRef;
         let map_type = map.data_type().clone();
-        let fields = vec![field_with_slot_id(
-            Field::new("m", map_type.clone(), true),
-            SlotId::new(1),
-        )];
+        let fields = vec![Field::new("m", map_type.clone(), true)];
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), vec![map]).unwrap();
-        (Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]), map_type)
+        (
+            {
+                let batch = batch;
+                let chunk_schema =
+                    crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                        batch.schema().as_ref(),
+                        &[SlotId::new(1)],
+                    )
+                    .expect("chunk schema");
+                Chunk::new_with_chunk_schema(batch, chunk_schema)
+            },
+            map_type,
+        )
     }
 
     fn build_lambda_identity_map(arena: &mut ExprArena) -> ExprId {

@@ -36,24 +36,13 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub fn try_new_with_schema_and_chunk_schema(
-        schema: SchemaRef,
-        columns: Vec<ArrayRef>,
+    pub fn try_new_with_columns(
         chunk_schema: ChunkSchemaRef,
+        columns: Vec<ArrayRef>,
     ) -> Result<Self, String> {
-        let batch = RecordBatch::try_new(schema, columns)
+        let batch = RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
             .map_err(|e| format!("build chunk record batch failed: {e}"))?;
         Self::try_new_with_chunk_schema(batch, chunk_schema)
-    }
-
-    pub fn try_new_with_schema_and_slot_ids(
-        schema: SchemaRef,
-        columns: Vec<ArrayRef>,
-        slot_ids: &[SlotId],
-    ) -> Result<Self, String> {
-        let batch = RecordBatch::try_new(schema, columns)
-            .map_err(|e| format!("build chunk record batch failed: {e}"))?;
-        Self::try_new_with_slot_ids(batch, slot_ids)
     }
 
     pub fn try_new_like(batch: RecordBatch, source: &Chunk) -> Result<Self, String> {
@@ -81,19 +70,6 @@ impl Chunk {
 
     pub fn new_with_chunk_schema(batch: RecordBatch, chunk_schema: ChunkSchemaRef) -> Self {
         match Self::try_new_with_chunk_schema(batch, chunk_schema) {
-            Ok(v) => v,
-            Err(e) => panic!("{e}"),
-        }
-    }
-
-    pub fn try_new_with_slot_ids(batch: RecordBatch, slot_ids: &[SlotId]) -> Result<Self, String> {
-        let chunk_schema =
-            ChunkSchema::try_from_schema_and_slot_ids(batch.schema().as_ref(), slot_ids)?;
-        Self::try_new_with_chunk_schema(batch, Arc::new(chunk_schema))
-    }
-
-    pub fn new_with_slot_ids(batch: RecordBatch, slot_ids: &[SlotId]) -> Self {
-        match Self::try_new_with_slot_ids(batch, slot_ids) {
             Ok(v) => v,
             Err(e) => panic!("{e}"),
         }

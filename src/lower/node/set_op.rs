@@ -120,11 +120,9 @@ fn lower_distinct_set_node(
         .iter()
         .map(|(_, slot_id)| SlotId::try_from(*slot_id))
         .collect::<Result<Vec<_>, _>>()?;
-    let output_chunk_schema = if let Some(desc_tbl) = desc_tbl {
-        Some(chunk_schema_for_layout(desc_tbl, &out_layout)?)
-    } else {
-        None
-    };
+    let desc_tbl =
+        desc_tbl.ok_or_else(|| format!("{op_name} lowering requires descriptor table"))?;
+    let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
 
     let mut inputs = Vec::with_capacity(children.len());
     for (child, expr_list) in children.into_iter().zip(result_expr_lists.iter()) {
@@ -147,7 +145,6 @@ fn lower_distinct_set_node(
                 expr_slot_ids: output_slots.clone(),
                 expr_slot_schemas: None,
                 output_indices: None,
-                output_slots: output_slots.clone(),
                 output_chunk_schema: output_chunk_schema.clone(),
             }),
         });
@@ -159,7 +156,7 @@ fn lower_distinct_set_node(
                 kind: set_op_kind,
                 inputs,
                 node_id: node.node_id,
-                output_slots,
+                output_chunk_schema,
             }),
         },
         layout: out_layout,

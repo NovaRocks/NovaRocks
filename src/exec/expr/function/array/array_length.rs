@@ -100,7 +100,6 @@ pub fn eval_array_length(
 mod tests {
     use super::*;
     use crate::common::ids::SlotId;
-    use crate::exec::chunk::field_with_slot_id;
     use crate::exec::expr::function::array::eval_array_function;
     use crate::exec::expr::function::array::test_utils::{chunk_len_1, typed_null};
     use crate::exec::expr::{ExprNode, LiteralValue};
@@ -155,12 +154,21 @@ mod tests {
         let cast_expr = arena.push_typed(ExprNode::Cast(lit), arr_type);
 
         let array = Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef;
-        let schema = Arc::new(Schema::new(vec![field_with_slot_id(
-            Field::new("dummy", DataType::Int64, false),
-            SlotId::new(1),
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "dummy",
+            DataType::Int64,
+            false,
         )]));
         let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        let chunk = Chunk::new_with_slot_ids(batch, &[SlotId::new(1)]);
+        let chunk = {
+            let batch = batch;
+            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                batch.schema().as_ref(),
+                &[SlotId::new(1)],
+            )
+            .expect("chunk schema");
+            Chunk::new_with_chunk_schema(batch, chunk_schema)
+        };
 
         let out = eval_array_length(&arena, expr, &[cast_expr], &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Int64Array>().unwrap();

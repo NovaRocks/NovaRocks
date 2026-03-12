@@ -49,8 +49,7 @@ use std::sync::Arc;
 
 use crate::cache::{CachedRangeReader, DataCacheContext};
 use crate::common::config;
-use crate::common::ids::SlotId;
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::RuntimeFilterContext;
 use crate::exec::variant::VariantValue;
@@ -86,13 +85,15 @@ fn runtime_filters_to_min_max_predicates(
     if snapshot.is_empty() {
         return Ok(Vec::new());
     }
-    if cfg.slot_ids.is_empty() || cfg.columns.is_empty() || cfg.slot_ids.len() != cfg.columns.len()
+    if cfg.chunk_schema.slot_ids().is_empty()
+        || cfg.columns.is_empty()
+        || cfg.chunk_schema.slot_ids().len() != cfg.columns.len()
     {
         return Ok(Vec::new());
     }
 
     let mut slot_to_index = HashMap::new();
-    for (idx, slot_id) in cfg.slot_ids.iter().enumerate() {
+    for (idx, slot_id) in cfg.chunk_schema.slot_ids().iter().enumerate() {
         slot_to_index.insert(*slot_id, idx.to_string());
     }
 
@@ -150,7 +151,7 @@ fn runtime_filters_to_min_max_predicates(
 #[derive(Clone, Debug)]
 pub struct ParquetScanConfig {
     pub columns: Vec<String>,
-    pub slot_ids: Vec<SlotId>,
+    pub chunk_schema: ChunkSchemaRef,
     pub slot_types: Vec<types::TPrimitiveType>,
     pub case_sensitive: bool,
     pub enable_page_index: bool,
@@ -954,7 +955,18 @@ impl Iterator for ParquetScanIter {
                             clamp_u128_to_i64(to_take as u128),
                         );
                     }
-                    return Some(Ok(Chunk::new_with_slot_ids(batch, &self.cfg.slot_ids)));
+                    let chunk_schema = match self.cfg.chunk_schema.with_fields_in_order(
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .map(|field| field.as_ref().clone())
+                            .collect(),
+                    ) {
+                        Ok(schema) => Arc::new(schema),
+                        Err(e) => return Some(Err(e)),
+                    };
+                    return Some(Chunk::try_new_with_chunk_schema(batch, chunk_schema));
                 }
                 Some(Err(e)) => {
                     self.reader = None;
@@ -1668,18 +1680,18 @@ fn validate_batch_slot_count(
         return Ok(batch);
     }
 
-    if cfg.slot_ids.is_empty() {
+    if cfg.chunk_schema.slot_ids().is_empty() {
         return Err(format!(
-            "parquet scan missing slot_ids for non-empty batch: num_columns={}",
+            "parquet scan missing chunk schema for non-empty batch: num_columns={}",
             batch.num_columns()
         ));
     }
 
-    if batch.num_columns() != cfg.slot_ids.len() {
+    if batch.num_columns() != cfg.chunk_schema.slot_ids().len() {
         return Err(format!(
-            "parquet scan output columns/slot_ids mismatch: num_columns={}, slot_ids={:?}",
+            "parquet scan output columns/chunk schema mismatch: num_columns={}, slot_ids={:?}",
             batch.num_columns(),
-            cfg.slot_ids
+            cfg.chunk_schema.slot_ids()
         ));
     }
 
@@ -1915,6 +1927,7 @@ mod tests {
         CacheOptions, CachedRangeReader, DataCacheManager, DataCachePageCacheOptions,
     };
     use crate::common::ids::SlotId;
+    use crate::exec::chunk::ChunkSchema;
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
     use crate::fs::scan_context::{FileScanContext, FileScanRange};
     use crate::types;
@@ -1946,10 +1959,27 @@ mod tests {
     ) -> ParquetScanConfig {
         let slot_ids = (0..columns.len())
             .map(|idx| SlotId::try_from((idx + 1) as i32).expect("slot id"))
-            .collect();
+            .collect::<Vec<_>>();
+        let chunk_schema_schema = iceberg_output_schema.clone().unwrap_or_else(|| {
+            let fields = columns
+                .iter()
+                .zip(slot_types.iter().copied())
+                .map(|(name, primitive)| {
+                    let data_type =
+                        crate::lower::type_lowering::arrow_type_from_primitive(primitive)
+                            .expect("arrow type");
+                    Field::new(name.clone(), data_type, true)
+                })
+                .collect::<Vec<_>>();
+            Schema::new(fields)
+        });
         ParquetScanConfig {
             columns,
-            slot_ids,
+            chunk_schema: ChunkSchema::try_ref_from_schema_and_slot_ids(
+                &chunk_schema_schema,
+                &slot_ids,
+            )
+            .expect("chunk schema"),
             slot_types,
             case_sensitive: true,
             enable_page_index: false,
