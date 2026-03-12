@@ -19,9 +19,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use crate::frontend_service::TFrontendServiceSyncClient;
-use crate::service::frontend_rpc::{
-    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
-};
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::{frontend_service, status_code, types};
 
 #[derive(Clone, Copy, Debug)]
@@ -37,26 +35,14 @@ fn interval_cache() -> &'static Mutex<HashMap<i64, AutoIncrementInterval>> {
     AUTO_INCREMENT_INTERVALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn with_frontend_client<T>(
-    fe_addr: &types::TNetworkAddress,
-    f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-) -> Result<T, String> {
-    let mut f = Some(f);
+fn with_frontend_client<T, F>(fe_addr: &types::TNetworkAddress, f: F) -> Result<T, String>
+where
+    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+{
     FrontendRpcManager::shared()
-        .call_with_options(
-            FrontendRpcKind::Control,
-            fe_addr,
-            FrontendRpcCallOptions {
-                transport_retries: 0,
-            },
-            |client| {
-                f.take()
-                    .expect("auto increment FE RPC closure is consumed once per request")(
-                    client
-                )
-                .map_err(FrontendRpcError::from_message_guess)
-            },
-        )
+        .call(FrontendRpcKind::Control, fe_addr, move |client| {
+            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
+        })
         .map_err(|err| err.to_string())
 }
 

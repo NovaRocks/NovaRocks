@@ -661,9 +661,14 @@ fn format_addr(fe_addr: &types::TNetworkAddress) -> String {
 fn looks_like_transport_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("transport")
+        || lower.contains("bad data")
+        || lower.contains("bad version")
         || lower.contains("broken pipe")
         || lower.contains("connection reset")
         || lower.contains("connection refused")
+        || lower.contains("end of file")
+        || lower.contains("invalid thrift version")
+        || lower.contains("not open")
         || lower.contains("unexpected eof")
         || lower.contains("timed out")
         || lower.contains("timeout")
@@ -883,6 +888,70 @@ mod tests {
         assert_eq!(calls.load(Ordering::Acquire), 2);
         assert!(server.accepts() >= 2);
         assert_eq!(manager.host_idle_len(&super::host_key(server.addr())), 1);
+    }
+
+    #[test]
+    fn message_guess_treats_end_of_file_as_transport() {
+        let err = FrontendRpcError::from_message_guess("createPartition RPC failed: end of file");
+        assert!(err.is_transport());
+    }
+
+    #[test]
+    fn message_guess_treats_bad_data_as_transport() {
+        let err = FrontendRpcError::from_message_guess("bad data");
+        assert!(err.is_transport());
+        let err = FrontendRpcError::from_message_guess("invalid thrift version");
+        assert!(err.is_transport());
+        let err = FrontendRpcError::from_message_guess("not open");
+        assert!(err.is_transport());
+    }
+
+    #[test]
+    fn retries_stringified_end_of_file_transport_errors() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = Arc::clone(&calls);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "createPartition" => {
+                    let _req: frontend_service::TCreatePartitionRequest = read_struct_arg(i_prot)?;
+                    if calls_for_server.fetch_add(1, Ordering::AcqRel) == 0 {
+                        return Ok(ServerAction::Close);
+                    }
+                    let response = frontend_service::TCreatePartitionResult {
+                        status: Some(ok_status()),
+                        partitions: None,
+                        tablets: None,
+                        nodes: None,
+                    };
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+        let manager = FrontendRpcManager::new(test_manager_settings());
+        let request = frontend_service::TCreatePartitionRequest::new(
+            Some(10),
+            Some(1),
+            Some(2),
+            Some(vec![vec!["2025-01-01".to_string()]]),
+            Some(false),
+        );
+
+        let response = manager
+            .call(FrontendRpcKind::Control, server.addr(), |client| {
+                client.create_partition(request.clone()).map_err(|err| {
+                    FrontendRpcError::from_message_guess(format!(
+                        "createPartition RPC failed: {err}"
+                    ))
+                })
+            })
+            .expect("request retries after stringified EOF transport error");
+
+        assert_eq!(response.status, Some(ok_status()));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(server.accepts() >= 2);
     }
 
     #[test]

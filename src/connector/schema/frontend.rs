@@ -17,9 +17,7 @@
 use crate::common::types::format_uuid;
 use crate::frontend_service::{self, TFrontendServiceSyncClient};
 use crate::service::disk_report;
-use crate::service::frontend_rpc::{
-    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
-};
+use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
 use crate::{internal_service, status, status_code, types};
 
 use super::SchemaScanContext;
@@ -32,30 +30,21 @@ pub(crate) fn resolve_frontend_addr(
     fe_addr.cloned().or_else(disk_report::latest_fe_addr)
 }
 
-pub(crate) fn with_frontend_client<T>(
+pub(crate) fn with_frontend_client<T, F>(
     fe_addr: Option<&types::TNetworkAddress>,
-    f: impl FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
-) -> Result<T, String> {
+    f: F,
+) -> Result<T, String>
+where
+    F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
+{
     let fe_addr = resolve_frontend_addr(fe_addr).ok_or_else(|| {
         "missing FE address for schema scan (coord is absent and heartbeat cache is empty)"
             .to_string()
     })?;
-    let mut f = Some(f);
     FrontendRpcManager::shared()
-        .call_with_options(
-            FrontendRpcKind::SchemaQuery,
-            &fe_addr,
-            FrontendRpcCallOptions {
-                transport_retries: 0,
-            },
-            |client| {
-                f.take()
-                    .expect("schema FE RPC closure is consumed once per request")(
-                    client
-                )
-                .map_err(FrontendRpcError::from_message_guess)
-            },
-        )
+        .call(FrontendRpcKind::SchemaQuery, &fe_addr, move |client| {
+            f.clone()(client).map_err(FrontendRpcError::from_message_guess)
+        })
         .map_err(|err| err.to_string())
 }
 
@@ -188,7 +177,18 @@ fn random_unique_id() -> types::TUniqueId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::plan_nodes;
+    use crate::service::frontend_rpc::test_clear_shared_host_pools;
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn make_context() -> SchemaScanContext {
         SchemaScanContext {
@@ -246,5 +246,50 @@ mod tests {
         assert_eq!(ident.host.as_deref(), Some("10.0.0.9"));
         assert_eq!(ident.is_domain, Some(false));
         assert_eq!(ident.is_ephemeral, Some(false));
+    }
+
+    #[test]
+    fn schema_query_with_frontend_client_retries_end_of_file() {
+        test_clear_shared_host_pools();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = Arc::clone(&calls);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "getLoads" => {
+                    let _req: frontend_service::TGetLoadsParams = read_struct_arg(i_prot)?;
+                    if calls_for_server.fetch_add(1, Ordering::AcqRel) == 0 {
+                        return Ok(ServerAction::Close);
+                    }
+                    let response = frontend_service::TGetLoadsResult::new(Some(vec![
+                        frontend_service::TLoadInfo {
+                            job_id: Some(1),
+                            label: Some("load_1".to_string()),
+                            ..Default::default()
+                        },
+                    ]));
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+        let request = frontend_service::TGetLoadsParams::new(
+            Some("db1".to_string()),
+            Some(1),
+            None::<i64>,
+            None::<String>,
+            None::<String>,
+        );
+
+        let response = with_frontend_client(Some(server.addr()), |client| {
+            client.get_loads(request).map_err(|err| err.to_string())
+        })
+        .expect("schema FE RPC retries after EOF");
+
+        assert_eq!(response.loads.unwrap_or_default().len(), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(server.accepts() >= 2);
+        test_clear_shared_host_pools();
     }
 }

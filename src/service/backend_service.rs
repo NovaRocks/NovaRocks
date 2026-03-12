@@ -101,6 +101,9 @@ fn next_report_version() -> i64 {
 const CREATE_TABLET_ADD_SHARD_WAIT_MS: u64 = 1_500;
 const CREATE_TABLET_ADD_SHARD_POLL_MS: u64 = 25;
 const ALTER_FAILFAST_ERROR_REPORT_TIMES: usize = 3;
+const FINISH_TASK_MAX_RETRY: usize = 3;
+const ALTER_FINISH_TASK_MAX_RETRY: usize = 10;
+const FINISH_TASK_RETRY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 fn backend_server_state() -> &'static Mutex<BackendServerState> {
     static STATE: OnceLock<Mutex<BackendServerState>> = OnceLock::new();
@@ -145,15 +148,12 @@ fn build_backend_for_finish_task() -> Result<types::TBackend, String> {
     ))
 }
 
-fn send_finish_task(
+fn build_finish_task_request(
     task: &agent_service::TAgentTaskRequest,
     task_status: TStatus,
-) -> Result<(), String> {
-    let fe_addr = disk_report::latest_fe_addr().ok_or_else(|| {
-        "missing FE address for finish_task (heartbeat not received yet)".to_string()
-    })?;
+) -> Result<master_service::TFinishTaskRequest, String> {
     let report_version = next_report_version();
-    let request = master_service::TFinishTaskRequest::new(
+    Ok(master_service::TFinishTaskRequest::new(
         build_backend_for_finish_task()?,
         task.task_type,
         task.signature,
@@ -173,39 +173,133 @@ fn send_finish_task(
         None::<Vec<master_service::TTabletVersionPair>>,
         None::<Vec<master_service::TTabletVersionPair>>,
         None::<types::TSnapshotInfo>,
-    );
+    ))
+}
+
+fn send_finish_task_request_once(
+    fe_addr: &types::TNetworkAddress,
+    request: &master_service::TFinishTaskRequest,
+) -> Result<master_service::TMasterResult, FrontendRpcError> {
     tracing::debug!(
-        signature = task.signature,
-        task_type = ?task.task_type,
+        signature = request.signature,
+        task_type = ?request.task_type,
         report_version = ?request.report_version,
-        req = %json_summary(&request),
+        req = %json_summary(request),
         "BackendService.finish_task sending request"
     );
-    let result = FrontendRpcManager::shared()
-        .call(FrontendRpcKind::Control, &fe_addr, |client| {
-            client
-                .finish_task(request.clone())
-                .map_err(FrontendRpcError::from_thrift)
-        })
-        .map_err(|e| {
-            format!(
-                "FE finish_task rpc failed for signature={}: {e}",
-                task.signature
-            )
-        })?;
-    if result.status.status_code != TStatusCode::OK {
-        return Err(format!(
-            "FE finish_task returned non-OK for signature={}: {:?}",
-            task.signature, result.status
-        ));
+    FrontendRpcManager::shared().call(FrontendRpcKind::Control, fe_addr, |client| {
+        client
+            .finish_task(request.clone())
+            .map_err(FrontendRpcError::from_thrift)
+    })
+}
+
+fn send_finish_task_request_with_retry<Send, Sleep>(
+    task_type: types::TTaskType,
+    signature: i64,
+    mut send_once: Send,
+    mut sleep: Sleep,
+) -> Result<(), String>
+where
+    Send: FnMut() -> Result<master_service::TMasterResult, FrontendRpcError>,
+    Sleep: FnMut(Duration),
+{
+    let mut attempt = 0usize;
+    let mut max_attempts = FINISH_TASK_MAX_RETRY;
+    let mut retry_delay = FINISH_TASK_RETRY_INITIAL_BACKOFF;
+
+    loop {
+        attempt += 1;
+        match send_once() {
+            Ok(result) if result.status.status_code == TStatusCode::OK => return Ok(()),
+            Ok(result) => {
+                let status_code = result.status.status_code;
+                let sleep_for = if status_code == TStatusCode::TOO_MANY_TASKS
+                    && task_type == types::TTaskType::ALTER
+                {
+                    max_attempts = ALTER_FINISH_TASK_MAX_RETRY;
+                    retry_delay = retry_delay.saturating_mul(2);
+                    Some(retry_delay)
+                } else if status_code == TStatusCode::LEADER_TRANSFERRED
+                    && task_type == types::TTaskType::CREATE
+                {
+                    retry_delay = retry_delay.saturating_mul(2);
+                    Some(retry_delay)
+                } else {
+                    None
+                };
+
+                if let Some(sleep_for) = sleep_for.filter(|_| attempt < max_attempts) {
+                    tracing::warn!(
+                        signature,
+                        ?task_type,
+                        attempt,
+                        max_attempts,
+                        ?status_code,
+                        sleep_ms = sleep_for.as_millis() as u64,
+                        "BackendService.finish_task got retryable FE status"
+                    );
+                    sleep(sleep_for);
+                    continue;
+                }
+
+                return Err(format!(
+                    "FE finish_task returned non-OK for signature={signature}: {:?}",
+                    result.status
+                ));
+            }
+            Err(err) => {
+                if err.is_transport() && attempt < max_attempts {
+                    tracing::warn!(
+                        signature,
+                        ?task_type,
+                        attempt,
+                        max_attempts,
+                        sleep_ms = retry_delay.as_millis() as u64,
+                        error = %err,
+                        "BackendService.finish_task transport error, retrying"
+                    );
+                    sleep(retry_delay);
+                    continue;
+                }
+                return Err(format!(
+                    "FE finish_task rpc failed for signature={signature}: {err}"
+                ));
+            }
+        }
     }
+}
+
+fn send_finish_task_to_fe(
+    fe_addr: &types::TNetworkAddress,
+    task: &agent_service::TAgentTaskRequest,
+    task_status: TStatus,
+) -> Result<(), String> {
+    let request = build_finish_task_request(task, task_status)?;
+    let report_version = request.report_version;
+    send_finish_task_request_with_retry(
+        task.task_type,
+        task.signature,
+        || send_finish_task_request_once(fe_addr, &request),
+        std::thread::sleep,
+    )?;
     tracing::debug!(
         signature = task.signature,
         task_type = ?task.task_type,
-        report_version,
+        ?report_version,
         "BackendService.finish_task reported"
     );
     Ok(())
+}
+
+fn send_finish_task(
+    task: &agent_service::TAgentTaskRequest,
+    task_status: TStatus,
+) -> Result<(), String> {
+    let fe_addr = disk_report::latest_fe_addr().ok_or_else(|| {
+        "missing FE address for finish_task (heartbeat not received yet)".to_string()
+    })?;
+    send_finish_task_to_fe(&fe_addr, task, task_status)
 }
 
 fn execute_create_tablet_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
@@ -705,6 +799,10 @@ pub fn start_backend_service(config: BackendServiceConfig) -> Result<(), String>
                         if stop_for_thread.load(Ordering::Acquire) {
                             break;
                         }
+                        if let Err(err) = s.set_nonblocking(false) {
+                            tracing::warn!("failed to switch accepted be_port socket to blocking mode: {err}");
+                            continue;
+                        }
                         worker_pool.execute(move || {
                             let peer = s.peer_addr().ok();
 
@@ -812,17 +910,31 @@ pub fn stop_backend_service() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::net::{TcpListener, TcpStream};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use super::{
         BackendServiceConfig, build_backend_for_finish_task, execute_backend_task,
-        finish_task_report_times_for_error, start_backend_service, stop_backend_service,
+        finish_task_report_times_for_error, send_finish_task_request_with_retry,
+        send_finish_task_to_fe, start_backend_service, stop_backend_service,
     };
     use crate::common::thrift::{thrift_binary_deserialize, thrift_binary_serialize};
-    use crate::{agent_service, descriptors, service::disk_report, types};
+    use crate::{
+        agent_service, descriptors, master_service, service::disk_report, status, status_code,
+        types,
+    };
+
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn backend_test_guard() -> &'static Mutex<()> {
         static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
@@ -939,6 +1051,13 @@ mod tests {
         }
     }
 
+    fn ok_master_result() -> master_service::TMasterResult {
+        master_service::TMasterResult::new(
+            status::TStatus::new(status_code::TStatusCode::OK, None),
+            None::<Vec<crate::work_group::TWorkGroupOp>>,
+        )
+    }
+
     #[test]
     fn execute_backend_task_fails_fast_for_alter_without_request() {
         let task = test_task(types::TTaskType::ALTER);
@@ -1012,6 +1131,91 @@ mod tests {
         assert_eq!(backend.host, "127.0.0.1");
         assert_eq!(backend.be_port, cfg.server.be_port as i32);
         assert_eq!(backend.http_port, cfg.server.http_port as i32);
+
+        disk_report::set_backend_host_for_test(None);
+    }
+
+    #[test]
+    fn send_finish_task_request_with_retry_retries_transport_error() {
+        let mut attempts = VecDeque::from([
+            Err(crate::service::frontend_rpc::FrontendRpcError::transport(
+                "end of file",
+            )),
+            Ok(ok_master_result()),
+        ]);
+        let mut sleeps = Vec::new();
+
+        send_finish_task_request_with_retry(
+            types::TTaskType::CREATE,
+            7,
+            || attempts.pop_front().expect("send attempt"),
+            |duration| sleeps.push(duration),
+        )
+        .expect("transport error should retry once");
+
+        assert!(attempts.is_empty(), "all attempts should be consumed");
+        assert_eq!(sleeps, vec![Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn send_finish_task_request_with_retry_retries_leader_transferred_for_create() {
+        let mut attempts = VecDeque::from([
+            Ok(master_service::TMasterResult::new(
+                status::TStatus::new(
+                    status_code::TStatusCode::LEADER_TRANSFERRED,
+                    Some(vec!["leader transferred".to_string()]),
+                ),
+                None::<Vec<crate::work_group::TWorkGroupOp>>,
+            )),
+            Ok(ok_master_result()),
+        ]);
+        let mut sleeps = Vec::new();
+
+        send_finish_task_request_with_retry(
+            types::TTaskType::CREATE,
+            9,
+            || attempts.pop_front().expect("send attempt"),
+            |duration| sleeps.push(duration),
+        )
+        .expect("leader transferred should retry");
+
+        assert!(attempts.is_empty(), "all attempts should be consumed");
+        assert_eq!(sleeps, vec![Duration::from_secs(2)]);
+    }
+
+    #[test]
+    fn send_finish_task_to_fe_retries_after_transport_eof() {
+        let finish_calls = Arc::new(AtomicUsize::new(0));
+        let finish_calls_for_handler = Arc::clone(&finish_calls);
+        let server = FakeFeRpcServer::start(
+            2,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "finishTask" => {
+                    let request: master_service::TFinishTaskRequest = read_struct_arg(i_prot)?;
+                    assert_eq!(request.signature, 77);
+                    finish_calls_for_handler.fetch_add(1, Ordering::AcqRel);
+                    write_struct_reply(o_prot, method, seq, &ok_master_result())?;
+                    Ok(ServerAction::Continue)
+                }
+                other => Err(thrift::Error::from(format!(
+                    "unexpected fake FE method: {other}"
+                ))),
+            }),
+        );
+
+        disk_report::set_backend_host_for_test(Some("127.0.0.1"));
+
+        let mut task = test_task(types::TTaskType::CREATE);
+        task.signature = 77;
+        send_finish_task_to_fe(
+            server.addr(),
+            &task,
+            status::TStatus::new(status_code::TStatusCode::OK, None),
+        )
+        .expect("finish_task should recover after EOF");
+
+        assert_eq!(finish_calls.load(Ordering::Acquire), 1);
+        assert_eq!(server.accepts(), 3);
 
         disk_report::set_backend_host_for_test(None);
     }
