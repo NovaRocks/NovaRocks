@@ -1,2 +1,39 @@
+-- query 1
 count(*)
 1
+
+-- query 2
+k1	c1
+1	1
+
+-- query 3
+count(*)
+1
+
+-- query 4
+count(*)
+1
+
+-- query 5
+count(*)
+1
+
+-- query 6
+count(*)
+1
+
+-- query 7
+count(*)
+1
+
+-- query 8
+count(*)
+1
+
+-- query 9
+count(*)
+1
+
+-- query 10
+k1	c1	b1
+1	1	NULL
