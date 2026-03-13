@@ -19,8 +19,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::connector::starrocks::lake::context::{TabletWriteContext, register_tablet_runtime};
 use crate::formats::starrocks::writer::bundle_meta::{
-    empty_tablet_metadata, load_latest_tablet_metadata, load_tablet_metadata_at_version,
-    write_initial_meta_file, write_standalone_meta_file,
+    empty_tablet_metadata, load_latest_tablet_metadata, write_initial_meta_file,
+    write_standalone_meta_file,
+};
+use crate::formats::starrocks::writer::io::read_bytes_if_exists;
+use crate::formats::starrocks::writer::layout::{
+    initial_meta_file_path, standalone_meta_file_path,
 };
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{
@@ -211,12 +215,16 @@ pub(crate) fn create_lake_tablet_from_req(
     };
     register_tablet_runtime(&runtime_ctx)?;
 
-    let existing_base = load_tablet_metadata_at_version(tablet_root_path, tablet_id, 1)?;
-    if existing_base.is_some() {
+    let standalone_v1_path = standalone_meta_file_path(tablet_root_path, tablet_id, 1)?;
+    if read_bytes_if_exists(&standalone_v1_path)?.is_some() {
         return Ok(());
     }
 
-    let (latest_version, _) = load_latest_tablet_metadata(tablet_root_path, tablet_id)?;
+    let latest_version = match load_latest_tablet_metadata(tablet_root_path, tablet_id) {
+        Ok((version, _)) => version,
+        Err(err) if is_missing_tablet_page_in_bundle_error(&err) => 0,
+        Err(err) => return Err(err),
+    };
     if latest_version > 1 {
         return Ok(());
     }
@@ -249,7 +257,12 @@ pub(crate) fn create_lake_tablet_from_req(
     tablet_meta.flat_json_config = flat_json_config;
     seed_tablet_metadata_schema(&mut tablet_meta, &tablet_schema);
     if request.enable_tablet_creation_optimization.unwrap_or(false) {
-        write_initial_meta_file(tablet_root_path, &tablet_meta)
+        let initial_path = initial_meta_file_path(tablet_root_path)?;
+        if read_bytes_if_exists(&initial_path)?.is_some() {
+            write_standalone_meta_file(tablet_root_path, tablet_id, 1, &tablet_meta)
+        } else {
+            write_initial_meta_file(tablet_root_path, &tablet_meta)
+        }
     } else {
         write_standalone_meta_file(tablet_root_path, tablet_id, 1, &tablet_meta)
     }
@@ -1099,7 +1112,9 @@ mod tests {
         build_sink_tablet_schema, create_lake_tablet_from_req,
         is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type,
     };
-    use crate::formats::starrocks::writer::bundle_meta::load_tablet_metadata_at_version;
+    use crate::formats::starrocks::writer::bundle_meta::{
+        load_tablet_metadata_at_version, write_bundle_meta_file,
+    };
     use crate::service::grpc_client::proto::starrocks::KeysType;
     use tempfile::TempDir;
 
@@ -1217,6 +1232,67 @@ mod tests {
         let schema = metadata.schema.expect("schema should be persisted");
         assert_eq!(schema.id, Some(88001));
         assert_eq!(metadata.historical_schemas.get(&88001), Some(&schema));
+    }
+
+    #[test]
+    fn create_tablet_optimized_shared_root_writes_standalone_for_following_tablets() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let first = build_test_create_tablet_req(41003, true);
+        let second = build_test_create_tablet_req(41004, true);
+        let root = temp_dir.path().to_str().expect("temp path to str");
+
+        create_lake_tablet_from_req(&first, root, None).expect("create first tablet");
+        create_lake_tablet_from_req(&second, root, None).expect("create second tablet");
+
+        let initial_path = temp_dir
+            .path()
+            .join("meta/0000000000000000_0000000000000001.meta");
+        let second_standalone_path = temp_dir
+            .path()
+            .join("meta/000000000000A02C_0000000000000001.meta");
+        assert!(initial_path.exists(), "expected shared initial metadata");
+        assert!(
+            second_standalone_path.exists(),
+            "expected standalone v1 metadata for later optimized tablet"
+        );
+
+        let metadata = load_tablet_metadata_at_version(root, 41004, 1)
+            .expect("load second tablet metadata")
+            .expect("second tablet metadata should exist");
+        let schema = metadata.schema.expect("schema should be persisted");
+        assert_eq!(schema.id, Some(88001));
+        assert_eq!(metadata.historical_schemas.get(&88001), Some(&schema));
+    }
+
+    #[test]
+    fn create_tablet_ignores_bundle_versions_missing_new_tablet_page() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let first = build_test_create_tablet_req(41005, true);
+        let second = build_test_create_tablet_req(41006, true);
+        let root = temp_dir.path().to_str().expect("temp path to str");
+
+        create_lake_tablet_from_req(&first, root, None).expect("create first tablet");
+
+        let first_meta = load_tablet_metadata_at_version(root, 41005, 1)
+            .expect("load first tablet metadata")
+            .expect("first tablet metadata should exist");
+        let first_schema = first_meta
+            .schema
+            .clone()
+            .expect("first tablet schema should exist");
+        write_bundle_meta_file(root, 41005, 2, &first_schema, &first_meta)
+            .expect("write v2 bundle metadata for first tablet");
+
+        create_lake_tablet_from_req(&second, root, None)
+            .expect("create second tablet even when v2 bundle lacks its page");
+
+        let second_meta = load_tablet_metadata_at_version(root, 41006, 1)
+            .expect("load second tablet metadata")
+            .expect("second tablet metadata should exist");
+        let second_schema = second_meta
+            .schema
+            .expect("second tablet schema should exist");
+        assert_eq!(second_schema.id, Some(88001));
     }
 
     #[test]

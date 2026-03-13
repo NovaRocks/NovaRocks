@@ -198,7 +198,9 @@ impl SupportedSchemaType {
             Self::SmallInt => "Int16",
             Self::Int => "Int32",
             Self::BigInt => "Int64",
-            Self::LargeInt => "FixedSizeBinary(16)",
+            // FE descriptors occasionally surface LARGEINT slots as Decimal128(scale=0)
+            // even though the on-disk tablet schema remains LARGEINT.
+            Self::LargeInt => "FixedSizeBinary(16)|Decimal128(scale=0)",
             Self::Float => "Float32",
             Self::Double => "Float64",
             Self::Boolean => "Boolean",
@@ -247,6 +249,7 @@ impl SupportedSchemaType {
             {
                 true
             }
+            (Self::LargeInt, DataType::Decimal128(_, scale)) if *scale == 0 => true,
             (Self::Decimal32, DataType::Decimal128(precision, _))
             | (Self::Decimal64, DataType::Decimal128(precision, _))
             | (Self::Decimal128, DataType::Decimal128(precision, _)) => {
@@ -2262,6 +2265,12 @@ mod tests {
         assert_eq!(plan.projected_columns.len(), 2);
         assert_eq!(plan.segments.len(), 2);
         assert_eq!(plan.estimated_rows, 30);
+    }
+
+    #[test]
+    fn largeint_schema_accepts_decimal128_scale_zero_output() {
+        assert!(SupportedSchemaType::LargeInt.matches_arrow_type(&DataType::Decimal128(38, 0)));
+        assert!(!SupportedSchemaType::LargeInt.matches_arrow_type(&DataType::Decimal128(38, 2)));
     }
 
     #[test]

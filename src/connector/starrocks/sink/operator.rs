@@ -27,7 +27,7 @@ use arrow::array::{
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::compute::{concat_batches, take};
+use arrow::compute::{cast, concat_batches, filter_record_batch, take};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow::util::display::array_value_to_string;
@@ -55,8 +55,11 @@ use crate::connector::starrocks::sink::routing::{
     RowRejectReason, RowRoutingPlan, route_chunk_rows,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
+use crate::exec::expr::ExprArena;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::lower::expr::lower_t_expr;
+use crate::lower::layout::Layout;
 use crate::novarocks_logging::{debug, info};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry;
@@ -397,6 +400,96 @@ fn filter_rows_for_tablet_schema(
     })
 }
 
+fn apply_index_where_clause(
+    predicate_chunk: &Chunk,
+    target_chunk: &Chunk,
+    index_id: i64,
+    where_clause: Option<&crate::exprs::TExpr>,
+) -> Result<Option<Chunk>, String> {
+    let Some(where_clause) = where_clause.filter(|expr| !expr.nodes.is_empty()) else {
+        return Ok(Some(target_chunk.clone()));
+    };
+    if predicate_chunk.is_empty() {
+        return Ok(Some(target_chunk.clone()));
+    }
+
+    let mut arena = ExprArena::default();
+    let empty_layout = Layout {
+        order: Vec::new(),
+        index: HashMap::new(),
+    };
+    let expr_id =
+        lower_t_expr(where_clause, &mut arena, &empty_layout, None, None).map_err(|e| {
+            format!(
+                "OLAP_TABLE_SINK lower index where_clause failed: index_id={} error={}",
+                index_id, e
+            )
+        })?;
+    let predicate = arena.eval(expr_id, predicate_chunk).map_err(|e| {
+        format!(
+            "OLAP_TABLE_SINK evaluate index where_clause failed: index_id={} rows={} error={}",
+            index_id,
+            predicate_chunk.len(),
+            e
+        )
+    })?;
+    let predicate_bool = if predicate.data_type() == &DataType::Boolean {
+        predicate
+    } else {
+        cast(predicate.as_ref(), &DataType::Boolean).map_err(|e| {
+            format!(
+                "OLAP_TABLE_SINK cast index where_clause to boolean failed: index_id={} from={:?} error={}",
+                index_id,
+                predicate.data_type(),
+                e
+            )
+        })?
+    };
+    let predicate_bool = predicate_bool
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            format!(
+                "OLAP_TABLE_SINK index where_clause did not produce boolean array: index_id={} result_type={:?}",
+                index_id,
+                predicate_bool.data_type()
+            )
+        })?;
+    if predicate_bool.len() != predicate_chunk.len() || predicate_bool.len() != target_chunk.len() {
+        return Err(format!(
+            "OLAP_TABLE_SINK index where_clause row count mismatch: index_id={} predicate_rows={} target_rows={} actual_rows={}",
+            index_id,
+            predicate_chunk.len(),
+            target_chunk.len(),
+            predicate_bool.len()
+        ));
+    }
+
+    let keep = (0..predicate_bool.len())
+        .map(|row| !predicate_bool.is_null(row) && predicate_bool.value(row))
+        .collect::<Vec<_>>();
+    if keep.iter().all(|keep_row| *keep_row) {
+        return Ok(Some(target_chunk.clone()));
+    }
+    if keep.iter().all(|keep_row| !*keep_row) {
+        return Ok(None);
+    }
+
+    let mask = BooleanArray::from(keep);
+    let filtered_batch = filter_record_batch(&target_chunk.batch, &mask).map_err(|e| {
+        format!(
+            "OLAP_TABLE_SINK apply index where_clause failed: index_id={} rows={} error={}",
+            index_id,
+            target_chunk.len(),
+            e
+        )
+    })?;
+    Ok(Some(Chunk::try_new_with_chunk_schema(
+        filtered_batch,
+        target_chunk.chunk_schema_ref(),
+    )?))
+}
+
 fn format_tracking_row(batch: &RecordBatch, row_idx: usize) -> Result<String, String> {
     let mut values = Vec::new();
     for (col_idx, field) in batch.schema().fields().iter().enumerate() {
@@ -458,6 +551,7 @@ impl OlapTableSinkOperator {
                 write_targets: write_targets.clone(),
                 schema_slot_bindings: plan.schema_slot_bindings.clone(),
                 op_slot_id: plan.op_slot_id,
+                where_clause: None,
             }]
         } else {
             plan.index_write_plans.clone()
@@ -470,6 +564,7 @@ impl OlapTableSinkOperator {
                 write_targets: write_targets.clone(),
                 schema_slot_bindings: plan.schema_slot_bindings.clone(),
                 op_slot_id: plan.op_slot_id,
+                where_clause: None,
             });
         }
         let mut all_write_targets = HashMap::new();
@@ -1329,6 +1424,15 @@ impl OlapTableSinkOperator {
                         } else {
                             take_chunk_rows(&sink_chunk, &row_indices)?
                         };
+                        let Some(routed_chunk) = apply_index_where_clause(
+                            &routed_chunk,
+                            &routed_chunk,
+                            index_plan.index_id,
+                            index_plan.where_clause.as_ref(),
+                        )?
+                        else {
+                            continue;
+                        };
                         let is_primary_keys_table = target.context.tablet_schema.keys_type
                             == Some(KeysType::PrimaryKeys as i32);
                         let routed_chunk = match align_chunk_to_schema_slot_bindings(
@@ -2129,7 +2233,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, Date32Array, Int8Array, Int32Array, Int64Array, StringArray,
+        ArrayRef, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
         TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
@@ -2139,8 +2243,8 @@ mod tests {
 
     use super::{
         LOAD_OP_COLUMN, OlapSinkFinalizeSharedState, OlapTableSinkOperator,
-        align_batch_to_schema_slot_bindings, filter_rows_for_tablet_schema,
-        format_partition_rejection, is_retryable_sink_write_error,
+        align_batch_to_schema_slot_bindings, apply_index_where_clause,
+        filter_rows_for_tablet_schema, format_partition_rejection, is_retryable_sink_write_error,
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
@@ -2166,7 +2270,7 @@ mod tests {
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
-    use crate::types;
+    use crate::{exprs, opcodes, types};
 
     fn test_tablet_schema() -> TabletSchemaPb {
         TabletSchemaPb {
@@ -2352,6 +2456,109 @@ mod tests {
             table_indices: Vec::new(),
             compression_level: None,
             id: Some(5002),
+        }
+    }
+
+    fn default_expr_node() -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::INT),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: None,
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }
+    }
+
+    fn slot_ref_node(slot_id: i32, ty: types::TPrimitiveType) -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::SLOT_REF,
+            type_: crate::lower::type_lowering::scalar_type_desc(ty),
+            slot_ref: Some(exprs::TSlotRef {
+                slot_id,
+                tuple_id: 0,
+            }),
+            ..default_expr_node()
+        }
+    }
+
+    fn int_literal_node(value: i64) -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            int_literal: Some(exprs::TIntLiteral { value }),
+            ..default_expr_node()
+        }
+    }
+
+    fn string_literal_node(value: &str) -> exprs::TExprNode {
+        exprs::TExprNode {
+            node_type: exprs::TExprNodeType::STRING_LITERAL,
+            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::VARCHAR),
+            string_literal: Some(exprs::TStringLiteral {
+                value: value.to_string(),
+            }),
+            ..default_expr_node()
+        }
+    }
+
+    fn binary_pred_expr(
+        opcode: opcodes::TExprOpcode,
+        child_type: types::TPrimitiveType,
+        left: exprs::TExprNode,
+        right: exprs::TExprNode,
+    ) -> exprs::TExpr {
+        exprs::TExpr {
+            nodes: vec![
+                exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::BINARY_PRED,
+                    type_: crate::lower::type_lowering::scalar_type_desc(
+                        types::TPrimitiveType::BOOLEAN,
+                    ),
+                    opcode: Some(opcode),
+                    num_children: 2,
+                    child_type: Some(child_type),
+                    ..default_expr_node()
+                },
+                left,
+                right,
+            ],
         }
     }
 
@@ -2700,6 +2907,7 @@ mod tests {
                     write_targets: HashMap::from([(9904, primary_target.clone())]),
                     schema_slot_bindings: Vec::new(),
                     op_slot_id: None,
+                    where_clause: None,
                 },
                 SinkIndexWritePlan {
                     index_id: 20,
@@ -2708,6 +2916,7 @@ mod tests {
                     write_targets: HashMap::from([(9905, secondary_target.clone())]),
                     schema_slot_bindings: Vec::new(),
                     op_slot_id: None,
+                    where_clause: None,
                 },
             ],
             auto_partition: Some(AutomaticPartitionPlan {
@@ -2958,6 +3167,168 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    #[test]
+    fn apply_index_where_clause_filters_false_and_null_rows() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k7", DataType::Int16, true),
+                Field::new("payload", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int16Array::from(vec![Some(1_i16), Some(3_i16), None])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64, 30_i64])) as ArrayRef,
+            ],
+        )
+        .expect("build where-clause batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(7), SlotId::new(8)],
+        )
+        .expect("build chunk schema");
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let where_clause = binary_pred_expr(
+            opcodes::TExprOpcode::GT,
+            types::TPrimitiveType::SMALLINT,
+            slot_ref_node(7, types::TPrimitiveType::SMALLINT),
+            int_literal_node(2),
+        );
+
+        let filtered = apply_index_where_clause(&chunk, &chunk, 10, Some(&where_clause))
+            .expect("apply where clause")
+            .expect("where clause should keep one row");
+        assert_eq!(filtered.len(), 1);
+        let k7 = filtered
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .expect("downcast k7");
+        let payload = filtered
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast payload");
+        assert_eq!(k7.value(0), 3);
+        assert_eq!(payload.value(0), 20);
+    }
+
+    #[test]
+    fn apply_index_where_clause_filters_string_predicate_rows() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k2", DataType::Utf8, true),
+                Field::new("k3", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("b")])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(22_i64)])) as ArrayRef,
+            ],
+        )
+        .expect("build string predicate batch");
+        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(2), SlotId::new(3)],
+        )
+        .expect("build chunk schema");
+        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+        let where_clause = binary_pred_expr(
+            opcodes::TExprOpcode::EQ,
+            types::TPrimitiveType::VARCHAR,
+            slot_ref_node(2, types::TPrimitiveType::VARCHAR),
+            string_literal_node("a"),
+        );
+
+        let filtered = apply_index_where_clause(&chunk, &chunk, 11, Some(&where_clause))
+            .expect("apply string where clause")
+            .expect("where clause should keep one row");
+        assert_eq!(filtered.len(), 1);
+        let k2 = filtered
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("downcast k2");
+        let k3 = filtered
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast k3");
+        assert_eq!(k2.value(0), "a");
+        assert_eq!(k3.value(0), 11);
+    }
+
+    #[test]
+    fn apply_index_where_clause_filters_projected_target_chunk() {
+        let predicate_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k2", DataType::Utf8, true),
+                Field::new("k7", DataType::Int16, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("a"), None, Some("a")])) as ArrayRef,
+                Arc::new(Int16Array::from(vec![Some(3_i16), None, Some(9_i16)])) as ArrayRef,
+            ],
+        )
+        .expect("build predicate batch");
+        let predicate_chunk_schema =
+            crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                predicate_batch.schema().as_ref(),
+                &[SlotId::new(2), SlotId::new(7)],
+            )
+            .expect("build predicate chunk schema");
+        let predicate_chunk = Chunk::new_with_chunk_schema(predicate_batch, predicate_chunk_schema);
+
+        let target_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("mv_key", DataType::Int64, false),
+                Field::new("mv_sum", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64, 3_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64, 30_i64])) as ArrayRef,
+            ],
+        )
+        .expect("build target batch");
+        let target_chunk_schema =
+            crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+                target_batch.schema().as_ref(),
+                &[SlotId::new(20), SlotId::new(21)],
+            )
+            .expect("build target chunk schema");
+        let target_chunk = Chunk::new_with_chunk_schema(target_batch, target_chunk_schema);
+
+        let where_clause = binary_pred_expr(
+            opcodes::TExprOpcode::EQ,
+            types::TPrimitiveType::VARCHAR,
+            slot_ref_node(2, types::TPrimitiveType::VARCHAR),
+            string_literal_node("a"),
+        );
+
+        let filtered =
+            apply_index_where_clause(&predicate_chunk, &target_chunk, 12, Some(&where_clause))
+                .expect("apply projected target where clause")
+                .expect("where clause should keep two rows");
+        assert_eq!(filtered.len(), 2);
+        let mv_key = filtered
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast mv_key");
+        let mv_sum = filtered
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast mv_sum");
+        assert_eq!(mv_key.value(0), 1);
+        assert_eq!(mv_key.value(1), 3);
+        assert_eq!(mv_sum.value(0), 10);
+        assert_eq!(mv_sum.value(1), 30);
     }
 
     fn slot_bound_batch_with_unnamed_op_slot() -> Chunk {
