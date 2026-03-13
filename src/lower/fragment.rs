@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, push_down_local_runtime_filters};
 use crate::exec::row_position::RowPositionDescriptor;
@@ -33,8 +32,7 @@ use crate::common::config::{
 use crate::common::types::UniqueId;
 use crate::exec::operators::{
     DataStreamSinkFactory, IcebergTableSinkFactory, MultiCastDataStreamSinkFactory,
-    NoopSinkFactory, OlapTableSinkFactory, ResultSinkFactory, ResultSinkHandle,
-    SplitDataStreamSinkFactory,
+    NoopSinkFactory, OlapTableSinkFactory, ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
@@ -46,7 +44,6 @@ use crate::{data_sinks, descriptors, internal_service, planner, types};
 
 #[derive(Clone, Debug)]
 pub(crate) struct FragmentOutput {
-    pub(crate) chunks: Vec<Chunk>,
     pub(crate) profile_json: Option<String>,
 }
 
@@ -286,7 +283,6 @@ pub(crate) fn execute_fragment(
         push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
         let root_plan_node_id = plan.nodes.first().map(|n| n.node_id).unwrap_or(-1);
 
-        let mut chunks = Vec::new();
         match sink.type_ {
             data_sinks::TDataSinkType::DATA_STREAM_SINK => {
                 let stream_sink = sink
@@ -417,8 +413,16 @@ pub(crate) fn execute_fragment(
                 )?;
             }
             data_sinks::TDataSinkType::RESULT_SINK => {
-                let result_sink_handle = ResultSinkHandle::new();
-                let sink_factory = ResultSinkFactory::new(result_sink_handle.clone());
+                let result_sink = sink
+                    .result_sink
+                    .as_ref()
+                    .ok_or_else(|| "RESULT_SINK missing result_sink payload".to_string())?;
+                let sink_factory = ResultBufferSinkFactory::new(
+                    fragment.output_exprs.clone(),
+                    result_sink.type_,
+                    result_sink.format,
+                    None,
+                );
                 let exchange_finst_id = exec_params.map(|params| {
                     (
                         params.fragment_instance_id.hi,
@@ -441,7 +445,6 @@ pub(crate) fn execute_fragment(
                     fe_addr.cloned(),
                     backend_num,
                 )?;
-                chunks = result_sink_handle.take_chunks();
             }
             data_sinks::TDataSinkType::NOOP_SINK => {
                 let sink_factory = NoopSinkFactory::new();
@@ -570,7 +573,6 @@ pub(crate) fn execute_fragment(
             }
         }
         return Ok(FragmentOutput {
-            chunks,
             profile_json: None,
         });
     }

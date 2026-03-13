@@ -44,6 +44,7 @@ mod nljoin;
 mod noop_sink;
 mod project_processor;
 mod repeat_processor;
+mod result_buffer_sink;
 mod result_sink;
 pub(crate) mod scan;
 mod setop;
@@ -77,6 +78,7 @@ pub use nljoin::{NlJoinBuildSinkFactory, NlJoinProbeProcessorFactory};
 pub use noop_sink::NoopSinkFactory;
 pub use project_processor::ProjectProcessorFactory;
 pub use repeat_processor::RepeatProcessorFactory;
+pub(crate) use result_buffer_sink::ResultBufferSinkFactory;
 pub use result_sink::{ResultSinkFactory, ResultSinkHandle};
 pub use scan::ScanSourceFactory;
 pub(crate) use setop::{
