@@ -1,0 +1,38 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 8
+metric_time_1h	CAST((count(request_id)) AS DOUBLE)
+2025-10-01 00:00:00	9
+
+-- query 9
+
+-- query 11
+metric_time_1h	CAST((count(request_id)) AS DOUBLE)
+NULL	1
+2025-10-01 00:00:00	9
+
+-- query 12
+
+-- query 14
+metric_time_1h	CAST((count(request_id)) AS DOUBLE)
+NULL	1
+2025-10-01 00:00:00	9
+
+-- query 17
+metric_time_1h	CAST((count(request_id)) AS DOUBLE)
+NULL	1
+2025-10-01 00:00:00	9
+
+-- query 18
+
+-- query 19
+
+-- query 20

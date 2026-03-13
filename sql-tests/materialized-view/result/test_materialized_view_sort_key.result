@@ -1,0 +1,67 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 13
+sum(cost)	date	sum(price)	sum(price + 1)
+1	2023-10-02 00:00:00	100	101
+3	2023-10-01 00:00:00	1110	1112
+
+-- query 14
+DATE	SUM_COST	sum(PRICE)	max(PRICE)
+2023-10-01 00:00:00	3	1110	1010
+2023-10-02 00:00:00	1	100	100
+
+-- query 15
+sum(cost)	date	sum(price)	sum(price + 1)
+1	2023-10-02 00:00:00	100	101
+3	2023-10-01 00:00:00	1110	1112
+
+-- query 16
+DATE	SUM_COST	sum(PRICE)	max(PRICE)
+2023-10-01 00:00:00	3	1110	1010
+2023-10-02 00:00:00	1	100	100
+
+-- query 17
+
+-- query 18
+
+-- query 23
+sum(cost)	date	sum(price)	sum(price + 1)
+2	2023-10-02 00:00:00	200	202
+6	2023-10-01 00:00:00	2220	2224
+
+-- query 24
+DATE	SUM_COST	sum(PRICE)	max(PRICE)
+2023-10-01 00:00:00	6	2220	1010
+2023-10-02 00:00:00	2	200	100
+
+-- query 25
+sum(cost)	date	sum(price)	sum(price + 1)
+2	2023-10-02 00:00:00	200	202
+6	2023-10-01 00:00:00	2220	2224
+
+-- query 26
+DATE	SUM_COST	sum(PRICE)	max(PRICE)
+2023-10-01 00:00:00	6	2220	1010
+2023-10-02 00:00:00	2	200	100
+
+-- query 27
+
+-- query 28
+
+-- query 29
+
+-- query 30

@@ -1,0 +1,131 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 12
+k1	sum(CASE WHEN (k6 > 1) THEN k9 ELSE 0 END)
+2023-06-15	0
+2023-06-16	6
+2023-06-17	8
+
+-- query 13
+k1	sum(CASE WHEN (k6 > 1) THEN (k9 + 1) ELSE 0 END)
+2023-06-15	0
+2023-06-16	7
+2023-06-17	9
+
+-- query 14
+k1	sum(CASE WHEN (k6 = 1) THEN k9 ELSE 0 END)
+2023-06-15	6
+2023-06-16	0
+2023-06-17	0
+
+-- query 15
+k1	sum(CASE WHEN (k6 = 1) THEN (k9 + 1) ELSE 0 END)
+2023-06-15	8
+2023-06-16	0
+2023-06-17	0
+
+-- query 16
+k1	sum(k9)	cnt0	cnt1	cnt2
+2023-06-15	6	0	6	0
+2023-06-16	6	0	0	0
+2023-06-17	8	0	0	0
+
+-- query 17
+k1	cnt0
+2023-06-15	0
+2023-06-16	6
+2023-06-17	8
+
+-- query 18
+
+-- query 19
+
+-- query 27
+k1	sum(CASE WHEN (k6 > 1) THEN k9 ELSE 0 END)
+2023-06-15	0
+2023-06-16	6
+2023-06-17	8
+
+-- query 28
+k1	sum(CASE WHEN (k6 > 1) THEN (k9 + 1) ELSE 0 END)
+2023-06-15	0
+2023-06-16	8
+2023-06-17	10
+
+-- query 29
+k1	sum(CASE WHEN (k6 = 1) THEN k9 ELSE 0 END)
+2023-06-15	6
+2023-06-16	0
+2023-06-17	0
+
+-- query 30
+k1	sum(CASE WHEN (k6 = 1) THEN (k9 + 1) ELSE 0 END)
+2023-06-15	10
+2023-06-16	0
+2023-06-17	0
+
+-- query 31
+k1	sum(k9)	cnt0	cnt1	cnt2
+2023-06-15	6	0	6	0
+2023-06-16	6	0	0	0
+2023-06-17	8	0	0	0
+
+-- query 32
+k1	cnt0
+2023-06-15	0
+2023-06-16	6
+2023-06-17	8
+
+-- query 33
+
+-- query 34
+
+-- query 44
+count(1)
+8
+
+-- query 45
+count(*)
+8
+
+-- query 46
+count(k6)
+8
+
+-- query 47
+k1	sum(CASE WHEN (k6 > 1) THEN k6 ELSE 0 END)
+2023-06-15	0
+2023-06-16	6
+2023-06-17	8
+
+-- query 48
+k1	sum(CASE WHEN (k6 > 1) THEN (k6 + 1) ELSE 0 END)
+2023-06-15	0
+2023-06-16	8
+2023-06-17	10
+
+-- query 49
+k1	sum(CASE WHEN (k6 = 1) THEN k6 ELSE 0 END)
+2023-06-15	4
+2023-06-16	0
+2023-06-17	0
+
+-- query 50
+k1	sum(CASE WHEN (k6 = 1) THEN (k6 + 1) ELSE 0 END)
+2023-06-15	8
+2023-06-16	0
+2023-06-17	0
+
+-- query 51
+k1	cnt0
+2023-06-15	0
+2023-06-16	6
+2023-06-17	8
+
+-- query 52

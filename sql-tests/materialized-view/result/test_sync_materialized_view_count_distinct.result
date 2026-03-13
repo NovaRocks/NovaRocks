@@ -1,0 +1,73 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 7
+
+-- query 8
+
+-- query 9
+
+-- query 13
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-01	19	36	10	1	1	0	0	1	0
+2023-11-02	19	36	10	1	1	0	0	1	0
+
+-- query 14
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-01	19	36	10	1	1	0	0	1	0
+2023-11-02	19	36	10	1	1	0	0	1	0
+
+-- query 15
+column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2
+19	36	10	1	1	0
+
+-- query 16
+
+-- query 18
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-01	19	36	20	1	1	0	0	1	0
+2023-11-02	19	36	20	1	1	0	0	1	0
+
+-- query 19
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-01	19	36	20	1	1	0	0	1	0
+2023-11-02	19	36	20	1	1	0	0	1	0
+
+-- query 20
+column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2
+19	36	20	1	1	0
+
+-- query 21
+
+-- query 22
+
+-- query 26
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-02	19	36	20	1	1	0	0	1	0
+
+-- query 27
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-02	19	36	20	1	1	0	0	1	0
+
+-- query 28
+column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2
+19	36	20	1	1	0
+
+-- query 29
+
+-- query 32
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-02	19	36	30	1	1	0	0	1	0
+
+-- query 33
+ds	column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2	filter_dist_cnt_3	filter_dist_cnt_4	filter_dist_cnt_5
+2023-11-02	19	36	30	1	1	0	0	1	0
+
+-- query 34
+column_19	column_36	column_01_sum	user_id_dist_cnt	filter_dist_cnt_1	filter_dist_cnt_2
+19	36	30	1	1	0
+
+-- query 35

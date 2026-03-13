@@ -1,0 +1,24 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 9
+table_name	query_rewrite_status
+mv1	VALID
+mv2	INVALID: enable_query_rewrite=FALSE
+mv3	INVALID: MV is not active
+mv4	INVALID: no valid plan: MV contains non-SPJG operators(no view rewrite): LOGICAL_LIMIT
+
+-- query 10

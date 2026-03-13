@@ -1,0 +1,91 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 8
+count(1)
+1
+
+-- query 9
+k3	month	cnt
+11	2024-08	2
+
+-- query 10
+
+-- query 11
+
+-- query 12
+
+-- query 13
+
+-- query 14
+sleep(10)
+1
+
+-- query 17
+count(1)
+1
+
+-- query 18
+k3	month	cnt
+11	2024-08	8
+
+-- query 19
+k3	month	cnt
+11	2024-08	8
+
+-- query 20
+
+-- query 21
+k3	month	cnt
+11	2024-08	8
+
+-- query 22
+
+-- query 23
+
+-- query 24
+
+-- query 30
+count(1)
+1
+
+-- query 31
+month	cnt
+2024-08	8
+
+-- query 32
+
+-- query 33
+
+-- query 34
+
+-- query 35
+
+-- query 36
+sleep(10)
+1
+
+-- query 39
+count(1)
+1
+
+-- query 40
+month	cnt
+2024-08	14
+
+-- query 41
+month	cnt
+2024-08	14
+
+-- query 42
+
+-- query 43
+month	cnt
+2024-08	14
+
+-- query 44

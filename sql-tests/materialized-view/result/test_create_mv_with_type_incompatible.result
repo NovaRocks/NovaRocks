@@ -1,0 +1,17 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 5
+count(*)
+5
+
+-- query 6
+new_col1	col1	col2	dt
+举头望明月	c	d	2023-12-01
+床前明月光	a	b	2023-12-01
+g	g	h	2023-12-02
+一二三四五六七八九十	e	f	2023-12-02
+i	i	j	2023-12-03

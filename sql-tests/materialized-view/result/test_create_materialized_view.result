@@ -1,0 +1,57 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 9
+table_schema	table_name	mv_query
+test_create_mv	mv1	["CREATE MATERIALIZED VIEW `mv1` (`k1`, `v1`)","REFRESH ASYNC","AS select t0.k1, t1.v1"]
+
+-- query 10
+
+-- query 11
+table_schema	table_name	mv_query
+test_create_mv	mv2	["CREATE MATERIALIZED VIEW `mv2` (`k1`, `count(v1)`)","REFRESH ASYNC","AS select k1, count(v1)  from t_random group by k1;"]
+
+-- query 12
+
+-- query 13
+table_schema	table_name	mv_query
+test_create_mv	mv3	["CREATE MATERIALIZED VIEW `mv3` (`k1`, `v1`)","REFRESH ASYNC","AS select t0.k1, t1.v1"]
+
+-- query 14
+
+-- query 15
+table_schema	table_name	mv_query
+test_create_mv	mv4	["CREATE MATERIALIZED VIEW `mv4` (`k1`, `v1`)","REFRESH ASYNC","AS select t0.k1, t1.v1"]
+
+-- query 16
+
+-- query 17
+table_schema	table_name	mv_query
+test_create_mv	mv_part1	["CREATE MATERIALIZED VIEW `mv_part1` (`k1`, `v1`)","REFRESH ASYNC","AS select t1.k1, t2.v1"]
+
+-- query 18
+
+-- query 19
+table_schema	table_name	mv_query
+test_create_mv	mv5	["CREATE MATERIALIZED VIEW `mv5` (`k1`, `v1`, `v2`)","REFRESH ASYNC","AS select k1, v1, v2 from t1"]
+
+-- query 20
+
+-- query 21
+table_schema	table_name	mv_query
+test_create_mv	mv6	["CREATE MATERIALIZED VIEW `mv6` (`k1`, `v1`, `v2`)","REFRESH ASYNC","AS select k1, v1, v2 from t1"]
+
+-- query 22

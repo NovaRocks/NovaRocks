@@ -1,0 +1,15 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 8
+if((count(*)) > 0, 'pass', 'fail')
+pass
+
+-- query 9

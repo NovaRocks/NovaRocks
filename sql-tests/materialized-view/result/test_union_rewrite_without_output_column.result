@@ -1,0 +1,35 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 5
+Explain String
+- Output => [7:count]
+    - AGGREGATE(GLOBAL) []
+            Estimates: {row: 1, cpu: 8.00, memory: 8.00, network: 0.00, cost: 104.30}
+            7:count := count(7:count)
+        - EXCHANGE(GATHER)
+                Estimates: {row: 1, cpu: 8.00, memory: 0.00, network: 8.00, cost: 84.30}
+            - AGGREGATE(LOCAL) []
+                    Estimates: {row: 1, cpu: 1.40, memory: 0.80, network: 0.00, cost: 68.30}
+                    7:count := count(1:event_id)
+                - UNION => [19: event_id]
+                        Estimates: {row: 3, cpu: 0.00, memory: 0.00, network: 0.00, cost: 59.00}
+                    - EXCHANGE(ROUND_ROBIN)
+                            Estimates: {row: 1, cpu: 6.00, memory: 0.00, network: 6.00, cost: 35.00}
+                        - SCAN [event1] => [21:event_type, 11:event_id]
+                                Estimates: {row: 1, cpu: 14.00, memory: 0.00, network: 0.00, cost: 7.00}
+                                partitionRatio: 1/7, tabletRatio: 12/12
+                                predicate: DictMapping(21: event_type, 12: event_type != click)
+                    - EXCHANGE(ROUND_ROBIN)
+                            Estimates: {row: 2, cpu: 8.00, memory: 0.00, network: 8.00, cost: 24.00}
+                        - SCAN [olap_mv1] => [8:event_id]
+                                MaterializedView: true
+                                Estimates: {row: 2, cpu: 8.00, memory: 0.00, network: 0.00, cost: 4.00}
+                                partitionRatio: 1/7, tabletRatio: 1/1
+
+-- query 6
+count(event_id)
+3

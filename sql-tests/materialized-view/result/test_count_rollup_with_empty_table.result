@@ -1,0 +1,50 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+count()
+0
+
+-- query 4
+user_id	count(tag_id)
+
+-- query 5
+user_id	count(tag_id)
+
+-- query 6
+
+-- query 8
+count()
+0
+
+-- query 9
+user_id	count(tag_id)
+
+-- query 10
+user_id	count(tag_id)
+
+-- query 11
+user_id	count(tag_id)
+1	1
+
+-- query 12
+count(user_id)
+
+-- query 13
+count(user_id)
+0
+
+-- query 14
+
+-- query 15
+
+-- query 16
+
+-- query 17
+
+-- query 18
+count()
+0
+
+-- query 19
