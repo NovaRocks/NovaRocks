@@ -25,7 +25,6 @@ use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 
-use crate::common::config::exchange_wait_ms;
 use crate::common::ids::SlotId;
 use crate::common::types::format_uuid;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
@@ -997,7 +996,7 @@ fn decode_arrow_ipc_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, String> {
 }
 
 fn chunk_schema_for_wire_meta(
-    expected_chunk_schema: &ChunkSchemaRef,
+    expected_chunk_schema: Option<&ChunkSchemaRef>,
     batch: &RecordBatch,
     wire_meta: &ExchangeWireMeta,
 ) -> Result<ChunkSchemaRef, String> {
@@ -1008,6 +1007,12 @@ fn chunk_schema_for_wire_meta(
             wire_meta.slot_ids_by_index.len()
         ));
     }
+    let Some(expected_chunk_schema) = expected_chunk_schema else {
+        return crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &wire_meta.slot_ids_by_index,
+        );
+    };
     let mut slots = Vec::with_capacity(batch.num_columns());
     let batch_schema = batch.schema();
     for (idx, slot_id) in wire_meta.slot_ids_by_index.iter().enumerate() {
@@ -1087,8 +1092,6 @@ pub fn decode_chunks_for_sender(
     let expected_chunk_schema;
     let wire_meta;
     {
-        let wait_start = Instant::now();
-        let wait_timeout = Duration::from_millis(exchange_wait_ms());
         let mut st = receiver.mu.lock().expect("exchange receiver lock");
         if let Some(meta) = decoded_wire_meta {
             match st.sender_wire_meta.get(&(sender_id, be_number)) {
@@ -1123,48 +1126,17 @@ pub fn decode_chunks_for_sender(
                     )
                 })?;
         }
-        loop {
-            if let Some(schema) = st.expected_chunk_schema.clone() {
-                expected_chunk_schema = schema;
-                break;
-            }
-            if st.canceled {
-                return Err("exchange canceled".to_string());
-            }
-            let elapsed = wait_start.elapsed();
-            if elapsed >= wait_timeout {
-                return Err(format!(
-                    "exchange expected chunk schema not registered: finst={} node_id={}",
-                    key.finst_uuid(),
-                    key.node_id
-                ));
-            }
-            let remain = wait_timeout - elapsed;
-            let wait_step = remain.min(EXCHANGE_WAIT_LOG_INTERVAL);
-            let (next, wait_res) = receiver
-                .cv
-                .wait_timeout(st, wait_step)
-                .map_err(|_| "exchange wait poisoned".to_string())?;
-            st = next;
-            if wait_res.timed_out() && wait_step < remain {
-                let elapsed_after = wait_start.elapsed();
-                debug!(
-                    "exchange decode waiting for schema: finst={} node_id={} sender_id={} be_number={} elapsed={:?} remain={:?}",
-                    key.finst_uuid(),
-                    key.node_id,
-                    sender_id,
-                    be_number,
-                    elapsed_after,
-                    wait_timeout.saturating_sub(elapsed_after)
-                );
-            }
+        if st.canceled {
+            return Err("exchange canceled".to_string());
         }
+        expected_chunk_schema = st.expected_chunk_schema.clone();
     }
 
     let batches = decode_arrow_ipc_batches(arrow_payload)?;
     let mut chunks = Vec::with_capacity(batches.len());
     for batch in batches {
-        let chunk_schema = chunk_schema_for_wire_meta(&expected_chunk_schema, &batch, &wire_meta)?;
+        let chunk_schema =
+            chunk_schema_for_wire_meta(expected_chunk_schema.as_ref(), &batch, &wire_meta)?;
         chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
     }
     Ok(chunks)
@@ -1172,12 +1144,10 @@ pub fn decode_chunks_for_sender(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
     use arrow::array::{ArrayRef, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     use super::{
         ExchangeKey, cancel_exchange_key, decode_chunks, decode_chunks_for_sender, encode_chunks,
@@ -1402,24 +1372,20 @@ mod tests {
     }
 
     #[test]
-    fn decode_chunks_for_sender_waits_for_schema_registration() {
+    fn decode_chunks_for_sender_decodes_with_wire_meta_before_schema_registration() {
         let key = ExchangeKey {
             finst_id_hi: 201,
             finst_id_lo: 202,
             node_id: 19,
         };
         let payload = encode_chunks(&[exchange_test_chunk("_cse_0")], true).expect("encode");
-        let decode_key = key;
-        let handle = std::thread::spawn(move || {
-            decode_chunks_for_sender(decode_key, 7, 1, &payload).expect("decode after wait")
-        });
-
-        std::thread::sleep(Duration::from_millis(50));
-        let expected_chunk_schema = exchange_test_chunk("_cse_0").chunk_schema_ref();
-        register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
-
-        let decoded = handle.join().expect("join decode thread");
+        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
         assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].chunk_schema().slots()[3].slot_id(),
+            SlotId::new(32)
+        );
+        assert_eq!(decoded[0].schema().field(3).name(), "_cse_0");
 
         cancel_exchange_key(key);
     }

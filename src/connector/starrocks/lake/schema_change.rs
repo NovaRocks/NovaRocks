@@ -1200,14 +1200,8 @@ fn build_rollup_expr_input(
             source_field.data_type().clone(),
             slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
         );
+        slot_schemas.push(ChunkSlotSchema::from_field(slot_id, &field, None)?);
         fields.push(field);
-        slot_schemas.push(ChunkSlotSchema::new(
-            slot_id,
-            slot_name,
-            slot_desc.is_nullable.unwrap_or(source_field.is_nullable()),
-            None,
-            None,
-        ));
         arrays.push(
             source_batch
                 .columns()
@@ -1636,17 +1630,22 @@ fn write_schema_change_txn_log(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_expected_initial_metadata_without_schema, resolve_target_schema, schemas_equivalent,
-        should_patch_initial_metadata_schema,
+        build_rollup_expr_input, is_expected_initial_metadata_without_schema,
+        resolve_target_schema, schemas_equivalent, should_patch_initial_metadata_schema,
     };
     use crate::agent_service::TAlterTabletReqV2;
     use crate::connector::starrocks::lake::context::PartialUpdateWritePolicy;
     use crate::connector::starrocks::lake::context::{
         TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
     };
+    use crate::descriptors;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
     };
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -1808,6 +1807,46 @@ mod tests {
             err.contains("target schema unresolved"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn build_rollup_expr_input_accepts_runtime_fields_without_slot_type() {
+        let mut request = test_alter_request(1, 2);
+        request.desc_tbl = Some(descriptors::TDescriptorTable {
+            slot_descriptors: Some(vec![descriptors::TSlotDescriptor {
+                id: Some(7),
+                parent: Some(3),
+                slot_type: None,
+                column_pos: None,
+                byte_offset: None,
+                null_indicator_byte: None,
+                null_indicator_bit: None,
+                col_name: Some("k1".to_string()),
+                slot_idx: None,
+                is_materialized: Some(true),
+                is_output_column: Some(true),
+                is_nullable: Some(false),
+                col_unique_id: None,
+                col_physical_name: None,
+            }]),
+            tuple_descriptors: Vec::new(),
+            table_descriptors: None,
+            is_cached: None,
+        });
+        let source_schema = test_schema(1, vec![test_scalar_column(10, "k1", "INT")]);
+        let source_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("k1", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("source batch");
+
+        let input = build_rollup_expr_input(&request, &source_batch, &source_schema, 0)
+            .expect("runtime fields should build without slot_type");
+
+        assert_eq!(input.layout.order, vec![(3, 7)]);
+        assert_eq!(input.chunk.schema().field(0).name(), "k1");
+        assert_eq!(input.chunk.schema().field(0).data_type(), &DataType::Int32);
+        assert!(!input.chunk.chunk_schema().slots()[0].nullable());
     }
 
     fn test_schema(schema_id: i64, columns: Vec<ColumnPb>) -> TabletSchemaPb {

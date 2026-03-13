@@ -21,8 +21,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
     TimestampMicrosecondArray, UInt32Array, new_null_array,
 };
 use arrow::compute::{cast, concat, take};
@@ -1632,7 +1632,9 @@ fn resolve_tablet_column_arrow_type(column: &ColumnPb) -> Result<DataType, Strin
         // Partial-update materialization must allow these columns instead of
         // failing fast when FE chooses AUTO/COLUMN_* paths.
         "OBJECT" | "BITMAP" | "HLL" | "PERCENTILE" | "JSON" | "VARIANT" => Ok(DataType::Binary),
-        "LARGEINT" => Ok(DataType::Decimal128(38, 0)),
+        "LARGEINT" => Ok(DataType::FixedSizeBinary(
+            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+        )),
         "DECIMAL" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
             let (precision, scale) = resolve_decimal_precision_scale(column)?;
             Ok(DataType::Decimal128(precision, scale))
@@ -2342,6 +2344,17 @@ pub(crate) fn parse_default_literal_to_singleton_array(
         DataType::Timestamp(TimeUnit::Microsecond, None) => Ok(Arc::new(
             TimestampMicrosecondArray::from(vec![Some(parse_timestamp_default_literal(unquoted)?)]),
         )),
+        DataType::FixedSizeBinary(width)
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            let parsed = unquoted.parse::<i128>().map_err(|e| {
+                format!(
+                    "parse LARGEINT default literal '{}' failed: {}",
+                    unquoted, e
+                )
+            })?;
+            crate::common::largeint::array_from_i128(&[Some(parsed)])
+        }
         DataType::Decimal128(precision, scale) => {
             let parsed = parse_decimal128_default_literal(unquoted, *precision, *scale)?;
             let array = Decimal128Array::from(vec![Some(parsed)])
@@ -2590,6 +2603,20 @@ fn scalar_array_gt(left: &ArrayRef, right: &ArrayRef) -> Result<bool, String> {
                 .downcast_ref::<TimestampMicrosecondArray>()
                 .ok_or_else(|| "downcast merge_condition right DATETIME failed".to_string())?;
             Ok(left.value(0) > right.value(0))
+        }
+        DataType::FixedSizeBinary(width)
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            let left = left
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "downcast merge_condition left LARGEINT failed".to_string())?;
+            let right = right
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "downcast merge_condition right LARGEINT failed".to_string())?;
+            Ok(crate::common::largeint::value_at(left, 0)?
+                > crate::common::largeint::value_at(right, 0)?)
         }
         DataType::Decimal128(_, _) => {
             let left = left
@@ -3361,8 +3388,12 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use tempfile::tempdir;
 
-    use super::{TabletWriteContext, append_lake_txn_log_with_rowset, read_txn_log_if_exists};
+    use super::{
+        TabletWriteContext, append_lake_txn_log_with_rowset, build_tablet_output_schema,
+        parse_default_literal_to_singleton_array, read_txn_log_if_exists, scalar_array_gt,
+    };
     use crate::common::ids::SlotId;
+    use crate::common::largeint;
     use crate::exec::chunk::Chunk;
     use crate::formats::starrocks::metadata::{
         collect_delete_predicates, lake_rowset_visibility_version,
@@ -3598,6 +3629,76 @@ mod tests {
             s3_config: None,
             partial_update: Default::default(),
         }
+    }
+
+    #[test]
+    fn build_tablet_output_schema_uses_largeint_fixed_size_binary() {
+        let tablet_schema = TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 1,
+                name: Some("k1".to_string()),
+                r#type: "LARGEINT".to_string(),
+                is_key: Some(true),
+                aggregation: None,
+                is_nullable: Some(false),
+                default_value: None,
+                precision: None,
+                frac: None,
+                length: None,
+                index_length: None,
+                is_bf_column: None,
+                referenced_column_id: None,
+                referenced_column: None,
+                has_bitmap_index: None,
+                visible: None,
+                children_columns: Vec::new(),
+                is_auto_increment: Some(false),
+                agg_state_desc: None,
+            }],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(2),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(7),
+        };
+
+        let schema =
+            build_tablet_output_schema(&tablet_schema).expect("build tablet output schema");
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH)
+        );
+    }
+
+    #[test]
+    fn parse_largeint_default_literal_to_fixed_size_binary_array() {
+        let array = parse_default_literal_to_singleton_array(
+            &DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH),
+            "170141183460469231731687303715884105727",
+        )
+        .expect("parse LARGEINT default literal");
+        let array = largeint::as_fixed_size_binary_array(&array, "test largeint default")
+            .expect("downcast largeint array");
+        assert_eq!(
+            largeint::value_at(array, 0).expect("decode largeint value"),
+            170141183460469231731687303715884105727_i128
+        );
+    }
+
+    #[test]
+    fn scalar_array_gt_compares_largeint_binary_values() {
+        let left = largeint::array_from_i128(&[Some(11)]).expect("build left largeint");
+        let right = largeint::array_from_i128(&[Some(7)]).expect("build right largeint");
+        assert!(scalar_array_gt(&left, &right).expect("compare largeint arrays"));
     }
 
     fn test_primary_key_tablet_schema(schema_id: i64) -> TabletSchemaPb {

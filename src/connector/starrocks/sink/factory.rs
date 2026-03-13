@@ -102,12 +102,14 @@ pub(crate) struct SinkIndexWritePlan {
     pub(crate) write_targets: HashMap<i64, TabletWriteTarget>,
     pub(crate) schema_slot_bindings: Vec<Option<SlotId>>,
     pub(crate) op_slot_id: Option<SlotId>,
+    pub(crate) where_clause: Option<exprs::TExpr>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SinkWriteIndexSelection {
     index_id: i64,
     schema_id: i64,
+    where_clause: Option<exprs::TExpr>,
 }
 
 #[derive(Clone)]
@@ -236,7 +238,7 @@ impl OlapTableSinkFactory {
                     tablet_commit_infos.push(commit.clone());
                 }
             }
-            index_routings.push((*index, routing));
+            index_routings.push((index.clone(), routing));
         }
         if all_refs.is_empty() {
             return Err("OLAP_TABLE_SINK resolved empty tablet refs for write targets".to_string());
@@ -353,6 +355,7 @@ impl OlapTableSinkFactory {
                 write_targets,
                 schema_slot_bindings,
                 op_slot_id,
+                where_clause: index.where_clause.clone(),
             });
         }
         let primary_plan = index_write_plans.first().cloned().ok_or_else(|| {
@@ -1224,10 +1227,16 @@ fn build_output_projection_plan(
     let Some(output_exprs) = output_exprs.filter(|exprs| !exprs.is_empty()) else {
         return Ok(None);
     };
-    // Slot-ref-only output exprs do not need an extra projection stage.
-    // Keeping the original upstream slot ids avoids accidental remapping when
-    // FE expr order does not match sink slot descriptor order.
-    if output_exprs_are_plain_slot_refs(output_exprs) {
+    let has_index_where_clause = sink.schema.indexes.iter().any(|index| {
+        index
+            .where_clause
+            .as_ref()
+            .is_some_and(|expr| !expr.nodes.is_empty())
+    });
+    // Slot-ref-only output exprs can usually reuse the upstream chunk directly.
+    // When FE attaches index where-clause expressions, we must still remap slot ids
+    // to the sink output tuple so predicate evaluation sees the expected slots.
+    if output_exprs_are_plain_slot_refs(output_exprs) && !has_index_where_clause {
         return Ok(None);
     }
     let layout = layout.ok_or_else(|| {
@@ -1649,6 +1658,9 @@ fn resolve_sink_write_index_selections(
                     primary_index_id
                 )
             })?,
+        where_clause: index_by_id
+            .get(&primary_index_id)
+            .and_then(|index| index.where_clause.clone()),
     });
 
     let mut rest = scored
@@ -1657,6 +1669,9 @@ fn resolve_sink_write_index_selections(
         .map(|item| SinkWriteIndexSelection {
             index_id: item.0,
             schema_id: item.1,
+            where_clause: index_by_id
+                .get(&item.0)
+                .and_then(|index| index.where_clause.clone()),
         })
         .collect::<Vec<_>>();
     rest.sort_by_key(|item| item.index_id);
@@ -1772,11 +1787,13 @@ fn collect_required_tablets(partition: &descriptors::TOlapTablePartitionParam) -
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::resolve_write_slot_bindings;
+    use super::{build_output_projection_plan, resolve_write_slot_bindings};
     use crate::common::ids::SlotId;
+    use crate::lower::layout::Layout;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::{data_sinks, descriptors, exprs, types};
@@ -2171,6 +2188,51 @@ mod tests {
             ]
         );
         assert_eq!(op_slot_id, None);
+    }
+
+    #[test]
+    fn plain_slot_ref_output_projection_is_forced_for_index_where_clause() {
+        let mut sink = test_sink_with_aliased_agg_slots();
+        sink.schema.indexes[0].where_clause = Some(exprs::TExpr {
+            nodes: vec![exprs::TExprNode {
+                node_type: exprs::TExprNodeType::SLOT_REF,
+                type_: dummy_type_desc(),
+                num_children: 0,
+                slot_ref: Some(exprs::TSlotRef {
+                    slot_id: 2,
+                    tuple_id: 0,
+                }),
+                ..default_expr_node()
+            }],
+        });
+        let output_exprs = vec![
+            slot_ref_expr(1),
+            slot_ref_expr(2),
+            slot_ref_expr(3),
+            slot_ref_expr(4),
+        ];
+        let projection = build_output_projection_plan(
+            &sink,
+            Some(output_exprs.as_slice()),
+            Some(&Layout {
+                order: Vec::new(),
+                index: HashMap::new(),
+            }),
+            None,
+            None,
+            None,
+        )
+        .expect("build output projection plan")
+        .expect("where-clause indexes should force slot remapping projection");
+        assert_eq!(
+            projection.output_slot_ids,
+            vec![
+                SlotId::new(1),
+                SlotId::new(2),
+                SlotId::new(3),
+                SlotId::new(4),
+            ]
+        );
     }
 
     #[test]

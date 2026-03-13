@@ -62,7 +62,7 @@ pub(crate) fn arrow_type_from_primitive(primitive: types::TPrimitiveType) -> Opt
         t if t == types::TPrimitiveType::SMALLINT => DataType::Int16,
         t if t == types::TPrimitiveType::INT => DataType::Int32,
         t if t == types::TPrimitiveType::BIGINT => DataType::Int64,
-        t if t == types::TPrimitiveType::LARGEINT => DataType::Decimal128(38, 0),
+        t if t == types::TPrimitiveType::LARGEINT => DataType::FixedSizeBinary(16),
         t if t == types::TPrimitiveType::FLOAT => DataType::Float32,
         t if t == types::TPrimitiveType::DOUBLE => DataType::Float64,
         t if t == types::TPrimitiveType::DATE => DataType::Date32,
@@ -241,6 +241,14 @@ mod tests {
         assert_eq!(
             arrow_type_from_primitive(TPrimitiveType::PERCENTILE),
             Some(DataType::Binary)
+        );
+    }
+
+    #[test]
+    fn largeint_primitive_lowers_to_fixed_size_binary() {
+        assert_eq!(
+            arrow_type_from_primitive(TPrimitiveType::LARGEINT),
+            Some(DataType::FixedSizeBinary(16))
         );
     }
 }
