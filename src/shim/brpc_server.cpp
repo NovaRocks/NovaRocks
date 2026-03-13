@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
@@ -148,6 +149,14 @@ struct UniqueIdKey {
     bool operator==(const UniqueIdKey& other) const { return hi == other.hi && lo == other.lo; }
 };
 
+struct UniqueIdKeyHash {
+    size_t operator()(const UniqueIdKey& id) const {
+        const auto hi = static_cast<uint64_t>(id.hi);
+        const auto lo = static_cast<uint64_t>(id.lo);
+        return std::hash<uint64_t>{}((hi << 1) ^ lo);
+    }
+};
+
 std::string format_unique_id(const UniqueIdKey& id) {
     const auto hi = static_cast<uint64_t>(id.hi);
     const auto lo = static_cast<uint64_t>(id.lo);
@@ -166,21 +175,6 @@ struct ResultPacket {
     int64_t packet_seq = 0;
     bool eos = true;
 };
-
-ResultPacket make_empty_eos_packet(AttachmentProtocol proto, int64_t packet_seq, std::string* err) {
-    starrocks::TResultBatch batch;
-    batch.is_compressed = false;
-    batch.packet_seq = packet_seq;
-
-    std::string bytes;
-    (void)thrift_serialize(batch, proto, &bytes, err);
-
-    ResultPacket pkt;
-    pkt.thrift_bytes = std::move(bytes);
-    pkt.packet_seq = packet_seq;
-    pkt.eos = true;
-    return pkt;
-}
 
 std::string take_rust_buf_string(NovaRocksRustBuf* buf) {
     if (buf == nullptr) {
@@ -447,6 +441,408 @@ private:
 
 std::unique_ptr<QueryRpcPool> g_query_rpc_pool;
 
+struct FetchTryOutcome {
+    enum class Kind {
+        Ready,
+        NotReady,
+        Error,
+    };
+
+    Kind kind = Kind::Error;
+    ResultPacket packet;
+    starrocks::TStatusCode::type status_code = starrocks::TStatusCode::INTERNAL_ERROR;
+    std::string message;
+};
+
+void finish_fetch_response(brpc::Controller* cntl,
+                           starrocks::PFetchDataResult* response,
+                           const ResultPacket& pkt) {
+    if (response == nullptr) {
+        return;
+    }
+    status_ok(response->mutable_status());
+    response->set_packet_seq(pkt.packet_seq);
+    response->set_eos(pkt.eos);
+    if (cntl != nullptr && !pkt.thrift_bytes.empty()) {
+        cntl->response_attachment().append(pkt.thrift_bytes);
+    }
+}
+
+void finish_fetch_error(starrocks::PFetchDataResult* response,
+                        starrocks::TStatusCode::type code,
+                        const std::string& msg) {
+    if (response != nullptr) {
+        status_err(response->mutable_status(), code, msg);
+    }
+}
+
+FetchTryOutcome try_fetch_result_packet(UniqueIdKey finst_id) {
+    FetchTryOutcome outcome;
+
+    NovaRocksRustBuf batch_buf{nullptr, 0};
+    NovaRocksRustBuf err_buf{nullptr, 0};
+    int64_t packet_seq = 0;
+    bool eos = true;
+    int32_t rc = novarocks_rs_try_fetch_result_batch(
+            finst_id.hi, finst_id.lo, &packet_seq, &eos, &batch_buf, &err_buf);
+
+    auto take_err = [&]() -> std::string {
+        std::string msg = take_rust_buf_string(&err_buf);
+        if (msg.empty()) {
+            msg = "unknown error";
+        }
+        return msg;
+    };
+
+    if (rc == 4) {
+        outcome.kind = FetchTryOutcome::Kind::NotReady;
+        if (batch_buf.ptr != nullptr) {
+            novarocks_rs_free_buf(batch_buf.ptr, batch_buf.len);
+        }
+        return outcome;
+    }
+
+    if (rc != 0) {
+        outcome.kind = FetchTryOutcome::Kind::Error;
+        outcome.message = take_err();
+        switch (rc) {
+        case 1:
+            outcome.status_code = starrocks::TStatusCode::NOT_FOUND;
+            break;
+        case 2:
+            outcome.status_code = starrocks::TStatusCode::CANCELLED;
+            break;
+        case 3:
+        default:
+            outcome.status_code = starrocks::TStatusCode::INTERNAL_ERROR;
+            break;
+        }
+        if (batch_buf.ptr != nullptr) {
+            novarocks_rs_free_buf(batch_buf.ptr, batch_buf.len);
+        }
+        return outcome;
+    }
+
+    outcome.kind = FetchTryOutcome::Kind::Ready;
+    outcome.packet.packet_seq = packet_seq;
+    outcome.packet.eos = eos;
+    if (batch_buf.ptr != nullptr && batch_buf.len > 0) {
+        outcome.packet.thrift_bytes.assign(reinterpret_cast<char*>(batch_buf.ptr), batch_buf.len);
+    }
+    if (batch_buf.ptr != nullptr) {
+        novarocks_rs_free_buf(batch_buf.ptr, batch_buf.len);
+    }
+    take_rust_buf_string(&err_buf);
+
+    if (outcome.packet.thrift_bytes.empty() && !outcome.packet.eos) {
+        outcome.kind = FetchTryOutcome::Kind::Error;
+        outcome.status_code = starrocks::TStatusCode::INTERNAL_ERROR;
+        outcome.message = "non-eos fetch result missing batch attachment";
+    }
+
+    return outcome;
+}
+
+struct FetchWaiter {
+    UniqueIdKey finst_id;
+    brpc::Controller* cntl;
+    starrocks::PFetchDataResult* response;
+    google::protobuf::Closure* done;
+    std::chrono::steady_clock::time_point deadline;
+};
+
+void complete_fetch_waiter(FetchWaiter waiter, const FetchTryOutcome& outcome) {
+    brpc::ClosureGuard guard(waiter.done);
+
+    switch (outcome.kind) {
+    case FetchTryOutcome::Kind::Ready:
+        std::cerr << "[DEBUG] fetch_data called, remote="
+                  << (waiter.cntl != nullptr ? waiter.cntl->remote_side() : butil::EndPoint())
+                  << " finst_id=" << format_unique_id(waiter.finst_id)
+                  << " packet_seq=" << outcome.packet.packet_seq
+                  << " eos=" << (outcome.packet.eos ? "true" : "false")
+                  << " attachment_bytes=" << outcome.packet.thrift_bytes.size() << std::endl;
+        finish_fetch_response(waiter.cntl, waiter.response, outcome.packet);
+        return;
+    case FetchTryOutcome::Kind::NotReady:
+        finish_fetch_error(waiter.response,
+                           starrocks::TStatusCode::INTERNAL_ERROR,
+                           "fetch waiter completed without ready result");
+        return;
+    case FetchTryOutcome::Kind::Error:
+        std::cerr << "[WARN] fetch_data failed, finst_id=" << format_unique_id(waiter.finst_id)
+                  << " msg=" << outcome.message << std::endl;
+        finish_fetch_error(waiter.response, outcome.status_code, outcome.message);
+        return;
+    }
+}
+
+void complete_fetch_waiter_timeout(FetchWaiter waiter) {
+    brpc::ClosureGuard guard(waiter.done);
+    std::string msg = "timeout waiting for fetch result";
+    std::cerr << "[WARN] fetch_data waiter timed out, finst_id=" << format_unique_id(waiter.finst_id)
+              << " msg=" << msg << std::endl;
+    finish_fetch_error(waiter.response, starrocks::TStatusCode::TIMEOUT, msg);
+}
+
+void complete_fetch_waiter_shutdown(FetchWaiter waiter) {
+    brpc::ClosureGuard guard(waiter.done);
+    finish_fetch_error(waiter.response,
+                       starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                       "fetch waiter registry is stopping");
+}
+
+class FetchWaiterRegistry {
+public:
+    explicit FetchWaiterRegistry(QueryRpcPool* pool) : pool_(pool) {
+        cleaner_ = std::thread([this]() { cleaner_loop(); });
+    }
+
+    ~FetchWaiterRegistry() { shutdown(); }
+
+    bool register_waiter(FetchWaiter waiter, std::string* err) {
+        const UniqueIdKey finst_id = waiter.finst_id;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                if (err != nullptr) {
+                    *err = "fetch waiter registry is stopping";
+                }
+                return false;
+            }
+            waiters_[waiter.finst_id].push_back(std::move(waiter));
+        }
+
+        cv_.notify_one();
+        schedule_drain(finst_id);
+        return true;
+    }
+
+    void notify_ready(UniqueIdKey finst_id) {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                return;
+            }
+            ready_notified_.insert(finst_id);
+        }
+        schedule_drain(finst_id, /*consume_ready_hint=*/true);
+    }
+
+    void shutdown() {
+        std::vector<FetchWaiter> pending;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                return;
+            }
+            stopped_ = true;
+            for (auto& [finst_id, queue] : waiters_) {
+                (void)finst_id;
+                while (!queue.empty()) {
+                    pending.push_back(std::move(queue.front()));
+                    queue.pop_front();
+                }
+            }
+            waiters_.clear();
+            draining_.clear();
+            ready_notified_.clear();
+        }
+
+        cv_.notify_all();
+        if (cleaner_.joinable()) {
+            cleaner_.join();
+        }
+        for (auto& waiter : pending) {
+            complete_fetch_waiter_shutdown(std::move(waiter));
+        }
+    }
+
+private:
+    using WaiterQueue = std::deque<FetchWaiter>;
+
+    void schedule_drain(UniqueIdKey finst_id, bool consume_ready_hint = false) {
+        bool should_submit = false;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                return;
+            }
+            if (draining_.find(finst_id) != draining_.end()) {
+                return;
+            }
+            draining_.insert(finst_id);
+            if (consume_ready_hint) {
+                ready_notified_.erase(finst_id);
+            }
+            should_submit = true;
+        }
+        if (!should_submit) {
+            return;
+        }
+
+        auto* pool = pool_;
+        if (pool == nullptr) {
+            fail_waiters_for_id(finst_id, starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                                "query rpc pool is unavailable");
+            clear_draining(finst_id);
+            return;
+        }
+
+        if (!pool->submit([this, finst_id]() { drain_ready(finst_id); })) {
+            fail_waiters_for_id(finst_id,
+                                starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                                "query rpc pool is stopping");
+            clear_draining(finst_id);
+        }
+    }
+
+    void clear_draining(UniqueIdKey finst_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        draining_.erase(finst_id);
+        ready_notified_.erase(finst_id);
+    }
+
+    void fail_waiters_for_id(UniqueIdKey finst_id,
+                             starrocks::TStatusCode::type code,
+                             const std::string& message) {
+        std::vector<FetchWaiter> pending;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            auto it = waiters_.find(finst_id);
+            if (it != waiters_.end()) {
+                while (!it->second.empty()) {
+                    pending.push_back(std::move(it->second.front()));
+                    it->second.pop_front();
+                }
+                waiters_.erase(it);
+            }
+            ready_notified_.erase(finst_id);
+        }
+
+        for (auto& waiter : pending) {
+            brpc::ClosureGuard guard(waiter.done);
+            finish_fetch_error(waiter.response, code, message);
+        }
+    }
+
+    bool pop_waiter(UniqueIdKey finst_id, FetchWaiter* waiter) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (stopped_) {
+            draining_.erase(finst_id);
+            ready_notified_.erase(finst_id);
+            return false;
+        }
+        auto it = waiters_.find(finst_id);
+        if (it == waiters_.end() || it->second.empty()) {
+            draining_.erase(finst_id);
+            ready_notified_.erase(finst_id);
+            return false;
+        }
+        *waiter = std::move(it->second.front());
+        it->second.pop_front();
+        if (it->second.empty()) {
+            waiters_.erase(it);
+        }
+        return true;
+    }
+
+    void requeue_waiter_front(FetchWaiter waiter) {
+        bool complete_shutdown = false;
+        bool reschedule = false;
+        const UniqueIdKey finst_id = waiter.finst_id;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                draining_.erase(finst_id);
+                ready_notified_.erase(finst_id);
+                complete_shutdown = true;
+            } else {
+                waiters_[finst_id].push_front(std::move(waiter));
+                draining_.erase(finst_id);
+                reschedule = ready_notified_.erase(finst_id) > 0;
+            }
+        }
+        if (complete_shutdown) {
+            complete_fetch_waiter_shutdown(std::move(waiter));
+        } else if (reschedule) {
+            schedule_drain(finst_id, /*consume_ready_hint=*/false);
+        }
+    }
+
+    void drain_ready(UniqueIdKey finst_id) {
+        while (true) {
+            FetchWaiter waiter;
+            if (!pop_waiter(finst_id, &waiter)) {
+                return;
+            }
+
+            if (std::chrono::steady_clock::now() >= waiter.deadline) {
+                complete_fetch_waiter_timeout(std::move(waiter));
+                continue;
+            }
+
+            FetchTryOutcome outcome = try_fetch_result_packet(finst_id);
+            if (outcome.kind == FetchTryOutcome::Kind::NotReady) {
+                requeue_waiter_front(std::move(waiter));
+                return;
+            }
+
+            complete_fetch_waiter(std::move(waiter), outcome);
+        }
+    }
+
+    void cleaner_loop() {
+        std::unique_lock<std::mutex> lock(mu_);
+        while (!stopped_) {
+            cv_.wait_for(lock, std::chrono::seconds(1));
+            if (stopped_) {
+                break;
+            }
+
+            std::vector<FetchWaiter> expired;
+            const auto now = std::chrono::steady_clock::now();
+            for (auto it = waiters_.begin(); it != waiters_.end();) {
+                WaiterQueue kept;
+                while (!it->second.empty()) {
+                    FetchWaiter waiter = std::move(it->second.front());
+                    it->second.pop_front();
+                    if (now >= waiter.deadline) {
+                        expired.push_back(std::move(waiter));
+                    } else {
+                        kept.push_back(std::move(waiter));
+                    }
+                }
+                it->second.swap(kept);
+                if (it->second.empty()) {
+                    draining_.erase(it->first);
+                    ready_notified_.erase(it->first);
+                    it = waiters_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            lock.unlock();
+            for (auto& waiter : expired) {
+                complete_fetch_waiter_timeout(std::move(waiter));
+            }
+            lock.lock();
+        }
+    }
+
+    QueryRpcPool* pool_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::unordered_map<UniqueIdKey, WaiterQueue, UniqueIdKeyHash> waiters_;
+    std::unordered_set<UniqueIdKey, UniqueIdKeyHash> draining_;
+    std::unordered_set<UniqueIdKey, UniqueIdKeyHash> ready_notified_;
+    std::thread cleaner_;
+    bool stopped_ = false;
+};
+
+std::unique_ptr<FetchWaiterRegistry> g_fetch_waiter_registry;
+
 class InternalServiceImpl final : public starrocks::PInternalService {
 public:
     explicit InternalServiceImpl(NovaRocksCompatConfig cfg) : cfg_(cfg) {}
@@ -503,13 +899,63 @@ public:
             finst_id.hi = request->finst_id().hi();
             finst_id.lo = request->finst_id().lo();
         }
+        if (request == nullptr || response == nullptr || cntl == nullptr) {
+            brpc::ClosureGuard guard(done);
+            finish_fetch_error(response,
+                               starrocks::TStatusCode::INVALID_ARGUMENT,
+                               "missing fetch_data request/controller/response");
+            return;
+        }
 
-        submit_query_rpc_task("fetch_data",
-                              response,
-                              done,
-                              [cntl, finst_id, response]() {
-                                  run_fetch_data(cntl, finst_id, response);
-                              });
+        FetchTryOutcome outcome = try_fetch_result_packet(finst_id);
+        if (outcome.kind != FetchTryOutcome::Kind::NotReady || done == nullptr) {
+            brpc::ClosureGuard guard(done);
+            if (outcome.kind == FetchTryOutcome::Kind::Ready) {
+                std::cerr << "[DEBUG] fetch_data called, remote=" << cntl->remote_side()
+                          << " finst_id=" << format_unique_id(finst_id)
+                          << " packet_seq=" << outcome.packet.packet_seq
+                          << " eos=" << (outcome.packet.eos ? "true" : "false")
+                          << " attachment_bytes=" << outcome.packet.thrift_bytes.size() << std::endl;
+                finish_fetch_response(cntl, response, outcome.packet);
+            } else if (outcome.kind == FetchTryOutcome::Kind::Error) {
+                std::cerr << "[WARN] fetch_data failed, finst_id=" << format_unique_id(finst_id)
+                          << " msg=" << outcome.message << std::endl;
+                finish_fetch_error(response, outcome.status_code, outcome.message);
+            } else {
+                finish_fetch_error(response,
+                                   starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                                   "fetch_data waiter requires async closure");
+            }
+            return;
+        }
+
+        auto* registry = g_fetch_waiter_registry.get();
+        if (registry == nullptr) {
+            brpc::ClosureGuard guard(done);
+            finish_fetch_error(response,
+                               starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                               "fetch waiter registry is unavailable");
+            return;
+        }
+
+        int64_t timeout_ms = novarocks_rs_fetch_wait_timeout_ms(finst_id.hi, finst_id.lo);
+        if (timeout_ms <= 0) {
+            timeout_ms = 300000;
+        }
+
+        FetchWaiter waiter{
+                finst_id,
+                cntl,
+                response,
+                done,
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms)};
+        std::string err;
+        if (!registry->register_waiter(std::move(waiter), &err)) {
+            brpc::ClosureGuard guard(done);
+            finish_fetch_error(response,
+                               starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                               err.empty() ? "fetch waiter registry rejected request" : err);
+        }
     }
 
     void cancel_plan_fragment(google::protobuf::RpcController* controller,
@@ -720,100 +1166,6 @@ private:
             return;
         }
         status_ok(response->mutable_status());
-    }
-
-    static void run_fetch_data(brpc::Controller* cntl,
-                               UniqueIdKey finst_id,
-                               starrocks::PFetchDataResult* response) {
-        if (cntl == nullptr || response == nullptr) {
-            if (response != nullptr) {
-                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
-                           "missing fetch_data controller/response");
-            }
-            return;
-        }
-
-        ResultPacket pkt;
-        std::string err;
-        NovaRocksRustBuf batch_buf;
-        batch_buf.ptr = nullptr;
-        batch_buf.len = 0;
-        NovaRocksRustBuf err_buf;
-        err_buf.ptr = nullptr;
-        err_buf.len = 0;
-        int64_t packet_seq = 0;
-        bool eos = true;
-        int32_t rc = novarocks_rs_fetch_result_batch(
-                finst_id.hi, finst_id.lo, &packet_seq, &eos, &batch_buf, &err_buf);
-
-        auto take_err = [&]() -> std::string {
-            std::string msg;
-            if (err_buf.ptr != nullptr && err_buf.len > 0) {
-                msg.assign(reinterpret_cast<char*>(err_buf.ptr), err_buf.len);
-            }
-            if (err_buf.ptr != nullptr) {
-                novarocks_rs_free_buf(err_buf.ptr, err_buf.len);
-                err_buf.ptr = nullptr;
-                err_buf.len = 0;
-            }
-            if (msg.empty()) {
-                msg = "unknown error";
-            }
-            return msg;
-        };
-
-        if (rc != 0) {
-            std::string msg = take_err();
-            starrocks::TStatusCode::type code = starrocks::TStatusCode::INTERNAL_ERROR;
-            switch (rc) {
-            case 1:
-                code = starrocks::TStatusCode::NOT_FOUND;
-                break;
-            case 2:
-                code = starrocks::TStatusCode::CANCELLED;
-                break;
-            case 4:
-                code = starrocks::TStatusCode::TIMEOUT;
-                break;
-            case 3:
-            default:
-                code = starrocks::TStatusCode::INTERNAL_ERROR;
-                break;
-            }
-            std::cerr << "[WARN] fetch_data failed, finst_id=" << format_unique_id(finst_id)
-                      << " rc=" << rc << " msg=" << msg << std::endl;
-            status_err(response->mutable_status(), code, msg);
-            return;
-        }
-
-        if (batch_buf.ptr != nullptr && batch_buf.len > 0) {
-            pkt.thrift_bytes.assign(reinterpret_cast<char*>(batch_buf.ptr), batch_buf.len);
-            pkt.packet_seq = packet_seq;
-            pkt.eos = eos;
-        }
-        if (batch_buf.ptr != nullptr) {
-            novarocks_rs_free_buf(batch_buf.ptr, batch_buf.len);
-        }
-
-        if (pkt.thrift_bytes.empty()) {
-            pkt = make_empty_eos_packet(
-                    AttachmentProtocol::Binary, /*packet_seq=*/packet_seq, &err);
-            if (!err.empty()) {
-                std::cerr << "[ERROR] fetch_data build empty packet failed: " << err << std::endl;
-            }
-            pkt.eos = eos;
-        }
-
-        std::cerr << "[DEBUG] fetch_data called, remote=" << cntl->remote_side()
-                  << " finst_id=" << format_unique_id(finst_id)
-                  << " packet_seq=" << pkt.packet_seq
-                  << " eos=" << (pkt.eos ? "true" : "false")
-                  << " attachment_bytes=" << pkt.thrift_bytes.size() << std::endl;
-
-        status_ok(response->mutable_status());
-        response->set_packet_seq(pkt.packet_seq);
-        response->set_eos(pkt.eos);
-        cntl->response_attachment().append(pkt.thrift_bytes);
     }
 
     static void run_cancel_plan_fragment(brpc::Controller* cntl,
@@ -2098,6 +2450,14 @@ int32_t novarocks_compat_lookup(const char* host,
             &starrocks::PInternalService_Stub::lookup);
 }
 
+extern "C" void novarocks_compat_notify_fetch_ready(int64_t finst_id_hi, int64_t finst_id_lo) {
+    auto* registry = g_fetch_waiter_registry.get();
+    if (registry == nullptr) {
+        return;
+    }
+    registry->notify_ready(UniqueIdKey{finst_id_hi, finst_id_lo});
+}
+
 void novarocks_compat_free_buf(uint8_t* ptr, size_t /*len*/) {
     std::free(ptr);
 }
@@ -2138,6 +2498,7 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         auto service = std::make_unique<InternalServiceImpl>(*cfg);
         auto lake_service = std::make_unique<LakeServiceImpl>();
         auto query_rpc_pool = std::make_unique<QueryRpcPool>(query_rpc_threads);
+        auto fetch_waiter_registry = std::make_unique<FetchWaiterRegistry>(query_rpc_pool.get());
 
         if (server->AddService(service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
             if (err) *err = "failed to add PInternalService";
@@ -2162,6 +2523,7 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         g_internal_service = std::move(service);
         g_lake_service = std::move(lake_service);
         g_query_rpc_pool = std::move(query_rpc_pool);
+        g_fetch_waiter_registry = std::move(fetch_waiter_registry);
         g_brpc_server = std::move(server);
         std::cerr << "[INFO] query rpc pool started, threads=" << query_rpc_threads << std::endl;
         if (err) err->clear();
@@ -2172,6 +2534,7 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         g_brpc_server.reset();
         g_internal_service.reset();
         g_lake_service.reset();
+        g_fetch_waiter_registry.reset();
         g_query_rpc_pool.reset();
         return 6;
     }
@@ -2183,11 +2546,17 @@ void novarocks_compat_stop_brpc() {
     }
     if (g_brpc_server) {
         g_brpc_server->Stop(0);
-        g_brpc_server->Join();
+    }
+    if (g_fetch_waiter_registry) {
+        g_fetch_waiter_registry->shutdown();
     }
     if (g_query_rpc_pool) {
         g_query_rpc_pool->shutdown();
     }
+    if (g_brpc_server) {
+        g_brpc_server->Join();
+    }
+    g_fetch_waiter_registry.reset();
     g_query_rpc_pool.reset();
     g_lake_service.reset();
     g_internal_service.reset();

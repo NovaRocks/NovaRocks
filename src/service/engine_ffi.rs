@@ -54,6 +54,7 @@ const FETCH_NOT_FOUND: i32 = 1;
 const FETCH_CANCELLED: i32 = 2;
 const FETCH_FAILED: i32 = 3;
 const FETCH_TIMEOUT: i32 = 4;
+const FETCH_NOT_READY: i32 = 4;
 
 fn unique_id(hi: i64, lo: i64) -> UniqueId {
     UniqueId { hi, lo }
@@ -73,12 +74,20 @@ fn write_fetch_result(
             *out_eos = result.eos;
         }
         if !out_batch.is_null() {
-            result.result_batch.packet_seq = result.packet_seq;
-            let bytes = thrift_serialize_result_batch(&result.result_batch);
-            let boxed = bytes.into_boxed_slice();
-            let len = boxed.len();
-            let ptr = Box::into_raw(boxed) as *mut u8;
-            *out_batch = NovaRocksRustBuf { ptr, len };
+            *out_batch = NovaRocksRustBuf {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            };
+            // Align with StarRocks BE: EOS closes the stream with packet_seq/eos only
+            // and does not send an empty TResultBatch attachment.
+            if !(result.eos && result.result_batch.rows.is_empty()) {
+                result.result_batch.packet_seq = result.packet_seq;
+                let bytes = thrift_serialize_result_batch(&result.result_batch);
+                let boxed = bytes.into_boxed_slice();
+                let len = boxed.len();
+                let ptr = Box::into_raw(boxed) as *mut u8;
+                *out_batch = NovaRocksRustBuf { ptr, len };
+            }
         }
     }
 }
@@ -204,21 +213,79 @@ pub extern "C" fn novarocks_rs_fetch_result_batch(
     }
 
     let finst_id = unique_id(finst_id_hi, finst_id_lo);
-    match crate::runtime::result_buffer::fetch(finst_id) {
-        Ok(result) => {
+    let timeout = crate::runtime::result_buffer::fetch_wait_timeout(finst_id);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match crate::runtime::result_buffer::try_fetch(finst_id) {
+            crate::runtime::result_buffer::TryFetchResult::Ready(result) => {
+                write_fetch_result(result, out_packet_seq, out_eos, out_batch);
+                return FETCH_OK;
+            }
+            crate::runtime::result_buffer::TryFetchResult::NotReady => {
+                if std::time::Instant::now() >= deadline {
+                    write_string_buf(
+                        format!("timeout waiting for result after {:?}", timeout),
+                        out_err,
+                    );
+                    return FETCH_TIMEOUT;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            crate::runtime::result_buffer::TryFetchResult::Error(err) => {
+                write_string_buf(err.message, out_err);
+                return match err.kind {
+                    crate::runtime::result_buffer::FetchErrorKind::NotFound => FETCH_NOT_FOUND,
+                    crate::runtime::result_buffer::FetchErrorKind::Cancelled => FETCH_CANCELLED,
+                    crate::runtime::result_buffer::FetchErrorKind::Failed => FETCH_FAILED,
+                };
+            }
+        }
+    }
+}
+
+/// Returns:
+/// - 0: OK (a result batch is returned; may be EOS)
+/// - 1: NOT_FOUND
+/// - 2: CANCELLED
+/// - 3: FAILED
+/// - 4: NOT_READY
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_try_fetch_result_batch(
+    finst_id_hi: i64,
+    finst_id_lo: i64,
+    out_packet_seq: *mut i64,
+    out_eos: *mut bool,
+    out_batch: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    unsafe {
+        if !out_err.is_null() {
+            (*out_err).ptr = std::ptr::null_mut();
+            (*out_err).len = 0;
+        }
+    }
+
+    let finst_id = unique_id(finst_id_hi, finst_id_lo);
+    match crate::runtime::result_buffer::try_fetch(finst_id) {
+        crate::runtime::result_buffer::TryFetchResult::Ready(result) => {
             write_fetch_result(result, out_packet_seq, out_eos, out_batch);
             FETCH_OK
         }
-        Err(err) => {
+        crate::runtime::result_buffer::TryFetchResult::NotReady => FETCH_NOT_READY,
+        crate::runtime::result_buffer::TryFetchResult::Error(err) => {
             write_string_buf(err.message, out_err);
             match err.kind {
                 crate::runtime::result_buffer::FetchErrorKind::NotFound => FETCH_NOT_FOUND,
                 crate::runtime::result_buffer::FetchErrorKind::Cancelled => FETCH_CANCELLED,
                 crate::runtime::result_buffer::FetchErrorKind::Failed => FETCH_FAILED,
-                crate::runtime::result_buffer::FetchErrorKind::Timeout => FETCH_TIMEOUT,
             }
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_fetch_wait_timeout_ms(finst_id_hi: i64, finst_id_lo: i64) -> i64 {
+    crate::runtime::result_buffer::fetch_wait_timeout_ms(unique_id(finst_id_hi, finst_id_lo))
 }
 
 #[unsafe(no_mangle)]
@@ -816,6 +883,15 @@ pub extern "C" fn novarocks_rs_free_buf(ptr: *mut u8, len: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::query_context::{QueryId, query_context_manager};
+    use std::time::Duration;
+
+    fn empty_buf() -> NovaRocksRustBuf {
+        NovaRocksRustBuf {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        }
+    }
 
     #[test]
     fn ffi_fetch_propagates_close_error() {
@@ -883,5 +959,105 @@ mod tests {
         assert!(!err.ptr.is_null());
         assert!(err.len > 0);
         novarocks_rs_free_buf(err.ptr, err.len);
+    }
+
+    #[test]
+    fn ffi_try_fetch_reports_not_ready_then_batch() {
+        let finst = UniqueId { hi: 12, lo: 34 };
+        crate::runtime::result_buffer::create_sender(finst);
+
+        let mut packet_seq: i64 = -1;
+        let mut eos = false;
+        let mut batch = empty_buf();
+        let mut err = empty_buf();
+        let rc = novarocks_rs_try_fetch_result_batch(
+            finst.hi,
+            finst.lo,
+            &mut packet_seq,
+            &mut eos,
+            &mut batch,
+            &mut err,
+        );
+        assert_eq!(rc, FETCH_NOT_READY);
+        assert!(batch.ptr.is_null());
+        assert!(err.ptr.is_null());
+
+        crate::runtime::result_buffer::insert(
+            finst,
+            FetchResult {
+                packet_seq: 0,
+                eos: false,
+                result_batch: crate::data::TResultBatch::new(
+                    vec![b"row".to_vec()],
+                    false,
+                    0,
+                    None,
+                ),
+            },
+        );
+
+        let rc = novarocks_rs_try_fetch_result_batch(
+            finst.hi,
+            finst.lo,
+            &mut packet_seq,
+            &mut eos,
+            &mut batch,
+            &mut err,
+        );
+        assert_eq!(rc, FETCH_OK);
+        assert_eq!(packet_seq, 0);
+        assert!(!eos);
+        assert!(!batch.ptr.is_null());
+        assert!(err.ptr.is_null());
+        novarocks_rs_free_buf(batch.ptr, batch.len);
+    }
+
+    #[test]
+    fn ffi_fetch_wait_timeout_ms_prefers_query_context() {
+        let query_id = QueryId { hi: 3001, lo: 4002 };
+        let finst_id = UniqueId { hi: 5003, lo: 6004 };
+        let mgr = query_context_manager();
+        mgr.ensure_context(
+            query_id,
+            false,
+            Duration::from_secs(5),
+            Duration::from_secs(9),
+        )
+        .expect("ensure query context");
+        mgr.register_finst(finst_id, query_id);
+
+        assert_eq!(
+            novarocks_rs_fetch_wait_timeout_ms(finst_id.hi, finst_id.lo),
+            9_000
+        );
+
+        mgr.unregister_finst(finst_id);
+        mgr.finish_fragment(query_id);
+    }
+
+    #[test]
+    fn ffi_try_fetch_eos_has_no_attachment() {
+        let finst = UniqueId { hi: 70, lo: 80 };
+        crate::runtime::result_buffer::create_sender(finst);
+        crate::runtime::result_buffer::close_ok(finst);
+
+        let mut packet_seq: i64 = -1;
+        let mut eos = false;
+        let mut batch = empty_buf();
+        let mut err = empty_buf();
+        let rc = novarocks_rs_try_fetch_result_batch(
+            finst.hi,
+            finst.lo,
+            &mut packet_seq,
+            &mut eos,
+            &mut batch,
+            &mut err,
+        );
+        assert_eq!(rc, FETCH_OK);
+        assert_eq!(packet_seq, 0);
+        assert!(eos);
+        assert!(batch.ptr.is_null());
+        assert_eq!(batch.len, 0);
+        assert!(err.ptr.is_null());
     }
 }

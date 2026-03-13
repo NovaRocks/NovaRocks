@@ -70,6 +70,24 @@ int32_t novarocks_rs_fetch_result_batch(int64_t finst_id_hi,
                                       NovaRocksRustBuf* out_batch,
                                       NovaRocksRustBuf* out_err);
 
+// Returns:
+// - 0: OK (a result batch is returned; may be EOS)
+// - 1: NOT_FOUND
+// - 2: CANCELLED
+// - 3: FAILED
+// - 4: NOT_READY
+int32_t novarocks_rs_try_fetch_result_batch(int64_t finst_id_hi,
+                                            int64_t finst_id_lo,
+                                            int64_t* out_packet_seq,
+                                            bool* out_eos,
+                                            NovaRocksRustBuf* out_batch,
+                                            NovaRocksRustBuf* out_err);
+
+int64_t novarocks_rs_fetch_wait_timeout_ms(int64_t finst_id_hi, int64_t finst_id_lo);
+
+// Rust result-buffer callback into the brpc shim when a fetch waiter may make progress.
+void novarocks_compat_notify_fetch_ready(int64_t finst_id_hi, int64_t finst_id_lo);
+
 int32_t novarocks_rs_cancel(int64_t finst_id_hi, int64_t finst_id_lo);
 
 // internal_service.proto PTransmitChunkParams -> PTransmitChunkResult (protobuf bytes).

@@ -32,7 +32,7 @@ use crate::common::thrift::{
 };
 
 use crate::cache::CacheOptions;
-use crate::common::types::{FetchResult, UniqueId};
+use crate::common::types::UniqueId;
 use crate::common::util::{
     http_json_row_from_arrays_with_primitives, mysql_text_row_from_arrays_with_primitives,
 };
@@ -858,15 +858,52 @@ fn rows_to_statistic_data(
     Ok(out)
 }
 
-fn build_statistic_fetch_result(
-    chunks: &[Chunk],
-    output_exprs: &[exprs::TExpr],
-) -> Result<FetchResult, String> {
+pub(crate) fn build_empty_fetch_result_batch_template(
+    result_sink_type: Option<data_sinks::TResultSinkType>,
+    result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+) -> Result<data::TResultBatch, String> {
+    let is_http_sink = matches!(
+        result_sink_type,
+        Some(t) if t == data_sinks::TResultSinkType::HTTP_PROTOCAL
+    );
+    if is_http_sink {
+        let format = result_sink_format.unwrap_or(data_sinks::TResultSinkFormatType::JSON);
+        if format != data_sinks::TResultSinkFormatType::JSON {
+            return Err(format!(
+                "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
+                format
+            ));
+        }
+    }
+
     let mut batch = data::TResultBatch::new(vec![], false, 0, None);
-    for chunk in chunks {
-        let columns = columns_for_output_exprs(chunk, output_exprs)?;
-        let primitives = primitives_for_output_exprs(output_exprs)?;
-        let field_schemas = field_schemas_for_output_exprs(output_exprs)?;
+    if matches!(
+        result_sink_type,
+        Some(t) if t == data_sinks::TResultSinkType::STATISTIC
+    ) {
+        batch.statistic_version = Some(STATISTIC_DATA_VERSION_V1);
+    }
+    Ok(batch)
+}
+
+pub(crate) fn build_fetch_result_batch_for_chunk(
+    chunk: &Chunk,
+    output_exprs: Option<&[exprs::TExpr]>,
+    result_sink_type: Option<data_sinks::TResultSinkType>,
+    result_sink_format: Option<data_sinks::TResultSinkFormatType>,
+) -> Result<data::TResultBatch, String> {
+    let is_statistic_sink = matches!(
+        result_sink_type,
+        Some(t) if t == data_sinks::TResultSinkType::STATISTIC
+    );
+    if is_statistic_sink {
+        let exprs = output_exprs
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| "STATISTIC result sink requires non-empty output_exprs".to_string())?;
+        let mut batch = data::TResultBatch::new(vec![], false, 0, None);
+        let columns = columns_for_output_exprs(chunk, exprs)?;
+        let primitives = primitives_for_output_exprs(exprs)?;
+        let field_schemas = field_schemas_for_output_exprs(exprs)?;
         for row in 0..chunk.len() {
             let mysql_row = mysql_text_row_from_arrays_with_primitives(
                 &columns,
@@ -890,23 +927,26 @@ fn build_statistic_fetch_result(
             let encoded = thrift_compact_serialize(&row_sd)?;
             batch.rows.push(encoded);
         }
+        if batch.statistic_version.is_none() {
+            batch.statistic_version = Some(STATISTIC_DATA_VERSION_V1);
+        }
+        return Ok(batch);
     }
-    if batch.statistic_version.is_none() {
-        batch.statistic_version = Some(STATISTIC_DATA_VERSION_V1);
-    }
-    Ok(FetchResult {
-        packet_seq: 0,
-        eos: true,
-        result_batch: batch,
-    })
-}
 
-fn build_http_json_fetch_result(
-    chunks: &[Chunk],
-    output_exprs: Option<&[exprs::TExpr]>,
-) -> Result<FetchResult, String> {
-    let mut batch = data::TResultBatch::new(vec![], false, 0, None);
-    for chunk in chunks {
+    let is_http_sink = matches!(
+        result_sink_type,
+        Some(t) if t == data_sinks::TResultSinkType::HTTP_PROTOCAL
+    );
+    if is_http_sink {
+        let format = result_sink_format.unwrap_or(data_sinks::TResultSinkFormatType::JSON);
+        if format != data_sinks::TResultSinkFormatType::JSON {
+            return Err(format!(
+                "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
+                format
+            ));
+        }
+
+        let mut batch = data::TResultBatch::new(vec![], false, 0, None);
         if let Some(output_exprs) = output_exprs.filter(|v| !v.is_empty()) {
             let columns = columns_for_output_exprs(chunk, output_exprs)?;
             let primitives = primitives_for_output_exprs(output_exprs)?;
@@ -935,80 +975,38 @@ fn build_http_json_fetch_result(
                 )?);
             }
         }
-    }
-    Ok(FetchResult {
-        packet_seq: 0,
-        eos: true,
-        result_batch: batch,
-    })
-}
-
-fn build_fetch_result(
-    chunks: &[Chunk],
-    output_exprs: Option<&[exprs::TExpr]>,
-    result_sink_type: Option<data_sinks::TResultSinkType>,
-    result_sink_format: Option<data_sinks::TResultSinkFormatType>,
-) -> Result<FetchResult, String> {
-    let is_statistic_sink = matches!(
-        result_sink_type,
-        Some(t) if t == data_sinks::TResultSinkType::STATISTIC
-    );
-    if is_statistic_sink {
-        let exprs = output_exprs
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| "STATISTIC result sink requires non-empty output_exprs".to_string())?;
-        return build_statistic_fetch_result(chunks, exprs);
-    }
-    let is_http_sink = matches!(
-        result_sink_type,
-        Some(t) if t == data_sinks::TResultSinkType::HTTP_PROTOCAL
-    );
-    if is_http_sink {
-        let format = result_sink_format.unwrap_or(data_sinks::TResultSinkFormatType::JSON);
-        if format != data_sinks::TResultSinkFormatType::JSON {
-            return Err(format!(
-                "HTTP_PROTOCAL result sink only supports JSON format, got {:?}",
-                format
-            ));
-        }
-        return build_http_json_fetch_result(chunks, output_exprs);
+        return Ok(batch);
     }
 
     let mut batch = data::TResultBatch::new(vec![], false, 0, None);
-    for chunk in chunks {
-        if let Some(output_exprs) = output_exprs.filter(|v| !v.is_empty()) {
-            let columns = columns_for_output_exprs(chunk, output_exprs)?;
-            let primitives = primitives_for_output_exprs(output_exprs)?;
-            let field_schemas = field_schemas_for_output_exprs(output_exprs)?;
-            for row in 0..chunk.len() {
-                let bytes = mysql_text_row_from_arrays_with_primitives(
-                    &columns,
-                    row,
-                    Some(&primitives),
-                    Some(&field_schemas),
-                )?;
-                batch.rows.push(bytes);
-            }
-        } else {
-            let columns = chunk.columns();
-            let primitives = primitives_for_chunk_fields(chunk);
-            let field_schemas = field_schemas_for_chunk_fields(chunk);
-            for row in 0..chunk.len() {
-                let bytes = mysql_text_row_from_arrays_with_primitives(
-                    columns,
-                    row,
-                    Some(&primitives),
-                    Some(&field_schemas),
-                )?;
-                batch.rows.push(bytes);
-            }
+    if let Some(output_exprs) = output_exprs.filter(|v| !v.is_empty()) {
+        let columns = columns_for_output_exprs(chunk, output_exprs)?;
+        let primitives = primitives_for_output_exprs(output_exprs)?;
+        let field_schemas = field_schemas_for_output_exprs(output_exprs)?;
+        for row in 0..chunk.len() {
+            let bytes = mysql_text_row_from_arrays_with_primitives(
+                &columns,
+                row,
+                Some(&primitives),
+                Some(&field_schemas),
+            )?;
+            batch.rows.push(bytes);
+        }
+    } else {
+        let columns = chunk.columns();
+        let primitives = primitives_for_chunk_fields(chunk);
+        let field_schemas = field_schemas_for_chunk_fields(chunk);
+        for row in 0..chunk.len() {
+            let bytes = mysql_text_row_from_arrays_with_primitives(
+                columns,
+                row,
+                Some(&primitives),
+                Some(&field_schemas),
+            )?;
+            batch.rows.push(bytes);
         }
     }
-    Ok(FetchResult {
-        packet_seq: 0,
-        eos: true,
-        result_batch: batch,
-    })
+    Ok(batch)
 }
 
 fn spawn_exec_fragment(
@@ -1029,15 +1027,11 @@ fn spawn_exec_fragment(
     mem_tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
     mgr: Arc<QueryContextManager>,
 ) {
-    let has_result_sink = fragment.output_exprs.is_some();
-    let result_sink = fragment
-        .output_sink
-        .as_ref()
-        .and_then(|sink| sink.result_sink.as_ref())
-        .cloned();
-    let result_sink_type = result_sink.as_ref().and_then(|sink| sink.type_);
-    let result_sink_format = result_sink.as_ref().and_then(|sink| sink.format);
-    if has_result_sink {
+    let uses_fetch_result_buffer = matches!(
+        fragment.output_sink.as_ref().map(|sink| sink.type_),
+        Some(data_sinks::TDataSinkType::RESULT_SINK)
+    );
+    if uses_fetch_result_buffer {
         result_buffer::create_sender(finst_id);
         if let Some(root) = mem_tracker.as_ref() {
             let label = format!("ResultBuffer: finst={}", finst_id);
@@ -1087,27 +1081,17 @@ fn spawn_exec_fragment(
             );
         }
         let mut report_error: Option<String> = None;
-        if has_result_sink {
-            let output_exprs = fragment.output_exprs.as_deref();
-            match out.and_then(|out| {
-                if let Some(json) = out.profile_json.as_deref() {
-                    info!(
-                        target: "novarocks::profile",
-                        finst_id = %finst_id,
-                        profile_bytes = json.len(),
-                        "fragment_profile"
-                    );
-                }
-                build_fetch_result(
-                    &out.chunks,
-                    output_exprs,
-                    result_sink_type,
-                    result_sink_format,
-                )
-            }) {
-                Ok(result) => {
-                    result_buffer::insert(finst_id, result);
-                    result_buffer::close_ok(finst_id);
+        if uses_fetch_result_buffer {
+            match out {
+                Ok(out) => {
+                    if let Some(json) = out.profile_json.as_deref() {
+                        info!(
+                            target: "novarocks::profile",
+                            finst_id = %finst_id,
+                            profile_bytes = json.len(),
+                            "fragment_profile"
+                        );
+                    }
                 }
                 Err(e) => {
                     report_error = Some(e.clone());
