@@ -376,8 +376,9 @@ pub fn push_chunks_with_stats(
     if eos {
         st.finished.insert((sender_id, be_number));
         debug!(
-            "push_chunks: sender_id={} marked as FINISHED, total finished={}/{}",
+            "push_chunks: sender_id={} be_number={} marked as FINISHED, total finished={}/{}",
             sender_id,
+            be_number,
             st.finished.len(),
             st.expected_senders
         );
@@ -1151,7 +1152,7 @@ mod tests {
 
     use super::{
         ExchangeKey, cancel_exchange_key, decode_chunks, decode_chunks_for_sender, encode_chunks,
-        register_expected_chunk_schema,
+        push_chunks, register_expected_chunk_schema, set_expected_senders, snapshot_receiver_state,
     };
     use crate::common::ids::SlotId;
     use crate::exec::chunk::Chunk;
@@ -1386,6 +1387,32 @@ mod tests {
             SlotId::new(32)
         );
         assert_eq!(decoded[0].schema().field(3).name(), "_cse_0");
+
+        cancel_exchange_key(key);
+    }
+
+    #[test]
+    fn eos_completion_counts_unique_sender_instances() {
+        let key = ExchangeKey {
+            finst_id_hi: 401,
+            finst_id_lo: 402,
+            node_id: 29,
+        };
+
+        set_expected_senders(key, 2);
+        push_chunks(key, 7, 11, Vec::new(), true);
+        let snapshot = snapshot_receiver_state(key).expect("receiver snapshot after first eos");
+        assert_eq!(snapshot.expected_senders, 2);
+        assert_eq!(snapshot.finished_senders, 1);
+
+        push_chunks(key, 7, 11, Vec::new(), true);
+        let snapshot =
+            snapshot_receiver_state(key).expect("receiver snapshot after duplicate sender eos");
+        assert_eq!(snapshot.finished_senders, 1);
+
+        push_chunks(key, 8, 11, Vec::new(), true);
+        let snapshot = snapshot_receiver_state(key).expect("receiver snapshot after second sender");
+        assert_eq!(snapshot.finished_senders, 2);
 
         cancel_exchange_key(key);
     }

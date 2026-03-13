@@ -21,6 +21,7 @@ struct NovaRocksCompatConfig {
     host: *const std::os::raw::c_char,
     heartbeat_port: u16,
     brpc_port: u16,
+    internal_service_query_rpc_thread_num: u32,
     debug_exec_batch_plan_json: u8,
     log_level: u8,
 }
@@ -39,6 +40,7 @@ pub struct CompatConfig<'a> {
     pub host: &'a str,
     pub heartbeat_port: u16,
     pub brpc_port: u16,
+    pub internal_service_query_rpc_thread_num: u32,
     pub debug_exec_batch_plan_json: bool,
     pub log_level: u8,
 }
@@ -71,6 +73,7 @@ pub fn start(cfg: &CompatConfig<'_>) -> Result<(), CompatError> {
         host: host.as_ptr(),
         heartbeat_port: cfg.heartbeat_port,
         brpc_port: cfg.brpc_port,
+        internal_service_query_rpc_thread_num: cfg.internal_service_query_rpc_thread_num,
         debug_exec_batch_plan_json: u8::from(cfg.debug_exec_batch_plan_json),
         log_level: cfg.log_level,
     };

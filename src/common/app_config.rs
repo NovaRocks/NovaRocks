@@ -268,6 +268,8 @@ pub struct RuntimeConfig {
     pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
+    #[serde(default = "default_internal_service_query_rpc_thread_num")]
+    pub internal_service_query_rpc_thread_num: usize,
     #[serde(default = "default_data_runtime_worker_threads")]
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
@@ -473,6 +475,10 @@ fn default_pipeline_exec_thread_pool_thread_num() -> usize {
     0 // 0 means use CPU cores
 }
 
+fn default_internal_service_query_rpc_thread_num() -> usize {
+    0 // 0 means use CPU cores, aligned with StarRocks internal_service_query_rpc_thread_num
+}
+
 fn default_data_runtime_worker_threads() -> usize {
     0 // 0 means use CPU cores for global data runtime
 }
@@ -638,6 +644,7 @@ impl Default for RuntimeConfig {
             io_coalesce_adaptive_lazy_active: default_io_coalesce_adaptive_lazy_active(),
             pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
+            internal_service_query_rpc_thread_num: default_internal_service_query_rpc_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             spill_io_threads: default_spill_io_threads(),
@@ -735,6 +742,18 @@ impl RuntimeConfig {
     pub fn actual_data_runtime_threads(&self) -> usize {
         if self.data_runtime_worker_threads > 0 {
             self.data_runtime_worker_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        }
+    }
+
+    /// Get the actual number of internal-service query RPC threads.
+    /// Returns CPU cores if configured as 0.
+    pub fn actual_internal_service_query_rpc_threads(&self) -> usize {
+        if self.internal_service_query_rpc_thread_num > 0 {
+            self.internal_service_query_rpc_thread_num
         } else {
             std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -1040,6 +1059,44 @@ data_runtime_max_blocking_threads = 99
         assert_eq!(runtime.actual_data_runtime_threads(), expected);
         runtime.data_runtime_worker_threads = 3;
         assert_eq!(runtime.actual_data_runtime_threads(), 3);
+    }
+
+    #[test]
+    fn test_runtime_internal_service_query_rpc_threads_default_to_auto() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.internal_service_query_rpc_thread_num, 0);
+    }
+
+    #[test]
+    fn test_runtime_internal_service_query_rpc_threads_can_be_overridden() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime]
+internal_service_query_rpc_thread_num = 7
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(cfg.runtime.internal_service_query_rpc_thread_num, 7);
+    }
+
+    #[test]
+    fn test_actual_internal_service_query_rpc_threads_behavior() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.internal_service_query_rpc_thread_num = 0;
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(
+            runtime.actual_internal_service_query_rpc_threads(),
+            expected
+        );
+        runtime.internal_service_query_rpc_thread_num = 5;
+        assert_eq!(runtime.actual_internal_service_query_rpc_threads(), 5);
     }
 
     #[test]

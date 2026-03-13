@@ -27,6 +27,7 @@ typedef struct NovaRocksCompatConfig {
     const char* host;           // e.g. "0.0.0.0"
     uint16_t heartbeat_port;    // (unused, kept for ABI compatibility)
     uint16_t brpc_port;         // brpc PInternalService
+    uint32_t internal_service_query_rpc_thread_num;
     uint8_t debug_exec_batch_plan_json;
     uint8_t log_level;          // 0=INFO, 1=WARNING, 2=ERROR, 3=FATAL
 } NovaRocksCompatConfig;

@@ -216,6 +216,17 @@ pub(crate) fn pipeline_scan_thread_pool_thread_num() -> usize {
         })
 }
 
+pub fn internal_service_query_rpc_thread_num() -> usize {
+    novarocks_app_config()
+        .ok()
+        .map(|c| c.runtime.actual_internal_service_query_rpc_threads())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+}
+
 pub(crate) fn enable_tablet_write_log() -> bool {
     novarocks_app_config()
         .ok()
