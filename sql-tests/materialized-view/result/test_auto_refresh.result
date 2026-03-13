@@ -1,0 +1,35 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 8
+count(*)
+3
+
+-- query 9
+
+-- query 12
+count(*)
+6
+
+-- query 16
+count(*)
+10
+
+-- query 20
+count(*)
+10
+
+-- query 21
+
+-- query 24
+count(*)
+4
+
+-- query 25

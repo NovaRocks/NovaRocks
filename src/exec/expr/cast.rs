@@ -17,6 +17,7 @@
 use crate::common::largeint;
 use crate::exec::chunk::{Chunk, ChunkFieldSchema};
 use crate::exec::expr::decimal::pow10_i256;
+use crate::exec::expr::function::{parse_date_value, parse_datetime_value};
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
@@ -772,6 +773,56 @@ fn parse_datetime_string_to_seconds(raw: &str) -> Option<i64> {
     let dt = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok()?;
     let t = dt.time();
     Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
+}
+
+fn parse_string_to_naive_datetime(raw: &str) -> Option<NaiveDateTime> {
+    parse_datetime_value(raw)
+        .or_else(|| parse_date_value(raw).and_then(|d: NaiveDate| d.and_hms_opt(0, 0, 0)))
+}
+
+fn cast_utf8_to_date32_array(arr: &StringArray) -> ArrayRef {
+    let mut builder = Date32Builder::new();
+    for row in 0..arr.len() {
+        if arr.is_null(row) {
+            builder.append_null();
+            continue;
+        }
+        let days = parse_string_to_naive_datetime(arr.value(row))
+            .map(|dt| dt.date().num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET);
+        match days {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish()) as ArrayRef
+}
+
+fn cast_utf8_to_timestamp_array(
+    arr: &StringArray,
+    target_type: &DataType,
+) -> Result<ArrayRef, String> {
+    let micros = (0..arr.len())
+        .map(|row| {
+            if arr.is_null(row) {
+                None
+            } else {
+                parse_string_to_naive_datetime(arr.value(row))
+                    .map(|dt| dt.and_utc().timestamp_micros())
+            }
+        })
+        .collect::<Vec<_>>();
+    let micro_array = Arc::new(TimestampMicrosecondArray::from(micros)) as ArrayRef;
+    if micro_array.data_type() == target_type {
+        return Ok(micro_array);
+    }
+    cast(micro_array.as_ref(), target_type).map_err(|e| {
+        format!(
+            "CAST failed: from {:?} to {:?}: {}",
+            arr.data_type(),
+            target_type,
+            e
+        )
+    })
 }
 
 fn parse_time_integer_to_seconds(value: i64) -> Option<i64> {
@@ -1672,6 +1723,20 @@ fn cast_with_special_rules_with_field_schema(
         return Ok(array.clone());
     }
     match (array.data_type(), target_type) {
+        (DataType::Utf8, DataType::Date32) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+            Ok(cast_utf8_to_date32_array(arr))
+        }
+        (DataType::Utf8, DataType::Timestamp(_, _)) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
+            cast_utf8_to_timestamp_array(arr, target_type)
+        }
         (source, DataType::Date32) if is_numeric_datetime_source(source) => {
             cast_numeric_to_date32_array(array)
         }
@@ -3714,6 +3779,41 @@ mod tests {
         assert!(out.is_null(2));
         assert!(out.is_null(3));
         assert!(out.is_null(4));
+    }
+
+    #[test]
+    fn test_cast_utf8_to_date32_uses_lenient_datetime_parser() {
+        let input =
+            Arc::new(StringArray::from(vec![Some("2023-08-17 08:00:006")])) as ArrayRef;
+        let out = cast_with_special_rules(&input, &DataType::Date32).expect("cast to date");
+        let out = out.as_any().downcast_ref::<Date32Array>().expect("date32");
+        assert!(!out.is_null(0));
+        assert_eq!(out.value(0), days_since_epoch(2023, 8, 17));
+    }
+
+    #[test]
+    fn test_cast_utf8_to_timestamp_uses_lenient_datetime_parser() {
+        let input =
+            Arc::new(StringArray::from(vec![Some("2023-08-17 08:00:006")])) as ArrayRef;
+        let out = cast_with_special_rules(
+            &input,
+            &DataType::Timestamp(TimeUnit::Microsecond, None),
+        )
+        .expect("cast to timestamp");
+        let out = out
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp");
+        assert!(!out.is_null(0));
+        assert_eq!(
+            out.value(0),
+            NaiveDate::from_ymd_opt(2023, 8, 17)
+                .unwrap()
+                .and_hms_opt(8, 0, 6)
+                .unwrap()
+                .and_utc()
+                .timestamp_micros()
+        );
     }
 
     #[test]

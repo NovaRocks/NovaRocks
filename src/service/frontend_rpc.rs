@@ -135,6 +135,17 @@ impl FrontendRpcError {
     fn should_backoff_host(&self) -> bool {
         self.transport || looks_like_backoff_message(&self.message)
     }
+
+    fn should_clear_idle_pool(&self) -> bool {
+        let lower = self.message.to_ascii_lowercase();
+        self.transport
+            && (lower.contains("end of file")
+                || lower.contains("unexpected eof")
+                || lower.contains("bad data")
+                || lower.contains("bad version")
+                || lower.contains("invalid thrift version")
+                || lower.contains("not open"))
+    }
 }
 
 impl Display for FrontendRpcError {
@@ -540,6 +551,15 @@ impl FrontendRpcManager {
         attempt: usize,
         err: &FrontendRpcError,
     ) {
+        let cleared_idle = if err.should_clear_idle_pool() {
+            let mut guard = self.host_pools.lock().expect("FE host pool lock");
+            guard
+                .get_mut(host_key)
+                .map(|pool| std::mem::take(&mut pool.idle).len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         if err.should_backoff_host() {
             let mut guard = self.host_pools.lock().expect("FE host pool lock");
             let pool = guard.entry(host_key.to_string()).or_default();
@@ -555,6 +575,7 @@ impl FrontendRpcManager {
             inflight_total = self.total_permits.current(),
             inflight_kind = self.kind_permit_pool(rpc_kind).current(),
             pool_idle_host = self.host_idle_len(host_key),
+            cleared_idle,
             error = %err,
             "FE RPC transport error"
         );
@@ -894,16 +915,20 @@ mod tests {
     fn message_guess_treats_end_of_file_as_transport() {
         let err = FrontendRpcError::from_message_guess("createPartition RPC failed: end of file");
         assert!(err.is_transport());
+        assert!(err.should_clear_idle_pool());
     }
 
     #[test]
     fn message_guess_treats_bad_data_as_transport() {
         let err = FrontendRpcError::from_message_guess("bad data");
         assert!(err.is_transport());
+        assert!(err.should_clear_idle_pool());
         let err = FrontendRpcError::from_message_guess("invalid thrift version");
         assert!(err.is_transport());
+        assert!(err.should_clear_idle_pool());
         let err = FrontendRpcError::from_message_guess("not open");
         assert!(err.is_transport());
+        assert!(err.should_clear_idle_pool());
     }
 
     #[test]

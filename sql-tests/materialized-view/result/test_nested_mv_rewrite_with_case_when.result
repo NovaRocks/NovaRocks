@@ -1,0 +1,26 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 12
+Explain String
+- Output => [39:case, 40:case, 41:expr]
+    - SCAN [join_mv1] => [39:case, 40:case, 41:expr]
+            MaterializedView: true
+            Estimates: {row: 1, cpu: 48.00, memory: 0.00, network: 0.00, cost: 24.00}
+            partitionRatio: 1/1, tabletRatio: 16/16
+            39:case := CASE WHEN 51:a_ds IS NOT NULL THEN 51:a_ds WHEN null IS NOT NULL THEN null ELSE null END
+            40:case := CASE WHEN 52:dim_1_ffund_union_5061_lvl1 IS NOT NULL THEN 52:dim_1_ffund_union_5061_lvl1 WHEN 'null' IS NOT NULL THEN 'null' ELSE 'null' END
+            41:expr := coalesce(53:1154_7969, 0.0) - coalesce(null, 0.0)

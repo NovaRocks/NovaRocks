@@ -1,0 +1,101 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 6
+
+-- query 8
+
+-- query 10
+
+-- query 11
+
+-- query 12
+
+-- query 13
+user_id	time	mv_bitmap_union_tag_id
+1	2023-04-13	NULL
+2	2023-04-13	NULL
+3	2023-04-13	NULL
+
+-- query 14
+user_id	count(DISTINCT tag_id)
+1	5
+2	1
+3	1
+
+-- query 15
+user_id	bitmap_union_count(to_bitmap(tag_id))
+1	5
+2	1
+3	1
+
+-- query 16
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 17
+user_id	time	mv_hll_union_tag_id
+1	2023-04-13	NULL
+2	2023-04-13	NULL
+3	2023-04-13	NULL
+
+-- query 18
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 19
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 20
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 21
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 22
+user_id	time	mv_percentile_union_tag_id
+1	2023-04-13	NULL
+2	2023-04-13	NULL
+3	2023-04-13	NULL
+
+-- query 23
+user_id	x
+1	5
+2	5
+3	6
+
+-- query 24
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 25
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 26
+
+-- query 27
+
+-- query 28

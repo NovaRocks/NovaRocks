@@ -1,2 +1,13 @@
+-- query 1
 cnt	sum_score
 9	76
+
+-- query 2
+country	country_cnt	score_sum
+CN	4	46
+JP	1	5
+US	4	25
+
+-- query 3
+cnt	sum_score
+4	10

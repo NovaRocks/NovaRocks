@@ -1,0 +1,57 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 6
+count(1)
+9
+
+-- query 8
+k1	count(v1)	sum(v2)
+1	9	18
+2	9	18
+3	9	18
+
+-- query 10
+count(1)
+27
+
+-- query 12
+k1	count(v1)	sum(v2)
+1	9	18
+2	9	18
+3	9	18
+
+-- query 13
+
+-- query 15
+count(1)
+27
+
+-- query 17
+k1	count(v1)	sum(v2)
+1	9	18
+2	9	18
+3	9	18
+4	1	1
+
+-- query 19
+count(1)
+28
+
+-- query 21
+k1	count(v1)	sum(v2)
+1	9	18
+2	9	18
+3	9	18
+4	1	1
+
+-- query 22
+
+-- query 23
+
+-- query 24

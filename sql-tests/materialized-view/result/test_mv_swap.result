@@ -1,0 +1,135 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 9
+
+-- query 10
+
+-- query 11
+
+-- query 12
+
+-- query 14
+
+-- query 16
+event_day	sum_pv
+2020-01-14	5
+2020-01-15	2
+
+-- query 17
+event_day	count_pv
+2020-01-14	2
+2020-01-15	1
+
+-- query 18
+
+-- query 19
+event_day	count_pv
+2020-01-14	2
+2020-01-15	1
+
+-- query 20
+event_day	sum_pv
+2020-01-14	5
+2020-01-15	2
+
+-- query 21
+Field	Type	Null	Key	Default	Extra
+event_day	date	YES	true	NULL	
+count_pv	bigint	NO	true	NULL	
+
+-- query 22
+Field	Type	Null	Key	Default	Extra
+event_day	date	YES	true	NULL	
+sum_pv	bigint	YES	true	NULL	
+
+-- query 23
+
+-- query 26
+event_day	count_pv
+2020-01-14	2
+2020-01-15	2
+
+-- query 27
+event_day	sum_pv
+2020-01-14	5
+2020-01-15	4
+
+-- query 31
+
+-- query 32
+
+-- query 33
+
+-- query 36
+
+-- query 37
+sleep(3)
+1
+
+-- query 38
+IS_ACTIVE	INACTIVE_REASON
+false	base-table swapped: mv1
+
+-- query 39
+IS_ACTIVE	INACTIVE_REASON
+false	base-mv inactive: mv_on_mv_1
+
+-- query 42
+IS_ACTIVE	INACTIVE_REASON
+false	base-table swapped: mv1
+
+-- query 43
+IS_ACTIVE	INACTIVE_REASON
+false	base-mv inactive: mv_on_mv_1
+
+-- query 44
+
+-- query 45
+sleep(3)
+1
+
+-- query 46
+
+-- query 47
+
+-- query 48
+IS_ACTIVE	INACTIVE_REASON
+true	
+
+-- query 49
+IS_ACTIVE	INACTIVE_REASON
+true	
+
+-- query 50
+
+-- query 52
+
+-- query 53
+sleep(3)
+1
+
+-- query 54
+IS_ACTIVE	INACTIVE_REASON
+false	base-table swapped: jj
+
+-- query 55
+
+-- query 56
+IS_ACTIVE	INACTIVE_REASON
+true	
+
+-- query 58

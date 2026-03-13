@@ -770,8 +770,12 @@ fn build_projected_columns(
         let schema_col_from_unique_id = output_field_unique_id
             .and_then(|unique_id| current_lookup.by_unique_id.get(&unique_id).copied());
         let schema_col_from_name = current_lookup.by_name.get(&normalized_name).copied();
+        let source_schema_col_from_name = source_lookup.by_name.get(&normalized_name).copied();
+        let source_schema_col_from_unique_id = output_field_unique_id
+            .and_then(|unique_id| source_lookup.by_unique_id.get(&unique_id).copied());
+        let source_schema_col = source_schema_col_from_unique_id.or(source_schema_col_from_name);
         let schema_col = if let Some(schema_col) = schema_col_from_unique_id {
-            Some(schema_col)
+            Some((schema_col, source_schema_col))
         } else if let Some(schema_col) = schema_col_from_name {
             if let Some(expected_unique_id) = output_field_unique_id {
                 let name_col_unique_id = u32::try_from(schema_col.unique_id).map_err(|_| {
@@ -780,27 +784,25 @@ fn build_projected_columns(
                         snapshot.tablet_id, snapshot.version, output_name, schema_col.unique_id
                     )
                 })?;
-                (name_col_unique_id == expected_unique_id).then_some(schema_col)
+                if name_col_unique_id == expected_unique_id {
+                    Some((schema_col, source_schema_col))
+                } else {
+                    let source_name_unique_id = source_schema_col_from_name
+                        .and_then(|col| u32::try_from(col.unique_id).ok());
+                    // FE rewrite output slots may carry non-physical unique ids. When the
+                    // current schema and the physical source schema agree on the named column,
+                    // bind by the real column instead of synthesizing a missing output column.
+                    source_name_unique_id
+                        .filter(|source_unique_id| *source_unique_id == name_col_unique_id)
+                        .map(|_| (schema_col, source_schema_col_from_name))
+                }
             } else {
-                Some(schema_col)
+                Some((schema_col, source_schema_col))
             }
         } else {
             None
         };
         let allow_flat_json_fallback = output_field_unique_id.is_none();
-        let source_schema_col = if source_tablet_schema.is_some() {
-            if let Some(unique_id) = output_field_unique_id {
-                source_lookup
-                    .by_unique_id
-                    .get(&unique_id)
-                    .copied()
-                    .or_else(|| source_lookup.by_name.get(&normalized_name).copied())
-            } else {
-                source_lookup.by_name.get(&normalized_name).copied()
-            }
-        } else {
-            None
-        };
         let (
             schema,
             schema_unique_id,
@@ -808,7 +810,7 @@ fn build_projected_columns(
             source_column_missing,
             fallback_default_literal,
             fallback_is_nullable,
-        ) = if let Some(schema_col) = schema_col {
+        ) = if let Some((schema_col, source_schema_col)) = schema_col {
             let schema = build_schema_column_plan(
                 snapshot.tablet_id,
                 snapshot.version,
@@ -2066,6 +2068,11 @@ fn build_schema_column_plan(
 
     let unique_id = u32::try_from(schema_col.unique_id).ok();
 
+    let aggregation = normalize_aggregation(schema_col.aggregation.as_deref()).or_else(|| {
+        source_schema_col
+            .and_then(|col| normalize_aggregation(col.aggregation.as_deref()))
+    });
+
     Ok(StarRocksNativeSchemaColumnPlan {
         unique_id,
         source_index,
@@ -2073,7 +2080,7 @@ fn build_schema_column_plan(
         schema_type: schema_type.as_str().to_string(),
         is_nullable: schema_col.is_nullable.unwrap_or(true),
         is_key: schema_col.is_key.unwrap_or(false),
-        aggregation: normalize_aggregation(schema_col.aggregation.as_deref()),
+        aggregation,
         precision,
         scale,
         children,
@@ -2823,6 +2830,125 @@ mod tests {
         assert_eq!(plan.projected_columns.len(), 1);
         assert_eq!(plan.projected_columns[0].schema_unique_id, 4);
         assert_eq!(plan.projected_columns[0].schema_type, "VARCHAR");
+    }
+
+    #[test]
+    fn projected_column_falls_back_to_source_schema_aggregation() {
+        let mut snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "k1", "BIGINT"),
+            build_column(2, "mv_sum_k9", "BIGINT"),
+        ]);
+        snapshot.tablet_schema.keys_type = Some(KeysType::AggKeys as i32);
+        snapshot.tablet_schema.column[0].is_key = Some(true);
+        snapshot.tablet_schema.column[1].is_key = Some(false);
+        snapshot.tablet_schema.column[1].aggregation = None;
+
+        let source_schema = TabletSchemaPb {
+            column: vec![
+                {
+                    let mut col = build_column(1, "k1", "BIGINT");
+                    col.is_key = Some(true);
+                    col
+                },
+                {
+                    let mut col = build_column(2, "mv_sum_k9", "BIGINT");
+                    col.is_key = Some(false);
+                    col.aggregation = Some("SUM".to_string());
+                    col
+                },
+            ],
+            ..Default::default()
+        };
+
+        let footers = vec![build_footer(10, &[1, 2]), build_footer(20, &[1, 2])];
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int64, true),
+            Field::new("mv_sum_k9", DataType::Int64, true),
+        ]));
+        let output_hints = vec![
+            StarRocksOutputColumnHint {
+                schema_unique_id: Some(1),
+                fallback_default_literal: None,
+            },
+            StarRocksOutputColumnHint {
+                schema_unique_id: Some(2),
+                fallback_default_literal: None,
+            },
+        ];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            Some(&source_schema),
+        )
+        .expect("build read plan");
+
+        assert_eq!(
+            plan.projected_columns[1].schema.aggregation.as_deref(),
+            Some("SUM")
+        );
+    }
+
+    #[test]
+    fn projected_column_ignores_non_physical_output_hint_unique_id_when_source_schema_agrees() {
+        let mut snapshot = build_snapshot_with_columns(vec![
+            build_column(1, "k1", "BIGINT"),
+            build_column(22, "mv_sum_k9", "BIGINT"),
+        ]);
+        snapshot.tablet_schema.keys_type = Some(KeysType::AggKeys as i32);
+        snapshot.tablet_schema.column[0].is_key = Some(true);
+        snapshot.tablet_schema.column[1].is_key = Some(false);
+        snapshot.tablet_schema.column[1].aggregation = Some("SUM".to_string());
+
+        let source_schema = TabletSchemaPb {
+            column: vec![
+                {
+                    let mut col = build_column(1, "k1", "BIGINT");
+                    col.is_key = Some(true);
+                    col
+                },
+                {
+                    let mut col = build_column(22, "mv_sum_k9", "BIGINT");
+                    col.is_key = Some(false);
+                    col.aggregation = Some("SUM".to_string());
+                    col
+                },
+            ],
+            ..Default::default()
+        };
+
+        let footers = vec![build_footer(10, &[1, 22]), build_footer(20, &[1, 22])];
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int64, true),
+            Field::new("mv_sum_k9", DataType::Int64, true),
+        ]));
+        let output_hints = vec![
+            StarRocksOutputColumnHint {
+                schema_unique_id: Some(1),
+                fallback_default_literal: None,
+            },
+            StarRocksOutputColumnHint {
+                schema_unique_id: Some(28),
+                fallback_default_literal: None,
+            },
+        ];
+
+        let plan = build_native_read_plan_with_output_hints(
+            &snapshot,
+            &footers,
+            &output_schema,
+            &output_hints,
+            Some(&source_schema),
+        )
+        .expect("build read plan");
+
+        assert_eq!(plan.projected_columns[1].schema_unique_id, 22);
+        assert_eq!(
+            plan.projected_columns[1].schema.aggregation.as_deref(),
+            Some("SUM")
+        );
     }
 
     #[test]

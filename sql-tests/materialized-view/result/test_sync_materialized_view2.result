@@ -1,0 +1,139 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 6
+
+-- query 8
+
+-- query 10
+
+-- query 12
+
+-- query 13
+user_id	time	agg1
+1	2023-04-13	NULL
+2	2023-04-13	NULL
+3	2023-04-13	NULL
+
+-- query 14
+user_id	time	agg1
+1	2023-04-13	5
+2	2023-04-13	1
+3	2023-04-13	1
+
+-- query 15
+time	agg1
+2023-04-13	6
+
+-- query 16
+col1	time	agg2
+2	2023-04-13	NULL
+4	2023-04-13	NULL
+6	2023-04-13	NULL
+
+-- query 17
+time	agg2
+2023-04-13	NULL
+
+-- query 18
+col1	time	agg2
+2	2023-04-13	5
+4	2023-04-13	1
+6	2023-04-13	1
+
+-- query 19
+time	agg2
+2023-04-13	6
+
+-- query 20
+col1	time	agg1
+2	2023-04-13	NULL
+3	2023-04-13	NULL
+4	2023-04-13	NULL
+
+-- query 21
+col1	time	sum1	sum2	count1
+2	2023-04-13	300	3000	10
+3	2023-04-13	100	1000	2
+4	2023-04-13	120	1200	2
+
+-- query 22
+
+-- query 23
+
+-- query 24
+
+-- query 25
+
+-- query 27
+
+-- query 28
+
+-- query 29
+
+-- query 30
+
+-- query 32
+sleep(1)
+1
+
+-- query 33
+k1	k2	k3	k4
+1	a	1	aa
+2	b	1	NULL
+3	NULL	NULL	NULL
+
+-- query 34
+mv_k1_2	k2	mv_sum_k3	mv_hll_union_k4
+2	a	1	NULL
+4	b	1	NULL
+6	NULL	NULL	NULL
+
+-- query 35
+
+-- query 36
+
+-- query 37
+
+-- query 38
+
+-- query 40
+K1	mv_sum_V1
+2020-01-01	1
+2020-01-01	4
+
+-- query 41
+K1	sum(V1)
+2020-01-01	5
+
+-- query 42
+
+-- query 43
+K1	mv_sum_V1
+2020-01-01	2
+2020-01-01	8
+
+-- query 44
+K1	sum(V1)
+2020-01-01	10
+
+-- query 45
+
+-- query 46
+
+-- query 47
+
+-- query 48
+
+-- query 49
+
+-- query 51
+k2
+2
+
+-- query 52

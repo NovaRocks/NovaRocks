@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -31,6 +32,7 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use chrono::NaiveDate;
 
+use crate::common::config;
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeTableIdentity, LakeTabletPartitionRef, resolve_tablet_paths_for_olap_sink,
@@ -59,13 +61,16 @@ use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_logging::info;
 use crate::runtime::starlet_shard_registry;
 use crate::service::disk_report;
-use crate::service::frontend_rpc::{FrontendRpcError, FrontendRpcKind, FrontendRpcManager};
+use crate::service::frontend_rpc::{
+    FrontendRpcCallOptions, FrontendRpcError, FrontendRpcKind, FrontendRpcManager,
+};
 use crate::service::grpc_client::proto::starrocks::{KeysType, PUniqueId, TabletSchemaPb};
 use crate::status_code;
 use crate::{data_sinks, descriptors, exprs, types};
 
 const LOAD_OP_COLUMN: &str = "__op";
 pub(crate) const STARROCKS_DEFAULT_PARTITION_VALUE: &str = "__STARROCKS_DEFAULT_PARTITION__";
+const CREATE_PARTITION_TRANSPORT_RETRIES: usize = 4;
 
 #[derive(Clone)]
 pub struct OlapTableSinkFactory {
@@ -258,7 +263,15 @@ impl OlapTableSinkFactory {
             .map(ToString::to_string);
         let mut index_write_plans = Vec::with_capacity(index_routings.len());
         for (index, routing) in index_routings {
-            let tablet_schema = build_sink_tablet_schema(&sink.schema, index.schema_id, keys_type)?;
+            let sink_tablet_schema =
+                build_sink_tablet_schema(&sink.schema, index.schema_id, keys_type)?;
+            let tablet_schema = resolve_effective_tablet_schema_for_index(
+                sink.table_id,
+                index.index_id,
+                index.schema_id,
+                &routing.row_routing.tablet_ids,
+                &sink_tablet_schema,
+            );
             let projected_output_slot_ids = output_projection
                 .as_ref()
                 .map(|plan| plan.output_slot_ids.as_slice());
@@ -643,16 +656,13 @@ fn extract_partition_literal_value(expr: &exprs::TExpr) -> Option<String> {
             return node.large_int_literal.as_ref().map(|v| v.value.clone());
         }
         if ty == exprs::TExprNodeType::BOOL_LITERAL {
-            return node
-                .bool_literal
-                .as_ref()
-                .map(|v| {
-                    if v.value {
-                        "TRUE".to_string()
-                    } else {
-                        "FALSE".to_string()
-                    }
-                });
+            return node.bool_literal.as_ref().map(|v| {
+                if v.value {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                }
+            });
         }
     }
     None
@@ -742,16 +752,13 @@ fn scalar_partition_value_to_string(array: &dyn Array, row: usize) -> Option<Str
             .as_any()
             .downcast_ref::<UInt64Array>()
             .map(|v| v.value(row).to_string()),
-        DataType::Boolean => array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(|v| {
-                if v.value(row) {
-                    "TRUE".to_string()
-                } else {
-                    "FALSE".to_string()
-                }
-            }),
+        DataType::Boolean => array.as_any().downcast_ref::<BooleanArray>().map(|v| {
+            if v.value(row) {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }),
         DataType::Date32 => {
             let days_since_epoch = array
                 .as_any()
@@ -771,12 +778,16 @@ fn resolve_frontend_addr(
     fe_addr.cloned().or_else(disk_report::latest_fe_addr)
 }
 
-fn with_frontend_client<T, F>(fe_addr: &types::TNetworkAddress, f: F) -> Result<T, String>
+fn with_frontend_client<T, F>(
+    fe_addr: &types::TNetworkAddress,
+    options: FrontendRpcCallOptions,
+    f: F,
+) -> Result<T, String>
 where
     F: Clone + FnOnce(&mut dyn TFrontendServiceSyncClient) -> Result<T, String>,
 {
     FrontendRpcManager::shared()
-        .call(FrontendRpcKind::Control, fe_addr, move |client| {
+        .call_with_options(FrontendRpcKind::Control, fe_addr, options, move |client| {
             f.clone()(client).map_err(FrontendRpcError::from_message_guess)
         })
         .map_err(|err| err.to_string())
@@ -816,16 +827,37 @@ pub(crate) fn create_automatic_partitions(
         Some(partition_values),
         Some(is_temp),
     );
-    let response = with_frontend_client(fe_addr, |client| {
-        client
-            .create_partition(request)
-            .map_err(|e| format!("createPartition RPC failed: {e}"))
-    })?;
-    let status = response
-        .status
-        .as_ref()
-        .ok_or_else(|| "createPartition response missing status".to_string())?;
-    if status.status_code != status_code::TStatusCode::OK {
+    let retry_interval = Duration::from_millis(config::fe_rpc_retry_interval_ms().clamp(1, 5_000));
+    let deadline = Instant::now() + Duration::from_millis(config::fe_rpc_timeout_ms().max(1));
+    let mut service_unavailable_attempts = 0usize;
+    loop {
+        let response = with_frontend_client(
+            fe_addr,
+            FrontendRpcCallOptions {
+                transport_retries: CREATE_PARTITION_TRANSPORT_RETRIES,
+            },
+            |client| {
+                client
+                    .create_partition(request.clone())
+                    .map_err(|e| format!("createPartition RPC failed: {e}"))
+            },
+        )?;
+        let status = response
+            .status
+            .as_ref()
+            .ok_or_else(|| "createPartition response missing status".to_string())?;
+        if status.status_code == status_code::TStatusCode::OK {
+            return Ok(response);
+        }
+        if status.status_code == status_code::TStatusCode::SERVICE_UNAVAILABLE
+            && Instant::now() < deadline
+        {
+            service_unavailable_attempts += 1;
+            if service_unavailable_attempts > 1 {
+                std::thread::sleep(retry_interval);
+            }
+            continue;
+        }
         let detail = status
             .error_msgs
             .as_ref()
@@ -836,7 +868,6 @@ pub(crate) fn create_automatic_partitions(
             status.status_code
         ));
     }
-    Ok(response)
 }
 
 fn resolve_write_slot_bindings(
@@ -1039,6 +1070,37 @@ fn resolve_write_slot_bindings(
         );
     }
     Ok((out, op_slot_id))
+}
+
+fn resolve_effective_tablet_schema_for_index(
+    table_id: i64,
+    index_id: i64,
+    schema_id: i64,
+    tablet_ids: &[i64],
+    fallback_schema: &TabletSchemaPb,
+) -> TabletSchemaPb {
+    for tablet_id in tablet_ids {
+        let Ok(runtime) = get_tablet_runtime(*tablet_id) else {
+            continue;
+        };
+        if runtime.schema.id != Some(schema_id) {
+            continue;
+        }
+        if runtime.schema != *fallback_schema {
+            info!(
+                target: "novarocks::sink",
+                table_id,
+                index_id,
+                schema_id,
+                tablet_id,
+                fallback_keys_type = ?fallback_schema.keys_type,
+                runtime_keys_type = ?runtime.schema.keys_type,
+                "OLAP_TABLE_SINK prefer registered tablet runtime schema for write index"
+            );
+        }
+        return runtime.schema;
+    }
+    fallback_schema.clone()
 }
 
 fn resolve_column_to_expr_value_for_write(
@@ -1846,13 +1908,17 @@ mod tests {
     use super::{
         LOAD_OP_COLUMN, SinkWriteIndexSelection, build_auto_partition_plan,
         build_output_projection_plan, extract_partition_literal_value,
-        resolve_write_slot_bindings,
+        resolve_effective_tablet_schema_for_index, resolve_write_slot_bindings,
     };
     use crate::common::ids::SlotId;
+    use crate::connector::starrocks::lake::context::{
+        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+    };
     use crate::lower::layout::Layout;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::{data_sinks, descriptors, exprs, types};
+    use tempfile::tempdir;
     mod fe_rpc_server {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2290,6 +2356,19 @@ mod tests {
         }
     }
 
+    fn test_dup_keys_mv_like_fallback_schema() -> TabletSchemaPb {
+        let mut schema = test_mv_tablet_schema();
+        schema.keys_type = Some(KeysType::DupKeys as i32);
+        for column in schema
+            .column
+            .iter_mut()
+            .filter(|column| !column.is_key.unwrap_or(false))
+        {
+            column.aggregation = None;
+        }
+        schema
+    }
+
     fn dummy_type_desc() -> types::TTypeDesc {
         types::TTypeDesc {
             types: Some(vec![types::TTypeNode {
@@ -2455,10 +2534,7 @@ mod tests {
             10,
             None,
             None,
-            Some(&types::TNetworkAddress::new(
-                "127.0.0.1".to_string(),
-                9030,
-            )),
+            Some(&types::TNetworkAddress::new("127.0.0.1".to_string(), 9030)),
         )
         .expect("build automatic partition plan without shadow partitions");
 
@@ -2483,6 +2559,39 @@ mod tests {
             extract_partition_literal_value(&expr),
             Some("TRUE".to_string())
         );
+    }
+
+    #[test]
+    fn write_index_prefers_registered_runtime_schema_for_rollup_tablets() {
+        clear_tablet_runtime_cache_for_test();
+        let dir = tempdir().expect("create tempdir");
+        let runtime_schema = test_mv_tablet_schema();
+        register_tablet_runtime(&TabletWriteContext {
+            db_id: 1,
+            table_id: 2,
+            tablet_id: 100,
+            tablet_root_path: dir.path().to_string_lossy().to_string(),
+            tablet_schema: runtime_schema.clone(),
+            s3_config: None,
+            partial_update: Default::default(),
+        })
+        .expect("register runtime schema");
+
+        let resolved = resolve_effective_tablet_schema_for_index(
+            2,
+            10,
+            10,
+            &[100],
+            &test_dup_keys_mv_like_fallback_schema(),
+        );
+        assert_eq!(resolved.keys_type, Some(KeysType::AggKeys as i32));
+        assert_eq!(resolved.column[2].aggregation.as_deref(), Some("SUM"));
+        assert_eq!(
+            resolved.column[3].aggregation.as_deref(),
+            Some("BITMAP_UNION")
+        );
+
+        clear_tablet_runtime_cache_for_test();
     }
 
     #[test]
@@ -2618,6 +2727,55 @@ mod tests {
         .expect("createPartition succeeds");
 
         assert!(saw_temp.load(Ordering::Acquire));
+        test_clear_shared_host_pools();
+    }
+
+    #[test]
+    fn create_automatic_partitions_retries_multiple_end_of_file() {
+        test_clear_shared_host_pools();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = Arc::clone(&calls);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "createPartition" => {
+                    let _req: crate::frontend_service::TCreatePartitionRequest =
+                        read_struct_arg(i_prot)?;
+                    if calls_for_server.fetch_add(1, Ordering::AcqRel) < 2 {
+                        return Ok(ServerAction::Close);
+                    }
+                    let response = crate::frontend_service::TCreatePartitionResult {
+                        status: Some(crate::status::TStatus::new(
+                            crate::status_code::TStatusCode::OK,
+                            None,
+                        )),
+                        partitions: None,
+                        tablets: None,
+                        nodes: None,
+                    };
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+
+        let response = super::create_automatic_partitions(
+            server.addr(),
+            1,
+            2,
+            10,
+            false,
+            vec![vec!["2025-01-01".to_string()]],
+        )
+        .expect("createPartition retries across multiple EOF transport errors");
+
+        assert_eq!(
+            response.status.map(|status| status.status_code),
+            Some(crate::status_code::TStatusCode::OK)
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        assert!(server.accepts() >= 3);
         test_clear_shared_host_pools();
     }
 }

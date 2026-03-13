@@ -1,0 +1,356 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 9
+
+-- query 11
+
+-- query 12
+user_id	count(DISTINCT tag_id)
+1	5
+2	1
+3	1
+
+-- query 13
+user_id	bitmap_union_count(to_bitmap(tag_id))
+1	5
+2	1
+3	1
+
+-- query 14
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 15
+
+-- query 16
+user_id	count(DISTINCT tag_id)
+1	5
+2	1
+3	1
+
+-- query 17
+user_id	bitmap_union_count(to_bitmap(tag_id))
+1	5
+2	1
+3	1
+
+-- query 18
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 19
+
+-- query 20
+
+-- query 22
+
+-- query 23
+Explain String
+- Output => [2:user_id, 8:count]
+    - SORT(FINAL)[2: user_id ASC NULLS FIRST]
+            Estimates: {row: 3, cpu: 72.00, memory: 72.00, network: 72.00, cost: 732.00}
+        - SORT(PARTIAL)[2: user_id ASC NULLS FIRST]
+                Estimates: {row: 3, cpu: 72.00, memory: 72.00, network: 72.00, cost: 444.00}
+            - AGGREGATE(GLOBAL) [9:user_id] => [2:user_id, 8:count]
+                    Estimates: {row: 3, cpu: 12.00, memory: 72.00, network: 0.00, cost: 156.00}
+                    12:count := bitmap_union_count(11:bitmap_union(to_bitmap(tag_id)))
+                    2:user_id := 9:user_id
+                    8:count := 12:count
+                - SCAN [user_tags_mv2] => [9:user_id, 11:bitmap_union(to_bitmap(tag_id))]
+                        MaterializedView: true
+                        Estimates: {row: 3, cpu: 12.00, memory: 0.00, network: 0.00, cost: 6.00}
+                        partitionRatio: 1/1, tabletRatio: 2/2
+
+-- query 24
+user_id	count(DISTINCT tag_id)
+1	5
+2	1
+3	1
+
+-- query 25
+user_id	bitmap_union_count(to_bitmap(tag_id))
+1	5
+2	1
+3	1
+
+-- query 26
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 27
+
+-- query 28
+
+-- query 30
+
+-- query 31
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 32
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 33
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 34
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 35
+
+-- query 36
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 37
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 38
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 39
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 40
+
+-- query 41
+
+-- query 43
+
+-- query 44
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 45
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 46
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 47
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 48
+
+-- query 49
+
+-- query 51
+
+-- query 52
+user_id	x
+1	5
+2	5
+3	6
+
+-- query 53
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 54
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 55
+
+-- query 56
+user_id	x
+1	5
+2	5
+3	6
+
+-- query 57
+user_id	x
+1	5
+2	5
+3	6
+
+-- query 58
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 59
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 60
+
+-- query 61
+
+-- query 63
+
+-- query 64
+user_id	x
+1	5
+2	5
+3	6
+
+-- query 65
+user_id	x
+1	5
+2	5
+3	6
+
+-- query 66
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 67
+user_id	x
+1	1
+2	5
+3	6
+
+-- query 68
+user_id	time	round(percentile_approx(tag_id, 0))
+1	2023-04-13	1
+2	2023-04-13	5
+3	2023-04-13	6
+
+-- query 69
+
+-- query 70
+
+-- query 72
+
+-- query 73
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 74
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 75
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 76
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 77
+
+-- query 78
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 79
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 80
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 81
+user_id	x
+1	5
+2	1
+3	1
+
+-- query 82
+
+-- query 83
+
+-- query 86
+user_id	time	total
+1	2023-04-13	15
+2	2023-04-13	5
+3	2023-04-13	6
+
+-- query 88
+user_id	total
+1	15
+2	5
+3	6
+
+-- query 89
+
+-- query 91
+user_id	time	total
+1	2023-04-13	15
+2	2023-04-13	5
+3	2023-04-13	6
+
+-- query 93
+user_id	total
+1	15
+2	5
+3	6

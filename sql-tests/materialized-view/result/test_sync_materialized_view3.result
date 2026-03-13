@@ -1,0 +1,13 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 7
+ss_store_sk	sum(ss_ext_list_price)
+50001	60.00
+
+-- query 8

@@ -1,0 +1,172 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 6
+
+-- query 8
+
+-- query 10
+
+-- query 12
+
+-- query 19
+k1	k6	k7
+2023-06-15	3	1
+2023-06-16	1	1
+
+-- query 20
+k1	k6	k7
+2023-06-15	6	10
+2023-06-16	2	10
+
+-- query 21
+k1	c_k6	m_k7
+2023-06-15	3	10
+2023-06-16	1	10
+
+-- query 22
+k1	min(k6)	min(k7)	min(k8)	sum(k9)	max(k10)	min(k11)	min(k12)	sum(k13)
+2023-06-15	1	1	1	3	1	1	1	3.000000000
+2023-06-16	1	1	1	1	1	1	1	1.000000000
+
+-- query 23
+k1	min1	sum1	max1	sum(2 * k13)
+2023-06-15	2	3	3	6.000000000
+2023-06-16	2	1	3	2.000000000
+
+-- query 24
+
+-- query 30
+k1	k6	k7
+2023-06-15	6	1
+2023-06-16	2	1
+
+-- query 31
+k1	k6	k7
+2023-06-15	12	10
+2023-06-16	4	10
+
+-- query 32
+k1	c_k6	m_k7
+2023-06-15	6	10
+2023-06-16	2	10
+
+-- query 33
+k1	min(k6)	min(k7)	min(k8)	sum(k9)	max(k10)	min(k11)	min(k12)	sum(k13)
+2023-06-15	1	1	1	6	1	1	1	6.000000000
+2023-06-16	1	1	1	2	1	1	1	2.000000000
+
+-- query 34
+k1	min1	sum1	max1	sum(2 * k13)
+2023-06-15	2	6	3	12.000000000
+2023-06-16	2	2	3	4.000000000
+
+-- query 35
+
+-- query 36
+
+-- query 37
+
+-- query 38
+
+-- query 39
+
+-- query 40
+
+-- query 41
+
+-- query 42
+
+-- query 43
+
+-- query 45
+
+-- query 49
+k1	city
+1	smallcity
+2	bigcity
+3	smallcity
+
+-- query 50
+k1	city
+1	1smallcity
+2	2bigcity
+3	3smallcity
+
+-- query 51
+
+-- query 54
+k1	city
+1	smallcity
+2	bigcity
+3	smallcity
+
+-- query 55
+k1	city
+1	1smallcity
+2	2bigcity
+3	3smallcity
+
+-- query 56
+
+-- query 57
+
+-- query 58
+
+-- query 59
+
+-- query 60
+
+-- query 61
+
+-- query 62
+
+-- query 67
+col3	startTime	endTime
+Fujian	NULL	NULL
+Guangdong	10001	10001
+
+-- query 69
+col0	col2	col3	id	col1
+123456789	2022-04-30 12:00:00	Guangdong	1	10001
+
+-- query 71
+col0	col2	col3	id	col1
+123456789	2022-04-30 12:00:00	Guangdong	1	10001
+987654321	2022-04-30 13:00:00	Fujian	NULL	NULL
+
+-- query 73
+col0	col2	col3	id	col1
+123456789	2022-04-30 12:00:00	Guangdong	1	10001
+987654321	2022-04-30 13:00:00	Fujian	NULL	NULL
+
+-- query 74
+
+-- query 77
+col0	col2	col3	id	col1
+123456789	2022-04-30 12:00:00	Guangdong	1	10001
+987654321	2022-04-30 13:00:00	Fujian	NULL	NULL
+
+-- query 80
+col0	col2	col3	id	col1
+123456789	2022-04-30 12:00:00	Guangdong	1	10001
+
+-- query 81
+
+-- query 86
+
+-- query 87
+
+-- query 89
+col0	col2	col3	id	col1
+123456789	2022-04-30 12:00:00	Guangdong	1	10001
+987654321	2022-04-30 13:00:00	Fujian	NULL	NULL
+
+-- query 90
+
+-- query 91

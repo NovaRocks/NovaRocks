@@ -1,12 +1,16 @@
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
+use mysql::prelude::Queryable;
+use mysql::{Conn as MysqlConn, OptsBuilder, Row as MysqlRow, Value as MysqlValue};
 use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -17,6 +21,7 @@ struct SuiteConfig {
     sql_glob: String,
     default_catalog: String,
     default_db: String,
+    auto_case_db: bool,
     verify_default: bool,
     init_sql: Option<PathBuf>,
     cleanup_sql: Option<PathBuf>,
@@ -29,16 +34,26 @@ struct QueryMeta {
     db: Option<String>,
     expect_error: Option<String>,
     result_contains: Vec<String>,
+    result_contains_any: Vec<String>,
     result_not_contains: Vec<String>,
     tags: Vec<String>,
+    skip_result_check: bool,
+    retry_count: Option<usize>,
+    retry_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
-struct QueryCase {
-    source_file: PathBuf,
-    query_id: String,
+struct SqlStep {
+    query_number: usize,
     sql: String,
     meta: QueryMeta,
+}
+
+#[derive(Debug, Clone)]
+struct SqlCase {
+    source_file: PathBuf,
+    case_id: String,
+    steps: Vec<SqlStep>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +73,16 @@ struct QueryExecution {
     rows: Vec<Vec<String>>,
     text_output: String,
     elapsed: Duration,
+}
+
+struct MysqlSession {
+    conn: MysqlConn,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResultSet {
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -309,12 +334,12 @@ fn insert_placeholder_default(
 }
 
 fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
-    if suite_name != "iceberg" {
+    if suite_name != "iceberg" && suite_name != "mv-on-iceberg" {
         return;
     }
 
-    // Keep the local Iceberg suite aligned with bootstrap defaults so it runs
-    // out of the box against the standard MinIO-backed test environment.
+    // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
+    // defaults so they run out of the box against the MinIO-backed dev setup.
     insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
     insert_placeholder_default(
         variables,
@@ -354,6 +379,30 @@ fn placeholder_variables(
     variables.insert("suite".to_string(), suite_name.to_string());
     for idx in 0..10 {
         variables.insert(format!("uuid{}", idx), format!("{}_{}", run_id, idx));
+    }
+    variables
+}
+
+fn stable_hash_hex(input: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn case_placeholder_variables(
+    base_variables: &HashMap<String, String>,
+    case_id: &str,
+) -> HashMap<String, String> {
+    let mut variables = base_variables.clone();
+    let suite_run_id = base_variables
+        .get("run_id")
+        .cloned()
+        .unwrap_or_else(|| "sqlt".to_string());
+    let case_run_id = format!("{}_{}", suite_run_id, stable_hash_hex(case_id));
+    variables.insert("case_id".to_string(), case_id.to_string());
+    variables.insert("run_id".to_string(), case_run_id.clone());
+    for idx in 0..10 {
+        variables.insert(format!("uuid{}", idx), format!("{}_{}", case_run_id, idx));
     }
     variables
 }
@@ -487,6 +536,9 @@ fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "result_contains" => {
                 meta.result_contains.push(raw_value);
             }
+            "result_contains_any" => {
+                meta.result_contains_any.push(raw_value);
+            }
             "result_not_contains" => {
                 meta.result_not_contains.push(raw_value);
             }
@@ -502,6 +554,24 @@ fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .filter(|s| !s.is_empty())
                     .map(ToString::to_string)
                     .collect();
+            }
+            "skip_result_check" => {
+                meta.skip_result_check = parse_bool(&raw_value)?;
+            }
+            "retry_count" => {
+                let value: usize = raw_value
+                    .parse()
+                    .with_context(|| format!("invalid retry_count: {}", raw_value))?;
+                if value == 0 {
+                    bail!("retry_count must be > 0, got {}", value);
+                }
+                meta.retry_count = Some(value);
+            }
+            "retry_interval_ms" => {
+                let value: u64 = raw_value
+                    .parse()
+                    .with_context(|| format!("invalid retry_interval_ms: {}", raw_value))?;
+                meta.retry_interval_ms = Some(value);
             }
             _ => {}
         }
@@ -523,6 +593,11 @@ fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         } else {
             override_meta.result_contains.clone()
         },
+        result_contains_any: if override_meta.result_contains_any.is_empty() {
+            base.result_contains_any.clone()
+        } else {
+            override_meta.result_contains_any.clone()
+        },
         result_not_contains: if override_meta.result_not_contains.is_empty() {
             base.result_not_contains.clone()
         } else {
@@ -533,6 +608,9 @@ fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         } else {
             override_meta.tags.clone()
         },
+        skip_result_check: override_meta.skip_result_check || base.skip_result_check,
+        retry_count: override_meta.retry_count.or(base.retry_count),
+        retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
     }
 }
 
@@ -561,32 +639,22 @@ fn extract_meta_and_sql(lines: &[String], meta_re: &Regex) -> Result<(QueryMeta,
     Ok((meta, sql))
 }
 
-fn split_queries(lines: &[String], marker_re: &Regex) -> Vec<Vec<String>> {
-    let mut marker_indexes: Vec<usize> = Vec::new();
-    for (idx, line) in lines.iter().enumerate() {
-        if marker_re.is_match(line.trim()) {
-            marker_indexes.push(idx);
-        }
-    }
-
-    if marker_indexes.len() <= 1 {
-        return vec![lines.to_vec()];
-    }
-
-    let mut sections: Vec<Vec<String>> = Vec::new();
-    for (i, start) in marker_indexes.iter().enumerate() {
-        let end = marker_indexes.get(i + 1).copied().unwrap_or(lines.len());
-        sections.push(lines[*start..end].to_vec());
-    }
-    sections
+fn extract_query_number(line: &str, marker_re: &Regex) -> Option<usize> {
+    let captures = marker_re.captures(line.trim())?;
+    captures.get(1)?.as_str().parse::<usize>().ok()
 }
 
-fn load_sql_queries_from_file(
+fn load_sql_case_from_file(
     sql_path: &Path,
     meta_re: &Regex,
     marker_re: &Regex,
     variables: &HashMap<String, String>,
-) -> Result<Vec<QueryCase>> {
+) -> Result<Option<SqlCase>> {
+    let base_name = sql_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?
+        .to_string();
     let content = match fs::read_to_string(sql_path) {
         Ok(c) => c,
         Err(exc) => {
@@ -595,44 +663,67 @@ fn load_sql_queries_from_file(
                 sql_path.display(),
                 exc
             );
-            return Ok(vec![]);
+            return Ok(None);
         }
     };
+    let case_variables = case_placeholder_variables(variables, &base_name);
     let content = substitute_placeholders(
         &content,
-        variables,
+        &case_variables,
         &format!("{}: placeholder substitution", sql_path.display()),
     )?;
 
-    let base_name = sql_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?
-        .to_string();
-
     let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let sections = split_queries(&lines, marker_re);
-    let file_meta_lines = if sections.len() > 1 {
-        let first_marker_idx = lines
-            .iter()
-            .position(|line| marker_re.is_match(line.trim()))
-            .unwrap_or(0);
-        lines[..first_marker_idx].to_vec()
+    let markers: Vec<(usize, usize)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
+        .collect();
+    for (expected_idx, (_, query_number)) in markers.iter().enumerate() {
+        let expected_query_number = expected_idx + 1;
+        if *query_number != expected_query_number {
+            bail!(
+                "{}: expected marker '-- query {}', found '-- query {}'",
+                sql_path.display(),
+                expected_query_number,
+                query_number
+            );
+        }
+    }
+
+    let file_meta_lines = if let Some((first_marker_idx, _)) = markers.first() {
+        lines[..*first_marker_idx].to_vec()
     } else {
         lines.clone()
     };
     let (file_meta, _) = extract_meta_and_sql(&file_meta_lines, meta_re)
         .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
 
-    let mut cases = Vec::new();
-    for (idx, section) in sections.iter().enumerate() {
-        let section_id = if idx == 0 {
-            base_name.clone()
+    let sections: Vec<(usize, Vec<String>)> = if markers.is_empty() {
+        vec![(1, lines.clone())]
+    } else {
+        markers
+            .iter()
+            .enumerate()
+            .map(|(idx, (start, query_number))| {
+                let end = markers
+                    .get(idx + 1)
+                    .map(|(next_start, _)| *next_start)
+                    .unwrap_or(lines.len());
+                (*query_number, lines[*start..end].to_vec())
+            })
+            .collect()
+    };
+
+    let mut steps = Vec::new();
+    for (query_number, section) in sections {
+        let section_id = if query_number == 1 {
+            base_name.as_str().to_string()
         } else {
-            format!("{}-{}", base_name, idx + 1)
+            format!("{}-{}", base_name, query_number)
         };
 
-        let (section_meta, sql) = extract_meta_and_sql(section, meta_re).with_context(|| {
+        let (section_meta, sql) = extract_meta_and_sql(&section, meta_re).with_context(|| {
             format!("{} ({}): invalid metadata", sql_path.display(), section_id)
         })?;
 
@@ -641,15 +732,22 @@ fn load_sql_queries_from_file(
         }
 
         let merged_meta = merge_meta(&file_meta, &section_meta);
-        cases.push(QueryCase {
-            source_file: sql_path.to_path_buf(),
-            query_id: section_id,
+        steps.push(SqlStep {
+            query_number,
             sql,
             meta: merged_meta,
         });
     }
 
-    Ok(cases)
+    if steps.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(SqlCase {
+        source_file: sql_path.to_path_buf(),
+        case_id: base_name,
+        steps,
+    }))
 }
 
 fn parse_suite_hook_meta(
@@ -738,7 +836,39 @@ fn load_suite_hook(
     }))
 }
 
-fn load_expected_result(result_path: &Path) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+fn parse_result_set(lines: &[String]) -> ResultSet {
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    if lines.is_empty() {
+        return ResultSet::default();
+    }
+
+    let header = split_row(&lines[0]);
+    let rows = lines[1..].iter().map(|line| split_row(line)).collect();
+    ResultSet { header, rows }
+}
+
+fn render_result_set(header: &[String], rows: &[Vec<String>]) -> String {
+    if header.is_empty() && rows.is_empty() {
+        return String::new();
+    }
+
+    let mut out_lines = Vec::with_capacity(rows.len() + 1);
+    out_lines.push(header.join("\t"));
+    out_lines.extend(rows.iter().map(|row| row.join("\t")));
+    format!("{}\n", out_lines.join("\n"))
+}
+
+fn load_expected_results(
+    result_path: &Path,
+    multi_step: bool,
+    marker_re: &Regex,
+) -> Option<BTreeMap<usize, ResultSet>> {
     let content = match fs::read_to_string(result_path) {
         Ok(c) => c,
         Err(exc) => {
@@ -751,43 +881,65 @@ fn load_expected_result(result_path: &Path) -> Option<(Vec<String>, Vec<Vec<Stri
         }
     };
 
-    // Treat an empty file as a valid empty result set.
-    // This matches target output when mysql --batch returns no header for 0-row results.
-    if content.trim().is_empty() {
-        return Some((vec![], vec![]));
+    if multi_step {
+        let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
+        let markers: Vec<(usize, usize)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
+            .collect();
+        if markers.is_empty() {
+            println!(
+                "Warning: multi-step expected result must use '-- query N' sections: {}",
+                result_path.display()
+            );
+            return None;
+        }
+
+        let mut result_sets = BTreeMap::new();
+        for (idx, (start, query_number)) in markers.iter().enumerate() {
+            let end = markers
+                .get(idx + 1)
+                .map(|(next_start, _)| *next_start)
+                .unwrap_or(lines.len());
+            let body_lines = lines[start + 1..end].to_vec();
+            result_sets.insert(*query_number, parse_result_set(&body_lines));
+        }
+        return Some(result_sets);
     }
 
-    let lines: Vec<String> = content
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(ToString::to_string)
-        .collect();
-
-    if lines.is_empty() {
-        return Some((vec![], vec![]));
-    }
-
-    let header = split_row(&lines[0]);
-    let rows = lines[1..].iter().map(|line| split_row(line)).collect();
-    Some((header, rows))
+    let result_set =
+        parse_result_set(&content.lines().map(ToString::to_string).collect::<Vec<_>>());
+    Some(BTreeMap::from([(1usize, result_set)]))
 }
 
-fn write_result_file(path: &Path, header: &[String], rows: &[Vec<String>]) -> Result<()> {
+fn write_result_file(
+    path: &Path,
+    result_sets: &BTreeMap<usize, ResultSet>,
+    multi_step: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create parent dir failed: {}", parent.display()))?;
     }
 
-    if header.is_empty() && rows.is_empty() {
-        fs::write(path, "").with_context(|| format!("write file failed: {}", path.display()))?;
-        return Ok(());
-    }
+    let content = if multi_step {
+        let mut blocks = Vec::new();
+        for (query_number, result_set) in result_sets {
+            let mut block = format!("-- query {}\n", query_number);
+            block.push_str(&render_result_set(&result_set.header, &result_set.rows));
+            blocks.push(block.trim_end_matches('\n').to_string());
+        }
+        if blocks.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", blocks.join("\n\n"))
+        }
+    } else {
+        let result_set = result_sets.get(&1).cloned().unwrap_or_default();
+        render_result_set(&result_set.header, &result_set.rows)
+    };
 
-    let mut out_lines = Vec::with_capacity(rows.len() + 1);
-    out_lines.push(header.join("\t"));
-    out_lines.extend(rows.iter().map(|row| row.join("\t")));
-    let content = format!("{}\n", out_lines.join("\n"));
     fs::write(path, content).with_context(|| format!("write file failed: {}", path.display()))?;
     Ok(())
 }
@@ -799,10 +951,11 @@ fn split_row(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_suite_hook, is_transient_iceberg_commit_error, load_expected_result,
-        substitute_placeholders, write_result_file,
+        ResultSet, extract_suite_hook, is_transient_iceberg_commit_error, load_expected_results,
+        parse_output, parse_selector_list, substitute_placeholders, write_result_file,
     };
     use regex::Regex;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -824,22 +977,136 @@ mod tests {
     fn load_expected_result_accepts_empty_file() {
         let path = temp_result_path("empty_load");
         fs::write(&path, "\n").expect("write empty file");
-        let loaded = load_expected_result(&path).expect("must parse empty result file");
-        assert!(loaded.0.is_empty());
-        assert!(loaded.1.is_empty());
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded =
+            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
+        let result_set = loaded.get(&1).expect("single-step result");
+        assert!(result_set.header.is_empty());
+        assert!(result_set.rows.is_empty());
         let _ = fs::remove_file(path);
     }
 
     #[test]
     fn write_result_file_persists_empty_result_set() {
         let path = temp_result_path("empty_write");
-        write_result_file(&path, &[], &[]).expect("write empty result file");
+        write_result_file(&path, &BTreeMap::new(), false).expect("write empty result file");
         let content = fs::read_to_string(&path).expect("read empty result file");
         assert_eq!(content, "");
-        let loaded = load_expected_result(&path).expect("must parse empty result file");
-        assert!(loaded.0.is_empty());
-        assert!(loaded.1.is_empty());
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded =
+            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
+        let result_set = loaded.get(&1).expect("single-step result");
+        assert!(result_set.header.is_empty());
+        assert!(result_set.rows.is_empty());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_step_result_round_trip() {
+        let path = temp_result_path("multi_step");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let result_sets = BTreeMap::from([
+            (
+                1usize,
+                ResultSet {
+                    header: vec!["count(*)".to_string()],
+                    rows: vec![vec!["1".to_string()]],
+                },
+            ),
+            (
+                3usize,
+                ResultSet {
+                    header: vec!["k1".to_string(), "c1".to_string()],
+                    rows: vec![vec!["1".to_string(), "2".to_string()]],
+                },
+            ),
+        ]);
+        write_result_file(&path, &result_sets, true).expect("write multi-step result file");
+        let loaded = load_expected_results(&path, true, &marker_re)
+            .expect("must parse multi-step result file");
+        assert_eq!(loaded, result_sets);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_expected_results_rejects_multi_step_without_markers() {
+        let path = temp_result_path("bad_multi_step");
+        fs::write(&path, "count(*)\n1\n").expect("write bad multi-step file");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded = load_expected_results(&path, true, &marker_re);
+        assert!(loaded.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_expected_results_preserves_trailing_empty_columns() {
+        let path = temp_result_path("trailing_empty_columns");
+        fs::write(
+            &path,
+            "-- query 1\nField\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
+        )
+        .expect("write result file");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded = load_expected_results(&path, true, &marker_re).expect("load result");
+        assert_eq!(
+            loaded.get(&1).expect("query 1"),
+            &ResultSet {
+                header: vec![
+                    "Field".to_string(),
+                    "Type".to_string(),
+                    "Null".to_string(),
+                    "Key".to_string(),
+                    "Default".to_string(),
+                    "Extra".to_string(),
+                ],
+                rows: vec![vec![
+                    "event_day".to_string(),
+                    "date".to_string(),
+                    "YES".to_string(),
+                    "true".to_string(),
+                    "NULL".to_string(),
+                    String::new(),
+                ]],
+            }
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_output_preserves_trailing_empty_columns() {
+        let (header, rows) = parse_output(
+            "Field\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
+        );
+        assert_eq!(
+            header,
+            vec![
+                "Field".to_string(),
+                "Type".to_string(),
+                "Null".to_string(),
+                "Key".to_string(),
+                "Default".to_string(),
+                "Extra".to_string(),
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                "event_day".to_string(),
+                "date".to_string(),
+                "YES".to_string(),
+                "true".to_string(),
+                "NULL".to_string(),
+                String::new(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn selector_list_rejects_legacy_step_ids() {
+        let available_cases = std::collections::HashSet::from(["foo".to_string()]);
+        let err = parse_selector_list(Some("foo-2"), &available_cases, "--only")
+            .expect_err("legacy step id must fail");
+        assert!(err.to_string().contains("sub-query selectors"));
     }
 
     #[test]
@@ -875,7 +1142,7 @@ mod tests {
 fn parse_output(stdout: &str) -> (Vec<String>, Vec<Vec<String>>) {
     let lines: Vec<&str> = stdout
         .lines()
-        .map(str::trim_end)
+        .map(|line| line.trim_end_matches('\r'))
         .filter(|line| !line.trim().is_empty())
         .collect();
 
@@ -897,9 +1164,9 @@ fn render_output(header: &[String], rows: &[Vec<String>]) -> String {
     lines.join("\n")
 }
 
-fn verify_text_assertions(case: &QueryCase, execution: &QueryExecution) -> (bool, String) {
+fn verify_text_assertions(step: &SqlStep, execution: &QueryExecution) -> (bool, String) {
     let haystack = execution.text_output.as_str();
-    for needle in &case.meta.result_contains {
+    for needle in &step.meta.result_contains {
         if !haystack.contains(needle) {
             return (
                 false,
@@ -907,7 +1174,22 @@ fn verify_text_assertions(case: &QueryCase, execution: &QueryExecution) -> (bool
             );
         }
     }
-    for needle in &case.meta.result_not_contains {
+    if !step.meta.result_contains_any.is_empty()
+        && !step
+            .meta
+            .result_contains_any
+            .iter()
+            .any(|needle| haystack.contains(needle))
+    {
+        return (
+            false,
+            format!(
+                "result missing all required substrings {:?}",
+                step.meta.result_contains_any
+            ),
+        );
+    }
+    for needle in &step.meta.result_not_contains {
         if haystack.contains(needle) {
             return (
                 false,
@@ -1121,22 +1403,61 @@ fn compare_result_sets(
     }
 }
 
-fn expected_result_path(result_dir: &Path, query_id: &str, base_query_id: &str) -> Option<PathBuf> {
-    let variant = result_dir.join(format!("{}.result", query_id));
-    if variant.exists() {
-        return Some(variant);
-    }
-
-    if query_id != base_query_id {
-        return None;
-    }
-
-    let base = result_dir.join(format!("{}.result", base_query_id));
-    if base.exists() { Some(base) } else { None }
+fn case_result_path(result_dir: &Path, case_id: &str) -> PathBuf {
+    result_dir.join(format!("{}.result", case_id))
 }
 
-fn target_result_path(result_dir: &Path, query_id: &str) -> PathBuf {
-    result_dir.join(format!("{}.result", query_id))
+fn find_legacy_result_paths(result_dir: &Path, case_id: &str) -> Result<Vec<PathBuf>> {
+    let prefix = format!("{}-", case_id);
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(result_dir)
+        .with_context(|| format!("read dir failed: {}", result_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with(&prefix) && file_name.ends_with(".result") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
+    step.meta.expect_error.is_some()
+        || step.meta.skip_result_check
+        || !step.meta.result_contains.is_empty()
+        || !step.meta.result_contains_any.is_empty()
+        || !step.meta.result_not_contains.is_empty()
+        || step_has_implicit_skip_result(step)
+}
+
+fn step_requires_recorded_result(step: &SqlStep) -> bool {
+    !step_allows_missing_expected_result(step)
+}
+
+fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
+    let normalized = step
+        .sql
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    normalized.starts_with("refresh materialized view ") && normalized.contains(" with sync mode")
+}
+
+fn step_retry_count(step: &SqlStep) -> usize {
+    step.meta.retry_count.unwrap_or(1)
+}
+
+fn step_retry_interval(step: &SqlStep) -> Duration {
+    Duration::from_millis(step.meta.retry_interval_ms.unwrap_or(1000))
 }
 
 fn build_statements(
@@ -1157,6 +1478,214 @@ fn build_statements(
     statements.push(format!("SET query_timeout={};", query_timeout));
     statements.push(sql.to_string());
     statements.join("\n")
+}
+
+fn mysql_value_to_string(value: &MysqlValue) -> String {
+    match value {
+        MysqlValue::NULL => "NULL".to_string(),
+        MysqlValue::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        MysqlValue::Int(v) => v.to_string(),
+        MysqlValue::UInt(v) => v.to_string(),
+        MysqlValue::Float(v) => v.to_string(),
+        MysqlValue::Double(v) => v.to_string(),
+        MysqlValue::Date(year, mon, day, hour, min, sec, usec) => {
+            if *hour == 0 && *min == 0 && *sec == 0 && *usec == 0 {
+                format!("{year:04}-{mon:02}-{day:02}")
+            } else if *usec == 0 {
+                format!("{year:04}-{mon:02}-{day:02} {hour:02}:{min:02}:{sec:02}")
+            } else {
+                format!("{year:04}-{mon:02}-{day:02} {hour:02}:{min:02}:{sec:02}.{usec:06}")
+            }
+        }
+        MysqlValue::Time(is_neg, days, hours, mins, secs, usec) => {
+            let total_hours = days * 24 + u32::from(*hours);
+            let sign = if *is_neg { "-" } else { "" };
+            if *usec == 0 {
+                format!("{sign}{total_hours:02}:{mins:02}:{secs:02}")
+            } else {
+                format!("{sign}{total_hours:02}:{mins:02}:{secs:02}.{usec:06}")
+            }
+        }
+    }
+}
+
+fn mysql_row_to_strings(row: MysqlRow) -> Vec<String> {
+    (0..row.len())
+        .map(|idx| {
+            row.as_ref(idx)
+                .map(mysql_value_to_string)
+                .unwrap_or_else(|| "NULL".to_string())
+        })
+        .collect()
+}
+
+impl MysqlSession {
+    fn new(conn: &ConnectionConfig) -> Result<Self> {
+        let port = conn
+            .port
+            .parse::<u16>()
+            .with_context(|| format!("invalid mysql port: {}", conn.port))?;
+        let builder = OptsBuilder::new()
+            .ip_or_hostname(Some(conn.host.clone()))
+            .tcp_port(port)
+            .prefer_socket(false)
+            .user(Some(conn.user.clone()))
+            .pass(conn.password.clone());
+        let mut session = Self {
+            conn: MysqlConn::new(builder).with_context(|| {
+                format!(
+                    "failed to establish mysql protocol session to {}:{}",
+                    conn.host, conn.port
+                )
+            })?,
+        };
+
+        session.apply_base_context(conn)?;
+        Ok(session)
+    }
+
+    fn apply_base_context(&mut self, conn: &ConnectionConfig) -> Result<()> {
+        // Align sql-tests sessions with the default dev/test harness so FE planner timeouts do not
+        // dominate correctness runs under suite-wide load.
+        self.conn
+            .query_drop("SET new_planner_optimize_timeout = 10000")
+            .context("failed to set new_planner_optimize_timeout")?;
+        if let Some(catalog) = conn.catalog.as_deref() {
+            if !catalog.is_empty() {
+                self.conn
+                    .query_drop(format!("SET catalog {}", catalog))
+                    .with_context(|| format!("failed to set catalog {}", catalog))?;
+            }
+        }
+        if let Some(db) = conn.db.as_deref() {
+            if !db.is_empty() {
+                self.conn
+                    .query_drop(format!("USE {}", db))
+                    .with_context(|| format!("failed to USE {}", db))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_query(
+        &mut self,
+        query_timeout: u64,
+        sql: &str,
+        db_override: Option<&str>,
+    ) -> (bool, Option<QueryExecution>, String) {
+        const MAX_TRANSIENT_ATTEMPTS: usize = 2;
+        const TRANSIENT_RETRY_DELAY_MS: u64 = 300;
+
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let started = Instant::now();
+            if let Some(db) = db_override {
+                if !db.is_empty() {
+                    if let Err(exc) = self.conn.query_drop(format!("USE {}", db)) {
+                        let elapsed = started.elapsed();
+                        return (
+                            false,
+                            None,
+                            format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
+                        );
+                    }
+                }
+            }
+
+            if let Err(exc) = self
+                .conn
+                .query_drop(format!("SET query_timeout={}", query_timeout))
+            {
+                let elapsed = started.elapsed();
+                return (
+                    false,
+                    None,
+                    format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
+                );
+            }
+
+            match self.conn.query_iter(sql) {
+                Ok(mut query_result) => {
+                    let mut last_header: Vec<String> = Vec::new();
+                    let mut last_rows: Vec<Vec<String>> = Vec::new();
+                    let mut saw_tabular_result = false;
+
+                    while let Some(mut result_set) = query_result.iter() {
+                        let header: Vec<String> = result_set
+                            .columns()
+                            .as_ref()
+                            .iter()
+                            .map(|column| column.name_str().to_string())
+                            .collect();
+                        let mut rows: Vec<Vec<String>> = Vec::new();
+
+                        for row_result in result_set.by_ref() {
+                            match row_result {
+                                Ok(row) => rows.push(mysql_row_to_strings(row)),
+                                Err(exc) => {
+                                    let elapsed = started.elapsed();
+                                    let message = exc.to_string();
+                                    let clipped = if message.len() > 500 {
+                                        message[..500].to_string()
+                                    } else {
+                                        message
+                                    };
+                                    return (
+                                        false,
+                                        None,
+                                        format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
+                                    );
+                                }
+                            }
+                        }
+
+                        if !header.is_empty() {
+                            saw_tabular_result = true;
+                            last_header = header;
+                            last_rows = rows;
+                        } else if !saw_tabular_result {
+                            last_header = header;
+                            last_rows = rows;
+                        }
+                    }
+
+                    let elapsed = started.elapsed();
+                    let execution = QueryExecution {
+                        text_output: render_output(&last_header, &last_rows),
+                        header: last_header,
+                        rows: last_rows,
+                        elapsed,
+                    };
+                    return (true, Some(execution), String::new());
+                }
+                Err(exc) => {
+                    let elapsed = started.elapsed();
+                    let message = exc.to_string();
+                    if attempt + 1 < MAX_TRANSIENT_ATTEMPTS
+                        && is_transient_iceberg_commit_error(&message)
+                    {
+                        std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
+                        continue;
+                    }
+                    let clipped = if message.len() > 500 {
+                        message[..500].to_string()
+                    } else {
+                        message
+                    };
+                    return (
+                        false,
+                        None,
+                        format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
+                    );
+                }
+            }
+        }
+
+        (
+            false,
+            None,
+            "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
+        )
+    }
 }
 
 fn run_mysql_sql(conn: &ConnectionConfig, sql: &str, skip_column_names: bool) -> Result<String> {
@@ -1198,6 +1727,46 @@ fn execute_suite_hook(
     let sql = build_statements(&hook.sql, query_timeout, None, None);
     run_mysql_sql(conn, &sql, true)
         .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
+    Ok(())
+}
+
+fn case_auto_db_name(case_id: &str) -> String {
+    format!("db_sqlt_{}", stable_hash_hex(case_id))
+}
+
+fn reset_case_database(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    db_name: &str,
+    label: &str,
+) -> Result<()> {
+    let sql = build_statements(
+        &format!(
+            "DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;"
+        ),
+        query_timeout,
+        None,
+        None,
+    );
+    run_mysql_sql(conn, &sql, true)
+        .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
+    Ok(())
+}
+
+fn drop_case_database(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    db_name: &str,
+    label: &str,
+) -> Result<()> {
+    let sql = build_statements(
+        &format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;"),
+        query_timeout,
+        None,
+        None,
+    );
+    run_mysql_sql(conn, &sql, true)
+        .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
     Ok(())
 }
 
@@ -1303,14 +1872,38 @@ fn is_transient_iceberg_commit_error(message: &str) -> bool {
         && lower.contains("/metadata")
 }
 
-fn parse_query_list(value: Option<&str>) -> HashSet<String> {
-    value
+fn parse_selector_list(
+    value: Option<&str>,
+    available_case_ids: &HashSet<String>,
+    flag_name: &str,
+) -> Result<HashSet<String>> {
+    let selectors: HashSet<String> = value
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
-        .collect()
+        .collect();
+
+    for selector in &selectors {
+        if available_case_ids.contains(selector) {
+            continue;
+        }
+        let Some((candidate_case_id, candidate_step)) = selector.rsplit_once('-') else {
+            continue;
+        };
+        if candidate_step.parse::<usize>().is_ok() && available_case_ids.contains(candidate_case_id)
+        {
+            bail!(
+                "{} no longer supports sub-query selectors like '{}'; use '{}' instead",
+                flag_name,
+                selector,
+                candidate_case_id
+            );
+        }
+    }
+
+    Ok(selectors)
 }
 
 fn suite_sql_glob(suite_name: &str) -> String {
@@ -1333,6 +1926,17 @@ fn suite_default_db(suite_name: &str) -> String {
 fn suite_default_catalog(suite_name: &str) -> String {
     let _ = suite_name;
     "default_catalog".to_string()
+}
+
+fn suite_auto_case_db(suite_name: &str) -> bool {
+    matches!(suite_name, "materialized-view")
+}
+
+fn suite_default_query_timeout(suite_name: &str) -> u64 {
+    match suite_name {
+        "materialized-view" => 300,
+        _ => 120,
+    }
 }
 
 fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>> {
@@ -1365,6 +1969,7 @@ fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>>
             sql_glob: suite_sql_glob(&name),
             default_catalog: suite_default_catalog(&name),
             default_db: suite_default_db(&name),
+            auto_case_db: suite_auto_case_db(&name),
             verify_default: true,
             init_sql: path
                 .join("init.sql")
@@ -1428,18 +2033,18 @@ fn summarize_connection(label: &str, conn: &ConnectionConfig) -> String {
     )
 }
 
-fn query_order_sensitive(case: &QueryCase, cli: &Cli) -> bool {
-    case.meta
+fn query_order_sensitive(step: &SqlStep, cli: &Cli) -> bool {
+    step.meta
         .order_sensitive
         .unwrap_or(cli.order_sensitive_default)
 }
 
-fn query_float_epsilon(case: &QueryCase, cli: &Cli) -> Option<f64> {
-    case.meta.float_epsilon.or(cli.float_epsilon)
+fn query_float_epsilon(step: &SqlStep, cli: &Cli) -> Option<f64> {
+    step.meta.float_epsilon.or(cli.float_epsilon)
 }
 
-fn query_db(case: &QueryCase, fallback: Option<&str>) -> Option<String> {
-    case.meta
+fn query_db(step: &SqlStep, fallback: Option<&str>) -> Option<String> {
+    step.meta
         .db
         .clone()
         .or_else(|| fallback.map(ToString::to_string))
@@ -1448,23 +2053,34 @@ fn query_db(case: &QueryCase, fallback: Option<&str>) -> Option<String> {
 fn write_mismatch_artifacts(
     root_dir: &Path,
     suite_name: &str,
-    query_id: &str,
+    artifact_id: &str,
     expected_header: &[String],
     expected_rows: &[Vec<String>],
     actual_header: &[String],
     actual_rows: &[Vec<String>],
     reason: &str,
 ) -> Result<()> {
-    let out_dir = root_dir.join(suite_name).join(query_id);
+    let out_dir = root_dir.join(suite_name).join(artifact_id);
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("create dir failed: {}", out_dir.display()))?;
 
-    write_result_file(
-        &out_dir.join("expected.tsv"),
-        expected_header,
-        expected_rows,
-    )?;
-    write_result_file(&out_dir.join("actual.tsv"), actual_header, actual_rows)?;
+    let expected = BTreeMap::from([(
+        1usize,
+        ResultSet {
+            header: expected_header.to_vec(),
+            rows: expected_rows.to_vec(),
+        },
+    )]);
+    let actual = BTreeMap::from([(
+        1usize,
+        ResultSet {
+            header: actual_header.to_vec(),
+            rows: actual_rows.to_vec(),
+        },
+    )]);
+
+    write_result_file(&out_dir.join("expected.tsv"), &expected, false)?;
+    write_result_file(&out_dir.join("actual.tsv"), &actual, false)?;
     fs::write(out_dir.join("diff.txt"), format!("{}\n", reason))
         .with_context(|| format!("write diff failed: {}", out_dir.display()))?;
     Ok(())
@@ -1531,7 +2147,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| suite.sql_glob.clone());
 
     let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$")?;
-    let marker_re = Regex::new(r"(?i)^--\s*query\s+\d+(?:\s+.*)?$")?;
+    let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$")?;
     let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
     let suite_init_hook =
         load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
@@ -1554,9 +2170,9 @@ fn main() -> Result<()> {
 
     let verify_enabled = verify_override(&cli).unwrap_or(suite.verify_default);
     let query_timeout = cli.query_timeout.unwrap_or_else(|| {
-        env_or_default("STARUST_TEST_TIMEOUT", "120")
-            .parse()
-            .unwrap_or(120)
+        env_optional("STARUST_TEST_TIMEOUT")
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or_else(|| suite_default_query_timeout(&suite.name))
     });
     let reference_required = cli.mode == Mode::Diff
         || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
@@ -1683,50 +2299,35 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    let only_set = parse_query_list(cli.only.as_deref());
-    let skip_set = parse_query_list(cli.skip.as_deref());
-
-    let mut cases: Vec<QueryCase> = Vec::new();
-    let mut failed_query_ids: Vec<String> = Vec::new();
+    let mut cases: Vec<SqlCase> = Vec::new();
 
     for sql_file in sql_files {
-        let loaded_cases =
-            match load_sql_queries_from_file(&sql_file, &meta_re, &marker_re, &placeholder_vars) {
-                Ok(c) => c,
-                Err(exc) => {
-                    println!("❌ ERROR: {}", exc);
-                    std::process::exit(1);
-                }
-            };
-
-        if loaded_cases.is_empty() {
-            if let Some(stem) = sql_file.file_stem().and_then(|s| s.to_str()) {
-                failed_query_ids.push(stem.to_string());
+        match load_sql_case_from_file(&sql_file, &meta_re, &marker_re, &placeholder_vars) {
+            Ok(Some(case)) => cases.push(case),
+            Ok(None) => {
+                println!(
+                    "Warning: skipping SQL file without executable steps: {}",
+                    sql_file.display()
+                );
             }
-            continue;
-        }
-
-        for case in loaded_cases {
-            let base_id = case
-                .source_file
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-
-            if !only_set.is_empty()
-                && !only_set.contains(&case.query_id)
-                && !only_set.contains(&base_id)
-            {
-                continue;
+            Err(exc) => {
+                println!("❌ ERROR: {}", exc);
+                std::process::exit(1);
             }
-            if skip_set.contains(&case.query_id) || skip_set.contains(&base_id) {
-                continue;
-            }
-
-            cases.push(case);
         }
     }
+
+    let available_case_ids: HashSet<String> =
+        cases.iter().map(|case| case.case_id.clone()).collect();
+    let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
+    let skip_set = parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
+
+    cases.retain(|case| {
+        if !only_set.is_empty() && !only_set.contains(&case.case_id) {
+            return false;
+        }
+        !skip_set.contains(&case.case_id)
+    });
 
     if let Some(limit) = cli.limit {
         if cases.len() > limit {
@@ -1740,14 +2341,19 @@ fn main() -> Result<()> {
     }
 
     if cli.dry_run {
-        println!("selected queries:");
+        println!("selected cases:");
         for case in &cases {
             let file_name = case
                 .source_file
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
-            println!("  {} ({})", case.query_id, file_name);
+            println!(
+                "  {} ({}, steps={})",
+                case.case_id,
+                file_name,
+                case.steps.len()
+            );
         }
         return Ok(());
     }
@@ -1833,419 +2439,663 @@ fn main() -> Result<()> {
     let mut passed = 0usize;
     let mut failed = 0usize;
     let mut total_time = Duration::from_secs(0);
-    let mut per_query_times: Vec<(String, Duration, bool)> = Vec::new();
+    let mut per_case_times: Vec<(String, Duration)> = Vec::new();
+    let mut failed_case_ids: Vec<String> = Vec::new();
+    let mut abort_run = false;
 
-    for (idx, case) in cases.iter().enumerate() {
-        let order_sensitive = query_order_sensitive(case, &cli);
-        let epsilon = query_float_epsilon(case, &cli);
-
-        let target_conn = ConnectionConfig {
-            mysql: target_conn_base.mysql.clone(),
-            host: target_conn_base.host.clone(),
-            port: target_conn_base.port.clone(),
-            user: target_conn_base.user.clone(),
-            password: target_conn_base.password.clone(),
-            catalog: target_conn_base.catalog.clone(),
-            db: query_db(case, target_conn_base.db.as_deref()),
-        };
-
-        let reference_conn = ConnectionConfig {
-            mysql: reference_conn_base.mysql.clone(),
-            host: reference_conn_base.host.clone(),
-            port: reference_conn_base.port.clone(),
-            user: reference_conn_base.user.clone(),
-            password: reference_conn_base.password.clone(),
-            catalog: reference_conn_base.catalog.clone(),
-            db: query_db(case, reference_conn_base.db.as_deref()),
-        };
+    'case_loop: for (idx, case) in cases.iter().enumerate() {
+        let multi_step = case.steps.len() > 1;
+        let case_path = result_dir
+            .as_ref()
+            .map(|dir| case_result_path(dir, &case.case_id));
+        let case_requires_result_file = case.steps.iter().any(step_requires_recorded_result);
+        let mut case_elapsed = Duration::from_secs(0);
+        let mut case_failed = false;
 
         println!(
-            "\n[{}/{}] {} (order_sensitive={}, epsilon={:?})",
+            "\n[{}/{}] {} (steps={})",
             idx + 1,
             total,
-            case.query_id,
-            order_sensitive,
-            epsilon
+            case.case_id,
+            case.steps.len()
         );
 
-        match cli.mode {
-            Mode::Verify => {
-                let (ok, execution, err_msg) =
-                    execute_query(&target_conn, query_timeout, &case.sql);
-                if let Some(expected_error) = case.meta.expect_error.as_deref() {
-                    let elapsed = execution
-                        .as_ref()
-                        .map(|result| result.elapsed)
-                        .unwrap_or_default();
-                    total_time += elapsed;
-                    if ok {
-                        failed += 1;
-                        failed_query_ids.push(case.query_id.clone());
-                        per_query_times.push((case.query_id.clone(), elapsed, false));
-                        println!(
-                            "    ❌ expected error containing {:?}, but query succeeded",
-                            expected_error
-                        );
-                    } else if error_message_matches(&err_msg, expected_error) {
-                        passed += 1;
-                        per_query_times.push((case.query_id.clone(), elapsed, true));
-                        println!("    ✅ PASS (expected error matched): {}", err_msg);
-                    } else {
-                        failed += 1;
-                        failed_query_ids.push(case.query_id.clone());
-                        per_query_times.push((case.query_id.clone(), elapsed, false));
-                        println!(
-                            "    ❌ expected error containing {:?}, got: {}",
-                            expected_error, err_msg
-                        );
-                    }
-                    if cli.fail_fast && failed > 0 {
-                        break;
-                    }
-                    continue;
+        if matches!(cli.mode, Mode::Verify | Mode::Record) {
+            let Some(dir) = &result_dir else {
+                println!("    ❌ missing result_dir in {:?} mode", cli.mode);
+                failed += 1;
+                failed_case_ids.push(case.case_id.clone());
+                if cli.fail_fast {
+                    break 'case_loop;
                 }
-                if !ok || execution.is_none() {
+                continue;
+            };
+
+            match find_legacy_result_paths(dir, &case.case_id) {
+                Ok(paths) if !paths.is_empty() => {
                     failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    per_query_times.push((case.query_id.clone(), Duration::from_secs(0), false));
-                    println!("    ❌ target execute failed: {}", err_msg);
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                }
-
-                let execution = execution.expect("checked above");
-                per_query_times.push((case.query_id.clone(), execution.elapsed, true));
-                total_time += execution.elapsed;
-
-                let (assertions_ok, assertions_reason) = verify_text_assertions(case, &execution);
-                if !assertions_ok {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!("    ❌ VERIFY FAILED: {}", assertions_reason);
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                }
-
-                if !verify_enabled {
-                    passed += 1;
+                    failed_case_ids.push(case.case_id.clone());
                     println!(
-                        "    ✅ PASS (verify disabled) ({:.2}s)",
-                        execution.elapsed.as_secs_f64()
+                        "    ❌ legacy split result files are no longer supported: {}",
+                        paths
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     );
-                    continue;
-                }
-
-                let Some(result_dir) = &result_dir else {
-                    println!("    ❌ missing result_dir in verify mode");
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
                     if cli.fail_fast {
-                        break;
+                        break 'case_loop;
                     }
                     continue;
-                };
+                }
+                Ok(_) => {}
+                Err(exc) => {
+                    failed += 1;
+                    failed_case_ids.push(case.case_id.clone());
+                    println!("    ❌ failed to inspect result_dir: {}", exc);
+                    if cli.fail_fast {
+                        break 'case_loop;
+                    }
+                    continue;
+                }
+            }
+        }
 
-                let base_query_id = case
-                    .source_file
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
-                let expected_path = expected_result_path(result_dir, &case.query_id, base_query_id);
-                let Some(expected_path) = expected_path else {
-                    if !case.meta.result_contains.is_empty()
-                        || !case.meta.result_not_contains.is_empty()
-                    {
-                        passed += 1;
-                        println!(
-                            "    ✅ PASS ({:.2}s, text assertions only)",
-                            execution.elapsed.as_secs_f64()
-                        );
-                    } else {
+        let expected_results = if cli.mode == Mode::Verify && verify_enabled {
+            if let Some(path) = case_path.as_ref().filter(|path| path.exists()) {
+                match load_expected_results(path, multi_step, &marker_re) {
+                    Some(results) => Some(results),
+                    None => {
                         failed += 1;
-                        failed_query_ids.push(case.query_id.clone());
-                        println!("    ❌ missing expected result file");
+                        failed_case_ids.push(case.case_id.clone());
+                        println!("    ❌ failed to load expected result: {}", path.display());
                         if cli.fail_fast {
-                            break;
+                            break 'case_loop;
                         }
+                        continue;
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if cli.mode == Mode::Record
+            && case_requires_result_file
+            && case_path.as_ref().is_some_and(|path| path.exists())
+            && !cli.update_expected
+        {
+            failed += 1;
+            failed_case_ids.push(case.case_id.clone());
+            println!(
+                "    ❌ expected file exists ({}); rerun with --update-expected",
+                case_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            );
+            if cli.fail_fast {
+                break 'case_loop;
+            }
+            continue;
+        }
+
+        let case_auto_db = suite
+            .auto_case_db
+            .then(|| case_auto_db_name(&case.case_id));
+
+        if let Some(db_name) = case_auto_db.as_deref() {
+            if let Err(exc) =
+                reset_case_database(&target_admin_conn, query_timeout, db_name, "target")
+            {
+                failed += 1;
+                failed_case_ids.push(case.case_id.clone());
+                println!("    ❌ failed to prepare target case database: {:#}", exc);
+                if cli.fail_fast {
+                    break 'case_loop;
+                }
+                continue;
+            }
+            if reference_required {
+                if let Err(exc) =
+                    reset_case_database(&reference_admin_conn, query_timeout, db_name, "reference")
+                {
+                    let _ = drop_case_database(&target_admin_conn, query_timeout, db_name, "target");
+                    failed += 1;
+                    failed_case_ids.push(case.case_id.clone());
+                    println!("    ❌ failed to prepare reference case database: {:#}", exc);
+                    if cli.fail_fast {
+                        break 'case_loop;
                     }
                     continue;
-                };
-
-                let expected = load_expected_result(&expected_path);
-                let Some((expected_header, expected_rows)) = expected else {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!(
-                        "    ❌ failed to load expected result: {}",
-                        expected_path.display()
-                    );
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                };
-
-                let (same, reason) = compare_result_sets(
-                    &expected_header,
-                    &expected_rows,
-                    &execution.header,
-                    &execution.rows,
-                    order_sensitive,
-                    epsilon,
-                );
-
-                if same {
-                    passed += 1;
-                    println!(
-                        "    ✅ PASS ({:.2}s, rows={})",
-                        execution.elapsed.as_secs_f64(),
-                        execution.rows.len()
-                    );
-                    for row in execution.rows.iter().take(cli.preview_lines) {
-                        println!("    {:?}", row);
-                    }
-                } else {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!("    ❌ VERIFY FAILED: {}", reason);
-                    if let Some(root) = &actual_artifact_dir {
-                        if let Err(exc) = write_mismatch_artifacts(
-                            root,
-                            &suite.name,
-                            &case.query_id,
-                            &expected_header,
-                            &expected_rows,
-                            &execution.header,
-                            &execution.rows,
-                            &reason,
-                        ) {
-                            println!("    ⚠️ failed to write mismatch artifacts: {}", exc);
-                        }
-                    }
-                    if cli.fail_fast {
-                        break;
-                    }
                 }
             }
-            Mode::Record => {
-                let record_conn = if cli.record_from == RecordFrom::Target {
-                    &target_conn
-                } else {
-                    &reference_conn
-                };
-                if let Some(expected_error) = case.meta.expect_error.as_deref() {
-                    let (ok, execution, err_msg) =
-                        execute_query(record_conn, query_timeout, &case.sql);
-                    let elapsed = execution
-                        .as_ref()
-                        .map(|result| result.elapsed)
-                        .unwrap_or_default();
-                    total_time += elapsed;
-                    if ok {
-                        failed += 1;
-                        failed_query_ids.push(case.query_id.clone());
-                        per_query_times.push((case.query_id.clone(), elapsed, false));
-                        println!(
-                            "    ❌ expected error containing {:?}, but query succeeded",
-                            expected_error
-                        );
-                    } else if error_message_matches(&err_msg, expected_error) {
-                        passed += 1;
-                        per_query_times.push((case.query_id.clone(), elapsed, true));
-                        println!(
-                            "    ✅ RECORDED EXPECTED ERROR ({:.2}s): {}",
-                            elapsed.as_secs_f64(),
-                            err_msg
-                        );
-                    } else {
-                        failed += 1;
-                        failed_query_ids.push(case.query_id.clone());
-                        per_query_times.push((case.query_id.clone(), elapsed, false));
-                        println!(
-                            "    ❌ expected error containing {:?}, got: {}",
-                            expected_error, err_msg
+        }
+
+        let case_target_conn = ConnectionConfig {
+            db: case_auto_db
+                .clone()
+                .map(Some)
+                .unwrap_or_else(|| target_conn_base.db.clone()),
+            ..target_conn_base.clone()
+        };
+        let case_reference_conn = ConnectionConfig {
+            db: case_auto_db
+                .clone()
+                .map(Some)
+                .unwrap_or_else(|| reference_conn_base.db.clone()),
+            ..reference_conn_base.clone()
+        };
+
+        let mut target_session = match MysqlSession::new(&case_target_conn) {
+            Ok(session) => session,
+            Err(exc) => {
+                if let Some(db_name) = case_auto_db.as_deref() {
+                    let _ = drop_case_database(&target_admin_conn, query_timeout, db_name, "target");
+                    if reference_required {
+                        let _ = drop_case_database(
+                            &reference_admin_conn,
+                            query_timeout,
+                            db_name,
+                            "reference",
                         );
                     }
-                    if cli.fail_fast && failed > 0 {
-                        break;
-                    }
-                    continue;
                 }
-
-                let (ok, execution, err_msg) = execute_query(record_conn, query_timeout, &case.sql);
-                if !ok || execution.is_none() {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    per_query_times.push((case.query_id.clone(), Duration::from_secs(0), false));
-                    println!("    ❌ record source execute failed: {}", err_msg);
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
+                failed += 1;
+                failed_case_ids.push(case.case_id.clone());
+                println!("    ❌ failed to create target mysql session: {:#}", exc);
+                if cli.fail_fast {
+                    break 'case_loop;
                 }
-
-                let execution = execution.expect("checked above");
-                per_query_times.push((case.query_id.clone(), execution.elapsed, true));
-                total_time += execution.elapsed;
-
-                let Some(result_dir) = &result_dir else {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!("    ❌ missing result_dir in record mode");
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                };
-
-                let out_path = target_result_path(result_dir, &case.query_id);
-                if out_path.exists() && !cli.update_expected {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!(
-                        "    ❌ expected file exists ({}); rerun with --update-expected",
-                        out_path.display()
-                    );
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                }
-
-                if let Err(exc) = write_result_file(&out_path, &execution.header, &execution.rows) {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!("    ❌ failed to write expected result: {}", exc);
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                }
-
-                passed += 1;
-                println!(
-                    "    ✅ RECORDED ({:.2}s, rows={}) -> {}",
-                    execution.elapsed.as_secs_f64(),
-                    execution.rows.len(),
-                    out_path.display()
-                );
+                continue;
             }
-            Mode::Diff => {
-                if let Some(expected_error) = case.meta.expect_error.as_deref() {
-                    let (ok_t, execution_t, err_t) =
-                        execute_query(&target_conn, query_timeout, &case.sql);
-                    let (ok_r, execution_r, err_r) =
-                        execute_query(&reference_conn, query_timeout, &case.sql);
-                    let elapsed = execution_t
-                        .as_ref()
-                        .map(|result| result.elapsed)
-                        .unwrap_or_default()
-                        + execution_r
+        };
+        let mut reference_session = if reference_required {
+            match MysqlSession::new(&case_reference_conn) {
+                Ok(session) => Some(session),
+                Err(exc) => {
+                    if let Some(db_name) = case_auto_db.as_deref() {
+                        let _ =
+                            drop_case_database(&target_admin_conn, query_timeout, db_name, "target");
+                        let _ = drop_case_database(
+                            &reference_admin_conn,
+                            query_timeout,
+                            db_name,
+                            "reference",
+                        );
+                    }
+                    failed += 1;
+                    failed_case_ids.push(case.case_id.clone());
+                    println!("    ❌ failed to create reference mysql session: {:#}", exc);
+                    if cli.fail_fast {
+                        break 'case_loop;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut recorded_results: BTreeMap<usize, ResultSet> = BTreeMap::new();
+
+        for step in &case.steps {
+            let order_sensitive = query_order_sensitive(step, &cli);
+            let epsilon = query_float_epsilon(step, &cli);
+
+            println!(
+                "  step {} (order_sensitive={}, epsilon={:?})",
+                step.query_number, order_sensitive, epsilon
+            );
+
+            match cli.mode {
+                Mode::Verify => {
+                    let retry_count = step_retry_count(step);
+                    let retry_interval = step_retry_interval(step);
+                    let mut matched_expected_error = false;
+                    let mut passed_execution: Option<QueryExecution> = None;
+                    let mut last_execution: Option<QueryExecution> = None;
+                    let mut last_failure = String::new();
+
+                    for attempt in 0..retry_count {
+                        let (ok, execution, err_msg) = target_session.execute_query(
+                            query_timeout,
+                            &step.sql,
+                            step.meta.db.as_deref(),
+                        );
+                        let elapsed = execution
                             .as_ref()
                             .map(|result| result.elapsed)
                             .unwrap_or_default();
-                    total_time += elapsed;
+                        case_elapsed += elapsed;
+                        total_time += elapsed;
+                        last_execution = execution.clone();
 
-                    let target_matched = !ok_t && error_message_matches(&err_t, expected_error);
-                    let reference_matched = !ok_r && error_message_matches(&err_r, expected_error);
-                    if target_matched && reference_matched {
-                        passed += 1;
-                        per_query_times.push((case.query_id.clone(), elapsed, true));
-                        println!(
-                            "    ✅ DIFF PASS (both sides matched expected error: {:?})",
-                            expected_error
-                        );
+                        if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                            if ok {
+                                last_failure = format!(
+                                    "expected error containing {:?}, but query succeeded",
+                                    expected_error
+                                );
+                            } else if error_message_matches(&err_msg, expected_error) {
+                                matched_expected_error = true;
+                                last_failure = err_msg.clone();
+                                break;
+                            } else {
+                                last_failure = format!(
+                                    "expected error containing {:?}, got: {}",
+                                    expected_error, err_msg
+                                );
+                            }
+                        } else if !ok || execution.is_none() {
+                            last_failure = format!("target execute failed: {}", err_msg);
+                        } else {
+                            let execution = execution.expect("checked above");
+                            let (assertions_ok, assertions_reason) =
+                                verify_text_assertions(step, &execution);
+                            if !assertions_ok {
+                                last_failure = format!("VERIFY FAILED: {}", assertions_reason);
+                            } else if !verify_enabled {
+                                passed_execution = Some(execution);
+                                break;
+                            } else if step.meta.skip_result_check
+                                || step_has_implicit_skip_result(step)
+                            {
+                                passed_execution = Some(execution);
+                                break;
+                            } else if let Some(expected) = expected_results
+                                .as_ref()
+                                .and_then(|results| results.get(&step.query_number))
+                            {
+                                let (same, reason) = compare_result_sets(
+                                    &expected.header,
+                                    &expected.rows,
+                                    &execution.header,
+                                    &execution.rows,
+                                    order_sensitive,
+                                    epsilon,
+                                );
+                                if same {
+                                    passed_execution = Some(execution);
+                                    break;
+                                }
+                                last_failure = format!("VERIFY FAILED: {}", reason);
+                            } else if step_allows_missing_expected_result(step) {
+                                passed_execution = Some(execution);
+                                break;
+                            } else if let Some(path) = &case_path {
+                                if path.exists() {
+                                    last_failure = format!(
+                                        "missing expected result section for step {} in {}",
+                                        step.query_number,
+                                        path.display()
+                                    );
+                                } else {
+                                    last_failure =
+                                        format!("missing expected result file: {}", path.display());
+                                }
+                            } else {
+                                last_failure = "missing result_dir in verify mode".to_string();
+                            }
+                        }
+
+                        if attempt + 1 < retry_count {
+                            println!(
+                                "    ⏳ retrying attempt {}/{} after {}ms: {}",
+                                attempt + 2,
+                                retry_count,
+                                retry_interval.as_millis(),
+                                last_failure
+                            );
+                            sleep(retry_interval);
+                        }
+                    }
+
+                    if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                        if matched_expected_error {
+                            println!("    ✅ PASS (expected error matched): {}", last_failure);
+                        } else {
+                            case_failed = true;
+                            println!("    ❌ {}", last_failure);
+                            let _ = expected_error;
+                        }
+                    } else if let Some(execution) = passed_execution {
+                        if !verify_enabled {
+                            println!(
+                                "    ✅ PASS (verify disabled) ({:.2}s)",
+                                execution.elapsed.as_secs_f64()
+                            );
+                        } else if step.meta.skip_result_check
+                            || step_has_implicit_skip_result(step)
+                        {
+                            println!(
+                                "    ✅ PASS ({:.2}s, skip_result_check)",
+                                execution.elapsed.as_secs_f64()
+                            );
+                        } else if expected_results
+                            .as_ref()
+                            .and_then(|results| results.get(&step.query_number))
+                            .is_some()
+                        {
+                            println!(
+                                "    ✅ PASS ({:.2}s, rows={})",
+                                execution.elapsed.as_secs_f64(),
+                                execution.rows.len()
+                            );
+                            for row in execution.rows.iter().take(cli.preview_lines) {
+                                println!("    {:?}", row);
+                            }
+                        } else {
+                            println!(
+                                "    ✅ PASS ({:.2}s, text assertions only)",
+                                execution.elapsed.as_secs_f64()
+                            );
+                        }
                     } else {
-                        failed += 1;
-                        failed_query_ids.push(case.query_id.clone());
-                        per_query_times.push((case.query_id.clone(), elapsed, false));
-                        println!(
-                            "    ❌ DIFF FAILED expected error {:?} (target_ok={}, target_err={}, reference_ok={}, reference_err={})",
-                            expected_error, ok_t, err_t, ok_r, err_r
-                        );
-                        if cli.fail_fast {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                let (ok_t, execution_t, err_t) =
-                    execute_query(&target_conn, query_timeout, &case.sql);
-                if !ok_t || execution_t.is_none() {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    per_query_times.push((case.query_id.clone(), Duration::from_secs(0), false));
-                    println!("    ❌ target execute failed: {}", err_t);
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                }
-                let execution_t = execution_t.expect("checked above");
-
-                let (ok_r, execution_r, err_r) =
-                    execute_query(&reference_conn, query_timeout, &case.sql);
-                if !ok_r || execution_r.is_none() {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    per_query_times.push((case.query_id.clone(), execution_t.elapsed, false));
-                    total_time += execution_t.elapsed;
-                    println!("    ❌ reference execute failed: {}", err_r);
-                    if cli.fail_fast {
-                        break;
-                    }
-                    continue;
-                }
-                let execution_r = execution_r.expect("checked above");
-
-                let elapsed = execution_t.elapsed + execution_r.elapsed;
-                total_time += elapsed;
-                per_query_times.push((case.query_id.clone(), elapsed, true));
-
-                let (same, reason) = compare_result_sets(
-                    &execution_r.header,
-                    &execution_r.rows,
-                    &execution_t.header,
-                    &execution_t.rows,
-                    order_sensitive,
-                    epsilon,
-                );
-
-                if same {
-                    passed += 1;
-                    println!(
-                        "    ✅ DIFF PASS (target={:.2}s, reference={:.2}s)",
-                        execution_t.elapsed.as_secs_f64(),
-                        execution_r.elapsed.as_secs_f64()
-                    );
-                } else {
-                    failed += 1;
-                    failed_query_ids.push(case.query_id.clone());
-                    println!("    ❌ DIFF FAILED: {}", reason);
-                    if let Some(root) = &actual_artifact_dir {
-                        if let Err(exc) = write_mismatch_artifacts(
-                            root,
-                            &suite.name,
-                            &case.query_id,
-                            &execution_r.header,
-                            &execution_r.rows,
-                            &execution_t.header,
-                            &execution_t.rows,
-                            &reason,
+                        case_failed = true;
+                        println!("    ❌ {}", last_failure);
+                        if let (Some(root), Some(expected), Some(execution)) = (
+                            actual_artifact_dir.as_ref(),
+                            expected_results
+                                .as_ref()
+                                .and_then(|results| results.get(&step.query_number)),
+                            last_execution.as_ref(),
                         ) {
-                            println!("    ⚠️ failed to write mismatch artifacts: {}", exc);
+                            if last_failure.starts_with("VERIFY FAILED: ") {
+                                let artifact_id =
+                                    format!("{}-query{}", case.case_id, step.query_number);
+                                let reason =
+                                    last_failure.trim_start_matches("VERIFY FAILED: ").to_string();
+                                if let Err(exc) = write_mismatch_artifacts(
+                                    root,
+                                    &suite.name,
+                                    &artifact_id,
+                                    &expected.header,
+                                    &expected.rows,
+                                    &execution.header,
+                                    &execution.rows,
+                                    &reason,
+                                ) {
+                                    println!(
+                                        "    ⚠️ failed to write mismatch artifacts: {}",
+                                        exc
+                                    );
+                                }
+                            }
                         }
                     }
-                    if cli.fail_fast {
-                        break;
+                }
+                Mode::Record => {
+                    let retry_count = step_retry_count(step);
+                    let retry_interval = step_retry_interval(step);
+                    let mut matched_expected_error = false;
+                    let mut recorded_execution: Option<QueryExecution> = None;
+                    let mut last_failure = String::new();
+
+                    for attempt in 0..retry_count {
+                        let (ok, execution, err_msg) = if cli.record_from == RecordFrom::Target {
+                            target_session.execute_query(
+                                query_timeout,
+                                &step.sql,
+                                step.meta.db.as_deref(),
+                            )
+                        } else {
+                            reference_session
+                                .as_mut()
+                                .expect("reference session required in record-from=reference")
+                                .execute_query(
+                                    query_timeout,
+                                    &step.sql,
+                                    step.meta.db.as_deref(),
+                                )
+                        };
+                        let elapsed = execution
+                            .as_ref()
+                            .map(|result| result.elapsed)
+                            .unwrap_or_default();
+                        case_elapsed += elapsed;
+                        total_time += elapsed;
+
+                        if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                            if ok {
+                                last_failure = format!(
+                                    "expected error containing {:?}, but query succeeded",
+                                    expected_error
+                                );
+                            } else if error_message_matches(&err_msg, expected_error) {
+                                matched_expected_error = true;
+                                last_failure = err_msg.clone();
+                                break;
+                            } else {
+                                last_failure = format!(
+                                    "expected error containing {:?}, got: {}",
+                                    expected_error, err_msg
+                                );
+                            }
+                        } else if !ok || execution.is_none() {
+                            last_failure = format!("record source execute failed: {}", err_msg);
+                        } else {
+                            let execution = execution.expect("checked above");
+                            let (assertions_ok, assertions_reason) =
+                                verify_text_assertions(step, &execution);
+                            if !assertions_ok {
+                                last_failure = format!("VERIFY FAILED: {}", assertions_reason);
+                            } else {
+                                recorded_execution = Some(execution);
+                                break;
+                            }
+                        }
+
+                        if attempt + 1 < retry_count {
+                            println!(
+                                "    ⏳ retrying attempt {}/{} after {}ms: {}",
+                                attempt + 2,
+                                retry_count,
+                                retry_interval.as_millis(),
+                                last_failure
+                            );
+                            sleep(retry_interval);
+                        }
+                    }
+
+                    if step.meta.expect_error.is_some() {
+                        if matched_expected_error {
+                            println!("    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
+                        } else {
+                            case_failed = true;
+                            println!("    ❌ {}", last_failure);
+                        }
+                    } else if let Some(execution) = recorded_execution {
+                        if step_requires_recorded_result(step) {
+                            recorded_results.insert(
+                                step.query_number,
+                                ResultSet {
+                                    header: execution.header.clone(),
+                                    rows: execution.rows.clone(),
+                                },
+                            );
+                        }
+                        if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
+                            println!(
+                                "    ✅ STEP RECORDED ({:.2}s, skip_result_check)",
+                                execution.elapsed.as_secs_f64()
+                            );
+                        } else {
+                            println!(
+                                "    ✅ STEP RECORDED ({:.2}s, rows={})",
+                                execution.elapsed.as_secs_f64(),
+                                execution.rows.len()
+                            );
+                        }
+                    } else {
+                        case_failed = true;
+                        println!("    ❌ {}", last_failure);
+                    }
+                }
+                Mode::Diff => {
+                    if let Some(expected_error) = step.meta.expect_error.as_deref() {
+                        let (ok_t, execution_t, err_t) = target_session.execute_query(
+                            query_timeout,
+                            &step.sql,
+                            step.meta.db.as_deref(),
+                        );
+                        let (ok_r, execution_r, err_r) = reference_session
+                            .as_mut()
+                            .expect("reference session required in diff mode")
+                            .execute_query(
+                                query_timeout,
+                                &step.sql,
+                                step.meta.db.as_deref(),
+                            );
+                        let elapsed = execution_t
+                            .as_ref()
+                            .map(|result| result.elapsed)
+                            .unwrap_or_default()
+                            + execution_r
+                                .as_ref()
+                                .map(|result| result.elapsed)
+                                .unwrap_or_default();
+                        case_elapsed += elapsed;
+                        total_time += elapsed;
+
+                        let target_matched = !ok_t && error_message_matches(&err_t, expected_error);
+                        let reference_matched =
+                            !ok_r && error_message_matches(&err_r, expected_error);
+                        if target_matched && reference_matched {
+                            println!(
+                                "    ✅ DIFF PASS (both sides matched expected error: {:?})",
+                                expected_error
+                            );
+                        } else {
+                            case_failed = true;
+                            println!(
+                                "    ❌ DIFF FAILED expected error {:?} (target_ok={}, target_err={}, reference_ok={}, reference_err={})",
+                                expected_error, ok_t, err_t, ok_r, err_r
+                            );
+                        }
+                    } else {
+                        let (ok_t, execution_t, err_t) = target_session.execute_query(
+                            query_timeout,
+                            &step.sql,
+                            step.meta.db.as_deref(),
+                        );
+                        if !ok_t || execution_t.is_none() {
+                            case_failed = true;
+                            println!("    ❌ target execute failed: {}", err_t);
+                        } else {
+                            let execution_t = execution_t.expect("checked above");
+                            let (ok_r, execution_r, err_r) = reference_session
+                                .as_mut()
+                                .expect("reference session required in diff mode")
+                                .execute_query(
+                                    query_timeout,
+                                    &step.sql,
+                                    step.meta.db.as_deref(),
+                                );
+                            if !ok_r || execution_r.is_none() {
+                                case_failed = true;
+                                case_elapsed += execution_t.elapsed;
+                                total_time += execution_t.elapsed;
+                                println!("    ❌ reference execute failed: {}", err_r);
+                            } else {
+                                let execution_r = execution_r.expect("checked above");
+                                let elapsed = execution_t.elapsed + execution_r.elapsed;
+                                case_elapsed += elapsed;
+                                total_time += elapsed;
+
+                                let (same, reason) = compare_result_sets(
+                                    &execution_r.header,
+                                    &execution_r.rows,
+                                    &execution_t.header,
+                                    &execution_t.rows,
+                                    order_sensitive,
+                                    epsilon,
+                                );
+                                if same {
+                                    println!(
+                                        "    ✅ DIFF PASS (target={:.2}s, reference={:.2}s)",
+                                        execution_t.elapsed.as_secs_f64(),
+                                        execution_r.elapsed.as_secs_f64()
+                                    );
+                                } else {
+                                    case_failed = true;
+                                    println!("    ❌ DIFF FAILED: {}", reason);
+                                    if let Some(root) = &actual_artifact_dir {
+                                        let artifact_id =
+                                            format!("{}-query{}", case.case_id, step.query_number);
+                                        if let Err(exc) = write_mismatch_artifacts(
+                                            root,
+                                            &suite.name,
+                                            &artifact_id,
+                                            &execution_r.header,
+                                            &execution_r.rows,
+                                            &execution_t.header,
+                                            &execution_t.rows,
+                                            &reason,
+                                        ) {
+                                            println!(
+                                                "    ⚠️ failed to write mismatch artifacts: {}",
+                                                exc
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
+
+            if case_failed {
+                println!("    ⏭️ skipping remaining steps in {}", case.case_id);
+                break;
+            }
+        }
+
+        drop(target_session);
+        drop(reference_session);
+
+        if let Some(db_name) = case_auto_db.as_deref() {
+            if let Err(exc) = drop_case_database(&target_admin_conn, query_timeout, db_name, "target")
+            {
+                case_failed = true;
+                println!("    ❌ failed to cleanup target case database: {:#}", exc);
+            }
+            if reference_required {
+                if let Err(exc) = drop_case_database(
+                    &reference_admin_conn,
+                    query_timeout,
+                    db_name,
+                    "reference",
+                ) {
+                    case_failed = true;
+                    println!("    ❌ failed to cleanup reference case database: {:#}", exc);
+                }
+            }
+        }
+
+        if !case_failed && cli.mode == Mode::Record && case_requires_result_file {
+            if let Some(path) = case_path.as_ref() {
+                if let Err(exc) = write_result_file(path, &recorded_results, multi_step) {
+                    case_failed = true;
+                    println!("    ❌ failed to write expected result: {}", exc);
+                } else {
+                    println!("    ✅ RECORDED CASE -> {}", path.display());
+                }
+            }
+        }
+
+        per_case_times.push((case.case_id.clone(), case_elapsed));
+        if case_failed {
+            failed += 1;
+            failed_case_ids.push(case.case_id.clone());
+            if cli.fail_fast {
+                abort_run = true;
+            }
+        } else {
+            passed += 1;
         }
 
         println!(
@@ -2254,6 +3104,10 @@ fn main() -> Result<()> {
             failed,
             total_time.as_secs_f64()
         );
+
+        if abort_run {
+            break;
+        }
     }
 
     let mut cleanup_errors = Vec::new();
@@ -2283,15 +3137,15 @@ fn main() -> Result<()> {
     println!("fail={}", failed);
     println!("elapsed={:.2}s", total_time.as_secs_f64());
 
-    per_query_times.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("\nslowest queries (top 5):");
-    for (query_id, elapsed, _) in per_query_times.iter().take(5) {
-        println!("  {}: {:.2}s", query_id, elapsed.as_secs_f64());
+    per_case_times.sort_by(|a, b| b.1.cmp(&a.1));
+    println!("\nslowest cases (top 5):");
+    for (case_id, elapsed) in per_case_times.iter().take(5) {
+        println!("  {}: {:.2}s", case_id, elapsed.as_secs_f64());
     }
 
-    if !failed_query_ids.is_empty() {
-        println!("\nfailed queries:");
-        for id in &failed_query_ids {
+    if !failed_case_ids.is_empty() {
+        println!("\nfailed cases:");
+        for id in &failed_case_ids {
             println!("  {}", id);
         }
     }

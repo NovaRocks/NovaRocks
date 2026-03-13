@@ -1,0 +1,71 @@
+-- Test Objective:
+-- 1. Validate a synchronous aggregate MV can rewrite filtered fact-table group-by queries on duplicated input rows.
+-- 2. Cover sync-MV build completion and selective aggregate rewrite on warehouse-style sales data.
+-- Source: dev/test/sql/test_materialized_view/T/test_sync_materialized_view3
+
+-- query 1
+admin set frontend config('alter_scheduler_interval_millisecond' = '100');
+
+-- query 2
+CREATE TABLE `store_sales` (
+  `ss_item_sk` int(11) NULL COMMENT "",
+  `ss_ticket_number` int(11) NULL COMMENT "",
+  `ss_sold_date_sk` int(11) NULL COMMENT "",
+  `ss_sold_time_sk` int(11) NULL COMMENT "",
+  `ss_customer_sk` int(11) NULL COMMENT "",
+  `ss_cdemo_sk` int(11) NULL COMMENT "",
+  `ss_hdemo_sk` int(11) NULL COMMENT "",
+  `ss_addr_sk` int(11) NULL COMMENT "",
+  `ss_store_sk` int(11) NULL COMMENT "",
+  `ss_promo_sk` int(11) NULL COMMENT "",
+  `ss_quantity` int(11) NULL COMMENT "",
+  `ss_wholesale_cost` decimal(7, 2) NULL COMMENT "",
+  `ss_list_price` decimal(7, 2) NULL COMMENT "",
+  `ss_sales_price` decimal(7, 2) NULL COMMENT "",
+  `ss_ext_discount_amt` decimal(7, 2) NULL COMMENT "",
+  `ss_ext_sales_price` decimal(7, 2) NULL COMMENT "",
+  `ss_ext_wholesale_cost` decimal(7, 2) NULL COMMENT "",
+  `ss_ext_list_price` decimal(7, 2) NULL COMMENT "",
+  `ss_ext_tax` decimal(7, 2) NULL COMMENT "",
+  `ss_coupon_amt` decimal(7, 2) NULL COMMENT "",
+  `ss_net_paid` decimal(7, 2) NULL COMMENT "",
+  `ss_net_paid_inc_tax` decimal(7, 2) NULL COMMENT "",
+  `ss_net_profit` decimal(7, 2) NULL COMMENT ""
+) ENGINE=OLAP
+DUPLICATE KEY(`ss_item_sk`, `ss_ticket_number`, `ss_sold_date_sk`)
+DISTRIBUTED BY RANDOM;
+
+-- query 3
+INSERT INTO `store_sales` (
+  `ss_item_sk`, `ss_ticket_number`, `ss_sold_date_sk`, `ss_sold_time_sk`, `ss_customer_sk`,
+  `ss_cdemo_sk`, `ss_hdemo_sk`, `ss_addr_sk`, `ss_store_sk`, `ss_promo_sk`,
+  `ss_quantity`, `ss_wholesale_cost`, `ss_list_price`, `ss_sales_price`, `ss_ext_discount_amt`,
+  `ss_ext_sales_price`, `ss_ext_wholesale_cost`, `ss_ext_list_price`, `ss_ext_tax`,
+  `ss_coupon_amt`, `ss_net_paid`, `ss_net_paid_inc_tax`, `ss_net_profit`
+) VALUES
+(1, 1001, 20230601, 123456, 10001, 20001, 30001, 40001, 50001, 60001, 10, 20.00, 30.00, 25.00, 5.00, 25.00, 20.00, 30.00, 2.50, 1.00, 23.50, 26.00, 3.50),
+(2, 1002, 20230602, 123457, 10002, 20002, 30002, 40002, 50002, 60002, 15, 22.00, 32.00, 27.00, 5.50, 27.00, 22.00, 32.00, 2.70, 1.20, 25.80, 28.50, 4.50),
+(3, 1003, 20230603, 123458, 10003, 20003, 30003, 40003, 50003, 60003, 12, 21.00, 31.00, 26.00, 5.20, 26.00, 21.00, 31.00, 2.60, 1.10, 24.90, 27.20, 3.90),
+(1, 1001, 20230601, 123456, 10001, 20001, 30001, 40001, 50001, 60001, 10, 20.00, 30.00, 25.00, 5.00, 25.00, 20.00, 30.00, 2.50, 1.00, 23.50, 26.00, 3.50),
+(2, 1002, 20230602, 123457, 10002, 20002, 30002, 40002, 50002, 60002, 15, 22.00, 32.00, 27.00, 5.50, 27.00, 22.00, 32.00, 2.70, 1.20, 25.80, 28.50, 4.50),
+(3, 1003, 20230603, 123458, 10003, 20003, 30003, 40003, 50003, 60003, 12, 21.00, 31.00, 26.00, 5.20, 26.00, 21.00, 31.00, 2.60, 1.10, 24.90, 27.20, 3.90);
+
+-- query 4
+create materialized view test_mv1 as select  ss_store_sk,SUM(ss_ext_list_price) from store_sales GROUP BY ss_store_sk ;
+
+-- query 5
+-- @result_contains=FINISHED
+-- @retry_count=60
+-- @retry_interval_ms=1000
+SHOW ALTER MATERIALIZED VIEW ORDER BY JobId DESC LIMIT 1;
+
+-- query 6
+-- @result_contains=test_mv1
+SET enable_materialized_view_rewrite = true;
+EXPLAIN select ss_store_sk,SUM(ss_ext_list_price) from store_sales where  ss_store_sk=50001 GROUP BY ss_store_sk;
+
+-- query 7
+select ss_store_sk, SUM(ss_ext_list_price) from store_sales where  ss_store_sk=50001 GROUP BY ss_store_sk order by 1;
+
+-- query 8
+drop table store_sales;

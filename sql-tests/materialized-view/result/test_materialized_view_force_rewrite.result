@@ -1,0 +1,101 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 9
+Table	Op	Msg_type	Msg_text
+db_sqlt_c40809a6bb1372f4.mv1	analyze	status	OK
+
+-- query 10
+
+-- query 11
+
+-- query 14
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age))
+1	1
+2	1
+
+-- query 15
+t1_id	count(DISTINCT t1.t1_age)
+1	1
+2	1
+
+-- query 16
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age + 1))
+1	1
+2	1
+
+-- query 17
+t1_id	count(DISTINCT t1.t1_age + 1)
+1	1
+2	1
+
+-- query 18
+
+-- query 21
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age))
+1	1
+2	1
+
+-- query 22
+t1_id	count(DISTINCT t1.t1_age)
+1	1
+2	1
+
+-- query 23
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age + 1))
+1	1
+2	1
+
+-- query 24
+t1_id	count(DISTINCT t1.t1_age + 1)
+1	1
+2	1
+
+-- query 25
+
+-- query 30
+
+-- query 33
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age))
+1	1
+2	1
+
+-- query 34
+t1_id	count(DISTINCT t1.t1_age)
+1	1
+2	1
+
+-- query 35
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age + 1))
+1	1
+2	1
+
+-- query 36
+t1_id	count(DISTINCT t1.t1_age + 1)
+1	1
+2	1
+
+-- query 37
+
+-- query 39
+t1_id	bitmap_union_count(to_bitmap(t1.t1_age))
+1	1
+2	1
+
+-- query 40
+t1_id	count(DISTINCT t1.t1_age)
+1	1
+2	1
+
+-- query 43

@@ -1,0 +1,17 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 7
+k1	k2	a	b
+3	2	NULL	NULL
+
+-- query 8
+k1	k2	a	b
+NULL	NULL	2	2

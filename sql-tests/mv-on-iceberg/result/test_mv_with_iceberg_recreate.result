@@ -1,0 +1,69 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 9
+
+-- query 10
+
+-- query 17
+dt	sum(col_int)
+2023-12-03	4002
+2023-12-04	4002
+
+-- query 18
+dt	sum(col_int)
+2023-12-01	4000
+2023-12-02	4000
+2023-12-03	4002
+2023-12-04	4002
+
+-- query 19
+
+-- query 20
+
+-- query 21
+
+-- query 22
+
+-- query 23
+
+-- query 24
+
+-- query 25
+
+-- query 26
+
+-- query 27
+
+-- query 31
+dt	sum(col_int)
+
+-- query 32
+dt	sum(col_int)
+2023-12-01	4000
+2023-12-02	4000
+2023-12-03	4002
+2023-12-04	4002
+
+-- query 33
+
+-- query 34
+
+-- query 35
+
+-- query 36
+
+-- query 37

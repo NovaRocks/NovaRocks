@@ -1,0 +1,44 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 8
+col1	sum_col2	sum_col3
+
+-- query 9
+col1	sum_col2	sum_col3
+1	1	0
+
+-- query 10
+col1	sum_col2	sum_col3
+1	1	0
+
+-- query 11
+col1	sum_col2	sum_col3
+
+-- query 12
+col1	sum_col2	sum_col3
+
+-- query 13
+col1	sum_col2	sum_col3
+1	1	0
+
+-- query 14
+
+-- query 15
+
+-- query 16
+
+-- query 17
+
+-- query 18
+
+-- query 21
+lo_orderdate	count(1)
+1994-01-01 00:00:00	2
+
+-- query 22
+
+-- query 23

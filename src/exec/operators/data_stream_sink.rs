@@ -1149,6 +1149,11 @@ impl Operator for DataStreamSinkOperator {
         self.profiles = Some(profiles);
     }
 
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+        self.be_number = state.backend_num().unwrap_or(0);
+        Ok(())
+    }
+
     fn prepare(&mut self) -> Result<(), String> {
         // Align with StarRocks: count actual sink drivers prepared, not planned DOP.
         self.finish_state.register_driver();
@@ -1911,4 +1916,85 @@ fn project_chunk_by_slot_ids(chunk: &Chunk, slot_ids: &[SlotId]) -> Result<Chunk
         Arc::new(crate::exec::chunk::ChunkSchema::try_new(projected_slots)?),
         cols,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn make_test_operator() -> DataStreamSinkOperator {
+        DataStreamSinkOperator {
+            name: "DataStreamSink(test)".to_string(),
+            sink: data_sinks::TDataStreamSink::new(
+                1,
+                partitions::TDataPartition::new(
+                    partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::exprs::TExpr>>,
+                    None::<Vec<partitions::TRangePartition>>,
+                    None::<Vec<partitions::TBucketProperty>>,
+                ),
+                None::<bool>,
+                None::<bool>,
+                None::<i32>,
+                None::<Vec<i32>>,
+                None::<i64>,
+            ),
+            exec_params: internal_service::TPlanFragmentExecParams {
+                query_id: types::TUniqueId::new(1, 1),
+                fragment_instance_id: types::TUniqueId::new(1, 2),
+                per_node_scan_ranges: BTreeMap::new(),
+                per_exch_num_senders: BTreeMap::new(),
+                destinations: Some(Vec::new()),
+                sender_id: Some(11),
+                num_senders: None,
+                send_query_statistics_with_every_batch: None,
+                use_vectorized: None,
+                runtime_filter_params: None,
+                instances_number: None,
+                enable_exchange_pass_through: None,
+                node_to_per_driver_seq_scan_ranges: None,
+                enable_exchange_perf: None,
+                pipeline_sink_dop: None,
+                report_when_finish: None,
+                exec_debug_options: None,
+            },
+            arena: ExprArena::default(),
+            expr_ids: Vec::new(),
+            init_error: None,
+            driver_id: 0,
+            sender_id: 11,
+            be_number: 0,
+            output_columns: Vec::new(),
+            shared_sequence: Arc::new(AtomicI64::new(0)),
+            random_next: 0,
+            wire_meta_sent_per_dest: Vec::new(),
+            pending_per_dest: Vec::new(),
+            pending_bytes_per_dest: Vec::new(),
+            pending_payloads_per_dest: Vec::new(),
+            max_transmit_batched_bytes: 1,
+            finished: AtomicBool::new(false),
+            finishing: AtomicBool::new(false),
+            send_tracker: ExchangeSendTracker::new(),
+            send_observable: Arc::new(Observable::new()),
+            error_state: None,
+            finish_state: Arc::new(DataStreamSinkFinishState::default()),
+            profile_initialized: false,
+            profiles: None,
+            pending_chunks_mem_tracker: None,
+            pending_payload_mem_tracker: None,
+            send_queue_mem_tracker: None,
+        }
+    }
+
+    #[test]
+    fn bind_runtime_state_uses_backend_num_as_be_number() {
+        let mut op = make_test_operator();
+        let state = RuntimeState::new(None, None, None, None, None, Some(7), None, None, None);
+
+        Operator::bind_runtime_state(&mut op, &state).expect("bind runtime state");
+
+        assert_eq!(op.sender_id, 11);
+        assert_eq!(op.be_number, 7);
+    }
 }

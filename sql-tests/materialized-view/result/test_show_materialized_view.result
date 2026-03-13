@@ -1,0 +1,54 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 10
+
+-- query 11
+
+-- query 16
+TABLE_NAME	LAST_REFRESH_STATE	LAST_REFRESH_ERROR_CODE	IS_ACTIVE	INACTIVE_REASON
+user_tags_mv1	SKIPPED	0	true	NULL
+
+-- query 17
+
+-- query 20
+TABLE_NAME	LAST_REFRESH_STATE	LAST_REFRESH_ERROR_CODE	IS_ACTIVE	INACTIVE_REASON
+user_tags_mv1	SUCCESS	0	true	NULL
+
+-- query 21
+
+-- query 22
+if((@last_refresh_time) != (@this_refresh_time), 'refreshed', concat('no refresh after ', @last_refresh_time))
+refreshed
+
+-- query 23
+TABLE_NAME	IS_ACTIVE	INACTIVE_REASON
+user_tags_mv1	true	<empty>
+
+-- query 24
+TABLE_NAME	IS_ACTIVE	INACTIVE_REASON
+user_tags_mv1	true	<empty>
+
+-- query 25
+TABLE_NAME	IS_ACTIVE	INACTIVE_REASON
+user_tags_mv1	true	<empty>
+
+-- query 26
+TABLE_NAME	IS_ACTIVE	INACTIVE_REASON
+user_tags_mv1	true	<empty>
+
+-- query 27
+TABLE_NAME	LAST_REFRESH_ERROR_CODE	IS_ACTIVE	INACTIVE_REASON
+
+-- query 39

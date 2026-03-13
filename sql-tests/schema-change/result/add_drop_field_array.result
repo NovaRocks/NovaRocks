@@ -1,3 +1,53 @@
+-- query 1
 c0	c1
 1	[{"v1":1,"v2":1},{"v1":1,"v2":2}]
 2	[{"v1":2,"v2":1},{"v1":2,"v2":2}]
+
+-- query 5
+c0	c1
+1	[{"v1":1,"v2":1,"val1":null},{"v1":1,"v2":2,"val1":null}]
+2	[{"v1":2,"v2":1,"val1":null},{"v1":2,"v2":2,"val1":null}]
+
+-- query 6
+c0	c1
+1	[{"v1":1,"v2":1,"val1":null},{"v1":1,"v2":2,"val1":null}]
+2	[{"v1":2,"v2":1,"val1":null},{"v1":2,"v2":2,"val1":null}]
+3	[{"v1":3,"v2":1,"val1":1},{"v1":3,"v2":2,"val1":1}]
+
+-- query 7
+count(*)
+3
+
+-- query 8
+c0	c1
+1	[{"v1":1,"v2":1,"val1":null},{"v1":1,"v2":2,"val1":null}]
+2	[{"v1":2,"v2":1,"val1":null},{"v1":2,"v2":2,"val1":null}]
+3	[{"v1":3,"v2":1,"val1":1},{"v1":3,"v2":2,"val1":1}]
+
+-- query 9
+c0	c1
+3	[{"v2":1,"val1":1},{"v2":2,"val1":1}]
+1	[{"v2":1,"val1":null},{"v2":2,"val1":null}]
+2	[{"v2":1,"val1":null},{"v2":2,"val1":null}]
+
+-- query 10
+c0	c1
+1	[{"v2":1,"val1":null},{"v2":2,"val1":null}]
+2	[{"v2":1,"val1":null},{"v2":2,"val1":null}]
+3	[{"v2":1,"val1":1},{"v2":2,"val1":1}]
+4	[{"v2":4,"val1":4},{"v2":4,"val1":5}]
+
+-- query 11
+c0	c1
+3	[{"v2":1,"val1":1,"v1":null},{"v2":2,"val1":1,"v1":null}]
+4	[{"v2":4,"val1":4,"v1":null},{"v2":4,"val1":5,"v1":null}]
+1	[{"v2":1,"val1":null,"v1":null},{"v2":2,"val1":null,"v1":null}]
+2	[{"v2":1,"val1":null,"v1":null},{"v2":2,"val1":null,"v1":null}]
+
+-- query 12
+c0	c1
+1	[{"v2":1,"val1":null,"v1":null},{"v2":2,"val1":null,"v1":null}]
+2	[{"v2":1,"val1":null,"v1":null},{"v2":2,"val1":null,"v1":null}]
+5	[{"v2":5,"val1":5,"v1":5},{"v2":5,"val1":6,"v1":6}]
+3	[{"v2":1,"val1":1,"v1":null},{"v2":2,"val1":1,"v1":null}]
+4	[{"v2":4,"val1":4,"v1":null},{"v2":4,"val1":5,"v1":null}]

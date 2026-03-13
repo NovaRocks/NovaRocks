@@ -1,0 +1,95 @@
+-- query 1
+
+-- query 2
+
+-- query 3
+
+-- query 4
+
+-- query 5
+
+-- query 6
+
+-- query 7
+
+-- query 8
+
+-- query 9
+
+-- query 10
+
+-- query 12
+event_day	sum_pv
+2020-01-14	5
+2020-01-15	2
+
+-- query 13
+
+-- query 15
+event_day	sum_pv
+2020-01-14	5
+2020-01-15	5
+
+-- query 16
+
+-- query 17
+
+-- query 19
+IS_ACTIVE	INACTIVE_REASON
+true	<empty>
+
+-- query 20
+
+-- query 21
+
+-- query 23
+IS_ACTIVE	INACTIVE_REASON
+true	<empty>
+
+-- query 24
+
+-- query 26
+
+-- query 27
+IS_ACTIVE	INACTIVE_REASON
+true	<empty>
+
+-- query 28
+
+-- query 31
+IS_ACTIVE	INACTIVE_REASON
+false	base table schema changed for columns: pv
+
+-- query 32
+
+-- query 34
+
+-- query 36
+IS_ACTIVE	INACTIVE_REASON
+true	<empty>
+
+-- query 37
+
+-- query 38
+IS_ACTIVE	INACTIVE_REASON
+true	<empty>
+
+-- query 40
+event_day	sum_pv
+2020-01-16	NULL
+
+-- query 41
+
+-- query 42
+
+-- query 43
+
+-- query 45
+IS_ACTIVE	INACTIVE_REASON
+true	<empty>
+
+-- query 46
+event_day	sum_pv
+2020-01-16	NULL
+
+-- query 47
