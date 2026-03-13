@@ -166,6 +166,39 @@ fn wait_for_start_ready(
     ))
 }
 
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    const TARGET_SOFT_NOFILE: libc::rlim_t = 8192;
+
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+
+    if limit.rlim_cur >= TARGET_SOFT_NOFILE {
+        return;
+    }
+
+    let target = std::cmp::min(limit.rlim_max, TARGET_SOFT_NOFILE);
+    if target <= limit.rlim_cur {
+        return;
+    }
+
+    let updated = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: limit.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &updated) } == 0 {
+        eprintln!(
+            "Raised RLIMIT_NOFILE soft limit from {} to {}",
+            limit.rlim_cur, target
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_nofile_limit() {}
+
 fn open_daemon_stdout_log() -> Result<(File, String), String> {
     let log_path = novarocks_logging::resolve_stdout_log_path();
     if let Some(parent) = log_path.parent() {
@@ -185,6 +218,8 @@ fn open_daemon_stdout_log() -> Result<(File, String), String> {
 }
 
 fn main() {
+    raise_nofile_limit();
+
     let args: Vec<String> = env::args().collect();
     let mut idx = 1usize;
     let mode = if args.get(idx).is_some_and(|s| !s.starts_with('-')) {
@@ -435,6 +470,9 @@ fn main() {
                 host: server.host.as_str(),
                 heartbeat_port: server.heartbeat_port,
                 brpc_port: server.brpc_port,
+                internal_service_query_rpc_thread_num:
+                    novarocks::common::config::internal_service_query_rpc_thread_num()
+                        .min(u32::MAX as usize) as u32,
                 debug_exec_batch_plan_json: cfg.debug.exec_batch_plan_json,
                 log_level: log_level_num,
             };

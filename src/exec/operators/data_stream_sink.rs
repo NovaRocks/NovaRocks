@@ -1180,6 +1180,12 @@ impl Operator for DataStreamSinkOperator {
 }
 
 impl DataStreamSinkOperator {
+    fn sync_be_number(&mut self, state: &RuntimeState) {
+        if let Some(be_number) = state.backend_num() {
+            self.be_number = be_number;
+        }
+    }
+
     fn pending_chunk_bytes_total(&self) -> usize {
         self.pending_bytes_per_dest.iter().sum()
     }
@@ -1738,6 +1744,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
         if self.finished.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.sync_be_number(_state);
         self.ensure_error_state(_state);
         if let Some(err) = self.current_error() {
             return Err(err);
@@ -1765,6 +1772,7 @@ impl ProcessorOperator for DataStreamSinkOperator {
         if self.finished.load(Ordering::Acquire) {
             return Ok(());
         }
+        self.sync_be_number(_state);
         self.ensure_error_state(_state);
         if let Some(err) = self.current_error() {
             return Err(err);

@@ -16,11 +16,14 @@
 // under the License.
 #include "compat.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <deque>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -28,6 +31,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -308,14 +313,38 @@ int32_t invoke_internal_brpc_client(
         return 2;
     }
 
-    brpc::Channel channel;
     std::string endpoint = std::string(host) + ":" + std::to_string(port);
-    if (channel.Init(endpoint.c_str(), nullptr) != 0) {
-        write_compat_buf(std::string(rpc_name) + " channel init failed: " + endpoint, out_err);
+    static std::mutex s_channel_mu;
+    static std::unordered_map<std::string, std::shared_ptr<brpc::Channel>> s_channels;
+    std::shared_ptr<brpc::Channel> channel;
+    {
+        std::lock_guard<std::mutex> guard(s_channel_mu);
+        auto it = s_channels.find(endpoint);
+        if (it != s_channels.end()) {
+            channel = it->second;
+        } else {
+            brpc::ChannelOptions options;
+            options.connect_timeout_ms = 2000;
+            options.timeout_ms = 600000;
+            options.max_retry = 3;
+
+            channel = std::make_shared<brpc::Channel>();
+            if (channel->Init(endpoint.c_str(), &options) != 0) {
+                write_compat_buf(std::string(rpc_name) + " channel init failed: " + endpoint,
+                                 out_err);
+                return 1;
+            }
+            s_channels.emplace(endpoint, channel);
+        }
+    }
+
+    if (channel == nullptr) {
+        write_compat_buf(std::string(rpc_name) + " channel cache returned null: " + endpoint,
+                         out_err);
         return 1;
     }
 
-    starrocks::PInternalService_Stub stub(&channel);
+    starrocks::PInternalService_Stub stub(channel.get());
     brpc::Controller cntl;
     cntl.set_timeout_ms(600000);
     if (configure) {
@@ -337,6 +366,87 @@ int32_t invoke_internal_brpc_client(
     return 0;
 }
 
+class QueryRpcPool {
+public:
+    explicit QueryRpcPool(size_t thread_count) {
+        const size_t actual_threads = std::max<size_t>(1, thread_count);
+        workers_.reserve(actual_threads);
+        for (size_t i = 0; i < actual_threads; ++i) {
+            workers_.emplace_back([this]() { worker_loop(); });
+        }
+    }
+
+    ~QueryRpcPool() { shutdown(); }
+
+    bool submit(std::function<void()> task) {
+        if (!task) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                return false;
+            }
+            tasks_.push_back(std::move(task));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (stopped_) {
+                return;
+            }
+            stopped_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        workers_.clear();
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mu_);
+                cv_.wait(lock, [this]() { return stopped_ || !tasks_.empty(); });
+                if (tasks_.empty()) {
+                    if (stopped_) {
+                        return;
+                    }
+                    continue;
+                }
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+
+            try {
+                task();
+            } catch (const std::exception& e) {
+                std::cerr << "[ERROR] query rpc pool task failed: " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[ERROR] query rpc pool task failed: unknown exception" << std::endl;
+            }
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> tasks_;
+    std::vector<std::thread> workers_;
+    bool stopped_ = false;
+};
+
+std::unique_ptr<QueryRpcPool> g_query_rpc_pool;
+
 class InternalServiceImpl final : public starrocks::PInternalService {
 public:
     explicit InternalServiceImpl(NovaRocksCompatConfig cfg) : cfg_(cfg) {}
@@ -345,15 +455,212 @@ public:
                             const starrocks::PExecPlanFragmentRequest* request,
                             starrocks::PExecPlanFragmentResult* response,
                             google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
         auto* cntl = static_cast<brpc::Controller*>(controller);
         std::string proto_str = request != nullptr && request->has_attachment_protocol()
                                         ? request->attachment_protocol()
                                         : "binary";
         auto proto = parse_attachment_protocol(proto_str);
+        std::string attachment =
+                cntl != nullptr ? cntl->request_attachment().to_string() : std::string();
 
-        std::string attachment = cntl->request_attachment().to_string();
+        submit_query_rpc_task(
+                "exec_plan_fragment",
+                response,
+                done,
+                [proto, attachment = std::move(attachment), response]() mutable {
+                    run_exec_plan_fragment(proto, std::move(attachment), response);
+                });
+    }
 
+    void exec_batch_plan_fragments(google::protobuf::RpcController* controller,
+                                   const ::starrocks::PExecBatchPlanFragmentsRequest* request,
+                                   ::starrocks::PExecBatchPlanFragmentsResult* response,
+                                   ::google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        std::string proto_str = request != nullptr && request->has_attachment_protocol()
+                                        ? request->attachment_protocol()
+                                        : "binary";
+        auto proto = parse_attachment_protocol(proto_str);
+        std::string attachment =
+                cntl != nullptr ? cntl->request_attachment().to_string() : std::string();
+
+        submit_query_rpc_task(
+                "exec_batch_plan_fragments",
+                response,
+                done,
+                [proto, attachment = std::move(attachment), response]() mutable {
+                    run_exec_batch_plan_fragments(proto, std::move(attachment), response);
+                });
+    }
+
+    void fetch_data(google::protobuf::RpcController* controller,
+                    const starrocks::PFetchDataRequest* request,
+                    starrocks::PFetchDataResult* response,
+                    google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        UniqueIdKey finst_id{0, 0};
+        if (request != nullptr) {
+            finst_id.hi = request->finst_id().hi();
+            finst_id.lo = request->finst_id().lo();
+        }
+
+        submit_query_rpc_task("fetch_data",
+                              response,
+                              done,
+                              [cntl, finst_id, response]() {
+                                  run_fetch_data(cntl, finst_id, response);
+                              });
+    }
+
+    void cancel_plan_fragment(google::protobuf::RpcController* controller,
+                              const starrocks::PCancelPlanFragmentRequest* request,
+                              starrocks::PCancelPlanFragmentResult* response,
+                              google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        UniqueIdKey finst_id{0, 0};
+        if (request != nullptr) {
+            finst_id.hi = request->finst_id().hi();
+            finst_id.lo = request->finst_id().lo();
+        }
+
+        submit_query_rpc_task("cancel_plan_fragment",
+                              response,
+                              done,
+                              [cntl, finst_id, response]() {
+                                  run_cancel_plan_fragment(cntl, finst_id, response);
+                              });
+    }
+
+    void trigger_profile_report(google::protobuf::RpcController* controller,
+                                const starrocks::PTriggerProfileReportRequest* request,
+                                starrocks::PTriggerProfileReportResult* response,
+                                google::protobuf::Closure* done) override {
+        brpc::ClosureGuard guard(done);
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        if (request == nullptr) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                       "missing request");
+            return;
+        }
+
+        // StarRocks FE does not actively call trigger_profile_report in production. Runtime
+        // profiles are pushed by BE via reportExecStatus, so this RPC is treated as a no-op.
+        std::cerr << "[INFO] trigger_profile_report ignored, remote=" << cntl->remote_side()
+                  << " instances=" << request->instance_ids_size() << std::endl;
+        status_ok(response->mutable_status());
+    }
+
+    void transmit_chunk(google::protobuf::RpcController* controller,
+                        const starrocks::PTransmitChunkParams* request,
+                        starrocks::PTransmitChunkResult* response,
+                        google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        submit_query_rpc_task(
+                "transmit_chunk",
+                response,
+                done,
+                [cntl, request, response]() { run_transmit_chunk(cntl, request, response); });
+    }
+
+    void transmit_runtime_filter(google::protobuf::RpcController* controller,
+                                 const starrocks::PTransmitRuntimeFilterParams* request,
+                                 starrocks::PTransmitRuntimeFilterResult* response,
+                                 google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        submit_query_rpc_task("transmit_runtime_filter",
+                              response,
+                              done,
+                              [cntl, request, response]() {
+                                  run_transmit_runtime_filter(cntl, request, response);
+                              });
+    }
+
+    void lookup(google::protobuf::RpcController* controller,
+                const starrocks::PLookUpRequest* request,
+                starrocks::PLookUpResponse* response,
+                google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        submit_query_rpc_task("lookup",
+                              response,
+                              done,
+                              [cntl, request, response]() { run_lookup(cntl, request, response); });
+    }
+
+private:
+    template <typename Response>
+    static void finish_query_rpc_error(Response* response,
+                                       const char* rpc_name,
+                                       starrocks::TStatusCode::type code,
+                                       const std::string& msg) {
+        std::cerr << "[WARN] " << rpc_name << " failed: " << msg << std::endl;
+        if (response != nullptr) {
+            status_err(response->mutable_status(), code, msg);
+        }
+    }
+
+    template <typename Response>
+    static void submit_query_rpc_task(const char* rpc_name,
+                                      Response* response,
+                                      google::protobuf::Closure* done,
+                                      std::function<void()> task) {
+        if (done == nullptr) {
+            try {
+                task();
+            } catch (const std::exception& e) {
+                finish_query_rpc_error(response,
+                                       rpc_name,
+                                       starrocks::TStatusCode::INTERNAL_ERROR,
+                                       std::string("unexpected exception: ") + e.what());
+            } catch (...) {
+                finish_query_rpc_error(response,
+                                       rpc_name,
+                                       starrocks::TStatusCode::INTERNAL_ERROR,
+                                       "unexpected unknown exception");
+            }
+            return;
+        }
+
+        auto* pool = g_query_rpc_pool.get();
+        if (pool == nullptr) {
+            finish_query_rpc_error(response,
+                                   rpc_name,
+                                   starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                                   std::string(rpc_name) + " query rpc pool is unavailable");
+            done->Run();
+            return;
+        }
+
+        std::function<void()> wrapped = [rpc_name, response, done, task = std::move(task)]() mutable {
+            brpc::ClosureGuard guard(done);
+            try {
+                task();
+            } catch (const std::exception& e) {
+                finish_query_rpc_error(response,
+                                       rpc_name,
+                                       starrocks::TStatusCode::INTERNAL_ERROR,
+                                       std::string("unexpected exception: ") + e.what());
+            } catch (...) {
+                finish_query_rpc_error(response,
+                                       rpc_name,
+                                       starrocks::TStatusCode::INTERNAL_ERROR,
+                                       "unexpected unknown exception");
+            }
+        };
+        if (!pool->submit(std::move(wrapped))) {
+            finish_query_rpc_error(response,
+                                   rpc_name,
+                                   starrocks::TStatusCode::SERVICE_UNAVAILABLE,
+                                   std::string(rpc_name) + " query rpc pool is stopping");
+            done->Run();
+        }
+    }
+
+    static void run_exec_plan_fragment(AttachmentProtocol proto,
+                                       std::string attachment,
+                                       starrocks::PExecPlanFragmentResult* response) {
+        if (response == nullptr) {
+            return;
+        }
         if (proto != AttachmentProtocol::Binary) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
                        "only attachment_protocol=binary is supported for now");
@@ -384,19 +691,12 @@ public:
         status_ok(response->mutable_status());
     }
 
-    void exec_batch_plan_fragments(google::protobuf::RpcController* controller,
-                                   const ::starrocks::PExecBatchPlanFragmentsRequest* request,
-                                   ::starrocks::PExecBatchPlanFragmentsResult* response,
-                                   ::google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
-        std::string proto_str = request != nullptr && request->has_attachment_protocol()
-                                        ? request->attachment_protocol()
-                                        : "binary";
-        auto proto = parse_attachment_protocol(proto_str);
-
-        std::string attachment = cntl->request_attachment().to_string();
-
+    static void run_exec_batch_plan_fragments(AttachmentProtocol proto,
+                                              std::string attachment,
+                                              starrocks::PExecBatchPlanFragmentsResult* response) {
+        if (response == nullptr) {
+            return;
+        }
         if (proto != AttachmentProtocol::Binary) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
                        "only attachment_protocol=binary is supported for now");
@@ -422,16 +722,15 @@ public:
         status_ok(response->mutable_status());
     }
 
-    void fetch_data(google::protobuf::RpcController* controller,
-                    const starrocks::PFetchDataRequest* request,
-                    starrocks::PFetchDataResult* response,
-                    google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
-        UniqueIdKey finst_id{0, 0};
-        if (request != nullptr) {
-            finst_id.hi = request->finst_id().hi();
-            finst_id.lo = request->finst_id().lo();
+    static void run_fetch_data(brpc::Controller* cntl,
+                               UniqueIdKey finst_id,
+                               starrocks::PFetchDataResult* response) {
+        if (cntl == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
+                           "missing fetch_data controller/response");
+            }
+            return;
         }
 
         ResultPacket pkt;
@@ -462,21 +761,21 @@ public:
             }
             return msg;
         };
-        
+
         if (rc != 0) {
             std::string msg = take_err();
             starrocks::TStatusCode::type code = starrocks::TStatusCode::INTERNAL_ERROR;
             switch (rc) {
-            case 1: // NOT_FOUND
+            case 1:
                 code = starrocks::TStatusCode::NOT_FOUND;
                 break;
-            case 2: // CANCELLED
+            case 2:
                 code = starrocks::TStatusCode::CANCELLED;
                 break;
-            case 4: // TIMEOUT
+            case 4:
                 code = starrocks::TStatusCode::TIMEOUT;
                 break;
-            case 3: // FAILED
+            case 3:
             default:
                 code = starrocks::TStatusCode::INTERNAL_ERROR;
                 break;
@@ -486,8 +785,7 @@ public:
             status_err(response->mutable_status(), code, msg);
             return;
         }
-        
-        // Handle success
+
         if (batch_buf.ptr != nullptr && batch_buf.len > 0) {
             pkt.thrift_bytes.assign(reinterpret_cast<char*>(batch_buf.ptr), batch_buf.len);
             pkt.packet_seq = packet_seq;
@@ -496,10 +794,10 @@ public:
         if (batch_buf.ptr != nullptr) {
             novarocks_rs_free_buf(batch_buf.ptr, batch_buf.len);
         }
-        
+
         if (pkt.thrift_bytes.empty()) {
-            // Got success but empty data, return eos packet
-            pkt = make_empty_eos_packet(AttachmentProtocol::Binary, /*packet_seq=*/packet_seq, &err);
+            pkt = make_empty_eos_packet(
+                    AttachmentProtocol::Binary, /*packet_seq=*/packet_seq, &err);
             if (!err.empty()) {
                 std::cerr << "[ERROR] fetch_data build empty packet failed: " << err << std::endl;
             }
@@ -507,9 +805,10 @@ public:
         }
 
         std::cerr << "[DEBUG] fetch_data called, remote=" << cntl->remote_side()
-                  << " finst_id=" << format_unique_id(finst_id) << " packet_seq=" << pkt.packet_seq
-                  << " eos=" << (pkt.eos ? "true" : "false") << " attachment_bytes=" << pkt.thrift_bytes.size()
-                  << std::endl;
+                  << " finst_id=" << format_unique_id(finst_id)
+                  << " packet_seq=" << pkt.packet_seq
+                  << " eos=" << (pkt.eos ? "true" : "false")
+                  << " attachment_bytes=" << pkt.thrift_bytes.size() << std::endl;
 
         status_ok(response->mutable_status());
         response->set_packet_seq(pkt.packet_seq);
@@ -517,61 +816,42 @@ public:
         cntl->response_attachment().append(pkt.thrift_bytes);
     }
 
-    void cancel_plan_fragment(google::protobuf::RpcController* controller,
-                              const starrocks::PCancelPlanFragmentRequest* request,
-                              starrocks::PCancelPlanFragmentResult* response,
-                              google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
-        UniqueIdKey finst_id{0, 0};
-        if (request != nullptr) {
-            finst_id.hi = request->finst_id().hi();
-            finst_id.lo = request->finst_id().lo();
-        }
+    static void run_cancel_plan_fragment(brpc::Controller* cntl,
+                                         UniqueIdKey finst_id,
+                                         starrocks::PCancelPlanFragmentResult* response) {
         novarocks_rs_cancel(finst_id.hi, finst_id.lo);
-        std::cerr << "[INFO] cancel_plan_fragment called, remote=" << cntl->remote_side()
-                  << " finst_id=" << format_unique_id(finst_id) << std::endl;
-        status_ok(response->mutable_status());
-    }
-
-    void trigger_profile_report(google::protobuf::RpcController* controller,
-                                const starrocks::PTriggerProfileReportRequest* request,
-                                starrocks::PTriggerProfileReportResult* response,
-                                google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
-        if (request == nullptr) {
-            status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
-                       "missing request");
-            return;
+        if (cntl != nullptr) {
+            std::cerr << "[INFO] cancel_plan_fragment called, remote=" << cntl->remote_side()
+                      << " finst_id=" << format_unique_id(finst_id) << std::endl;
+        } else {
+            std::cerr << "[INFO] cancel_plan_fragment called, finst_id="
+                      << format_unique_id(finst_id) << std::endl;
         }
-
-        // StarRocks FE does not actively call trigger_profile_report in production. Runtime
-        // profiles are pushed by BE via reportExecStatus, so this RPC is treated as a no-op.
-        std::cerr << "[INFO] trigger_profile_report ignored, remote=" << cntl->remote_side()
-                  << " instances=" << request->instance_ids_size() << std::endl;
-        status_ok(response->mutable_status());
+        if (response != nullptr) {
+            status_ok(response->mutable_status());
+        }
     }
 
-    void transmit_chunk(google::protobuf::RpcController* controller,
-                        const starrocks::PTransmitChunkParams* request,
-                        starrocks::PTransmitChunkResult* response,
-                        google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
+    static void run_transmit_chunk(brpc::Controller* cntl,
+                                   const starrocks::PTransmitChunkParams* request,
+                                   starrocks::PTransmitChunkResult* response) {
         if (request == nullptr || response == nullptr) {
             if (response != nullptr) {
                 status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
                            "missing transmit_chunk request/response");
             }
-            cntl->SetFailed("missing transmit_chunk request/response");
+            if (cntl != nullptr) {
+                cntl->SetFailed("missing transmit_chunk request/response");
+            }
             return;
         }
 
         std::string err;
         if (!invoke_transmit_chunk(*request, response, &err)) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
-            cntl->SetFailed(err);
+            if (cntl != nullptr) {
+                cntl->SetFailed(err);
+            }
             return;
         }
         if (!response->has_status()) {
@@ -579,25 +859,27 @@ public:
         }
     }
 
-    void transmit_runtime_filter(google::protobuf::RpcController* controller,
-                                 const starrocks::PTransmitRuntimeFilterParams* request,
-                                 starrocks::PTransmitRuntimeFilterResult* response,
-                                 google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
+    static void run_transmit_runtime_filter(
+            brpc::Controller* cntl,
+            const starrocks::PTransmitRuntimeFilterParams* request,
+            starrocks::PTransmitRuntimeFilterResult* response) {
         if (request == nullptr || response == nullptr) {
             if (response != nullptr) {
                 status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
                            "missing transmit_runtime_filter request/response");
             }
-            cntl->SetFailed("missing transmit_runtime_filter request/response");
+            if (cntl != nullptr) {
+                cntl->SetFailed("missing transmit_runtime_filter request/response");
+            }
             return;
         }
 
         std::string err;
         if (!invoke_transmit_runtime_filter(*request, response, &err)) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
-            cntl->SetFailed(err);
+            if (cntl != nullptr) {
+                cntl->SetFailed(err);
+            }
             return;
         }
         if (!response->has_status()) {
@@ -605,25 +887,26 @@ public:
         }
     }
 
-    void lookup(google::protobuf::RpcController* controller,
-                const starrocks::PLookUpRequest* request,
-                starrocks::PLookUpResponse* response,
-                google::protobuf::Closure* done) override {
-        brpc::ClosureGuard guard(done);
-        auto* cntl = static_cast<brpc::Controller*>(controller);
+    static void run_lookup(brpc::Controller* cntl,
+                           const starrocks::PLookUpRequest* request,
+                           starrocks::PLookUpResponse* response) {
         if (request == nullptr || response == nullptr) {
             if (response != nullptr) {
                 status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
                            "missing lookup request/response");
             }
-            cntl->SetFailed("missing lookup request/response");
+            if (cntl != nullptr) {
+                cntl->SetFailed("missing lookup request/response");
+            }
             return;
         }
 
         std::string err;
         if (!invoke_lookup(*request, response, &err)) {
             status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
-            cntl->SetFailed(err);
+            if (cntl != nullptr) {
+                cntl->SetFailed(err);
+            }
             return;
         }
         if (!response->has_status()) {
@@ -631,7 +914,6 @@ public:
         }
     }
 
-private:
     static bool invoke_transmit_chunk(const starrocks::PTransmitChunkParams& request,
                                       starrocks::PTransmitChunkResult* response,
                                       std::string* err) {
@@ -1844,9 +2126,18 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
                       << static_cast<int>(cfg->debug_exec_batch_plan_json) << std::endl;
         }
 
+        size_t query_rpc_threads = static_cast<size_t>(cfg->internal_service_query_rpc_thread_num);
+        if (query_rpc_threads == 0) {
+            query_rpc_threads = std::thread::hardware_concurrency();
+        }
+        if (query_rpc_threads == 0) {
+            query_rpc_threads = 1;
+        }
+
         auto server = std::make_unique<brpc::Server>();
         auto service = std::make_unique<InternalServiceImpl>(*cfg);
         auto lake_service = std::make_unique<LakeServiceImpl>();
+        auto query_rpc_pool = std::make_unique<QueryRpcPool>(query_rpc_threads);
 
         if (server->AddService(service.get(), brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
             if (err) *err = "failed to add PInternalService";
@@ -1870,7 +2161,9 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
 
         g_internal_service = std::move(service);
         g_lake_service = std::move(lake_service);
+        g_query_rpc_pool = std::move(query_rpc_pool);
         g_brpc_server = std::move(server);
+        std::cerr << "[INFO] query rpc pool started, threads=" << query_rpc_threads << std::endl;
         if (err) err->clear();
         return 0;
     } catch (const std::exception& e) {
@@ -1879,6 +2172,7 @@ int novarocks_compat_start_brpc(const NovaRocksCompatConfig* cfg, std::string* e
         g_brpc_server.reset();
         g_internal_service.reset();
         g_lake_service.reset();
+        g_query_rpc_pool.reset();
         return 6;
     }
 }
@@ -1891,6 +2185,10 @@ void novarocks_compat_stop_brpc() {
         g_brpc_server->Stop(0);
         g_brpc_server->Join();
     }
+    if (g_query_rpc_pool) {
+        g_query_rpc_pool->shutdown();
+    }
+    g_query_rpc_pool.reset();
     g_lake_service.reset();
     g_internal_service.reset();
     g_brpc_server.reset();

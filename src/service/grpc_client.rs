@@ -46,9 +46,36 @@ struct StreamConn {
     tx: tokio::sync::mpsc::Sender<proto::novarocks::ExchangeRequest>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ExchangeStreamKey {
+    dest_host: String,
+    dest_port: u16,
+    finst_id: UniqueId,
+    node_id: i32,
+    sender_id: i32,
+}
+
+impl ExchangeStreamKey {
+    fn new(
+        dest_host: &str,
+        dest_port: u16,
+        finst_id: UniqueId,
+        node_id: i32,
+        sender_id: i32,
+    ) -> Self {
+        Self {
+            dest_host: dest_host.to_string(),
+            dest_port,
+            finst_id,
+            node_id,
+            sender_id,
+        }
+    }
+}
+
 #[derive(Default)]
 struct StreamCache {
-    mu: Mutex<HashMap<String, StreamConn>>,
+    mu: Mutex<HashMap<ExchangeStreamKey, StreamConn>>,
 }
 
 static STREAMS: OnceLock<StreamCache> = OnceLock::new();
@@ -98,8 +125,14 @@ async fn get_channel(host: &str, port: u16) -> Result<Channel, String> {
     Ok(ch)
 }
 
-fn get_or_create_exchange_stream(dest_host: &str, port: u16) -> Result<StreamConn, String> {
-    let key = format!("{dest_host}:{port}");
+fn get_or_create_exchange_stream(
+    dest_host: &str,
+    port: u16,
+    finst_id: UniqueId,
+    node_id: i32,
+    sender_id: i32,
+) -> Result<StreamConn, String> {
+    let key = ExchangeStreamKey::new(dest_host, port, finst_id, node_id, sender_id);
     if let Some(conn) = streams()
         .mu
         .lock()
@@ -113,6 +146,7 @@ fn get_or_create_exchange_stream(dest_host: &str, port: u16) -> Result<StreamCon
     let (tx, rx) = tokio::sync::mpsc::channel::<proto::novarocks::ExchangeRequest>(4096);
     let dest_host = dest_host.to_string();
     let port = port;
+    let key_for_task = key.clone();
     let runtime_handle = data_runtime_handle()?;
     runtime_handle.spawn(async move {
         let ch = match get_channel(&dest_host, port).await {
@@ -122,6 +156,11 @@ fn get_or_create_exchange_stream(dest_host: &str, port: u16) -> Result<StreamCon
                     "exchange stream connect failed: dest={}:{} error={}",
                     dest_host, port, e
                 );
+                streams()
+                    .mu
+                    .lock()
+                    .expect("stream cache lock")
+                    .remove(&key_for_task);
                 return;
             }
         };
@@ -137,6 +176,11 @@ fn get_or_create_exchange_stream(dest_host: &str, port: u16) -> Result<StreamCon
                     "exchange stream open failed: dest={}:{} error={}",
                     dest_host, port, e
                 );
+                streams()
+                    .mu
+                    .lock()
+                    .expect("stream cache lock")
+                    .remove(&key_for_task);
                 return;
             }
         };
@@ -165,6 +209,11 @@ fn get_or_create_exchange_stream(dest_host: &str, port: u16) -> Result<StreamCon
                 }
             }
         }
+        streams()
+            .mu
+            .lock()
+            .expect("stream cache lock")
+            .remove(&key_for_task);
     });
 
     let conn = StreamConn { tx };
@@ -205,15 +254,31 @@ pub fn send_chunks(
         payload,
     };
 
-    let conn = get_or_create_exchange_stream(dest_host, port)?;
+    let conn = get_or_create_exchange_stream(dest_host, port, finst_id, node_id, sender_id)?;
     match conn.tx.blocking_send(req) {
         Ok(()) => Ok(()),
         Err(e) => {
-            // Drop cached stream so the next send will re-create it.
-            let key = format!("{dest_host}:{port}");
+            let key = ExchangeStreamKey::new(dest_host, port, finst_id, node_id, sender_id);
             streams().mu.lock().expect("stream cache lock").remove(&key);
             Err(format!("exchange stream send failed: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exchange_stream_key_is_sender_scoped() {
+        let finst = UniqueId { hi: 1, lo: 2 };
+        let base = ExchangeStreamKey::new("127.0.0.1", 8060, finst, 3, 7);
+        assert_eq!(base, ExchangeStreamKey::new("127.0.0.1", 8060, finst, 3, 7));
+        assert_ne!(base, ExchangeStreamKey::new("127.0.0.1", 8060, finst, 3, 8));
+        assert_ne!(
+            base,
+            ExchangeStreamKey::new("127.0.0.1", 8060, UniqueId { hi: 1, lo: 3 }, 3, 7)
+        );
     }
 }
 
