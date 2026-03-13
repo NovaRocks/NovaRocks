@@ -31,6 +31,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use prost::Message;
 
+use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::common::ids::SlotId;
 use crate::connector::schema::{self, BeTabletWriteLoadLogRecord, BeTxnActiveRecord};
 use crate::connector::starrocks::ObjectStoreProfile;
@@ -959,6 +960,8 @@ fn resolve_upsert_batch_for_mode(
     existing_txn_log: Option<&TxnLogPb>,
     full_schema_col_count: usize,
 ) -> Result<LakeBatchWriteRouting, String> {
+    let data_batch =
+        materialize_present_auto_increment_column(ctx, &data_batch, data_batch_slot_ids)?;
     if ctx.partial_update.merge_condition.is_some() {
         info!(
             target: "novarocks::sink",
@@ -1097,6 +1100,62 @@ fn materialize_non_primary_auto_increment_batch(
     RecordBatch::try_new(batch.schema(), columns).map_err(|e| {
         format!(
             "build non-primary key batch after auto_increment materialization failed: {}",
+            e
+        )
+    })
+}
+
+fn materialize_present_auto_increment_column(
+    ctx: &TabletWriteContext,
+    batch: &RecordBatch,
+    batch_slot_ids: Option<&[Option<SlotId>]>,
+) -> Result<RecordBatch, String> {
+    let auto_policy = &ctx.partial_update.auto_increment;
+    let Some(auto_col_idx) = auto_policy.auto_increment_column_idx else {
+        return Ok(batch.clone());
+    };
+    let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch, batch_slot_ids)?;
+    let Some(batch_idx) = schema_to_batch.get(auto_col_idx).and_then(|idx| *idx) else {
+        return Ok(batch.clone());
+    };
+
+    let auto_col_name = auto_policy
+        .auto_increment_column_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            ctx.tablet_schema
+                .column
+                .get(auto_col_idx)
+                .and_then(|column| column.name.as_deref())
+                .filter(|name| !name.trim().is_empty())
+        })
+        .unwrap_or("<auto_increment>");
+    let auto_col = batch.column(batch_idx);
+    let null_rows = auto_col.null_count();
+    if null_rows == 0 {
+        return Ok(batch.clone());
+    }
+    if auto_policy.null_expr_in_auto_increment {
+        return Err(format!(
+            "NULL value in auto increment column '{}'",
+            auto_col_name
+        ));
+    }
+
+    let fe_addr = auto_policy
+        .fe_addr
+        .as_ref()
+        .ok_or_else(|| "write cannot allocate auto_increment id without FE address".to_string())?;
+    let allocated_ids = allocate_auto_increment_ids(fe_addr, ctx.table_id, null_rows)?;
+    let filled_auto_col =
+        fill_auto_increment_column_nulls(auto_col.as_ref(), &allocated_ids, auto_col_name)?;
+
+    let mut columns = batch.columns().to_vec();
+    columns[batch_idx] = filled_auto_col;
+    RecordBatch::try_new(batch.schema(), columns).map_err(|e| {
+        format!(
+            "build write batch after auto_increment materialization failed: {}",
             e
         )
     })
@@ -1635,7 +1694,7 @@ fn resolve_tablet_column_arrow_type(column: &ColumnPb) -> Result<DataType, Strin
         "LARGEINT" => Ok(DataType::FixedSizeBinary(
             crate::common::largeint::LARGEINT_BYTE_WIDTH,
         )),
-        "DECIMAL" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
+        "DECIMAL" | "DECIMALV2" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
             let (precision, scale) = resolve_decimal_precision_scale(column)?;
             Ok(DataType::Decimal128(precision, scale))
         }
@@ -1651,6 +1710,16 @@ fn resolve_tablet_column_arrow_type(column: &ColumnPb) -> Result<DataType, Strin
 }
 
 fn resolve_decimal_precision_scale(column: &ColumnPb) -> Result<(u8, i8), String> {
+    let base_type = column
+        .r#type
+        .trim()
+        .split('(')
+        .next()
+        .unwrap_or(column.r#type.as_str())
+        .trim();
+    if base_type.eq_ignore_ascii_case("DECIMALV2") {
+        return Ok((LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE));
+    }
     if let (Some(precision), Some(scale)) = (column.precision, column.frac) {
         let precision_u8 = u8::try_from(precision)
             .map_err(|_| format!("invalid decimal precision in tablet schema: {}", precision))?;
@@ -3379,6 +3448,7 @@ fn unix_millis_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use arrow::array::{
@@ -3394,7 +3464,9 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::common::largeint;
+    use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_test;
     use crate::exec::chunk::Chunk;
+    use crate::frontend_service;
     use crate::formats::starrocks::metadata::{
         collect_delete_predicates, lake_rowset_visibility_version,
     };
@@ -3402,10 +3474,19 @@ mod tests {
     use crate::formats::starrocks::writer::layout::{
         txn_log_file_path, txn_log_file_path_with_load_id,
     };
+    use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{
         BinaryPredicatePb, ColumnPb, DeletePredicatePb, KeysType, PUniqueId, RowsetMetadataPb,
         TabletMetadataPb, TabletSchemaPb,
     };
+    use crate::{status, status_code};
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn test_tablet_schema(schema_id: i64) -> TabletSchemaPb {
         TabletSchemaPb {
@@ -3551,6 +3632,103 @@ mod tests {
         ctx
     }
 
+    fn test_primary_key_auto_increment_tablet_schema(schema_id: i64) -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::PrimaryKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("k1".to_string()),
+                    r#type: "INT".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("id".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(true),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(3),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(schema_id),
+        }
+    }
+
+    fn test_pk_auto_increment_context(
+        root: &str,
+        table_id: i64,
+        tablet_id: i64,
+        schema_id: i64,
+    ) -> TabletWriteContext {
+        let mut ctx = TabletWriteContext {
+            db_id: 6001,
+            table_id,
+            tablet_id,
+            tablet_root_path: root.to_string(),
+            tablet_schema: test_primary_key_auto_increment_tablet_schema(schema_id),
+            s3_config: None,
+            partial_update: Default::default(),
+        };
+        ctx.partial_update.auto_increment.auto_increment_column_idx = Some(1);
+        ctx.partial_update.auto_increment.auto_increment_column_name = Some("id".to_string());
+        ctx
+    }
+
+    fn pk_auto_increment_batch(k1_values: Vec<i32>, id_values: Vec<Option<i64>>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int32, false),
+                Field::new("id", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(k1_values)) as ArrayRef,
+                Arc::new(Int64Array::from(id_values)) as ArrayRef,
+            ],
+        )
+        .expect("build primary key auto increment batch")
+    }
+
     fn test_rollup_like_tablet_schema(schema_id: i64) -> TabletSchemaPb {
         TabletSchemaPb {
             keys_type: Some(KeysType::DupKeys as i32),
@@ -3677,6 +3855,51 @@ mod tests {
             schema.field(0).data_type(),
             &DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH)
         );
+    }
+
+    #[test]
+    fn build_tablet_output_schema_normalizes_decimalv2_scale() {
+        let tablet_schema = TabletSchemaPb {
+            keys_type: Some(KeysType::DupKeys as i32),
+            column: vec![ColumnPb {
+                unique_id: 1,
+                name: Some("k1".to_string()),
+                r#type: "DECIMALV2".to_string(),
+                is_key: Some(true),
+                aggregation: None,
+                is_nullable: Some(false),
+                default_value: None,
+                precision: Some(9),
+                frac: Some(0),
+                length: None,
+                index_length: None,
+                is_bf_column: None,
+                referenced_column_id: None,
+                referenced_column: None,
+                has_bitmap_index: None,
+                visible: None,
+                children_columns: Vec::new(),
+                is_auto_increment: Some(false),
+                agg_state_desc: None,
+            }],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(2),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(7),
+        };
+
+        let schema =
+            build_tablet_output_schema(&tablet_schema).expect("build tablet output schema");
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(27, 9));
     }
 
     #[test]
@@ -4600,6 +4823,80 @@ mod tests {
         assert_eq!(typed.null_count(), 0);
         assert_eq!(typed.value(0), 100);
         assert_eq!(typed.value(1), 200);
+    }
+
+    #[test]
+    fn primary_key_full_row_mode_materializes_auto_increment_nulls() {
+        test_clear_shared_host_pools();
+        clear_auto_increment_cache_for_test();
+        let saw_requests = Arc::new(AtomicUsize::new(0));
+        let saw_requests_for_server = Arc::clone(&saw_requests);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "allocAutoIncrementId" => {
+                    let req: frontend_service::TAllocateAutoIncrementIdParam =
+                        read_struct_arg(i_prot)?;
+                    assert_eq!(req.table_id, Some(7021));
+                    assert_eq!(req.rows, Some(1024));
+                    saw_requests_for_server.fetch_add(1, Ordering::AcqRel);
+                    let response = frontend_service::TAllocateAutoIncrementIdResult {
+                        status: Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
+                        auto_increment_id: Some(1001),
+                        allocated_rows: Some(1024),
+                    };
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut ctx = test_pk_auto_increment_context(&root, 7021, 88112, 4021);
+        ctx.partial_update.auto_increment.fe_addr = Some(server.addr().clone());
+
+        let batch = pk_auto_increment_batch(vec![1, 2], vec![Some(10), None]);
+        let routing = super::resolve_lake_batch_write_routing_with_slots(&ctx, &batch, None, None)
+            .expect("resolve primary key row-mode write with auto increment");
+        let super::LakeBatchWriteRouting::Upsert { data_batch } = routing else {
+            panic!("expected upsert routing for primary key row-mode write");
+        };
+        let typed = data_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast primary key auto increment column");
+        assert_eq!(typed.null_count(), 0);
+        assert_eq!(typed.value(0), 10);
+        assert_eq!(typed.value(1), 1001);
+        assert_eq!(saw_requests.load(Ordering::Acquire), 1);
+
+        clear_auto_increment_cache_for_test();
+        test_clear_shared_host_pools();
+    }
+
+    #[test]
+    fn primary_key_auto_increment_null_expr_fails_fast() {
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        let mut ctx = test_pk_auto_increment_context(&root, 7022, 88113, 4022);
+        ctx.partial_update
+            .auto_increment
+            .null_expr_in_auto_increment = true;
+
+        let batch = pk_auto_increment_batch(vec![1, 2], vec![Some(10), None]);
+        let err = match super::resolve_lake_batch_write_routing_with_slots(&ctx, &batch, None, None)
+        {
+            Ok(_) => panic!("explicit null on primary key auto increment should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("NULL value in auto increment column 'id'"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]

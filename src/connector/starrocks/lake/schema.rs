@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::connector::starrocks::lake::context::{TabletWriteContext, register_tablet_runtime};
 use crate::formats::starrocks::writer::bundle_meta::{
     empty_tablet_metadata, load_latest_tablet_metadata, write_initial_meta_file,
@@ -612,6 +613,11 @@ fn build_create_tablet_column_pb_from_column_type(
             column_type.type_, column_idx
         )
     })?;
+    let (precision, frac) = resolve_decimal_type_attrs(
+        column_type.type_,
+        column_type.precision,
+        column_type.scale,
+    );
     Ok(ColumnPb {
         unique_id: -1,
         name: None,
@@ -620,8 +626,8 @@ fn build_create_tablet_column_pb_from_column_type(
         aggregation: Some("NONE".to_string()),
         is_nullable: Some(true),
         default_value: None,
-        precision: column_type.precision,
-        frac: column_type.scale,
+        precision,
+        frac,
         length: column_type.len,
         index_length: column_type.index_len.or(column_type.len),
         is_bf_column: None,
@@ -697,8 +703,10 @@ fn type_desc_to_column_pb(
             )
         })?;
         column_pb.r#type = sr_type.to_string();
-        column_pb.precision = scalar.precision;
-        column_pb.frac = scalar.scale;
+        let (precision, frac) =
+            resolve_decimal_type_attrs(scalar.type_, scalar.precision, scalar.scale);
+        column_pb.precision = precision;
+        column_pb.frac = frac;
         column_pb.length = scalar.len;
         column_pb.index_length = scalar.len;
         return Ok(());
@@ -806,6 +814,20 @@ fn init_create_tablet_sub_field_pb() -> ColumnPb {
         is_auto_increment: Some(false),
         agg_state_desc: None,
     }
+}
+
+fn resolve_decimal_type_attrs(
+    primitive: crate::types::TPrimitiveType,
+    precision: Option<i32>,
+    scale: Option<i32>,
+) -> (Option<i32>, Option<i32>) {
+    if primitive == crate::types::TPrimitiveType::DECIMALV2 {
+        return (
+            Some(i32::from(LEGACY_DECIMALV2_PRECISION)),
+            Some(i32::from(LEGACY_DECIMALV2_SCALE)),
+        );
+    }
+    (precision, scale)
 }
 
 fn normalize_column_pb_type_attrs(column: &mut ColumnPb) {
@@ -1109,6 +1131,7 @@ fn map_primitive_to_starrocks_type(
 #[cfg(test)]
 mod tests {
     use super::{
+        build_create_tablet_column_pb_from_column_type, build_create_tablet_column_pb_from_type_desc,
         build_sink_tablet_schema, create_lake_tablet_from_req,
         is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type,
     };
@@ -1317,6 +1340,59 @@ mod tests {
         assert_eq!(tablet_schema.column[0].unique_id, 0);
         assert_eq!(tablet_schema.sort_key_unique_ids, vec![0]);
         assert_eq!(tablet_schema.next_column_unique_id, Some(1));
+    }
+
+    #[test]
+    fn create_tablet_column_pb_normalizes_decimalv2_column_type() {
+        let column_pb = build_create_tablet_column_pb_from_column_type(
+            &crate::types::TColumnType {
+                type_: crate::types::TPrimitiveType::DECIMALV2,
+                len: None,
+                index_len: None,
+                precision: Some(9),
+                scale: Some(0),
+            },
+            0,
+        )
+        .expect("build decimalv2 column");
+
+        assert_eq!(column_pb.r#type, "DECIMAL128");
+        assert_eq!(column_pb.precision, Some(27));
+        assert_eq!(column_pb.frac, Some(9));
+    }
+
+    #[test]
+    fn create_tablet_column_pb_normalizes_nested_decimalv2_type_desc() {
+        let type_desc = crate::types::TTypeDesc {
+            types: Some(vec![
+                crate::types::TTypeNode {
+                    type_: crate::types::TTypeNodeType::ARRAY,
+                    scalar_type: None,
+                    is_named: None,
+                    struct_fields: None,
+                },
+                crate::types::TTypeNode {
+                    type_: crate::types::TTypeNodeType::SCALAR,
+                    scalar_type: Some(crate::types::TScalarType {
+                        type_: crate::types::TPrimitiveType::DECIMALV2,
+                        len: None,
+                        precision: Some(9),
+                        scale: Some(0),
+                    }),
+                    is_named: None,
+                    struct_fields: None,
+                },
+            ]),
+        };
+
+        let column_pb =
+            build_create_tablet_column_pb_from_type_desc(&type_desc, 0).expect("build array type");
+
+        assert_eq!(column_pb.r#type, "ARRAY");
+        assert_eq!(column_pb.children_columns.len(), 1);
+        assert_eq!(column_pb.children_columns[0].r#type, "DECIMAL128");
+        assert_eq!(column_pb.children_columns[0].precision, Some(27));
+        assert_eq!(column_pb.children_columns[0].frac, Some(9));
     }
 
     fn build_test_create_tablet_req(

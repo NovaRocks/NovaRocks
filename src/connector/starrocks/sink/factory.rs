@@ -132,6 +132,7 @@ pub(crate) struct AutomaticPartitionPlan {
     pub(crate) db_id: i64,
     pub(crate) table_id: i64,
     pub(crate) txn_id: i64,
+    pub(crate) dynamic_overwrite: bool,
     pub(crate) fe_addr: types::TNetworkAddress,
     pub(crate) partition_key_source: PartitionKeySource,
     pub(crate) partition_column_names: Vec<String>,
@@ -465,6 +466,7 @@ fn maybe_create_automatic_partitions_for_literal_insert(
         sink.db_id,
         sink.table_id,
         sink.txn_id,
+        sink.dynamic_overwrite.unwrap_or(false),
         vec![partition_values],
     )
     .map_err(|e| format!("OLAP_TABLE_SINK precreate automatic partition failed: {e}"))?;
@@ -528,17 +530,12 @@ fn build_auto_partition_plan(
     if !sink.partition.enable_automatic_partition.unwrap_or(false) {
         return Ok(None);
     }
-    let has_shadow_partition = sink
-        .partition
-        .partitions
-        .iter()
-        .any(|part| part.is_shadow_partition.unwrap_or(false));
-    if !has_shadow_partition {
-        return Ok(None);
-    }
-    // Automatic partition tables may carry both visible and shadow partitions.
-    // Keep runtime createPartition enabled as long as FE marks this table with
-    // shadow partition metadata.
+    // StarRocks BE keeps automatic partition routing enabled for the whole load,
+    // even when FE only opens a subset of partitions in the initial sink metadata.
+    // Existing partitions may therefore be "missing" from TOlapTablePartitionParam
+    // and need to be recovered through createPartition reuse semantics at runtime.
+    // Gating this path on shadow partitions breaks insert-select/reuse flows once
+    // FE stops sending shadow metadata after the first load.
 
     let partition_column_names = resolve_partition_columns_for_write(&sink.partition);
     if partition_column_names.is_empty() {
@@ -595,6 +592,7 @@ fn build_auto_partition_plan(
         db_id: sink.db_id,
         table_id: sink.table_id,
         txn_id: sink.txn_id,
+        dynamic_overwrite: sink.dynamic_overwrite.unwrap_or(false),
         fe_addr,
         partition_key_source,
         partition_column_names,
@@ -648,7 +646,13 @@ fn extract_partition_literal_value(expr: &exprs::TExpr) -> Option<String> {
             return node
                 .bool_literal
                 .as_ref()
-                .map(|v| if v.value { "1" } else { "0" }.to_string());
+                .map(|v| {
+                    if v.value {
+                        "TRUE".to_string()
+                    } else {
+                        "FALSE".to_string()
+                    }
+                });
         }
     }
     None
@@ -741,7 +745,13 @@ fn scalar_partition_value_to_string(array: &dyn Array, row: usize) -> Option<Str
         DataType::Boolean => array
             .as_any()
             .downcast_ref::<BooleanArray>()
-            .map(|v| if v.value(row) { "1" } else { "0" }.to_string()),
+            .map(|v| {
+                if v.value(row) {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                }
+            }),
         DataType::Date32 => {
             let days_since_epoch = array
                 .as_any()
@@ -777,6 +787,7 @@ pub(crate) fn create_automatic_partitions(
     db_id: i64,
     table_id: i64,
     txn_id: i64,
+    is_temp: bool,
     partition_values: Vec<Vec<String>>,
 ) -> Result<frontend_service::TCreatePartitionResult, String> {
     if db_id <= 0 {
@@ -803,7 +814,7 @@ pub(crate) fn create_automatic_partitions(
         Some(db_id),
         Some(table_id),
         Some(partition_values),
-        Some(false),
+        Some(is_temp),
     );
     let response = with_frontend_client(fe_addr, |client| {
         client
@@ -835,14 +846,33 @@ fn resolve_write_slot_bindings(
     projected_output_slot_ids: Option<&[SlotId]>,
     tablet_schema: &TabletSchemaPb,
 ) -> Result<(Vec<Option<SlotId>>, Option<SlotId>), String> {
+    let has_hidden_op_slot = sink.keys_type == Some(types::TKeysType::PRIMARY_KEYS)
+        && sink.schema.slot_descs.iter().any(|slot| {
+            slot.col_name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|name| name.eq_ignore_ascii_case(LOAD_OP_COLUMN))
+        });
     let slot_by_name = build_slot_name_map(&sink.schema.slot_descs)?;
     let output_expr_slot_map =
         build_output_expr_slot_name_map_for_write(sink, schema_id, output_exprs)?;
-    let output_expr_slot_by_ordinal = resolve_output_expr_slot_ids_for_write(output_exprs)?;
-    let projected_output_slot_by_ordinal = projected_output_slot_ids
-        .map(|slot_ids| slot_ids.iter().copied().map(Some).collect::<Vec<_>>())
-        .unwrap_or_default();
-    let schema_slot_by_ordinal = resolve_schema_slot_ids_by_ordinal(&sink.schema.slot_descs)?;
+    let output_expr_slot_by_ordinal = filter_hidden_op_slot_ids_by_ordinal(
+        &sink.schema.slot_descs,
+        resolve_output_expr_slot_ids_for_write(output_exprs)?,
+        has_hidden_op_slot,
+    );
+    let projected_output_slot_by_ordinal = filter_hidden_op_slot_ids_by_ordinal(
+        &sink.schema.slot_descs,
+        projected_output_slot_ids
+            .map(|slot_ids| slot_ids.iter().copied().map(Some).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        has_hidden_op_slot,
+    );
+    let schema_slot_by_ordinal = filter_hidden_op_slot_ids_by_ordinal(
+        &sink.schema.slot_descs,
+        resolve_schema_slot_ids_by_ordinal(&sink.schema.slot_descs)?,
+        has_hidden_op_slot,
+    );
     let index_column_names = resolve_index_column_names_for_write(sink, schema_id)?;
     let allow_output_ordinal_fallback =
         output_expr_slot_by_ordinal.len() == tablet_schema.column.len();
@@ -1214,6 +1244,28 @@ fn resolve_output_expr_slot_ids_for_write(
         out.push(SlotId::try_from(slot_ref.slot_id).ok());
     }
     Ok(out)
+}
+
+fn filter_hidden_op_slot_ids_by_ordinal(
+    slot_descs: &[descriptors::TSlotDescriptor],
+    slot_ids: Vec<Option<SlotId>>,
+    filter_load_op: bool,
+) -> Vec<Option<SlotId>> {
+    if !filter_load_op || slot_descs.len() != slot_ids.len() {
+        return slot_ids;
+    }
+    slot_descs
+        .iter()
+        .zip(slot_ids)
+        .filter_map(|(slot_desc, slot_id)| {
+            let is_load_op = slot_desc
+                .col_name
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|name| name.eq_ignore_ascii_case(LOAD_OP_COLUMN));
+            (!is_load_op).then_some(slot_id)
+        })
+        .collect()
 }
 
 fn build_output_projection_plan(
@@ -1789,9 +1841,13 @@ fn collect_required_tablets(partition: &descriptors::TOlapTablePartitionParam) -
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{build_output_projection_plan, resolve_write_slot_bindings};
+    use super::{
+        LOAD_OP_COLUMN, SinkWriteIndexSelection, build_auto_partition_plan,
+        build_output_projection_plan, extract_partition_literal_value,
+        resolve_write_slot_bindings,
+    };
     use crate::common::ids::SlotId;
     use crate::lower::layout::Layout;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
@@ -2059,6 +2115,181 @@ mod tests {
         }
     }
 
+    fn test_pk_sink_with_hidden_op_slot() -> data_sinks::TOlapTableSink {
+        data_sinks::TOlapTableSink {
+            load_id: types::TUniqueId { hi: 1, lo: 2 },
+            txn_id: 10,
+            db_id: 1,
+            table_id: 2,
+            tuple_id: 1,
+            num_replicas: 1,
+            need_gen_rollup: false,
+            db_name: Some("db".to_string()),
+            table_name: Some("tbl".to_string()),
+            schema: descriptors::TOlapTableSchemaParam {
+                db_id: 1,
+                table_id: 2,
+                version: 1,
+                slot_descs: vec![
+                    descriptors::TSlotDescriptor {
+                        id: Some(0),
+                        parent: None,
+                        slot_type: None,
+                        column_pos: None,
+                        byte_offset: None,
+                        null_indicator_byte: None,
+                        null_indicator_bit: None,
+                        col_name: Some("k1".to_string()),
+                        slot_idx: None,
+                        is_materialized: None,
+                        is_output_column: None,
+                        is_nullable: Some(false),
+                        col_unique_id: Some(0),
+                        col_physical_name: None,
+                    },
+                    descriptors::TSlotDescriptor {
+                        id: Some(1),
+                        parent: None,
+                        slot_type: None,
+                        column_pos: None,
+                        byte_offset: None,
+                        null_indicator_byte: None,
+                        null_indicator_bit: None,
+                        col_name: Some(LOAD_OP_COLUMN.to_string()),
+                        slot_idx: None,
+                        is_materialized: None,
+                        is_output_column: None,
+                        is_nullable: Some(false),
+                        col_unique_id: None,
+                        col_physical_name: None,
+                    },
+                ],
+                tuple_desc: descriptors::TTupleDescriptor {
+                    id: Some(1),
+                    byte_size: Some(16),
+                    num_null_bytes: Some(0),
+                    table_id: Some(2),
+                    num_null_slots: Some(0),
+                },
+                indexes: vec![descriptors::TOlapTableIndexSchema {
+                    id: 10,
+                    columns: vec!["k1".to_string(), "v".to_string()],
+                    schema_hash: 1,
+                    column_param: None,
+                    where_clause: None,
+                    schema_id: Some(10),
+                    column_to_expr_value: None,
+                    is_shadow: None,
+                }],
+            },
+            partition: descriptors::TOlapTablePartitionParam {
+                db_id: 1,
+                table_id: 2,
+                version: 1,
+                partition_column: None,
+                distributed_columns: Some(vec!["k1".to_string()]),
+                partitions: Vec::new(),
+                partition_columns: None,
+                partition_exprs: None,
+                enable_automatic_partition: Some(false),
+            },
+            location: descriptors::TOlapTableLocationParam {
+                db_id: 1,
+                table_id: 2,
+                version: 1,
+                tablets: Vec::new(),
+            },
+            nodes_info: descriptors::TNodesInfo {
+                version: 1,
+                nodes: Vec::new(),
+            },
+            load_channel_timeout_s: None,
+            is_lake_table: Some(true),
+            txn_trace_parent: None,
+            keys_type: Some(types::TKeysType::PRIMARY_KEYS),
+            write_quorum_type: None,
+            enable_replicated_storage: None,
+            merge_condition: None,
+            null_expr_in_auto_increment: None,
+            miss_auto_increment_column: None,
+            abort_delete: None,
+            auto_increment_slot_id: None,
+            partial_update_mode: None,
+            label: None,
+            enable_colocate_mv_index: None,
+            automatic_bucket_size: None,
+            write_txn_log: None,
+            ignore_out_of_partition: None,
+            encryption_meta: None,
+            dynamic_overwrite: None,
+            enable_data_file_bundling: None,
+            is_multi_statements_txn: None,
+        }
+    }
+
+    fn test_pk_tablet_schema_two_cols() -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::PrimaryKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("k1".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("v".to_string()),
+                    r#type: "VARCHAR".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: Some(32),
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(3),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(10),
+        }
+    }
+
     fn dummy_type_desc() -> types::TTypeDesc {
         types::TTypeDesc {
             types: Some(vec![types::TTypeNode {
@@ -2191,6 +2422,70 @@ mod tests {
     }
 
     #[test]
+    fn write_slot_bindings_skip_hidden_op_for_primary_key_delete_plan() {
+        let sink = test_pk_sink_with_hidden_op_slot();
+        let output_exprs = vec![slot_ref_expr(1), slot_ref_expr(6)];
+        let (bindings, op_slot_id) = resolve_write_slot_bindings(
+            &sink,
+            10,
+            Some(output_exprs.as_slice()),
+            None,
+            &test_pk_tablet_schema_two_cols(),
+        )
+        .expect("resolve write slot bindings for pk delete");
+
+        assert_eq!(bindings, vec![Some(SlotId::new(1)), None]);
+        assert_eq!(op_slot_id, Some(SlotId::new(6)));
+    }
+
+    #[test]
+    fn automatic_partition_plan_does_not_require_shadow_partitions() {
+        let mut sink = test_sink_with_aliased_agg_slots();
+        sink.partition.partition_columns = Some(vec!["ds".to_string()]);
+        sink.partition.enable_automatic_partition = Some(true);
+        sink.partition.partitions.clear();
+
+        let plan = build_auto_partition_plan(
+            &sink,
+            &[SinkWriteIndexSelection {
+                index_id: 10,
+                schema_id: 10,
+                where_clause: None,
+            }],
+            10,
+            None,
+            None,
+            Some(&types::TNetworkAddress::new(
+                "127.0.0.1".to_string(),
+                9030,
+            )),
+        )
+        .expect("build automatic partition plan without shadow partitions");
+
+        let plan = plan.expect("automatic partition plan should stay enabled");
+        assert_eq!(plan.partition_column_names, vec!["ds".to_string()]);
+        assert_eq!(plan.partition_slot_ids, vec![SlotId::new(1)]);
+    }
+
+    #[test]
+    fn extract_partition_literal_value_formats_bool_as_uppercase() {
+        let expr = exprs::TExpr {
+            nodes: vec![exprs::TExprNode {
+                node_type: exprs::TExprNodeType::BOOL_LITERAL,
+                type_: dummy_type_desc(),
+                num_children: 0,
+                bool_literal: Some(exprs::TBoolLiteral { value: true }),
+                ..default_expr_node()
+            }],
+        };
+
+        assert_eq!(
+            extract_partition_literal_value(&expr),
+            Some("TRUE".to_string())
+        );
+    }
+
+    #[test]
     fn plain_slot_ref_output_projection_is_forced_for_index_where_clause() {
         let mut sink = test_sink_with_aliased_agg_slots();
         sink.schema.indexes[0].where_clause = Some(exprs::TExpr {
@@ -2270,6 +2565,7 @@ mod tests {
             1,
             2,
             10,
+            false,
             vec![vec!["2025-01-01".to_string()]],
         )
         .expect("createPartition retries after EOF");
@@ -2280,6 +2576,48 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::Acquire), 2);
         assert!(server.accepts() >= 2);
+        test_clear_shared_host_pools();
+    }
+
+    #[test]
+    fn create_automatic_partitions_marks_temp_for_dynamic_overwrite() {
+        test_clear_shared_host_pools();
+        let saw_temp = Arc::new(AtomicBool::new(false));
+        let saw_temp_for_server = Arc::clone(&saw_temp);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "createPartition" => {
+                    let req: crate::frontend_service::TCreatePartitionRequest =
+                        read_struct_arg(i_prot)?;
+                    saw_temp_for_server.store(req.is_temp.unwrap_or(false), Ordering::Release);
+                    let response = crate::frontend_service::TCreatePartitionResult {
+                        status: Some(crate::status::TStatus::new(
+                            crate::status_code::TStatusCode::OK,
+                            None,
+                        )),
+                        partitions: None,
+                        tablets: None,
+                        nodes: None,
+                    };
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+
+        super::create_automatic_partitions(
+            server.addr(),
+            1,
+            2,
+            10,
+            true,
+            vec![vec!["2025-01-01".to_string()]],
+        )
+        .expect("createPartition succeeds");
+
+        assert!(saw_temp.load(Ordering::Acquire));
         test_clear_shared_host_pools();
     }
 }

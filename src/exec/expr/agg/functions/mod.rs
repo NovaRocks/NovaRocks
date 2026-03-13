@@ -85,6 +85,7 @@ pub(super) enum AggKind {
     Retention,
     WindowFunnel,
     Histogram,
+    HistogramHllNdv,
     MannWhitneyUTest,
     DictMerge,
     BitmapAgg,
@@ -152,7 +153,7 @@ use dict_merge::DictMergeAgg;
 use ds_hll::DsHllAgg;
 use ds_theta::DsThetaAgg;
 use group_concat::GroupConcatAgg;
-use histogram::HistogramAgg;
+use histogram::{HistogramAgg, HistogramHllNdvAgg};
 use hll_raw::HllRawAgg;
 use mann_whitney_u_test::MannWhitneyUTestAgg;
 use map_agg::MapAggAgg;
@@ -239,6 +240,7 @@ static SUM_MAP: SumMapAgg = SumMapAgg;
 static RETENTION: RetentionAgg = RetentionAgg;
 static WINDOW_FUNNEL: WindowFunnelAgg = WindowFunnelAgg;
 static HISTOGRAM: HistogramAgg = HistogramAgg;
+static HISTOGRAM_HLL_NDV: HistogramHllNdvAgg = HistogramHllNdvAgg;
 static MANN_WHITNEY: MannWhitneyUTestAgg = MannWhitneyUTestAgg;
 static DICT_MERGE: DictMergeAgg = DictMergeAgg;
 static DS_HLL: DsHllAgg = DsHllAgg;
@@ -275,6 +277,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
         "retention" => Ok(&RETENTION),
         "window_funnel" => Ok(&WINDOW_FUNNEL),
         "histogram" => Ok(&HISTOGRAM),
+        "histogram_hll_ndv" => Ok(&HISTOGRAM_HLL_NDV),
         "mann_whitney_u_test" => Ok(&MANN_WHITNEY),
         "dict_merge" => Ok(&DICT_MERGE),
         "bitmap_agg" | "bitmap_union" | "bitmap_union_count" => Ok(&BITMAP_UNION_INT),
@@ -342,6 +345,7 @@ fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
         AggKind::Retention => &RETENTION,
         AggKind::WindowFunnel => &WINDOW_FUNNEL,
         AggKind::Histogram => &HISTOGRAM,
+        AggKind::HistogramHllNdv => &HISTOGRAM_HLL_NDV,
         AggKind::MannWhitneyUTest => &MANN_WHITNEY,
         AggKind::DictMerge => &DICT_MERGE,
         AggKind::DsHllHash | AggKind::DsHllMerge | AggKind::DsHllCount => &DS_HLL,

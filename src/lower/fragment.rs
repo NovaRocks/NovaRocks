@@ -572,9 +572,7 @@ pub(crate) fn execute_fragment(
                 ));
             }
         }
-        return Ok(FragmentOutput {
-            profile_json: None,
-        });
+        return Ok(FragmentOutput { profile_json: None });
     }
 
     Err("unsupported fragment: missing plan".to_string())

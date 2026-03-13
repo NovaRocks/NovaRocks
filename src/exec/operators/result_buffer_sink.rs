@@ -43,9 +43,9 @@ impl ResultBufferSinkShared {
 
     fn init_driver_count(&self, dop: i32) {
         let dop = dop.max(1);
-        let _ = self
-            .remaining_drivers
-            .compare_exchange(-1, dop, Ordering::AcqRel, Ordering::Acquire);
+        let _ =
+            self.remaining_drivers
+                .compare_exchange(-1, dop, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 
@@ -119,8 +119,10 @@ impl ResultBufferSinkOperator {
 
     fn ensure_eos_template(&self, state: &RuntimeState) -> Result<UniqueId, String> {
         let finst_id = self.finst_id(state)?;
-        let template =
-            build_empty_fetch_result_batch_template(self.result_sink_type, self.result_sink_format)?;
+        let template = build_empty_fetch_result_batch_template(
+            self.result_sink_type,
+            self.result_sink_format,
+        )?;
         result_buffer::set_eos_template(finst_id, template);
         Ok(finst_id)
     }

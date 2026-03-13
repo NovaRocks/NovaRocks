@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::types;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use std::sync::Arc;
@@ -86,8 +87,11 @@ pub(crate) fn arrow_type_from_primitive(primitive: types::TPrimitiveType) -> Opt
             DataType::Utf8
         }
         t if t == types::TPrimitiveType::VARIANT => DataType::LargeBinary,
+        t if t == types::TPrimitiveType::DECIMALV2 => {
+            DataType::Decimal128(LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE)
+        }
         // Decimal requires precision/scale from TTypeDesc; without that metadata we cannot build a
-        // correct Arrow decimal type.
+        // correct Arrow decimal type, except for legacy DECIMALV2 which has a fixed BE shape.
         _ => return None,
     };
     Some(data_type)
@@ -125,12 +129,14 @@ pub(crate) fn arrow_type_from_nodes(
                 t if t == types::TPrimitiveType::DATETIME || t == types::TPrimitiveType::TIME => {
                     DataType::Timestamp(TimeUnit::Microsecond, None)
                 }
+                t if t == types::TPrimitiveType::DECIMALV2 => {
+                    DataType::Decimal128(LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE)
+                }
                 t if t == types::TPrimitiveType::DECIMAL32
                     || t == types::TPrimitiveType::DECIMAL64
                     || t == types::TPrimitiveType::DECIMAL128
                     || t == types::TPrimitiveType::DECIMAL256
-                    || t == types::TPrimitiveType::DECIMAL
-                    || t == types::TPrimitiveType::DECIMALV2 =>
+                    || t == types::TPrimitiveType::DECIMAL =>
                 {
                     let precision = scalar.precision.and_then(|v| u8::try_from(v).ok())?;
                     let scale = scalar.scale.and_then(|v| i8::try_from(v).ok())?;
@@ -224,8 +230,9 @@ pub(crate) fn decimal_params_from_desc(desc: &types::TTypeDesc) -> Option<(u8, i
 
 #[cfg(test)]
 mod tests {
-    use super::arrow_type_from_primitive;
+    use super::{arrow_type_from_desc, arrow_type_from_primitive};
     use crate::types::TPrimitiveType;
+    use crate::types::{TScalarType, TTypeDesc, TTypeNode, TTypeNodeType};
     use arrow::datatypes::DataType;
 
     #[test]
@@ -250,5 +257,32 @@ mod tests {
             arrow_type_from_primitive(TPrimitiveType::LARGEINT),
             Some(DataType::FixedSizeBinary(16))
         );
+    }
+
+    #[test]
+    fn decimalv2_primitive_lowers_to_legacy_decimal128() {
+        assert_eq!(
+            arrow_type_from_primitive(TPrimitiveType::DECIMALV2),
+            Some(DataType::Decimal128(27, 9))
+        );
+    }
+
+    #[test]
+    fn decimalv2_desc_ignores_fe_default_precision_scale() {
+        let desc = TTypeDesc {
+            types: Some(vec![TTypeNode {
+                type_: TTypeNodeType::SCALAR,
+                scalar_type: Some(TScalarType {
+                    type_: TPrimitiveType::DECIMALV2,
+                    len: None,
+                    precision: Some(9),
+                    scale: Some(0),
+                }),
+                is_named: None,
+                struct_fields: None,
+            }]),
+        };
+
+        assert_eq!(arrow_type_from_desc(&desc), Some(DataType::Decimal128(27, 9)));
     }
 }

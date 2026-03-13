@@ -408,14 +408,16 @@ impl AggregateFunction for DsHllAgg {
         match output_type {
             DataType::Binary => {
                 let mut builder = BinaryBuilder::new();
+                let empty_payload =
+                    HllHandle::new(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?;
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let state = unsafe { get_state(ptr) };
-                    if let Some(state) = state {
-                        builder.append_value(state.handle.serialize()?);
-                    } else {
-                        builder.append_null();
-                    }
+                    let payload = state
+                        .map(|state| state.handle.serialize())
+                        .transpose()?
+                        .unwrap_or_else(|| empty_payload.clone());
+                    builder.append_value(payload);
                 }
                 Ok(Arc::new(builder.finish()) as ArrayRef)
             }

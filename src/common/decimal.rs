@@ -14,18 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod app_config;
-pub mod config;
-pub mod datasketches;
-pub mod decimal;
-pub mod file_identity;
-pub mod ids;
-pub mod largeint;
-pub mod logging;
-pub mod min_max_predicate;
-pub mod network;
-pub mod percentile;
-pub mod sketch_hash;
-pub mod thrift;
-pub mod types;
-pub mod util;
+
+pub const LEGACY_DECIMALV2_PRECISION: u8 = 27;
+pub const LEGACY_DECIMALV2_SCALE: i8 = 9;

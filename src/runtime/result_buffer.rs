@@ -162,7 +162,9 @@ pub(crate) fn insert(finst_id: UniqueId, result: FetchResult) {
     let c = ctx();
     {
         let mut guard = c.mu.lock().expect("ctx lock");
-        let block = guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
         let tracked = TrackedFetchResult::new(result, block.mem_tracker.as_ref());
         block.queue.push_back(tracked);
     }
@@ -173,7 +175,9 @@ pub(crate) fn close_ok(finst_id: UniqueId) {
     let c = ctx();
     {
         let mut guard = c.mu.lock().expect("ctx lock");
-        let block = guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
         block.closed_ok = true;
     }
     notify_fetch_ready(finst_id);
@@ -183,7 +187,9 @@ pub(crate) fn close_error(finst_id: UniqueId, message: String) {
     let c = ctx();
     {
         let mut guard = c.mu.lock().expect("ctx lock");
-        let block = guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
         block.status_error = Some(message);
         block.queue.clear();
     }
@@ -194,7 +200,9 @@ pub(crate) fn cancel(finst_id: UniqueId) {
     let c = ctx();
     {
         let mut guard = c.mu.lock().expect("ctx lock");
-        let block = guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+        let block = guard
+            .entry(finst_id)
+            .or_insert_with(BufferControlBlock::new);
         block.cancelled = true;
         if block.cancel_message.is_none() {
             block.cancel_message = Some("Cancelled".to_string());
@@ -207,13 +215,17 @@ pub(crate) fn cancel(finst_id: UniqueId) {
 pub(crate) fn create_sender(finst_id: UniqueId) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
-    guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+    guard
+        .entry(finst_id)
+        .or_insert_with(BufferControlBlock::new);
 }
 
 pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
-    let block = guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+    let block = guard
+        .entry(finst_id)
+        .or_insert_with(BufferControlBlock::new);
     block.mem_tracker = Some(Arc::clone(&tracker));
     for result in block.queue.iter_mut() {
         result.set_mem_tracker(Arc::clone(&tracker));
@@ -223,7 +235,9 @@ pub(crate) fn set_mem_tracker(finst_id: UniqueId, tracker: Arc<MemTracker>) {
 pub(crate) fn set_eos_template(finst_id: UniqueId, template: crate::data::TResultBatch) {
     let c = ctx();
     let mut guard = c.mu.lock().expect("ctx lock");
-    let block = guard.entry(finst_id).or_insert_with(BufferControlBlock::new);
+    let block = guard
+        .entry(finst_id)
+        .or_insert_with(BufferControlBlock::new);
     block.eos_template = Some(template);
 }
 

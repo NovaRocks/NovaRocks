@@ -14,31 +14,274 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, ListArray, make_array};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::sync::Arc;
+
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray,
+    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, make_array,
+};
 use arrow::datatypes::DataType;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 use arrow_data::transform::MutableArrayData;
-use std::cmp::Ordering;
-use std::sync::Arc;
+use crc32c::crc32c_append;
+use hashbrown::HashMap;
 
-fn insertion_sort_indices(values: &ArrayRef, indices: &mut [usize]) -> Result<(), String> {
-    for i in 1..indices.len() {
-        let mut j = i;
-        while j > 0 {
-            let prev = indices[j - 1];
-            let curr = indices[j];
-            let ord = super::common::compare_values_ordered(values, prev, curr)?;
-            if ord == Ordering::Greater {
-                indices.swap(j - 1, j);
-                j -= 1;
-            } else {
-                break;
-            }
+use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use crate::common::largeint;
+use crate::exec::chunk::Chunk;
+use crate::exec::expr::{ExprArena, ExprId};
+
+const CRC_HASH_SEED1: u32 = 0x811C9DC5;
+const FNV_PRIME: u32 = 0x0100_0193;
+const PHMAP_K: u64 = 0xde5fb9d2630458e9;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IntersectValue {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    LargeInt(i128),
+    LegacyDecimalV2(i128),
+    F32(u32),
+    F64(u64),
+    Str(String),
+    Date(i32),
+    Decimal(i128),
+    Ts(i64),
+}
+
+impl Hash for IntersectValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Bool(v) => state.write_u8(u8::from(*v)),
+            Self::I8(v) => state.write_i8(*v),
+            Self::I16(v) => state.write_i16(*v),
+            Self::I32(v) => state.write_i32(*v),
+            Self::I64(v) => state.write_i64(*v),
+            Self::LargeInt(v) | Self::Decimal(v) => state.write_i128(*v),
+            Self::LegacyDecimalV2(v) => state.write_u32(decimalv2_std_hash(*v)),
+            Self::F32(bits) => state.write_u32(*bits),
+            Self::F64(bits) => state.write_u64(*bits),
+            Self::Str(v) => state.write(v.as_bytes()),
+            Self::Date(v) => state.write_i32(*v),
+            Self::Ts(v) => state.write_i64(*v),
         }
     }
-    Ok(())
+}
+
+#[derive(Default)]
+struct PhmapCompatHasher {
+    hash: u64,
+}
+
+impl Hasher for PhmapCompatHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.hash = phmap_crc_hash_64(bytes);
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.hash = phmap_mix_u64(u64::from(i));
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.hash = phmap_mix_u64(u64::from(i));
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.hash = phmap_mix_u64(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.hash = phmap_mix_u64(i);
+    }
+
+    fn write_i8(&mut self, i: i8) {
+        self.hash = phmap_mix_u64(i as i64 as u64);
+    }
+
+    fn write_i16(&mut self, i: i16) {
+        self.hash = phmap_mix_u64(i as i64 as u64);
+    }
+
+    fn write_i32(&mut self, i: i32) {
+        self.hash = phmap_mix_u64(i as i64 as u64);
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.hash = phmap_mix_u64(i as u64);
+    }
+
+    fn write_i128(&mut self, i: i128) {
+        self.hash = phmap_hash_i128(i);
+    }
+}
+
+fn phmap_mix_u64(value: u64) -> u64 {
+    let product = (value as u128).wrapping_mul(PHMAP_K as u128);
+    (product as u64).wrapping_add((product >> 64) as u64)
+}
+
+fn phmap_mix_u32(value: u32) -> u64 {
+    let mixed = u64::from(value).wrapping_mul(0xcc9e2d51_u64);
+    mixed ^ (mixed >> 32)
+}
+
+fn phmap_crc_hash_64(bytes: &[u8]) -> u64 {
+    let unmixed = if bytes.len() < 8 {
+        phmap_mix_u32(crc32c_append(CRC_HASH_SEED1, bytes))
+    } else {
+        let mut hash = u64::from(CRC_HASH_SEED1);
+        let mut cursor = 0usize;
+        while cursor + 8 <= bytes.len() {
+            hash = u64::from(crc32c_append(hash as u32, &bytes[cursor..cursor + 8]));
+            cursor += 8;
+        }
+        if cursor != bytes.len() {
+            hash = u64::from(crc32c_append(hash as u32, &bytes[bytes.len() - 8..]));
+        }
+        hash
+    };
+    phmap_mix_u64(unmixed)
+}
+
+fn hash_combine_u64(seed: &mut u64, value: u64) {
+    *seed ^= value
+        .wrapping_add(0x9e3779b97f4a7c15_u64)
+        .wrapping_add(*seed << 12)
+        .wrapping_add(*seed >> 4);
+}
+
+fn phmap_hash_i128(value: i128) -> u64 {
+    let mut seed = u64::from(CRC_HASH_SEED1);
+    hash_combine_u64(&mut seed, value as u64);
+    hash_combine_u64(&mut seed, (value >> 64) as u64);
+    phmap_mix_u64(seed)
+}
+
+fn decimalv2_std_hash(value: i128) -> u32 {
+    decimalv2_crc_hash(value)
+}
+
+fn decimalv2_fnv_hash(value: i128) -> u32 {
+    let mut hash = 0u32;
+    for byte in value.to_ne_bytes() {
+        hash = (u32::from(byte) ^ hash).wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn decimalv2_crc_hash(value: i128) -> u32 {
+    let bytes = value.to_ne_bytes();
+    let mut hash = 0u32;
+    let mut cursor = 0usize;
+    while cursor + 4 <= bytes.len() {
+        hash = crc32c_append(hash, &bytes[cursor..cursor + 4]);
+        cursor += 4;
+    }
+    while cursor < bytes.len() {
+        hash = crc32c_append(hash, &bytes[cursor..cursor + 1]);
+        cursor += 1;
+    }
+    hash.rotate_left(16)
+}
+
+fn value_key(values: &ArrayRef, idx: usize) -> Result<IntersectValue, String> {
+    match values.data_type() {
+        DataType::Boolean => {
+            let arr = values.as_any().downcast_ref::<BooleanArray>().unwrap();
+            Ok(IntersectValue::Bool(arr.value(idx)))
+        }
+        DataType::Int8 => {
+            let arr = values.as_any().downcast_ref::<Int8Array>().unwrap();
+            Ok(IntersectValue::I8(arr.value(idx)))
+        }
+        DataType::Int16 => {
+            let arr = values.as_any().downcast_ref::<Int16Array>().unwrap();
+            Ok(IntersectValue::I16(arr.value(idx)))
+        }
+        DataType::Int32 => {
+            let arr = values.as_any().downcast_ref::<Int32Array>().unwrap();
+            Ok(IntersectValue::I32(arr.value(idx)))
+        }
+        DataType::Int64 => {
+            let arr = values.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok(IntersectValue::I64(arr.value(idx)))
+        }
+        DataType::Float32 => {
+            let arr = values.as_any().downcast_ref::<Float32Array>().unwrap();
+            Ok(IntersectValue::F32(arr.value(idx).to_bits()))
+        }
+        DataType::Float64 => {
+            let arr = values.as_any().downcast_ref::<Float64Array>().unwrap();
+            Ok(IntersectValue::F64(arr.value(idx).to_bits()))
+        }
+        DataType::Utf8 => {
+            let arr = values.as_any().downcast_ref::<StringArray>().unwrap();
+            Ok(IntersectValue::Str(arr.value(idx).to_string()))
+        }
+        DataType::Date32 => {
+            let arr = values.as_any().downcast_ref::<Date32Array>().unwrap();
+            Ok(IntersectValue::Date(arr.value(idx)))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let arr = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            if *precision == LEGACY_DECIMALV2_PRECISION && *scale == LEGACY_DECIMALV2_SCALE {
+                Ok(IntersectValue::LegacyDecimalV2(arr.value(idx)))
+            } else {
+                Ok(IntersectValue::Decimal(arr.value(idx)))
+            }
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {
+            let arr = values
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            Ok(IntersectValue::Ts(arr.value(idx)))
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None) => {
+            let arr = values
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            Ok(IntersectValue::Ts(arr.value(idx)))
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
+            let arr = values
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            Ok(IntersectValue::Ts(arr.value(idx)))
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
+            let arr = values
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            Ok(IntersectValue::Ts(arr.value(idx)))
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let arr = values
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "array_intersect failed to downcast LARGEINT values".to_string())?;
+            let decoded = largeint::i128_from_be_bytes(arr.value(idx))
+                .map_err(|e| format!("array_intersect LARGEINT decode failed: {e}"))?;
+            Ok(IntersectValue::LargeInt(decoded))
+        }
+        other => Err(format!(
+            "array_intersect unsupported hash key type: {:?}",
+            other
+        )),
+    }
 }
 
 pub fn eval_array_intersect(
@@ -90,6 +333,7 @@ pub fn eval_array_intersect(
         }
         value_arrays.push(values);
     }
+
     let values_data: Vec<arrow_data::ArrayData> =
         value_arrays.iter().map(|v| v.to_data()).collect();
     let data_refs: Vec<&arrow_data::ArrayData> = values_data.iter().collect();
@@ -102,9 +346,6 @@ pub fn eval_array_intersect(
 
     for row in 0..chunk.len() {
         let mut row_null = false;
-        let mut row_indices = Vec::<usize>::new();
-        let mut row_null_index: Option<usize> = None;
-
         for arr in &list_arrays {
             let list = arr.as_any().downcast_ref::<ListArray>().unwrap();
             let idx = super::common::row_index(row, list.len());
@@ -125,87 +366,52 @@ pub fn eval_array_intersect(
         let first_start = first_offsets[first_row] as usize;
         let first_end = first_offsets[first_row + 1] as usize;
 
-        for i in first_start..first_end {
-            if value_arrays[0].is_null(i) {
-                if row_null_index.is_some() {
+        let mut has_null_in_all = false;
+        let mut row_map =
+            HashMap::<IntersectValue, (usize, usize), BuildHasherDefault<PhmapCompatHasher>>::default();
+        for idx in first_start..first_end {
+            if value_arrays[0].is_null(idx) {
+                has_null_in_all = true;
+                continue;
+            }
+            let key = value_key(&value_arrays[0], idx)?;
+            row_map.entry(key).or_insert((0, idx));
+        }
+
+        for array_idx in 1..list_arrays.len() {
+            let list = list_arrays[array_idx]
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let list_row = super::common::row_index(row, list.len());
+            let offsets = list.value_offsets();
+            let start = offsets[list_row] as usize;
+            let end = offsets[list_row + 1] as usize;
+            let mut local_has_null = false;
+            for idx in start..end {
+                if value_arrays[array_idx].is_null(idx) {
+                    local_has_null = true;
                     continue;
                 }
-                let mut null_in_all = true;
-                for idx in 1..list_arrays.len() {
-                    let list = list_arrays[idx]
-                        .as_any()
-                        .downcast_ref::<ListArray>()
-                        .unwrap();
-                    let list_row = super::common::row_index(row, list.len());
-                    let offs = list.value_offsets();
-                    let s = offs[list_row] as usize;
-                    let e = offs[list_row + 1] as usize;
-                    let mut found_null = false;
-                    for j in s..e {
-                        if value_arrays[idx].is_null(j) {
-                            found_null = true;
-                            break;
-                        }
-                    }
-                    if !found_null {
-                        null_in_all = false;
-                        break;
-                    }
-                }
-                if null_in_all {
-                    row_null_index = Some(i);
-                }
-                continue;
-            }
-
-            let mut duplicated = false;
-            for &picked in &row_indices {
-                if super::common::compare_values_at(&value_arrays[0], i, &value_arrays[0], picked)?
+                let key = value_key(&value_arrays[array_idx], idx)?;
+                if let Some((overlap_times, _)) = row_map.get_mut(&key)
+                    && *overlap_times < array_idx
                 {
-                    duplicated = true;
-                    break;
+                    *overlap_times += 1;
                 }
             }
-            if duplicated {
-                continue;
-            }
+            has_null_in_all = has_null_in_all && local_has_null;
+        }
 
-            let mut in_all = true;
-            for idx in 1..list_arrays.len() {
-                let list = list_arrays[idx]
-                    .as_any()
-                    .downcast_ref::<ListArray>()
-                    .unwrap();
-                let list_row = super::common::row_index(row, list.len());
-                let offs = list.value_offsets();
-                let s = offs[list_row] as usize;
-                let e = offs[list_row + 1] as usize;
-
-                let mut found = false;
-                for j in s..e {
-                    if super::common::compare_values_at(&value_arrays[0], i, &value_arrays[idx], j)?
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    in_all = false;
-                    break;
-                }
-            }
-            if in_all {
-                row_indices.push(i);
+        let max_overlap_times = list_arrays.len() - 1;
+        for (_key, (overlap_times, first_idx)) in &row_map {
+            if *overlap_times == max_overlap_times {
+                mutable.extend(0, *first_idx, *first_idx + 1);
+                current += 1;
             }
         }
-        insertion_sort_indices(&value_arrays[0], &mut row_indices)?;
-
-        if let Some(idx) = row_null_index {
-            mutable.extend(0, idx, idx + 1);
-            current += 1;
-        }
-        for idx in row_indices {
-            mutable.extend(0, idx, idx + 1);
+        if has_null_in_all {
+            mutable.extend_nulls(1);
             current += 1;
         }
         if current > i32::MAX as i64 {
@@ -231,7 +437,7 @@ mod tests {
     use crate::exec::expr::function::array::eval_array_function;
     use crate::exec::expr::function::array::test_utils::{chunk_len_1, typed_null};
     use crate::exec::expr::{ExprNode, LiteralValue};
-    use arrow::array::{Array, Int64Array};
+    use arrow::array::{Array, Decimal128Array, Int16Array, Int64Array};
     use arrow::datatypes::{DataType, Field};
 
     #[test]
@@ -297,7 +503,129 @@ mod tests {
         let list = out.as_any().downcast_ref::<ListArray>().unwrap();
         let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(values.len(), 2);
-        assert!(values.is_null(0));
-        assert_eq!(values.value(1), 2);
+        assert_eq!(values.value(0), 2);
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn test_array_intersect_preserves_starrocks_hash_order() {
+        let mut arena = ExprArena::default();
+        let chunk = chunk_len_1();
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int16, true)));
+        let expr = typed_null(&mut arena, list_type.clone());
+
+        let v100_a =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(100)), DataType::Int16);
+        let v200 =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(200)), DataType::Int16);
+        let v300_a =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(300)), DataType::Int16);
+        let v100_b =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(100)), DataType::Int16);
+        let v300_b =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(300)), DataType::Int16);
+        let v900 =
+            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(900)), DataType::Int16);
+        let arr1 = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![v100_a, v200, v300_a],
+            },
+            list_type.clone(),
+        );
+        let arr2 = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![v100_b, v300_b, v900],
+            },
+            list_type,
+        );
+
+        let out =
+            eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list.values().as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(values.values(), &[300, 100]);
+    }
+
+    #[test]
+    fn test_array_intersect_preserves_decimalv2_hash_order() {
+        let mut arena = ExprArena::default();
+        let chunk = chunk_len_1();
+        let decimal_type = DataType::Decimal128(27, 9);
+        let list_type = DataType::List(Arc::new(Field::new("item", decimal_type.clone(), true)));
+        let expr = typed_null(&mut arena, list_type.clone());
+
+        let v123_a = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 123_450_000_000,
+                precision: 27,
+                scale: 9,
+            }),
+            decimal_type.clone(),
+        );
+        let v456_a = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 456_780_000_000,
+                precision: 27,
+                scale: 9,
+            }),
+            decimal_type.clone(),
+        );
+        let v789_a = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 789_010_000_000,
+                precision: 27,
+                scale: 9,
+            }),
+            decimal_type.clone(),
+        );
+        let v123_b = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 123_450_000_000,
+                precision: 27,
+                scale: 9,
+            }),
+            decimal_type.clone(),
+        );
+        let v456_b = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 456_780_000_000,
+                precision: 27,
+                scale: 9,
+            }),
+            decimal_type.clone(),
+        );
+        let v789_b = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 789_010_000_000,
+                precision: 27,
+                scale: 9,
+            }),
+            decimal_type.clone(),
+        );
+        let arr1 = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![v123_a, v456_a, v789_a],
+            },
+            list_type.clone(),
+        );
+        let arr2 = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![v123_b, v456_b, v789_b],
+            },
+            list_type,
+        );
+
+        let out =
+            eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(
+            values.values(),
+            &[123_450_000_000, 789_010_000_000, 456_780_000_000]
+        );
     }
 }

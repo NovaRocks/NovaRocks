@@ -539,6 +539,184 @@ fn compare_map_rows(
     compare_map_rows_non_null(left, left_row, right, right_row).map(Some)
 }
 
+fn eq_value_recursive(
+    left: &ArrayRef,
+    left_idx: usize,
+    right: &ArrayRef,
+    right_idx: usize,
+) -> Result<Option<bool>, String> {
+    if left.data_type() != right.data_type() {
+        return Err(format!(
+            "eq type mismatch: {:?} vs {:?}",
+            left.data_type(),
+            right.data_type()
+        ));
+    }
+    if left.is_null(left_idx) || right.is_null(right_idx) {
+        return Ok(None);
+    }
+    if matches!(left.data_type(), DataType::List(_)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| "failed to downcast left to ListArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .ok_or_else(|| "failed to downcast right to ListArray".to_string())?;
+        return eq_list_rows(l, left_idx, r, right_idx);
+    }
+    if matches!(left.data_type(), DataType::Struct(_)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| "failed to downcast left to StructArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| "failed to downcast right to StructArray".to_string())?;
+        return eq_struct_rows(l, left_idx, r, right_idx);
+    }
+    if matches!(left.data_type(), DataType::Map(_, _)) {
+        let l = left
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast left to MapArray".to_string())?;
+        let r = right
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .ok_or_else(|| "failed to downcast right to MapArray".to_string())?;
+        return eq_map_rows(l, left_idx, r, right_idx);
+    }
+    Ok(Some(
+        compare_scalar_non_null(left, left_idx, right, right_idx)? == Ordering::Equal,
+    ))
+}
+
+fn eq_list_rows(
+    left: &ListArray,
+    left_row: usize,
+    right: &ListArray,
+    right_row: usize,
+) -> Result<Option<bool>, String> {
+    if left.is_null(left_row) || right.is_null(right_row) {
+        return Ok(None);
+    }
+
+    let left_offsets = left.value_offsets();
+    let right_offsets = right.value_offsets();
+    let left_start = left_offsets[left_row] as usize;
+    let left_end = left_offsets[left_row + 1] as usize;
+    let right_start = right_offsets[right_row] as usize;
+    let right_end = right_offsets[right_row + 1] as usize;
+    let left_len = left_end.saturating_sub(left_start);
+    let right_len = right_end.saturating_sub(right_start);
+    if left_len != right_len {
+        return Ok(Some(false));
+    }
+
+    let left_values = left.values();
+    let right_values = right.values();
+    let mut has_unknown = false;
+    for idx in 0..left_len {
+        let l_idx = left_start + idx;
+        let r_idx = right_start + idx;
+        match eq_value_recursive(&left_values, l_idx, &right_values, r_idx)? {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => has_unknown = true,
+        }
+    }
+
+    if has_unknown {
+        Ok(None)
+    } else {
+        Ok(Some(true))
+    }
+}
+
+fn eq_struct_rows(
+    left: &StructArray,
+    left_row: usize,
+    right: &StructArray,
+    right_row: usize,
+) -> Result<Option<bool>, String> {
+    if left.is_null(left_row) || right.is_null(right_row) {
+        return Ok(None);
+    }
+    if left.columns().len() != right.columns().len() {
+        return Err(format!(
+            "eq struct field count mismatch: {} vs {}",
+            left.columns().len(),
+            right.columns().len()
+        ));
+    }
+
+    let mut has_unknown = false;
+    for (left_col, right_col) in left.columns().iter().zip(right.columns()) {
+        match eq_value_recursive(left_col, left_row, right_col, right_row)? {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => has_unknown = true,
+        }
+    }
+
+    if has_unknown {
+        Ok(None)
+    } else {
+        Ok(Some(true))
+    }
+}
+
+fn eq_map_rows(
+    left: &MapArray,
+    left_row: usize,
+    right: &MapArray,
+    right_row: usize,
+) -> Result<Option<bool>, String> {
+    if left.is_null(left_row) || right.is_null(right_row) {
+        return Ok(None);
+    }
+
+    let left_offsets = left.value_offsets();
+    let right_offsets = right.value_offsets();
+    let left_start = left_offsets[left_row] as usize;
+    let left_end = left_offsets[left_row + 1] as usize;
+    let right_start = right_offsets[right_row] as usize;
+    let right_end = right_offsets[right_row + 1] as usize;
+    let left_len = left_end.saturating_sub(left_start);
+    let right_len = right_end.saturating_sub(right_start);
+    if left_len != right_len {
+        return Ok(Some(false));
+    }
+
+    let left_keys = left.keys();
+    let right_keys = right.keys();
+    let left_values = left.values();
+    let right_values = right.values();
+    let mut has_unknown = false;
+    for idx in 0..left_len {
+        let left_idx = left_start + idx;
+        let right_idx = right_start + idx;
+        match eq_value_recursive(&left_keys, left_idx, &right_keys, right_idx)? {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => has_unknown = true,
+        }
+        match eq_value_recursive(&left_values, left_idx, &right_values, right_idx)? {
+            Some(true) => {}
+            Some(false) => return Ok(Some(false)),
+            None => has_unknown = true,
+        }
+    }
+
+    if has_unknown {
+        Ok(None)
+    } else {
+        Ok(Some(true))
+    }
+}
+
 fn eq_value_recursive_null_safe(
     left: &ArrayRef,
     left_idx: usize,
@@ -769,6 +947,72 @@ where
     Ok(Arc::new(builder.finish()))
 }
 
+fn eval_nested_eq(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+    if left.data_type() != right.data_type() {
+        return Err(format!(
+            "nested eq type mismatch: {:?} vs {:?}",
+            left.data_type(),
+            right.data_type()
+        ));
+    }
+    let out_len = left.len().max(right.len());
+    if out_len == 0 {
+        return Ok(Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())));
+    }
+
+    let mut builder = arrow::array::BooleanBuilder::new();
+    for row in 0..out_len {
+        let left_row = if left.len() == 1 { 0 } else { row };
+        let right_row = if right.len() == 1 { 0 } else { row };
+        if left_row >= left.len() || right_row >= right.len() {
+            return Err(format!(
+                "nested eq row out of bounds: left_len={} right_len={} row={}",
+                left.len(),
+                right.len(),
+                row
+            ));
+        }
+        match eq_value_recursive(left, left_row, right, right_row)? {
+            Some(value) => builder.append_value(value),
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn eval_nested_ne(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+    if left.data_type() != right.data_type() {
+        return Err(format!(
+            "nested ne type mismatch: {:?} vs {:?}",
+            left.data_type(),
+            right.data_type()
+        ));
+    }
+    let out_len = left.len().max(right.len());
+    if out_len == 0 {
+        return Ok(Arc::new(BooleanArray::from(Vec::<Option<bool>>::new())));
+    }
+
+    let mut builder = arrow::array::BooleanBuilder::new();
+    for row in 0..out_len {
+        let left_row = if left.len() == 1 { 0 } else { row };
+        let right_row = if right.len() == 1 { 0 } else { row };
+        if left_row >= left.len() || right_row >= right.len() {
+            return Err(format!(
+                "nested ne row out of bounds: left_len={} right_len={} row={}",
+                left.len(),
+                right.len(),
+                row
+            ));
+        }
+        match eq_value_recursive(left, left_row, right, right_row)? {
+            Some(value) => builder.append_value(!value),
+            None => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
 // Helper function to normalize types for comparison
 fn normalize_comparison_types(
     left: ArrayRef,
@@ -915,7 +1159,7 @@ pub fn eval_eq(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_compare(&l_norm, &r_norm, |ord| ord == Ordering::Equal);
+        return eval_nested_eq(&l_norm, &r_norm);
     }
     let result = eq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
@@ -946,7 +1190,7 @@ pub fn eval_ne(
         l_norm.data_type(),
         DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
     ) {
-        return eval_nested_compare(&l_norm, &r_norm, |ord| ord != Ordering::Equal);
+        return eval_nested_ne(&l_norm, &r_norm);
     }
     let result = neq(&l_norm, &r_norm).map_err(|e| e.to_string())?;
     Ok(Arc::new(result))
@@ -1646,6 +1890,32 @@ mod tests {
     }
 
     #[test]
+    fn test_eq_list_arrays_with_nested_nulls() {
+        let mut arena = ExprArena::default();
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let left = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(22), None, Some(33)]),
+            Some(vec![Some(22), None, Some(44)]),
+            Some(vec![Some(22), None, Some(33)]),
+        ]);
+        let right = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(22), None, Some(33)]),
+            Some(vec![Some(22), None, Some(33)]),
+            Some(vec![Some(22), Some(11), Some(33)]),
+        ]);
+        let chunk = create_test_chunk_list_i64(left, right, list_type.clone());
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), list_type.clone());
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
+        let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(out.is_null(0));
+        assert_eq!(out.value(1), false);
+        assert!(out.is_null(2));
+    }
+
+    #[test]
     fn test_eq_for_null_list_arrays() {
         let mut arena = ExprArena::default();
         let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
@@ -1675,6 +1945,32 @@ mod tests {
         assert_eq!(out.value(2), true);
         assert_eq!(out.value(3), false);
         assert_eq!(out.value(4), false);
+    }
+
+    #[test]
+    fn test_ne_list_arrays_with_nested_nulls() {
+        let mut arena = ExprArena::default();
+        let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        let left = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(22), None, Some(33)]),
+            Some(vec![Some(22), None, Some(44)]),
+            Some(vec![Some(22), None, Some(33)]),
+        ]);
+        let right = ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(vec![
+            Some(vec![Some(22), None, Some(33)]),
+            Some(vec![Some(22), None, Some(33)]),
+            Some(vec![Some(22), Some(11), Some(33)]),
+        ]);
+        let chunk = create_test_chunk_list_i64(left, right, list_type.clone());
+
+        let l = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), list_type.clone());
+        let r = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), list_type);
+        let expr = arena.push_typed(ExprNode::Ne(l, r), DataType::Boolean);
+        let out = arena.eval(expr, &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(out.is_null(0));
+        assert_eq!(out.value(1), true);
+        assert!(out.is_null(2));
     }
 
     #[test]

@@ -37,11 +37,12 @@ use crate::common::ids::SlotId;
 use crate::connector::starrocks::fe_v2_meta::{
     LakeTabletPartitionRef, resolve_tablet_paths_for_olap_sink,
 };
-use crate::connector::starrocks::lake::context::get_tablet_runtime;
+use crate::connector::starrocks::lake::context::{AutoIncrementWritePolicy, get_tablet_runtime};
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
 use crate::connector::starrocks::lake::{
     TabletWriteContext, append_lake_txn_log_with_chunk_rowset,
 };
+use crate::connector::starrocks::sink::auto_increment::allocate_auto_increment_ids;
 use crate::connector::starrocks::sink::factory::{
     OlapTableSinkPlan, STARROCKS_DEFAULT_PARTITION_VALUE, SinkIndexWritePlan, TabletWriteTarget,
     create_automatic_partitions,
@@ -335,9 +336,208 @@ struct FilteredBatch {
     tracking_logs: Vec<String>,
 }
 
+fn delete_row_mask_for_auto_increment(batch: &RecordBatch) -> Result<Option<Vec<bool>>, String> {
+    let Some(op_idx) = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, field)| (field.name() == LOAD_OP_COLUMN).then_some(idx))
+    else {
+        return Ok(None);
+    };
+
+    let op_col = batch.column(op_idx);
+    match op_col.data_type() {
+        DataType::Int8 => {
+            let typed = op_col
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "downcast __op Int8Array failed".to_string())?;
+            let mut out = Vec::with_capacity(typed.len());
+            for row_idx in 0..typed.len() {
+                out.push(!typed.is_null(row_idx) && typed.value(row_idx) != 0);
+            }
+            Ok(Some(out))
+        }
+        DataType::Int32 => {
+            let typed = op_col
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "downcast __op Int32Array failed".to_string())?;
+            let mut out = Vec::with_capacity(typed.len());
+            for row_idx in 0..typed.len() {
+                out.push(!typed.is_null(row_idx) && typed.value(row_idx) != 0);
+            }
+            Ok(Some(out))
+        }
+        other => Err(format!(
+            "OLAP_TABLE_SINK unsupported '{}' column type for auto_increment handling: {:?}",
+            LOAD_OP_COLUMN, other
+        )),
+    }
+}
+
+fn materialize_auto_increment_for_sink_batch(
+    batch: &RecordBatch,
+    tablet_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    auto_increment: Option<&AutoIncrementWritePolicy>,
+    rejected: &mut [bool],
+    tracking_logs: &mut Vec<String>,
+    table_id: i64,
+) -> Result<RecordBatch, String> {
+    let Some(auto_policy) = auto_increment else {
+        return Ok(batch.clone());
+    };
+    let Some(auto_idx) = auto_policy.auto_increment_column_idx else {
+        return Ok(batch.clone());
+    };
+    if auto_idx >= batch.num_columns() || auto_idx >= tablet_schema.column.len() {
+        return Ok(batch.clone());
+    }
+
+    let auto_column = batch.column(auto_idx);
+    if auto_column.null_count() == 0 {
+        return Ok(batch.clone());
+    }
+    let auto_col_name = auto_policy
+        .auto_increment_column_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            tablet_schema
+                .column
+                .get(auto_idx)
+                .and_then(|column| column.name.as_deref())
+                .filter(|name| !name.trim().is_empty())
+        })
+        .unwrap_or("<auto_increment>");
+
+    if auto_policy.null_expr_in_auto_increment {
+        for row_idx in 0..batch.num_rows() {
+            if !auto_column.is_null(row_idx) || rejected[row_idx] {
+                continue;
+            }
+            rejected[row_idx] = true;
+            tracking_logs.push(format!(
+                "Error: NULL value in auto increment column '{}'. Row: {}",
+                auto_col_name,
+                format_tracking_row(batch, row_idx)?
+            ));
+        }
+        return Ok(batch.clone());
+    }
+
+    let delete_rows = if tablet_schema.keys_type == Some(KeysType::PrimaryKeys as i32) {
+        delete_row_mask_for_auto_increment(batch)?
+    } else {
+        None
+    };
+    let alloc_rows = (0..batch.num_rows())
+        .filter(|row_idx| {
+            auto_column.is_null(*row_idx)
+                && !delete_rows
+                    .as_ref()
+                    .is_some_and(|mask| mask.get(*row_idx).copied().unwrap_or(false))
+        })
+        .count();
+    let allocated_ids = if alloc_rows == 0 {
+        Vec::new()
+    } else {
+        let fe_addr = auto_policy.fe_addr.as_ref().ok_or_else(|| {
+            "OLAP_TABLE_SINK cannot allocate auto_increment id without FE address".to_string()
+        })?;
+        allocate_auto_increment_ids(fe_addr, table_id, alloc_rows)?
+    };
+
+    let mut next_alloc = 0usize;
+    let filled_auto_column: ArrayRef = match auto_column.data_type() {
+        DataType::Int64 => {
+            let typed = auto_column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "downcast Int64Array failed".to_string())?;
+            let mut values = Vec::with_capacity(typed.len());
+            for row_idx in 0..typed.len() {
+                if typed.is_null(row_idx) {
+                    let is_delete = delete_rows
+                        .as_ref()
+                        .is_some_and(|mask| mask.get(row_idx).copied().unwrap_or(false));
+                    if is_delete {
+                        values.push(0);
+                    } else {
+                        let auto_id = *allocated_ids.get(next_alloc).ok_or_else(|| {
+                            "allocate_auto_increment_ids returned fewer ids than requested"
+                                .to_string()
+                        })?;
+                        next_alloc = next_alloc.saturating_add(1);
+                        values.push(auto_id);
+                    }
+                } else {
+                    values.push(typed.value(row_idx));
+                }
+            }
+            Arc::new(Int64Array::from(values))
+        }
+        DataType::Int32 => {
+            let typed = auto_column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "downcast Int32Array failed".to_string())?;
+            let mut values = Vec::with_capacity(typed.len());
+            for row_idx in 0..typed.len() {
+                if typed.is_null(row_idx) {
+                    let is_delete = delete_rows
+                        .as_ref()
+                        .is_some_and(|mask| mask.get(row_idx).copied().unwrap_or(false));
+                    if is_delete {
+                        values.push(0);
+                    } else {
+                        let auto_id = *allocated_ids.get(next_alloc).ok_or_else(|| {
+                            "allocate_auto_increment_ids returned fewer ids than requested"
+                                .to_string()
+                        })?;
+                        let casted = i32::try_from(auto_id).map_err(|_| {
+                            format!(
+                                "auto_increment value overflow for INT column '{}'",
+                                auto_col_name
+                            )
+                        })?;
+                        next_alloc = next_alloc.saturating_add(1);
+                        values.push(casted);
+                    }
+                } else {
+                    values.push(typed.value(row_idx));
+                }
+            }
+            Arc::new(Int32Array::from(values))
+        }
+        other => {
+            return Err(format!(
+                "OLAP_TABLE_SINK unsupported auto_increment column type: column='{}' type={:?}",
+                auto_col_name, other
+            ));
+        }
+    };
+    if next_alloc != allocated_ids.len() {
+        return Err(format!(
+            "allocate_auto_increment_ids returned unexpected id count: expected={} actual={}",
+            next_alloc,
+            allocated_ids.len()
+        ));
+    }
+
+    let mut columns = batch.columns().to_vec();
+    columns[auto_idx] = filled_auto_column;
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| format!("OLAP_TABLE_SINK build auto_increment batch failed: {e}"))
+}
+
 fn filter_rows_for_tablet_schema(
     batch: &RecordBatch,
     tablet_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    auto_increment: Option<&AutoIncrementWritePolicy>,
+    table_id: i64,
 ) -> Result<FilteredBatch, String> {
     if batch.num_rows() == 0 {
         return Ok(FilteredBatch {
@@ -349,13 +549,21 @@ fn filter_rows_for_tablet_schema(
 
     let mut rejected = vec![false; batch.num_rows()];
     let mut tracking_logs = Vec::new();
-    let column_count = batch.num_columns().min(tablet_schema.column.len());
+    let materialized_batch = materialize_auto_increment_for_sink_batch(
+        batch,
+        tablet_schema,
+        auto_increment,
+        rejected.as_mut_slice(),
+        &mut tracking_logs,
+        table_id,
+    )?;
+    let column_count = materialized_batch.num_columns().min(tablet_schema.column.len());
     for column_idx in 0..column_count {
         let schema_col = &tablet_schema.column[column_idx];
         if schema_col.is_nullable.unwrap_or(true) {
             continue;
         }
-        let column = batch.column(column_idx);
+        let column = materialized_batch.column(column_idx);
         if column.null_count() == 0 {
             continue;
         }
@@ -364,8 +572,8 @@ fn filter_rows_for_tablet_schema(
             .as_deref()
             .filter(|name| !name.trim().is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| batch.schema().field(column_idx).name().to_string());
-        for row_idx in 0..batch.num_rows() {
+            .unwrap_or_else(|| materialized_batch.schema().field(column_idx).name().to_string());
+        for row_idx in 0..materialized_batch.num_rows() {
             if !column.is_null(row_idx) || rejected[row_idx] {
                 continue;
             }
@@ -373,7 +581,7 @@ fn filter_rows_for_tablet_schema(
             tracking_logs.push(format!(
                 "Error: NULL value in non-nullable column '{}'. Row: {}",
                 column_name,
-                format_tracking_row(batch, row_idx)?
+                format_tracking_row(&materialized_batch, row_idx)?
             ));
         }
     }
@@ -381,7 +589,7 @@ fn filter_rows_for_tablet_schema(
     let rejected_rows = rejected.iter().filter(|flag| **flag).count();
     if rejected_rows == 0 {
         return Ok(FilteredBatch {
-            batch: batch.clone(),
+            batch: materialized_batch,
             rejected_rows: 0,
             tracking_logs,
         });
@@ -392,7 +600,7 @@ fn filter_rows_for_tablet_schema(
         .enumerate()
         .filter_map(|(row_idx, rejected)| (!rejected).then_some(row_idx as u32))
         .collect::<Vec<_>>();
-    let filtered_batch = take_batch_rows(batch, &kept_indices)?;
+    let filtered_batch = take_batch_rows(&materialized_batch, &kept_indices)?;
     Ok(FilteredBatch {
         batch: filtered_batch,
         rejected_rows,
@@ -919,6 +1127,7 @@ impl OlapTableSinkOperator {
                 auto_partition.db_id,
                 auto_partition.table_id,
                 auto_partition.txn_id,
+                auto_partition.dynamic_overwrite,
                 vec![partition_values.clone()],
             )
             .map_err(|e| format!("OLAP_TABLE_SINK runtime automatic partition failed: {e}"))?;
@@ -1480,6 +1689,8 @@ impl OlapTableSinkOperator {
                         let filtered_batch = filter_rows_for_tablet_schema(
                             &routed_chunk.batch,
                             &target.context.tablet_schema,
+                            Some(&target.context.partial_update.auto_increment),
+                            target.context.table_id,
                         )?;
                         if plan_idx == 0 {
                             flush_loaded_rows_delta = flush_loaded_rows_delta
@@ -1920,7 +2131,12 @@ fn partition_scalar_value_to_string(array: &dyn Array, row: usize) -> Result<Str
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "downcast BooleanArray failed".to_string())?;
-            Ok(if typed.value(row) { "1" } else { "0" }.to_string())
+            Ok(if typed.value(row) {
+                "TRUE"
+            } else {
+                "FALSE"
+            }
+            .to_string())
         }
         DataType::Date32 => {
             let typed = array
@@ -2230,11 +2446,12 @@ fn align_batch_to_schema_slot_bindings(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use arrow::array::{
-        ArrayRef, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-        TimestampMicrosecondArray,
+        Array, ArrayRef, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        StringArray, TimestampMicrosecondArray,
     };
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -2249,9 +2466,10 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
     use crate::connector::starrocks::lake::context::{
-        clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+        AutoIncrementWritePolicy, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::{TabletWriteContext, txn_log::read_txn_log_if_exists};
+    use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_test;
     use crate::connector::starrocks::sink::factory::{
         AutomaticPartitionPlan, OlapTableSinkPlan, SinkIndexWritePlan, SinkOutputProjectionPlan,
         TabletWriteTarget,
@@ -2264,13 +2482,22 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::pipeline::operator::ProcessorOperator;
+    use crate::frontend_service;
     use crate::formats::starrocks::writer::{StarRocksWriteFormat, layout::txn_log_file_path};
     use crate::frontend_service::TCreatePartitionResult;
     use crate::runtime::runtime_state::RuntimeState;
+    use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, KeysType, PUniqueId, TabletSchemaPb,
     };
-    use crate::{exprs, opcodes, types};
+    use crate::{exprs, opcodes, status, status_code, types};
+    mod fe_rpc_server {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fe_rpc_server.rs"
+        ));
+    }
+    use fe_rpc_server::{FakeFeRpcServer, ServerAction, read_struct_arg, write_struct_reply};
 
     fn test_tablet_schema() -> TabletSchemaPb {
         TabletSchemaPb {
@@ -2456,6 +2683,82 @@ mod tests {
             table_indices: Vec::new(),
             compression_level: None,
             id: Some(5002),
+        }
+    }
+
+    fn primary_key_auto_increment_schema() -> TabletSchemaPb {
+        TabletSchemaPb {
+            keys_type: Some(KeysType::PrimaryKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("id".to_string()),
+                    r#type: "DATE".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 2,
+                    name: Some("job1".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(true),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(3),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![1],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(5004),
+        }
+    }
+
+    fn primary_key_auto_increment_policy(
+        fe_addr: Option<types::TNetworkAddress>,
+    ) -> AutoIncrementWritePolicy {
+        AutoIncrementWritePolicy {
+            null_expr_in_auto_increment: false,
+            miss_auto_increment_column: false,
+            auto_increment_column_idx: Some(1),
+            auto_increment_column_name: Some("job1".to_string()),
+            auto_increment_in_sort_key: false,
+            fe_addr,
         }
     }
 
@@ -2923,6 +3226,7 @@ mod tests {
                 db_id: 6001,
                 table_id: 7005,
                 txn_id: 8001,
+                dynamic_overwrite: false,
                 fe_addr: types::TNetworkAddress::new("127.0.0.1".to_string(), 9031),
                 partition_key_source: PartitionKeySource::None,
                 partition_column_names: Vec::new(),
@@ -3156,14 +3460,112 @@ mod tests {
         )
         .expect("build nullable batch");
 
-        let filtered = filter_rows_for_tablet_schema(&batch, &non_nullable_three_col_schema())
-            .expect("filter batch");
+        let filtered =
+            filter_rows_for_tablet_schema(&batch, &non_nullable_three_col_schema(), None, 0)
+                .expect("filter batch");
         assert_eq!(filtered.batch.num_rows(), 0);
         assert_eq!(filtered.rejected_rows, 1);
         assert_eq!(
             filtered.tracking_logs,
             vec![
                 "Error: NULL value in non-nullable column 'k1'. Row: [NULL, NULL, NULL]"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_rows_for_tablet_schema_materializes_auto_increment_defaults() {
+        test_clear_shared_host_pools();
+        clear_auto_increment_cache_for_test();
+        let saw_requests = Arc::new(AtomicUsize::new(0));
+        let saw_requests_for_server = Arc::clone(&saw_requests);
+        let server = FakeFeRpcServer::start(
+            0,
+            Box::new(move |method, seq, i_prot, o_prot| match method {
+                "allocAutoIncrementId" => {
+                    let req: frontend_service::TAllocateAutoIncrementIdParam =
+                        read_struct_arg(i_prot)?;
+                    assert_eq!(req.table_id, Some(97145));
+                    assert_eq!(req.rows, Some(1024));
+                    saw_requests_for_server.fetch_add(1, Ordering::AcqRel);
+                    let response = frontend_service::TAllocateAutoIncrementIdResult {
+                        status: Some(status::TStatus::new(status_code::TStatusCode::OK, None)),
+                        auto_increment_id: Some(2001),
+                        allocated_rows: Some(1024),
+                    };
+                    write_struct_reply(o_prot, method, seq, &response)?;
+                    Ok(ServerAction::Continue)
+                }
+                other => panic!("unexpected FE RPC method: {other}"),
+            }),
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Date32, false),
+                Field::new("job1", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Date32Array::from(vec![18_628_i32, 18_630_i32])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(1_i64), None])) as ArrayRef,
+            ],
+        )
+        .expect("build auto increment batch");
+
+        let filtered = filter_rows_for_tablet_schema(
+            &batch,
+            &primary_key_auto_increment_schema(),
+            Some(&primary_key_auto_increment_policy(Some(server.addr().clone()))),
+            97145,
+        )
+        .expect("materialize auto increment defaults");
+        assert_eq!(filtered.rejected_rows, 0);
+        assert!(filtered.tracking_logs.is_empty());
+        let typed = filtered
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("downcast auto increment column");
+        assert_eq!(typed.null_count(), 0);
+        assert_eq!(typed.value(0), 1);
+        assert_eq!(typed.value(1), 2001);
+        assert_eq!(saw_requests.load(Ordering::Acquire), 1);
+
+        clear_auto_increment_cache_for_test();
+        test_clear_shared_host_pools();
+    }
+
+    #[test]
+    fn filter_rows_for_tablet_schema_rejects_explicit_auto_increment_nulls() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Date32, false),
+                Field::new("job1", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Date32Array::from(vec![18_630_i32])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![None::<i64>])) as ArrayRef,
+            ],
+        )
+        .expect("build explicit null auto increment batch");
+
+        let mut policy = primary_key_auto_increment_policy(None);
+        policy.null_expr_in_auto_increment = true;
+        let filtered = filter_rows_for_tablet_schema(
+            &batch,
+            &primary_key_auto_increment_schema(),
+            Some(&policy),
+            97145,
+        )
+        .expect("reject explicit auto increment nulls");
+        assert_eq!(filtered.batch.num_rows(), 0);
+        assert_eq!(filtered.rejected_rows, 1);
+        assert_eq!(
+            filtered.tracking_logs,
+            vec![
+                "Error: NULL value in auto increment column 'job1'. Row: [2021-01-03, NULL]"
                     .to_string()
             ]
         );
@@ -3884,6 +4286,19 @@ mod tests {
         assert_eq!(
             super::partition_scalar_value_to_string(&values, 0).expect("format timestamp"),
             "2024-08-30 19:02:13.440000"
+        );
+    }
+
+    #[test]
+    fn partition_scalar_value_formats_bool_as_uppercase() {
+        let values = BooleanArray::from(vec![true, false]);
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 0).expect("true bool partition"),
+            "TRUE"
+        );
+        assert_eq!(
+            super::partition_scalar_value_to_string(&values, 1).expect("false bool partition"),
+            "FALSE"
         );
     }
 
