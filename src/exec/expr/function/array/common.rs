@@ -25,6 +25,7 @@ use arrow::datatypes::{DataType, TimeUnit};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use crate::common::decimal::LEGACY_DECIMALV2_SCALE;
 use crate::common::largeint;
 use crate::exec::expr::function::date::common::{
     naive_to_date32, naive_to_timestamp_micros, parse_date, parse_datetime,
@@ -46,6 +47,20 @@ pub(super) fn cast_output(
         return Ok(out);
     }
     cast(&out, target).map_err(|e| format!("{}: failed to cast output: {}", fn_name, e))
+}
+
+pub(super) fn adjust_legacy_decimalv2_target_type(
+    source_type: &DataType,
+    requested_type: &DataType,
+) -> DataType {
+    match (source_type, requested_type) {
+        (DataType::Decimal128(source_precision, source_scale), DataType::Decimal128(target_precision, target_scale))
+            if *target_scale == LEGACY_DECIMALV2_SCALE && source_scale != target_scale =>
+        {
+            DataType::Decimal128((*target_precision).max(*source_precision), *source_scale)
+        }
+        _ => requested_type.clone(),
+    }
 }
 
 fn cast_utf8_to_date32(array: &ArrayRef) -> Result<ArrayRef, String> {

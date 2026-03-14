@@ -512,7 +512,9 @@ pub(crate) fn lower_function_call(
                                 item1.data_type()
                             ));
                         }
-                        _ => return Err("arrays_overlap expects ARRAY arguments".to_string()),
+                        // FE may propagate dictionary/intermediate types for expressions such as
+                        // ifnull(array_col, []). Defer exact validation to runtime in that case.
+                        _ => {}
                     }
                     if !matches!(data_type, DataType::Boolean) {
                         return Err("arrays_overlap must return BOOLEAN type".to_string());

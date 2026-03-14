@@ -268,7 +268,10 @@ pub fn eval_array_sum(
         other => return Err(format!("array_sum unsupported element type: {:?}", other)),
     };
 
-    super::common::cast_output(out, arena.data_type(expr), "array_sum")
+    let adjusted_output_type = arena
+        .data_type(expr)
+        .map(|t| super::common::adjust_legacy_decimalv2_target_type(values.data_type(), t));
+    super::common::cast_output(out, adjusted_output_type.as_ref(), "array_sum")
 }
 
 #[cfg(test)]

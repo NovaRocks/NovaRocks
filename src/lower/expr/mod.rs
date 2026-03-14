@@ -203,6 +203,34 @@ fn infer_function_return_type_from_children(
     }
 }
 
+fn choose_node_data_type(
+    node: &exprs::TExprNode,
+    resolved: Option<DataType>,
+    inferred: Option<DataType>,
+) -> Option<DataType> {
+    if !matches!(
+        node.node_type,
+        exprs::TExprNodeType::FUNCTION_CALL | exprs::TExprNodeType::COMPUTE_FUNCTION_CALL
+    ) {
+        return resolved.or(inferred);
+    }
+
+    let fn_name = node
+        .fn_
+        .as_ref()
+        .map(|f| f.name.function_name.to_ascii_lowercase());
+    match (fn_name.as_deref(), resolved, inferred) {
+        (
+            Some("if" | "ifnull" | "nvl" | "coalesce"),
+            Some(DataType::Boolean),
+            Some(inferred_type),
+        ) if !matches!(inferred_type, DataType::Boolean | DataType::Null) => Some(inferred_type),
+        (_, Some(data_type), _) => Some(data_type),
+        (_, None, Some(data_type)) => Some(data_type),
+        (_, None, None) => None,
+    }
+}
+
 fn lower_dict_expr_node(
     node: &exprs::TExprNode,
     nodes: &[exprs::TExprNode],
@@ -377,9 +405,11 @@ fn lower_expr_node_impl(
         )?);
     }
 
-    let data_type = match resolve_node_data_type(node)
-        .or_else(|| infer_function_return_type_from_children(node, &children, arena))
-    {
+    let data_type = match choose_node_data_type(
+        node,
+        resolve_node_data_type(node),
+        infer_function_return_type_from_children(node, &children, arena),
+    ) {
         Some(data_type) => data_type,
         None if cfg!(test) => {
             // Unit tests in this module intentionally use minimal dummy thrift type descriptors.

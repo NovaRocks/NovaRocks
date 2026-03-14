@@ -1,0 +1,10 @@
+-- query 10
+Field	Type	Null	Key	Default	Extra
+k0	bigint	YES	true	NULL	
+k1	datetime	YES	true	NULL	
+v0	bigint	YES	false	NULL	
+v1	varchar(100)	YES	false	NULL	
+
+-- query 11
+k0	k1	v0	v1
+0	2024-01-01 00:00:00	10	100

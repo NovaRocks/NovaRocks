@@ -22,6 +22,21 @@ use arrow::compute::kernels::zip::zip;
 use arrow::compute::take;
 use arrow::datatypes::DataType;
 
+fn inferred_if_output_type(then_type: &DataType, else_type: &DataType) -> Option<DataType> {
+    match (then_type, else_type) {
+        (left, right) if left == right && !matches!(left, DataType::Boolean | DataType::Null) => {
+            Some(left.clone())
+        }
+        (left, DataType::Null) if !matches!(left, DataType::Boolean | DataType::Null) => {
+            Some(left.clone())
+        }
+        (DataType::Null, right) if !matches!(right, DataType::Boolean | DataType::Null) => {
+            Some(right.clone())
+        }
+        _ => None,
+    }
+}
+
 // IF function for Arrow arrays
 pub fn eval_if(
     arena: &ExprArena,
@@ -67,7 +82,9 @@ pub fn eval_if(
         .data_type(else_expr)
         .cloned()
         .unwrap_or(DataType::Null);
-    let target_type = if !matches!(output_type, DataType::Null) {
+    let target_type = if matches!(output_type, DataType::Boolean) {
+        inferred_if_output_type(&then_type, &else_type).unwrap_or(output_type)
+    } else if !matches!(output_type, DataType::Null) {
         output_type
     } else if !matches!(then_type, DataType::Null) {
         then_type

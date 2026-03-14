@@ -20,6 +20,7 @@ use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, ListArray,
 };
+use arrow::datatypes::DataType;
 use std::sync::Arc;
 
 fn avg_rows<T, F>(
@@ -60,6 +61,87 @@ where
         }
     }
     out
+}
+
+fn pow10_i128(exp: u32) -> Result<i128, String> {
+    10_i128
+        .checked_pow(exp)
+        .ok_or_else(|| "array_avg decimal scale overflow".to_string())
+}
+
+fn div_round_half_up_i128(numerator: i128, denominator: i128) -> Result<i128, String> {
+    if denominator == 0 {
+        return Err("array_avg division by zero".to_string());
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder == 0 {
+        return Ok(quotient);
+    }
+
+    let twice_remainder = remainder
+        .abs()
+        .checked_mul(2)
+        .ok_or_else(|| "array_avg decimal rounding overflow".to_string())?;
+    if twice_remainder < denominator.abs() {
+        return Ok(quotient);
+    }
+
+    Ok(quotient + numerator.signum())
+}
+
+fn avg_decimal_rows(
+    list: &ListArray,
+    values: &Decimal128Array,
+    chunk_len: usize,
+    input_scale: i8,
+    output_scale: i8,
+) -> Result<Vec<Option<i128>>, String> {
+    let offsets = list.value_offsets();
+    let mut out = Vec::with_capacity(chunk_len);
+    for row in 0..chunk_len {
+        let row_idx = super::common::row_index(row, list.len());
+        if list.is_null(row_idx) {
+            out.push(None);
+            continue;
+        }
+
+        let start = offsets[row_idx] as usize;
+        let end = offsets[row_idx + 1] as usize;
+        let count = i128::try_from(end - start).map_err(|_| "array_avg count overflow".to_string())?;
+        let mut sum = 0_i128;
+        let mut has_value = false;
+        for idx in start..end {
+            if values.is_null(idx) {
+                continue;
+            }
+            has_value = true;
+            sum = sum
+                .checked_add(values.value(idx))
+                .ok_or_else(|| "array_avg decimal accumulation overflow".to_string())?;
+        }
+
+        if count == 0 || !has_value {
+            out.push(None);
+            continue;
+        }
+
+        let (numerator, denominator) = if output_scale >= input_scale {
+            let factor = pow10_i128(u32::from((output_scale - input_scale) as u8))?;
+            let numerator = sum
+                .checked_mul(factor)
+                .ok_or_else(|| "array_avg decimal rescale overflow".to_string())?;
+            (numerator, count)
+        } else {
+            let factor = pow10_i128(u32::from((input_scale - output_scale) as u8))?;
+            let denominator = count
+                .checked_mul(factor)
+                .ok_or_else(|| "array_avg decimal rescale overflow".to_string())?;
+            (sum, denominator)
+        };
+        out.push(Some(div_round_half_up_i128(numerator, denominator)?));
+    }
+    Ok(out)
 }
 
 pub fn eval_array_avg(
@@ -139,15 +221,17 @@ pub fn eval_array_avg(
                 |a, idx| a.value(idx),
             ))) as ArrayRef
         }
-        arrow::datatypes::DataType::Decimal128(_, scale) => {
+        arrow::datatypes::DataType::Decimal128(precision, scale) => {
             let values = values.as_any().downcast_ref::<Decimal128Array>().unwrap();
-            let factor = 10_f64.powi(i32::from(*scale));
-            Arc::new(Float64Array::from(avg_rows(
-                list,
-                values,
-                chunk.len(),
-                |a, idx| a.value(idx) as f64 / factor,
-            ))) as ArrayRef
+            let (out_precision, out_scale) = match arena.data_type(expr) {
+                Some(DataType::Decimal128(p, s)) => (*p, *s),
+                _ => (*precision, *scale),
+            };
+            let avgs = avg_decimal_rows(list, values, chunk.len(), *scale, out_scale)?;
+            let out = Decimal128Array::from(avgs)
+                .with_precision_and_scale(out_precision, out_scale)
+                .map_err(|e| e.to_string())?;
+            Arc::new(out) as ArrayRef
         }
         arrow::datatypes::DataType::FixedSizeBinary(width)
             if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
@@ -249,5 +333,51 @@ mod tests {
         let out = eval_array_function("array_avg", &arena, expr, &[arr], &chunk).unwrap();
         let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(out.is_null(0));
+    }
+
+    #[test]
+    fn test_array_avg_decimal_rounds_exactly() {
+        let mut arena = ExprArena::default();
+        let chunk = chunk_len_1();
+        let expr = typed_null(&mut arena, DataType::Decimal128(18, 8));
+        let list_type = DataType::List(Arc::new(Field::new(
+            "item",
+            DataType::Decimal128(9, 2),
+            true,
+        )));
+        let v1 = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 100,
+                precision: 9,
+                scale: 2,
+            }),
+            DataType::Decimal128(9, 2),
+        );
+        let v2 = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 200,
+                precision: 9,
+                scale: 2,
+            }),
+            DataType::Decimal128(9, 2),
+        );
+        let v3 = arena.push_typed(
+            ExprNode::Literal(LiteralValue::Decimal128 {
+                value: 200,
+                precision: 9,
+                scale: 2,
+            }),
+            DataType::Decimal128(9, 2),
+        );
+        let arr = arena.push_typed(
+            ExprNode::ArrayExpr {
+                elements: vec![v1, v2, v3],
+            },
+            list_type,
+        );
+
+        let out = eval_array_function("array_avg", &arena, expr, &[arr], &chunk).unwrap();
+        let out = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
+        assert_eq!(out.value(0), 166_666_667);
     }
 }

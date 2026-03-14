@@ -1,104 +1,35 @@
-use anyhow::{Context, Result, bail};
+mod config;
+mod parser;
+mod results;
+mod runner;
+mod session;
+mod shell;
+mod types;
+
+use crate::config::{
+    build_suite_configs, env_optional, env_or_default, list_sql_files, load_runner_config,
+    placeholder_variables, resolve_config_path, resolve_path, resolve_reference_port,
+    resolve_repo_root, resolve_target_port, suite_default_query_timeout,
+};
+use crate::parser::load_suite_hook;
+use crate::results::{
+    case_result_path, compare_result_sets, find_legacy_result_paths, load_expected_results,
+    step_allows_missing_expected_result, step_has_implicit_skip_result,
+    step_requires_recorded_result, step_retry_count, step_retry_interval, verify_text_assertions,
+    write_mismatch_artifacts, write_result_file,
+};
+use crate::runner::{error_message_matches, parse_selector_list, summarize_connection};
+use crate::session::{
+    MysqlSession, case_auto_db_name, drop_case_database, execute_suite_hook, reset_case_database,
+};
+use crate::types::*;
+use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
-use mysql::prelude::Queryable;
-use mysql::{Conn as MysqlConn, OptsBuilder, Row as MysqlRow, Value as MysqlValue};
 use regex::Regex;
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread::sleep;
-use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone)]
-struct SuiteConfig {
-    name: String,
-    sql_dir: PathBuf,
-    result_dir: Option<PathBuf>,
-    sql_glob: String,
-    default_catalog: String,
-    default_db: String,
-    auto_case_db: bool,
-    verify_default: bool,
-    init_sql: Option<PathBuf>,
-    cleanup_sql: Option<PathBuf>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct QueryMeta {
-    order_sensitive: Option<bool>,
-    float_epsilon: Option<f64>,
-    db: Option<String>,
-    expect_error: Option<String>,
-    result_contains: Vec<String>,
-    result_contains_any: Vec<String>,
-    result_not_contains: Vec<String>,
-    tags: Vec<String>,
-    skip_result_check: bool,
-    retry_count: Option<usize>,
-    retry_interval_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct SqlStep {
-    query_number: usize,
-    sql: String,
-    meta: QueryMeta,
-}
-
-#[derive(Debug, Clone)]
-struct SqlCase {
-    source_file: PathBuf,
-    case_id: String,
-    steps: Vec<SqlStep>,
-}
-
-#[derive(Debug, Clone)]
-struct ConnectionConfig {
-    mysql: String,
-    host: String,
-    port: String,
-    user: String,
-    password: Option<String>,
-    catalog: Option<String>,
-    db: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct QueryExecution {
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
-    text_output: String,
-    elapsed: Duration,
-}
-
-struct MysqlSession {
-    conn: MysqlConn,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct ResultSet {
-    header: Vec<String>,
-    rows: Vec<Vec<String>>,
-}
-
-#[derive(Debug, Clone)]
-struct SuiteHook {
-    path: PathBuf,
-    sql: String,
-    catalog: Option<String>,
-    db: Option<String>,
-}
-
-#[derive(Debug, Default, Clone)]
-struct RunnerConfig {
-    path: Option<PathBuf>,
-    values: HashMap<String, String>,
-    cluster: HashMap<String, String>,
-}
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Mode {
@@ -210,1827 +141,22 @@ struct Cli {
     fail_fast: bool,
 }
 
-fn env_or_default(key: &str, default: &str) -> String {
-    env::var(key)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn env_optional(key: &str) -> Option<String> {
-    env::var(key)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
-fn strip_optional_quotes(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.len() >= 2 {
-        let quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
-            || (trimmed.starts_with('\'') && trimmed.ends_with('\''));
-        if quoted {
-            return trimmed[1..trimmed.len() - 1].to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn detect_default_config(base_dir: &Path) -> Option<PathBuf> {
-    let sr_conf = base_dir
-        .join("tests")
-        .join("sql-test-runner")
-        .join("conf")
-        .join("sr.conf");
-    sr_conf.exists().then_some(sr_conf)
-}
-
-fn resolve_config_path(cli_path: Option<&str>, base_dir: &Path) -> Option<PathBuf> {
-    if let Some(path) = resolve_path(cli_path, base_dir) {
-        return Some(path);
-    }
-    if let Some(raw) = env_optional("STARUST_TEST_CONFIG") {
-        return resolve_path(Some(&raw), base_dir).or_else(|| Some(PathBuf::from(raw)));
-    }
-    detect_default_config(base_dir)
-}
-
-fn load_runner_config(path: Option<&Path>) -> Result<RunnerConfig> {
-    let Some(path) = path else {
-        return Ok(RunnerConfig::default());
-    };
-
-    let content =
-        fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
-    let mut config = RunnerConfig {
-        path: Some(path.to_path_buf()),
-        ..RunnerConfig::default()
-    };
-
-    let mut current_section: Option<String> = None;
-    let mut current_scope: Option<String> = None;
-    for (line_no, line) in content.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-            continue;
-        }
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let section_name = trimmed[1..trimmed.len() - 1].trim();
-            if let Some(stripped) = section_name.strip_prefix('.') {
-                let Some(parent) = current_section.as_deref() else {
-                    bail!(
-                        "{}:{} subsection [{}] missing parent section",
-                        path.display(),
-                        line_no + 1,
-                        section_name
-                    );
-                };
-                current_scope = Some(format!("{}.{}", parent, stripped));
-            } else {
-                current_section = Some(section_name.to_string());
-                current_scope = Some(section_name.to_string());
-            }
-            continue;
-        }
-
-        let Some((key, raw_value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_string();
-        if key.is_empty() {
-            continue;
-        }
-
-        let value = strip_optional_quotes(raw_value);
-        if let Some(scope) = current_scope.as_deref() {
-            config
-                .values
-                .insert(format!("{}.{}", scope, key), value.clone());
-        }
-        if current_section.as_deref() == Some("env") {
-            config.values.insert(key.clone(), value.clone());
-        }
-        if current_section.as_deref() == Some("cluster") {
-            config.cluster.insert(key, value);
-        }
-    }
-
-    Ok(config)
-}
-
-fn insert_placeholder_default(
-    variables: &mut HashMap<String, String>,
-    key: &str,
-    value: impl Into<String>,
-) {
-    let should_insert = variables
-        .get(key)
-        .map(|existing| existing.trim().is_empty())
-        .unwrap_or(true);
-    if should_insert {
-        variables.insert(key.to_string(), value.into());
-    }
-}
-
-fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>, suite_name: &str) {
-    if suite_name != "iceberg" && suite_name != "mv-on-iceberg" {
-        return;
-    }
-
-    // Keep local suites that exercise Iceberg catalogs aligned with bootstrap
-    // defaults so they run out of the box against the MinIO-backed dev setup.
-    insert_placeholder_default(variables, "iceberg_catalog_type", "hadoop");
-    insert_placeholder_default(
-        variables,
-        "iceberg_catalog_warehouse",
-        env_or_default("CATALOG_WAREHOUSE_URI", "s3://novarocks/iceberg-catalog"),
-    );
-    insert_placeholder_default(
-        variables,
-        "oss_ak",
-        env_or_default("MINIO_ROOT_USER", "admin"),
-    );
-    insert_placeholder_default(
-        variables,
-        "oss_sk",
-        env_or_default("MINIO_ROOT_PASSWORD", "admin123"),
-    );
-    insert_placeholder_default(
-        variables,
-        "oss_endpoint",
-        env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"),
-    );
-}
-
-fn placeholder_variables(
-    runner_config: &RunnerConfig,
-    suite_name: &str,
-) -> HashMap<String, String> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let run_id = format!("sqlt_{:x}_{}", nanos, std::process::id());
-
-    let mut variables = runner_config.values.clone();
-    apply_suite_placeholder_defaults(&mut variables, suite_name);
-    variables.insert("run_id".to_string(), run_id.clone());
-    variables.insert("suite".to_string(), suite_name.to_string());
-    for idx in 0..10 {
-        variables.insert(format!("uuid{}", idx), format!("{}_{}", run_id, idx));
-    }
-    variables
-}
-
-fn stable_hash_hex(input: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn case_placeholder_variables(
-    base_variables: &HashMap<String, String>,
-    case_id: &str,
-) -> HashMap<String, String> {
-    let mut variables = base_variables.clone();
-    let suite_run_id = base_variables
-        .get("run_id")
-        .cloned()
-        .unwrap_or_else(|| "sqlt".to_string());
-    let case_run_id = format!("{}_{}", suite_run_id, stable_hash_hex(case_id));
-    variables.insert("case_id".to_string(), case_id.to_string());
-    variables.insert("run_id".to_string(), case_run_id.clone());
-    for idx in 0..10 {
-        variables.insert(format!("uuid{}", idx), format!("{}_{}", case_run_id, idx));
-    }
-    variables
-}
-
-fn substitute_placeholders(
-    raw: &str,
-    variables: &HashMap<String, String>,
-    context: &str,
-) -> Result<String> {
-    let placeholder_re =
-        Regex::new(r"\$\{([A-Za-z0-9_.-]+)\}").context("failed to compile placeholder regex")?;
-    let mut substituted = String::with_capacity(raw.len());
-    let mut last = 0usize;
-    for captures in placeholder_re.captures_iter(raw) {
-        let matched = captures.get(0).expect("placeholder match");
-        let key = captures.get(1).expect("placeholder key").as_str();
-        substituted.push_str(&raw[last..matched.start()]);
-        let Some(value) = variables.get(key) else {
-            bail!("{}: missing placeholder variable '{}'", context, key);
-        };
-        substituted.push_str(value);
-        last = matched.end();
-    }
-    substituted.push_str(&raw[last..]);
-    Ok(substituted)
-}
-
-fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig) -> Result<String> {
-    if let Some(port) = cli_port.filter(|v| !v.trim().is_empty()) {
-        return Ok(port.trim().to_string());
-    }
-    if let Some(port) = env_optional("STARUST_TEST_PORT") {
-        return Ok(port);
-    }
-    if let Some(port) = runner_config
-        .cluster
-        .get("port")
-        .filter(|v| !v.trim().is_empty())
-    {
-        return Ok(port.trim().to_string());
-    }
-    bail!(
-        "target port is not set; provide --port or STARUST_TEST_PORT, or configure tests/sql-test-runner/conf/sr.conf with [cluster].port"
-    );
-}
-
-fn resolve_repo_root() -> Result<PathBuf> {
-    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    loop {
-        if dir.join("sql-tests").is_dir() && dir.join("Cargo.toml").is_file() {
-            return Ok(dir);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    bail!(
-        "failed to resolve repo root from manifest directory {}",
-        env!("CARGO_MANIFEST_DIR")
-    )
-}
-
-fn resolve_reference_port(
-    cli_ref_port: Option<&str>,
-    target_port: &str,
-    reference_required: bool,
-) -> Result<String> {
-    if let Some(port) = cli_ref_port.filter(|v| !v.trim().is_empty()) {
-        return Ok(port.trim().to_string());
-    }
-    if let Some(port) = env_optional("STARUST_REF_PORT") {
-        return Ok(port);
-    }
-    if reference_required {
-        bail!("reference port is required for this mode; provide --ref-port or STARUST_REF_PORT");
-    }
-    Ok(target_port.to_string())
-}
-
-fn resolve_path(path_value: Option<&str>, base_dir: &Path) -> Option<PathBuf> {
-    let raw = path_value?;
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        Some(path)
+fn verify_override(cli: &Cli) -> Option<bool> {
+    if cli.verify {
+        Some(true)
+    } else if cli.no_verify {
+        Some(false)
     } else {
-        Some(base_dir.join(path))
+        None
     }
 }
 
-fn parse_bool(raw: &str) -> Result<bool> {
-    let lowered = raw.trim().to_lowercase();
-    match lowered.as_str() {
-        "1" | "true" | "yes" | "y" | "on" => Ok(true),
-        "0" | "false" | "no" | "n" | "off" => Ok(false),
-        _ => bail!("invalid boolean value: {}", raw),
+fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Verify => "verify",
+        Mode::Record => "record",
+        Mode::Diff => "diff",
     }
-}
-
-fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> {
-    let captures = meta_re.captures(line.trim())?;
-    let key = captures.get(1)?.as_str().to_lowercase();
-    let value = captures.get(2)?.as_str().trim().to_string();
-    Some((key, value))
-}
-
-fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
-    let mut meta = QueryMeta::default();
-    for line in lines {
-        let Some((key, raw_value)) = parse_meta_line(line, meta_re) else {
-            continue;
-        };
-        match key.as_str() {
-            "order_sensitive" => {
-                meta.order_sensitive = Some(parse_bool(&raw_value)?);
-            }
-            "float_epsilon" => {
-                let value: f64 = raw_value
-                    .parse()
-                    .with_context(|| format!("invalid float_epsilon: {}", raw_value))?;
-                if value <= 0.0 {
-                    bail!("float_epsilon must be > 0, got {}", value);
-                }
-                meta.float_epsilon = Some(value);
-            }
-            "db" => {
-                meta.db = Some(raw_value);
-            }
-            "expect_error" => {
-                meta.expect_error = Some(raw_value);
-            }
-            "result_contains" => {
-                meta.result_contains.push(raw_value);
-            }
-            "result_contains_any" => {
-                meta.result_contains_any.push(raw_value);
-            }
-            "result_not_contains" => {
-                meta.result_not_contains.push(raw_value);
-            }
-            "catalog" => {
-                bail!(
-                    "@catalog metadata is no longer supported; use suite init.sql metadata instead"
-                );
-            }
-            "tags" => {
-                meta.tags = raw_value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string)
-                    .collect();
-            }
-            "skip_result_check" => {
-                meta.skip_result_check = parse_bool(&raw_value)?;
-            }
-            "retry_count" => {
-                let value: usize = raw_value
-                    .parse()
-                    .with_context(|| format!("invalid retry_count: {}", raw_value))?;
-                if value == 0 {
-                    bail!("retry_count must be > 0, got {}", value);
-                }
-                meta.retry_count = Some(value);
-            }
-            "retry_interval_ms" => {
-                let value: u64 = raw_value
-                    .parse()
-                    .with_context(|| format!("invalid retry_interval_ms: {}", raw_value))?;
-                meta.retry_interval_ms = Some(value);
-            }
-            _ => {}
-        }
-    }
-    Ok(meta)
-}
-
-fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
-    QueryMeta {
-        order_sensitive: override_meta.order_sensitive.or(base.order_sensitive),
-        float_epsilon: override_meta.float_epsilon.or(base.float_epsilon),
-        db: override_meta.db.clone().or_else(|| base.db.clone()),
-        expect_error: override_meta
-            .expect_error
-            .clone()
-            .or_else(|| base.expect_error.clone()),
-        result_contains: if override_meta.result_contains.is_empty() {
-            base.result_contains.clone()
-        } else {
-            override_meta.result_contains.clone()
-        },
-        result_contains_any: if override_meta.result_contains_any.is_empty() {
-            base.result_contains_any.clone()
-        } else {
-            override_meta.result_contains_any.clone()
-        },
-        result_not_contains: if override_meta.result_not_contains.is_empty() {
-            base.result_not_contains.clone()
-        } else {
-            override_meta.result_not_contains.clone()
-        },
-        tags: if override_meta.tags.is_empty() {
-            base.tags.clone()
-        } else {
-            override_meta.tags.clone()
-        },
-        skip_result_check: override_meta.skip_result_check || base.skip_result_check,
-        retry_count: override_meta.retry_count.or(base.retry_count),
-        retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
-    }
-}
-
-fn extract_meta_and_sql(lines: &[String], meta_re: &Regex) -> Result<(QueryMeta, String)> {
-    let mut preface_meta_lines: Vec<String> = Vec::new();
-    let mut sql_lines: Vec<String> = Vec::new();
-    let mut started = false;
-
-    for line in lines {
-        let stripped = line.trim();
-        if !started {
-            if stripped.is_empty() {
-                continue;
-            }
-            if stripped.starts_with("--") {
-                preface_meta_lines.push(line.clone());
-                continue;
-            }
-            started = true;
-        }
-        sql_lines.push(line.trim_end().to_string());
-    }
-
-    let meta = parse_meta(&preface_meta_lines, meta_re)?;
-    let sql = sql_lines.join("\n").trim().to_string();
-    Ok((meta, sql))
-}
-
-fn extract_query_number(line: &str, marker_re: &Regex) -> Option<usize> {
-    let captures = marker_re.captures(line.trim())?;
-    captures.get(1)?.as_str().parse::<usize>().ok()
-}
-
-fn load_sql_case_from_file(
-    sql_path: &Path,
-    meta_re: &Regex,
-    marker_re: &Regex,
-    variables: &HashMap<String, String>,
-) -> Result<Option<SqlCase>> {
-    let base_name = sql_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid SQL file name: {}", sql_path.display()))?
-        .to_string();
-    let content = match fs::read_to_string(sql_path) {
-        Ok(c) => c,
-        Err(exc) => {
-            println!(
-                "Warning: failed to read SQL file {}: {}",
-                sql_path.display(),
-                exc
-            );
-            return Ok(None);
-        }
-    };
-    let case_variables = case_placeholder_variables(variables, &base_name);
-    let content = substitute_placeholders(
-        &content,
-        &case_variables,
-        &format!("{}: placeholder substitution", sql_path.display()),
-    )?;
-
-    let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let markers: Vec<(usize, usize)> = lines
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
-        .collect();
-    for (expected_idx, (_, query_number)) in markers.iter().enumerate() {
-        let expected_query_number = expected_idx + 1;
-        if *query_number != expected_query_number {
-            bail!(
-                "{}: expected marker '-- query {}', found '-- query {}'",
-                sql_path.display(),
-                expected_query_number,
-                query_number
-            );
-        }
-    }
-
-    let file_meta_lines = if let Some((first_marker_idx, _)) = markers.first() {
-        lines[..*first_marker_idx].to_vec()
-    } else {
-        lines.clone()
-    };
-    let (file_meta, _) = extract_meta_and_sql(&file_meta_lines, meta_re)
-        .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
-
-    let sections: Vec<(usize, Vec<String>)> = if markers.is_empty() {
-        vec![(1, lines.clone())]
-    } else {
-        markers
-            .iter()
-            .enumerate()
-            .map(|(idx, (start, query_number))| {
-                let end = markers
-                    .get(idx + 1)
-                    .map(|(next_start, _)| *next_start)
-                    .unwrap_or(lines.len());
-                (*query_number, lines[*start..end].to_vec())
-            })
-            .collect()
-    };
-
-    let mut steps = Vec::new();
-    for (query_number, section) in sections {
-        let section_id = if query_number == 1 {
-            base_name.as_str().to_string()
-        } else {
-            format!("{}-{}", base_name, query_number)
-        };
-
-        let (section_meta, sql) = extract_meta_and_sql(&section, meta_re).with_context(|| {
-            format!("{} ({}): invalid metadata", sql_path.display(), section_id)
-        })?;
-
-        if sql.is_empty() {
-            continue;
-        }
-
-        let merged_meta = merge_meta(&file_meta, &section_meta);
-        steps.push(SqlStep {
-            query_number,
-            sql,
-            meta: merged_meta,
-        });
-    }
-
-    if steps.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(SqlCase {
-        source_file: sql_path.to_path_buf(),
-        case_id: base_name,
-        steps,
-    }))
-}
-
-fn parse_suite_hook_meta(
-    lines: &[String],
-    meta_re: &Regex,
-) -> Result<(Option<String>, Option<String>)> {
-    let mut catalog = None;
-    let mut db = None;
-    for line in lines {
-        let Some((key, raw_value)) = parse_meta_line(line, meta_re) else {
-            continue;
-        };
-        match key.as_str() {
-            "catalog" => catalog = Some(raw_value),
-            "db" => db = Some(raw_value),
-            other => {
-                bail!(
-                    "unsupported suite hook metadata key '{}'; only @catalog and @db are allowed",
-                    other
-                );
-            }
-        }
-    }
-    Ok((catalog, db))
-}
-
-fn extract_suite_hook(
-    lines: &[String],
-    meta_re: &Regex,
-) -> Result<(Option<String>, Option<String>, String)> {
-    let mut preface_meta_lines: Vec<String> = Vec::new();
-    let mut sql_lines: Vec<String> = Vec::new();
-    let mut started = false;
-
-    for line in lines {
-        let stripped = line.trim();
-        if !started {
-            if stripped.is_empty() {
-                continue;
-            }
-            if stripped.starts_with("--") {
-                preface_meta_lines.push(line.clone());
-                continue;
-            }
-            started = true;
-        }
-        sql_lines.push(line.trim_end().to_string());
-    }
-
-    let (catalog, db) = parse_suite_hook_meta(&preface_meta_lines, meta_re)?;
-    let sql = sql_lines.join("\n").trim().to_string();
-    Ok((catalog, db, sql))
-}
-
-fn load_suite_hook(
-    hook_path: Option<&Path>,
-    meta_re: &Regex,
-    variables: &HashMap<String, String>,
-) -> Result<Option<SuiteHook>> {
-    let Some(path) = hook_path else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let content =
-        fs::read_to_string(path).with_context(|| format!("read failed: {}", path.display()))?;
-    let content = substitute_placeholders(
-        &content,
-        variables,
-        &format!("{}: placeholder substitution", path.display()),
-    )?;
-    let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-    let (catalog, db, sql) = extract_suite_hook(&lines, meta_re)
-        .with_context(|| format!("{}: invalid suite hook metadata", path.display()))?;
-    if sql.is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(SuiteHook {
-        path: path.to_path_buf(),
-        sql,
-        catalog,
-        db,
-    }))
-}
-
-fn parse_result_set(lines: &[String]) -> ResultSet {
-    let lines: Vec<String> = lines
-        .iter()
-        .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| !line.trim().is_empty())
-        .map(ToString::to_string)
-        .collect();
-
-    if lines.is_empty() {
-        return ResultSet::default();
-    }
-
-    let header = split_row(&lines[0]);
-    let rows = lines[1..].iter().map(|line| split_row(line)).collect();
-    ResultSet { header, rows }
-}
-
-fn render_result_set(header: &[String], rows: &[Vec<String>]) -> String {
-    if header.is_empty() && rows.is_empty() {
-        return String::new();
-    }
-
-    let mut out_lines = Vec::with_capacity(rows.len() + 1);
-    out_lines.push(header.join("\t"));
-    out_lines.extend(rows.iter().map(|row| row.join("\t")));
-    format!("{}\n", out_lines.join("\n"))
-}
-
-fn load_expected_results(
-    result_path: &Path,
-    multi_step: bool,
-    marker_re: &Regex,
-) -> Option<BTreeMap<usize, ResultSet>> {
-    let content = match fs::read_to_string(result_path) {
-        Ok(c) => c,
-        Err(exc) => {
-            println!(
-                "Warning: failed to load expected result from {}: {}",
-                result_path.display(),
-                exc
-            );
-            return None;
-        }
-    };
-
-    if multi_step {
-        let lines: Vec<String> = content.lines().map(ToString::to_string).collect();
-        let markers: Vec<(usize, usize)> = lines
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
-            .collect();
-        if markers.is_empty() {
-            println!(
-                "Warning: multi-step expected result must use '-- query N' sections: {}",
-                result_path.display()
-            );
-            return None;
-        }
-
-        let mut result_sets = BTreeMap::new();
-        for (idx, (start, query_number)) in markers.iter().enumerate() {
-            let end = markers
-                .get(idx + 1)
-                .map(|(next_start, _)| *next_start)
-                .unwrap_or(lines.len());
-            let body_lines = lines[start + 1..end].to_vec();
-            result_sets.insert(*query_number, parse_result_set(&body_lines));
-        }
-        return Some(result_sets);
-    }
-
-    let result_set =
-        parse_result_set(&content.lines().map(ToString::to_string).collect::<Vec<_>>());
-    Some(BTreeMap::from([(1usize, result_set)]))
-}
-
-fn write_result_file(
-    path: &Path,
-    result_sets: &BTreeMap<usize, ResultSet>,
-    multi_step: bool,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create parent dir failed: {}", parent.display()))?;
-    }
-
-    let content = if multi_step {
-        let mut blocks = Vec::new();
-        for (query_number, result_set) in result_sets {
-            let mut block = format!("-- query {}\n", query_number);
-            block.push_str(&render_result_set(&result_set.header, &result_set.rows));
-            blocks.push(block.trim_end_matches('\n').to_string());
-        }
-        if blocks.is_empty() {
-            String::new()
-        } else {
-            format!("{}\n", blocks.join("\n\n"))
-        }
-    } else {
-        let result_set = result_sets.get(&1).cloned().unwrap_or_default();
-        render_result_set(&result_set.header, &result_set.rows)
-    };
-
-    fs::write(path, content).with_context(|| format!("write file failed: {}", path.display()))?;
-    Ok(())
-}
-
-fn split_row(line: &str) -> Vec<String> {
-    line.split('\t').map(ToString::to_string).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        ResultSet, extract_suite_hook, is_transient_iceberg_commit_error, load_expected_results,
-        parse_output, parse_selector_list, substitute_placeholders, write_result_file,
-    };
-    use regex::Regex;
-    use std::collections::BTreeMap;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_result_path(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before unix epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "novarocks_sql_tests_{}_{}_{}.result",
-            name,
-            std::process::id(),
-            nanos
-        ))
-    }
-
-    #[test]
-    fn load_expected_result_accepts_empty_file() {
-        let path = temp_result_path("empty_load");
-        fs::write(&path, "\n").expect("write empty file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded =
-            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
-        let result_set = loaded.get(&1).expect("single-step result");
-        assert!(result_set.header.is_empty());
-        assert!(result_set.rows.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn write_result_file_persists_empty_result_set() {
-        let path = temp_result_path("empty_write");
-        write_result_file(&path, &BTreeMap::new(), false).expect("write empty result file");
-        let content = fs::read_to_string(&path).expect("read empty result file");
-        assert_eq!(content, "");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded =
-            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
-        let result_set = loaded.get(&1).expect("single-step result");
-        assert!(result_set.header.is_empty());
-        assert!(result_set.rows.is_empty());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn multi_step_result_round_trip() {
-        let path = temp_result_path("multi_step");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let result_sets = BTreeMap::from([
-            (
-                1usize,
-                ResultSet {
-                    header: vec!["count(*)".to_string()],
-                    rows: vec![vec!["1".to_string()]],
-                },
-            ),
-            (
-                3usize,
-                ResultSet {
-                    header: vec!["k1".to_string(), "c1".to_string()],
-                    rows: vec![vec!["1".to_string(), "2".to_string()]],
-                },
-            ),
-        ]);
-        write_result_file(&path, &result_sets, true).expect("write multi-step result file");
-        let loaded = load_expected_results(&path, true, &marker_re)
-            .expect("must parse multi-step result file");
-        assert_eq!(loaded, result_sets);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_expected_results_rejects_multi_step_without_markers() {
-        let path = temp_result_path("bad_multi_step");
-        fs::write(&path, "count(*)\n1\n").expect("write bad multi-step file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, true, &marker_re);
-        assert!(loaded.is_none());
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_expected_results_preserves_trailing_empty_columns() {
-        let path = temp_result_path("trailing_empty_columns");
-        fs::write(
-            &path,
-            "-- query 1\nField\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
-        )
-        .expect("write result file");
-        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, true, &marker_re).expect("load result");
-        assert_eq!(
-            loaded.get(&1).expect("query 1"),
-            &ResultSet {
-                header: vec![
-                    "Field".to_string(),
-                    "Type".to_string(),
-                    "Null".to_string(),
-                    "Key".to_string(),
-                    "Default".to_string(),
-                    "Extra".to_string(),
-                ],
-                rows: vec![vec![
-                    "event_day".to_string(),
-                    "date".to_string(),
-                    "YES".to_string(),
-                    "true".to_string(),
-                    "NULL".to_string(),
-                    String::new(),
-                ]],
-            }
-        );
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn parse_output_preserves_trailing_empty_columns() {
-        let (header, rows) = parse_output(
-            "Field\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
-        );
-        assert_eq!(
-            header,
-            vec![
-                "Field".to_string(),
-                "Type".to_string(),
-                "Null".to_string(),
-                "Key".to_string(),
-                "Default".to_string(),
-                "Extra".to_string(),
-            ]
-        );
-        assert_eq!(
-            rows,
-            vec![vec![
-                "event_day".to_string(),
-                "date".to_string(),
-                "YES".to_string(),
-                "true".to_string(),
-                "NULL".to_string(),
-                String::new(),
-            ]]
-        );
-    }
-
-    #[test]
-    fn selector_list_rejects_legacy_step_ids() {
-        let available_cases = std::collections::HashSet::from(["foo".to_string()]);
-        let err = parse_selector_list(Some("foo-2"), &available_cases, "--only")
-            .expect_err("legacy step id must fail");
-        assert!(err.to_string().contains("sub-query selectors"));
-    }
-
-    #[test]
-    fn transient_iceberg_commit_error_matches_missing_metadata() {
-        let message = "ERROR 1064 (HY000) at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
-        assert!(is_transient_iceberg_commit_error(message));
-    }
-
-    #[test]
-    fn transient_iceberg_commit_error_ignores_regular_failures() {
-        let message =
-            "ERROR 5904 (42000) at line 10: Warehouse default_warehouse is not available.";
-        assert!(!is_transient_iceberg_commit_error(message));
-    }
-
-    #[test]
-    fn suite_hook_extracts_catalog_override_and_sql() {
-        let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").expect("meta regex");
-        let raw = "-- @catalog=iceberg_cat_${uuid0}\n-- @db=tpch\nCREATE EXTERNAL CATALOG `iceberg_cat_${uuid0}`;";
-        let variables =
-            std::collections::HashMap::from([("uuid0".to_string(), "abc123".to_string())]);
-        let substituted =
-            substitute_placeholders(raw, &variables, "test suite hook").expect("substitute");
-        let lines: Vec<String> = substituted.lines().map(ToString::to_string).collect();
-        let (catalog, db, sql) = extract_suite_hook(&lines, &meta_re).expect("extract hook");
-
-        assert_eq!(catalog.as_deref(), Some("iceberg_cat_abc123"));
-        assert_eq!(db.as_deref(), Some("tpch"));
-        assert_eq!(sql, "CREATE EXTERNAL CATALOG `iceberg_cat_abc123`;");
-    }
-}
-
-fn parse_output(stdout: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let lines: Vec<&str> = stdout
-        .lines()
-        .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-
-    if lines.is_empty() {
-        return (vec![], vec![]);
-    }
-
-    let header = split_row(lines[0]);
-    let rows = lines[1..].iter().map(|line| split_row(line)).collect();
-    (header, rows)
-}
-
-fn render_output(header: &[String], rows: &[Vec<String>]) -> String {
-    let mut lines = Vec::new();
-    if !header.is_empty() {
-        lines.push(header.join("\t"));
-    }
-    lines.extend(rows.iter().map(|row| row.join("\t")));
-    lines.join("\n")
-}
-
-fn verify_text_assertions(step: &SqlStep, execution: &QueryExecution) -> (bool, String) {
-    let haystack = execution.text_output.as_str();
-    for needle in &step.meta.result_contains {
-        if !haystack.contains(needle) {
-            return (
-                false,
-                format!("result missing required substring {:?}", needle),
-            );
-        }
-    }
-    if !step.meta.result_contains_any.is_empty()
-        && !step
-            .meta
-            .result_contains_any
-            .iter()
-            .any(|needle| haystack.contains(needle))
-    {
-        return (
-            false,
-            format!(
-                "result missing all required substrings {:?}",
-                step.meta.result_contains_any
-            ),
-        );
-    }
-    for needle in &step.meta.result_not_contains {
-        if haystack.contains(needle) {
-            return (
-                false,
-                format!("result unexpectedly contains substring {:?}", needle),
-            );
-        }
-    }
-    (true, String::new())
-}
-
-fn parse_float(cell: &str) -> Option<f64> {
-    let value = cell.parse::<f64>().ok()?;
-    if value.is_finite() { Some(value) } else { None }
-}
-
-fn cell_equal(expected: &str, actual: &str, epsilon: Option<f64>) -> bool {
-    if expected == actual {
-        return true;
-    }
-    let Some(eps) = epsilon else {
-        return false;
-    };
-
-    let Some(left) = parse_float(expected) else {
-        return false;
-    };
-    let Some(right) = parse_float(actual) else {
-        return false;
-    };
-
-    (left - right).abs() <= eps
-}
-
-fn compare_headers(expected: &[String], actual: &[String]) -> (bool, String) {
-    if expected == actual {
-        (true, String::new())
-    } else {
-        (
-            false,
-            format!(
-                "header mismatch (actual={:?}, expected={:?})",
-                actual, expected
-            ),
-        )
-    }
-}
-
-fn compare_rows_ordered(
-    expected_rows: &[Vec<String>],
-    actual_rows: &[Vec<String>],
-    epsilon: Option<f64>,
-) -> (bool, String) {
-    if expected_rows.len() != actual_rows.len() {
-        return (
-            false,
-            format!(
-                "row count mismatch (actual={}, expected={})",
-                actual_rows.len(),
-                expected_rows.len()
-            ),
-        );
-    }
-
-    for (row_idx, (expected_row, actual_row)) in
-        expected_rows.iter().zip(actual_rows.iter()).enumerate()
-    {
-        if expected_row.len() != actual_row.len() {
-            return (
-                false,
-                format!(
-                    "column count mismatch at row {} (actual={}, expected={})",
-                    row_idx,
-                    actual_row.len(),
-                    expected_row.len()
-                ),
-            );
-        }
-
-        for (col_idx, (expected_cell, actual_cell)) in
-            expected_row.iter().zip(actual_row.iter()).enumerate()
-        {
-            if !cell_equal(expected_cell, actual_cell, epsilon) {
-                return (
-                    false,
-                    format!(
-                        "value mismatch at row {}, col {} (actual={}, expected={})",
-                        row_idx, col_idx, actual_cell, expected_cell
-                    ),
-                );
-            }
-        }
-    }
-
-    (true, String::new())
-}
-
-fn normalized_cell_for_sort(cell: &str, epsilon: Option<f64>) -> String {
-    let Some(eps) = epsilon else {
-        return format!("s:{}", cell);
-    };
-
-    let Some(value) = parse_float(cell) else {
-        return format!("s:{}", cell);
-    };
-
-    let bucket = (value / eps).round() as i64;
-    format!("f:{}", bucket)
-}
-
-fn compare_rows_unordered(
-    expected_rows: &[Vec<String>],
-    actual_rows: &[Vec<String>],
-    epsilon: Option<f64>,
-) -> (bool, String) {
-    if expected_rows.len() != actual_rows.len() {
-        return (
-            false,
-            format!(
-                "row count mismatch (actual={}, expected={})",
-                actual_rows.len(),
-                expected_rows.len()
-            ),
-        );
-    }
-
-    if epsilon.is_none() {
-        let mut expected_counter: HashMap<Vec<String>, usize> = HashMap::new();
-        let mut actual_counter: HashMap<Vec<String>, usize> = HashMap::new();
-
-        for row in expected_rows {
-            *expected_counter.entry(row.clone()).or_insert(0) += 1;
-        }
-        for row in actual_rows {
-            *actual_counter.entry(row.clone()).or_insert(0) += 1;
-        }
-
-        if expected_counter == actual_counter {
-            return (true, String::new());
-        }
-
-        let mut missing_detail = None;
-        for (row, count) in &expected_counter {
-            let actual_count = actual_counter.get(row).copied().unwrap_or(0);
-            if *count > actual_count {
-                missing_detail = Some(format!("missing row x{}: {:?}", count - actual_count, row));
-                break;
-            }
-        }
-
-        let mut extra_detail = None;
-        for (row, count) in &actual_counter {
-            let expected_count = expected_counter.get(row).copied().unwrap_or(0);
-            if *count > expected_count {
-                extra_detail = Some(format!(
-                    "unexpected row x{}: {:?}",
-                    count - expected_count,
-                    row
-                ));
-                break;
-            }
-        }
-
-        let mut details = Vec::new();
-        if let Some(d) = missing_detail {
-            details.push(d);
-        }
-        if let Some(d) = extra_detail {
-            details.push(d);
-        }
-
-        return (false, details.join("; "));
-    }
-
-    let mut expected_sorted = expected_rows.to_vec();
-    let mut actual_sorted = actual_rows.to_vec();
-
-    let sort_by_epsilon = |a: &Vec<String>, b: &Vec<String>| -> Ordering {
-        let ka: Vec<String> = a
-            .iter()
-            .map(|cell| normalized_cell_for_sort(cell, epsilon))
-            .collect();
-        let kb: Vec<String> = b
-            .iter()
-            .map(|cell| normalized_cell_for_sort(cell, epsilon))
-            .collect();
-        ka.cmp(&kb)
-    };
-
-    expected_sorted.sort_by(sort_by_epsilon);
-    actual_sorted.sort_by(sort_by_epsilon);
-    compare_rows_ordered(&expected_sorted, &actual_sorted, epsilon)
-}
-
-fn compare_result_sets(
-    expected_header: &[String],
-    expected_rows: &[Vec<String>],
-    actual_header: &[String],
-    actual_rows: &[Vec<String>],
-    order_sensitive: bool,
-    epsilon: Option<f64>,
-) -> (bool, String) {
-    let (ok, msg) = compare_headers(expected_header, actual_header);
-    if !ok {
-        return (false, msg);
-    }
-
-    if order_sensitive {
-        compare_rows_ordered(expected_rows, actual_rows, epsilon)
-    } else {
-        compare_rows_unordered(expected_rows, actual_rows, epsilon)
-    }
-}
-
-fn case_result_path(result_dir: &Path, case_id: &str) -> PathBuf {
-    result_dir.join(format!("{}.result", case_id))
-}
-
-fn find_legacy_result_paths(result_dir: &Path, case_id: &str) -> Result<Vec<PathBuf>> {
-    let prefix = format!("{}-", case_id);
-    let mut paths = Vec::new();
-    for entry in fs::read_dir(result_dir)
-        .with_context(|| format!("read dir failed: {}", result_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if file_name.starts_with(&prefix) && file_name.ends_with(".result") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn step_allows_missing_expected_result(step: &SqlStep) -> bool {
-    step.meta.expect_error.is_some()
-        || step.meta.skip_result_check
-        || !step.meta.result_contains.is_empty()
-        || !step.meta.result_contains_any.is_empty()
-        || !step.meta.result_not_contains.is_empty()
-        || step_has_implicit_skip_result(step)
-}
-
-fn step_requires_recorded_result(step: &SqlStep) -> bool {
-    !step_allows_missing_expected_result(step)
-}
-
-fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
-    let normalized = step
-        .sql
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    normalized.starts_with("refresh materialized view ") && normalized.contains(" with sync mode")
-}
-
-fn step_retry_count(step: &SqlStep) -> usize {
-    step.meta.retry_count.unwrap_or(1)
-}
-
-fn step_retry_interval(step: &SqlStep) -> Duration {
-    Duration::from_millis(step.meta.retry_interval_ms.unwrap_or(1000))
-}
-
-fn build_statements(
-    sql: &str,
-    query_timeout: u64,
-    catalog: Option<&str>,
-    db: Option<&str>,
-) -> String {
-    let mut statements = Vec::new();
-    if let Some(c) = catalog {
-        statements.push(format!("SET catalog {};", c));
-    }
-    if let Some(d) = db {
-        if !d.is_empty() {
-            statements.push(format!("USE {};", d));
-        }
-    }
-    statements.push(format!("SET query_timeout={};", query_timeout));
-    statements.push(sql.to_string());
-    statements.join("\n")
-}
-
-fn mysql_value_to_string(value: &MysqlValue) -> String {
-    match value {
-        MysqlValue::NULL => "NULL".to_string(),
-        MysqlValue::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        MysqlValue::Int(v) => v.to_string(),
-        MysqlValue::UInt(v) => v.to_string(),
-        MysqlValue::Float(v) => v.to_string(),
-        MysqlValue::Double(v) => v.to_string(),
-        MysqlValue::Date(year, mon, day, hour, min, sec, usec) => {
-            if *hour == 0 && *min == 0 && *sec == 0 && *usec == 0 {
-                format!("{year:04}-{mon:02}-{day:02}")
-            } else if *usec == 0 {
-                format!("{year:04}-{mon:02}-{day:02} {hour:02}:{min:02}:{sec:02}")
-            } else {
-                format!("{year:04}-{mon:02}-{day:02} {hour:02}:{min:02}:{sec:02}.{usec:06}")
-            }
-        }
-        MysqlValue::Time(is_neg, days, hours, mins, secs, usec) => {
-            let total_hours = days * 24 + u32::from(*hours);
-            let sign = if *is_neg { "-" } else { "" };
-            if *usec == 0 {
-                format!("{sign}{total_hours:02}:{mins:02}:{secs:02}")
-            } else {
-                format!("{sign}{total_hours:02}:{mins:02}:{secs:02}.{usec:06}")
-            }
-        }
-    }
-}
-
-fn mysql_row_to_strings(row: MysqlRow) -> Vec<String> {
-    (0..row.len())
-        .map(|idx| {
-            row.as_ref(idx)
-                .map(mysql_value_to_string)
-                .unwrap_or_else(|| "NULL".to_string())
-        })
-        .collect()
-}
-
-impl MysqlSession {
-    fn new(conn: &ConnectionConfig) -> Result<Self> {
-        let port = conn
-            .port
-            .parse::<u16>()
-            .with_context(|| format!("invalid mysql port: {}", conn.port))?;
-        let builder = OptsBuilder::new()
-            .ip_or_hostname(Some(conn.host.clone()))
-            .tcp_port(port)
-            .prefer_socket(false)
-            .user(Some(conn.user.clone()))
-            .pass(conn.password.clone());
-        let mut session = Self {
-            conn: MysqlConn::new(builder).with_context(|| {
-                format!(
-                    "failed to establish mysql protocol session to {}:{}",
-                    conn.host, conn.port
-                )
-            })?,
-        };
-
-        session.apply_base_context(conn)?;
-        Ok(session)
-    }
-
-    fn apply_base_context(&mut self, conn: &ConnectionConfig) -> Result<()> {
-        // Align sql-tests sessions with the default dev/test harness so FE planner timeouts do not
-        // dominate correctness runs under suite-wide load.
-        self.conn
-            .query_drop("SET new_planner_optimize_timeout = 10000")
-            .context("failed to set new_planner_optimize_timeout")?;
-        if let Some(catalog) = conn.catalog.as_deref() {
-            if !catalog.is_empty() {
-                self.conn
-                    .query_drop(format!("SET catalog {}", catalog))
-                    .with_context(|| format!("failed to set catalog {}", catalog))?;
-            }
-        }
-        if let Some(db) = conn.db.as_deref() {
-            if !db.is_empty() {
-                self.conn
-                    .query_drop(format!("USE {}", db))
-                    .with_context(|| format!("failed to USE {}", db))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn execute_query(
-        &mut self,
-        query_timeout: u64,
-        sql: &str,
-        db_override: Option<&str>,
-    ) -> (bool, Option<QueryExecution>, String) {
-        const MAX_TRANSIENT_ATTEMPTS: usize = 2;
-        const TRANSIENT_RETRY_DELAY_MS: u64 = 300;
-
-        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-            let started = Instant::now();
-            if let Some(db) = db_override {
-                if !db.is_empty() {
-                    if let Err(exc) = self.conn.query_drop(format!("USE {}", db)) {
-                        let elapsed = started.elapsed();
-                        return (
-                            false,
-                            None,
-                            format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
-                        );
-                    }
-                }
-            }
-
-            if let Err(exc) = self
-                .conn
-                .query_drop(format!("SET query_timeout={}", query_timeout))
-            {
-                let elapsed = started.elapsed();
-                return (
-                    false,
-                    None,
-                    format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
-                );
-            }
-
-            match self.conn.query_iter(sql) {
-                Ok(mut query_result) => {
-                    let mut last_header: Vec<String> = Vec::new();
-                    let mut last_rows: Vec<Vec<String>> = Vec::new();
-                    let mut saw_tabular_result = false;
-
-                    while let Some(mut result_set) = query_result.iter() {
-                        let header: Vec<String> = result_set
-                            .columns()
-                            .as_ref()
-                            .iter()
-                            .map(|column| column.name_str().to_string())
-                            .collect();
-                        let mut rows: Vec<Vec<String>> = Vec::new();
-
-                        for row_result in result_set.by_ref() {
-                            match row_result {
-                                Ok(row) => rows.push(mysql_row_to_strings(row)),
-                                Err(exc) => {
-                                    let elapsed = started.elapsed();
-                                    let message = exc.to_string();
-                                    let clipped = if message.len() > 500 {
-                                        message[..500].to_string()
-                                    } else {
-                                        message
-                                    };
-                                    return (
-                                        false,
-                                        None,
-                                        format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
-                                    );
-                                }
-                            }
-                        }
-
-                        if !header.is_empty() {
-                            saw_tabular_result = true;
-                            last_header = header;
-                            last_rows = rows;
-                        } else if !saw_tabular_result {
-                            last_header = header;
-                            last_rows = rows;
-                        }
-                    }
-
-                    let elapsed = started.elapsed();
-                    let execution = QueryExecution {
-                        text_output: render_output(&last_header, &last_rows),
-                        header: last_header,
-                        rows: last_rows,
-                        elapsed,
-                    };
-                    return (true, Some(execution), String::new());
-                }
-                Err(exc) => {
-                    let elapsed = started.elapsed();
-                    let message = exc.to_string();
-                    if attempt + 1 < MAX_TRANSIENT_ATTEMPTS
-                        && is_transient_iceberg_commit_error(&message)
-                    {
-                        std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
-                        continue;
-                    }
-                    let clipped = if message.len() > 500 {
-                        message[..500].to_string()
-                    } else {
-                        message
-                    };
-                    return (
-                        false,
-                        None,
-                        format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
-                    );
-                }
-            }
-        }
-
-        (
-            false,
-            None,
-            "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
-        )
-    }
-}
-
-fn run_mysql_sql(conn: &ConnectionConfig, sql: &str, skip_column_names: bool) -> Result<String> {
-    let mut cmd = Command::new(&conn.mysql);
-    cmd.arg(format!("-h{}", conn.host))
-        .arg(format!("-P{}", conn.port))
-        .arg(format!("-u{}", conn.user))
-        .arg("--batch")
-        .arg("--raw")
-        .arg("--default-character-set=utf8mb4");
-    if let Some(password) = conn.password.as_deref() {
-        if !password.is_empty() {
-            cmd.arg(format!("-p{}", password));
-        }
-    }
-    if skip_column_names {
-        cmd.arg("--skip-column-names");
-    }
-    cmd.arg("-e").arg(sql);
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("failed to execute mysql command: {}", conn.mysql))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        bail!("mysql command failed: {}", detail);
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-fn execute_suite_hook(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    hook: &SuiteHook,
-    label: &str,
-) -> Result<()> {
-    let sql = build_statements(&hook.sql, query_timeout, None, None);
-    run_mysql_sql(conn, &sql, true)
-        .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
-    Ok(())
-}
-
-fn case_auto_db_name(case_id: &str) -> String {
-    format!("db_sqlt_{}", stable_hash_hex(case_id))
-}
-
-fn reset_case_database(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-) -> Result<()> {
-    let sql = build_statements(
-        &format!(
-            "DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;"
-        ),
-        query_timeout,
-        None,
-        None,
-    );
-    run_mysql_sql(conn, &sql, true)
-        .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
-    Ok(())
-}
-
-fn drop_case_database(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    db_name: &str,
-    label: &str,
-) -> Result<()> {
-    let sql = build_statements(
-        &format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;"),
-        query_timeout,
-        None,
-        None,
-    );
-    run_mysql_sql(conn, &sql, true)
-        .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
-    Ok(())
-}
-
-fn execute_query(
-    conn: &ConnectionConfig,
-    query_timeout: u64,
-    sql: &str,
-) -> (bool, Option<QueryExecution>, String) {
-    let full_sql = build_statements(
-        sql,
-        query_timeout,
-        conn.catalog.as_deref(),
-        conn.db.as_deref(),
-    );
-
-    const MAX_TRANSIENT_ATTEMPTS: usize = 2;
-    const TRANSIENT_RETRY_DELAY_MS: u64 = 300;
-
-    for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-        let started = Instant::now();
-        let output = match Command::new(&conn.mysql)
-            .arg(format!("-h{}", conn.host))
-            .arg(format!("-P{}", conn.port))
-            .arg(format!("-u{}", conn.user))
-            .arg("--batch")
-            .arg("--raw")
-            .arg("--default-character-set=utf8mb4")
-            .args(
-                conn.password
-                    .as_deref()
-                    .filter(|password| !password.is_empty())
-                    .map(|password| vec![format!("-p{}", password)])
-                    .unwrap_or_default(),
-            )
-            .arg("-e")
-            .arg(&full_sql)
-            .output()
-        {
-            Ok(out) => out,
-            Err(exc) => {
-                let elapsed = started.elapsed();
-                return (
-                    false,
-                    None,
-                    format!("ERROR ({:.2}s): {}", elapsed.as_secs_f64(), exc),
-                );
-            }
-        };
-
-        let elapsed = started.elapsed();
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let (header, rows) = parse_output(&stdout);
-            let execution = QueryExecution {
-                text_output: render_output(&header, &rows),
-                header,
-                rows,
-                elapsed,
-            };
-            return (true, Some(execution), String::new());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if !stderr.is_empty() { stderr } else { stdout };
-        if attempt + 1 < MAX_TRANSIENT_ATTEMPTS && is_transient_iceberg_commit_error(&message) {
-            std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
-            continue;
-        }
-
-        let clipped = if message.len() > 500 {
-            message[..500].to_string()
-        } else {
-            message
-        };
-        return (
-            false,
-            None,
-            format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
-        );
-    }
-
-    (
-        false,
-        None,
-        "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
-    )
-}
-
-fn error_message_matches(actual: &str, expected_substring: &str) -> bool {
-    if expected_substring.trim().is_empty() {
-        return false;
-    }
-    actual
-        .to_ascii_lowercase()
-        .contains(&expected_substring.to_ascii_lowercase())
-}
-
-fn is_transient_iceberg_commit_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("metadata file for version")
-        && lower.contains("is missing under")
-        && lower.contains("/metadata")
-}
-
-fn parse_selector_list(
-    value: Option<&str>,
-    available_case_ids: &HashSet<String>,
-    flag_name: &str,
-) -> Result<HashSet<String>> {
-    let selectors: HashSet<String> = value
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-        .collect();
-
-    for selector in &selectors {
-        if available_case_ids.contains(selector) {
-            continue;
-        }
-        let Some((candidate_case_id, candidate_step)) = selector.rsplit_once('-') else {
-            continue;
-        };
-        if candidate_step.parse::<usize>().is_ok() && available_case_ids.contains(candidate_case_id)
-        {
-            bail!(
-                "{} no longer supports sub-query selectors like '{}'; use '{}' instead",
-                flag_name,
-                selector,
-                candidate_case_id
-            );
-        }
-    }
-
-    Ok(selectors)
-}
-
-fn suite_sql_glob(suite_name: &str) -> String {
-    if suite_name == "tpc-h" || suite_name == "tpc-ds" {
-        "q*.sql".to_string()
-    } else {
-        "*.sql".to_string()
-    }
-}
-
-fn suite_default_db(suite_name: &str) -> String {
-    match suite_name {
-        "ssb" => "ssb".to_string(),
-        "tpc-h" => "tpch".to_string(),
-        "tpc-ds" => "tpcds".to_string(),
-        _ => String::new(),
-    }
-}
-
-fn suite_default_catalog(suite_name: &str) -> String {
-    let _ = suite_name;
-    "default_catalog".to_string()
-}
-
-fn suite_auto_case_db(suite_name: &str) -> bool {
-    matches!(suite_name, "materialized-view")
-}
-
-fn suite_default_query_timeout(suite_name: &str) -> u64 {
-    match suite_name {
-        "materialized-view" => 300,
-        _ => 120,
-    }
-}
-
-fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>> {
-    let sql_tests_dir = base_dir.join("sql-tests");
-    let entries = fs::read_dir(&sql_tests_dir)
-        .with_context(|| format!("failed to read {}", sql_tests_dir.display()))?;
-
-    let mut suite_configs: BTreeMap<String, SuiteConfig> = BTreeMap::new();
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('_') || name == "rust" {
-            continue;
-        }
-
-        let sql_dir = path.join("sql");
-        if !sql_dir.exists() || !sql_dir.is_dir() {
-            continue;
-        }
-
-        let config = SuiteConfig {
-            name: name.clone(),
-            sql_dir,
-            result_dir: Some(path.join("result")),
-            sql_glob: suite_sql_glob(&name),
-            default_catalog: suite_default_catalog(&name),
-            default_db: suite_default_db(&name),
-            auto_case_db: suite_auto_case_db(&name),
-            verify_default: true,
-            init_sql: path
-                .join("init.sql")
-                .exists()
-                .then(|| path.join("init.sql")),
-            cleanup_sql: path
-                .join("cleanup.sql")
-                .exists()
-                .then(|| path.join("cleanup.sql")),
-        };
-        suite_configs.insert(name, config);
-    }
-
-    Ok(suite_configs)
-}
-
-fn wildcard_match(name: &str, pattern: &str) -> bool {
-    if pattern == "*.sql" {
-        return name.ends_with(".sql");
-    }
-    if pattern == "q*.sql" {
-        return name.starts_with('q') && name.ends_with(".sql");
-    }
-
-    let escaped = regex::escape(pattern)
-        .replace("\\*", ".*")
-        .replace("\\?", ".");
-    let expr = format!("^{}$", escaped);
-    Regex::new(&expr)
-        .map(|re| re.is_match(name))
-        .unwrap_or(false)
-}
-
-fn list_sql_files(sql_dir: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    for entry in
-        fs::read_dir(sql_dir).with_context(|| format!("read dir failed: {}", sql_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if wildcard_match(name, pattern) {
-            files.push(path);
-        }
-    }
-    files.sort();
-    Ok(files)
-}
-
-fn summarize_connection(label: &str, conn: &ConnectionConfig) -> String {
-    let catalog = conn.catalog.as_deref().unwrap_or("");
-    let db = conn.db.as_deref().unwrap_or("");
-    format!(
-        "{}: mysql={}, host={}:{}, user={}, catalog={}, db={}",
-        label, conn.mysql, conn.host, conn.port, conn.user, catalog, db
-    )
 }
 
 fn query_order_sensitive(step: &SqlStep, cli: &Cli) -> bool {
@@ -2048,60 +174,6 @@ fn query_db(step: &SqlStep, fallback: Option<&str>) -> Option<String> {
         .db
         .clone()
         .or_else(|| fallback.map(ToString::to_string))
-}
-
-fn write_mismatch_artifacts(
-    root_dir: &Path,
-    suite_name: &str,
-    artifact_id: &str,
-    expected_header: &[String],
-    expected_rows: &[Vec<String>],
-    actual_header: &[String],
-    actual_rows: &[Vec<String>],
-    reason: &str,
-) -> Result<()> {
-    let out_dir = root_dir.join(suite_name).join(artifact_id);
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("create dir failed: {}", out_dir.display()))?;
-
-    let expected = BTreeMap::from([(
-        1usize,
-        ResultSet {
-            header: expected_header.to_vec(),
-            rows: expected_rows.to_vec(),
-        },
-    )]);
-    let actual = BTreeMap::from([(
-        1usize,
-        ResultSet {
-            header: actual_header.to_vec(),
-            rows: actual_rows.to_vec(),
-        },
-    )]);
-
-    write_result_file(&out_dir.join("expected.tsv"), &expected, false)?;
-    write_result_file(&out_dir.join("actual.tsv"), &actual, false)?;
-    fs::write(out_dir.join("diff.txt"), format!("{}\n", reason))
-        .with_context(|| format!("write diff failed: {}", out_dir.display()))?;
-    Ok(())
-}
-
-fn verify_override(cli: &Cli) -> Option<bool> {
-    if cli.verify {
-        Some(true)
-    } else if cli.no_verify {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn mode_name(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Verify => "verify",
-        Mode::Record => "record",
-        Mode::Diff => "diff",
-    }
 }
 
 fn main() -> Result<()> {
@@ -2302,7 +374,7 @@ fn main() -> Result<()> {
     let mut cases: Vec<SqlCase> = Vec::new();
 
     for sql_file in sql_files {
-        match load_sql_case_from_file(&sql_file, &meta_re, &marker_re, &placeholder_vars) {
+        match parser::load_sql_case_from_file(&sql_file, &meta_re, &marker_re, &placeholder_vars) {
             Ok(Some(case)) => cases.push(case),
             Ok(None) => {
                 println!(
@@ -2660,11 +732,17 @@ fn main() -> Result<()> {
                     let mut last_failure = String::new();
 
                     for attempt in 0..retry_count {
-                        let (ok, execution, err_msg) = target_session.execute_query(
-                            query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                        );
+                        let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
+                            let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                            let exec = shell::execute_shell_command(cmd);
+                            (true, Some(exec), String::new())
+                        } else {
+                            target_session.execute_query(
+                                query_timeout,
+                                &step.sql,
+                                step.meta.db.as_deref(),
+                            )
+                        };
                         let elapsed = execution
                             .as_ref()
                             .map(|result| result.elapsed)
@@ -2836,11 +914,21 @@ fn main() -> Result<()> {
 
                     for attempt in 0..retry_count {
                         let (ok, execution, err_msg) = if cli.record_from == RecordFrom::Target {
-                            target_session.execute_query(
-                                query_timeout,
-                                &step.sql,
-                                step.meta.db.as_deref(),
-                            )
+                            if shell::is_shell_step(&step.sql) {
+                                let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                                let exec = shell::execute_shell_command(cmd);
+                                (true, Some(exec), String::new())
+                            } else {
+                                target_session.execute_query(
+                                    query_timeout,
+                                    &step.sql,
+                                    step.meta.db.as_deref(),
+                                )
+                            }
+                        } else if shell::is_shell_step(&step.sql) {
+                            let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                            let exec = shell::execute_shell_command(cmd);
+                            (true, Some(exec), String::new())
                         } else {
                             reference_session
                                 .as_mut()
@@ -2936,19 +1024,31 @@ fn main() -> Result<()> {
                 }
                 Mode::Diff => {
                     if let Some(expected_error) = step.meta.expect_error.as_deref() {
-                        let (ok_t, execution_t, err_t) = target_session.execute_query(
-                            query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                        );
-                        let (ok_r, execution_r, err_r) = reference_session
-                            .as_mut()
-                            .expect("reference session required in diff mode")
-                            .execute_query(
+                        let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
+                            let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                            let exec = shell::execute_shell_command(cmd);
+                            (true, Some(exec), String::new())
+                        } else {
+                            target_session.execute_query(
                                 query_timeout,
                                 &step.sql,
                                 step.meta.db.as_deref(),
-                            );
+                            )
+                        };
+                        let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
+                            let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                            let exec = shell::execute_shell_command(cmd);
+                            (true, Some(exec), String::new())
+                        } else {
+                            reference_session
+                                .as_mut()
+                                .expect("reference session required in diff mode")
+                                .execute_query(
+                                    query_timeout,
+                                    &step.sql,
+                                    step.meta.db.as_deref(),
+                                )
+                        };
                         let elapsed = execution_t
                             .as_ref()
                             .map(|result| result.elapsed)
@@ -2976,24 +1076,36 @@ fn main() -> Result<()> {
                             );
                         }
                     } else {
-                        let (ok_t, execution_t, err_t) = target_session.execute_query(
-                            query_timeout,
-                            &step.sql,
-                            step.meta.db.as_deref(),
-                        );
+                        let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
+                            let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                            let exec = shell::execute_shell_command(cmd);
+                            (true, Some(exec), String::new())
+                        } else {
+                            target_session.execute_query(
+                                query_timeout,
+                                &step.sql,
+                                step.meta.db.as_deref(),
+                            )
+                        };
                         if !ok_t || execution_t.is_none() {
                             case_failed = true;
                             println!("    ❌ target execute failed: {}", err_t);
                         } else {
                             let execution_t = execution_t.expect("checked above");
-                            let (ok_r, execution_r, err_r) = reference_session
-                                .as_mut()
-                                .expect("reference session required in diff mode")
-                                .execute_query(
-                                    query_timeout,
-                                    &step.sql,
-                                    step.meta.db.as_deref(),
-                                );
+                            let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
+                                let cmd = step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                                let exec = shell::execute_shell_command(cmd);
+                                (true, Some(exec), String::new())
+                            } else {
+                                reference_session
+                                    .as_mut()
+                                    .expect("reference session required in diff mode")
+                                    .execute_query(
+                                        query_timeout,
+                                        &step.sql,
+                                        step.meta.db.as_deref(),
+                                    )
+                            };
                             if !ok_r || execution_r.is_none() {
                                 case_failed = true;
                                 case_elapsed += execution_t.elapsed;
@@ -3162,4 +1274,196 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::parser::extract_suite_hook;
+    use crate::results::{load_expected_results, parse_output, write_result_file};
+    use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
+    use crate::config::substitute_placeholders;
+    use crate::types::ResultSet;
+    use regex::Regex;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_result_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "novarocks_sql_tests_{}_{}_{}.result",
+            name,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[test]
+    fn load_expected_result_accepts_empty_file() {
+        let path = temp_result_path("empty_load");
+        fs::write(&path, "\n").expect("write empty file");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded =
+            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
+        let result_set = loaded.get(&1).expect("single-step result");
+        assert!(result_set.header.is_empty());
+        assert!(result_set.rows.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_result_file_persists_empty_result_set() {
+        let path = temp_result_path("empty_write");
+        write_result_file(&path, &BTreeMap::new(), false).expect("write empty result file");
+        let content = fs::read_to_string(&path).expect("read empty result file");
+        assert_eq!(content, "");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded =
+            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
+        let result_set = loaded.get(&1).expect("single-step result");
+        assert!(result_set.header.is_empty());
+        assert!(result_set.rows.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_step_result_round_trip() {
+        let path = temp_result_path("multi_step");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let result_sets = BTreeMap::from([
+            (
+                1usize,
+                ResultSet {
+                    header: vec!["count(*)".to_string()],
+                    rows: vec![vec!["1".to_string()]],
+                },
+            ),
+            (
+                3usize,
+                ResultSet {
+                    header: vec!["k1".to_string(), "c1".to_string()],
+                    rows: vec![vec!["1".to_string(), "2".to_string()]],
+                },
+            ),
+        ]);
+        write_result_file(&path, &result_sets, true).expect("write multi-step result file");
+        let loaded = load_expected_results(&path, true, &marker_re)
+            .expect("must parse multi-step result file");
+        assert_eq!(loaded, result_sets);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_expected_results_rejects_multi_step_without_markers() {
+        let path = temp_result_path("bad_multi_step");
+        fs::write(&path, "count(*)\n1\n").expect("write bad multi-step file");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded = load_expected_results(&path, true, &marker_re);
+        assert!(loaded.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_expected_results_preserves_trailing_empty_columns() {
+        let path = temp_result_path("trailing_empty_columns");
+        fs::write(
+            &path,
+            "-- query 1\nField\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
+        )
+        .expect("write result file");
+        let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
+        let loaded = load_expected_results(&path, true, &marker_re).expect("load result");
+        assert_eq!(
+            loaded.get(&1).expect("query 1"),
+            &ResultSet {
+                header: vec![
+                    "Field".to_string(),
+                    "Type".to_string(),
+                    "Null".to_string(),
+                    "Key".to_string(),
+                    "Default".to_string(),
+                    "Extra".to_string(),
+                ],
+                rows: vec![vec![
+                    "event_day".to_string(),
+                    "date".to_string(),
+                    "YES".to_string(),
+                    "true".to_string(),
+                    "NULL".to_string(),
+                    String::new(),
+                ]],
+            }
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parse_output_preserves_trailing_empty_columns() {
+        let (header, rows) = parse_output(
+            "Field\tType\tNull\tKey\tDefault\tExtra\nevent_day\tdate\tYES\ttrue\tNULL\t\n",
+        );
+        assert_eq!(
+            header,
+            vec![
+                "Field".to_string(),
+                "Type".to_string(),
+                "Null".to_string(),
+                "Key".to_string(),
+                "Default".to_string(),
+                "Extra".to_string(),
+            ]
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                "event_day".to_string(),
+                "date".to_string(),
+                "YES".to_string(),
+                "true".to_string(),
+                "NULL".to_string(),
+                String::new(),
+            ]]
+        );
+    }
+
+    #[test]
+    fn selector_list_rejects_legacy_step_ids() {
+        let available_cases = std::collections::HashSet::from(["foo".to_string()]);
+        let err = parse_selector_list(Some("foo-2"), &available_cases, "--only")
+            .expect_err("legacy step id must fail");
+        assert!(err.to_string().contains("sub-query selectors"));
+    }
+
+    #[test]
+    fn transient_iceberg_commit_error_matches_missing_metadata() {
+        let message = "ERROR 1064 (HY000) at line 11: Metadata file for version 2 is missing under file:/tmp/table/metadata";
+        assert!(is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn transient_iceberg_commit_error_ignores_regular_failures() {
+        let message =
+            "ERROR 5904 (42000) at line 10: Warehouse default_warehouse is not available.";
+        assert!(!is_transient_iceberg_commit_error(message));
+    }
+
+    #[test]
+    fn suite_hook_extracts_catalog_override_and_sql() {
+        let meta_re = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").expect("meta regex");
+        let raw = "-- @catalog=iceberg_cat_${uuid0}\n-- @db=tpch\nCREATE EXTERNAL CATALOG `iceberg_cat_${uuid0}`;";
+        let variables =
+            std::collections::HashMap::from([("uuid0".to_string(), "abc123".to_string())]);
+        let substituted =
+            substitute_placeholders(raw, &variables, "test suite hook").expect("substitute");
+        let lines: Vec<String> = substituted.lines().map(ToString::to_string).collect();
+        let (catalog, db, sql) = extract_suite_hook(&lines, &meta_re).expect("extract hook");
+
+        assert_eq!(catalog.as_deref(), Some("iceberg_cat_abc123"));
+        assert_eq!(db.as_deref(), Some("tpch"));
+        assert_eq!(sql, "CREATE EXTERNAL CATALOG `iceberg_cat_abc123`;");
+    }
 }

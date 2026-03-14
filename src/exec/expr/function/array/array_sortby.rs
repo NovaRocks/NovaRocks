@@ -172,7 +172,10 @@ pub fn eval_array_sortby(
             let key_end = key_offsets[key_row + 1] as usize;
             let key_len = key_end.saturating_sub(key_start);
             if src_len != key_len {
-                return Err("Input arrays' size are not equal in array_sortby.".to_string());
+                return Err(
+                    "Expr evaluate meet error: Input arrays' size are not equal in array_sortby."
+                        .to_string(),
+                );
             }
             key_starts.push(Some(key_start));
         }

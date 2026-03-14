@@ -203,8 +203,13 @@ pub(crate) fn execute_alter_tablet_task(request: &TAlterTabletReqV2) -> Result<(
         "schema_change resolved target schema"
     );
 
-    ensure_non_primary_keys_schema(&base_read_schema, "base_tablet_read_schema")?;
-    ensure_non_primary_keys_schema(&new_schema, "new_tablet_schema")?;
+    if alter_mode == AlterMode::SchemaChange {
+        ensure_schema_change_base_supported(
+            &base_read_schema,
+            &base_metadata,
+            "base_tablet_read_schema",
+        )?;
+    }
 
     let base_ctx = TabletWriteContext {
         db_id: 0,
@@ -667,17 +672,30 @@ fn resolve_tablet_location(
     }
 }
 
-fn ensure_non_primary_keys_schema(schema: &TabletSchemaPb, context: &str) -> Result<(), String> {
+fn ensure_schema_change_base_supported(
+    schema: &TabletSchemaPb,
+    metadata: &TabletMetadataPb,
+    context: &str,
+) -> Result<(), String> {
     let keys_type_raw = schema
         .keys_type
         .ok_or_else(|| format!("{context} missing keys_type"))?;
     let keys_type = KeysType::try_from(keys_type_raw)
         .map_err(|_| format!("{context} has unknown keys_type={keys_type_raw}"))?;
-    if keys_type == KeysType::PrimaryKeys {
+    if keys_type != KeysType::PrimaryKeys {
+        return Ok(());
+    }
+
+    let has_delvec_meta = metadata.delvec_meta.as_ref().is_some_and(|delvec_meta| {
+        !delvec_meta.version_to_file.is_empty() || !delvec_meta.delvecs.is_empty()
+    });
+    let has_rowset_del_files = metadata.rowsets.iter().any(|rowset| !rowset.del_files.is_empty());
+    if has_delvec_meta || has_rowset_del_files {
         return Err(format!(
-            "{context} PRIMARY_KEYS is unsupported for SCHEMA_CHANGE V1"
+            "{context} PRIMARY_KEYS with delete vectors is unsupported for SCHEMA_CHANGE V1"
         ));
     }
+
     Ok(())
 }
 
@@ -1630,8 +1648,9 @@ fn write_schema_change_txn_log(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_rollup_expr_input, is_expected_initial_metadata_without_schema,
-        resolve_target_schema, schemas_equivalent, should_patch_initial_metadata_schema,
+        build_rollup_expr_input, ensure_schema_change_base_supported,
+        is_expected_initial_metadata_without_schema, resolve_target_schema, schemas_equivalent,
+        should_patch_initial_metadata_schema, transform_rowset_batch_schema_change,
     };
     use crate::agent_service::TAlterTabletReqV2;
     use crate::connector::starrocks::lake::context::PartialUpdateWritePolicy;
@@ -1640,7 +1659,8 @@ mod tests {
     };
     use crate::descriptors;
     use crate::service::grpc_client::proto::starrocks::{
-        ColumnPb, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
+        ColumnPb, DelfileWithRowsetId, KeysType, RowsetMetadataPb, TabletMetadataPb,
+        TabletSchemaPb,
     };
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1847,6 +1867,85 @@ mod tests {
         assert_eq!(input.chunk.schema().field(0).name(), "k1");
         assert_eq!(input.chunk.schema().field(0).data_type(), &DataType::Int32);
         assert!(!input.chunk.chunk_schema().slots()[0].nullable());
+    }
+
+    #[test]
+    fn schema_change_allows_primary_keys_without_delete_vectors() {
+        let mut schema = test_schema(
+            1,
+            vec![
+                test_scalar_column(10, "k1", "BIGINT"),
+                test_scalar_column(11, "v1", "CHAR"),
+            ],
+        );
+        schema.keys_type = Some(KeysType::PrimaryKeys as i32);
+        schema.column[0].is_key = Some(true);
+        let metadata = TabletMetadataPb::default();
+
+        ensure_schema_change_base_supported(&schema, &metadata, "base_tablet_read_schema")
+            .expect("primary key schema without delete vectors should be supported");
+    }
+
+    #[test]
+    fn schema_change_rejects_primary_keys_with_delete_files() {
+        let mut schema = test_schema(
+            1,
+            vec![
+                test_scalar_column(10, "k1", "BIGINT"),
+                test_scalar_column(11, "v1", "CHAR"),
+            ],
+        );
+        schema.keys_type = Some(KeysType::PrimaryKeys as i32);
+        schema.column[0].is_key = Some(true);
+        let metadata = TabletMetadataPb {
+            rowsets: vec![RowsetMetadataPb {
+                del_files: vec![DelfileWithRowsetId {
+                    name: Some("d0.del".to_string()),
+                    origin_rowset_id: Some(1),
+                    op_offset: Some(1),
+                    shared: Some(false),
+                    encryption_meta: Some(Vec::new()),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let err = ensure_schema_change_base_supported(&schema, &metadata, "base_tablet_read_schema")
+            .expect_err("delete files must keep primary key schema change fail-fast");
+        assert!(
+            err.contains("delete vectors"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_change_transforms_primary_key_batches_without_rejection() {
+        let mut schema = test_schema(
+            1,
+            vec![
+                test_scalar_column(10, "k1", "BIGINT"),
+                test_scalar_column(11, "v1", "CHAR"),
+            ],
+        );
+        schema.keys_type = Some(KeysType::PrimaryKeys as i32);
+        schema.column[0].is_key = Some(true);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int32, false),
+                Field::new("v1", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(arrow::array::StringArray::from(vec![Some("1"), Some("2")])),
+            ],
+        )
+        .expect("source batch");
+
+        let transformed =
+            transform_rowset_batch_schema_change(&batch, &schema, &schema, 0).expect("transform");
+        assert_eq!(transformed.num_rows(), 2);
+        assert_eq!(transformed.num_columns(), 2);
     }
 
     fn test_schema(schema_id: i64, columns: Vec<ColumnPb>) -> TabletSchemaPb {

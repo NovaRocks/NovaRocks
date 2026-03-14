@@ -20,8 +20,8 @@ use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray,
-    StringArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, make_array,
+    MapArray, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, make_array,
 };
 use arrow::datatypes::DataType;
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -35,7 +35,6 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 
 const CRC_HASH_SEED1: u32 = 0x811C9DC5;
-const FNV_PRIME: u32 = 0x0100_0193;
 const PHMAP_K: u64 = 0xde5fb9d2630458e9;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +52,7 @@ enum IntersectValue {
     Date(i32),
     Decimal(i128),
     Ts(i64),
+    GenericHash(u64),
 }
 
 impl Hash for IntersectValue {
@@ -70,6 +70,7 @@ impl Hash for IntersectValue {
             Self::Str(v) => state.write(v.as_bytes()),
             Self::Date(v) => state.write_i32(*v),
             Self::Ts(v) => state.write_i64(*v),
+            Self::GenericHash(v) => state.write_u64(*v),
         }
     }
 }
@@ -171,14 +172,6 @@ fn decimalv2_std_hash(value: i128) -> u32 {
     decimalv2_crc_hash(value)
 }
 
-fn decimalv2_fnv_hash(value: i128) -> u32 {
-    let mut hash = 0u32;
-    for byte in value.to_ne_bytes() {
-        hash = (u32::from(byte) ^ hash).wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
 fn decimalv2_crc_hash(value: i128) -> u32 {
     let bytes = value.to_ne_bytes();
     let mut hash = 0u32;
@@ -277,11 +270,202 @@ fn value_key(values: &ArrayRef, idx: usize) -> Result<IntersectValue, String> {
                 .map_err(|e| format!("array_intersect LARGEINT decode failed: {e}"))?;
             Ok(IntersectValue::LargeInt(decoded))
         }
-        other => Err(format!(
-            "array_intersect unsupported hash key type: {:?}",
-            other
-        )),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
+            Ok(IntersectValue::GenericHash(hash_complex_value(values, idx)?))
+        }
+        other => Err(format!("array_intersect unsupported hash key type: {:?}", other)),
     }
+}
+
+fn hash_complex_value(values: &ArrayRef, idx: usize) -> Result<u64, String> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hash_complex_value_impl(values, idx, &mut hasher)?;
+    Ok(hasher.finish())
+}
+
+fn hash_complex_value_impl(
+    values: &ArrayRef,
+    idx: usize,
+    hasher: &mut std::collections::hash_map::DefaultHasher,
+) -> Result<(), String> {
+    if values.is_null(idx) {
+        0u8.hash(hasher);
+        return Ok(());
+    }
+    1u8.hash(hasher);
+    values.data_type().hash(hasher);
+    match values.data_type() {
+        DataType::Boolean => {
+            values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Int8 => {
+            values
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Int16 => {
+            values
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Int32 => {
+            values
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Int64 => {
+            values
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Float32 => {
+            values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?
+                .value(idx)
+                .to_bits()
+                .hash(hasher);
+        }
+        DataType::Float64 => {
+            values
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?
+                .value(idx)
+                .to_bits()
+                .hash(hasher);
+        }
+        DataType::Utf8 => {
+            values
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "failed to downcast to StringArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Date32 => {
+            values
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Decimal128(_, _) => {
+            values
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None) => {
+            values
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None) => {
+            values
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None) => {
+            values
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None) => {
+            values
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            values
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?
+                .value(idx)
+                .hash(hasher);
+        }
+        DataType::List(_) => {
+            let list = values
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
+            let offsets = list.value_offsets();
+            let start = offsets[idx] as usize;
+            let end = offsets[idx + 1] as usize;
+            end.saturating_sub(start).hash(hasher);
+            let child_values = list.values();
+            for i in start..end {
+                hash_complex_value_impl(&child_values, i, hasher)?;
+            }
+        }
+        DataType::Struct(_) => {
+            let s = values
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| "failed to downcast to StructArray".to_string())?;
+            s.num_columns().hash(hasher);
+            for col_idx in 0..s.num_columns() {
+                hash_complex_value_impl(s.column(col_idx), idx, hasher)?;
+            }
+        }
+        DataType::Map(_, _) => {
+            let map = values
+                .as_any()
+                .downcast_ref::<MapArray>()
+                .ok_or_else(|| "failed to downcast to MapArray".to_string())?;
+            let offsets = map.value_offsets();
+            let start = offsets[idx] as usize;
+            let end = offsets[idx + 1] as usize;
+            end.saturating_sub(start).hash(hasher);
+            let keys = map.keys();
+            let vals = map.values();
+            for i in start..end {
+                hash_complex_value_impl(&keys, i, hasher)?;
+                hash_complex_value_impl(&vals, i, hasher)?;
+            }
+        }
+        other => return Err(format!("array_intersect hash unsupported type: {:?}", other)),
+    }
+    Ok(())
+}
+
+fn intersect_hash(value: &IntersectValue) -> u64 {
+    let mut hasher = PhmapCompatHasher::default();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub fn eval_array_intersect(
@@ -369,7 +553,7 @@ pub fn eval_array_intersect(
         let mut has_null_in_all = false;
         let mut row_map = HashMap::<
             IntersectValue,
-            (usize, usize),
+            (usize, usize, u64),
             BuildHasherDefault<PhmapCompatHasher>,
         >::default();
         for idx in first_start..first_end {
@@ -378,7 +562,8 @@ pub fn eval_array_intersect(
                 continue;
             }
             let key = value_key(&value_arrays[0], idx)?;
-            row_map.entry(key).or_insert((0, idx));
+            let order_key = intersect_hash(&key) & 31;
+            row_map.entry(key).or_insert((0, idx, order_key));
         }
 
         for array_idx in 1..list_arrays.len() {
@@ -397,7 +582,7 @@ pub fn eval_array_intersect(
                     continue;
                 }
                 let key = value_key(&value_arrays[array_idx], idx)?;
-                if let Some((overlap_times, _)) = row_map.get_mut(&key)
+                if let Some((overlap_times, _, _)) = row_map.get_mut(&key)
                     && *overlap_times < array_idx
                 {
                     *overlap_times += 1;
@@ -407,11 +592,15 @@ pub fn eval_array_intersect(
         }
 
         let max_overlap_times = list_arrays.len() - 1;
-        for (_key, (overlap_times, first_idx)) in &row_map {
-            if *overlap_times == max_overlap_times {
-                mutable.extend(0, *first_idx, *first_idx + 1);
-                current += 1;
-            }
+        let mut matched = row_map
+            .values()
+            .filter(|(overlap_times, _, _)| *overlap_times == max_overlap_times)
+            .map(|(_, first_idx, order_key)| (*order_key, *first_idx))
+            .collect::<Vec<_>>();
+        matched.sort_unstable();
+        for (_, first_idx) in matched {
+            mutable.extend(0, first_idx, first_idx + 1);
+            current += 1;
         }
         if has_null_in_all {
             mutable.extend_nulls(1);

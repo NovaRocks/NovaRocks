@@ -47,7 +47,19 @@ pub fn eval_array_remove(
             }
         },
     };
-    let target_item_type = output_field.data_type().clone();
+    let target_item_type = super::common::adjust_legacy_decimalv2_target_type(
+        list.values().data_type(),
+        output_field.data_type(),
+    );
+    let output_field = if output_field.data_type() == &target_item_type {
+        output_field
+    } else {
+        Arc::new(arrow::datatypes::Field::new(
+            output_field.name(),
+            target_item_type.clone(),
+            output_field.is_nullable(),
+        ))
+    };
 
     let mut values = list.values().clone();
     if values.data_type() != &target_item_type {

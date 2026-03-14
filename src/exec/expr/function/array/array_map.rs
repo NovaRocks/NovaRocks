@@ -185,6 +185,45 @@ pub fn eval_array_map(
         return Ok(Arc::new(list));
     }
 
+    let mut source_fields = chunk
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut source_columns = chunk.columns().to_vec();
+    let mut source_slot_ids = chunk.chunk_schema().slot_ids().to_vec();
+    let mut source_chunk = chunk.clone();
+    let mut source_row_common_sub_exprs = vec![None; common_sub_exprs.len()];
+    for (idx, (slot_id, expr_id)) in common_sub_exprs.iter().enumerate() {
+        let Some(source_col) = try_eval_expr_on_source_rows(arena, *expr_id, &source_chunk)? else {
+            continue;
+        };
+        source_fields.push(Field::new(
+            format!("lambda_common_source_{idx}"),
+            source_col.data_type().clone(),
+            true,
+        ));
+        source_slot_ids.push(*slot_id);
+        source_columns.push(source_col.clone());
+        source_chunk = build_chunk_from_columns(&source_fields, &source_columns, &source_slot_ids)?;
+        source_row_common_sub_exprs[idx] = Some(source_col);
+    }
+
+    if let Some(row_level_result) =
+        try_eval_expr_on_source_rows(arena, lambda_body, &source_chunk)?
+    {
+        let flat_result =
+            replicate_array_by_row_lengths(&row_level_result, &row_lengths, total_elements)?;
+        let list = ListArray::new(
+            output_field,
+            OffsetBuffer::new(offsets.into()),
+            flat_result,
+            nulls,
+        );
+        return Ok(Arc::new(list));
+    }
+
     let mut flat_args = Vec::with_capacity(list_refs.len());
     for list in &list_refs {
         let flat = flatten_list_values(list, &row_valid)?;
@@ -240,7 +279,35 @@ pub fn eval_array_map(
                 slot_id
             ));
         }
-        let col = arena.eval(*expr_id, &lambda_chunk)?;
+        let col = if let Some(source_col) = &source_row_common_sub_exprs[idx] {
+            replicate_array_by_row_lengths(source_col, &row_lengths, total_elements)?
+        } else {
+            match eval_common_sub_expr_on_source_rows(
+                arena,
+                *expr_id,
+                &source_chunk,
+                &lambda_chunk,
+                &row_lengths,
+                total_elements,
+            )? {
+                CommonSubExprEval::SourceRows(source_col, flat_col) => {
+                    source_fields.push(Field::new(
+                        format!("lambda_common_source_{idx}"),
+                        source_col.data_type().clone(),
+                        true,
+                    ));
+                    source_slot_ids.push(*slot_id);
+                    source_columns.push(source_col);
+                    source_chunk = build_chunk_from_columns(
+                        &source_fields,
+                        &source_columns,
+                        &source_slot_ids,
+                    )?;
+                    flat_col
+                }
+                CommonSubExprEval::FlatRows(flat_col) => flat_col,
+            }
+        };
         if col.len() != total_elements {
             return Err(format!(
                 "lambda common sub expr length mismatch: expected {}, got {}",
@@ -318,9 +385,10 @@ fn collect_captured_slots(
     lambda_args: &[SlotId],
 ) -> Vec<SlotId> {
     let mut referenced = HashSet::new();
-    collect_slot_ids(arena, lambda_body, &mut referenced);
+    let bound = HashSet::new();
+    collect_slot_ids(arena, lambda_body, &bound, &mut referenced);
     for (_, expr_id) in common_sub_exprs {
-        collect_slot_ids(arena, *expr_id, &mut referenced);
+        collect_slot_ids(arena, *expr_id, &bound, &mut referenced);
     }
 
     let mut excluded: HashSet<SlotId> = lambda_args.iter().copied().collect();
@@ -336,14 +404,21 @@ fn collect_captured_slots(
     captured
 }
 
-fn collect_slot_ids(arena: &ExprArena, expr_id: ExprId, out: &mut HashSet<SlotId>) {
+fn collect_slot_ids(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    bound: &HashSet<SlotId>,
+    out: &mut HashSet<SlotId>,
+) {
     let mut stack = vec![expr_id];
     while let Some(id) = stack.pop() {
         let Some(node) = arena.node(id) else { continue };
         match node {
             ExprNode::Literal(_) => {}
             ExprNode::SlotId(slot_id) => {
-                out.insert(*slot_id);
+                if !bound.contains(slot_id) {
+                    out.insert(*slot_id);
+                }
             }
             ExprNode::ArrayExpr { elements } => {
                 for child in elements {
@@ -355,8 +430,23 @@ fn collect_slot_ids(arena: &ExprArena, expr_id: ExprId, out: &mut HashSet<SlotId
                     stack.push(*child);
                 }
             }
-            ExprNode::LambdaFunction { .. } => {
-                // Do not descend into nested lambdas when collecting captures.
+            ExprNode::LambdaFunction {
+                body,
+                arg_slots,
+                common_sub_exprs,
+                ..
+            } => {
+                let mut nested_bound = bound.clone();
+                for slot_id in arg_slots {
+                    nested_bound.insert(*slot_id);
+                }
+                for (slot_id, _) in common_sub_exprs {
+                    nested_bound.insert(*slot_id);
+                }
+                collect_slot_ids(arena, *body, &nested_bound, out);
+                for (_, expr_id) in common_sub_exprs {
+                    collect_slot_ids(arena, *expr_id, &nested_bound, out);
+                }
             }
             ExprNode::DictDecode { child, .. } => {
                 stack.push(*child);
@@ -405,6 +495,106 @@ fn collect_slot_ids(arena: &ExprArena, expr_id: ExprId, out: &mut HashSet<SlotId
             }
         }
     }
+}
+
+enum CommonSubExprEval {
+    SourceRows(ArrayRef, ArrayRef),
+    FlatRows(ArrayRef),
+}
+
+fn try_eval_expr_on_source_rows(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    source_chunk: &Chunk,
+) -> Result<Option<ArrayRef>, String> {
+    let Ok(source_result) = arena.eval(expr_id, source_chunk) else {
+        return Ok(None);
+    };
+
+    let source_result = match source_result.len() {
+        len if len == source_chunk.len() => source_result,
+        1 => broadcast_array(&source_result, source_chunk.len())?,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(source_result))
+}
+
+fn eval_common_sub_expr_on_source_rows(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    source_chunk: &Chunk,
+    lambda_chunk: &Chunk,
+    row_lengths: &[usize],
+    total_elements: usize,
+) -> Result<CommonSubExprEval, String> {
+    if let Ok(source_col) = arena.eval(expr_id, source_chunk) {
+        let source_col = match source_col.len() {
+            len if len == source_chunk.len() => source_col,
+            1 => broadcast_array(&source_col, source_chunk.len())?,
+            other => {
+                return Err(format!(
+                    "lambda common sub expr source length mismatch: expected {} or 1, got {}",
+                    source_chunk.len(),
+                    other
+                ));
+            }
+        };
+        let flat_col = replicate_array_by_row_lengths(&source_col, row_lengths, total_elements)?;
+        return Ok(CommonSubExprEval::SourceRows(source_col, flat_col));
+    }
+
+    let flat_col = arena.eval(expr_id, lambda_chunk)?;
+    Ok(CommonSubExprEval::FlatRows(flat_col))
+}
+
+fn broadcast_array(array: &ArrayRef, len: usize) -> Result<ArrayRef, String> {
+    if array.len() == len {
+        return Ok(array.clone());
+    }
+    if array.len() == 0 {
+        return Ok(new_empty_array(array.data_type()));
+    }
+    if array.len() != 1 {
+        return Err(format!(
+            "cannot broadcast array of length {} to {}",
+            array.len(),
+            len
+        ));
+    }
+    if len == 0 {
+        return Ok(new_empty_array(array.data_type()));
+    }
+    let indices = UInt32Array::from(vec![0_u32; len]);
+    take(array.as_ref(), &indices, None).map_err(|e| e.to_string())
+}
+
+fn replicate_array_by_row_lengths(
+    array: &ArrayRef,
+    row_lengths: &[usize],
+    total_elements: usize,
+) -> Result<ArrayRef, String> {
+    if total_elements == 0 {
+        return Ok(new_empty_array(array.data_type()));
+    }
+    if array.len() != 1 && array.len() != row_lengths.len() {
+        return Err(format!(
+            "cannot replicate array with length {} for {} source rows",
+            array.len(),
+            row_lengths.len()
+        ));
+    }
+
+    let mut indices: Vec<u32> = Vec::with_capacity(total_elements);
+    for (row, len) in row_lengths.iter().enumerate() {
+        let src_row = if array.len() == 1 { 0 } else { row };
+        let src_row = u32::try_from(src_row).map_err(|_| "array_map index overflow".to_string())?;
+        for _ in 0..*len {
+            indices.push(src_row);
+        }
+    }
+    let idx_array = UInt32Array::from(indices);
+    take(array.as_ref(), &idx_array, None).map_err(|e| e.to_string())
 }
 
 fn replicate_captured_columns(

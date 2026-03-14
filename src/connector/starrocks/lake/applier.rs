@@ -127,9 +127,9 @@ pub(crate) fn apply_txn_log_to_metadata(
             apply_compaction_log(metadata, op_compaction, default_schema_id)
         }
         TxnLogDispatch::SchemaChange(op_schema_change) => {
-            if is_primary_keys_table(tablet_schema)? {
+            if primary_key_schema_change_requires_delvec_support(metadata, tablet_schema)? {
                 return Err(format!(
-                    "publish_version does not support op_schema_change for PRIMARY_KEYS yet: tablet_id={:?} txn_id={:?}",
+                    "publish_version does not support op_schema_change for PRIMARY_KEYS with delete vectors yet: tablet_id={:?} txn_id={:?}",
                     txn_log.tablet_id, txn_log.txn_id
                 ));
             }
@@ -464,16 +464,31 @@ fn is_primary_keys_table(tablet_schema: &TabletSchemaPb) -> Result<bool, String>
     Ok(keys_type == KeysType::PrimaryKeys)
 }
 
+fn primary_key_schema_change_requires_delvec_support(
+    metadata: &TabletMetadataPb,
+    tablet_schema: &TabletSchemaPb,
+) -> Result<bool, String> {
+    if !is_primary_keys_table(tablet_schema)? {
+        return Ok(false);
+    }
+    let has_delvec_meta = metadata.delvec_meta.as_ref().is_some_and(|delvec_meta| {
+        !delvec_meta.version_to_file.is_empty() || !delvec_meta.delvecs.is_empty()
+    });
+    let has_rowset_del_files = metadata.rowsets.iter().any(|rowset| !rowset.del_files.is_empty());
+    Ok(has_delvec_meta || has_rowset_del_files)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use crate::service::grpc_client::proto::starrocks::{
-        ColumnPb, CompactionStrategyPb, KeysType, MetadataUpdateInfoPb, RowsetMetadataPb,
-        TableSchemaKeyPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
+        ColumnPb, CompactionStrategyPb, DelfileWithRowsetId, KeysType, MetadataUpdateInfoPb,
+        RowsetMetadataPb, TableSchemaKeyPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb,
+        txn_log_pb,
     };
 
-    use super::apply_txn_log_to_metadata;
+    use super::{apply_txn_log_to_metadata, primary_key_schema_change_requires_delvec_support};
 
     fn test_tablet_schema() -> TabletSchemaPb {
         TabletSchemaPb {
@@ -796,6 +811,82 @@ mod tests {
         assert_eq!(meta.rowsets[0].id, Some(10));
         assert_eq!(meta.next_rowset_id, Some(11));
         assert_eq!(meta.rowset_to_schema.get(&10), Some(&99));
+    }
+
+    #[test]
+    fn apply_txn_log_applies_schema_change_rowsets_for_primary_keys_without_delete_vectors() {
+        let mut pk_schema = test_tablet_schema();
+        pk_schema.keys_type = Some(KeysType::PrimaryKeys as i32);
+        let mut meta = TabletMetadataPb {
+            id: Some(30),
+            version: Some(1),
+            schema: Some(pk_schema.clone()),
+            rowsets: Vec::new(),
+            next_rowset_id: Some(10),
+            cumulative_point: Some(0),
+            delvec_meta: None,
+            compaction_inputs: Vec::new(),
+            prev_garbage_version: None,
+            orphan_files: Vec::new(),
+            enable_persistent_index: None,
+            persistent_index_type: None,
+            commit_time: None,
+            source_schema: None,
+            sstable_meta: None,
+            dcg_meta: None,
+            historical_schemas: std::collections::HashMap::new(),
+            rowset_to_schema: std::collections::HashMap::new(),
+            gtid: Some(0),
+            compaction_strategy: None,
+            flat_json_config: None,
+        };
+        let txn_log = TxnLogPb {
+            tablet_id: Some(30),
+            txn_id: Some(300),
+            op_write: None,
+            op_compaction: None,
+            op_schema_change: Some(txn_log_pb::OpSchemaChange {
+                rowsets: vec![test_rowset("seg_sc_pk.dat", 4, 32)],
+                linked_segment: Some(false),
+                alter_version: Some(5),
+                delvec_meta: None,
+            }),
+            op_alter_metadata: None,
+            op_replication: None,
+            partition_id: Some(1),
+            load_id: None,
+        };
+        let tmp = tempdir().expect("create tempdir");
+        let root = tmp.path().to_string_lossy().to_string();
+        apply_txn_log_to_metadata(&mut meta, &txn_log, 99, &pk_schema, &root, None, 2)
+            .expect("primary key schema change without delete vectors should succeed");
+        assert_eq!(meta.rowsets.len(), 1);
+        assert_eq!(meta.rowsets[0].id, Some(10));
+    }
+
+    #[test]
+    fn primary_key_schema_change_requires_delete_vector_support_when_rowset_has_del_files() {
+        let mut pk_schema = test_tablet_schema();
+        pk_schema.keys_type = Some(KeysType::PrimaryKeys as i32);
+        let metadata = TabletMetadataPb {
+            rowsets: vec![RowsetMetadataPb {
+                del_files: vec![DelfileWithRowsetId {
+                    name: Some("d0.del".to_string()),
+                    origin_rowset_id: Some(1),
+                    op_offset: Some(1),
+                    shared: Some(false),
+                    encryption_meta: Some(Vec::new()),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(
+            primary_key_schema_change_requires_delvec_support(&metadata, &pk_schema)
+                .expect("helper should succeed"),
+            "delete files should keep primary key schema change guarded"
+        );
     }
 
     #[test]

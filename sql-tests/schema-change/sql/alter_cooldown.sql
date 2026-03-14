@@ -1,0 +1,37 @@
+-- Test Objective:
+-- 1. Validate ALTER TABLE SET storage_cooldown_ttl on an aggregate key table with auto-partition.
+-- 2. Verify inserts succeed after changing cooldown settings.
+-- Migrated from: dev/test/sql/test_alter_table/T/test_alter_cooldown
+
+-- query 1
+-- @skip_result_check=true
+DROP DATABASE IF EXISTS sc_alter_cooldown_${uuid0} FORCE;
+CREATE DATABASE sc_alter_cooldown_${uuid0};
+USE sc_alter_cooldown_${uuid0};
+CREATE TABLE t0 (
+    `__d` date NOT NULL COMMENT "",
+    `__time` bigint(20) NOT NULL COMMENT "",
+    `pub_app_id` int(11) NOT NULL DEFAULT "0" COMMENT "",
+    `no_bid_price` decimal(38, 6) SUM NOT NULL DEFAULT "0" COMMENT ""
+) ENGINE=OLAP
+AGGREGATE KEY(`__d`, `__time`, `pub_app_id`)
+COMMENT "OLAP"
+PARTITION BY date_trunc('day', __d)
+DISTRIBUTED BY HASH(`__time`, `pub_app_id`)
+PROPERTIES (
+    "compression" = "LZ4",
+    "fast_schema_evolution" = "true",
+    "partition_live_number" = "5",
+    "replicated_storage" = "true",
+    "replication_num" = "1",
+    "storage_medium" = "SSD"
+);
+ADMIN SET FRONTEND CONFIG ("tablet_sched_storage_cooldown_second" = "15552000");
+INSERT INTO t0 VALUES ('2025-06-20','1',20,20), ('2025-06-21','1',21,21), ('2025-06-22','1',22,22), ('2025-06-23','1',23,23), ('2025-06-24','1',24,24);
+ALTER TABLE t0 SET ("storage_cooldown_ttl" = "2 DAY");
+INSERT INTO t0 VALUES ('2025-06-25','1',25,25);
+ADMIN SET FRONTEND CONFIG ("tablet_sched_storage_cooldown_second" = "-1");
+
+-- query 2
+-- @skip_result_check=true
+DROP DATABASE IF EXISTS sc_alter_cooldown_${uuid0} FORCE;

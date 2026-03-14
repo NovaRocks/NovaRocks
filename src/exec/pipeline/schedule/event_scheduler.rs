@@ -89,10 +89,17 @@ impl EventScheduler {
     }
 
     pub(crate) fn shutdown(&self) {
+        // Guard the shutdown predicate with the same mutex used by the condvar wait loop,
+        // otherwise the idle scheduler thread can miss the wake-up and keep join() blocked.
+        let queue_guard = self
+            .reschedule_queue
+            .lock()
+            .expect("event scheduler queue lock");
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
         self.reschedule_cv.notify_all();
+        drop(queue_guard);
         if let Some(handle) = self
             .thread
             .lock()

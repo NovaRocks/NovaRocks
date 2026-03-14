@@ -32,9 +32,10 @@ pub fn eval_array_max(
         .downcast_ref::<ListArray>()
         .ok_or_else(|| format!("array_max expects ListArray, got {:?}", arr.data_type()))?;
 
+    let source_type = list.values().data_type().clone();
     let target_type = match arena.data_type(expr) {
-        Some(t) => t.clone(),
-        None => list.values().data_type().clone(),
+        Some(t) => super::common::adjust_legacy_decimalv2_target_type(&source_type, t),
+        None => source_type.clone(),
     };
     let mut values = list.values().clone();
     if values.data_type() != &target_type {
