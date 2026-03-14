@@ -1,0 +1,1911 @@
+-- query 5
+array_contains([1, 2, 3, 4], 1)
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 6
+array_position([1, 2, 3, 4], 1)
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 7
+array_contains([1, 2, 3, 4], NULL)
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+-- query 8
+array_position([1, 2, 3, 4], NULL)
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+-- query 9
+array_contains([1, 2, 3, NULL], NULL)
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 10
+array_position([1, 2, 3, NULL], NULL)
+4
+4
+4
+4
+4
+4
+4
+4
+4
+4
+
+-- query 11
+array_contains(NULL, NULL)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 12
+array_position(NULL, NULL)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 14
+sum(array_contains(@arr, pk))
+10000
+
+-- query 15
+sum(array_contains(@arr, 100))
+10001
+
+-- query 16
+sum(array_position(@arr, pk))
+50005000
+
+-- query 17
+sum(array_position(@arr, 100))
+1000100
+
+-- query 18
+sum(array_contains(array_append(@arr, NULL), pk))
+10000
+
+-- query 19
+sum(array_contains(array_append(@arr, NULL), NULL))
+10001
+
+-- query 20
+sum(array_contains(arr_bigint, 100))
+2
+
+-- query 21
+sum(array_position(arr_bigint, 100))
+101
+
+-- query 22
+sum(array_contains(arr_str, md5sum(100)))
+1
+
+-- query 23
+sum(array_position(arr_str, md5sum(100)))
+1
+
+-- query 24
+sum(array_contains(arr_decimal, pk))
+10000
+
+-- query 25
+sum(array_position(arr_decimal, pk))
+10000
+
+-- query 26
+sum(array_contains(arr_decimal, 100))
+2
+
+-- query 27
+sum(array_position(arr_decimal, 100))
+101
+
+-- query 29
+sum(array_contains(@arr, 'abcdefg'))
+10001
+
+-- query 30
+sum(array_contains(@arr, str))
+0
+
+-- query 33
+array_contains(v1, 1.1)
+1
+
+-- query 34
+array_contains(v2, [1.1])
+1
+
+-- query 35
+array_contains(v3, [[1.1]])
+1
+
+-- query 36
+array_contains(v2, v1)
+1
+
+-- query 37
+array_contains(v3, v2)
+1
+
+-- query 38
+array_position(v1, 1.1)
+1
+
+-- query 39
+array_position(v2, [1.1])
+1
+
+-- query 40
+array_position(v3, [[1.1]])
+1
+
+-- query 41
+array_position(v2, v1)
+1
+
+-- query 42
+array_position(v3, v2)
+1
+
+-- query 45
+array_contains_all(arr_0, arr_1)
+1
+1
+0
+NULL
+1
+1
+1
+1
+1
+
+-- query 46
+array_contains_all(arr_1, arr_0)
+0
+0
+0
+NULL
+1
+0
+1
+1
+1
+
+-- query 47
+array_contains_all(arr_0, arr_2)
+1
+1
+0
+1
+NULL
+1
+1
+1
+1
+
+-- query 48
+array_contains_all(arr_2, arr_0)
+0
+0
+0
+1
+NULL
+0
+1
+0
+0
+
+-- query 49
+array_contains_all(arr_1, arr_2)
+1
+1
+1
+NULL
+NULL
+1
+1
+1
+1
+
+-- query 50
+array_contains_all(arr_2, arr_1)
+0
+0
+1
+NULL
+NULL
+1
+1
+0
+0
+
+-- query 51
+array_contains_all([1, 2, 3, 4], arr_0)
+1
+0
+0
+0
+0
+1
+0
+1
+0
+
+-- query 52
+array_contains_all([1, 2, 3, 4], arr_1)
+1
+0
+1
+NULL
+0
+1
+0
+1
+0
+
+-- query 53
+array_contains_all([1, 2, 3, 4, NULL], arr_1)
+1
+1
+1
+NULL
+1
+1
+1
+1
+1
+
+-- query 54
+array_contains_all(arr_0, [1, NULL])
+0
+1
+1
+1
+1
+0
+0
+0
+1
+
+-- query 55
+array_contains_all(arr_0, [])
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 56
+array_contains_all(NULL, arr_0)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 57
+array_contains_all(arr_1, NULL)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 60
+array_contains_all(@arr0, @arr1)
+0
+
+-- query 63
+array_contains_all(@arr0, @arr1)
+0
+
+-- query 64
+array_contains_all(@arr1, @arr0)
+1
+
+-- query 65
+array_contains_seq(arr_0, arr_1)
+1
+0
+0
+NULL
+1
+1
+0
+1
+1
+
+-- query 66
+array_contains_seq(arr_1, arr_0)
+0
+0
+0
+NULL
+1
+0
+1
+0
+0
+
+-- query 67
+array_contains_seq(arr_0, arr_2)
+1
+1
+0
+1
+NULL
+1
+1
+1
+1
+
+-- query 68
+array_contains_seq(arr_2, arr_0)
+0
+0
+0
+1
+NULL
+0
+1
+0
+0
+
+-- query 69
+array_contains_seq(arr_1, arr_2)
+1
+1
+1
+NULL
+NULL
+1
+1
+1
+1
+
+-- query 70
+array_contains_seq(arr_2, arr_1)
+0
+0
+1
+NULL
+NULL
+1
+0
+0
+0
+
+-- query 71
+array_contains_seq([1, 2, 3, 4], arr_0)
+1
+0
+0
+0
+0
+1
+0
+0
+0
+
+-- query 72
+array_contains_seq([1, 2, 3, 4], arr_1)
+1
+0
+1
+NULL
+0
+1
+0
+1
+0
+
+-- query 73
+array_contains_seq([1, 2, 3, 4, NULL], arr_1)
+1
+0
+1
+NULL
+0
+1
+0
+1
+0
+
+-- query 74
+array_contains_seq(arr_0, [1, NULL])
+0
+0
+0
+0
+0
+0
+0
+0
+1
+
+-- query 75
+array_contains_seq(arr_0, [])
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 76
+array_contains_seq(NULL, arr_0)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 77
+array_contains_seq(arr_1, NULL)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 78
+array_contains_seq([1, 1, 2, 3], [1, 1])
+1
+
+-- query 79
+array_contains_seq([1, 1, 2, 3], [1, 2])
+1
+
+-- query 80
+array_contains_seq([1, 1, 2, 3], [1, 3])
+0
+
+-- query 81
+array_contains_seq([1, 1, 2, 3], [2, 3])
+1
+
+-- query 82
+array_contains_seq([1, 1, 2, 3], [1, 1, 2])
+1
+
+-- query 83
+array_contains_seq([NULL, NULL, 1, 2], [NULL])
+1
+
+-- query 84
+array_contains_seq([NULL, NULL, 1, 2], [NULL, NULL])
+1
+
+-- query 85
+array_contains_seq([NULL, NULL, 1, 2], [NULL, 1])
+1
+
+-- query 86
+array_contains_seq([NULL, NULL, 1, 2], [NULL, NULL, 1])
+1
+
+-- query 87
+array_contains_seq([NULL, NULL, 1, 2], [NULL, 1, 2])
+1
+
+-- query 90
+array_contains_seq(@arr0, @arr1)
+1
+
+-- query 97
+id
+1
+3
+4
+5
+7
+8
+9
+
+-- query 98
+id
+2
+8
+
+-- query 99
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 100
+id
+4
+
+-- query 101
+id
+1
+
+-- query 102
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 103
+id
+5
+
+-- query 104
+id
+2
+
+-- query 105
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 106
+id
+5
+
+-- query 107
+id
+5
+
+-- query 108
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 109
+id
+7
+
+-- query 110
+id
+1
+
+-- query 111
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 112
+id
+6
+
+-- query 113
+id
+1
+6
+8
+
+-- query 114
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 115
+id
+2
+3
+
+-- query 116
+id
+1
+6
+
+-- query 117
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 118
+id
+4
+10
+
+-- query 119
+id
+1
+10
+
+-- query 120
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 121
+id
+8
+
+-- query 122
+id
+1
+10
+
+-- query 123
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 124
+id
+9
+
+-- query 126
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 128
+id
+1
+2
+
+-- query 129
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 130
+id
+6
+9
+
+-- query 131
+id
+1
+
+-- query 132
+id
+1
+2
+3
+5
+6
+7
+8
+9
+10
+
+-- query 133
+id
+1
+
+-- query 134
+id
+1
+
+-- query 135
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 136
+id
+8
+
+-- query 137
+id
+1
+
+-- query 138
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 139
+id
+10
+
+-- query 140
+id	position
+1	1
+2	NULL
+3	1
+4	2
+5	3
+6	2
+7	0
+8	1
+9	2
+10	1
+
+-- query 141
+id	position
+1	3
+2	NULL
+3	2
+4	1
+5	2
+6	1
+7	3
+8	2
+9	3
+10	3
+
+-- query 142
+id	position
+1	2
+2	NULL
+3	3
+4	3
+5	1
+6	0
+7	1
+8	3
+9	1
+10	0
+
+-- query 143
+id	position
+1	0
+2	1
+3	0
+4	0
+5	0
+6	0
+7	0
+8	1
+9	0
+10	0
+
+-- query 144
+id	position
+1	3
+2	2
+3	3
+4	1
+5	2
+6	1
+7	2
+8	3
+9	3
+10	3
+
+-- query 145
+id	position
+1	0
+2	0
+3	0
+4	2
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 146
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 147
+id	position
+1	3
+2	3
+3	2
+4	3
+5	3
+6	3
+7	2
+8	2
+9	2
+10	3
+
+-- query 148
+id	position
+1	0
+2	0
+3	0
+4	0
+5	1
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 149
+id	position
+1	0
+2	1
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 150
+id	position
+1	3
+2	3
+3	2
+4	1
+5	2
+6	3
+7	3
+8	2
+9	3
+10	3
+
+-- query 151
+id	position
+1	0
+2	0
+3	0
+4	0
+5	3
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 152
+id	position
+1	0
+2	0
+3	0
+4	0
+5	1
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 153
+id	position
+1	3
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 154
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	1
+8	0
+9	0
+10	0
+
+-- query 155
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 156
+id	position
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 157
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	1
+7	0
+8	0
+9	0
+10	0
+
+-- query 158
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	3
+7	0
+8	3
+9	0
+10	0
+
+-- query 159
+id	position
+1	3
+2	2
+3	2
+4	3
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 160
+id	position
+1	0
+2	1
+3	3
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 161
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	1
+7	0
+8	0
+9	0
+10	0
+
+-- query 162
+id	position
+1	3
+2	2
+3	2
+4	3
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 163
+id	position
+1	0
+2	0
+3	0
+4	1
+5	0
+6	0
+7	0
+8	0
+9	0
+10	1
+
+-- query 164
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	1
+
+-- query 165
+id	position
+1	3
+2	2
+3	2
+4	3
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 166
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	3
+9	0
+10	0
+
+-- query 167
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	1
+
+-- query 168
+id	position
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+10	2
+
+-- query 169
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	1
+10	0
+
+-- query 170
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 171
+id	position
+1	3
+2	2
+3	2
+4	1
+5	3
+6	1
+7	3
+8	2
+9	2
+10	1
+
+-- query 172
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 173
+id	position
+1	1
+2	3
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 174
+id	position
+1	3
+2	2
+3	2
+4	1
+5	2
+6	2
+7	2
+8	2
+9	2
+10	3
+
+-- query 175
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	3
+7	0
+8	0
+9	1
+10	0
+
+-- query 176
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 177
+id	position
+1	2
+2	1
+3	3
+4	0
+5	3
+6	1
+7	2
+8	1
+9	2
+10	3
+
+-- query 178
+id	position
+1	3
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 179
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 180
+id	position
+1	3
+2	1
+3	2
+4	1
+5	3
+6	3
+7	3
+8	2
+9	1
+10	3
+
+-- query 181
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	1
+9	0
+10	0
+
+-- query 182
+id	position
+1	1
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	0
+
+-- query 183
+id	position
+1	2
+2	3
+3	3
+4	1
+5	2
+6	2
+7	2
+8	3
+9	2
+10	1
+
+-- query 184
+id	position
+1	0
+2	0
+3	0
+4	0
+5	0
+6	0
+7	0
+8	0
+9	0
+10	2
+
+-- query 186
+id
+1
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 187
+id
+1
+4
+
+-- query 189
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 192
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 193
+id
+1
+
+-- query 195
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 198
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 201
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 204
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 207
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 210
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 213
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 216
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 219
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 220
+id
+1
+
+-- query 222
+id
+1
+2
+3
+5
+6
+7
+8
+9
+10
+
+-- query 225
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 228
+id
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 275
+id
+1
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 276
+id
+1
+3
+4
+5
+6
+7
+8
+9
+10
+
+-- query 287
+id
+4
+
+-- query 288
+id
+4
+
+-- query 289
+id
+4
+
+-- query 290
+id
+4
+
+-- query 291
+id
+4
+
+-- query 292
+id
+4
+
+-- query 293
+id
+4
+
+-- query 294
+id
+4
+
+-- query 295
+id
+4
+
+-- query 296
+id
+4
+
+-- query 297
+id
+4
+
+-- query 298
+id
+4
+
+-- query 299
+id
+4
+
+-- query 300
+id
+4
+
+-- query 302
+id
+1
+
+-- query 303
+id
+1
+
+-- query 304
+id
+1
+2
+4
+
+-- query 305
+id
+1
+
+-- query 306
+id
+1
+
+-- query 307
+id
+2
+
+-- query 310
+id
+1
+
+-- query 311
+id
+1
+
+-- query 312
+id
+2
+
+-- query 315
+id
+1
+
+-- query 316
+id
+1
+
+-- query 317
+id
+2
+
+-- query 319
+id	array_position(array_map, map{'a':1,'b':2})
+1	1
+2	0
+3	NULL
+4	0
+
+-- query 320
+id	array_position(array_map, map{'c':3,'d':4})
+1	2
+2	0
+3	NULL
+4	0
+
+-- query 321
+id	array_position(array_map, map{'x':5,'y':6})
+1	0
+2	1
+3	NULL
+4	0
+
+-- query 322
+id	array_position(array_map, NULL)
+1	0
+2	0
+3	NULL
+4	0
+
+-- query 323
+id	array_position(array_map, map{})
+1	0
+2	0
+3	NULL
+4	0
+
+-- query 324
+id	array_position(array_json, '{"key1": 100, "key2": 200}')
+1	1
+2	0
+3	NULL
+4	0
+
+-- query 325
+id	array_position(array_json, '{"key3": 300}')
+1	2
+2	0
+3	NULL
+4	0
+
+-- query 326
+id	array_position(array_json, '{"key5": 500, "key6": 600}')
+1	0
+2	2
+3	NULL
+4	0
+
+-- query 327
+id	array_position(array_json, NULL)
+1	0
+2	0
+3	NULL
+4	0
+
+-- query 328
+id	array_position(array_json, '{}')
+1	0
+2	0
+3	NULL
+4	0
+
+-- query 329
+id	array_position(array_struct, row(10, 'hello'))
+1	1
+2	0
+3	NULL
+4	0
+
+-- query 330
+id	array_position(array_struct, row(20, 'world'))
+1	2
+2	0
+3	NULL
+4	0
+
+-- query 331
+id	array_position(array_struct, row(40, 'database'))
+1	0
+2	2
+3	NULL
+4	0
+
+-- query 332
+id	array_position(array_struct, NULL)
+1	0
+2	0
+3	NULL
+4	0
+
+-- query 333
+array_contains([NULL], NULL)	array_position([NULL], NULL)
+1	1
+
+-- query 337
+pk	array_contains(arr_bigint, 1000)	arr_bigint
+0	0	[0,0,0,0,0,0,0,0,0,0]
+
+-- query 338
+pk	array_length(arr_bigint)	arr_bigint
+0	10	[0,0,0,0,0,0,0,0,0,0]

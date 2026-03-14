@@ -1,0 +1,27 @@
+-- query 5
+@arr_str[1]
+abcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopqabcdefghijklmnopq
+
+-- query 6
+array_agg(array_length(@arr_str))[5]
+10000
+
+-- query 8
+count(*)
+100
+
+-- query 9
+count(*)
+100
+
+-- query 10
+count(*)	array_length(array_agg(arr))
+10	10
+
+-- query 11
+array_length(array_agg(arr))
+100
+
+-- query 12
+array_agg(arr)[1]
+[[1,2,3],[1,2,3]]

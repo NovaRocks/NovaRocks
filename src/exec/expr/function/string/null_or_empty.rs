@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, ListArray, StringArray};
 use std::sync::Arc;
 
 pub fn eval_null_or_empty(
@@ -26,21 +26,45 @@ pub fn eval_null_or_empty(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let _ = expr;
-    let str_arr = arena.eval(args[0], chunk)?;
-    let s_arr = str_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "null_or_empty expects string".to_string())?;
-    let len = s_arr.len();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        if s_arr.is_null(i) {
-            out.push(Some(true));
-        } else {
-            out.push(Some(s_arr.value(i).is_empty()));
+    let input = arena.eval(args[0], chunk)?;
+    let len = input.len();
+
+    // Try StringArray first
+    if let Some(s_arr) = input.as_any().downcast_ref::<StringArray>() {
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            if s_arr.is_null(i) {
+                out.push(Some(true));
+            } else {
+                out.push(Some(s_arr.value(i).is_empty()));
+            }
         }
+        return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
     }
-    Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
+
+    // Try ListArray (array types)
+    if let Some(list_arr) = input.as_any().downcast_ref::<ListArray>() {
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            if list_arr.is_null(i) {
+                out.push(Some(true));
+            } else {
+                out.push(Some(list_arr.value(i).len() == 0));
+            }
+        }
+        return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
+    }
+
+    // For all-null input (NullArray), everything is null_or_empty
+    if input.null_count() == len {
+        let out: Vec<Option<bool>> = vec![Some(true); len];
+        return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);
+    }
+
+    Err(format!(
+        "null_or_empty expects string or array, got {:?}",
+        input.data_type()
+    ))
 }
 #[cfg(test)]
 mod tests {

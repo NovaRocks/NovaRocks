@@ -1,0 +1,19 @@
+-- query 6
+k1	c1	c2
+3	["0","2","1"]	[1,1,1]
+4	["1","2"]	[1,1]
+
+-- query 12
+t1_id	t2_id	arr_largeint
+1	1	[1,2]
+2	2	[3,4,5]
+3	NULL	[6]
+
+-- query 13
+array_map(arg -> (bool_1 AND bool_2) AND bool_3, arr)	array_map(arg -> (bool_1 AND bool_3) AND bool_2, arr)
+[1]	[1]
+[1]	[1]
+
+-- query 14
+price_list	fields
+[{"num": 1, "open_id": "aaa"}, {"num": 2, "open_id": "bbb"}, {"num": 3, "open_id": "ccc"}]	["aaa","bbb","ccc"]

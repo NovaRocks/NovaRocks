@@ -1,0 +1,3 @@
+-- query 6
+array_length(array_distinct(c2))
+5000000

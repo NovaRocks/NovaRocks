@@ -1,0 +1,175 @@
+-- query 4
+count()
+1
+
+-- query 5
+count(array_length(array_map((x, y) -> (id + (length(x))) + y, arr_str, arr_largeint)))
+1
+
+-- query 6
+count()
+0
+
+-- query 7
+count(any_match(x -> any_match(x -> x < 10, arr_largeint), arr_largeint))
+1
+
+-- query 8
+count(array_map(x -> array_length(array_concat(arr_str, [])), arr_largeint))
+1
+
+-- query 10
+array_length(array_map((x, y) -> x > y, @arr, @arr))
+1000000
+1000000
+1000000
+1000000
+1000000
+1000000
+1000000
+1000000
+1000000
+1000000
+
+-- query 11
+count(*)
+1
+
+-- query 15
+array_map((x, y, z) -> (x + y) + z, arr_0, arr_1, arr_2)
+[4,7]
+NULL
+NULL
+[null,null]
+
+-- query 17
+array_map((x, y, z) -> (x + y) + z, arr_0, arr_1, arr_2)
+[4,7]
+NULL
+NULL
+[null,null]
+
+-- query 18
+array_map((x, y, z, d) -> ((x + y) + z) + d, arr_0, arr_1, arr_2, [1, 2])
+[5,9]
+NULL
+NULL
+[null,null]
+
+-- query 20
+array_map(x -> x * x, arr_0)
+[1,4]
+[1,4]
+[1,4]
+[1,4]
+
+-- query 21
+k
+1
+3
+
+-- query 22
+k
+1
+2
+3
+4
+
+-- query 23
+k	col1
+1	2
+2	3
+3	2
+4	3
+
+-- query 24
+k	col1	col2
+1	2	2
+2	3	3
+3	2	2
+4	3	3
+
+-- query 25
+array_map(x -> x, arr_0)
+[1,2]
+[1,2]
+[1,2]
+[1,2]
+
+-- query 26
+array_map((x, y, z) -> 10, arr_0, arr_1, arr_2)
+NULL
+NULL
+[10,10]
+[10,10]
+
+-- query 27
+array_map((x, y) -> k, arr_0, arr_1)
+[1,1]
+NULL
+[3,3]
+[4,4]
+
+-- query 28
+array_map((x, y) -> k, [1, 2], [2, 3])
+[1,1]
+[2,2]
+[3,3]
+[4,4]
+
+-- query 29
+array_map((x, y, z) -> (x + y) + z, [1, 2], [2, 3], [3, 4])
+[6,9]
+[6,9]
+[6,9]
+[6,9]
+
+-- query 30
+array_map((x, y, z) -> (x + y) + z, [1, 2], [2, NULL], [3, 4])
+[6,null]
+[6,null]
+[6,null]
+[6,null]
+
+-- query 31
+array_map((x, y, z) -> (x + y) + z, [1, 2], [2, NULL], NULL)
+NULL
+NULL
+NULL
+NULL
+
+-- query 32
+array_map(x -> array_map(x -> x + 100, x), [[1, 2, 3]])
+[[101,102,103]]
+
+-- query 33
+array_map(x -> array_map(x -> x + 100, x), [[1, 2, 3], [NULL]])
+[[101,102,103],[null]]
+
+-- query 34
+array_map(x -> array_map(x -> array_map(x -> x + 100, x), x), [[[1, 2, 3]]])
+[[[101,102,103]]]
+
+-- query 35
+array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> (array_length(arg1)) + arg3, arg2), arg1), arg0), [[[[1, 2]]]])
+[[[[2,3]]]]
+
+-- query 36
+array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> (array_length(arg0)) + arg3, arg2), arg1), arg0), [[[[1, 2]]]])
+[[[[2,3]]]]
+
+-- query 37
+array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> (array_length(arg2)) + arg3, arg2), arg1), arg0), [[[[1, 2]]]])
+[[[[3,4]]]]
+
+-- query 38
+array_map(arg0 -> array_map(arg1 -> array_map(arg2 -> array_map(arg3 -> array_map(arg4 -> (array_length(arg2)) + arg4, arg3), arg2), arg1), arg0), [[[[[1, 2]]]]])
+[[[[[2,3]]]]]
+
+-- query 40
+array_sum(array_map(x -> array_contains(@arr, x), array_generate(1, 100000)))
+10000
+
+-- query 43
+l	array_map(x -> concat(x, CAST((if(1 > (rand()), '[]', '')) AS ARRAY<VARCHAR(65533)>)), arr_str)
+[]	[["abcdefghasdasdasirnqwrq"],["abcdefghasdasdasirnqwrq"]]

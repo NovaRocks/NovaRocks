@@ -1,0 +1,128 @@
+-- query 4
+id	result
+1	[100,100,5]
+2	[]
+3	[100]
+4	[null,null,null]
+5	NULL
+6	[5,5,5]
+
+-- query 5
+id	result
+1	[100,100,5]
+2	[]
+3	[100]
+4	[null,null,null]
+5	NULL
+6	[5,5,5]
+
+-- query 6
+id	result
+1	[100,100,5]
+2	[]
+3	[100]
+4	[null,null,null]
+5	NULL
+6	[5,5,5]
+
+-- query 7
+id	result
+1	[100,100,5]
+2	[]
+3	[100]
+4	[null,null,null]
+5	NULL
+6	[5,5,5]
+
+-- query 8
+id	result
+1	[100.000000000,100.000000000,5.000000000]
+2	[]
+3	[100.000000000]
+4	[null,null,null]
+5	NULL
+6	[5.000000000,5.000000000,5.000000000]
+
+-- query 9
+id	result
+1	[1,1,1]
+2	[]
+3	[1]
+4	[null,null,null]
+5	NULL
+6	[1,1,1]
+
+-- query 10
+id	result
+1	["2023-12-31","2023-12-31","2023-06-15"]
+2	[]
+3	["2023-12-31"]
+4	[null,null,null]
+5	NULL
+6	["2023-05-05","2023-05-05","2023-05-05"]
+
+-- query 11
+id	result
+1	["2023-12-31 23:59:59","2023-12-31 23:59:59","2023-06-15 12:00:00"]
+2	[]
+3	["2023-12-31 23:59:59"]
+4	[null,null,null]
+5	NULL
+6	["2023-05-05 12:00:00","2023-05-05 12:00:00","2023-05-05 12:00:00"]
+
+-- query 12
+id	result
+1	["zzz","zzz","g"]
+2	[]
+3	["zzz"]
+4	[null,null,null]
+5	NULL
+6	["eee","eee","eee"]
+
+-- query 13
+id	result
+1	[]
+
+-- query 14
+id	result
+1	[]
+
+-- query 15
+id	result
+1	[100,100,5,1,1,null]
+
+-- query 16
+id	result
+1	[100]
+
+-- query 17
+id	result
+4	[null]
+
+-- query 18
+id	result
+6	[5,5,5]
+
+-- query 19
+result
+[100,5,3]
+
+-- query 20
+result
+[100,5,3]
+
+-- query 21
+result
+["zzz","world","mmm"]
+
+-- query 22
+result
+[100,5,1]
+
+-- query 23
+result
+[]
+
+-- query 24
+result
+NULL

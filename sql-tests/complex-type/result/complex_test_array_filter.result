@@ -1,0 +1,95 @@
+-- query 4
+array_filter(arr_0, arr_2)
+[2]
+[1,2]
+[]
+[]
+[]
+
+-- query 5
+array_filter(arr_1, arr_2)
+[2]
+NULL
+[]
+[]
+[]
+
+-- query 6
+array_filter(arr_0, [0, 0, 0, 1])
+[]
+[]
+[]
+[]
+[]
+
+-- query 7
+array_filter(arr_0, [1, 0, 1])
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 8
+array_filter(arr_0, NULL)
+[]
+[]
+[]
+[]
+[]
+
+-- query 9
+array_filter(arr_1, NULL)
+[]
+NULL
+[]
+[]
+[]
+
+-- query 10
+array_filter([1, 2, 3, 4], arr_2)
+[2]
+[1,2]
+[]
+[]
+[3]
+
+-- query 11
+array_filter(NULL, arr_2)
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 12
+array_filter([1, 2, 3, 4], [0, 0, 1, 1])
+[3,4]
+[3,4]
+[3,4]
+[3,4]
+[3,4]
+
+-- query 13
+array_filter(NULL, NULL)
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 14
+array_filter([1, 2, 3, 4], NULL)
+[]
+[]
+[]
+[]
+[]
+
+-- query 15
+array_filter(NULL, [1, 0, 1, NULL])
+NULL
+NULL
+NULL
+NULL
+NULL

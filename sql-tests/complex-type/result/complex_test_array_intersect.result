@@ -1,0 +1,89 @@
+-- query 4
+id	intersect_boolean
+1	[0,1]
+2	[0]
+3	[1]
+
+-- query 5
+id	intersect_tinyint
+1	[2]
+2	[]
+3	[8]
+
+-- query 6
+id	intersect_smallint
+1	[300,100]
+2	[]
+3	[]
+
+-- query 7
+id	intersect_int
+1	[]
+2	[]
+3	[]
+
+-- query 8
+id	intersect_bigint
+1	[]
+2	[]
+3	[]
+
+-- query 9
+id	intersect_largeint
+1	[]
+2	[]
+3	[]
+
+-- query 10
+id	intersect_float
+1	[]
+2	[]
+3	[]
+
+-- query 11
+id	intersect_double
+1	[]
+2	[]
+3	[]
+
+-- query 12
+id	intersect_decimalv2
+1	[123.450000000,789.010000000,456.780000000]
+2	[123.450000000]
+3	[]
+
+-- query 13
+id	intersect_decimal32
+1	[123.45,890.12]
+2	[]
+3	[]
+
+-- query 14
+id	intersect_decimal64
+1	[]
+2	[]
+3	[]
+
+-- query 15
+id	intersect_decimal128
+1	[1234567890.1234567890]
+2	[]
+3	[]
+
+-- query 16
+id	intersect_varchar
+1	["cherry","apple","banana"]
+2	[]
+3	[]
+
+-- query 17
+id	intersect_date
+1	["2025-01-01","2025-01-08"]
+2	[]
+3	[]
+
+-- query 18
+id	intersect_datetime
+1	["2025-01-01 12:00:00","2025-01-08 19:00:00"]
+2	[]
+3	[]
