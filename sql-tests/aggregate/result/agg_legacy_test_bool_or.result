@@ -1,0 +1,15 @@
+-- query 3
+bool_or(c0)	bool_or(c1)	bool_or(c2)	bool_or(c3)	bool_or(NULL)
+NULL	NULL	NULL	NULL	NULL
+
+-- query 5
+bool_or(c0)	bool_or(c1)	bool_or(c2)	bool_or(c3)	bool_or(NULL)
+1	1	1	0	0
+
+-- query 7
+sum(a)	sum(b)	sum(c)	sum(d)	sum(e)
+40960	40960	40960	0	0
+
+-- query 8
+sum(a)
+40960

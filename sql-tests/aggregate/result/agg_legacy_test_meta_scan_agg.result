@@ -1,0 +1,99 @@
+-- query 4
+count(*)
+0
+
+-- query 7
+count()
+5
+
+-- query 8
+count(c0)
+5
+
+-- query 9
+count(c1)
+5
+
+-- query 10
+count(c2)
+5
+
+-- query 11
+min(c0)	max(c0)	min(c1)	max(c1)	min(c2)	max(c2)
+2024-01-01	2024-01-05	1	5	1	5
+
+-- query 12
+count(c0)
+5
+
+-- query 13
+count(c1)
+5
+
+-- query 14
+count(c2)
+5
+
+-- query 15
+min(c0)	max(c0)	min(c1)	max(c1)	min(c2)	max(c2)
+2024-01-01	2024-01-05	1	5	1	5
+
+-- query 16
+count(1)
+5
+
+-- query 17
+count(*)
+5
+
+-- query 22
+count(*)
+2
+
+-- query 23
+count(*)
+3
+
+-- query 24
+count(c0)
+3
+
+-- query 25
+count(c1)
+3
+
+-- query 26
+min(c0)	max(c0)
+2024-03-10	2024-03-20
+
+-- query 27
+min(c1)	max(c1)
+50	70
+
+-- query 28
+min(c0)	max(c0)	min(c1)	max(c1)
+2024-03-10	2024-03-20	50	70
+
+-- query 31
+count(*)
+3
+
+-- query 32
+count(*)
+3
+
+-- query 34
+count(*)
+3
+
+-- query 35
+count(*)
+3
+
+-- query 37
+count(*)
+3
+
+-- query 38
+count(*)
+3

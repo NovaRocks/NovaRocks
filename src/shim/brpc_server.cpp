@@ -996,6 +996,20 @@ public:
         status_ok(response->mutable_status());
     }
 
+    void update_fail_point_status(google::protobuf::RpcController* controller,
+                                  const starrocks::PUpdateFailPointStatusRequest* request,
+                                  starrocks::PUpdateFailPointStatusResponse* response,
+                                  google::protobuf::Closure* done) override {
+        auto* cntl = static_cast<brpc::Controller*>(controller);
+        submit_query_rpc_task(
+                "update_fail_point_status",
+                response,
+                done,
+                [cntl, request, response]() {
+                    run_update_fail_point_status(cntl, request, response);
+                });
+    }
+
     void transmit_chunk(google::protobuf::RpcController* controller,
                         const starrocks::PTransmitChunkParams* request,
                         starrocks::PTransmitChunkResult* response,
@@ -1211,6 +1225,34 @@ private:
         }
     }
 
+    static void run_update_fail_point_status(
+            brpc::Controller* cntl,
+            const starrocks::PUpdateFailPointStatusRequest* request,
+            starrocks::PUpdateFailPointStatusResponse* response) {
+        if (request == nullptr || response == nullptr) {
+            if (response != nullptr) {
+                status_err(response->mutable_status(), starrocks::TStatusCode::INVALID_ARGUMENT,
+                           "missing update_fail_point_status request/response");
+            }
+            if (cntl != nullptr) {
+                cntl->SetFailed("missing update_fail_point_status request/response");
+            }
+            return;
+        }
+
+        std::string err;
+        if (!invoke_update_fail_point_status(*request, response, &err)) {
+            status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR, err);
+            if (cntl != nullptr) {
+                cntl->SetFailed(err);
+            }
+            return;
+        }
+        if (!response->has_status()) {
+            status_ok(response->mutable_status());
+        }
+    }
+
     static void run_transmit_runtime_filter(
             brpc::Controller* cntl,
             const starrocks::PTransmitRuntimeFilterParams* request,
@@ -1288,6 +1330,17 @@ private:
                               starrocks::PLookUpResponse* response,
                               std::string* err) {
         return invoke_rust_unary_rpc(request, response, novarocks_rs_lookup, "lookup", err);
+    }
+
+    static bool invoke_update_fail_point_status(
+            const starrocks::PUpdateFailPointStatusRequest& request,
+            starrocks::PUpdateFailPointStatusResponse* response,
+            std::string* err) {
+        return invoke_rust_unary_rpc(request,
+                                     response,
+                                     novarocks_rs_update_fail_point_status,
+                                     "update_fail_point_status",
+                                     err);
     }
 
     NovaRocksCompatConfig cfg_;

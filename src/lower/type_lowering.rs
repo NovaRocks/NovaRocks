@@ -283,6 +283,9 @@ mod tests {
             }]),
         };
 
-        assert_eq!(arrow_type_from_desc(&desc), Some(DataType::Decimal128(27, 9)));
+        assert_eq!(
+            arrow_type_from_desc(&desc),
+            Some(DataType::Decimal128(27, 9))
+        );
     }
 }

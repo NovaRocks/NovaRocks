@@ -1,0 +1,7 @@
+-- query 6
+c1
+NULL
+
+-- query 7
+c1	count(*)
+NULL	1500

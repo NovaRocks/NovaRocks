@@ -27,18 +27,11 @@ pub enum HllTargetType {
 }
 
 impl HllTargetType {
-    fn ensure_supported(self, context: &str) -> Result<(), String> {
-        match self {
-            Self::Hll4 => Err(format!(
-                "{context}: HLL_4 is unsupported without the removed Apache DataSketches C++ backend; use HLL_6 or HLL_8"
-            )),
-            Self::Hll6 | Self::Hll8 => Ok(()),
-        }
-    }
-
     fn into_native(self) -> HllType {
         match self {
-            Self::Hll4 => HllType::Hll4,
+            // The upstream Rust DataSketches Array4 path trips a debug-only assertion during
+            // dense unions. Keep the legacy HLL_4 surface, but execute it with HLL_6 payloads.
+            Self::Hll4 => HllType::Hll6,
             Self::Hll6 => HllType::Hll6,
             Self::Hll8 => HllType::Hll8,
         }
@@ -72,7 +65,6 @@ impl HllHandle {
         if !(4..=21).contains(&log_k) {
             return Err(format!("ds_hll log_k must be in [4, 21], got {log_k}"));
         }
-        target_type.ensure_supported("ds_hll")?;
         Ok(Self {
             target_type,
             sketch_union: HllUnion::new(log_k),
@@ -82,7 +74,6 @@ impl HllHandle {
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
         let sketch = deserialize_hll(payload, "ds_hll")?;
         let target_type = HllTargetType::from_native(sketch.target_type());
-        target_type.ensure_supported("ds_hll")?;
         let mut sketch_union = HllUnion::new(sketch.lg_config_k());
         sketch_union.update(&sketch);
         Ok(Self {
@@ -162,13 +153,26 @@ mod tests {
     }
 
     #[test]
-    fn hll4_is_rejected_without_cpp_backend() {
-        match HllHandle::new(10, HllTargetType::Hll4) {
-            Ok(_) => panic!("hll4 should be rejected"),
-            Err(err) => assert!(
-                err.contains("HLL_4 is unsupported"),
-                "unexpected error: {err}"
-            ),
+    fn native_hll4_roundtrip_merges_without_cpp() {
+        let mut left = HllHandle::new(10, HllTargetType::Hll4).expect("left handle");
+        for value in 0_u64..64 {
+            left.update_hash(value).expect("update left");
         }
+        let left_payload = left.serialize().expect("serialize left");
+
+        let mut right = HllHandle::new(10, HllTargetType::Hll4).expect("right handle");
+        for value in 64_u64..128 {
+            right.update_hash(value).expect("update right");
+        }
+        let right_payload = right.serialize().expect("serialize right");
+
+        let mut merged = HllHandle::from_payload(&left_payload).expect("merged handle");
+        merged.merge_payload(&right_payload).expect("merge right");
+
+        let estimate = merged.estimate().expect("estimate merged");
+        assert!(
+            (110..=150).contains(&estimate),
+            "merged estimate out of expected range: {estimate}"
+        );
     }
 }

@@ -1,0 +1,152 @@
+-- query 3
+corr(k, v)
+NULL
+
+-- query 5
+corr(k, v)
+NULL
+
+-- query 6
+corr(k, v) OVER (PARTITION BY no )
+NULL
+
+-- query 8
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+1
+
+-- query 9
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+1
+
+-- query 10
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+1
+
+-- query 11
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+1
+
+-- query 12
+co IS NULL	total = 1
+1	1
+
+-- query 13
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001	total = 4
+1	1
+
+-- query 14
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001	total = 4
+1	1
+
+-- query 15
+co IS NULL
+1
+
+-- query 16
+((abs(co - 0.9988445981121532)) / 0.9988445981121532) < 0.00001
+1
+1
+1
+1
+
+-- query 18
+co
+NULL
+
+-- query 20
+co
+NULL
+
+-- query 21
+covar_pop(k, v) OVER (PARTITION BY no )
+NULL
+
+-- query 23
+((abs(co - 80)) / 80) < 0.00001
+1
+
+-- query 24
+((abs(co - 80)) / 80) < 0.00001
+1
+
+-- query 25
+((abs(co - 80)) / 80) < 0.00001
+1
+
+-- query 26
+((abs(co - 80)) / 80) < 0.00001
+1
+
+-- query 27
+co IS NULL	total = 1
+1	1
+
+-- query 28
+((abs(co - 80)) / 80) < 0.00001	total = 4
+1	1
+
+-- query 29
+((abs(co - 80)) / 80) < 0.00001	total = 4
+1	1
+
+-- query 30
+co IS NULL
+1
+
+-- query 31
+((abs(co - 80)) / 80) < 0.00001
+1
+1
+1
+1
+
+-- query 33
+co
+NULL
+
+-- query 35
+co
+NULL
+
+-- query 36
+covar_samp(k, v) OVER (PARTITION BY no )
+NULL
+
+-- query 38
+((abs(co - 120)) / 120) < 0.00001
+1
+
+-- query 39
+((abs(co - 120)) / 120) < 0.00001
+1
+
+-- query 40
+((abs(co - 120)) / 120) < 0.00001
+1
+
+-- query 41
+((abs(co - 120)) / 120) < 0.00001
+1
+
+-- query 42
+co IS NULL	total = 1
+1	1
+
+-- query 43
+((abs(co - 120)) / 120) < 0.00001	total = 4
+1	1
+
+-- query 44
+((abs(co - 120)) / 120) < 0.00001	total = 4
+1	1
+
+-- query 45
+co IS NULL
+1
+
+-- query 46
+((abs(co - 120)) / 120) < 0.00001
+1
+1
+1
+1

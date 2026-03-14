@@ -3466,7 +3466,6 @@ mod tests {
     use crate::common::largeint;
     use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_test;
     use crate::exec::chunk::Chunk;
-    use crate::frontend_service;
     use crate::formats::starrocks::metadata::{
         collect_delete_predicates, lake_rowset_visibility_version,
     };
@@ -3474,6 +3473,7 @@ mod tests {
     use crate::formats::starrocks::writer::layout::{
         txn_log_file_path, txn_log_file_path_with_load_id,
     };
+    use crate::frontend_service;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
     use crate::service::grpc_client::proto::starrocks::{
         BinaryPredicatePb, ColumnPb, DeletePredicatePb, KeysType, PUniqueId, RowsetMetadataPb,

@@ -1,0 +1,3 @@
+-- query 5
+percentile_approx_raw(percentile_union(percentile_hash(c2)), 0.99)
+990.5

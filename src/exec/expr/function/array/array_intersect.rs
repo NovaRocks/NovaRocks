@@ -367,8 +367,11 @@ pub fn eval_array_intersect(
         let first_end = first_offsets[first_row + 1] as usize;
 
         let mut has_null_in_all = false;
-        let mut row_map =
-            HashMap::<IntersectValue, (usize, usize), BuildHasherDefault<PhmapCompatHasher>>::default();
+        let mut row_map = HashMap::<
+            IntersectValue,
+            (usize, usize),
+            BuildHasherDefault<PhmapCompatHasher>,
+        >::default();
         for idx in first_start..first_end {
             if value_arrays[0].is_null(idx) {
                 has_null_in_all = true;
@@ -514,18 +517,12 @@ mod tests {
         let list_type = DataType::List(Arc::new(Field::new("item", DataType::Int16, true)));
         let expr = typed_null(&mut arena, list_type.clone());
 
-        let v100_a =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(100)), DataType::Int16);
-        let v200 =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(200)), DataType::Int16);
-        let v300_a =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(300)), DataType::Int16);
-        let v100_b =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(100)), DataType::Int16);
-        let v300_b =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(300)), DataType::Int16);
-        let v900 =
-            arena.push_typed(ExprNode::Literal(LiteralValue::Int16(900)), DataType::Int16);
+        let v100_a = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(100)), DataType::Int16);
+        let v200 = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(200)), DataType::Int16);
+        let v300_a = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(300)), DataType::Int16);
+        let v100_b = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(100)), DataType::Int16);
+        let v300_b = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(300)), DataType::Int16);
+        let v900 = arena.push_typed(ExprNode::Literal(LiteralValue::Int16(900)), DataType::Int16);
         let arr1 = arena.push_typed(
             ExprNode::ArrayExpr {
                 elements: vec![v100_a, v200, v300_a],

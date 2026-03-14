@@ -3783,8 +3783,7 @@ mod tests {
 
     #[test]
     fn test_cast_utf8_to_date32_uses_lenient_datetime_parser() {
-        let input =
-            Arc::new(StringArray::from(vec![Some("2023-08-17 08:00:006")])) as ArrayRef;
+        let input = Arc::new(StringArray::from(vec![Some("2023-08-17 08:00:006")])) as ArrayRef;
         let out = cast_with_special_rules(&input, &DataType::Date32).expect("cast to date");
         let out = out.as_any().downcast_ref::<Date32Array>().expect("date32");
         assert!(!out.is_null(0));
@@ -3793,13 +3792,10 @@ mod tests {
 
     #[test]
     fn test_cast_utf8_to_timestamp_uses_lenient_datetime_parser() {
-        let input =
-            Arc::new(StringArray::from(vec![Some("2023-08-17 08:00:006")])) as ArrayRef;
-        let out = cast_with_special_rules(
-            &input,
-            &DataType::Timestamp(TimeUnit::Microsecond, None),
-        )
-        .expect("cast to timestamp");
+        let input = Arc::new(StringArray::from(vec![Some("2023-08-17 08:00:006")])) as ArrayRef;
+        let out =
+            cast_with_special_rules(&input, &DataType::Timestamp(TimeUnit::Microsecond, None))
+                .expect("cast to timestamp");
         let out = out
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()

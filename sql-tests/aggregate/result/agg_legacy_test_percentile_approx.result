@@ -1,0 +1,60 @@
+-- query 5
+CAST((percentile_approx(c2, 0.5)) AS INT)
+25000
+
+-- query 6
+CAST((percentile_approx(c2, 0.9)) AS INT)
+45000
+
+-- query 7
+CAST((percentile_approx(c2, 0.9, 2048)) AS INT)
+45000
+
+-- query 8
+CAST((percentile_approx(c2, 0.9, 5000)) AS INT)
+45000
+
+-- query 9
+CAST((percentile_approx(c2, 0.9, 10000)) AS INT)
+45000
+
+-- query 10
+CAST((percentile_approx(c2, v1)) AS INT)
+25000
+
+-- query 11
+CAST((percentile_approx(c2, v1, v2 + 1)) AS INT)
+25000
+
+-- query 12
+percentile_approx(c2, [0.25, 0.5, 0.75])
+[12499.75,25000,37500.25]
+
+-- query 13
+percentile_approx(c2, [0.0, 0.5, 1.0])
+[1,25000,49999]
+
+-- query 14
+percentile_approx(c2, [0.1, 0.25, 0.5, 0.75, 0.9])
+[4999.6005859375,12499.75,25000,37500.25,45000.3984375]
+
+-- query 15
+percentile_approx(c2, [0.25, 0.5, 0.75], 2048)
+[12499.75,25000,37500.25]
+
+-- query 16
+percentile_approx(c2, [0.5, 0.9], 5000)
+[25000,45000.39453125]
+
+-- query 17
+percentile_approx(c2, [0.1, 0.5, 0.9], 10000)
+[4999.6005859375,25000,45000.3984375]
+
+-- query 20
+percentile_approx(value, [0.5, 0.9], 5000)
+[3.5,6]
+[5.5,8]
+
+-- query 25
+percentile_approx(v2, [0.1, 0.5, 0.9], 5000)
+[2,5,8]

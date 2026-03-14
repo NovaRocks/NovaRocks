@@ -1,0 +1,34 @@
+-- query 11
+v1	count_if(v2 IS NOT NULL)
+c	1
+a	4
+
+-- query 12
+v1	count_if((v4 + v4) IS NOT NULL)
+c	2
+a	4
+
+-- query 13
+v1	count_if(v2 IS NULL)	count_if(v4)
+a	1	4
+c	2	2
+
+-- query 14
+count_if(v4 >= 3)	count_if(v4 < 3)	count_if(v3 = '2022-04-18 03:45:00')
+3	3	1
+
+-- query 15
+count_if(v2)	count_if(v2 IS NOT NULL)	count_if(NULL)	count_if(v4 + 1)
+0	5	0	6
+
+-- query 17
+count_if(v1 >= v2)	count_if((v1 >= v2) OR (v4 = 1))	count_if((v1 >= v2) AND (v4 = 1))
+2	3	1
+
+-- query 18
+count_if(TRUE)	count_if(FALSE)	count_if('')
+8	0	0
+
+-- query 19
+count_if(v1 = 'a')	count(v1)	count(if(v1 = 'a', 1, NULL))
+5	8	5

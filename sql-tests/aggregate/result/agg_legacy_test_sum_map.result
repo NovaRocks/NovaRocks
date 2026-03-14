@@ -1,0 +1,415 @@
+-- query 4
+sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+15	60	65	40	50
+
+-- query 5
+sum_map(c3)['a']	sum_map(c3)['b']	sum_map(c3)['c']
+150	450	500
+
+-- query 6
+sum_map(c4)[1]	sum_map(c4)[2]	sum_map(c4)[3]
+2	3.5	5.5
+
+-- query 7
+c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+1	10	20	30	NULL	NULL
+2	5	15	NULL	40	NULL
+3	NULL	25	35	NULL	50
+
+-- query 8
+sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]
+15	35	30	40
+
+-- query 10
+sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+15	60	65	40	50
+
+-- query 12
+sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+15	60	65	40	50
+
+-- query 13
+sum_map(c2)[1]
+15
+
+-- query 14
+sum_map(c2)[2]
+60
+
+-- query 15
+sum_map(c2)[3]
+65
+
+-- query 16
+sum_map(c2)[4]
+40
+
+-- query 17
+sum_map(c2)[5]
+50
+
+-- query 19
+sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+15	60	65	40	50
+
+-- query 20
+sum_map(c3)['a']	sum_map(c3)['b']	sum_map(c3)['c']
+150	450	500
+
+-- query 21
+sum_map(c4)[1]	sum_map(c4)[2]	sum_map(c4)[3]
+2	3.5	5.5
+
+-- query 22
+c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+1	10	20	30	NULL	NULL
+2	5	15	NULL	40	NULL
+3	NULL	25	35	NULL	50
+4	NULL	NULL	NULL	NULL	NULL
+5	NULL	NULL	NULL	NULL	NULL
+
+-- query 24
+sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+15	60	65	40	50
+
+-- query 25
+sum_map(c3)['a']	sum_map(c3)['b']	sum_map(c3)['c']
+150	450	500
+
+-- query 26
+sum_map(c4)[1]	sum_map(c4)[2]	sum_map(c4)[3]
+2	3.5	5.5
+
+-- query 27
+c1	sum_map(c2)[1]	sum_map(c2)[2]	sum_map(c2)[3]	sum_map(c2)[4]	sum_map(c2)[5]
+1	10	20	30	NULL	NULL
+2	5	15	NULL	40	NULL
+3	NULL	25	35	NULL	50
+4	NULL	NULL	NULL	NULL	NULL
+5	NULL	NULL	NULL	NULL	NULL
+
+-- query 31
+sum_map(m_tinyint)[1]	sum_map(m_tinyint)[2]	sum_map(m_tinyint)[3]
+15	20	30
+
+-- query 32
+sum_map(m_smallint)[1]	sum_map(m_smallint)[2]	sum_map(m_smallint)[3]
+150	200	300
+
+-- query 33
+sum_map(m_int)[1]	sum_map(m_int)[2]	sum_map(m_int)[3]
+1500	2000	3000
+
+-- query 34
+sum_map(m_bigint)[1]	sum_map(m_bigint)[2]	sum_map(m_bigint)[3]
+15000	20000	30000
+
+-- query 35
+sum_map(m_largeint)[1]	sum_map(m_largeint)[2]	sum_map(m_largeint)[3]
+150000	200000	300000
+
+-- query 36
+sum_map(m_float)[1]	sum_map(m_float)[2]	sum_map(m_float)[3]
+2	2.5	3.5
+
+-- query 37
+sum_map(m_double)[1]	sum_map(m_double)[2]	sum_map(m_double)[3]
+16	20.5	30.5
+
+-- query 40
+sum_map(m_key_tinyint)[1]	sum_map(m_key_tinyint)[2]	sum_map(m_key_tinyint)[3]
+15	20	30
+
+-- query 41
+sum_map(m_key_smallint)[1]	sum_map(m_key_smallint)[2]	sum_map(m_key_smallint)[3]
+150	200	300
+
+-- query 42
+sum_map(m_key_int)[1]	sum_map(m_key_int)[2]	sum_map(m_key_int)[3]
+1500	2000	3000
+
+-- query 43
+sum_map(m_key_bigint)[1]	sum_map(m_key_bigint)[2]	sum_map(m_key_bigint)[3]
+15000	20000	30000
+
+-- query 44
+sum_map(m_key_largeint)[1]	sum_map(m_key_largeint)[2]	sum_map(m_key_largeint)[3]
+150000	200000	300000
+
+-- query 45
+sum_map(m_key_varchar)['a']	sum_map(m_key_varchar)['b']	sum_map(m_key_varchar)['c']
+15	20	30
+
+-- query 46
+sum_map(NULL)
+NULL
+
+-- query 47
+sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[3]
+15	20	30
+
+-- query 48
+sum_map(m)
+NULL
+
+-- query 51
+sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[NULL]
+15	20	30	150
+
+-- query 53
+sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[4]	sum_map(m_nullable)[NULL]
+30	20	30	40	150
+
+-- query 55
+sum_map(m_nullable)[1]	sum_map(m_nullable)[2]	sum_map(m_nullable)[3]	sum_map(m_nullable)[4]	sum_map(m_nullable)[5]	sum_map(m_nullable)[6]	sum_map(m_nullable)[NULL]
+30	20	30	40	NULL	60	175
+
+-- query 56
+sum_map(m)[1]	sum_map(m)[2]
+10	20
+
+-- query 57
+sum_map(m)
+{}
+
+-- query 58
+sum_map(m)[1]	sum_map(m)[2]
+15	20
+
+-- query 59
+sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[5]	sum_map(m)[10]
+2	4	10	20
+
+-- query 60
+sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[3]	sum_map(m)[4]
+-5	5	-30	40
+
+-- query 61
+sum_map(m)[1]	sum_map(m)[2]
+5	10
+
+-- query 67
+category	sum_map(metrics)['clicks']	sum_map(metrics)['views']	sum_map(metrics)['impressions']	count(*)
+A	150	200	150	2
+B	75	400	250	2
+
+-- query 68
+category	clicks_total	views_total	impressions_total
+A	150	200	150
+B	75	400	250
+
+-- query 69
+sum_map(m)[1]	sum_map(m)[2]	sum_map(m)[3]
+25	45	65
+
+-- query 72
+sum_map(data)[1]	sum_map(data)[2]	sum_map(data)[3]
+5050	10100	15150
+
+-- query 76
+sum_map(m_ti_ti)[1]	sum_map(m_ti_ti)[2]	sum_map(m_ti_ti)[3]
+15	20	30
+
+-- query 77
+sum_map(m_ti_si)[1]	sum_map(m_ti_si)[2]	sum_map(m_ti_si)[3]
+150	200	300
+
+-- query 78
+sum_map(m_ti_i)[1]	sum_map(m_ti_i)[2]	sum_map(m_ti_i)[3]
+1500	2000	3000
+
+-- query 79
+sum_map(m_ti_bi)[1]	sum_map(m_ti_bi)[2]	sum_map(m_ti_bi)[3]
+15000	20000	30000
+
+-- query 80
+sum_map(m_ti_li)[1]	sum_map(m_ti_li)[2]	sum_map(m_ti_li)[3]
+150000	200000	300000
+
+-- query 81
+sum_map(m_ti_f)[1]	sum_map(m_ti_f)[2]	sum_map(m_ti_f)[3]
+2	2.5	3.5
+
+-- query 82
+sum_map(m_ti_d)[1]	sum_map(m_ti_d)[2]	sum_map(m_ti_d)[3]
+16	20.5	30.5
+
+-- query 83
+sum_map(m_si_ti)[1]	sum_map(m_si_ti)[2]	sum_map(m_si_ti)[3]
+15	20	30
+
+-- query 84
+sum_map(m_si_si)[1]	sum_map(m_si_si)[2]	sum_map(m_si_si)[3]
+150	200	300
+
+-- query 85
+sum_map(m_si_i)[1]	sum_map(m_si_i)[2]	sum_map(m_si_i)[3]
+1500	2000	3000
+
+-- query 86
+sum_map(m_si_bi)[1]	sum_map(m_si_bi)[2]	sum_map(m_si_bi)[3]
+15000	20000	30000
+
+-- query 87
+sum_map(m_si_li)[1]	sum_map(m_si_li)[2]	sum_map(m_si_li)[3]
+150000	200000	300000
+
+-- query 88
+sum_map(m_si_f)[1]	sum_map(m_si_f)[2]	sum_map(m_si_f)[3]
+2	2.5	3.5
+
+-- query 89
+sum_map(m_si_d)[1]	sum_map(m_si_d)[2]	sum_map(m_si_d)[3]
+16	20.5	30.5
+
+-- query 90
+sum_map(m_i_ti)[1]	sum_map(m_i_ti)[2]	sum_map(m_i_ti)[3]
+15	20	30
+
+-- query 91
+sum_map(m_i_si)[1]	sum_map(m_i_si)[2]	sum_map(m_i_si)[3]
+150	200	300
+
+-- query 92
+sum_map(m_i_i)[1]	sum_map(m_i_i)[2]	sum_map(m_i_i)[3]
+1500	2000	3000
+
+-- query 93
+sum_map(m_i_bi)[1]	sum_map(m_i_bi)[2]	sum_map(m_i_bi)[3]
+15000	20000	30000
+
+-- query 94
+sum_map(m_i_li)[1]	sum_map(m_i_li)[2]	sum_map(m_i_li)[3]
+150000	200000	300000
+
+-- query 95
+sum_map(m_i_f)[1]	sum_map(m_i_f)[2]	sum_map(m_i_f)[3]
+2	2.5	3.5
+
+-- query 96
+sum_map(m_i_d)[1]	sum_map(m_i_d)[2]	sum_map(m_i_d)[3]
+16	20.5	30.5
+
+-- query 97
+sum_map(m_bi_ti)[1]	sum_map(m_bi_ti)[2]	sum_map(m_bi_ti)[3]
+15	20	30
+
+-- query 98
+sum_map(m_bi_si)[1]	sum_map(m_bi_si)[2]	sum_map(m_bi_si)[3]
+150	200	300
+
+-- query 99
+sum_map(m_bi_i)[1]	sum_map(m_bi_i)[2]	sum_map(m_bi_i)[3]
+1500	2000	3000
+
+-- query 100
+sum_map(m_bi_bi)[1]	sum_map(m_bi_bi)[2]	sum_map(m_bi_bi)[3]
+15000	20000	30000
+
+-- query 101
+sum_map(m_bi_li)[1]	sum_map(m_bi_li)[2]	sum_map(m_bi_li)[3]
+150000	200000	300000
+
+-- query 102
+sum_map(m_bi_f)[1]	sum_map(m_bi_f)[2]	sum_map(m_bi_f)[3]
+2	2.5	3.5
+
+-- query 103
+sum_map(m_bi_d)[1]	sum_map(m_bi_d)[2]	sum_map(m_bi_d)[3]
+16	20.5	30.5
+
+-- query 104
+sum_map(m_li_ti)[1]	sum_map(m_li_ti)[2]	sum_map(m_li_ti)[3]
+15	20	30
+
+-- query 105
+sum_map(m_li_si)[1]	sum_map(m_li_si)[2]	sum_map(m_li_si)[3]
+150	200	300
+
+-- query 106
+sum_map(m_li_i)[1]	sum_map(m_li_i)[2]	sum_map(m_li_i)[3]
+1500	2000	3000
+
+-- query 107
+sum_map(m_li_bi)[1]	sum_map(m_li_bi)[2]	sum_map(m_li_bi)[3]
+15000	20000	30000
+
+-- query 108
+sum_map(m_li_li)[1]	sum_map(m_li_li)[2]	sum_map(m_li_li)[3]
+150000	200000	300000
+
+-- query 109
+sum_map(m_li_f)[1]	sum_map(m_li_f)[2]	sum_map(m_li_f)[3]
+2	2.5	3.5
+
+-- query 110
+sum_map(m_li_d)[1]	sum_map(m_li_d)[2]	sum_map(m_li_d)[3]
+16	20.5	30.5
+
+-- query 111
+sum_map(m_f_ti)[1.0]	sum_map(m_f_ti)[2.0]	sum_map(m_f_ti)[3.0]
+15	20	30
+
+-- query 112
+sum_map(m_f_si)[1.0]	sum_map(m_f_si)[2.0]	sum_map(m_f_si)[3.0]
+150	200	300
+
+-- query 113
+sum_map(m_f_i)[1.0]	sum_map(m_f_i)[2.0]	sum_map(m_f_i)[3.0]
+1500	2000	3000
+
+-- query 114
+sum_map(m_f_bi)[1.0]	sum_map(m_f_bi)[2.0]	sum_map(m_f_bi)[3.0]
+15000	20000	30000
+
+-- query 115
+sum_map(m_f_li)[1.0]	sum_map(m_f_li)[2.0]	sum_map(m_f_li)[3.0]
+150000	200000	300000
+
+-- query 116
+sum_map(m_f_f)[1.0]	sum_map(m_f_f)[2.0]	sum_map(m_f_f)[3.0]
+2	2.5	3.5
+
+-- query 117
+sum_map(m_f_d)[1.0]	sum_map(m_f_d)[2.0]	sum_map(m_f_d)[3.0]
+16	20.5	30.5
+
+-- query 118
+sum_map(m_d_ti)[1.0]	sum_map(m_d_ti)[2.0]	sum_map(m_d_ti)[3.0]
+15	20	30
+
+-- query 119
+sum_map(m_d_si)[1.0]	sum_map(m_d_si)[2.0]	sum_map(m_d_si)[3.0]
+150	200	300
+
+-- query 120
+sum_map(m_d_i)[1.0]	sum_map(m_d_i)[2.0]	sum_map(m_d_i)[3.0]
+1500	2000	3000
+
+-- query 121
+sum_map(m_d_bi)[1.0]	sum_map(m_d_bi)[2.0]	sum_map(m_d_bi)[3.0]
+15000	20000	30000
+
+-- query 122
+sum_map(m_d_li)[1.0]	sum_map(m_d_li)[2.0]	sum_map(m_d_li)[3.0]
+150000	200000	300000
+
+-- query 123
+sum_map(m_d_f)[1.0]	sum_map(m_d_f)[2.0]	sum_map(m_d_f)[3.0]
+2	2.5	3.5
+
+-- query 124
+sum_map(m_d_d)[1.0]	sum_map(m_d_d)[2.0]	sum_map(m_d_d)[3.0]
+16	20.5	30.5
+
+-- query 125
+sum_map(m_date_i)['2024-01-01']	sum_map(m_date_i)['2024-01-02']	sum_map(m_date_i)['2024-01-03']
+150	200	300
+
+-- query 126
+sum_map(m_dt_i)['2024-01-01 10:00:00']	sum_map(m_dt_i)['2024-01-01 11:00:00']	sum_map(m_dt_i)['2024-01-01 12:00:00']
+150	200	300
+
+-- query 127
+sum_map(m_str_i)['a']	sum_map(m_str_i)['b']	sum_map(m_str_i)['c']
+150	200	300

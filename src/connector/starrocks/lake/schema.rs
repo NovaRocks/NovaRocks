@@ -613,11 +613,8 @@ fn build_create_tablet_column_pb_from_column_type(
             column_type.type_, column_idx
         )
     })?;
-    let (precision, frac) = resolve_decimal_type_attrs(
-        column_type.type_,
-        column_type.precision,
-        column_type.scale,
-    );
+    let (precision, frac) =
+        resolve_decimal_type_attrs(column_type.type_, column_type.precision, column_type.scale);
     Ok(ColumnPb {
         unique_id: -1,
         name: None,
@@ -1131,9 +1128,10 @@ fn map_primitive_to_starrocks_type(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_create_tablet_column_pb_from_column_type, build_create_tablet_column_pb_from_type_desc,
-        build_sink_tablet_schema, create_lake_tablet_from_req,
-        is_missing_tablet_page_in_bundle_error, map_primitive_to_starrocks_type,
+        build_create_tablet_column_pb_from_column_type,
+        build_create_tablet_column_pb_from_type_desc, build_sink_tablet_schema,
+        create_lake_tablet_from_req, is_missing_tablet_page_in_bundle_error,
+        map_primitive_to_starrocks_type,
     };
     use crate::formats::starrocks::writer::bundle_meta::{
         load_tablet_metadata_at_version, write_bundle_meta_file,

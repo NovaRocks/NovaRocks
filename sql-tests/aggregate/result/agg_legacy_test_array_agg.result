@@ -1,0 +1,2050 @@
+-- query 17
+max(id)	array_agg(DISTINCT name)	count(DISTINCT id)	array_agg(name)
+1	["Tom"]	1	["Tom","Tom"]
+
+-- query 18
+max(id)	array_agg(DISTINCT name)
+1	["Tom"]
+
+-- query 19
+max(id)	array_agg(DISTINCT name)	array_agg(DISTINCT score > 0)
+1	["Tom"]	[1]
+
+-- query 20
+max(id)	array_agg(DISTINCT name)	count(DISTINCT id)	array_agg(name)
+1	["Tom"]	1	["Tom","Tom"]
+
+-- query 21
+max(id)	array_agg(DISTINCT name)
+1	["Tom"]
+
+-- query 23
+max(id)	array_agg(name)	array_agg(DISTINCT name)
+1	["Tom","Tom"]	["Tom"]
+
+-- query 24
+max(id)	array_agg(DISTINCT name)	array_agg(DISTINCT score > 0)
+1	["Tom"]	[1]
+
+-- query 25
+id	array_agg(DISTINCT name)	count(DISTINCT score)	array_agg(name)
+1	["Tom"]	2	["Tom","Tom"]
+
+-- query 26
+id	array_agg(DISTINCT name)
+1	["Tom"]
+
+-- query 28
+id	array_agg(name)	array_agg(DISTINCT name)
+1	["Tom","Tom"]	["Tom"]
+
+-- query 29
+id	array_agg(DISTINCT name)	array_agg(DISTINCT score > 1)
+1	["Tom"]	[1]
+
+-- query 30
+score	array_agg(DISTINCT name)	count(DISTINCT id)	array_agg(name)
+80	["Tom"]	1	["Tom"]
+90	["Tom"]	1	["Tom"]
+
+-- query 31
+score	array_agg(DISTINCT name)
+80	["Tom"]
+90	["Tom"]
+
+-- query 33
+score	array_agg(name)	array_agg(DISTINCT name)
+80	["Tom"]	["Tom"]
+90	["Tom"]	["Tom"]
+
+-- query 34
+score	array_agg(DISTINCT name)	array_agg(DISTINCT score > 1)
+80	["Tom"]	[1]
+90	["Tom"]	[1]
+
+-- query 35
+id	array_agg(DISTINCT name)	count(DISTINCT score)	array_agg(name)
+NULL	["Tom"]	2	["Tom","Tom"]
+1	["Tom"]	2	["Tom","Tom"]
+
+-- query 36
+id	array_agg(DISTINCT name)
+NULL	["Tom"]
+1	["Tom"]
+
+-- query 37
+id	array_agg(name)	array_agg(name ORDER BY name ASC)
+NULL	["Tom","Tom"]	["Tom","Tom"]
+1	["Tom","Tom"]	["Tom","Tom"]
+
+-- query 38
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null]	1	[null]
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+[null,"Ti"]	0	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	1	["May","Ti","欧阳诸葛方程"]
+["Tom"]	1	["Tom","Tom"]
+["Tom","王武程咬金"]	1	["Tom","Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	1	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	1	["李四大闹天空"]
+
+-- query 39
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+[null,"English","语文北京上海"]
+[null,"English","数学大不列颠"]
+[null]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 40
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null]	1
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	9
+[null,"Ti"]	2
+["May","Ti","欧阳诸葛方程"]	3
+["Tom"]	1
+["Tom","王武程咬金"]	3
+["张三掩耳盗铃","张三此地无银三百两"]	2
+["李四大闹天空"]	1
+
+-- query 41
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+[null,"May","Tom","李四大闹天空","欧阳诸葛方程"]	[null,"English","数学大不列颠","英语外语美誉"]
+["Ti"]	["物理Phy"]
+["Ti","张三此地无银三百两"]	["English","英文English"]
+["Tom"]	["English"]
+["Tom"]	["Math"]
+["张三掩耳盗铃"]	["Math数学欧拉方程"]
+["王武程咬金"]	["语文北京上海"]
+
+-- query 42
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null]	1	[null]
+[null,"Ti"]	0	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	1	["May","Ti","欧阳诸葛方程"]
+["Tom"]	1	["Tom","Tom"]
+["Tom","王武程咬金"]	1	["Tom","Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	1	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	1	["李四大闹天空"]
+
+-- query 43
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom","Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 44
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 45
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 46
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 47
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 48
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","Tom","王武程咬金"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 49
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 50
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Ti","May",null]
+
+-- query 51
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 52
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 53
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 54
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金",null,null]
+
+-- query 55
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"物理Phy"]
+["English","Math"]
+[null,"English","语文北京上海"]
+[null,"English","数学大不列颠"]
+[null]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 56
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null]	1
+[null,"Ti"]	2
+["May","Ti","欧阳诸葛方程"]	3
+["Tom"]	1
+["Tom","王武程咬金"]	3
+["张三掩耳盗铃","张三此地无银三百两"]	2
+["李四大闹天空"]	1
+
+-- query 57
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null]	[null]
+[null,"Ti"]	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+["Tom","Tom"]	["Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 58
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null]	[null]
+[null,"Ti"]	[null,99]
+["May","Ti","欧阳诸葛方程"]	[null,98]
+["Tom"]	[80,90]
+["Tom","王武程咬金"]	[null,22]
+["张三掩耳盗铃","张三此地无银三百两"]	[78,98]
+["李四大闹天空"]	[null]
+
+-- query 59
+array_agg(DISTINCT name ORDER BY name ASC)
+[null]
+[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]
+["Tom"]
+["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]
+
+-- query 60
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, cardinality(arr) ASC, arr ASC))
+1
+1
+1
+2
+2
+3
+3
+
+-- query 61
+array_agg(DISTINCT name ORDER BY name ASC, score ASC, name ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"Ti"]	0	99
+["May","Ti","欧阳诸葛方程"]	1	98
+["Tom"]	1	90
+["Tom","王武程咬金"]	1	22
+["张三掩耳盗铃","张三此地无银三百两"]	1	98
+["李四大闹天空"]	1	NULL
+
+-- query 62
+cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+2
+1
+3
+3
+1
+2
+1
+
+-- query 63
+array_agg(DISTINCT NULL ORDER BY score ASC)	array_agg(NULL ORDER BY score ASC)
+[null]	[null]
+[null]	[null]
+[null]	[null,null]
+[null]	[null,null]
+[null]	[null,null]
+[null]	[null,null,null]
+[null]	[null,null,null]
+
+-- query 64
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null]
+[null,"English","数学大不列颠"]
+[null,"English","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 65
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, name ASC, subject ASC))	cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+1	1
+1	1
+1	1
+2	2
+2	2
+3	3
+3	3
+
+-- query 66
+array_agg(DISTINCT score ORDER BY score ASC)	array_agg(subject ORDER BY score ASC, subject ASC)	array_agg(subject ORDER BY score ASC, subject ASC)
+[null]	[null]	[null]
+[null]	["英语外语美誉"]	["英语外语美誉"]
+[null,22]	[null,"English","语文北京上海"]	[null,"English","语文北京上海"]
+[null,98]	[null,"数学大不列颠","English"]	[null,"数学大不列颠","English"]
+[null,99]	[null,"物理Phy"]	[null,"物理Phy"]
+[78,98]	["Math数学欧拉方程","英文English"]	["Math数学欧拉方程","英文English"]
+[80,90]	["Math","English"]	["Math","English"]
+
+-- query 67
+array_agg(DISTINCT score ORDER BY score ASC)
+[null]
+[null]
+[null,22]
+[null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 68
+array_agg(DISTINCT score ORDER BY score ASC, name ASC)
+[null]
+[null]
+[null,22]
+[null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 69
+array_agg(DISTINCT 1)
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 70
+array_agg(DISTINCT 12 ORDER BY score ASC)
+[12]
+[12]
+[12]
+[12]
+[12]
+[12]
+[12]
+
+-- query 71
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null]
+[null,"English","数学大不列颠"]
+[null,"English","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 72
+group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	array_agg(DISTINCT id ORDER BY id ASC)	max(score)
+NULL	[4]	NULL
+TiEnglish,欧阳诸葛方程数学大不列颠	[3]	98
+Ti物理Phy	[null]	99
+TomEnglish,TomMath	[1]	90
+TomEnglish,王武程咬金语文北京上海	[2]	22
+张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English	[11]	98
+李四大闹天空英语外语美誉	[12]	NULL
+
+-- query 73
+array_agg(name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"Ti"]	0	99
+["May","Ti","欧阳诸葛方程"]	1	98
+["Tom","Tom"]	1	90
+["Tom","Tom","王武程咬金"]	1	22
+["张三掩耳盗铃","张三此地无银三百两"]	1	98
+["李四大闹天空"]	1	NULL
+
+-- query 74
+array_agg(subject ORDER BY score ASC, subject ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"English","语文北京上海"]	1	22
+[null,"数学大不列颠","English"]	1	98
+[null,"物理Phy"]	0	99
+["Math","English"]	1	90
+["Math数学欧拉方程","英文English"]	1	98
+["英语外语美誉"]	1	NULL
+
+-- query 76
+cardinality(array_agg(name ORDER BY score ASC))	cardinality(array_agg(DISTINCT name ORDER BY score ASC))
+1	1
+1	1
+2	1
+2	2
+2	2
+3	2
+3	3
+
+-- query 77
+array_agg(NULL ORDER BY score ASC)
+[null]
+[null]
+[null,null]
+[null,null]
+[null,null]
+[null,null,null]
+[null,null,null]
+
+-- query 78
+array_agg(score ORDER BY score ASC)
+[null]
+[null]
+[null,null,22]
+[null,null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 79
+array_agg(score ORDER BY score ASC, name ASC)
+[null]
+[null]
+[null,null,22]
+[null,null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 80
+array_agg(DISTINCT 1)
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 81
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 82
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 83
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr))
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	9
+
+-- query 84
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 85
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,22,78,80,90,98,99]
+
+-- query 86
+array_agg(DISTINCT name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 87
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+9
+
+-- query 88
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	99
+
+-- query 89
+cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, cardinality(mmap) ASC, name ASC))	a
+9	12
+
+-- query 90
+array_agg(DISTINCT NULL ORDER BY score ASC)	array_agg(NULL ORDER BY score ASC)
+[null]	[null,null,null,null,null,null,null,null,null,null,null,null,null,null]
+
+-- query 91
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 92
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, name ASC, subject ASC))	cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+9	9
+
+-- query 93
+array_agg(DISTINCT score ORDER BY score ASC)	array_agg(subject ORDER BY score ASC, subject ASC)	array_agg(subject ORDER BY score ASC, subject ASC)
+[null,22,78,80,90,98,99]	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]
+
+-- query 94
+array_agg(DISTINCT score ORDER BY score ASC)
+[null,22,78,80,90,98,99]
+
+-- query 95
+array_agg(DISTINCT score ORDER BY score ASC, name ASC)
+[null,22,78,80,90,98,99]
+
+-- query 96
+array_agg(DISTINCT 1)
+[1]
+
+-- query 97
+array_agg(DISTINCT 12 ORDER BY score ASC)
+[12]
+
+-- query 98
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 99
+group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	array_agg(DISTINCT id ORDER BY id ASC)	max(score)
+TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	[null,1,2,3,4,11,12]	99
+
+-- query 100
+array_agg(name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	99
+
+-- query 101
+array_agg(subject ORDER BY score ASC, subject ASC)	count(DISTINCT id)	max(score)
+[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]	6	99
+
+-- query 103
+array_agg(name ORDER BY name ASC, score ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 104
+array_agg(NULL ORDER BY score ASC)
+[null,null,null,null,null,null,null,null,null,null,null,null,null,null]
+
+-- query 105
+array_agg(score ORDER BY score ASC)
+[null,null,null,null,null,null,null,22,78,80,90,98,98,99]
+
+-- query 106
+array_agg(score ORDER BY score ASC, name ASC)
+[null,null,null,null,null,null,null,22,78,80,90,98,98,99]
+
+-- query 107
+array_agg(DISTINCT 1)
+[1]
+
+-- query 109
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null]	1	[null]
+[null,"Ti"]	0	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	1	["May","Ti","欧阳诸葛方程"]
+["Tom"]	1	["Tom","Tom"]
+["Tom","王武程咬金"]	1	["Tom","Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	1	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	1	["李四大闹天空"]
+
+-- query 110
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"物理Phy"]
+["English","Math"]
+[null,"English","语文北京上海"]
+[null,"English","数学大不列颠"]
+[null]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 111
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null]	1
+[null,"Ti"]	2
+["May","Ti","欧阳诸葛方程"]	3
+["Tom"]	1
+["Tom","王武程咬金"]	3
+["张三掩耳盗铃","张三此地无银三百两"]	2
+["李四大闹天空"]	1
+
+-- query 112
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null]	[null]
+[null,"Ti"]	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+["Tom","Tom"]	["Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 113
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null]	[null]
+[null,"Ti"]	[null,99]
+["May","Ti","欧阳诸葛方程"]	[null,98]
+["Tom"]	[80,90]
+["Tom","王武程咬金"]	[null,22]
+["张三掩耳盗铃","张三此地无银三百两"]	[78,98]
+["李四大闹天空"]	[null]
+
+-- query 114
+array_agg(DISTINCT name ORDER BY name ASC)
+[null]
+[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]
+["Tom"]
+["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]
+
+-- query 115
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+1
+1
+1
+2
+2
+3
+3
+
+-- query 116
+array_agg(DISTINCT name ORDER BY name ASC, score ASC, name ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"Ti"]	0	99
+["May","Ti","欧阳诸葛方程"]	1	98
+["Tom"]	1	90
+["Tom","王武程咬金"]	1	22
+["张三掩耳盗铃","张三此地无银三百两"]	1	98
+["李四大闹天空"]	1	NULL
+
+-- query 117
+cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+2
+1
+3
+3
+1
+2
+1
+
+-- query 118
+array_agg(DISTINCT NULL ORDER BY score ASC)	array_agg(NULL ORDER BY score ASC)
+[null]	[null]
+[null]	[null]
+[null]	[null,null]
+[null]	[null,null]
+[null]	[null,null]
+[null]	[null,null,null]
+[null]	[null,null,null]
+
+-- query 119
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null]
+[null,"English","数学大不列颠"]
+[null,"English","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 120
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, name ASC, subject ASC))	cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+1	1
+1	1
+1	1
+2	2
+2	2
+3	3
+3	3
+
+-- query 121
+array_agg(DISTINCT score ORDER BY score ASC)	array_agg(subject ORDER BY score ASC, subject ASC)	array_agg(subject ORDER BY score ASC, subject ASC)
+[null]	[null]	[null]
+[null]	["英语外语美誉"]	["英语外语美誉"]
+[null,22]	[null,"English","语文北京上海"]	[null,"English","语文北京上海"]
+[null,98]	[null,"数学大不列颠","English"]	[null,"数学大不列颠","English"]
+[null,99]	[null,"物理Phy"]	[null,"物理Phy"]
+[78,98]	["Math数学欧拉方程","英文English"]	["Math数学欧拉方程","英文English"]
+[80,90]	["Math","English"]	["Math","English"]
+
+-- query 122
+array_agg(DISTINCT score ORDER BY score ASC)
+[null]
+[null]
+[null,22]
+[null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 123
+array_agg(DISTINCT score ORDER BY score ASC, name ASC)
+[null]
+[null]
+[null,22]
+[null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 124
+array_agg(DISTINCT 1)
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 125
+array_agg(DISTINCT 12 ORDER BY score ASC)
+[12]
+[12]
+[12]
+[12]
+[12]
+[12]
+[12]
+
+-- query 126
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null]
+[null,"English","数学大不列颠"]
+[null,"English","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 127
+group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	array_agg(DISTINCT id ORDER BY id ASC)	max(score)
+NULL	[4]	NULL
+TiEnglish,欧阳诸葛方程数学大不列颠	[3]	98
+Ti物理Phy	[null]	99
+TomEnglish,TomMath	[1]	90
+TomEnglish,王武程咬金语文北京上海	[2]	22
+张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English	[11]	98
+李四大闹天空英语外语美誉	[12]	NULL
+
+-- query 128
+array_agg(name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"Ti"]	0	99
+["May","Ti","欧阳诸葛方程"]	1	98
+["Tom","Tom"]	1	90
+["Tom","Tom","王武程咬金"]	1	22
+["张三掩耳盗铃","张三此地无银三百两"]	1	98
+["李四大闹天空"]	1	NULL
+
+-- query 129
+array_agg(subject ORDER BY score ASC, subject ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"English","语文北京上海"]	1	22
+[null,"数学大不列颠","English"]	1	98
+[null,"物理Phy"]	0	99
+["Math","English"]	1	90
+["Math数学欧拉方程","英文English"]	1	98
+["英语外语美誉"]	1	NULL
+
+-- query 131
+cardinality(array_agg(name ORDER BY score ASC))	cardinality(array_agg(DISTINCT name ORDER BY score ASC))
+1	1
+1	1
+2	1
+2	2
+2	2
+3	2
+3	3
+
+-- query 132
+array_agg(NULL ORDER BY score ASC)
+[null]
+[null]
+[null,null]
+[null,null]
+[null,null]
+[null,null,null]
+[null,null,null]
+
+-- query 133
+array_agg(score ORDER BY score ASC)
+[null]
+[null]
+[null,null,22]
+[null,null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 134
+array_agg(score ORDER BY score ASC, name ASC)
+[null]
+[null]
+[null,null,22]
+[null,null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 135
+array_agg(DISTINCT 1)
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 136
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 137
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 138
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr))
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	9
+
+-- query 139
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 140
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,22,78,80,90,98,99]
+
+-- query 141
+array_agg(DISTINCT name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 142
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+9
+
+-- query 143
+array_agg(DISTINCT name ORDER BY name ASC, score ASC, name ASC)	count(DISTINCT id)	max(score)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	99
+
+-- query 145
+array_agg(DISTINCT NULL ORDER BY score ASC)	array_agg(NULL ORDER BY score ASC)
+[null]	[null,null,null,null,null,null,null,null,null,null,null,null,null,null]
+
+-- query 146
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 147
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, name ASC, subject ASC))	cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+9	9
+
+-- query 148
+array_agg(DISTINCT score ORDER BY score ASC)	array_agg(subject ORDER BY score ASC, subject ASC)	array_agg(subject ORDER BY score ASC, subject ASC)
+[null,22,78,80,90,98,99]	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]
+
+-- query 149
+array_agg(DISTINCT score ORDER BY score ASC)
+[null,22,78,80,90,98,99]
+
+-- query 150
+array_agg(DISTINCT score ORDER BY score ASC, name ASC)
+[null,22,78,80,90,98,99]
+
+-- query 151
+array_agg(DISTINCT 1)
+[1]
+
+-- query 152
+array_agg(DISTINCT 12 ORDER BY score ASC)
+[12]
+
+-- query 153
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 154
+group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	array_agg(DISTINCT id ORDER BY id ASC)	max(score)
+TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	[null,1,2,3,4,11,12]	99
+
+-- query 155
+array_agg(name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	99
+
+-- query 156
+array_agg(subject ORDER BY score ASC, subject ASC)	count(DISTINCT id)	max(score)
+[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]	6	99
+
+-- query 158
+array_agg(name ORDER BY name ASC, score ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 159
+array_agg(NULL ORDER BY score ASC)
+[null,null,null,null,null,null,null,null,null,null,null,null,null,null]
+
+-- query 160
+array_agg(score ORDER BY score ASC)
+[null,null,null,null,null,null,null,22,78,80,90,98,98,99]
+
+-- query 161
+array_agg(score ORDER BY score ASC, name ASC)
+[null,null,null,null,null,null,null,22,78,80,90,98,98,99]
+
+-- query 162
+array_agg(DISTINCT 1)
+[1]
+
+-- query 163
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom","Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 164
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 165
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 166
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 167
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["Tom","Tom","王武程咬金"]
+["欧阳诸葛方程","Ti","May"]	["May","Ti","欧阳诸葛方程"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 168
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","Tom","王武程咬金"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 169
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 170
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Ti","May",null]
+
+-- query 171
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 172
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 173
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 174
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金",null,null]
+
+-- query 177
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null]	1	[null]
+[null,"Ti"]	0	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	1	["May","Ti","欧阳诸葛方程"]
+["Tom"]	1	["Tom","Tom"]
+["Tom","王武程咬金"]	1	["Tom","Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	1	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	1	["李四大闹天空"]
+
+-- query 178
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"物理Phy"]
+["English","Math"]
+[null,"English","语文北京上海"]
+[null,"English","数学大不列颠"]
+[null]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 179
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null]	1
+[null,"Ti"]	2
+["May","Ti","欧阳诸葛方程"]	3
+["Tom"]	1
+["Tom","王武程咬金"]	3
+["张三掩耳盗铃","张三此地无银三百两"]	2
+["李四大闹天空"]	1
+
+-- query 180
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null]	[null]
+[null,"Ti"]	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+["Tom","Tom"]	["Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 181
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null]	[null]
+[null,"Ti"]	[null,99]
+["May","Ti","欧阳诸葛方程"]	[null,98]
+["Tom"]	[80,90]
+["Tom","王武程咬金"]	[null,22]
+["张三掩耳盗铃","张三此地无银三百两"]	[78,98]
+["李四大闹天空"]	[null]
+
+-- query 182
+array_agg(DISTINCT name ORDER BY name ASC)
+[null]
+[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]
+["Tom"]
+["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]
+
+-- query 183
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+1
+1
+1
+2
+2
+3
+3
+
+-- query 184
+array_agg(DISTINCT name ORDER BY name ASC, score ASC, name ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"Ti"]	0	99
+["May","Ti","欧阳诸葛方程"]	1	98
+["Tom"]	1	90
+["Tom","王武程咬金"]	1	22
+["张三掩耳盗铃","张三此地无银三百两"]	1	98
+["李四大闹天空"]	1	NULL
+
+-- query 185
+cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+2
+1
+3
+3
+1
+2
+1
+
+-- query 186
+array_agg(DISTINCT NULL ORDER BY score ASC)	array_agg(NULL ORDER BY score ASC)
+[null]	[null]
+[null]	[null]
+[null]	[null,null]
+[null]	[null,null]
+[null]	[null,null]
+[null]	[null,null,null]
+[null]	[null,null,null]
+
+-- query 187
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null]
+[null,"English","数学大不列颠"]
+[null,"English","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 188
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, name ASC, subject ASC))	cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, name ASC, subject ASC))
+1	1
+1	1
+1	1
+2	2
+2	2
+3	3
+3	3
+
+-- query 189
+array_agg(DISTINCT score ORDER BY score ASC)	array_agg(subject ORDER BY score ASC, subject ASC)	array_agg(subject ORDER BY score ASC, subject ASC)
+[null]	[null]	[null]
+[null]	["英语外语美誉"]	["英语外语美誉"]
+[null,22]	[null,"English","语文北京上海"]	[null,"English","语文北京上海"]
+[null,98]	[null,"数学大不列颠","English"]	[null,"数学大不列颠","English"]
+[null,99]	[null,"物理Phy"]	[null,"物理Phy"]
+[78,98]	["Math数学欧拉方程","英文English"]	["Math数学欧拉方程","英文English"]
+[80,90]	["Math","English"]	["Math","English"]
+
+-- query 190
+array_agg(DISTINCT score ORDER BY score ASC)
+[null]
+[null]
+[null,22]
+[null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 191
+array_agg(DISTINCT score ORDER BY score ASC, name ASC)
+[null]
+[null]
+[null,22]
+[null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 192
+array_agg(DISTINCT 1)
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 193
+array_agg(DISTINCT 12 ORDER BY score ASC)
+[12]
+[12]
+[12]
+[12]
+[12]
+[12]
+[12]
+
+-- query 194
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null]
+[null,"English","数学大不列颠"]
+[null,"English","语文北京上海"]
+[null,"物理Phy"]
+["English","Math"]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 195
+group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	array_agg(DISTINCT id ORDER BY id ASC)	max(score)
+NULL	[4]	NULL
+TiEnglish,欧阳诸葛方程数学大不列颠	[3]	98
+Ti物理Phy	[null]	99
+TomEnglish,TomMath	[1]	90
+TomEnglish,王武程咬金语文北京上海	[2]	22
+张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English	[11]	98
+李四大闹天空英语外语美誉	[12]	NULL
+
+-- query 196
+array_agg(name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"Ti"]	0	99
+["May","Ti","欧阳诸葛方程"]	1	98
+["Tom","Tom"]	1	90
+["Tom","Tom","王武程咬金"]	1	22
+["张三掩耳盗铃","张三此地无银三百两"]	1	98
+["李四大闹天空"]	1	NULL
+
+-- query 197
+array_agg(subject ORDER BY score ASC, subject ASC)	count(DISTINCT id)	max(score)
+[null]	1	NULL
+[null,"English","语文北京上海"]	1	22
+[null,"数学大不列颠","English"]	1	98
+[null,"物理Phy"]	0	99
+["Math","English"]	1	90
+["Math数学欧拉方程","英文English"]	1	98
+["英语外语美誉"]	1	NULL
+
+-- query 199
+cardinality(array_agg(name ORDER BY score ASC))	cardinality(array_agg(DISTINCT name ORDER BY score ASC))
+1	1
+1	1
+2	1
+2	2
+2	2
+3	2
+3	3
+
+-- query 200
+array_agg(NULL ORDER BY score ASC)
+[null]
+[null]
+[null,null]
+[null,null]
+[null,null]
+[null,null,null]
+[null,null,null]
+
+-- query 201
+array_agg(score ORDER BY score ASC)
+[null]
+[null]
+[null,null,22]
+[null,null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 202
+array_agg(score ORDER BY score ASC, name ASC)
+[null]
+[null]
+[null,null,22]
+[null,null,98]
+[null,99]
+[78,98]
+[80,90]
+
+-- query 203
+array_agg(DISTINCT 1)
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+[1]
+
+-- query 204
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 205
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 206
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	9
+
+-- query 207
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 208
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,22,78,80,90,98,99]
+
+-- query 209
+array_agg(DISTINCT name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 210
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+9
+
+-- query 211
+array_agg(DISTINCT name ORDER BY name ASC, score ASC, name ASC)	count(DISTINCT id)	max(score)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	99
+
+-- query 212
+cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, cardinality(mmap) ASC, name ASC))	a
+9	12
+
+-- query 213
+array_agg(DISTINCT NULL ORDER BY score ASC)	array_agg(NULL ORDER BY score ASC)
+[null]	[null,null,null,null,null,null,null,null,null,null,null,null,null,null]
+
+-- query 214
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 215
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, cardinality(arr) ASC, name ASC))	cardinality(array_agg(DISTINCT mmap ORDER BY score ASC, cardinality(mmap) ASC, name ASC))
+9	9
+
+-- query 216
+array_agg(DISTINCT score ORDER BY score ASC)	array_agg(subject ORDER BY score ASC, subject ASC)	array_agg(subject ORDER BY score ASC, subject ASC)
+[null,22,78,80,90,98,99]	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]	[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]
+
+-- query 217
+array_agg(DISTINCT score ORDER BY score ASC)
+[null,22,78,80,90,98,99]
+
+-- query 218
+array_agg(DISTINCT score ORDER BY score ASC, name ASC)
+[null,22,78,80,90,98,99]
+
+-- query 219
+array_agg(DISTINCT 1)
+[1]
+
+-- query 220
+array_agg(DISTINCT 12 ORDER BY score ASC)
+[12]
+
+-- query 221
+array_agg(DISTINCT subject ORDER BY subject ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 222
+group_concat(name,subject ORDER BY name ASC, subject ASC SEPARATOR ',')	array_agg(DISTINCT id ORDER BY id ASC)	max(score)
+TiEnglish,Ti物理Phy,TomEnglish,TomEnglish,TomMath,张三掩耳盗铃Math数学欧拉方程,张三此地无银三百两英文English,李四大闹天空英语外语美誉,欧阳诸葛方程数学大不列颠,王武程咬金语文北京上海	[null,1,2,3,4,11,12]	99
+
+-- query 223
+array_agg(name ORDER BY name ASC, score ASC)	count(DISTINCT id)	max(score)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	99
+
+-- query 224
+array_agg(subject ORDER BY score ASC, subject ASC)	count(DISTINCT id)	max(score)
+[null,null,null,null,"English","数学大不列颠","英语外语美誉","语文北京上海","Math数学欧拉方程","Math","English","English","英文English","物理Phy"]	6	99
+
+-- query 226
+array_agg(name ORDER BY name ASC, score ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 227
+array_agg(NULL ORDER BY score ASC)
+[null,null,null,null,null,null,null,null,null,null,null,null,null,null]
+
+-- query 228
+array_agg(score ORDER BY score ASC)
+[null,null,null,null,null,null,null,22,78,80,90,98,98,99]
+
+-- query 229
+array_agg(score ORDER BY score ASC, name ASC)
+[null,null,null,null,null,null,null,22,78,80,90,98,98,99]
+
+-- query 230
+array_agg(DISTINCT 1)
+[1]
+
+-- query 231
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom","Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 232
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 233
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 234
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 235
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 236
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","Tom","王武程咬金"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 237
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 238
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Ti","May",null]
+
+-- query 239
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 240
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 241
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 242
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金",null,null]
+
+-- query 244
+array_agg(DISTINCT subject ORDER BY subject ASC)	count(DISTINCT score)	array_agg(name ORDER BY name ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]	6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 245
+count(DISTINCT score)	array_agg(name ORDER BY name ASC)
+6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 246
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null]	1	[null]
+[null,"Ti"]	0	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	1	["May","Ti","欧阳诸葛方程"]
+["Tom"]	1	["Tom","Tom"]
+["Tom","王武程咬金"]	1	["Tom","Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	1	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	1	["李四大闹天空"]
+
+-- query 247
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"物理Phy"]
+["English","Math"]
+[null,"English","语文北京上海"]
+[null,"English","数学大不列颠"]
+[null]
+["Math数学欧拉方程","英文English"]
+["英语外语美誉"]
+
+-- query 248
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null]	1
+[null,"Ti"]	2
+["May","Ti","欧阳诸葛方程"]	3
+["Tom"]	1
+["Tom","王武程咬金"]	3
+["张三掩耳盗铃","张三此地无银三百两"]	2
+["李四大闹天空"]	1
+
+-- query 249
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null]	[null]
+[null,"Ti"]	[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+["Tom","Tom"]	["Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 250
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null]	[null]
+[null,"Ti"]	[null,99]
+["May","Ti","欧阳诸葛方程"]	[null,98]
+["Tom"]	[80,90]
+["Tom","王武程咬金"]	[null,22]
+["张三掩耳盗铃","张三此地无银三百两"]	[78,98]
+["李四大闹天空"]	[null]
+
+-- query 251
+array_agg(DISTINCT name ORDER BY name ASC)
+[null]
+[null,"Ti"]
+["May","Ti","欧阳诸葛方程"]
+["Tom"]
+["Tom","王武程咬金"]
+["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]
+
+-- query 252
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+1
+1
+1
+2
+2
+3
+3
+
+-- query 253
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	count(DISTINCT id)	array_agg(name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	6	[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 254
+array_agg(DISTINCT subject ORDER BY subject ASC, name ASC)
+[null,"English","Math","Math数学欧拉方程","数学大不列颠","物理Phy","英文English","英语外语美誉","语文北京上海"]
+
+-- query 255
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	9
+
+-- query 256
+array_agg(name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name ASC, score ASC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 257
+array_agg(DISTINCT name ORDER BY name ASC, score ASC)	array_agg(DISTINCT score ORDER BY score ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	[null,22,78,80,90,98,99]
+
+-- query 258
+array_agg(DISTINCT name ORDER BY name ASC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]
+
+-- query 259
+cardinality(array_agg(DISTINCT arr ORDER BY score ASC, arr ASC))
+9
+
+-- query 260
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom","Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 261
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null]	[null]
+[null,"Ti"]	["Ti",null]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+["Tom"]	["Tom"]
+["Tom","王武程咬金"]	["王武程咬金","Tom"]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 262
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["王武程咬金","Tom","Tom"]
+["May","Ti","欧阳诸葛方程"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 263
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 264
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["王武程咬金","Tom","Tom"]	["王武程咬金","Tom","Tom"]
+["欧阳诸葛方程","Ti","May"]	["欧阳诸葛方程","Ti","May"]
+[null]	[null]
+["张三此地无银三百两","张三掩耳盗铃"]	["张三此地无银三百两","张三掩耳盗铃"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 265
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,"Ti"]	["Ti",null]
+["Tom","Tom"]	["Tom","Tom"]
+["Tom","Tom","王武程咬金"]	["Tom","Tom","王武程咬金"]
+["May","Ti","欧阳诸葛方程"]	["May","Ti","欧阳诸葛方程"]
+[null]	[null]
+["张三掩耳盗铃","张三此地无银三百两"]	["张三掩耳盗铃","张三此地无银三百两"]
+["李四大闹天空"]	["李四大闹天空"]
+
+-- query 266
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 267
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Ti","May",null]
+
+-- query 268
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name DESC)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 269
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 270
+array_agg(name ORDER BY name DESC NULLS FIRST)	array_agg(name ORDER BY name DESC)
+[null,null,"王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 271
+array_agg(name ORDER BY name ASC)	array_agg(name ORDER BY name ASC NULLS LAST)
+[null,null,"May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["May","Ti","Ti","Tom","Tom","Tom","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金",null,null]
+
+-- query 274
+array_agg(',')
+[","]
+
+-- query 275
+array_agg('中国' ORDER BY id ASC)
+["中国","中国","中国","中国","中国","中国","中国","中国","中国","中国","中国","中国","中国","中国"]
+
+-- query 280
+array_agg([1, 2])
+[[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2],[1,2]]
+
+-- query 281
+array_agg(json_object('2:3'))
+['{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}','{"2:3": null}']
+
+-- query 284
+array_agg(map{2:3})
+[{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3},{2:3}]
+
+-- query 286
+array_agg(NULL)
+[null]
+
+-- query 289
+array_agg(DISTINCT name ORDER BY name ASC)	array_agg(DISTINCT name ORDER BY name DESC)	array_agg(name ORDER BY name DESC)
+[null,"May","Ti","Tom","张三掩耳盗铃","张三此地无银三百两","李四大闹天空","欧阳诸葛方程","王武程咬金"]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Ti","May",null]	["王武程咬金","欧阳诸葛方程","李四大闹天空","张三此地无银三百两","张三掩耳盗铃","Tom","Tom","Tom","Tom","Ti","Ti","May",null,null]
+
+-- query 290
+array_agg(DISTINCT name ORDER BY name ASC)	cardinality(array_agg(DISTINCT arr ORDER BY score ASC))
+[null]	1
+[null,"Ti"]	2
+["May","Ti","欧阳诸葛方程"]	3
+["Tom"]	1
+["Tom","王武程咬金"]	3
+["张三掩耳盗铃","张三此地无银三百两"]	2
+["李四大闹天空"]	1
+
+-- query 295
+array_agg(col_boolean ORDER BY id ASC NULLS LAST)
+[1,1,0,0,null,1,0]
+
+-- query 296
+array_agg(col_tinyint ORDER BY id DESC)
+[20,10,30,20,20,10,10]
+
+-- query 297
+array_agg(col_smallint ORDER BY id ASC)
+[100,100,200,200,300,100,200]
+
+-- query 298
+array_agg(col_int ORDER BY id DESC NULLS FIRST)
+[2000,1000,3000,2000,2000,1000,1000]
+
+-- query 299
+array_agg(col_bigint ORDER BY id ASC)
+[10000,10000,20000,20000,30000,10000,20000]
+
+-- query 300
+array_agg(col_largeint ORDER BY id DESC)
+[200000,100000,300000,200000,200000,100000,100000]
+
+-- query 301
+array_agg(col_float ORDER BY id ASC)
+[1.1,1.1,3.3,3.3,5.5,1.1,3.3]
+
+-- query 302
+array_agg(col_double ORDER BY id DESC)
+[4.4,2.2,6.6,4.4,4.4,2.2,2.2]
+
+-- query 303
+array_agg(col_varchar ORDER BY id ASC)
+["hello","hello","world","world",null,"hello","world"]
+
+-- query 304
+array_agg(col_char ORDER BY id DESC)
+["char_test2","char_test",null,"char_test2","char_test2","char_test","char_test"]
+
+-- query 305
+array_agg(col_datetime ORDER BY id ASC)
+["2024-01-01 12:00:00","2024-01-01 12:00:00","2024-02-02 13:00:00","2024-02-02 13:00:00",null,"2024-01-01 12:00:00","2024-02-02 13:00:00"]
+
+-- query 306
+array_agg(col_date ORDER BY id DESC)
+["2024-02-02","2024-01-01",null,"2024-02-02","2024-02-02","2024-01-01","2024-01-01"]
+
+-- query 307
+array_agg(col_array ORDER BY id ASC)
+[[1,2,3],[1,2,3],[4,5,6],[4,5,6],null,[1,2,3],[4,5,6]]
+
+-- query 308
+array_agg(col_map ORDER BY id DESC)
+[{"key3":3,"key4":4},{"key1":1,"key2":2},null,{"key3":3,"key4":4},{"key3":3,"key4":4},{"key1":1,"key2":2},{"key1":1,"key2":2}]
+
+-- query 309
+array_agg(col_struct ORDER BY id ASC)
+[{"f1":1,"f2":"test1"},{"f1":1,"f2":"test1"},{"f1":2,"f2":"test2"},{"f1":2,"f2":"test2"},null,{"f1":1,"f2":"test1"},{"f1":2,"f2":"test2"}]
+
+-- query 310
+id	array_agg(col_boolean ORDER BY id ASC NULLS LAST)
+1	[1,1]
+2	[0,0]
+3	[null]
+4	[1]
+5	[0]
+
+-- query 311
+id	array_agg(col_tinyint ORDER BY id DESC)
+1	[10,10]
+2	[20,20]
+3	[30]
+4	[10]
+5	[20]
+
+-- query 312
+id	array_agg(col_smallint ORDER BY id ASC)
+1	[100,100]
+2	[200,200]
+3	[300]
+4	[100]
+5	[200]
+
+-- query 313
+id	array_agg(col_int ORDER BY id DESC NULLS FIRST)
+1	[1000,1000]
+2	[2000,2000]
+3	[3000]
+4	[1000]
+5	[2000]
+
+-- query 314
+id	array_agg(col_bigint ORDER BY id ASC)
+1	[10000,10000]
+2	[20000,20000]
+3	[30000]
+4	[10000]
+5	[20000]
+
+-- query 315
+id	array_agg(col_largeint ORDER BY id DESC)
+1	[100000,100000]
+2	[200000,200000]
+3	[300000]
+4	[100000]
+5	[200000]
+
+-- query 316
+id	array_agg(col_float ORDER BY id ASC)
+1	[1.1,1.1]
+2	[3.3,3.3]
+3	[5.5]
+4	[1.1]
+5	[3.3]
+
+-- query 317
+id	array_agg(col_double ORDER BY id DESC)
+1	[2.2,2.2]
+2	[4.4,4.4]
+3	[6.6]
+4	[2.2]
+5	[4.4]
+
+-- query 318
+id	array_agg(col_varchar ORDER BY id ASC)
+1	["hello","hello"]
+2	["world","world"]
+3	[null]
+4	["hello"]
+5	["world"]
+
+-- query 319
+id	array_agg(col_char ORDER BY id DESC)
+1	["char_test","char_test"]
+2	["char_test2","char_test2"]
+3	[null]
+4	["char_test"]
+5	["char_test2"]
+
+-- query 320
+id	array_agg(col_datetime ORDER BY id ASC)
+1	["2024-01-01 12:00:00","2024-01-01 12:00:00"]
+2	["2024-02-02 13:00:00","2024-02-02 13:00:00"]
+3	[null]
+4	["2024-01-01 12:00:00"]
+5	["2024-02-02 13:00:00"]
+
+-- query 321
+id	array_agg(col_date ORDER BY id DESC)
+1	["2024-01-01","2024-01-01"]
+2	["2024-02-02","2024-02-02"]
+3	[null]
+4	["2024-01-01"]
+5	["2024-02-02"]
+
+-- query 322
+id	array_agg(col_array ORDER BY id ASC)
+1	[[1,2,3],[1,2,3]]
+2	[[4,5,6],[4,5,6]]
+3	[null]
+4	[[1,2,3]]
+5	[[4,5,6]]
+
+-- query 323
+id	array_agg(col_map ORDER BY id DESC)
+1	[{"key1":1,"key2":2},{"key1":1,"key2":2}]
+2	[{"key3":3,"key4":4},{"key3":3,"key4":4}]
+3	[null]
+4	[{"key1":1,"key2":2}]
+5	[{"key3":3,"key4":4}]
+
+-- query 324
+id	array_agg(col_struct ORDER BY id ASC)
+1	[{"f1":1,"f2":"test1"},{"f1":1,"f2":"test1"}]
+2	[{"f1":2,"f2":"test2"},{"f1":2,"f2":"test2"}]
+3	[null]
+4	[{"f1":1,"f2":"test1"}]
+5	[{"f1":2,"f2":"test2"}]
+
+-- query 325
+array_agg(DISTINCT col_boolean ORDER BY id ASC NULLS LAST)
+[1,0,null]
+
+-- query 326
+array_agg(DISTINCT col_tinyint ORDER BY id DESC)
+[20,10,30]
+
+-- query 327
+array_agg(DISTINCT col_smallint ORDER BY id ASC)
+[100,200,300]
+
+-- query 328
+array_agg(DISTINCT col_int ORDER BY id DESC NULLS FIRST)
+[2000,1000,3000]
+
+-- query 329
+array_agg(DISTINCT col_bigint ORDER BY id ASC)
+[10000,20000,30000]
+
+-- query 330
+array_agg(DISTINCT col_largeint ORDER BY id DESC)
+[200000,100000,300000]
+
+-- query 331
+array_agg(DISTINCT col_float ORDER BY id ASC)
+[1.1,3.3,5.5]
+
+-- query 332
+array_agg(DISTINCT col_double ORDER BY id DESC)
+[4.4,2.2,6.6]
+
+-- query 333
+array_agg(DISTINCT col_varchar ORDER BY id ASC)
+["hello","world",null]
+
+-- query 334
+array_agg(DISTINCT col_char ORDER BY id DESC)
+["char_test2","char_test",null]
+
+-- query 335
+array_agg(DISTINCT col_datetime ORDER BY id ASC)
+["2024-01-01 12:00:00","2024-02-02 13:00:00",null]
+
+-- query 336
+array_agg(DISTINCT col_date ORDER BY id DESC)
+["2024-02-02","2024-01-01",null]
+
+-- query 337
+array_agg(DISTINCT col_array ORDER BY id ASC)
+[[1,2,3],[4,5,6],null]
+
+-- query 338
+array_agg(DISTINCT col_map ORDER BY id DESC)
+[{"key3":3,"key4":4},{"key1":1,"key2":2},null]
+
+-- query 339
+array_agg(DISTINCT col_struct ORDER BY id ASC)
+[{"f1":1,"f2":"test1"},{"f1":2,"f2":"test2"},null]
+
+-- query 340
+id	array_agg(DISTINCT col_boolean ORDER BY id ASC NULLS LAST)
+1	[1]
+2	[0]
+3	[null]
+4	[1]
+5	[0]
+
+-- query 341
+id	array_agg(DISTINCT col_tinyint ORDER BY id DESC)
+1	[10]
+2	[20]
+3	[30]
+4	[10]
+5	[20]
+
+-- query 342
+id	array_agg(DISTINCT col_smallint ORDER BY id ASC)
+1	[100]
+2	[200]
+3	[300]
+4	[100]
+5	[200]
+
+-- query 343
+id	array_agg(DISTINCT col_int ORDER BY id DESC NULLS FIRST)
+1	[1000]
+2	[2000]
+3	[3000]
+4	[1000]
+5	[2000]
+
+-- query 344
+id	array_agg(DISTINCT col_bigint ORDER BY id ASC)
+1	[10000]
+2	[20000]
+3	[30000]
+4	[10000]
+5	[20000]
+
+-- query 345
+id	array_agg(DISTINCT col_largeint ORDER BY id DESC)
+1	[100000]
+2	[200000]
+3	[300000]
+4	[100000]
+5	[200000]
+
+-- query 346
+id	array_agg(DISTINCT col_float ORDER BY id ASC)
+1	[1.1]
+2	[3.3]
+3	[5.5]
+4	[1.1]
+5	[3.3]
+
+-- query 347
+id	array_agg(DISTINCT col_double ORDER BY id DESC)
+1	[2.2]
+2	[4.4]
+3	[6.6]
+4	[2.2]
+5	[4.4]
+
+-- query 348
+id	array_agg(DISTINCT col_varchar ORDER BY id ASC)
+1	["hello"]
+2	["world"]
+3	[null]
+4	["hello"]
+5	["world"]
+
+-- query 349
+id	array_agg(DISTINCT col_char ORDER BY id DESC)
+1	["char_test"]
+2	["char_test2"]
+3	[null]
+4	["char_test"]
+5	["char_test2"]
+
+-- query 350
+id	array_agg(DISTINCT col_datetime ORDER BY id ASC)
+1	["2024-01-01 12:00:00"]
+2	["2024-02-02 13:00:00"]
+3	[null]
+4	["2024-01-01 12:00:00"]
+5	["2024-02-02 13:00:00"]
+
+-- query 351
+id	array_agg(DISTINCT col_date ORDER BY id DESC)
+1	["2024-01-01"]
+2	["2024-02-02"]
+3	[null]
+4	["2024-01-01"]
+5	["2024-02-02"]
+
+-- query 352
+id	array_agg(DISTINCT col_array ORDER BY id ASC)
+1	[[1,2,3]]
+2	[[4,5,6]]
+3	[null]
+4	[[1,2,3]]
+5	[[4,5,6]]
+
+-- query 353
+id	array_agg(DISTINCT col_map ORDER BY id DESC)
+1	[{"key1":1,"key2":2}]
+2	[{"key3":3,"key4":4}]
+3	[null]
+4	[{"key1":1,"key2":2}]
+5	[{"key3":3,"key4":4}]
+
+-- query 354
+id	array_agg(DISTINCT col_struct ORDER BY id ASC)
+1	[{"f1":1,"f2":"test1"}]
+2	[{"f1":2,"f2":"test2"}]
+3	[null]
+4	[{"f1":1,"f2":"test1"}]
+5	[{"f1":2,"f2":"test2"}]

@@ -1,0 +1,112 @@
+-- query 2
+mann_whitney_u_test(x, t, 'two-sided')
+[50, 0.9697360424200407]
+
+-- query 3
+mann_whitney_u_test(x, t, 'less')
+[50, 0.5151319787899797]
+
+-- query 4
+mann_whitney_u_test(x, t, 'greater')
+[50, 0.5151319787899797]
+
+-- query 5
+mann_whitney_u_test(x, t, 'two-sided')
+[40509000.5, 0.9999988557063488]
+
+-- query 6
+mann_whitney_u_test(x, t, 'less')
+[40509000.5, 0.5000005721468257]
+
+-- query 7
+mann_whitney_u_test(x, t, 'greater')
+[40509000.5, 0.5000005721468257]
+
+-- query 8
+mann_whitney_u_test(x, t, 'two-sided', 0)
+[50, 1]
+
+-- query 9
+mann_whitney_u_test(x, t, 'less', 0)
+[50, 0.5]
+
+-- query 10
+mann_whitney_u_test(x, t, 'greater', 0)
+[50, 0.5]
+
+-- query 11
+mann_whitney_u_test(x, t, 'two-sided', 0)
+[40509000.5, 1]
+
+-- query 14
+mann_whitney_u_test(c3, c2, 'two-sided')
+[2, 1]
+
+-- query 15
+mann_whitney_u_test(c3, c2, 'greater')
+[2, 0.5]
+
+-- query 16
+mann_whitney_u_test(c3, c2, 'less')
+[2, 0.8144533152386512]
+
+-- query 17
+mann_whitney_u_test(c4, c2, 'two-sided')
+[2, 1]
+
+-- query 18
+mann_whitney_u_test(c4, c2, 'greater')
+[2, 0.5]
+
+-- query 19
+mann_whitney_u_test(c4, c2, 'less')
+[2, 0.8144533152386512]
+
+-- query 20
+mann_whitney_u_test(c5, c2, 'two-sided')
+[2, 1]
+
+-- query 21
+mann_whitney_u_test(c5, c2, 'greater')
+[2, 0.5]
+
+-- query 22
+mann_whitney_u_test(c5, c2, 'less')
+[2, 0.8144533152386512]
+
+-- query 23
+mann_whitney_u_test(c6, c2, 'two-sided')
+[2, 1]
+
+-- query 24
+mann_whitney_u_test(c6, c2, 'greater')
+[2, 0.5]
+
+-- query 25
+mann_whitney_u_test(c6, c2, 'less')
+[2, 0.8144533152386512]
+
+-- query 26
+mann_whitney_u_test(c6, c2, 'less')
+NULL
+
+-- query 27
+c1 % 3	mann_whitney_u_test(c6, c2, 'less')
+1	{"Error": "All numbers in both samples are identical."}
+2	[1, 0.9772498680518208]
+0	{"Error": "All numbers in both samples are identical."}
+
+-- query 28
+c1 % 2	mann_whitney_u_test(c6, c2, 'less')
+
+-- query 29
+mann_whitney_u_test(col1, col2)
+{"Error": "All numbers in both samples are identical."}
+
+-- query 30
+mann_whitney_u_test(col1, col2)
+[4, 0.7609067270751142]
+
+-- query 31
+mann_whitney_u_test(1, 1)
+{"Error": "All numbers in both samples are identical."}

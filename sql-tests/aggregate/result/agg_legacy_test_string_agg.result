@@ -1,0 +1,39 @@
+-- query 3
+orgs
+NULL
+
+-- query 20
+group_concat(DISTINCT score ORDER BY score ASC, name ASC SEPARATOR ',')
+NULL
+NULL
+22
+78,98
+80,90
+98
+99
+
+-- query 22
+group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
+NULL
+NULL
+22
+78,98
+80,90
+98
+99
+
+-- query 23
+group_concat(score ORDER BY score ASC, name ASC SEPARATOR ',')
+22,78,80,90,98,98,99
+
+-- query 24
+group_concat(name SEPARATOR ',')
+Tom,Tom
+
+-- query 25
+group_concat(DISTINCT name SEPARATOR ',')
+Tom
+
+-- query 26
+group_concat(concat(name, ':', score) SEPARATOR ',')
+Tom:90,Tom:80

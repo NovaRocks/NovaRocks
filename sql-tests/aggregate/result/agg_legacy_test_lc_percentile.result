@@ -1,0 +1,97 @@
+-- query 9
+percentile_disc_lc(score, 0)
+90
+
+-- query 10
+percentile_disc_lc(score, 0.25)
+91
+
+-- query 11
+percentile_disc_lc(score, 0.5)
+92
+
+-- query 12
+percentile_disc_lc(score, 0.75)
+93
+
+-- query 13
+percentile_disc_lc(score, 1)
+94
+
+-- query 14
+percentile_disc_lc(date, 0)
+2018-01-01
+
+-- query 15
+percentile_disc_lc(date, 0.25)
+2019-01-01
+
+-- query 16
+percentile_disc_lc(date, 0.5)
+2020-01-01
+
+-- query 17
+percentile_disc_lc(date, 0.75)
+2021-01-01
+
+-- query 18
+percentile_disc_lc(date, 1)
+2022-01-01
+
+-- query 19
+percentile_disc_lc(datetime, 0)
+2018-01-01 00:00:01
+
+-- query 20
+percentile_disc_lc(datetime, 0.25)
+2019-01-01 00:00:01
+
+-- query 21
+percentile_disc_lc(datetime, 0.5)
+2020-01-01 00:00:01
+
+-- query 22
+percentile_disc_lc(datetime, 0.75)
+2021-01-01 00:00:01
+
+-- query 23
+percentile_disc_lc(datetime, 1)
+2022-01-01 00:00:01
+
+-- query 24
+percentile_disc_lc(db, 0)
+11.1
+
+-- query 25
+percentile_disc_lc(db, 0.25)
+11.2
+
+-- query 26
+percentile_disc_lc(db, 0.5)
+11.3
+
+-- query 27
+percentile_disc_lc(db, 0.75)
+11.4
+
+-- query 28
+percentile_disc_lc(db, 1)
+11.5
+
+-- query 31
+date	percentile_disc_lc(score, 0)
+NULL	NULL
+2018-01-01	90
+2019-01-01	91
+2020-01-01	92
+2021-01-01	93
+2022-01-01	94
+
+-- query 33
+date	percentile_disc_lc(score, 0)
+NULL	NULL
+2018-01-01	90
+2019-01-01	91
+2020-01-01	92
+2021-01-01	93
+2022-01-01	94

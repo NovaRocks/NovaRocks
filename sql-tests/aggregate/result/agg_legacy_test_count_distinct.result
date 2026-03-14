@@ -1,0 +1,110 @@
+-- query 11
+v2	count(1)	count(DISTINCT v1)
+a	5	2
+b	3	1
+
+-- query 12
+v2	bitmap_union_count(to_bitmap(v4))	count(DISTINCT v1)
+a	3	2
+b	3	1
+
+-- query 13
+v2	hll_union_agg(hll_hash(v4))	count(DISTINCT v1)
+a	3	2
+b	3	1
+
+-- query 14
+count(DISTINCT 1, 2, 3, 4)
+1
+
+-- query 15
+count(DISTINCT 1, 2, 3, 4)
+1
+1
+
+-- query 16
+count(DISTINCT 1, v2)
+2
+
+-- query 17
+count(DISTINCT 1, v2)
+2
+
+-- query 18
+count(DISTINCT 1, 2, 3, 4)	sum(DISTINCT 1)	avg(DISTINCT 1)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+1	1	1	12	[1.3]
+
+-- query 19
+count(DISTINCT 1, 2, 3, 4)	sum(DISTINCT 1)	avg(DISTINCT 1)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+1	1	1	12	[1.3]
+1	1	1	12	[1.3]
+
+-- query 20
+v2	count(DISTINCT v1)	sum(DISTINCT v1)	avg(DISTINCT v1)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+a	2	NULL	NULL	12	[1.3]
+b	1	NULL	NULL	12	[1.3]
+
+-- query 21
+v2	count(DISTINCT v4)	sum(DISTINCT v4)	avg(DISTINCT v4)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+a	3	6	2	12	[1.3]
+b	3	6	2	12	[1.3]
+
+-- query 22
+v2	count(DISTINCT v5)	sum(DISTINCT v5)	avg(DISTINCT v5)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+a	5	904.40	180.88000000	12	[1.3]
+b	3	104.91	34.97000000	12	[1.3]
+
+-- query 23
+v2	count(DISTINCT v6)	array_agg(DISTINCT v6 ORDER BY v6 ASC)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+a	3	[null,[1,2,3],[2,2,3],[3,1,3]]	12	[1.3]
+b	3	[[2,1,3],[2,2,3],[3,1,3]]	12	[1.3]
+
+-- query 24
+v2	count(DISTINCT v7)	array_agg(DISTINCT v7 ORDER BY v7 ASC)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+a	3	[null,{"a":1,"b":"a"},{"a":2,"b":"a"},{"a":3,"b":"a"}]	12	[1.3]
+b	2	[{"a":2,"b":"a"},{"a":4,"b":"a"}]	12	[1.3]
+
+-- query 25
+v2	count(DISTINCT v1, v3, v6)	sum(DISTINCT v1)	avg(DISTINCT v1)	array_agg(v5 ORDER BY v5 ASC)	group_concat(DISTINCT 1,2 SEPARATOR ',')	array_agg(DISTINCT 1.3)
+a	4	NULL	NULL	[1.20,2.30,200.30,300.30,400.30]	12	[1.3]
+b	3	NULL	NULL	[1.30,3.31,100.30]	12	[1.3]
+
+-- query 26
+count(DISTINCT v4, v5)	sum(DISTINCT v4)	avg(DISTINCT v4)	group_concat(DISTINCT v4,v5,2 ORDER BY v4 ASC, v5 ASC SEPARATOR ',')	array_agg(DISTINCT 1.456)
+8	6	2	11.202,12.302,1100.302,1200.302,21.302,2300.302,33.312,3400.302	[1.456]
+
+-- query 27
+v2	count(DISTINCT v4, v5)	sum(DISTINCT v5)	avg(DISTINCT v5)	group_concat(DISTINCT v4,v5,2 ORDER BY v4 ASC, v5 ASC SEPARATOR ',')	array_agg(DISTINCT 1.456)
+a	5	904.40	180.88000000	11.202,12.302,1200.302,2300.302,3400.302	[1.456]
+b	3	104.91	34.97000000	1100.302,21.302,33.312	[1.456]
+
+-- query 28
+v2	count(DISTINCT v3, v5)	sum(DISTINCT v4)	avg(DISTINCT v5)	group_concat(DISTINCT v4,v5,2 ORDER BY v4 ASC, v5 ASC SEPARATOR ',')	array_agg(DISTINCT 1.456)
+a	1	1	1.20000000	11.202	[1.456]
+a	1	1	2.30000000	12.302	[1.456]
+a	1	2	300.30000000	2300.302	[1.456]
+a	1	3	400.30000000	3400.302	[1.456]
+a	1	1	200.30000000	1200.302	[1.456]
+b	1	2	1.30000000	21.302	[1.456]
+b	1	3	3.31000000	33.312	[1.456]
+b	1	1	100.30000000	1100.302	[1.456]
+
+-- query 29
+count(DISTINCT v4, v5)	sum(DISTINCT v4)	avg(DISTINCT v4)	group_concat(DISTINCT v4,v5,2 ORDER BY v4 ASC, v5 ASC SEPARATOR ',')	array_agg(DISTINCT v4 ORDER BY v4 ASC)
+8	6	2	11.202,12.302,1100.302,1200.302,21.302,2300.302,33.312,3400.302	[1,2,3]
+
+-- query 30
+v2	count(DISTINCT v4, v5)	sum(DISTINCT v5)	avg(DISTINCT v5)	group_concat(DISTINCT v4,v5,2 ORDER BY v4 ASC, v5 ASC SEPARATOR ',')	array_agg(DISTINCT v5 ORDER BY v5 ASC)
+a	5	904.40	180.88000000	11.202,12.302,1200.302,2300.302,3400.302	[1.20,2.30,200.30,300.30,400.30]
+b	3	104.91	34.97000000	1100.302,21.302,33.312	[1.30,3.31,100.30]
+
+-- query 31
+v2	count(DISTINCT v3, v5)	sum(DISTINCT v4)	avg(DISTINCT v5)	group_concat(DISTINCT v4,v5,2 ORDER BY v4 ASC, v5 ASC SEPARATOR ',')	array_agg(DISTINCT v5 ORDER BY v5 ASC)
+a	1	1	1.20000000	11.202	[1.20]
+a	1	1	2.30000000	12.302	[2.30]
+a	1	2	300.30000000	2300.302	[300.30]
+a	1	3	400.30000000	3400.302	[400.30]
+a	1	1	200.30000000	1200.302	[200.30]
+b	1	2	1.30000000	21.302	[1.30]
+b	1	3	3.31000000	33.312	[3.31]
+b	1	1	100.30000000	1100.302	[100.30]

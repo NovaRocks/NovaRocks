@@ -1,0 +1,1209 @@
+-- query 4
+approx_top_k(c_tinyint)
+[{"item":1,"count":10},{"item":2,"count":9},{"item":3,"count":8},{"item":4,"count":7},{"item":5,"count":6}]
+
+-- query 5
+approx_top_k(c_smallint)
+[{"item":11,"count":10},{"item":22,"count":9},{"item":33,"count":8},{"item":44,"count":7},{"item":55,"count":6}]
+
+-- query 6
+approx_top_k(c_int)
+[{"item":111,"count":10},{"item":222,"count":9},{"item":333,"count":8},{"item":444,"count":7},{"item":555,"count":6}]
+
+-- query 7
+approx_top_k(c_bigint)
+[{"item":1111,"count":10},{"item":2222,"count":9},{"item":3333,"count":8},{"item":4444,"count":7},{"item":5555,"count":6}]
+
+-- query 8
+approx_top_k(c_largeint)
+[{"item":11111,"count":10},{"item":22222,"count":9},{"item":33333,"count":8},{"item":44444,"count":7},{"item":55555,"count":6}]
+
+-- query 9
+approx_top_k(c_float)
+[{"item":1.1,"count":10},{"item":2.2,"count":9},{"item":3.3,"count":8},{"item":4.4,"count":7},{"item":5.5,"count":6}]
+
+-- query 10
+approx_top_k(c_double)
+[{"item":11.11,"count":10},{"item":22.22,"count":9},{"item":33.33,"count":8},{"item":44.44,"count":7},{"item":55.55,"count":6}]
+
+-- query 11
+approx_top_k(c_char)
+[{"item":"char1","count":10},{"item":"char2","count":9},{"item":"char3","count":8},{"item":"char4","count":7},{"item":"char5","count":6}]
+
+-- query 12
+approx_top_k(c_varchar)
+[{"item":"varchar1","count":10},{"item":"varchar2","count":9},{"item":"varchar3","count":8},{"item":"varchar4","count":7},{"item":"varchar5","count":6}]
+
+-- query 13
+approx_top_k(c_date)
+[{"item":"2021-01-01","count":10},{"item":"2021-01-02","count":9},{"item":"2021-01-03","count":8},{"item":"2021-01-04","count":7},{"item":"2021-01-05","count":6}]
+
+-- query 14
+approx_top_k(c_datetime)
+[{"item":"2021-01-01 00:00:00","count":10},{"item":"2021-01-02 00:00:00","count":9},{"item":"2021-01-03 00:00:00","count":8},{"item":"2021-01-04 00:00:00","count":7},{"item":"2021-01-05 00:00:00","count":6}]
+
+-- query 15
+approx_top_k(c_decimal)
+[{"item":111.110,"count":10},{"item":222.220,"count":9},{"item":333.330,"count":8},{"item":444.440,"count":7},{"item":555.550,"count":6}]
+
+-- query 16
+approx_top_k(c_tinyint, 3)
+[{"item":1,"count":10},{"item":2,"count":9},{"item":3,"count":8}]
+
+-- query 17
+approx_top_k(c_smallint, 3)
+[{"item":11,"count":10},{"item":22,"count":9},{"item":33,"count":8}]
+
+-- query 18
+approx_top_k(c_int, 3)
+[{"item":111,"count":10},{"item":222,"count":9},{"item":333,"count":8}]
+
+-- query 19
+approx_top_k(c_bigint, 3)
+[{"item":1111,"count":10},{"item":2222,"count":9},{"item":3333,"count":8}]
+
+-- query 20
+approx_top_k(c_largeint, 3)
+[{"item":11111,"count":10},{"item":22222,"count":9},{"item":33333,"count":8}]
+
+-- query 21
+approx_top_k(c_float, 3)
+[{"item":1.1,"count":10},{"item":2.2,"count":9},{"item":3.3,"count":8}]
+
+-- query 22
+approx_top_k(c_double, 3)
+[{"item":11.11,"count":10},{"item":22.22,"count":9},{"item":33.33,"count":8}]
+
+-- query 23
+approx_top_k(c_char, 3)
+[{"item":"char1","count":10},{"item":"char2","count":9},{"item":"char3","count":8}]
+
+-- query 24
+approx_top_k(c_varchar, 3)
+[{"item":"varchar1","count":10},{"item":"varchar2","count":9},{"item":"varchar3","count":8}]
+
+-- query 25
+approx_top_k(c_date, 3)
+[{"item":"2021-01-01","count":10},{"item":"2021-01-02","count":9},{"item":"2021-01-03","count":8}]
+
+-- query 26
+approx_top_k(c_datetime, 3)
+[{"item":"2021-01-01 00:00:00","count":10},{"item":"2021-01-02 00:00:00","count":9},{"item":"2021-01-03 00:00:00","count":8}]
+
+-- query 27
+approx_top_k(c_decimal, 3)
+[{"item":111.110,"count":10},{"item":222.220,"count":9},{"item":333.330,"count":8}]
+
+-- query 28
+approx_top_k(c_tinyint, 3, 10)
+[{"item":1,"count":10},{"item":2,"count":9},{"item":3,"count":8}]
+
+-- query 29
+approx_top_k(c_smallint, 3, 10)
+[{"item":11,"count":10},{"item":22,"count":9},{"item":33,"count":8}]
+
+-- query 30
+approx_top_k(c_int, 3, 10)
+[{"item":111,"count":10},{"item":222,"count":9},{"item":333,"count":8}]
+
+-- query 31
+approx_top_k(c_bigint, 3, 10)
+[{"item":1111,"count":10},{"item":2222,"count":9},{"item":3333,"count":8}]
+
+-- query 32
+approx_top_k(c_largeint, 3, 10)
+[{"item":11111,"count":10},{"item":22222,"count":9},{"item":33333,"count":8}]
+
+-- query 33
+approx_top_k(c_float, 3, 10)
+[{"item":1.1,"count":10},{"item":2.2,"count":9},{"item":3.3,"count":8}]
+
+-- query 34
+approx_top_k(c_double, 3, 10)
+[{"item":11.11,"count":10},{"item":22.22,"count":9},{"item":33.33,"count":8}]
+
+-- query 35
+approx_top_k(c_char, 3, 10)
+[{"item":"char1","count":10},{"item":"char2","count":9},{"item":"char3","count":8}]
+
+-- query 36
+approx_top_k(c_varchar, 3, 10)
+[{"item":"varchar1","count":10},{"item":"varchar2","count":9},{"item":"varchar3","count":8}]
+
+-- query 37
+approx_top_k(c_date, 3, 10)
+[{"item":"2021-01-01","count":10},{"item":"2021-01-02","count":9},{"item":"2021-01-03","count":8}]
+
+-- query 38
+approx_top_k(c_datetime, 3, 10)
+[{"item":"2021-01-01 00:00:00","count":10},{"item":"2021-01-02 00:00:00","count":9},{"item":"2021-01-03 00:00:00","count":8}]
+
+-- query 39
+approx_top_k(c_decimal, 3, 10)
+[{"item":111.110,"count":10},{"item":222.220,"count":9},{"item":333.330,"count":8}]
+
+-- query 40
+c_id	approx_top_k(c_tinyint) OVER ()
+71	[{"item":8,"count":3},{"item":9,"count":2}]
+72	[{"item":8,"count":3},{"item":9,"count":2}]
+73	[{"item":8,"count":3},{"item":9,"count":2}]
+81	[{"item":8,"count":3},{"item":9,"count":2}]
+82	[{"item":8,"count":3},{"item":9,"count":2}]
+
+-- query 41
+c_id	approx_top_k(c_smallint) OVER ()
+71	[{"item":88,"count":3},{"item":99,"count":2}]
+72	[{"item":88,"count":3},{"item":99,"count":2}]
+73	[{"item":88,"count":3},{"item":99,"count":2}]
+81	[{"item":88,"count":3},{"item":99,"count":2}]
+82	[{"item":88,"count":3},{"item":99,"count":2}]
+
+-- query 42
+c_id	approx_top_k(c_int) OVER ()
+71	[{"item":888,"count":3},{"item":999,"count":2}]
+72	[{"item":888,"count":3},{"item":999,"count":2}]
+73	[{"item":888,"count":3},{"item":999,"count":2}]
+81	[{"item":888,"count":3},{"item":999,"count":2}]
+82	[{"item":888,"count":3},{"item":999,"count":2}]
+
+-- query 43
+c_id	approx_top_k(c_bigint) OVER ()
+71	[{"item":8888,"count":3},{"item":9999,"count":2}]
+72	[{"item":8888,"count":3},{"item":9999,"count":2}]
+73	[{"item":8888,"count":3},{"item":9999,"count":2}]
+81	[{"item":8888,"count":3},{"item":9999,"count":2}]
+82	[{"item":8888,"count":3},{"item":9999,"count":2}]
+
+-- query 44
+c_id	approx_top_k(c_largeint) OVER ()
+71	[{"item":88888,"count":3},{"item":99999,"count":2}]
+72	[{"item":88888,"count":3},{"item":99999,"count":2}]
+73	[{"item":88888,"count":3},{"item":99999,"count":2}]
+81	[{"item":88888,"count":3},{"item":99999,"count":2}]
+82	[{"item":88888,"count":3},{"item":99999,"count":2}]
+
+-- query 45
+c_id	approx_top_k(c_float) OVER ()
+71	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
+72	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
+73	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
+81	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
+82	[{"item":8.8,"count":3},{"item":9.9,"count":2}]
+
+-- query 46
+c_id	approx_top_k(c_double) OVER ()
+71	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
+72	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
+73	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
+81	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
+82	[{"item":88.88,"count":3},{"item":99.99,"count":2}]
+
+-- query 47
+c_id	approx_top_k(c_char) OVER ()
+71	[{"item":"char8","count":3},{"item":"char9","count":2}]
+72	[{"item":"char8","count":3},{"item":"char9","count":2}]
+73	[{"item":"char8","count":3},{"item":"char9","count":2}]
+81	[{"item":"char8","count":3},{"item":"char9","count":2}]
+82	[{"item":"char8","count":3},{"item":"char9","count":2}]
+
+-- query 48
+c_id	approx_top_k(c_varchar) OVER ()
+71	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
+72	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
+73	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
+81	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
+82	[{"item":"varchar8","count":3},{"item":"varchar9","count":2}]
+
+-- query 49
+c_id	approx_top_k(c_date) OVER ()
+71	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
+72	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
+73	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
+81	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
+82	[{"item":"2021-01-08","count":3},{"item":"2021-01-09","count":2}]
+
+-- query 50
+c_id	approx_top_k(c_datetime) OVER ()
+71	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
+72	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
+73	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
+81	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
+82	[{"item":"2021-01-08 00:00:00","count":3},{"item":"2021-01-09 00:00:00","count":2}]
+
+-- query 51
+c_id	approx_top_k(c_decimal) OVER ()
+71	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
+72	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
+73	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
+81	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
+82	[{"item":888.880,"count":3},{"item":999.990,"count":2}]
+
+-- query 54
+approx_top_k(c_tinyint)
+[{"item":null,"count":12},{"item":1,"count":9},{"item":2,"count":8},{"item":3,"count":7},{"item":4,"count":6}]
+
+-- query 55
+approx_top_k(c_smallint)
+[{"item":null,"count":12},{"item":11,"count":9},{"item":22,"count":8},{"item":33,"count":7},{"item":44,"count":6}]
+
+-- query 56
+approx_top_k(c_int)
+[{"item":null,"count":12},{"item":111,"count":9},{"item":222,"count":8},{"item":333,"count":7},{"item":444,"count":6}]
+
+-- query 57
+approx_top_k(c_bigint)
+[{"item":null,"count":12},{"item":1111,"count":9},{"item":2222,"count":8},{"item":3333,"count":7},{"item":4444,"count":6}]
+
+-- query 58
+approx_top_k(c_largeint)
+[{"item":null,"count":12},{"item":11111,"count":9},{"item":22222,"count":8},{"item":33333,"count":7},{"item":44444,"count":6}]
+
+-- query 59
+approx_top_k(c_float)
+[{"item":null,"count":12},{"item":1.1,"count":9},{"item":2.2,"count":8},{"item":3.3,"count":7},{"item":4.4,"count":6}]
+
+-- query 60
+approx_top_k(c_double)
+[{"item":null,"count":12},{"item":11.11,"count":9},{"item":22.22,"count":8},{"item":33.33,"count":7},{"item":44.44,"count":6}]
+
+-- query 61
+approx_top_k(c_char)
+[{"item":null,"count":12},{"item":"char1","count":9},{"item":"char2","count":8},{"item":"char3","count":7},{"item":"char4","count":6}]
+
+-- query 62
+approx_top_k(c_varchar)
+[{"item":null,"count":12},{"item":"varchar1","count":9},{"item":"varchar2","count":8},{"item":"varchar3","count":7},{"item":"varchar4","count":6}]
+
+-- query 63
+approx_top_k(c_date)
+[{"item":null,"count":12},{"item":"2021-01-01","count":9},{"item":"2021-01-02","count":8},{"item":"2021-01-03","count":7},{"item":"2021-01-04","count":6}]
+
+-- query 64
+approx_top_k(c_datetime)
+[{"item":null,"count":12},{"item":"2021-01-01 00:00:00","count":9},{"item":"2021-01-02 00:00:00","count":8},{"item":"2021-01-03 00:00:00","count":7},{"item":"2021-01-04 00:00:00","count":6}]
+
+-- query 65
+approx_top_k(c_decimal)
+[{"item":null,"count":12},{"item":111.110,"count":9},{"item":222.220,"count":8},{"item":333.330,"count":7},{"item":444.440,"count":6}]
+
+-- query 66
+approx_top_k(c_tinyint, 3)
+[{"item":null,"count":12},{"item":1,"count":9},{"item":2,"count":8}]
+
+-- query 67
+approx_top_k(c_smallint, 3)
+[{"item":null,"count":12},{"item":11,"count":9},{"item":22,"count":8}]
+
+-- query 68
+approx_top_k(c_int, 3)
+[{"item":null,"count":12},{"item":111,"count":9},{"item":222,"count":8}]
+
+-- query 69
+approx_top_k(c_bigint, 3)
+[{"item":null,"count":12},{"item":1111,"count":9},{"item":2222,"count":8}]
+
+-- query 70
+approx_top_k(c_largeint, 3)
+[{"item":null,"count":12},{"item":11111,"count":9},{"item":22222,"count":8}]
+
+-- query 71
+approx_top_k(c_float, 3)
+[{"item":null,"count":12},{"item":1.1,"count":9},{"item":2.2,"count":8}]
+
+-- query 72
+approx_top_k(c_double, 3)
+[{"item":null,"count":12},{"item":11.11,"count":9},{"item":22.22,"count":8}]
+
+-- query 73
+approx_top_k(c_char, 3)
+[{"item":null,"count":12},{"item":"char1","count":9},{"item":"char2","count":8}]
+
+-- query 74
+approx_top_k(c_varchar, 3)
+[{"item":null,"count":12},{"item":"varchar1","count":9},{"item":"varchar2","count":8}]
+
+-- query 75
+approx_top_k(c_date, 3)
+[{"item":null,"count":12},{"item":"2021-01-01","count":9},{"item":"2021-01-02","count":8}]
+
+-- query 76
+approx_top_k(c_datetime, 3)
+[{"item":null,"count":12},{"item":"2021-01-01 00:00:00","count":9},{"item":"2021-01-02 00:00:00","count":8}]
+
+-- query 77
+approx_top_k(c_decimal, 3)
+[{"item":null,"count":12},{"item":111.110,"count":9},{"item":222.220,"count":8}]
+
+-- query 78
+approx_top_k(c_tinyint, 3, 10)
+[{"item":null,"count":12},{"item":1,"count":9},{"item":2,"count":8}]
+
+-- query 79
+approx_top_k(c_smallint, 3, 10)
+[{"item":null,"count":12},{"item":11,"count":9},{"item":22,"count":8}]
+
+-- query 80
+approx_top_k(c_int, 3, 10)
+[{"item":null,"count":12},{"item":111,"count":9},{"item":222,"count":8}]
+
+-- query 81
+approx_top_k(c_bigint, 3, 10)
+[{"item":null,"count":12},{"item":1111,"count":9},{"item":2222,"count":8}]
+
+-- query 82
+approx_top_k(c_largeint, 3, 10)
+[{"item":null,"count":12},{"item":11111,"count":9},{"item":22222,"count":8}]
+
+-- query 83
+approx_top_k(c_float, 3, 10)
+[{"item":null,"count":12},{"item":1.1,"count":9},{"item":2.2,"count":8}]
+
+-- query 84
+approx_top_k(c_double, 3, 10)
+[{"item":null,"count":12},{"item":11.11,"count":9},{"item":22.22,"count":8}]
+
+-- query 85
+approx_top_k(c_char, 3, 10)
+[{"item":null,"count":12},{"item":"char1","count":9},{"item":"char2","count":8}]
+
+-- query 86
+approx_top_k(c_varchar, 3, 10)
+[{"item":null,"count":12},{"item":"varchar1","count":9},{"item":"varchar2","count":8}]
+
+-- query 87
+approx_top_k(c_date, 3, 10)
+[{"item":null,"count":12},{"item":"2021-01-01","count":9},{"item":"2021-01-02","count":8}]
+
+-- query 88
+approx_top_k(c_datetime, 3, 10)
+[{"item":null,"count":12},{"item":"2021-01-01 00:00:00","count":9},{"item":"2021-01-02 00:00:00","count":8}]
+
+-- query 89
+approx_top_k(c_decimal, 3, 10)
+[{"item":null,"count":12},{"item":111.110,"count":9},{"item":222.220,"count":8}]
+
+-- query 90
+approx_top_k(c_int)
+[{"item":null,"count":3}]
+
+-- query 91
+approx_top_k(c_varchar, 3)
+[{"item":null,"count":3}]
+
+-- query 92
+approx_top_k(c_decimal, 3, 10)
+[{"item":null,"count":3}]
+
+-- query 93
+approx_top_k(c_date, 1)
+[{"item":null,"count":3}]
+
+-- query 94
+c_id	approx_top_k(c_tinyint) OVER ()
+71	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
+72	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
+73	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
+81	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
+82	[{"item":null,"count":2},{"item":8,"count":2},{"item":9,"count":1}]
+
+-- query 95
+c_id	approx_top_k(c_smallint) OVER ()
+71	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
+72	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
+73	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
+81	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
+82	[{"item":null,"count":2},{"item":88,"count":2},{"item":99,"count":1}]
+
+-- query 96
+c_id	approx_top_k(c_int) OVER ()
+71	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
+72	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
+73	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
+81	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
+82	[{"item":null,"count":2},{"item":888,"count":2},{"item":999,"count":1}]
+
+-- query 97
+c_id	approx_top_k(c_bigint) OVER ()
+71	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
+72	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
+73	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
+81	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
+82	[{"item":null,"count":2},{"item":8888,"count":2},{"item":9999,"count":1}]
+
+-- query 98
+c_id	approx_top_k(c_largeint) OVER ()
+71	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
+72	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
+73	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
+81	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
+82	[{"item":null,"count":2},{"item":88888,"count":2},{"item":99999,"count":1}]
+
+-- query 99
+c_id	approx_top_k(c_float) OVER ()
+71	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
+72	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
+73	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
+81	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
+82	[{"item":null,"count":2},{"item":8.8,"count":2},{"item":9.9,"count":1}]
+
+-- query 100
+c_id	approx_top_k(c_double) OVER ()
+71	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
+72	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
+73	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
+81	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
+82	[{"item":null,"count":2},{"item":88.88,"count":2},{"item":99.99,"count":1}]
+
+-- query 101
+c_id	approx_top_k(c_char) OVER ()
+71	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
+72	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
+73	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
+81	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
+82	[{"item":null,"count":2},{"item":"char8","count":2},{"item":"char9","count":1}]
+
+-- query 102
+c_id	approx_top_k(c_varchar) OVER ()
+71	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
+72	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
+73	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
+81	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
+82	[{"item":null,"count":2},{"item":"varchar8","count":2},{"item":"varchar9","count":1}]
+
+-- query 103
+c_id	approx_top_k(c_date) OVER ()
+71	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
+72	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
+73	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
+81	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
+82	[{"item":null,"count":2},{"item":"2021-01-08","count":2},{"item":"2021-01-09","count":1}]
+
+-- query 104
+c_id	approx_top_k(c_datetime) OVER ()
+71	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
+72	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
+73	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
+81	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
+82	[{"item":null,"count":2},{"item":"2021-01-08 00:00:00","count":2},{"item":"2021-01-09 00:00:00","count":1}]
+
+-- query 105
+c_id	approx_top_k(c_decimal) OVER ()
+71	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
+72	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
+73	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
+81	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
+82	[{"item":null,"count":2},{"item":888.880,"count":2},{"item":999.990,"count":1}]
+
+-- query 106
+c_id	approx_top_k(c_tinyint) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 107
+c_id	approx_top_k(c_smallint) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 108
+c_id	approx_top_k(c_int) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 109
+c_id	approx_top_k(c_bigint) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 110
+c_id	approx_top_k(c_largeint) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 111
+c_id	approx_top_k(c_float) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 112
+c_id	approx_top_k(c_double) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 113
+c_id	approx_top_k(c_char) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 114
+c_id	approx_top_k(c_varchar) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 115
+c_id	approx_top_k(c_date) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 116
+c_id	approx_top_k(c_datetime) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 117
+c_id	approx_top_k(c_decimal) OVER ()
+101	[{"item":null,"count":3}]
+102	[{"item":null,"count":3}]
+103	[{"item":null,"count":3}]
+
+-- query 120
+c_partition	approx_top_k(c_tinyint)
+1	[{"item":null,"count":6},{"item":1,"count":5},{"item":2,"count":4},{"item":3,"count":3},{"item":4,"count":2}]
+2	[{"item":1,"count":5},{"item":2,"count":4},{"item":3,"count":3},{"item":4,"count":2},{"item":5,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 121
+c_partition	approx_top_k(c_smallint)
+1	[{"item":null,"count":6},{"item":11,"count":5},{"item":22,"count":4},{"item":33,"count":3},{"item":44,"count":2}]
+2	[{"item":11,"count":5},{"item":22,"count":4},{"item":33,"count":3},{"item":44,"count":2},{"item":55,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 122
+c_partition	approx_top_k(c_int)
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 123
+c_partition	approx_top_k(c_bigint)
+1	[{"item":null,"count":6},{"item":1111,"count":5},{"item":2222,"count":4},{"item":3333,"count":3},{"item":4444,"count":2}]
+2	[{"item":1111,"count":5},{"item":2222,"count":4},{"item":3333,"count":3},{"item":4444,"count":2},{"item":5555,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 124
+c_partition	approx_top_k(c_largeint)
+1	[{"item":null,"count":6},{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2}]
+2	[{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2},{"item":55555,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 125
+c_partition	approx_top_k(c_float)
+1	[{"item":null,"count":6},{"item":1.1,"count":5},{"item":2.2,"count":4},{"item":3.3,"count":3},{"item":4.4,"count":2}]
+2	[{"item":1.1,"count":5},{"item":2.2,"count":4},{"item":3.3,"count":3},{"item":4.4,"count":2},{"item":5.5,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 126
+c_partition	approx_top_k(c_double)
+1	[{"item":null,"count":6},{"item":11.11,"count":5},{"item":22.22,"count":4},{"item":33.33,"count":3},{"item":44.44,"count":2}]
+2	[{"item":11.11,"count":5},{"item":22.22,"count":4},{"item":33.33,"count":3},{"item":44.44,"count":2},{"item":55.55,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 127
+c_partition	approx_top_k(c_char)
+1	[{"item":null,"count":6},{"item":"char1","count":5},{"item":"char2","count":4},{"item":"char3","count":3},{"item":"char4","count":2}]
+2	[{"item":"char1","count":5},{"item":"char2","count":4},{"item":"char3","count":3},{"item":"char4","count":2},{"item":"char5","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 128
+c_partition	approx_top_k(c_varchar)
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 129
+c_partition	approx_top_k(c_date)
+1	[{"item":null,"count":6},{"item":"2021-01-01","count":5},{"item":"2021-01-02","count":4},{"item":"2021-01-03","count":3},{"item":"2021-01-04","count":2}]
+2	[{"item":"2021-01-01","count":5},{"item":"2021-01-02","count":4},{"item":"2021-01-03","count":3},{"item":"2021-01-04","count":2},{"item":"2021-01-05","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 130
+c_partition	approx_top_k(c_datetime)
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3},{"item":"2021-01-04 00:00:00","count":2}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3},{"item":"2021-01-04 00:00:00","count":2},{"item":"2021-01-05 00:00:00","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 131
+c_partition	approx_top_k(c_decimal)
+1	[{"item":null,"count":6},{"item":111.110,"count":5},{"item":222.220,"count":4},{"item":333.330,"count":3},{"item":444.440,"count":2}]
+2	[{"item":111.110,"count":5},{"item":222.220,"count":4},{"item":333.330,"count":3},{"item":444.440,"count":2},{"item":555.550,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 132
+c_partition	approx_top_k(c_tinyint, 10)
+1	[{"item":null,"count":6},{"item":1,"count":5},{"item":2,"count":4},{"item":3,"count":3},{"item":4,"count":2},{"item":5,"count":1}]
+2	[{"item":1,"count":5},{"item":2,"count":4},{"item":3,"count":3},{"item":4,"count":2},{"item":5,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 133
+c_partition	approx_top_k(c_smallint, 10)
+1	[{"item":null,"count":6},{"item":11,"count":5},{"item":22,"count":4},{"item":33,"count":3},{"item":44,"count":2},{"item":55,"count":1}]
+2	[{"item":11,"count":5},{"item":22,"count":4},{"item":33,"count":3},{"item":44,"count":2},{"item":55,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 134
+c_partition	approx_top_k(c_int, 10)
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 135
+c_partition	approx_top_k(c_bigint, 10)
+1	[{"item":null,"count":6},{"item":1111,"count":5},{"item":2222,"count":4},{"item":3333,"count":3},{"item":4444,"count":2},{"item":5555,"count":1}]
+2	[{"item":1111,"count":5},{"item":2222,"count":4},{"item":3333,"count":3},{"item":4444,"count":2},{"item":5555,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 136
+c_partition	approx_top_k(c_largeint, 10)
+1	[{"item":null,"count":6},{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2},{"item":55555,"count":1}]
+2	[{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3},{"item":44444,"count":2},{"item":55555,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 137
+c_partition	approx_top_k(c_float, 10)
+1	[{"item":null,"count":6},{"item":1.1,"count":5},{"item":2.2,"count":4},{"item":3.3,"count":3},{"item":4.4,"count":2},{"item":5.5,"count":1}]
+2	[{"item":1.1,"count":5},{"item":2.2,"count":4},{"item":3.3,"count":3},{"item":4.4,"count":2},{"item":5.5,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 138
+c_partition	approx_top_k(c_double, 10)
+1	[{"item":null,"count":6},{"item":11.11,"count":5},{"item":22.22,"count":4},{"item":33.33,"count":3},{"item":44.44,"count":2},{"item":55.55,"count":1}]
+2	[{"item":11.11,"count":5},{"item":22.22,"count":4},{"item":33.33,"count":3},{"item":44.44,"count":2},{"item":55.55,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 139
+c_partition	approx_top_k(c_char, 10)
+1	[{"item":null,"count":6},{"item":"char1","count":5},{"item":"char2","count":4},{"item":"char3","count":3},{"item":"char4","count":2},{"item":"char5","count":1}]
+2	[{"item":"char1","count":5},{"item":"char2","count":4},{"item":"char3","count":3},{"item":"char4","count":2},{"item":"char5","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 140
+c_partition	approx_top_k(c_varchar, 10)
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 141
+c_partition	approx_top_k(c_date, 10)
+1	[{"item":null,"count":6},{"item":"2021-01-01","count":5},{"item":"2021-01-02","count":4},{"item":"2021-01-03","count":3},{"item":"2021-01-04","count":2},{"item":"2021-01-05","count":1}]
+2	[{"item":"2021-01-01","count":5},{"item":"2021-01-02","count":4},{"item":"2021-01-03","count":3},{"item":"2021-01-04","count":2},{"item":"2021-01-05","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 142
+c_partition	approx_top_k(c_datetime, 10)
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3},{"item":"2021-01-04 00:00:00","count":2},{"item":"2021-01-05 00:00:00","count":1}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3},{"item":"2021-01-04 00:00:00","count":2},{"item":"2021-01-05 00:00:00","count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 143
+c_partition	approx_top_k(c_decimal, 10)
+1	[{"item":null,"count":6},{"item":111.110,"count":5},{"item":222.220,"count":4},{"item":333.330,"count":3},{"item":444.440,"count":2},{"item":555.550,"count":1}]
+2	[{"item":111.110,"count":5},{"item":222.220,"count":4},{"item":333.330,"count":3},{"item":444.440,"count":2},{"item":555.550,"count":1}]
+3	[{"item":null,"count":5}]
+
+-- query 144
+c_partition	approx_top_k(c_tinyint, 3, 10)
+1	[{"item":null,"count":6},{"item":1,"count":5},{"item":2,"count":4}]
+2	[{"item":1,"count":5},{"item":2,"count":4},{"item":3,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 145
+c_partition	approx_top_k(c_smallint, 3, 10)
+1	[{"item":null,"count":6},{"item":11,"count":5},{"item":22,"count":4}]
+2	[{"item":11,"count":5},{"item":22,"count":4},{"item":33,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 146
+c_partition	approx_top_k(c_int, 3, 10)
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 147
+c_partition	approx_top_k(c_bigint, 3, 10)
+1	[{"item":null,"count":6},{"item":1111,"count":5},{"item":2222,"count":4}]
+2	[{"item":1111,"count":5},{"item":2222,"count":4},{"item":3333,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 148
+c_partition	approx_top_k(c_largeint, 3, 10)
+1	[{"item":null,"count":6},{"item":11111,"count":5},{"item":22222,"count":4}]
+2	[{"item":11111,"count":5},{"item":22222,"count":4},{"item":33333,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 149
+c_partition	approx_top_k(c_float, 3, 10)
+1	[{"item":null,"count":6},{"item":1.1,"count":5},{"item":2.2,"count":4}]
+2	[{"item":1.1,"count":5},{"item":2.2,"count":4},{"item":3.3,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 150
+c_partition	approx_top_k(c_double, 3, 10)
+1	[{"item":null,"count":6},{"item":11.11,"count":5},{"item":22.22,"count":4}]
+2	[{"item":11.11,"count":5},{"item":22.22,"count":4},{"item":33.33,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 151
+c_partition	approx_top_k(c_char, 3, 10)
+1	[{"item":null,"count":6},{"item":"char1","count":5},{"item":"char2","count":4}]
+2	[{"item":"char1","count":5},{"item":"char2","count":4},{"item":"char3","count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 152
+c_partition	approx_top_k(c_varchar, 3, 10)
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 153
+c_partition	approx_top_k(c_date, 3, 10)
+1	[{"item":null,"count":6},{"item":"2021-01-01","count":5},{"item":"2021-01-02","count":4}]
+2	[{"item":"2021-01-01","count":5},{"item":"2021-01-02","count":4},{"item":"2021-01-03","count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 154
+c_partition	approx_top_k(c_datetime, 3, 10)
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 155
+c_partition	approx_top_k(c_decimal, 3, 10)
+1	[{"item":null,"count":6},{"item":111.110,"count":5},{"item":222.220,"count":4}]
+2	[{"item":111.110,"count":5},{"item":222.220,"count":4},{"item":333.330,"count":3}]
+3	[{"item":null,"count":5}]
+
+-- query 156
+c_partition	approx_top_k(c_int) OVER (PARTITION BY c_partition )
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+1	[{"item":null,"count":6},{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+2	[{"item":111,"count":5},{"item":222,"count":4},{"item":333,"count":3},{"item":444,"count":2},{"item":555,"count":1}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 157
+c_partition	approx_top_k(c_varchar, 10) OVER (PARTITION BY c_partition )
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+1	[{"item":null,"count":6},{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+2	[{"item":"varchar1","count":5},{"item":"varchar2","count":4},{"item":"varchar3","count":3},{"item":"varchar4","count":2},{"item":"varchar5","count":1}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 158
+c_partition	approx_top_k(c_datetime, 3, 10) OVER (PARTITION BY c_partition )
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+1	[{"item":null,"count":6},{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+2	[{"item":"2021-01-01 00:00:00","count":5},{"item":"2021-01-02 00:00:00","count":4},{"item":"2021-01-03 00:00:00","count":3}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 159
+c_partition	approx_top_k(c_decimal, 1) OVER (PARTITION BY c_partition )
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+1	[{"item":null,"count":6}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+2	[{"item":111.110,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 160
+approx_top_k(c_decimal)
+[]
+
+-- query 161
+approx_top_k(c_decimal)
+
+-- query 162
+approx_top_k(c_decimal) OVER ()
+
+-- query 165
+approx_top_k(c_bool)
+[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+
+-- query 166
+approx_top_k(c_bool, 1)
+[{"item":1,"count":10}]
+
+-- query 167
+approx_top_k(c_bool, 3, 100)
+[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+
+-- query 168
+c_partition	approx_top_k(c_bool)
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+3	[{"item":null,"count":5}]
+
+-- query 169
+c_partition	approx_top_k(c_bool, 1)
+1	[{"item":1,"count":5}]
+2	[{"item":1,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 170
+c_partition	approx_top_k(c_bool, 3, 100)
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+3	[{"item":null,"count":5}]
+
+-- query 171
+c_id	approx_top_k(c_bool) OVER ()
+1	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+2	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+3	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+4	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+5	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+6	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+7	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+8	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+9	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+10	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+11	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+21	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+22	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+23	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+24	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+25	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+26	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+27	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+28	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+29	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+31	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+32	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+33	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+34	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+35	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+
+-- query 172
+c_id	approx_top_k(c_bool, 10) OVER ()
+1	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+2	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+3	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+4	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+5	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+6	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+7	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+8	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+9	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+10	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+11	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+21	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+22	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+23	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+24	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+25	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+26	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+27	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+28	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+29	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+31	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+32	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+33	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+34	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+35	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+
+-- query 173
+c_id	approx_top_k(c_bool, 3, 10) OVER ()
+1	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+2	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+3	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+4	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+5	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+6	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+7	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+8	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+9	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+10	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+11	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+21	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+22	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+23	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+24	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+25	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+26	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+27	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+28	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+29	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+31	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+32	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+33	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+34	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+35	[{"item":1,"count":10},{"item":0,"count":8},{"item":null,"count":7}]
+
+-- query 174
+c_partition	approx_top_k(c_bool) OVER (PARTITION BY c_partition )
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 175
+c_partition	approx_top_k(c_bool, 10) OVER (PARTITION BY c_partition )
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 176
+c_partition	approx_top_k(c_bool, 3, 10) OVER (PARTITION BY c_partition )
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+1	[{"item":1,"count":5},{"item":0,"count":4},{"item":null,"count":2}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+2	[{"item":1,"count":5},{"item":0,"count":4}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+3	[{"item":null,"count":5}]
+
+-- query 178
+approx_top_k(L_LINENUMBER)
+[{"item":1,"count":36},{"item":2,"count":31},{"item":3,"count":26},{"item":4,"count":21},{"item":5,"count":16}]
+
+-- query 179
+approx_top_k(L_LINENUMBER, 1)
+[{"item":1,"count":36}]
+
+-- query 180
+approx_top_k(L_LINENUMBER, 10)
+[{"item":1,"count":36},{"item":2,"count":31},{"item":3,"count":26},{"item":4,"count":21},{"item":5,"count":16},{"item":6,"count":11},{"item":7,"count":6}]
+
+-- query 181
+L_RETURNFLAG	approx_top_k(L_LINENUMBER)
+A	[{"item":1,"count":9},{"item":2,"count":8},{"item":3,"count":7},{"item":4,"count":6},{"item":5,"count":5}]
+N	[{"item":1,"count":15},{"item":2,"count":13},{"item":3,"count":11},{"item":4,"count":9},{"item":5,"count":7}]
+R	[{"item":1,"count":12},{"item":2,"count":10},{"item":3,"count":8},{"item":4,"count":6},{"item":5,"count":4}]
+
+-- query 182
+L_RETURNFLAG	approx_top_k(L_LINENUMBER, 2)
+A	[{"item":1,"count":9},{"item":2,"count":8}]
+N	[{"item":1,"count":15},{"item":2,"count":13}]
+R	[{"item":1,"count":12},{"item":2,"count":10}]
+
+-- query 183
+L_RETURNFLAG	approx_top_k(L_LINENUMBER, 20)
+A	[{"item":1,"count":9},{"item":2,"count":8},{"item":3,"count":7},{"item":4,"count":6},{"item":5,"count":5},{"item":6,"count":4},{"item":7,"count":3}]
+N	[{"item":1,"count":15},{"item":2,"count":13},{"item":3,"count":11},{"item":4,"count":9},{"item":5,"count":7},{"item":6,"count":5},{"item":7,"count":3}]
+R	[{"item":1,"count":12},{"item":2,"count":10},{"item":3,"count":8},{"item":4,"count":6},{"item":5,"count":4},{"item":6,"count":2}]
+
+-- query 184
+approx_top_k(col1)
+[{"item":1,"count":1}]
+
+-- query 185
+approx_top_k(col1)
+[{"item":1,"count":6}]
+
+-- query 186
+approx_top_k(1)
+[{"item":1,"count":1}]

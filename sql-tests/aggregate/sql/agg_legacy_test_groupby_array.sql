@@ -1,0 +1,47 @@
+-- Migrated from dev/test/sql/test_agg/R/test_groupby_array
+-- Test Objective:
+-- Preserve legacy aggregate coverage in a self-contained sql-tests case.
+-- query 1
+-- @skip_result_check=true
+DROP DATABASE IF EXISTS sql_tests_test_groupby_array FORCE;
+CREATE DATABASE sql_tests_test_groupby_array;
+USE sql_tests_test_groupby_array;
+
+-- name: test_groupby_array @slow @mac
+-- query 2
+-- @skip_result_check=true
+USE sql_tests_test_groupby_array;
+SET @var = array_map(x -> CAST(x AS STRING), array_generate(1, 2000000, 1));
+
+-- query 3
+USE sql_tests_test_groupby_array;
+with input as (SELECT @var AS a UNION ALL SELECT ["A", "B", "C"] AS a)
+SELECT count(*) from (select a from input group by 1) AS t;
+
+-- query 4
+-- @skip_result_check=true
+USE sql_tests_test_groupby_array;
+CREATE TABLE `t1` (
+  `id` int(11) NULL COMMENT "",
+  `array_varchar` array<varchar(100)>
+) ENGINE=OLAP
+DUPLICATE KEY(`id`)
+DISTRIBUTED BY HASH(`id`) BUCKETS 3
+PROPERTIES (
+"replication_num" = "1"
+);
+
+-- query 5
+-- @skip_result_check=true
+USE sql_tests_test_groupby_array;
+insert into t1 select generate_series, array_map(x -> cast(x as string), array_generate(1, generate_series % 100, 1)) from table(generate_series(1, 10000));
+
+-- query 6
+-- @skip_result_check=true
+USE sql_tests_test_groupby_array;
+insert into t1 values (0, array_map(x -> CAST(x AS STRING), array_generate(1, 100000, 1))),
+(10001, array_map(x -> CAST(x AS STRING), array_generate(1, 100000, 1)));
+
+-- query 7
+USE sql_tests_test_groupby_array;
+select count() from (select distinct array_varchar from t1) t;

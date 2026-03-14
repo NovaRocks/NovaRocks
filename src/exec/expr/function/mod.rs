@@ -43,6 +43,9 @@ pub use conditional::eval_if;
 pub use conditional::eval_ifnull;
 pub use conditional::eval_nullif;
 pub use conditional::{eval_is_not_null, eval_is_null};
+pub(crate) use date::common::{
+    parse_date as parse_date_value, parse_datetime as parse_datetime_value,
+};
 pub use date::eval_date_function;
 pub use date::eval_year;
 pub use encryption::eval_encryption_function;
@@ -63,7 +66,6 @@ pub use string::eval_substring;
 pub use string::eval_upper;
 pub use struct_fn::eval_struct_function;
 pub use variant::eval_variant_function;
-pub(crate) use date::common::{parse_date as parse_date_value, parse_datetime as parse_datetime_value};
 
 /// Function kind identifier for all supported functions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

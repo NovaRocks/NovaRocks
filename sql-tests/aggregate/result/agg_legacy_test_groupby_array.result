@@ -1,0 +1,7 @@
+-- query 3
+count(*)
+2
+
+-- query 7
+count()
+101

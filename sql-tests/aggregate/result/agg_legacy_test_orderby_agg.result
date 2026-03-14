@@ -1,0 +1,53 @@
+-- query 4
+v1
+NULL
+4
+2
+1
+1
+
+-- query 5
+v1	round_col
+NULL	NULL
+1	2
+1	2
+2	1
+4	0
+
+-- query 6
+v1
+NULL
+4
+2
+1
+1
+
+-- query 7
+v11
+NULL
+4
+2
+1
+1
+
+-- query 8
+v11	v1
+NULL	NULL
+4	4
+2	2
+1	1
+1	1
+
+-- query 9
+potential_customer_rate	v2
+NULL	NULL
+33.3333	3
+150.0000	2
+200.0000	1
+
+-- query 10
+potential_customer_rate	v2
+NULL	NULL
+33.3333	3
+150.0000	2
+200.0000	1

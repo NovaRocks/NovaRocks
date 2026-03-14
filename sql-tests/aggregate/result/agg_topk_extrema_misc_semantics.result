@@ -1,0 +1,23 @@
+-- query 1
+top_items
+[{"item":10,"count":3},{"item":20,"count":3},{"item":40,"count":2}]
+
+-- query 2
+grp	top_items
+1	[{"item":10,"count":1},{"item":20,"count":2}]
+2	[{"item":null,"count":1},{"item":10,"count":2}]
+3	[{"item":40,"count":2}]
+
+-- query 3
+min_three_values	min_two_texts
+[10,10,10]	["alpha","beta"]
+
+-- query 4
+grp	expr_avg
+1	32499997.316162
+2	29999997.627262
+3	24999998.249461
+
+-- query 5
+two_sided	less_side	greater_side
+[12.5, 0.610491756745271]	[12.5, 0.7775834956817393]	[12.5, 0.3052458783726355]

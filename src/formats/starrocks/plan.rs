@@ -2069,8 +2069,7 @@ fn build_schema_column_plan(
     let unique_id = u32::try_from(schema_col.unique_id).ok();
 
     let aggregation = normalize_aggregation(schema_col.aggregation.as_deref()).or_else(|| {
-        source_schema_col
-            .and_then(|col| normalize_aggregation(col.aggregation.as_deref()))
+        source_schema_col.and_then(|col| normalize_aggregation(col.aggregation.as_deref()))
     });
 
     Ok(StarRocksNativeSchemaColumnPlan {

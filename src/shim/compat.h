@@ -108,6 +108,12 @@ int32_t novarocks_rs_lookup(const uint8_t* ptr,
                             NovaRocksRustBuf* out_resp,
                             NovaRocksRustBuf* out_err);
 
+// internal_service.proto PUpdateFailPointStatusRequest -> PUpdateFailPointStatusResponse (protobuf bytes).
+int32_t novarocks_rs_update_fail_point_status(const uint8_t* ptr,
+                                              size_t len,
+                                              NovaRocksRustBuf* out_resp,
+                                              NovaRocksRustBuf* out_err);
+
 // lake_service.proto PublishVersionRequest -> PublishVersionResponse (protobuf bytes).
 // Returns:
 // - 0: OK

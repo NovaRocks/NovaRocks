@@ -1,0 +1,917 @@
+-- query 4
+count(DISTINCT c5)	c2
+1250	3
+
+-- query 5
+count(DISTINCT c5)	count((c3 + c1) + 3)
+1250	1250
+
+-- query 6
+count(DISTINCT c0, c5)	sum(c3)
+1250	5000
+
+-- query 7
+count(DISTINCT c1, c2, c3)	avg(c3)
+1	4
+
+-- query 8
+count(DISTINCT c0)	bitmap_union_count(to_bitmap(c0 + c3))
+1246	1246
+
+-- query 9
+sum(DISTINCT c3)	c2
+4	3
+
+-- query 10
+sum(DISTINCT c0)	c2
+6867924984	3
+
+-- query 11
+sum(DISTINCT c0)	approx_count_distinct(c3)
+6867924984	1
+
+-- query 12
+sum(DISTINCT c0)	approx_count_distinct(c3)
+6867924984	1
+
+-- query 13
+count(DISTINCT c5)	max(c2)
+1250	3
+
+-- query 14
+count(DISTINCT c5)	count((c3 + c1) + 3)
+1250	1250
+
+-- query 15
+count(DISTINCT c0, c5)	sum(c3)
+1250	5000
+
+-- query 16
+count(DISTINCT c1, c2, c3)	avg(c3)
+1	4
+
+-- query 17
+count(DISTINCT c0)	bitmap_union_count(to_bitmap(c0 + c3))
+1246	1246
+
+-- query 18
+sum(DISTINCT c3)	avg(c2)
+4	3
+
+-- query 19
+sum(DISTINCT c0)	min(c2)
+6867924984	3
+
+-- query 20
+sum(DISTINCT c0)	approx_count_distinct(c3)
+6867924984	1
+
+-- query 21
+sum(DISTINCT c0)	approx_count_distinct(c3)
+6867924984	1
+
+-- query 22
+count(DISTINCT c5)	max(c2)
+1250	3
+
+-- query 23
+count(DISTINCT c5)	count((c3 + c1) + 3)
+1250	1250
+
+-- query 24
+count(DISTINCT c0, c5)	sum(c3)
+1250	5000
+
+-- query 25
+count(DISTINCT c1, c2, c3)	avg(c3)
+1	4
+
+-- query 26
+count(DISTINCT c0)	bitmap_union_count(to_bitmap(c0 + c3))
+1246	1246
+
+-- query 27
+sum(DISTINCT c3)	avg(c2)
+4	3
+
+-- query 28
+sum(DISTINCT c0)	min(c2)
+6867924984	3
+
+-- query 29
+sum(DISTINCT c0)	approx_count_distinct(c3)
+6867924984	1
+
+-- query 30
+sum(DISTINCT c0)	approx_count_distinct(c3)
+6867924984	1
+
+-- query 31
+avg(DISTINCT c1)	count(c2)
+2	1250
+
+-- query 32
+avg(DISTINCT c1)	count(c2)
+2	1250
+
+-- query 33
+avg(DISTINCT c1)	count(c2)
+2	1250
+
+-- query 34
+fingerprint
+-5714598445053
+
+-- query 35
+fingerprint
+-5714598445053
+
+-- query 36
+fingerprint
+-5714598445053
+
+-- query 37
+fingerprint
+-5714598445053
+
+-- query 38
+fingerprint
+-12031151387514
+
+-- query 39
+fingerprint
+-12031151387514
+
+-- query 40
+fingerprint
+-12031151387514
+
+-- query 41
+fingerprint
+-12031151387514
+
+-- query 42
+array_length(array_agg(a1))	cnt
+1	1
+
+-- query 43
+array_length(array_agg(a1))	cnt
+1	1
+
+-- query 44
+cnt
+1
+
+-- query 45
+cnt
+1
+
+-- query 46
+count(DISTINCT c1, c2)
+1
+
+-- query 47
+count(DISTINCT c1, c2, c3)
+1
+
+-- query 48
+count(DISTINCT c1, c2)	count(DISTINCT c2, c3)	sum(c2)
+1	1	3750
+
+-- query 49
+count(DISTINCT c1, c2, c3)	count(DISTINCT c2, c3)	sum(c2)
+1	1	3750
+
+-- query 50
+count(DISTINCT t1.c1, if(t2.c3 IS NULL, 1, 0))	sum(t1.c2 + (if(t2.c3 IS NULL, 1, 0)))
+1	5000
+
+-- query 53
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 54
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 55
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 56
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 57
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 58
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 59
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 60
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 61
+group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
+1	[2]	5000
+1	[2]	5000
+1	[2]	5000
+
+-- query 62
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 63
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 64
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 65
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 68
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 69
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 70
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 71
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 72
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 73
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 74
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 75
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 76
+group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
+1	[2]	5000
+1	[2]	5000
+1	[2]	5000
+
+-- query 77
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 78
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 79
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 80
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 83
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 84
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 85
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 86
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 87
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 88
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 89
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 90
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 91
+group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
+1	[2]	5000
+1	[2]	5000
+1	[2]	5000
+
+-- query 92
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 93
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 94
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 95
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 98
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 99
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 100
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 101
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 102
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 103
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 104
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 105
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 106
+group_concat(DISTINCT 1 SEPARATOR ',')	array_agg(DISTINCT 2)	sum(c3)
+1	[2]	5000
+1	[2]	5000
+1	[2]	5000
+
+-- query 107
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 108
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 109
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 110
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 111
+array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+[3]	1	5000
+[3]	1	5000
+[3]	1	5000
+
+-- query 114
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 115
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 116
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 117
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 118
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 119
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 120
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 121
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 122
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 123
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 124
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 125
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 128
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 129
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 130
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 131
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 132
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 133
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 134
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 135
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 136
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 137
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 138
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 139
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 142
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 143
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 144
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 145
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 146
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 147
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 148
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 149
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 150
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 151
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 152
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 153
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 156
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 157
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 158
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 159
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 160
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 161
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 162
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 163
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 164
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 165
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 166
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 167
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 168
+array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+[3]	1	5000
+[3]	1	5000
+[3]	1	5000
+
+-- query 171
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 172
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 173
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 174
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 175
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 176
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 177
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 178
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 179
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 180
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 181
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 182
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 185
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 186
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 187
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 188
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 189
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 190
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 191
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 192
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 193
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 194
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 195
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 196
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 199
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 200
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 201
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 202
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 203
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 204
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 205
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 206
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 207
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 208
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 209
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 210
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 213
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 214
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 215
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 216
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+3A	[4,4,4,4,4,4,4,4,4,4]	11
+
+-- query 217
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 218
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 219
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+
+-- query 220
+group_concat(DISTINCT c2,upper(c4) ORDER BY abs(c2 + c3) ASC SEPARATOR ',')	array_agg(DISTINCT c3 ORDER BY c3 ASC, c4 ASC)	ceil(sum(c5))
+3A	[4]	630
+3A	[4]	630
+3A	[4]	630
+
+-- query 221
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 222
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 223
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+
+-- query 224
+group_concat(DISTINCT c2 SEPARATOR ',')	array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+3	[3]	1	5000
+3	[3]	1	5000
+3	[3]	1	5000
+
+-- query 225
+array_agg(DISTINCT c2)	count(DISTINCT c2)	sum(c3)
+[3]	1	5000
+[3]	1	5000
+[3]	1	5000
+
+-- query 227
+count(c2)	count(DISTINCT c3)	a
+1562500	1	a
+
+-- query 228
+count(c2)	a
+1562500	a
+
+-- query 229
+sum(c2)	count(DISTINCT c3)	a
+4687500	1	a
+
+-- query 230
+sum(c2)	a
+4687500	a
+
+-- query 232
+count(c2)	count(DISTINCT c3)	a
+1562500	1	a
+
+-- query 233
+count(c2)	a
+1562500	a
+
+-- query 234
+sum(c2)	count(DISTINCT c3)	a
+4687500	1	a
+
+-- query 235
+sum(c2)	a
+4687500	a
+
+-- query 237
+sum(c0)	count(DISTINCT c2, c3)
+480816	1
+
+-- query 238
+count(DISTINCT 1, 2)	count(DISTINCT 1)	count(DISTINCT NULL)	group_concat(DISTINCT 'a','b' SEPARATOR ',')	count(DISTINCT c2)
+1	1	0	ab	1

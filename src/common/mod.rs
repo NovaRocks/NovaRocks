@@ -18,6 +18,7 @@ pub mod app_config;
 pub mod config;
 pub mod datasketches;
 pub mod decimal;
+pub mod failpoint;
 pub mod file_identity;
 pub mod ids;
 pub mod largeint;

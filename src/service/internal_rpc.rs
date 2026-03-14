@@ -16,6 +16,7 @@
 // under the License.
 use std::collections::HashMap;
 
+use crate::common::failpoint::{self, FailPointMode};
 use crate::common::ids::SlotId;
 use crate::novarocks_logging::warn;
 use crate::runtime::exchange;
@@ -35,6 +36,55 @@ fn error_status(message: impl Into<String>) -> proto::starrocks::StatusPb {
         status_code: 1,
         error_msgs: vec![message.into()],
     }
+}
+
+pub(crate) fn handle_update_fail_point_status(
+    request: proto::starrocks::PUpdateFailPointStatusRequest,
+) -> proto::starrocks::PUpdateFailPointStatusResponse {
+    let mut response = proto::starrocks::PUpdateFailPointStatusResponse {
+        status: Some(ok_status()),
+    };
+
+    let Some(name) = request.fail_point_name.as_deref() else {
+        response.status = Some(error_status("missing fail_point_name"));
+        return response;
+    };
+    let Some(trigger_mode) = request.trigger_mode.as_ref() else {
+        response.status = Some(error_status("missing trigger_mode"));
+        return response;
+    };
+    let Some(mode) = trigger_mode.mode else {
+        response.status = Some(error_status("missing trigger_mode.mode"));
+        return response;
+    };
+
+    let mode = match proto::starrocks::FailPointTriggerModeType::try_from(mode) {
+        Ok(proto::starrocks::FailPointTriggerModeType::Enable) => FailPointMode::Enable,
+        Ok(proto::starrocks::FailPointTriggerModeType::Disable) => FailPointMode::Disable,
+        Ok(proto::starrocks::FailPointTriggerModeType::ProbabilityEnable) => {
+            let Some(probability) = trigger_mode.probability else {
+                response.status = Some(error_status("missing trigger_mode.probability"));
+                return response;
+            };
+            FailPointMode::Probability(probability)
+        }
+        Ok(proto::starrocks::FailPointTriggerModeType::EnableNTimes) => {
+            let Some(n_times) = trigger_mode.n_times else {
+                response.status = Some(error_status("missing trigger_mode.n_times"));
+                return response;
+            };
+            FailPointMode::EnableNTimes(n_times)
+        }
+        Err(_) => {
+            response.status = Some(error_status(format!("invalid trigger_mode.mode={mode}")));
+            return response;
+        }
+    };
+
+    if let Err(err) = failpoint::update(name, mode) {
+        response.status = Some(error_status(err));
+    }
+    response
 }
 
 pub(crate) fn handle_transmit_chunk(

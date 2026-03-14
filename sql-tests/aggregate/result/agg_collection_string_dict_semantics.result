@@ -1,0 +1,21 @@
+-- query 1
+g	names_all	names_distinct
+1	["Tom","Tom","May"]	["May","Tom"]
+2	["Ti","Ti"]	["Ti"]
+3	["Zoe"]	["Zoe"]
+
+-- query 2
+g	min_unique_score	max_unique_score	unique_score_count
+1	80	90	2
+2	98	99	2
+3	70	70	1
+
+-- query 3
+g	names_concat	distinct_scores
+1	Tom|Tom|May	80,90
+2	Ti|Ti	98,99
+3	Zoe	70
+
+-- query 4
+city_dict	city_null_dict	city_array_dict	city_array_null_dict
+{"2":{"lst":["str",4,"YmVpamluZw","aGFuZ3pob3U","bmFuamluZw","c2hhbmdoYWk"]},"3":{"lst":["i32",4,1,2,3,4]}}	{"2":{"lst":["str",4,"YmVpamluZw","aGFuZ3pob3U","bmFuamluZw","c2hhbmdoYWk"]},"3":{"lst":["i32",4,1,2,3,4]}}	{"2":{"lst":["str",5,"YmVpamluZw","aGFuZ3pob3U","bmFuamluZw","c2hhbmdoYWk","c2hlbnpoZW4"]},"3":{"lst":["i32",5,1,2,3,4,5]}}	{"2":{"lst":["str",4,"aGFuZ3pob3U","bmFuamluZw","c2hhbmdoYWk","c2hlbnpoZW4"]},"3":{"lst":["i32",4,1,2,3,4]}}

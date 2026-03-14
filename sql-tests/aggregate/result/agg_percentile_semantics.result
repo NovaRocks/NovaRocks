@@ -1,0 +1,19 @@
+-- query 1
+p0	p50	p100	disc50	disc75
+10	30	50	30	40
+
+-- query 2
+date_p50	dt_p50	date_disc75
+2020-01-01	2020-01-01 00:00:01	2021-01-01
+
+-- query 3
+approx50	approx90	approx_quartiles
+30	50	[17.5,30,42.5]
+
+-- query 4
+weighted50	weighted90	weighted_quartiles
+36	50	[23.33333396911621,36.66666793823242,47.5]
+
+-- query 5
+union_p75
+42

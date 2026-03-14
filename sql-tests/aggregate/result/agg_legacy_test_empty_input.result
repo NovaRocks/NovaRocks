@@ -1,0 +1,39 @@
+-- query 3
+percentile_disc(v1, 0.5)
+NULL
+
+-- query 4
+percentile_cont(v1, 0.5)
+NULL
+
+-- query 5
+percentile_disc_lc(v1, 0.5)
+NULL
+
+-- query 6
+max(v1)	min(v1)
+NULL	NULL
+
+-- query 7
+max(v1)	count(*)
+NULL	0
+
+-- query 8
+count(v1)
+0
+
+-- query 9
+count(*)
+0
+
+-- query 10
+count(DISTINCT v1)
+0
+
+-- query 13
+max(c2)
+NULL
+
+-- query 14
+min(c2)
+NULL

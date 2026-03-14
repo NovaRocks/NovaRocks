@@ -557,7 +557,9 @@ fn filter_rows_for_tablet_schema(
         &mut tracking_logs,
         table_id,
     )?;
-    let column_count = materialized_batch.num_columns().min(tablet_schema.column.len());
+    let column_count = materialized_batch
+        .num_columns()
+        .min(tablet_schema.column.len());
     for column_idx in 0..column_count {
         let schema_col = &tablet_schema.column[column_idx];
         if schema_col.is_nullable.unwrap_or(true) {
@@ -572,7 +574,13 @@ fn filter_rows_for_tablet_schema(
             .as_deref()
             .filter(|name| !name.trim().is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| materialized_batch.schema().field(column_idx).name().to_string());
+            .unwrap_or_else(|| {
+                materialized_batch
+                    .schema()
+                    .field(column_idx)
+                    .name()
+                    .to_string()
+            });
         for row_idx in 0..materialized_batch.num_rows() {
             if !column.is_null(row_idx) || rejected[row_idx] {
                 continue;
@@ -2131,12 +2139,7 @@ fn partition_scalar_value_to_string(array: &dyn Array, row: usize) -> Result<Str
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "downcast BooleanArray failed".to_string())?;
-            Ok(if typed.value(row) {
-                "TRUE"
-            } else {
-                "FALSE"
-            }
-            .to_string())
+            Ok(if typed.value(row) { "TRUE" } else { "FALSE" }.to_string())
         }
         DataType::Date32 => {
             let typed = array
@@ -2446,8 +2449,8 @@ fn align_batch_to_schema_slot_bindings(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::{
         Array, ArrayRef, BooleanArray, Date32Array, Int8Array, Int16Array, Int32Array, Int64Array,
@@ -2482,8 +2485,8 @@ mod tests {
     use crate::exec::chunk::Chunk;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
     use crate::exec::pipeline::operator::ProcessorOperator;
-    use crate::frontend_service;
     use crate::formats::starrocks::writer::{StarRocksWriteFormat, layout::txn_log_file_path};
+    use crate::frontend_service;
     use crate::frontend_service::TCreatePartitionResult;
     use crate::runtime::runtime_state::RuntimeState;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
@@ -3516,7 +3519,9 @@ mod tests {
         let filtered = filter_rows_for_tablet_schema(
             &batch,
             &primary_key_auto_increment_schema(),
-            Some(&primary_key_auto_increment_policy(Some(server.addr().clone()))),
+            Some(&primary_key_auto_increment_policy(Some(
+                server.addr().clone(),
+            ))),
             97145,
         )
         .expect("materialize auto increment defaults");

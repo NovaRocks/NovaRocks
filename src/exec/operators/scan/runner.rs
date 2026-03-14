@@ -30,6 +30,7 @@
 
 use super::dispatch::ScanDispatchState;
 use super::types::{PushResult, ScanAsyncState, ScanRuntimeFilterProbe};
+use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
@@ -334,6 +335,10 @@ impl ScanAsyncRunner {
             match next {
                 Some(Ok(chunk)) => {
                     self.last_progress = Instant::now();
+                    failpoint::sleep_if_triggered(
+                        failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
+                        Duration::from_millis(25),
+                    );
                     let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
                         continue;

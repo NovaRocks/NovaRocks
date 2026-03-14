@@ -32,6 +32,7 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
+use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
@@ -267,6 +268,18 @@ impl AggregateProcessorOperator {
 
         if chunk.is_empty() {
             return Ok(None);
+        }
+
+        if !self.group_by.is_empty() {
+            let failpoint_name = if self.functions.is_empty() {
+                failpoint::AGG_HASH_SET_BAD_ALLOC
+            } else {
+                failpoint::AGGREGATE_BUILD_HASH_MAP_BAD_ALLOC
+            };
+            failpoint::maybe_error(
+                failpoint_name,
+                "Mem usage has exceed the limit of BE: BE:10004",
+            )?;
         }
 
         let num_rows = chunk.len();
@@ -621,6 +634,10 @@ impl ProcessorOperator for AggregateProcessorOperator {
             return Ok(());
         }
         let out = self.finish()?;
+        if failpoint::should_trigger(failpoint::FORCE_RESET_AGGREGATOR_AFTER_STREAMING_SINK_FINISH)
+        {
+            self.reset_after_streaming_finish();
+        }
         self.pending_output = out;
         self.finalized = true;
         if self.pending_output.is_none() {
@@ -631,6 +648,15 @@ impl ProcessorOperator for AggregateProcessorOperator {
 }
 
 impl AggregateProcessorOperator {
+    fn reset_after_streaming_finish(&mut self) {
+        self.drop_group_states();
+        self.state_ptrs.clear();
+        self.observed_group_key_nullable.clear();
+        self.key_table = None;
+        self.kernels = None;
+        self.output_schema = None;
+    }
+
     fn eval_group_by_arrays(&self, chunk: &Chunk) -> Result<Vec<ArrayRef>, String> {
         if self.direct_input {
             if self.output_chunk_schema.slot_ids().len() < self.group_by.len() {

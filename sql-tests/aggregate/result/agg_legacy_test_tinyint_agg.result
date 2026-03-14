@@ -1,0 +1,7 @@
+-- query 4
+count(DISTINCT tinyint_col_1)
+4
+
+-- query 5
+count(DISTINCT tinyint_col_2)
+4

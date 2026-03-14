@@ -1,0 +1,161 @@
+-- query 12
+count(*)
+10
+
+-- query 13
+count(*)
+10
+
+-- query 14
+count(*)
+10
+
+-- query 15
+count(*)
+10
+
+-- query 16
+count(*)
+10000
+
+-- query 17
+count(*)
+10000
+
+-- query 18
+count(*)
+10000
+
+-- query 19
+count(*)
+10000
+
+-- query 20
+count(*)
+10
+
+-- query 21
+count(*)
+10
+
+-- query 22
+count(*)
+10
+
+-- query 23
+count(*)
+10
+
+-- query 24
+count(*)
+10000
+
+-- query 25
+count(*)
+10000
+
+-- query 26
+count(*)
+10000
+
+-- query 27
+count(*)
+10000
+
+-- query 29
+count(*)
+10000
+
+-- query 30
+count(*)
+10000
+
+-- query 31
+count(*)
+10000
+
+-- query 32
+count(*)
+10000
+
+-- query 39
+max(c3)	sc3	c0
+8	100003	0
+8	100000	1
+8	99998	2
+8	99996	3
+
+-- query 40
+max(c3)	sc3	c1
+NULL	NULL	NULL
+0	0	0
+1	11112	1
+2	22222	2
+3	33333	3
+4	44444	4
+5	55555	5
+6	66666	6
+7	77777	7
+8	88888	8
+
+-- query 42
+max(c3)	sc3	c0
+8	100003	0
+8	100000	1
+8	99998	2
+8	99996	3
+
+-- query 43
+max(c3)	sc3	c1
+NULL	NULL	NULL
+0	0	0
+1	11112	1
+2	22222	2
+3	33333	3
+4	44444	4
+5	55555	5
+6	66666	6
+7	77777	7
+8	88888	8
+
+-- query 46
+max(c3)	sc3	c2
+NULL	NULL	NULL
+0	0	0
+1	11112	1
+2	22222	2
+3	33333	3
+4	44444	4
+5	55555	5
+6	66666	6
+7	77777	7
+8	88888	8
+
+-- query 50
+count(*)
+10
+
+-- query 51
+count(*)
+10
+
+-- query 52
+count(*)
+10
+
+-- query 54
+sum(c3)
+
+-- query 55
+sum(c3)
+
+-- query 56
+sum(c3)
+
+-- query 59
+count(*)
+10
+
+-- query 60
+count(*)
+10

@@ -1,0 +1,45 @@
+-- query 4
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 5
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 6
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 7
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 8
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 9
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 10
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 12
+id	province	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1	1
+1	a	1	1	1	1
+2	2	1	1	1	1
+
+-- query 13
+id	province	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1	1
+1	a	1	1	1	1
+2	2	1	1	1	1
+
+-- query 14
+id	province	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1	1
+1	a	1	1	1	1
+2	2	1	1	1	1

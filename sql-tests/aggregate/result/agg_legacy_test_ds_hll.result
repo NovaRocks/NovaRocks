@@ -1,0 +1,59 @@
+-- query 20
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 21
+dt_key	id_ok	province_ok	age_ok	dt_ok
+2024-07-24	1	1	1	1
+NULL	1	1	1	1
+a	1	1	1	1
+
+-- query 22
+id_key	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1
+10	1	1	1	1
+100	1	1	1	1
+
+-- query 23
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 24
+dt	id_ok	province_ok	age_ok	dt_ok
+2024-07-24	1	1	1	1
+
+-- query 25
+id_key	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1
+10	1	1	1	1
+100	1	1	1	1
+
+-- query 29
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 30
+dt_key	id_ok	province_ok	age_ok	dt_ok
+2024-07-24	1	1	1	1
+NULL	1	1	1	1
+a	1	1	1	1
+
+-- query 31
+id_key	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1
+10	1	1	1	1
+100	1	1	1	1
+
+-- query 32
+id_ok	province_ok	age_ok	dt_ok
+1	1	1	1
+
+-- query 33
+dt	id_ok	province_ok	age_ok	dt_ok
+2024-07-24	1	1	1	1
+
+-- query 34
+id_key	id_ok	province_ok	age_ok	dt_ok
+1	1	1	1	1
+10	1	1	1	1
+100	1	1	1	1

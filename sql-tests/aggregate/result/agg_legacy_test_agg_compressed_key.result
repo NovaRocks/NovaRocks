@@ -1,0 +1,541 @@
+-- query 7
+c1	c2	c3	c4	c5	c6	c7	c8
+NULL	161	161	161	161	NULL	NULL	161
+NULL	162	162	162	162	NULL	NULL	162
+NULL	163	163	163	163	NULL	NULL	163
+
+-- query 16
+c9	c10	c11	c12	c13	c14	c15	c16
+10087	10087	10087	10087	7	7	7	87
+10088	10088	10088	10088	0	0	8	88
+10089	10089	10089	10089	1	1	9	89
+
+-- query 23
+c17	c18	c19	c20	c21	c22	c23	c24
+0	2020-02-02	2020-02-02 00:00:00	0	27800	27800	27800	27800
+0	2020-02-02	2020-02-02 00:00:00	0	2800	2800	2800	2800
+0	2020-02-02	2020-02-02 00:00:00	0	28000	28000	28000	28000
+
+-- query 31
+c1	sum(c1)
+NULL	NULL
+-1	-1
+0	0
+
+-- query 32
+c1	c2	sum(c1)
+NULL	NULL	NULL
+NULL	128	NULL
+NULL	129	NULL
+
+-- query 33
+c2	sum(c1)
+1	150
+
+-- query 34
+c3	sum(c1)
+1	150
+
+-- query 35
+c4	sum(c1)
+2	300
+
+-- query 36
+c5	sum(c1)
+2	300
+
+-- query 37
+c6	sum(c1)
+2000-01-03	103
+
+-- query 38
+c7	sum(c1)
+2000-01-03 00:00:00	103
+
+-- query 39
+c8	sum(c1)
+10	1500
+
+-- query 40
+c9	sum(c1)
+100	100
+
+-- query 41
+c13	sum(c1)
+2	148800
+
+-- query 42
+c14	sum(c1)
+2	148800
+
+-- query 43
+c14	sum(c1)
+2	148800
+
+-- query 44
+c16	sum(c1)
+2	300
+
+-- query 45
+c17	sum(c1)
+2	300
+
+-- query 46
+c18	sum(c1)
+
+-- query 47
+c19	sum(c1)
+
+-- query 48
+c2	sum(c1)
+199	NULL
+
+-- query 49
+c3	sum(c1)
+199	NULL
+
+-- query 50
+c4	sum(c1)
+199	NULL
+
+-- query 51
+c5	sum(c1)
+199	NULL
+
+-- query 52
+c6	sum(c1)
+2002-12-31	31
+
+-- query 53
+c7	sum(c1)
+2002-12-31 00:00:00	31
+
+-- query 54
+c8	sum(c1)
+99	14850
+
+-- query 55
+c9	sum(c1)
+9999	NULL
+
+-- query 56
+c13	sum(c1)
+7	160800
+
+-- query 57
+c14	sum(c1)
+7	160800
+
+-- query 58
+c14	sum(c1)
+7	160800
+
+-- query 59
+c16	sum(c1)
+199	NULL
+
+-- query 60
+c17	sum(c1)
+199	NULL
+
+-- query 61
+c18	sum(c1)
+2020-02-02	1219200
+
+-- query 62
+c19	sum(c1)
+2020-02-02 00:00:00	1219200
+
+-- query 63
+c3	c4	sum(c1)
+28	28	4200
+
+-- query 64
+c3	c5	sum(c1)
+28	28	4200
+
+-- query 65
+c3	c7	sum(c1)
+2	2001-04-02 00:00:00	2
+
+-- query 66
+c1	c2	c3	c4	c5	c6	c8	sum(c1)
+NULL	129	129	129	129	2001-07-29	129	NULL
+
+-- query 67
+c1	c2	c3	c4	c5	c6	c8	c13	c14	c15	c16	sum(c1)
+NULL	129	129	129	129	2001-03-29	129	1	1	9	129	NULL
+
+-- query 68
+c1	c2	c3	c4	c5	c6	c8	c11	c12	c13	c14	c15	c16	sum(c1)
+NULL	128	128	128	128	NULL	128	7128	7128	0	0	8	128	NULL
+
+-- query 69
+c1	c2	c3	c4	c5	c6	c8	sum(c1)
+NULL	128	128	128	128	NULL	128	NULL
+
+-- query 72
+c1	c2	c3	c4
+50.00	50.00	50.000000000	50.00000
+50.00	150.00	150.000000000	150.00000
+51.00	51.00	51.000000000	51.00000
+
+-- query 77
+c1	sum(c1)
+0.00	0.00
+
+-- query 78
+c2	sum(c1)
+0.00	0.00
+
+-- query 79
+c3	sum(c1)
+0.000000000	0.00
+
+-- query 80
+c4	sum(c1)
+0.00000	0.00
+
+-- query 81
+c1	c2	sum(c1)
+0.00	0.00	0.00
+
+-- query 82
+c1	c3	sum(c1)
+0.00	0.000000000	0.00
+
+-- query 83
+c1	c4	sum(c1)
+0.00	0.00000	0.00
+
+-- query 84
+c2	c3	sum(c1)
+0.00	0.000000000	0.00
+
+-- query 85
+c2	c4	sum(c1)
+0.00	0.00000	0.00
+
+-- query 86
+c3	c4	sum(c1)
+0.000000000	0.00000	0.00
+
+-- query 87
+c1	c2	c3	sum(c1)
+0.00	0.00	0.000000000	0.00
+
+-- query 88
+c1	c2	c4	sum(c1)
+0.00	0.00	0.00000	0.00
+
+-- query 89
+c2	c3	c4	sum(c1)
+0.00	0.000000000	0.00000	0.00
+
+-- query 90
+c1	c2	c3	c4	sum(c1)
+0.00	0.00	0.000000000	0.00000	0.00
+
+-- query 96
+c17	c16	c15	c14	c13	c5	c4	c3	c2	c1
+1	1	1	1	97	1	1	1	1	97
+
+-- query 107
+c1
+28
+
+-- query 108
+c2
+28
+
+-- query 109
+c3
+28
+
+-- query 110
+c4
+28
+
+-- query 111
+c5
+28
+
+-- query 112
+c13
+29
+
+-- query 113
+c14
+29
+
+-- query 114
+c15
+29
+
+-- query 115
+c16
+29
+
+-- query 116
+c17
+29
+
+-- query 117
+c1
+28
+
+-- query 118
+c2	c1
+1	97
+
+-- query 119
+c3	c2	c1
+1	1	97
+
+-- query 120
+c4	c3	c2	c1
+1	1	1	97
+
+-- query 121
+c5	c4	c3	c2	c1
+1	1	1	1	97
+
+-- query 122
+c13	c5	c4	c3	c2	c1
+1	25	25	25	25	1
+
+-- query 123
+c14	c13	c5	c4	c3	c2	c1
+1	97	1	1	1	1	97
+
+-- query 124
+c15	c14	c13	c5	c4	c3	c2	c1
+1	1	97	1	1	1	1	97
+
+-- query 125
+c16	c15	c14	c13	c5	c4	c3	c2	c1
+1	1	1	97	1	1	1	1	97
+
+-- query 126
+c17	c16	c15	c14	c13	c5	c4	c3	c2	c1
+1	1	1	1	97	1	1	1	1	97
+
+-- query 128
+c5	c4	c3	c2	c1
+1	1	1	1	97
+
+-- query 134
+c17	c16	c15	c14	c13
+1	1	1	1	105
+
+-- query 140
+c1
+28
+
+-- query 141
+c2
+28
+
+-- query 142
+c3
+28
+
+-- query 143
+c4
+28
+
+-- query 144
+c5
+28
+
+-- query 145
+c13
+29
+
+-- query 146
+c14
+29
+
+-- query 147
+c15
+29
+
+-- query 148
+c16
+29
+
+-- query 149
+c17
+29
+
+-- query 150
+c1
+28
+
+-- query 151
+c2	c1
+1	97
+
+-- query 152
+c3	c2	c1
+1	1	97
+
+-- query 153
+c4	c3	c2	c1
+1	1	1	97
+
+-- query 154
+c5	c4	c3	c2	c1
+1	1	1	1	97
+
+-- query 155
+c13	c5	c4	c3	c2	c1
+1	25	25	25	25	1
+
+-- query 156
+c14	c13	c5	c4	c3	c2	c1
+1	97	1	1	1	1	97
+
+-- query 157
+c15	c14	c13	c5	c4	c3	c2	c1
+1	1	97	1	1	1	1	97
+
+-- query 158
+c16	c15	c14	c13	c5	c4	c3	c2	c1
+1	1	1	97	1	1	1	1	97
+
+-- query 159
+c17	c16	c15	c14	c13	c5	c4	c3	c2	c1
+1	1	1	1	97	1	1	1	1	97
+
+-- query 160
+c2	c1
+7	7
+
+-- query 166
+k2
+10
+
+-- query 170
+k1
+1
+
+-- query 173
+k1
+2
+1
+
+-- query 176
+c1	c2	c3	c4	c5	c6	c7	c8
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 185
+c9	c10	c11	c12	c13	c14	c15	c16
+1	1	1	1	1	1	1	1
+
+-- query 194
+c17	c18	c19	c20	c21	c22	c23	c24
+1	1	1	1	NULL	NULL	NULL	NULL
+
+-- query 204
+test_name	result_hash
+Test Case 1	487758dabc82e041c3050f8b895ecbc8
+
+-- query 205
+test_name	result_hash
+Test Case 2	487758dabc82e041c3050f8b895ecbc8
+
+-- query 206
+test_name	result_hash
+Test Case 25	487758dabc82e041c3050f8b895ecbc8
+
+-- query 207
+test_name	result_hash
+Test Case 29	487758dabc82e041c3050f8b895ecbc8
+
+-- query 208
+test_name	result_hash
+Test Case 39	487758dabc82e041c3050f8b895ecbc8
+
+-- query 209
+test_name	result_hash
+Test Case 40	487758dabc82e041c3050f8b895ecbc8
+
+-- query 210
+test_name	result_hash
+Test Case 42	a613d9cefc453b9deda3447b62de3619
+
+-- query 211
+test_name	result_hash
+Test Case 51	487758dabc82e041c3050f8b895ecbc8
+
+-- query 212
+test_name	result_hash
+Test Case 52	7edd122be930f259f61890245f83cdfb
+
+-- query 213
+test_name	result_hash
+Test Case 53	d5094a9ad56d3b1aed1c51f5ed0db7dc
+
+-- query 214
+test_name	result_hash
+Test Case 54	86160c41b2b671826756bd405193a5f2
+
+-- query 215
+test_name	result_hash
+Test Case 55	487758dabc82e041c3050f8b895ecbc8
+
+-- query 216
+test_name	result_hash
+Test Case 56	487758dabc82e041c3050f8b895ecbc8
+
+-- query 217
+test_name	result_hash
+Test Case 57	487758dabc82e041c3050f8b895ecbc8
+
+-- query 218
+test_name	result_hash
+Test Case 58	487758dabc82e041c3050f8b895ecbc8
+
+-- query 219
+test_name	result_hash
+Test Case 59	487758dabc82e041c3050f8b895ecbc8
+
+-- query 220
+test_name	result_hash
+Test Case 60	487758dabc82e041c3050f8b895ecbc8
+
+-- query 221
+test_name	result_hash
+Test Case 61	487758dabc82e041c3050f8b895ecbc8
+
+-- query 222
+test_name	result_hash
+Test Case 62	487758dabc82e041c3050f8b895ecbc8
+
+-- query 223
+test_name	result_hash
+
+-- query 224
+test_name	result_hash
+Test Case 90	d5094a9ad56d3b1aed1c51f5ed0db7dc
+
+-- query 225
+test_name	result_hash
+Test Case 93	487758dabc82e041c3050f8b895ecbc8
+
+-- query 226
+test_name	result_hash
+Test Case 94	487758dabc82e041c3050f8b895ecbc8
+
+-- query 227
+test_name	result_hash
+Test Case 95	7edd122be930f259f61890245f83cdfb
+
+-- query 228
+test_name	result_hash
+Test Case 96	487758dabc82e041c3050f8b895ecbc8
+
+-- query 229
+test_name	result_hash
+Test Case 97	487758dabc82e041c3050f8b895ecbc8

@@ -30,8 +30,8 @@ use crate::service::grpc_client::proto::starrocks::{
     AbortCompactionRequest, AbortTxnRequest, CompactRequest, DeleteDataRequest,
     DeleteTabletRequest, DropTableRequest, PLookUpRequest, PLookUpResponse, PTransmitChunkParams,
     PTransmitChunkResult, PTransmitRuntimeFilterParams, PTransmitRuntimeFilterResult,
-    PublishLogVersionBatchRequest, PublishLogVersionRequest, PublishVersionRequest,
-    TabletStatRequest, VacuumRequest,
+    PUpdateFailPointStatusRequest, PUpdateFailPointStatusResponse, PublishLogVersionBatchRequest,
+    PublishLogVersionRequest, PublishVersionRequest, TabletStatRequest, VacuumRequest,
 };
 use crate::service::internal_rpc;
 use crate::{FetchResult, UniqueId};
@@ -342,6 +342,23 @@ pub extern "C" fn novarocks_rs_lookup(
         out_err,
         "lookup",
         internal_rpc::handle_lookup,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn novarocks_rs_update_fail_point_status(
+    ptr: *const u8,
+    len: usize,
+    out_resp: *mut NovaRocksRustBuf,
+    out_err: *mut NovaRocksRustBuf,
+) -> i32 {
+    handle_unary_proto_rpc::<PUpdateFailPointStatusRequest, PUpdateFailPointStatusResponse, _>(
+        ptr,
+        len,
+        out_resp,
+        out_err,
+        "update_fail_point_status",
+        internal_rpc::handle_update_fail_point_status,
     )
 }
 

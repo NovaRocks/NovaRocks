@@ -1,0 +1,16 @@
+-- query 1
+int_k1	int_k2	int_k3	int_k4	int_k5	str_a	str_b	str_c	dbl_k1	dbl_k2	dbl_k3
+15	60	65	40	50	150	450	500	2	3.5	5.5
+
+-- query 2
+g	int_k1	int_k2	int_k3	int_k4	int_k5
+1	15	35	30	40	NULL
+2	NULL	25	35	NULL	50
+
+-- query 3
+nullable_k1	nullable_k2	nullable_k3	nullable_k4
+10	20	30	40
+
+-- query 4
+nullable_all_null_map
+NULL

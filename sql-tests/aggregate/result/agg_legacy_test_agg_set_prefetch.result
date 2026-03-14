@@ -1,0 +1,23 @@
+-- query 5
+count(DISTINCT c0)
+30000
+
+-- query 6
+count(DISTINCT c1)
+30000
+
+-- query 7
+count(DISTINCT c2)
+30000
+
+-- query 8
+count(DISTINCT c3)
+30000
+
+-- query 9
+count(DISTINCT c0)
+1
+
+-- query 10
+count(DISTINCT c2)
+1

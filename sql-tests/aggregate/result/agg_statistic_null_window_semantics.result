@@ -1,0 +1,27 @@
+-- query 1
+corr_empty_is_null	covar_samp_empty_is_null	covar_pop_empty_is_null
+1	1	1
+
+-- query 2
+corr_match	covar_samp_match	covar_pop_match
+1	1	1
+
+-- query 3
+corr_match	pair_count_match
+1	1
+
+-- query 4
+var_samp_v	variance_samp_v	stddev_samp_v
+1	1	1
+
+-- query 5
+var_samp_is_null	variance_samp_is_null	stddev_samp_is_null
+1	1	1
+
+-- query 6
+no	k	covar_samp_window	var_samp_window
+1	10.00	NULL	NULL
+2	10.00	NULL	NULL
+2	20.00	55	50
+2	25.00	55	58.333
+2	30.00	120	25

@@ -1,0 +1,95 @@
+-- query 9
+percentile_cont(score, 0)
+90
+
+-- query 10
+percentile_cont(score, 0.25)
+91
+
+-- query 11
+percentile_cont(score, 0.5)
+92
+
+-- query 12
+percentile_cont(score, 0.75)
+93
+
+-- query 13
+percentile_cont(score, 1)
+94
+
+-- query 14
+percentile_cont(date, 0)
+2018-01-01
+
+-- query 15
+percentile_cont(date, 0.25)
+2019-01-01
+
+-- query 16
+percentile_cont(date, 0.5)
+2020-01-01
+
+-- query 17
+percentile_cont(date, 0.75)
+2021-01-01
+
+-- query 18
+percentile_cont(date, 1)
+2022-01-01
+
+-- query 19
+percentile_cont(datetime, 0)
+2018-01-01 00:00:01
+
+-- query 20
+percentile_cont(datetime, 0.25)
+2019-01-01 00:00:01
+
+-- query 21
+percentile_cont(datetime, 0.5)
+2020-01-01 00:00:01
+
+-- query 22
+percentile_cont(datetime, 0.75)
+2021-01-01 00:00:01
+
+-- query 23
+percentile_cont(datetime, 1)
+2022-01-01 00:00:01
+
+-- query 24
+percentile_cont(db, 0)
+11.1
+
+-- query 25
+percentile_cont(db, 0.25)
+11.2
+
+-- query 26
+percentile_cont(db, 0.5)
+11.3
+
+-- query 27
+percentile_cont(db, 0.75)
+11.4
+
+-- query 28
+percentile_cont(db, 1)
+11.5
+
+-- query 31
+percentile_cont(db, CAST(1.0 AS DOUBLE))
+11.5
+
+-- query 32
+percentile_cont(db, CAST(0.5 AS DOUBLE))
+11.3
+
+-- query 34
+percentile_cont(1, CAST(1.0 AS DOUBLE))
+1
+
+-- query 35
+percentile_cont(1, CAST(0.5 AS DOUBLE))
+1
