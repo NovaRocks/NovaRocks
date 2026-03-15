@@ -3,14 +3,12 @@
 -- Preserve legacy aggregate coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_test_min_max_n FORCE;
-CREATE DATABASE sql_tests_test_min_max_n;
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 
 -- name: test_min_max_n
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 CREATE TABLE `t_without_null` (
   `c_id` INT(11) NOT NULL,
   `c_int` INT(11) NOT NULL,
@@ -34,7 +32,7 @@ PROPERTIES (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 INSERT INTO `t_without_null` (
   `c_id`, `c_tinyint`, `c_smallint`, `c_int`, `c_bigint`, `c_largeint`, `c_float`, `c_double`, `c_char`, `c_varchar`, `c_date`, `c_datetime`, `c_decimal`)
 VALUES
@@ -56,101 +54,101 @@ VALUES
   (91, 10, 100, 1000, 10000, 100000, 1.01, 100.01, 'char10', 'varchar10', '2021-01-10', '2021-01-10 00:00:00', 1000.01);
 
 -- query 4
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_tinyint, 3) FROM t_without_null;
 
 -- query 5
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_smallint, 3) FROM t_without_null;
 
 -- query 6
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_int, 3) FROM t_without_null;
 
 -- query 7
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_bigint, 3) FROM t_without_null;
 
 -- query 8
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_largeint, 3) FROM t_without_null;
 
 -- query 9
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_float, 3) FROM t_without_null;
 
 -- query 10
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_double, 3) FROM t_without_null;
 
 -- query 11
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_char, 3) FROM t_without_null;
 
 -- query 12
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_varchar, 3) FROM t_without_null;
 
 -- query 13
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_date, 3) FROM t_without_null;
 
 -- query 14
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_datetime, 3) FROM t_without_null;
 
 -- query 15
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_decimal, 3) FROM t_without_null;
 
 -- query 16
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_tinyint, 1) FROM t_without_null;
 
 -- query 17
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_smallint, 1) FROM t_without_null;
 
 -- query 18
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_int, 1) FROM t_without_null;
 
 -- query 19
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ MIN_N(c_tinyint, 5) FROM t_without_null;
 
 -- query 20
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ MIN_N(c_smallint, 5) FROM t_without_null;
 
 -- query 21
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ MIN_N(c_int, 5) FROM t_without_null;
 
 -- query 22
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_id % 2 AS g, MIN_N(c_int, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 23
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_id % 3 AS g, MIN_N(c_varchar, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 24
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_id % 3 AS g, MIN_N(c_varchar, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 25
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_id % 4 AS g, MIN_N(c_date, 2) FROM t_without_null GROUP BY g ORDER BY g;
 
 -- query 26
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT min_n(col1, 3) FROM (VALUES (1)) AS tmp(col1);
 
 -- query 27
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT min_n(col1, 3) FROM (VALUES (1),(2),(3),(4),(5),(6)) AS tmp(col1);
 
 -- query 28
-USE sql_tests_test_min_max_n;
+USE ${case_db};
 SELECT min_n(1, 3);

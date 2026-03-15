@@ -7,24 +7,23 @@
 -- 2. Insert into INT table using a session variable and numeric literals.
 -- 3. Insert into INT table via INSERT-SELECT from BIGINT source table.
 -- 4. Query ordered rows and verify all expected values are persisted.
-CREATE DATABASE IF NOT EXISTS sql_tests_write_path;
-DROP TABLE IF EXISTS sql_tests_write_path.t_int_insert_regression;
-DROP TABLE IF EXISTS sql_tests_write_path.t_int_insert_src;
-CREATE TABLE sql_tests_write_path.t_int_insert_regression (
+DROP TABLE IF EXISTS ${case_db}.t_int_insert_regression;
+DROP TABLE IF EXISTS ${case_db}.t_int_insert_src;
+CREATE TABLE ${case_db}.t_int_insert_regression (
   id INT,
   v INT
 );
-CREATE TABLE sql_tests_write_path.t_int_insert_src (
+CREATE TABLE ${case_db}.t_int_insert_src (
   id BIGINT,
   v BIGINT
 );
 SET @i = 1;
-INSERT INTO sql_tests_write_path.t_int_insert_regression VALUES (@i, @i);
-INSERT INTO sql_tests_write_path.t_int_insert_regression VALUES (2, 2);
-INSERT INTO sql_tests_write_path.t_int_insert_src VALUES (3, 3);
-INSERT INTO sql_tests_write_path.t_int_insert_regression
+INSERT INTO ${case_db}.t_int_insert_regression VALUES (@i, @i);
+INSERT INTO ${case_db}.t_int_insert_regression VALUES (2, 2);
+INSERT INTO ${case_db}.t_int_insert_src VALUES (3, 3);
+INSERT INTO ${case_db}.t_int_insert_regression
 SELECT id, v
-FROM sql_tests_write_path.t_int_insert_src;
+FROM ${case_db}.t_int_insert_src;
 SELECT id, v
-FROM sql_tests_write_path.t_int_insert_regression
+FROM ${case_db}.t_int_insert_regression
 ORDER BY id;

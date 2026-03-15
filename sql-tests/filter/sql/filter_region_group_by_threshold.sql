@@ -7,14 +7,13 @@
 -- 1. Create/reset a minimal customer-like table.
 -- 2. Insert deterministic key/region rows around the threshold.
 -- 3. Aggregate filtered rows by region and order result deterministically.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_filter_group_by_customer;
-CREATE TABLE sql_tests_d04.t_filter_group_by_customer (
+DROP TABLE IF EXISTS ${case_db}.t_filter_group_by_customer;
+CREATE TABLE ${case_db}.t_filter_group_by_customer (
     c_custkey INT,
     c_region VARCHAR(32)
 );
 
-INSERT INTO sql_tests_d04.t_filter_group_by_customer VALUES
+INSERT INTO ${case_db}.t_filter_group_by_customer VALUES
     (10000, 'AFRICA'),
     (15001, 'AFRICA'),
     (15002, 'AMERICA'),
@@ -26,7 +25,7 @@ INSERT INTO sql_tests_d04.t_filter_group_by_customer VALUES
     (19000, 'MIDDLE EAST');
 
 SELECT c_region, COUNT(*) AS customer_count
-FROM sql_tests_d04.t_filter_group_by_customer
+FROM ${case_db}.t_filter_group_by_customer
 WHERE c_custkey > 15000
 GROUP BY c_region
 ORDER BY c_region;

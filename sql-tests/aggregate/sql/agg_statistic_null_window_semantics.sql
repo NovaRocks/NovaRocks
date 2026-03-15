@@ -8,15 +8,14 @@
 -- 2. Insert deterministic rows with one null-only group and one populated group.
 -- 3. Snapshot scalar, staged, and windowed statistics outputs.
 -- query 1
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_statistic_null_window;
-CREATE TABLE sql_tests_d06.t_agg_statistic_null_window (
+DROP TABLE IF EXISTS ${case_db}.t_agg_statistic_null_window;
+CREATE TABLE ${case_db}.t_agg_statistic_null_window (
     no INT,
     k DECIMAL(10, 2),
     v DECIMAL(10, 2)
 );
 
-INSERT INTO sql_tests_d06.t_agg_statistic_null_window VALUES
+INSERT INTO ${case_db}.t_agg_statistic_null_window VALUES
     (1, 10, NULL),
     (2, 10, 11),
     (2, 20, 22),
@@ -26,7 +25,7 @@ SELECT
     corr(k, v) IS NULL AS corr_empty_is_null,
     covar_samp(k, v) IS NULL AS covar_samp_empty_is_null,
     covar_pop(k, v) IS NULL AS covar_pop_empty_is_null
-FROM sql_tests_d06.t_agg_statistic_null_window
+FROM ${case_db}.t_agg_statistic_null_window
 WHERE no = 999;
 
 -- query 2
@@ -34,7 +33,7 @@ SELECT
     ABS(corr(k, v) - 0.9988445981121532) / 0.9988445981121532 < 0.00001 AS corr_match,
     ABS(covar_samp(k, v) - 120) / 120 < 0.00001 AS covar_samp_match,
     ABS(covar_pop(k, v) - 80) / 80 < 0.00001 AS covar_pop_match
-FROM sql_tests_d06.t_agg_statistic_null_window
+FROM ${case_db}.t_agg_statistic_null_window
 WHERE no = 2;
 
 -- query 3
@@ -46,7 +45,7 @@ FROM (
         /*+ SET_VAR (new_planner_agg_stage='3') */
         corr(k, v) AS co,
         COUNT(DISTINCT k) AS total
-    FROM sql_tests_d06.t_agg_statistic_null_window
+    FROM ${case_db}.t_agg_statistic_null_window
     WHERE no = 2
 ) t;
 
@@ -86,5 +85,5 @@ SELECT
         ORDER BY k
         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
     ), 3) AS var_samp_window
-FROM sql_tests_d06.t_agg_statistic_null_window
+FROM ${case_db}.t_agg_statistic_null_window
 ORDER BY no, k;

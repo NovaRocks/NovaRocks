@@ -7,9 +7,8 @@
 -- 2. Insert deterministic rows that only hit one partition and one hash key.
 -- 3. Query ordered rows for deterministic assertion.
 SET catalog default_catalog;
-CREATE DATABASE IF NOT EXISTS sql_tests_write_path_internal;
-DROP TABLE IF EXISTS sql_tests_write_path_internal.t_multi_partition_multi_bucket;
-CREATE TABLE sql_tests_write_path_internal.t_multi_partition_multi_bucket (
+DROP TABLE IF EXISTS ${case_db_2}.t_multi_partition_multi_bucket;
+CREATE TABLE ${case_db_2}.t_multi_partition_multi_bucket (
   p BIGINT,
   k BIGINT,
   v BIGINT
@@ -21,9 +20,9 @@ PARTITION BY RANGE (p) (
 )
 DISTRIBUTED BY HASH(k) BUCKETS 2
 PROPERTIES ("replication_num" = "1");
-INSERT INTO sql_tests_write_path_internal.t_multi_partition_multi_bucket VALUES
+INSERT INTO ${case_db_2}.t_multi_partition_multi_bucket VALUES
   (1, 1, 10),
   (2, 1, 20);
 SELECT p, k, v
-FROM sql_tests_write_path_internal.t_multi_partition_multi_bucket
+FROM ${case_db_2}.t_multi_partition_multi_bucket
 ORDER BY p, k, v;

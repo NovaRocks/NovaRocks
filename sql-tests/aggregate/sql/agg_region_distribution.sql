@@ -7,14 +7,13 @@
 -- 1. Create/reset a minimal customer-like table.
 -- 2. Insert deterministic rows spanning all expected regions.
 -- 3. Aggregate by region and order output for stable comparison.
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_region_distribution;
-CREATE TABLE sql_tests_d06.t_agg_region_distribution (
+DROP TABLE IF EXISTS ${case_db}.t_agg_region_distribution;
+CREATE TABLE ${case_db}.t_agg_region_distribution (
     c_custkey INT,
     c_region VARCHAR(32)
 );
 
-INSERT INTO sql_tests_d06.t_agg_region_distribution VALUES
+INSERT INTO ${case_db}.t_agg_region_distribution VALUES
     (1, 'AFRICA'),
     (2, 'ASIA'),
     (3, 'ASIA'),
@@ -25,6 +24,6 @@ INSERT INTO sql_tests_d06.t_agg_region_distribution VALUES
     (8, 'AFRICA');
 
 SELECT c_region, COUNT(*) AS customer_count
-FROM sql_tests_d06.t_agg_region_distribution
+FROM ${case_db}.t_agg_region_distribution
 GROUP BY c_region
 ORDER BY c_region;

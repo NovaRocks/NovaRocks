@@ -7,27 +7,26 @@
 -- 1. Create/reset left and right tables.
 -- 2. Insert deterministic overlapping and non-overlapping keys.
 -- 3. Execute RIGHT SEMI JOIN and assert ordered output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d05;
-DROP TABLE IF EXISTS sql_tests_d05.t_join_right_semi_l;
-DROP TABLE IF EXISTS sql_tests_d05.t_join_right_semi_r;
-CREATE TABLE sql_tests_d05.t_join_right_semi_l (
+DROP TABLE IF EXISTS ${case_db}.t_join_right_semi_l;
+DROP TABLE IF EXISTS ${case_db}.t_join_right_semi_r;
+CREATE TABLE ${case_db}.t_join_right_semi_l (
   id INT,
   lv STRING
 );
-CREATE TABLE sql_tests_d05.t_join_right_semi_r (
+CREATE TABLE ${case_db}.t_join_right_semi_r (
   id INT,
   rv STRING
 );
-INSERT INTO sql_tests_d05.t_join_right_semi_l VALUES
+INSERT INTO ${case_db}.t_join_right_semi_l VALUES
   (2, 'L2'),
   (4, 'L4');
-INSERT INTO sql_tests_d05.t_join_right_semi_r VALUES
+INSERT INTO ${case_db}.t_join_right_semi_r VALUES
   (1, 'R1'),
   (2, 'R2'),
   (3, 'R3'),
   (4, 'R4');
 SELECT r.id, r.rv
-FROM sql_tests_d05.t_join_right_semi_l l
-RIGHT SEMI JOIN sql_tests_d05.t_join_right_semi_r r
+FROM ${case_db}.t_join_right_semi_l l
+RIGHT SEMI JOIN ${case_db}.t_join_right_semi_r r
   ON l.id = r.id
 ORDER BY r.id;

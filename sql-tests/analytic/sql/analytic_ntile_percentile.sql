@@ -7,14 +7,13 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic ordered values.
 -- 3. Compute distribution windows and assert ordered output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d07;
-DROP TABLE IF EXISTS sql_tests_d07.t_analytic_ntile_percentile;
-CREATE TABLE sql_tests_d07.t_analytic_ntile_percentile (
+DROP TABLE IF EXISTS ${case_db}.t_analytic_ntile_percentile;
+CREATE TABLE ${case_db}.t_analytic_ntile_percentile (
     grp VARCHAR(10),
     v INT
 );
 
-INSERT INTO sql_tests_d07.t_analytic_ntile_percentile VALUES
+INSERT INTO ${case_db}.t_analytic_ntile_percentile VALUES
     ('A', 10),
     ('A', 20),
     ('A', 30),
@@ -26,5 +25,5 @@ SELECT
     NTILE(2) OVER (PARTITION BY grp ORDER BY v) AS nt,
     ROUND(PERCENT_RANK() OVER (PARTITION BY grp ORDER BY v), 6) AS pr,
     ROUND(CUME_DIST() OVER (PARTITION BY grp ORDER BY v), 6) AS cd
-FROM sql_tests_d07.t_analytic_ntile_percentile
+FROM ${case_db}.t_analytic_ntile_percentile
 ORDER BY grp, v;

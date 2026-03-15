@@ -187,6 +187,18 @@ pub fn stable_hash_hex(input: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+pub fn case_auto_db_name(case_id: &str) -> String {
+    format!("db_sqlt_{}", stable_hash_hex(case_id))
+}
+
+pub fn case_auto_db_name_n(case_id: &str, n: usize) -> String {
+    if n == 0 {
+        case_auto_db_name(case_id)
+    } else {
+        format!("db_sqlt_{}_{}", stable_hash_hex(case_id), n + 1)
+    }
+}
+
 pub fn case_placeholder_variables(
     base_variables: &HashMap<String, String>,
     case_id: &str,
@@ -201,6 +213,15 @@ pub fn case_placeholder_variables(
     variables.insert("run_id".to_string(), case_run_id.clone());
     for idx in 0..10 {
         variables.insert(format!("uuid{}", idx), format!("{}_{}", case_run_id, idx));
+    }
+    // Per-case database placeholders for parallel isolation.
+    let primary_db = case_auto_db_name(case_id);
+    variables.insert("case_db".to_string(), primary_db);
+    for idx in 2..=9 {
+        variables.insert(
+            format!("case_db_{}", idx),
+            case_auto_db_name_n(case_id, idx - 1),
+        );
     }
     variables
 }

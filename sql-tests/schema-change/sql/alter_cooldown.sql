@@ -5,9 +5,7 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_cooldown_${uuid0} FORCE;
-CREATE DATABASE sc_alter_cooldown_${uuid0};
-USE sc_alter_cooldown_${uuid0};
+USE ${case_db};
 CREATE TABLE t0 (
     `__d` date NOT NULL COMMENT "",
     `__time` bigint(20) NOT NULL COMMENT "",
@@ -34,4 +32,3 @@ ADMIN SET FRONTEND CONFIG ("tablet_sched_storage_cooldown_second" = "-1");
 
 -- query 2
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_cooldown_${uuid0} FORCE;

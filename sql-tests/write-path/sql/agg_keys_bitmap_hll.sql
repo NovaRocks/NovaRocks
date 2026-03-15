@@ -8,9 +8,8 @@
 -- 2. Insert duplicated keys with bitmap/hll values.
 -- 3. Query aggregated rows and assert value columns remain non-NULL after merge.
 SET catalog default_catalog;
-CREATE DATABASE IF NOT EXISTS sql_tests_write_path;
-DROP TABLE IF EXISTS sql_tests_write_path.t_agg_keys_bitmap_hll;
-CREATE TABLE sql_tests_write_path.t_agg_keys_bitmap_hll (
+DROP TABLE IF EXISTS ${case_db}.t_agg_keys_bitmap_hll;
+CREATE TABLE ${case_db}.t_agg_keys_bitmap_hll (
   k1 BIGINT,
   bm BITMAP BITMAP_UNION,
   hv HLL HLL_UNION
@@ -18,8 +17,8 @@ CREATE TABLE sql_tests_write_path.t_agg_keys_bitmap_hll (
 AGGREGATE KEY(k1)
 DISTRIBUTED BY HASH(k1) BUCKETS 1
 PROPERTIES ("replication_num" = "1");
-INSERT INTO sql_tests_write_path.t_agg_keys_bitmap_hll VALUES
+INSERT INTO ${case_db}.t_agg_keys_bitmap_hll VALUES
   (1, to_bitmap(1), hll_hash('a')),
   (1, to_bitmap(2), hll_hash('b')),
   (2, to_bitmap(7), hll_hash('c'));
-SELECT k1 FROM sql_tests_write_path.t_agg_keys_bitmap_hll ORDER BY k1;
+SELECT k1 FROM ${case_db}.t_agg_keys_bitmap_hll ORDER BY k1;

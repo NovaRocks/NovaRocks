@@ -7,15 +7,14 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic ordered rows.
 -- 3. Compute FIRST_VALUE/LAST_VALUE with full frame and assert output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d07;
-DROP TABLE IF EXISTS sql_tests_d07.t_analytic_first_last_value_frame;
-CREATE TABLE sql_tests_d07.t_analytic_first_last_value_frame (
+DROP TABLE IF EXISTS ${case_db}.t_analytic_first_last_value_frame;
+CREATE TABLE ${case_db}.t_analytic_first_last_value_frame (
     grp VARCHAR(10),
     ts INT,
     v INT
 );
 
-INSERT INTO sql_tests_d07.t_analytic_first_last_value_frame VALUES
+INSERT INTO ${case_db}.t_analytic_first_last_value_frame VALUES
     ('A', 1, 5),
     ('A', 2, 6),
     ('A', 3, 7),
@@ -34,5 +33,5 @@ SELECT
         PARTITION BY grp ORDER BY ts
         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
     ) AS last_v
-FROM sql_tests_d07.t_analytic_first_last_value_frame
+FROM ${case_db}.t_analytic_first_last_value_frame
 ORDER BY grp, ts;

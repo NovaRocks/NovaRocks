@@ -6,9 +6,7 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_char_pad_${uuid0} FORCE;
-CREATE DATABASE sc_char_pad_${uuid0};
-USE sc_char_pad_${uuid0};
+USE ${case_db};
 CREATE TABLE test3
 (
     k1 BIGINT,
@@ -26,13 +24,13 @@ INSERT INTO test3 VALUES (1, 1, 'a');
 -- query 2
 -- Verify data is accessible before schema change.
 -- @order_sensitive=true
-USE sc_char_pad_${uuid0};
+USE ${case_db};
 SELECT * FROM test3 WHERE v2 = 'a';
 
 -- query 3
 -- Trigger non-fast schema evolution: CHAR(4) -> CHAR(10).
 -- @skip_result_check=true
-USE sc_char_pad_${uuid0};
+USE ${case_db};
 ALTER TABLE test3 MODIFY COLUMN v2 CHAR(10);
 
 -- query 4
@@ -41,8 +39,8 @@ ALTER TABLE test3 MODIFY COLUMN v2 CHAR(10);
 -- @retry_interval_ms=1000
 -- @result_contains=FINISHED
 -- @skip_result_check=true
-USE sc_char_pad_${uuid0};
-SHOW ALTER TABLE COLUMN FROM sc_char_pad_${uuid0} ORDER BY CreateTime DESC LIMIT 1;
+USE ${case_db};
+SHOW ALTER TABLE COLUMN FROM ${case_db} ORDER BY CreateTime DESC LIMIT 1;
 
 -- query 5
 -- Verify data is still accessible after schema change. Retry because the table
@@ -50,9 +48,8 @@ SHOW ALTER TABLE COLUMN FROM sc_char_pad_${uuid0} ORDER BY CreateTime DESC LIMIT
 -- @retry_count=30
 -- @retry_interval_ms=2000
 -- @order_sensitive=true
-USE sc_char_pad_${uuid0};
+USE ${case_db};
 SELECT * FROM test3 WHERE v2 = 'a';
 
 -- query 6
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_char_pad_${uuid0} FORCE;

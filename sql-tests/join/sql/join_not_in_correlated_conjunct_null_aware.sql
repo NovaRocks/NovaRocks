@@ -7,20 +7,19 @@
 -- 1. Create/reset probe and build tables with nullable group/key columns.
 -- 2. Insert deterministic rows covering empty-subquery, NULL-in-subquery, and direct-match cases.
 -- 3. Execute correlated NOT IN and assert deterministic row ids.
-CREATE DATABASE IF NOT EXISTS sql_tests_d05;
-DROP TABLE IF EXISTS sql_tests_d05.t_naaj_corr_not_in_l;
-DROP TABLE IF EXISTS sql_tests_d05.t_naaj_corr_not_in_r;
-CREATE TABLE sql_tests_d05.t_naaj_corr_not_in_l (
+DROP TABLE IF EXISTS ${case_db}.t_naaj_corr_not_in_l;
+DROP TABLE IF EXISTS ${case_db}.t_naaj_corr_not_in_r;
+CREATE TABLE ${case_db}.t_naaj_corr_not_in_l (
     id INT,
     g INT,
     k INT
 );
-CREATE TABLE sql_tests_d05.t_naaj_corr_not_in_r (
+CREATE TABLE ${case_db}.t_naaj_corr_not_in_r (
     g INT,
     k INT
 );
 
-INSERT INTO sql_tests_d05.t_naaj_corr_not_in_l VALUES
+INSERT INTO ${case_db}.t_naaj_corr_not_in_l VALUES
     (1, 1, 2),
     (2, NULL, 0),
     (3, NULL, 1),
@@ -31,7 +30,7 @@ INSERT INTO sql_tests_d05.t_naaj_corr_not_in_l VALUES
     (8, 3, 2),
     (9, 2, 2);
 
-INSERT INTO sql_tests_d05.t_naaj_corr_not_in_r VALUES
+INSERT INTO ${case_db}.t_naaj_corr_not_in_r VALUES
     (NULL, 1),
     (1, 1),
     (NULL, 2),
@@ -39,10 +38,10 @@ INSERT INTO sql_tests_d05.t_naaj_corr_not_in_r VALUES
     (2, NULL);
 
 SELECT l.id
-FROM sql_tests_d05.t_naaj_corr_not_in_l l
+FROM ${case_db}.t_naaj_corr_not_in_l l
 WHERE l.k NOT IN (
     SELECT r.k
-    FROM sql_tests_d05.t_naaj_corr_not_in_r r
+    FROM ${case_db}.t_naaj_corr_not_in_r r
     WHERE r.g = l.g
 )
 ORDER BY l.id;

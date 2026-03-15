@@ -7,15 +7,14 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with NULL and non-NULL metrics.
 -- 3. Execute combined query and assert ordered top rows.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_filter_project_sort_limit_combo;
-CREATE TABLE sql_tests_d04.t_filter_project_sort_limit_combo (
+DROP TABLE IF EXISTS ${case_db}.t_filter_project_sort_limit_combo;
+CREATE TABLE ${case_db}.t_filter_project_sort_limit_combo (
   id INT,
   name STRING,
   qty INT,
   price INT
 );
-INSERT INTO sql_tests_d04.t_filter_project_sort_limit_combo VALUES
+INSERT INTO ${case_db}.t_filter_project_sort_limit_combo VALUES
   (1, 'apple', 2, 5),
   (2, 'banana', NULL, 3),
   (3, 'carrot', 7, 2),
@@ -24,7 +23,7 @@ INSERT INTO sql_tests_d04.t_filter_project_sort_limit_combo VALUES
 SELECT
   name,
   qty * price AS revenue
-FROM sql_tests_d04.t_filter_project_sort_limit_combo
+FROM ${case_db}.t_filter_project_sort_limit_combo
 WHERE qty IS NOT NULL AND qty >= 5
 ORDER BY revenue DESC, name ASC
 LIMIT 3;

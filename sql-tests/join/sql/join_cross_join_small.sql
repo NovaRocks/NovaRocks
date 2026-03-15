@@ -7,22 +7,21 @@
 -- 1. Create/reset two tiny tables.
 -- 2. Insert deterministic rows on each side.
 -- 3. Execute CROSS JOIN and assert ordered cartesian output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d05;
-DROP TABLE IF EXISTS sql_tests_d05.t_join_cross_a;
-DROP TABLE IF EXISTS sql_tests_d05.t_join_cross_b;
-CREATE TABLE sql_tests_d05.t_join_cross_a (
+DROP TABLE IF EXISTS ${case_db}.t_join_cross_a;
+DROP TABLE IF EXISTS ${case_db}.t_join_cross_b;
+CREATE TABLE ${case_db}.t_join_cross_a (
   id INT
 );
-CREATE TABLE sql_tests_d05.t_join_cross_b (
+CREATE TABLE ${case_db}.t_join_cross_b (
   c STRING
 );
-INSERT INTO sql_tests_d05.t_join_cross_a VALUES
+INSERT INTO ${case_db}.t_join_cross_a VALUES
   (1),
   (2);
-INSERT INTO sql_tests_d05.t_join_cross_b VALUES
+INSERT INTO ${case_db}.t_join_cross_b VALUES
   ('x'),
   ('y');
 SELECT a.id, b.c
-FROM sql_tests_d05.t_join_cross_a a
-CROSS JOIN sql_tests_d05.t_join_cross_b b
+FROM ${case_db}.t_join_cross_a a
+CROSS JOIN ${case_db}.t_join_cross_b b
 ORDER BY a.id, b.c;

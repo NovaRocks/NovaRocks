@@ -9,13 +9,12 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with duplicate scores in multiple peer groups.
 -- 3. Compute DENSE_RANK and filter with drk <= 3, then assert deterministic output order.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_topn_dense_rank_filter_tie_expand;
-CREATE TABLE sql_tests_d04.t_topn_dense_rank_filter_tie_expand (
+DROP TABLE IF EXISTS ${case_db}.t_topn_dense_rank_filter_tie_expand;
+CREATE TABLE ${case_db}.t_topn_dense_rank_filter_tie_expand (
   id INT,
   score INT
 );
-INSERT INTO sql_tests_d04.t_topn_dense_rank_filter_tie_expand VALUES
+INSERT INTO ${case_db}.t_topn_dense_rank_filter_tie_expand VALUES
   (1, 100),
   (2, 95),
   (3, 95),
@@ -28,7 +27,7 @@ FROM (
     id,
     score,
     DENSE_RANK() OVER (ORDER BY score DESC) AS drk
-  FROM sql_tests_d04.t_topn_dense_rank_filter_tie_expand
+  FROM ${case_db}.t_topn_dense_rank_filter_tie_expand
 ) t
 WHERE drk <= 3
 ORDER BY drk ASC, id ASC;

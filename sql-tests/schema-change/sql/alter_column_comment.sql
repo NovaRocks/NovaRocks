@@ -6,21 +6,19 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_comment_${uuid0} FORCE;
-CREATE DATABASE sc_alter_comment_${uuid0};
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 CREATE TABLE t(k int, v int) PRIMARY KEY(k);
 
 -- query 2
 -- Verify initial column comments are empty.
 -- @result_contains=COMMENT ""
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 SHOW CREATE TABLE t;
 
 -- query 3
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 ALTER TABLE t MODIFY COLUMN k COMMENT 'k';
 ALTER TABLE t MODIFY COLUMN v COMMENT 'v';
 
@@ -28,24 +26,24 @@ ALTER TABLE t MODIFY COLUMN v COMMENT 'v';
 -- Verify updated comments on primary key table.
 -- @result_contains=COMMENT "k"
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 SHOW CREATE TABLE t;
 
 -- query 5
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 CREATE TABLE d(k int, v int) DUPLICATE KEY(k);
 
 -- query 6
 -- Verify initial column comments are empty on duplicate key table.
 -- @result_contains=COMMENT ""
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 SHOW CREATE TABLE d;
 
 -- query 7
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 ALTER TABLE d MODIFY COLUMN k COMMENT 'k';
 ALTER TABLE d MODIFY COLUMN v COMMENT 'v';
 
@@ -53,9 +51,8 @@ ALTER TABLE d MODIFY COLUMN v COMMENT 'v';
 -- Verify updated comments on duplicate key table.
 -- @result_contains=COMMENT "k"
 -- @skip_result_check=true
-USE sc_alter_comment_${uuid0};
+USE ${case_db};
 SHOW CREATE TABLE d;
 
 -- query 9
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_comment_${uuid0} FORCE;

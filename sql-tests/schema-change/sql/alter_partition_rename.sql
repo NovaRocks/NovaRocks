@@ -4,17 +4,14 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_part_${uuid0} FORCE;
-CREATE DATABASE sc_alter_part_${uuid0};
-USE sc_alter_part_${uuid0};
+USE ${case_db};
 CREATE TABLE t(k datetime) PARTITION BY date_trunc('day',k);
 INSERT INTO t VALUES('2020-01-01');
 
 -- query 2
 -- @expect_error=automatic partitioned
-USE sc_alter_part_${uuid0};
+USE ${case_db};
 ALTER TABLE t RENAME PARTITION p20200101 pp;
 
 -- query 3
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_part_${uuid0} FORCE;

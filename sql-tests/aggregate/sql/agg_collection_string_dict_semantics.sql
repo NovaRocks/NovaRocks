@@ -8,9 +8,8 @@
 -- 2. Insert deterministic grouped rows with duplicates and NULLs.
 -- 3. Snapshot grouped collection outputs and dict_merge payloads.
 -- query 1
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_collection_string_dict;
-CREATE TABLE sql_tests_d06.t_agg_collection_string_dict (
+DROP TABLE IF EXISTS ${case_db}.t_agg_collection_string_dict;
+CREATE TABLE ${case_db}.t_agg_collection_string_dict (
     g INT,
     id INT,
     name STRING,
@@ -23,7 +22,7 @@ CREATE TABLE sql_tests_d06.t_agg_collection_string_dict (
     city_array_null ARRAY<STRING>
 );
 
-INSERT INTO sql_tests_d06.t_agg_collection_string_dict VALUES
+INSERT INTO ${case_db}.t_agg_collection_string_dict VALUES
     (1, 1, 'Tom', 90, [90, 90], ['a', 'b'], 'beijing', 'beijing', ['beijing', 'shanghai'], NULL),
     (1, 2, 'Tom', 80, [80], ['a', 'c'], 'beijing', NULL, ['shenzhen', 'shanghai'], ['shenzhen', 'shanghai']),
     (1, 3, 'May', NULL, [80], ['z'], 'shanghai', 'shanghai', ['shenzhen', NULL], ['shenzhen', NULL]),
@@ -35,7 +34,7 @@ SELECT
     g,
     ARRAY_AGG(name ORDER BY id) AS names_all,
     ARRAY_AGG(DISTINCT name ORDER BY name) AS names_distinct
-FROM sql_tests_d06.t_agg_collection_string_dict
+FROM ${case_db}.t_agg_collection_string_dict
 WHERE name IS NOT NULL
 GROUP BY g
 ORDER BY g;
@@ -46,7 +45,7 @@ SELECT
     ARRAY_MIN(ARRAY_UNIQUE_AGG(score_items)) AS min_unique_score,
     ARRAY_MAX(ARRAY_UNIQUE_AGG(score_items)) AS max_unique_score,
     CARDINALITY(ARRAY_UNIQUE_AGG(score_items)) AS unique_score_count
-FROM sql_tests_d06.t_agg_collection_string_dict
+FROM ${case_db}.t_agg_collection_string_dict
 GROUP BY g
 ORDER BY g;
 
@@ -55,7 +54,7 @@ SELECT
     g,
     STRING_AGG(name, '|' ORDER BY id) AS names_concat,
     STRING_AGG(DISTINCT CAST(score AS STRING), ',' ORDER BY 1) AS distinct_scores
-FROM sql_tests_d06.t_agg_collection_string_dict
+FROM ${case_db}.t_agg_collection_string_dict
 WHERE name IS NOT NULL
 GROUP BY g
 ORDER BY g;
@@ -66,4 +65,4 @@ SELECT
     DICT_MERGE(city_null, 255) AS city_null_dict,
     DICT_MERGE(city_array, 255) AS city_array_dict,
     DICT_MERGE(city_array_null, 255) AS city_array_null_dict
-FROM sql_tests_d06.t_agg_collection_string_dict;
+FROM ${case_db}.t_agg_collection_string_dict;

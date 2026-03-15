@@ -7,15 +7,14 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with duplicate order keys and NULL value.
 -- 3. Compute COUNT/SUM over full RANGE frame and assert stable output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d07;
-DROP TABLE IF EXISTS sql_tests_d07.t_analytic_range_unbounded_following_full_partition;
-CREATE TABLE sql_tests_d07.t_analytic_range_unbounded_following_full_partition (
+DROP TABLE IF EXISTS ${case_db}.t_analytic_range_unbounded_following_full_partition;
+CREATE TABLE ${case_db}.t_analytic_range_unbounded_following_full_partition (
     grp VARCHAR(10),
     ord_key INT,
     v INT
 );
 
-INSERT INTO sql_tests_d07.t_analytic_range_unbounded_following_full_partition VALUES
+INSERT INTO ${case_db}.t_analytic_range_unbounded_following_full_partition VALUES
     ('A', 1, 10),
     ('A', 2, 20),
     ('A', 2, 30),
@@ -33,5 +32,5 @@ SELECT
         PARTITION BY grp ORDER BY ord_key
         RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
     ) AS sum_all
-FROM sql_tests_d07.t_analytic_range_unbounded_following_full_partition
+FROM ${case_db}.t_analytic_range_unbounded_following_full_partition
 ORDER BY grp, ord_key, v;

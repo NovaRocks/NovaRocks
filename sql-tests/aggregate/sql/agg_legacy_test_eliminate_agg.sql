@@ -3,14 +3,12 @@
 -- Preserve legacy aggregate coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_test_eliminate_agg FORCE;
-CREATE DATABASE sql_tests_test_eliminate_agg;
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 
 -- name: test_eliminate_agg @mac
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 CREATE TABLE `test_agg_group_single_unique_key` (
   id INT NOT NULL,
   big_value BIGINT,
@@ -26,7 +24,7 @@ PROPERTIES (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 CREATE TABLE `test_agg_group_multi_unique_key` (
   id INT NOT NULL,
   big_value BIGINT,
@@ -42,7 +40,7 @@ PROPERTIES (
 
 -- query 4
 -- @skip_result_check=true
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 INSERT INTO `test_agg_group_single_unique_key` (id, big_value, double_value, decimal_value, varchar_value) VALUES
 (1, 100000, 1.23, 123.45678, 'Test1'),
 (2, 200000, 2.34, 234.56789, 'Test2'),
@@ -67,7 +65,7 @@ INSERT INTO `test_agg_group_single_unique_key` (id, big_value, double_value, dec
 
 -- query 5
 -- @skip_result_check=true
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 INSERT INTO `test_agg_group_multi_unique_key` (id, big_value, double_value, decimal_value, varchar_value) VALUES
 (1, 100000, 1.23, 123.45678, 'Test1'),
 (2, 200000, 2.34, 234.56789, 'Test2'),
@@ -91,7 +89,7 @@ INSERT INTO `test_agg_group_multi_unique_key` (id, big_value, double_value, deci
 (20, 2000000, 20.12, 2012.34567, 'Test20');
 
 -- query 6
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     SUM(big_value) AS sum_big_value
@@ -103,7 +101,7 @@ ORDER BY
     id;
 
 -- query 7
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     SUM(double_value) AS sum_double_value
@@ -115,7 +113,7 @@ ORDER BY
     id;
 
 -- query 8
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     AVG(big_value) AS avg_big_value
@@ -127,7 +125,7 @@ ORDER BY
     id;
 
 -- query 9
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     AVG(double_value) AS avg_double_value
@@ -139,7 +137,7 @@ ORDER BY
     id;
 
 -- query 10
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     COUNT(big_value) AS count_big_value
@@ -151,7 +149,7 @@ ORDER BY
     id;
 
 -- query 11
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     COUNT(varchar_value) AS count_varchar_value
@@ -163,7 +161,7 @@ ORDER BY
     id;
 
 -- query 12
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     MAX(decimal_value) AS max_decimal_value
@@ -175,7 +173,7 @@ ORDER BY
     id;
 
 -- query 13
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     MAX(double_value) AS max_double_value
@@ -187,7 +185,7 @@ ORDER BY
     id;
 
 -- query 14
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     MIN(double_value) AS min_double_value
@@ -199,7 +197,7 @@ ORDER BY
     id;
 
 -- query 15
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     MIN(big_value) AS min_big_value
@@ -211,7 +209,7 @@ ORDER BY
     id;
 
 -- query 16
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     GROUP_CONCAT(varchar_value ORDER BY varchar_value) AS group_concat_varchar_value
@@ -223,7 +221,7 @@ ORDER BY
     id;
 
 -- query 17
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     GROUP_CONCAT(double_value ORDER BY double_value) AS group_concat_double_value
@@ -235,7 +233,7 @@ ORDER BY
     id;
 
 -- query 18
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     big_value,
@@ -248,7 +246,7 @@ ORDER BY
     id;
 
 -- query 19
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     big_value,
@@ -261,7 +259,7 @@ ORDER BY
     id;
 
 -- query 20
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     big_value,
@@ -274,7 +272,7 @@ ORDER BY
     id;
 
 -- query 21
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     big_value,
@@ -287,7 +285,7 @@ ORDER BY
     id;
 
 -- query 22
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     big_value,
@@ -300,7 +298,7 @@ ORDER BY
     id;
 
 -- query 23
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 SELECT
     id,
     big_value,
@@ -314,10 +312,10 @@ ORDER BY
 
 -- query 24
 -- @skip_result_check=true
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 drop table test_agg_group_single_unique_key;
 
 -- query 25
 -- @skip_result_check=true
-USE sql_tests_test_eliminate_agg;
+USE ${case_db};
 drop table test_agg_group_multi_unique_key;

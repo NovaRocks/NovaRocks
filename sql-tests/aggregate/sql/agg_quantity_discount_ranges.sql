@@ -7,14 +7,13 @@
 -- 1. Create/reset a minimal lineorder-like table.
 -- 2. Insert deterministic quantity/discount rows with explicit boundaries.
 -- 3. Compute MIN/MAX and compare a single deterministic row.
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_quantity_discount_ranges;
-CREATE TABLE sql_tests_d06.t_agg_quantity_discount_ranges (
+DROP TABLE IF EXISTS ${case_db}.t_agg_quantity_discount_ranges;
+CREATE TABLE ${case_db}.t_agg_quantity_discount_ranges (
     lo_quantity INT,
     lo_discount INT
 );
 
-INSERT INTO sql_tests_d06.t_agg_quantity_discount_ranges VALUES
+INSERT INTO ${case_db}.t_agg_quantity_discount_ranges VALUES
     (1, 0),
     (50, 10),
     (20, 3),
@@ -26,4 +25,4 @@ SELECT
     MAX(lo_quantity) AS max_qty,
     MIN(lo_discount) AS min_discount,
     MAX(lo_discount) AS max_discount
-FROM sql_tests_d06.t_agg_quantity_discount_ranges;
+FROM ${case_db}.t_agg_quantity_discount_ranges;

@@ -7,14 +7,13 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows containing NULL and non-NULL sort keys.
 -- 3. Query ordered page with LIMIT/OFFSET and assert exact row order.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_topn_null_order_limit_offset;
-CREATE TABLE sql_tests_d04.t_topn_null_order_limit_offset (
+DROP TABLE IF EXISTS ${case_db}.t_topn_null_order_limit_offset;
+CREATE TABLE ${case_db}.t_topn_null_order_limit_offset (
   id INT,
   k INT,
   s STRING
 );
-INSERT INTO sql_tests_d04.t_topn_null_order_limit_offset VALUES
+INSERT INTO ${case_db}.t_topn_null_order_limit_offset VALUES
   (1, NULL, 'a'),
   (2, 2, 'x'),
   (3, 1, 'z'),
@@ -22,6 +21,6 @@ INSERT INTO sql_tests_d04.t_topn_null_order_limit_offset VALUES
   (5, 1, NULL),
   (6, 3, 'm');
 SELECT id, k, s
-FROM sql_tests_d04.t_topn_null_order_limit_offset
+FROM ${case_db}.t_topn_null_order_limit_offset
 ORDER BY k ASC NULLS LAST, s DESC NULLS FIRST, id ASC
 LIMIT 4 OFFSET 1;

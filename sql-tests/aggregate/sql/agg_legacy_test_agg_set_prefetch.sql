@@ -3,14 +3,12 @@
 -- Preserve legacy aggregate coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_test_agg_set_prefetch FORCE;
-CREATE DATABASE sql_tests_test_agg_set_prefetch;
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 
 -- name: test_agg_set_prefetch @mac
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 create table t0 (
     c0 STRING,
     c1 STRING NOT NULL,
@@ -20,34 +18,34 @@ create table t0 (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 insert into t0 SELECT generate_series, generate_series, generate_series, generate_series FROM TABLE(generate_series(1,  30000));
 
 -- query 4
 -- @skip_result_check=true
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 set pipeline_dop = 1;
 
 -- query 5
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 select count(distinct c0) from t0;
 
 -- query 6
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 select count(distinct c1) from t0;
 
 -- query 7
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 select count(distinct c2) from t0;
 
 -- query 8
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 select count(distinct c3) from t0;
 
 -- query 9
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 select count(distinct c0) from t0 group by c2 order by c2 limit 1;
 
 -- query 10
-USE sql_tests_test_agg_set_prefetch;
+USE ${case_db};
 select count(distinct c2) from t0 group by c3 order by c3 limit 1;

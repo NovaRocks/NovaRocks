@@ -3,14 +3,12 @@
 -- Preserve legacy aggregate coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_test_bitmap_union_int FORCE;
-CREATE DATABASE sql_tests_test_bitmap_union_int;
-USE sql_tests_test_bitmap_union_int;
+USE ${case_db};
 
 -- name: test_bitmap_union_int
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_test_bitmap_union_int;
+USE ${case_db};
 CREATE TABLE t1 (
     c1 int,
     c2 int
@@ -22,7 +20,7 @@ PROPERTIES ("replication_num" = "1");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_test_bitmap_union_int;
+USE ${case_db};
 INSERT INTO t1 values
     (-1, -1),
     (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8), (9, 9),
@@ -31,5 +29,5 @@ INSERT INTO t1 values
     (30, 30), (31, 31), (32, 32), (33, 33), (34, 34), (35, 35), (36, 36), (37, 37), (38, 38), (39, -1);
 
 -- query 4
-USE sql_tests_test_bitmap_union_int;
+USE ${case_db};
 select bitmap_union_int(c2) from t1;

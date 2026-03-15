@@ -6,17 +6,16 @@
 -- 1. Create/reset a basic table in the write-path database.
 -- 2. Insert fixed rows including a NULL value.
 -- 3. Read rows with ORDER BY and compare with expected result.
-CREATE DATABASE IF NOT EXISTS sql_tests_write_path;
-DROP TABLE IF EXISTS sql_tests_write_path.t_basic;
-CREATE TABLE sql_tests_write_path.t_basic (
+DROP TABLE IF EXISTS ${case_db}.t_basic;
+CREATE TABLE ${case_db}.t_basic (
   id BIGINT,
   name STRING,
   qty BIGINT
 );
-INSERT INTO sql_tests_write_path.t_basic VALUES
+INSERT INTO ${case_db}.t_basic VALUES
   (1, 'apple', 10),
   (2, 'banana', 20),
   (3, 'banana', NULL);
 SELECT id, name, qty
-FROM sql_tests_write_path.t_basic
+FROM ${case_db}.t_basic
 ORDER BY id;

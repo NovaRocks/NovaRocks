@@ -7,14 +7,13 @@
 -- 1. Create/reset source table.
 -- 2. Insert rows covering grade boundaries and NULL values.
 -- 3. Project CASE and COALESCE expressions, then assert ordered output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_project_case_coalesce;
-CREATE TABLE sql_tests_d04.t_project_case_coalesce (
+DROP TABLE IF EXISTS ${case_db}.t_project_case_coalesce;
+CREATE TABLE ${case_db}.t_project_case_coalesce (
   id INT,
   score INT,
   note STRING
 );
-INSERT INTO sql_tests_d04.t_project_case_coalesce VALUES
+INSERT INTO ${case_db}.t_project_case_coalesce VALUES
   (1, 95, 'top'),
   (2, 82, NULL),
   (3, NULL, 'missing'),
@@ -28,5 +27,5 @@ SELECT
     ELSE 'C'
   END AS grade,
   COALESCE(note, 'EMPTY') AS note_norm
-FROM sql_tests_d04.t_project_case_coalesce
+FROM ${case_db}.t_project_case_coalesce
 ORDER BY id;

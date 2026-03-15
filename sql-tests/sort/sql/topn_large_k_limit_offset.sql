@@ -7,13 +7,12 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows with score ties.
 -- 3. Query ORDER BY + LIMIT/OFFSET where limit+offset is large enough to hit large-k topn path.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_topn_large_k_limit_offset;
-CREATE TABLE sql_tests_d04.t_topn_large_k_limit_offset (
+DROP TABLE IF EXISTS ${case_db}.t_topn_large_k_limit_offset;
+CREATE TABLE ${case_db}.t_topn_large_k_limit_offset (
   id INT,
   score INT
 );
-INSERT INTO sql_tests_d04.t_topn_large_k_limit_offset VALUES
+INSERT INTO ${case_db}.t_topn_large_k_limit_offset VALUES
   (1, 100),
   (2, 95),
   (3, 95),
@@ -23,6 +22,6 @@ INSERT INTO sql_tests_d04.t_topn_large_k_limit_offset VALUES
   (7, 80),
   (8, 70);
 SELECT id, score
-FROM sql_tests_d04.t_topn_large_k_limit_offset
+FROM ${case_db}.t_topn_large_k_limit_offset
 ORDER BY score DESC, id ASC
 LIMIT 1500 OFFSET 2;

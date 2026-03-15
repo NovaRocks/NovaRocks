@@ -43,6 +43,10 @@ pub struct SqlCase {
     pub source_file: PathBuf,
     pub case_id: String,
     pub steps: Vec<SqlStep>,
+    /// Resolved per-case database names detected from `${case_db}` / `${case_db_N}` placeholders.
+    /// Index 0 is the primary (`${case_db}`), subsequent entries are `${case_db_2}`, etc.
+    /// Empty when the case does not use per-case database isolation.
+    pub case_dbs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

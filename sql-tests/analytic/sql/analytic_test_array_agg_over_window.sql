@@ -3,14 +3,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_analytic_test_array_agg_over_window FORCE;
-CREATE DATABASE sql_tests_analytic_test_array_agg_over_window;
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 
 -- name: test_array_agg_over_window
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 CREATE TABLE `t0` (
   `v1` int(11) NULL COMMENT "",
   `v2` int(11) NULL COMMENT "",
@@ -23,11 +21,11 @@ PROPERTIES("replication_num"="1");
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 insert into t0 select i/19 as v1, i/11 as v2, i/5 as v3, concat('item_', cast(i as varchar)) as v4, i/3.14 as v5, i/2.71 as v6 from table(generate_series(1,100)) t(i);
 
 -- query 4
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -41,7 +39,7 @@ select sum(
 ) as t;
 
 -- query 5
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -55,7 +53,7 @@ select sum(
 ) as t;
 
 -- query 6
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -69,7 +67,7 @@ select sum(
 ) as t;
 
 -- query 7
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -83,7 +81,7 @@ select sum(
 ) as t;
 
 -- query 8
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1) over() as arr_basic
@@ -91,7 +89,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 9
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v2) over() as arr_distinct
@@ -99,7 +97,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 10
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3 order by v2) over() as arr_order_by
@@ -107,7 +105,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 11
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0)
@@ -119,7 +117,7 @@ select sum(
 ) as t;
 
 -- query 12
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)
@@ -131,7 +129,7 @@ select sum(
 ) as t;
 
 -- query 13
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)
@@ -143,7 +141,7 @@ select sum(
 ) as t;
 
 -- query 14
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -157,7 +155,7 @@ select sum(
 ) as t;
 
 -- query 15
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -171,7 +169,7 @@ select sum(
 ) as t;
 
 -- query 16
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_int)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_int
@@ -179,7 +177,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 17
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_string)), 0)) as fingerprint from (
   select v1, v2, v4,
   array_agg(v4) over(partition by v1 order by v2) as arr_string
@@ -187,7 +185,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 18
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_decimal)), 0)) as fingerprint from (
   select v1, v2, v5,
   array_agg(v5) over(partition by v1 order by v2) as arr_decimal
@@ -195,7 +193,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 19
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(v6) over(partition by v1 order by v2) as arr_float
@@ -203,7 +201,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 20
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct_int)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v1) over(partition by v1 order by v2) as arr_distinct_int
@@ -211,7 +209,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 21
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_distinct_string)), 0)) as fingerprint from (
   select v1, v2, v4,
   array_agg(distinct v4) over(partition by v1 order by v2) as arr_distinct_string
@@ -219,7 +217,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 22
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct_decimal)), 0)) as fingerprint from (
   select v1, v2, v5,
   array_agg(distinct v5) over(partition by v1 order by v2) as arr_distinct_decimal
@@ -227,7 +225,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 23
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(distinct v6) over(partition by v1 order by v2) as arr_distinct_float
@@ -235,7 +233,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 24
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by_int)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1 order by v2) over(partition by v1 order by v2) as arr_order_by_int
@@ -243,7 +241,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 25
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_order_by_string)), 0)) as fingerprint from (
   select v1, v2, v4,
   array_agg(v4 order by v2) over(partition by v1 order by v2) as arr_order_by_string
@@ -251,7 +249,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 26
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by_decimal)), 0)) as fingerprint from (
   select v1, v2, v5,
   array_agg(v5 order by v2) over(partition by v1 order by v2) as arr_order_by_decimal
@@ -259,7 +257,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 27
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(v6 order by v2) over(partition by v1 order by v2) as arr_order_by_float
@@ -267,7 +265,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 28
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1 + v2) over(partition by v1 order by v2) as arr_basic
@@ -275,7 +273,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 29
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1 * v2) over(partition by v1 order by v2) as arr_basic
@@ -283,7 +281,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 30
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(cast(v3 as decimal(10,2))) over(partition by v1 order by v2) as arr_basic
@@ -291,7 +289,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 31
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(upper(v4)) over(partition by v1 order by v2) as arr_basic
@@ -299,7 +297,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 32
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(length(v4)) over(partition by v1 order by v2) as arr_basic
@@ -307,7 +305,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 33
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(abs(v6)) over(partition by v1 order by v2) as arr_basic
@@ -315,7 +313,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 34
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(round(v6, 2)) over(partition by v1 order by v2) as arr_basic
@@ -323,7 +321,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 35
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(concat('prefix_', v4)) over(partition by v1 order by v2) as arr_basic
@@ -331,7 +329,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 36
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(case when v1 > 2 then 'high' else 'low' end) over(partition by v1 order by v2) as arr_basic
@@ -339,7 +337,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 37
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(coalesce(v5, 0.0)) over(partition by v1 order by v2) as arr_basic
@@ -347,7 +345,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 38
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(sqrt(abs(v6))) over(partition by v1 order by v2) as arr_basic
@@ -355,7 +353,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 39
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(pow(v6, 2)) over(partition by v1 order by v2) as arr_basic
@@ -363,7 +361,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 40
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(year(days_add('2025-01-01', v3))) over(partition by v1 order by v2) as arr_basic
@@ -371,7 +369,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 41
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(month(days_add('2025-01-01', v3))) over(partition by v1 order by v2) as arr_basic
@@ -379,7 +377,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 42
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(nullif(v1, 1)) over(partition by v1 order by v2) as arr_basic
@@ -387,7 +385,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 43
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_complex)), 0) +
@@ -401,7 +399,7 @@ select sum(
 ) as t;
 
 -- query 44
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_complex)), 0) +
@@ -415,7 +413,7 @@ select sum(
 ) as t;
 
 -- query 45
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_large)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1 order by v2) as arr_large,
@@ -425,7 +423,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 46
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_large)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1 + v2) over(partition by v1 order by v2) as arr_large,
@@ -435,7 +433,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 47
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(0) over(partition by v1 order by v2) as arr_basic,
@@ -445,7 +443,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 48
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   murmur_hash3_32(coalesce(rn, 0)) +
@@ -460,7 +458,7 @@ select sum(
 
 -- query 49
 -- @expect_error=Getting syntax error
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   murmur_hash3_32(coalesce(d_rank, 0)) +
@@ -475,7 +473,7 @@ select sum(
 
 -- query 50
 -- @expect_error=Getting syntax error
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   murmur_hash3_32(coalesce(lead, 0)) +
@@ -489,7 +487,7 @@ select sum(
 ) as t;
 
 -- query 51
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   murmur_hash3_32(coalesce(cast(avg_window as bigint), 0)) +
@@ -503,7 +501,7 @@ select sum(
 ) as t;
 
 -- query 52
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(123456789012345678901234567890.123456789) over(partition by v1 order by v2) as arr_basic
@@ -511,7 +509,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 53
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(-9876543210.987654321) over(partition by v1 order by v2) as arr_basic
@@ -519,7 +517,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 54
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg('this_is_a_very_long_string_with_many_characters_for_testing') over(partition by v1 order by v2) as arr_basic
@@ -527,7 +525,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 55
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1) over(partition by v1, v2 order by v3) as arr_basic
@@ -535,7 +533,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 56
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v1) over(partition by v1, v2 order by v3) as arr_basic
@@ -543,7 +541,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 57
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1 order by v2, v3) over(partition by v1 order by v2) as arr_basic
@@ -552,7 +550,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 
 -- query 58
 -- @skip_result_check=true
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 CREATE TABLE `t1` (
   `v1` int(11) NULL COMMENT "",
   `v2` int(11) NULL COMMENT "",
@@ -565,7 +563,7 @@ PROPERTIES("replication_num"="1");
 
 -- query 59
 -- @skip_result_check=true
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 insert into t1 values
   (1, 1, 100, 'a', 1.1, 1.1),
   (1, 2, NULL, 'b', 2.2, NULL),
@@ -579,7 +577,7 @@ insert into t1 values
   (3, 2, 1000, 'j', 10.1, 10.1);
 
 -- query 60
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1) over() as arr_basic
@@ -587,7 +585,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 61
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v1) over() as arr_distinct
@@ -595,7 +593,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 62
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3 order by v2) over() as arr_order_by
@@ -603,7 +601,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 63
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_string)), 0)) as fingerprint from (
   select v1, v2, v4,
   array_agg(v4) over() as arr_string
@@ -611,7 +609,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 64
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_decimal)), 0)) as fingerprint from (
   select v1, v2, v5,
   array_agg(v5) over() as arr_decimal
@@ -619,7 +617,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 65
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_float)), 0)) as fingerprint from (
   select v1, v2, v6,
   array_agg(v6) over() as arr_float
@@ -627,7 +625,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 66
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v2) over(partition by v1) as arr_basic
@@ -635,7 +633,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 67
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v2) over(partition by v1) as arr_distinct
@@ -643,7 +641,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 68
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3 order by v2) over(partition by v1) as arr_order_by
@@ -651,7 +649,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 69
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3) over(partition by v1 order by v2) as arr_basic
@@ -659,7 +657,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 70
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v3) over(partition by v1 order by v2) as arr_distinct
@@ -667,7 +665,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 71
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3 order by v2) over(partition by v1 order by v2) as arr_order_by
@@ -675,7 +673,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 72
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_frame)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3) over(partition by v1 order by v2 range between unbounded preceding and unbounded following) as arr_frame
@@ -683,7 +681,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 73
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_int)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_str)), 0) +
@@ -697,7 +695,7 @@ select sum(
 ) as t;
 
 -- query 74
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   murmur_hash3_32(coalesce(rn, 0)) +
@@ -711,7 +709,7 @@ select sum(
 ) as t;
 
 -- query 75
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_expr)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v1 + v2 + v3) over(partition by v1 order by v2) as arr_expr
@@ -719,7 +717,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 76
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3) over(partition by v1, v2 order by v3) as arr_basic
@@ -727,7 +725,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 77
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), arr_distinct_str)), 0)) as fingerprint from (
   select v1, v2, v4,
   array_agg(distinct v4) over(partition by v1 order by v2) as arr_distinct_str
@@ -735,7 +733,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, '')), a
 ) as t;
 
 -- query 78
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v6) over(partition by v1 order by v2) as arr_basic
@@ -744,7 +742,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 79
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3) over() as arr_basic
@@ -753,7 +751,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 80
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_coalesce)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(coalesce(v3, -1)) over(partition by v1 order by v2) as arr_coalesce
@@ -761,7 +759,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 81
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v2) over(order by v1, v2) as arr_basic
@@ -769,7 +767,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 82
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_int)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_bigint)), 0) +
@@ -783,7 +781,7 @@ select sum(
 ) as t;
 
 -- query 83
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3 order by v3) over(partition by v1) as arr_order_by
@@ -791,7 +789,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 84
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_order_by)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3 order by v2, v3) over(partition by v1) as arr_order_by
@@ -799,7 +797,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 85
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(v3) over(partition by v1 order by v2) as arr_basic
@@ -808,7 +806,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 86
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0)) as fingerprint from (
   select v1, v2, v3,
   array_agg(distinct v5) over(partition by v1) as arr_distinct
@@ -817,7 +815,7 @@ select sum(coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), ar
 ) as t;
 
 -- query 87
-USE sql_tests_analytic_test_array_agg_over_window;
+USE ${case_db};
 select sum(
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_basic)), 0) +
   coalesce(array_sum(array_map(x -> murmur_hash3_32(coalesce(x, 0)), arr_distinct)), 0) +
@@ -832,4 +830,3 @@ select sum(
 
 -- query 88
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_analytic_test_array_agg_over_window FORCE;

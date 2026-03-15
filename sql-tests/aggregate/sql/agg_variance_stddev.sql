@@ -7,14 +7,13 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic numeric rows for two groups.
 -- 3. Compute rounded variance/stddev metrics and assert ordered output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_variance_stddev;
-CREATE TABLE sql_tests_d06.t_agg_variance_stddev (
+DROP TABLE IF EXISTS ${case_db}.t_agg_variance_stddev;
+CREATE TABLE ${case_db}.t_agg_variance_stddev (
     g INT,
     v INT
 );
 
-INSERT INTO sql_tests_d06.t_agg_variance_stddev VALUES
+INSERT INTO ${case_db}.t_agg_variance_stddev VALUES
     (1, 10),
     (1, 20),
     (1, 30),
@@ -28,6 +27,6 @@ SELECT
     ROUND(VAR_SAMP(v), 6) AS var_samp_v,
     ROUND(STDDEV_POP(v), 6) AS std_pop_v,
     ROUND(STDDEV_SAMP(v), 6) AS std_samp_v
-FROM sql_tests_d06.t_agg_variance_stddev
+FROM ${case_db}.t_agg_variance_stddev
 GROUP BY g
 ORDER BY g;

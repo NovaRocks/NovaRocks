@@ -2,9 +2,43 @@ use crate::config::{case_placeholder_variables, parse_bool, substitute_placehold
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
+
+/// Scan raw SQL content (before placeholder substitution) for `${case_db}` and
+/// `${case_db_N}` references.  Returns the resolved database names in order.
+/// Index 0 is the primary `${case_db}`, index 1 is `${case_db_2}`, etc.
+pub fn detect_case_dbs(
+    raw_content: &str,
+    variables: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut indices: BTreeSet<usize> = BTreeSet::new();
+
+    if raw_content.contains("${case_db}") {
+        indices.insert(0);
+    }
+    for n in 2..=9 {
+        let placeholder = format!("${{case_db_{}}}", n);
+        if raw_content.contains(&placeholder) {
+            // Secondary database implies primary is also needed.
+            indices.insert(0);
+            indices.insert(n - 1);
+        }
+    }
+
+    indices
+        .into_iter()
+        .filter_map(|idx| {
+            let key = if idx == 0 {
+                "case_db".to_string()
+            } else {
+                format!("case_db_{}", idx + 1)
+            };
+            variables.get(&key).cloned()
+        })
+        .collect()
+}
 
 pub fn parse_meta_line(line: &str, meta_re: &Regex) -> Option<(String, String)> {
     let captures = meta_re.captures(line.trim())?;
@@ -172,6 +206,7 @@ pub fn load_sql_case_from_file(
         }
     };
     let case_variables = case_placeholder_variables(variables, &base_name);
+    let case_dbs = detect_case_dbs(&content, &case_variables);
     let content = substitute_placeholders(
         &content,
         &case_variables,
@@ -252,6 +287,7 @@ pub fn load_sql_case_from_file(
         source_file: sql_path.to_path_buf(),
         case_id: base_name,
         steps,
+        case_dbs,
     }))
 }
 

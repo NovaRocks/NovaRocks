@@ -5,9 +5,7 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_ttl_${uuid0} FORCE;
-CREATE DATABASE sc_alter_ttl_${uuid0};
-USE sc_alter_ttl_${uuid0};
+USE ${case_db};
 CREATE TABLE `test` (
   `k1` date NULL COMMENT "",
   `k2` datetime NULL COMMENT "",
@@ -39,4 +37,3 @@ ALTER TABLE test MODIFY PARTITION (*) SET ("storage_cooldown_ttl" = "1 year", "s
 
 -- query 2
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_alter_ttl_${uuid0} FORCE;

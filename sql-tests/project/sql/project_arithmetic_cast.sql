@@ -7,14 +7,13 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows including NULL arithmetic operands.
 -- 3. Project computed columns and assert ordered output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d04;
-DROP TABLE IF EXISTS sql_tests_d04.t_project_arithmetic_cast;
-CREATE TABLE sql_tests_d04.t_project_arithmetic_cast (
+DROP TABLE IF EXISTS ${case_db}.t_project_arithmetic_cast;
+CREATE TABLE ${case_db}.t_project_arithmetic_cast (
   id INT,
   a INT,
   b INT
 );
-INSERT INTO sql_tests_d04.t_project_arithmetic_cast VALUES
+INSERT INTO ${case_db}.t_project_arithmetic_cast VALUES
   (1, 2, 3),
   (2, 5, NULL),
   (3, -4, 10);
@@ -23,5 +22,5 @@ SELECT
   a + IFNULL(b, 0) AS sum_ab,
   a * IFNULL(b, 1) AS mul_ab,
   CAST(a AS BIGINT) AS a_big
-FROM sql_tests_d04.t_project_arithmetic_cast
+FROM ${case_db}.t_project_arithmetic_cast
 ORDER BY id;

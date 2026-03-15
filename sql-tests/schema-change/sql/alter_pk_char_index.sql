@@ -5,9 +5,7 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_pk_char_idx_${uuid0} FORCE;
-CREATE DATABASE sc_pk_char_idx_${uuid0};
-USE sc_pk_char_idx_${uuid0};
+USE ${case_db};
 CREATE TABLE test2
 (
     k1 BIGINT,
@@ -24,13 +22,13 @@ INSERT INTO test2 VALUES (1, 1, '1');
 
 -- query 2
 -- Verify char filter works before adding index.
-USE sc_pk_char_idx_${uuid0};
+USE ${case_db};
 SELECT * FROM test2 WHERE v2 = '1';
 
 -- query 3
 -- Add bitmap index on v1.
 -- @skip_result_check=true
-USE sc_pk_char_idx_${uuid0};
+USE ${case_db};
 ALTER TABLE test2 ADD INDEX test_bitmap(v1);
 
 -- query 4
@@ -39,14 +37,13 @@ ALTER TABLE test2 ADD INDEX test_bitmap(v1);
 -- @retry_interval_ms=1000
 -- @result_contains=FINISHED
 -- @skip_result_check=true
-USE sc_pk_char_idx_${uuid0};
-SHOW ALTER TABLE COLUMN FROM sc_pk_char_idx_${uuid0} ORDER BY CreateTime DESC LIMIT 1;
+USE ${case_db};
+SHOW ALTER TABLE COLUMN FROM ${case_db} ORDER BY CreateTime DESC LIMIT 1;
 
 -- query 5
 -- Verify char filter still works after index creation.
-USE sc_pk_char_idx_${uuid0};
+USE ${case_db};
 SELECT * FROM test2 WHERE v2 = '1';
 
 -- query 6
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_pk_char_idx_${uuid0} FORCE;

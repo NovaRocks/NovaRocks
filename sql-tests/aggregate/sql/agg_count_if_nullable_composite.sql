@@ -7,15 +7,14 @@
 -- 1. Create/reset source table with nullable inputs.
 -- 2. Insert rows that yield TRUE/FALSE/NULL predicate outcomes.
 -- 3. Aggregate by group and assert deterministic count_if outputs.
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_count_if_nullable_composite;
-CREATE TABLE sql_tests_d06.t_agg_count_if_nullable_composite (
+DROP TABLE IF EXISTS ${case_db}.t_agg_count_if_nullable_composite;
+CREATE TABLE ${case_db}.t_agg_count_if_nullable_composite (
     g INT,
     x INT,
     y INT
 );
 
-INSERT INTO sql_tests_d06.t_agg_count_if_nullable_composite VALUES
+INSERT INTO ${case_db}.t_agg_count_if_nullable_composite VALUES
     (1, 3, 1),
     (1, 3, 0),
     (1, NULL, 2),
@@ -28,6 +27,6 @@ SELECT
     g,
     count_if(x > y AND y > 0) AS cnt_gt,
     count_if(x IS NULL OR y IS NULL) AS cnt_has_null
-FROM sql_tests_d06.t_agg_count_if_nullable_composite
+FROM ${case_db}.t_agg_count_if_nullable_composite
 GROUP BY g
 ORDER BY g;

@@ -7,15 +7,14 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows per partition.
 -- 3. Apply ROW_NUMBER in subquery and keep top-2 rows per partition.
-CREATE DATABASE IF NOT EXISTS sql_tests_d07;
-DROP TABLE IF EXISTS sql_tests_d07.t_analytic_filter_topn_with_window;
-CREATE TABLE sql_tests_d07.t_analytic_filter_topn_with_window (
+DROP TABLE IF EXISTS ${case_db}.t_analytic_filter_topn_with_window;
+CREATE TABLE ${case_db}.t_analytic_filter_topn_with_window (
     grp VARCHAR(10),
     id INT,
     score INT
 );
 
-INSERT INTO sql_tests_d07.t_analytic_filter_topn_with_window VALUES
+INSERT INTO ${case_db}.t_analytic_filter_topn_with_window VALUES
     ('A', 1, 70),
     ('A', 2, 90),
     ('A', 3, 80),
@@ -30,7 +29,7 @@ FROM (
         id,
         score,
         ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score DESC, id) AS rn
-    FROM sql_tests_d07.t_analytic_filter_topn_with_window
+    FROM ${case_db}.t_analytic_filter_topn_with_window
 ) t
 WHERE rn <= 2
 ORDER BY grp, rn;

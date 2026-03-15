@@ -1,4 +1,3 @@
-use crate::config::stable_hash_hex;
 use crate::results::{parse_output, render_output};
 use crate::runner::is_transient_iceberg_commit_error;
 use crate::types::*;
@@ -280,10 +279,6 @@ pub fn execute_suite_hook(
     run_mysql_sql(conn, &sql, true)
         .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
     Ok(())
-}
-
-pub fn case_auto_db_name(case_id: &str) -> String {
-    format!("db_sqlt_{}", stable_hash_hex(case_id))
 }
 
 pub fn reset_case_database(

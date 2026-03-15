@@ -3,14 +3,12 @@
 -- Preserve legacy aggregate coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_test_approx_top_k FORCE;
-CREATE DATABASE sql_tests_test_approx_top_k;
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 
 -- name: test_approx_top_k_without_null
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 CREATE TABLE `t_without_null` (
   `c_id` INT(11) NOT NULL,
   `c_int` INT(11) NOT NULL,
@@ -34,7 +32,7 @@ PROPERTIES (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 INSERT INTO `t_without_null` (
   `c_id`, `c_tinyint`, `c_smallint`, `c_int`, `c_bigint`, `c_largeint`, `c_float`, `c_double`, `c_char`, `c_varchar`, `c_date`, `c_datetime`, `c_decimal`)
 VALUES
@@ -104,201 +102,201 @@ VALUES
   (91, 10, 100, 1000, 10000, 100000, 1.01, 100.01, 'char10', 'varchar10', '2021-01-10', '2021-01-10 00:00:00', 1000.01);
 
 -- query 4
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_tinyint) FROM t_without_null;
 
 -- query 5
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_smallint) FROM t_without_null;
 
 -- query 6
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_int) FROM t_without_null;
 
 -- query 7
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bigint) FROM t_without_null;
 
 -- query 8
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_largeint) FROM t_without_null;
 
 -- query 9
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_float) FROM t_without_null;
 
 -- query 10
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_double) FROM t_without_null;
 
 -- query 11
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_char) FROM t_without_null;
 
 -- query 12
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_varchar) FROM t_without_null;
 
 -- query 13
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_date) FROM t_without_null;
 
 -- query 14
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_datetime) FROM t_without_null;
 
 -- query 15
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_decimal) FROM t_without_null;
 
 -- query 16
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_tinyint, 3) FROM t_without_null;
 
 -- query 17
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_smallint, 3) FROM t_without_null;
 
 -- query 18
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_int, 3) FROM t_without_null;
 
 -- query 19
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_bigint, 3) FROM t_without_null;
 
 -- query 20
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_largeint, 3) FROM t_without_null;
 
 -- query 21
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_float, 3) FROM t_without_null;
 
 -- query 22
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_double, 3) FROM t_without_null;
 
 -- query 23
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_char, 3) FROM t_without_null;
 
 -- query 24
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_varchar, 3) FROM t_without_null;
 
 -- query 25
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_date, 3) FROM t_without_null;
 
 -- query 26
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_datetime, 3) FROM t_without_null;
 
 -- query 27
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_decimal, 3) FROM t_without_null;
 
 -- query 28
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_tinyint, 3, 10) FROM t_without_null;
 
 -- query 29
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_smallint, 3, 10) FROM t_without_null;
 
 -- query 30
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_int, 3, 10) FROM t_without_null;
 
 -- query 31
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_bigint, 3, 10) FROM t_without_null;
 
 -- query 32
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_largeint, 3, 10) FROM t_without_null;
 
 -- query 33
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_float, 3, 10) FROM t_without_null;
 
 -- query 34
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_double, 3, 10) FROM t_without_null;
 
 -- query 35
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_char, 3, 10) FROM t_without_null;
 
 -- query 36
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_varchar, 3, 10) FROM t_without_null;
 
 -- query 37
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_date, 3, 10) FROM t_without_null;
 
 -- query 38
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_datetime, 3, 10) FROM t_without_null;
 
 -- query 39
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_decimal, 3, 10) FROM t_without_null;
 
 -- query 40
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_tinyint) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 41
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_smallint) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 42
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_int) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 43
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_bigint) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 44
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_largeint) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 45
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_float) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 46
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_double) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 47
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_char) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 48
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_varchar) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 49
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_date) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 50
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_datetime) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 51
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_decimal) over() FROM t_without_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- name: test_approx_top_k_with_null
 -- query 52
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 CREATE TABLE `t_with_null` (
   `c_id` INT(11) NULL,
   `c_int` INT(11) NULL,
@@ -322,7 +320,7 @@ PROPERTIES (
 
 -- query 53
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 INSERT INTO `t_with_null` (
   `c_id`, `c_tinyint`, `c_smallint`, `c_int`, `c_bigint`, `c_largeint`, `c_float`, `c_double`, `c_char`, `c_varchar`, `c_date`, `c_datetime`, `c_decimal`)
 VALUES
@@ -396,265 +394,265 @@ VALUES
   (103, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 -- query 54
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_tinyint) FROM t_with_null;
 
 -- query 55
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_smallint) FROM t_with_null;
 
 -- query 56
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_int) FROM t_with_null;
 
 -- query 57
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bigint) FROM t_with_null;
 
 -- query 58
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_largeint) FROM t_with_null;
 
 -- query 59
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_float) FROM t_with_null;
 
 -- query 60
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_double) FROM t_with_null;
 
 -- query 61
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_char) FROM t_with_null;
 
 -- query 62
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_varchar) FROM t_with_null;
 
 -- query 63
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_date) FROM t_with_null;
 
 -- query 64
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_datetime) FROM t_with_null;
 
 -- query 65
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_decimal) FROM t_with_null;
 
 -- query 66
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_tinyint, 3) FROM t_with_null;
 
 -- query 67
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_smallint, 3) FROM t_with_null;
 
 -- query 68
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_int, 3) FROM t_with_null;
 
 -- query 69
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_bigint, 3) FROM t_with_null;
 
 -- query 70
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_largeint, 3) FROM t_with_null;
 
 -- query 71
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_float, 3) FROM t_with_null;
 
 -- query 72
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_double, 3) FROM t_with_null;
 
 -- query 73
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_char, 3) FROM t_with_null;
 
 -- query 74
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_varchar, 3) FROM t_with_null;
 
 -- query 75
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_date, 3) FROM t_with_null;
 
 -- query 76
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_datetime, 3) FROM t_with_null;
 
 -- query 77
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_decimal, 3) FROM t_with_null;
 
 -- query 78
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_tinyint, 3, 10) FROM t_with_null;
 
 -- query 79
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_smallint, 3, 10) FROM t_with_null;
 
 -- query 80
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_int, 3, 10) FROM t_with_null;
 
 -- query 81
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_bigint, 3, 10) FROM t_with_null;
 
 -- query 82
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_largeint, 3, 10) FROM t_with_null;
 
 -- query 83
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_float, 3, 10) FROM t_with_null;
 
 -- query 84
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_double, 3, 10) FROM t_with_null;
 
 -- query 85
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_char, 3, 10) FROM t_with_null;
 
 -- query 86
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_varchar, 3, 10) FROM t_with_null;
 
 -- query 87
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_date, 3, 10) FROM t_with_null;
 
 -- query 88
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_datetime, 3, 10) FROM t_with_null;
 
 -- query 89
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_decimal, 3, 10) FROM t_with_null;
 
 -- query 90
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_int) FROM t_with_null WHERE c_id > 100;
 
 -- query 91
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_varchar, 3) FROM t_with_null WHERE c_id > 100;
 
 -- query 92
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_decimal, 3, 10) FROM t_with_null WHERE c_id > 100;
 
 -- query 93
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_date, 1) FROM t_with_null WHERE c_id > 100;
 
 -- query 94
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_tinyint) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 95
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_smallint) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 96
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_int) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 97
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_bigint) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 98
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_largeint) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 99
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_float) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 100
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_double) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 101
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_char) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 102
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_varchar) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 103
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_date) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 104
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_datetime) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 105
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_decimal) over() FROM t_with_null WHERE c_id >= 71 AND c_id <= 90 ORDER BY c_id;
 
 -- query 106
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_tinyint) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 107
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_smallint) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 108
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_int) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 109
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_bigint) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 110
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_largeint) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 111
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_float) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 112
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_double) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 113
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_char) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 114
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_varchar) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 115
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_date) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 116
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_datetime) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- query 117
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_decimal) over() FROM t_with_null WHERE c_id > 100 ORDER BY c_id;
 
 -- name: test_approx_top_k_with_partition
 -- query 118
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 CREATE TABLE `t_partition` (
   `c_id` INT(11) NULL,
   `c_partition` INT(11) NULL,
@@ -679,7 +677,7 @@ PROPERTIES (
 
 -- query 119
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 INSERT INTO `t_partition` (
   `c_id`, `c_partition`, `c_tinyint`, `c_smallint`, `c_int`, `c_bigint`, `c_largeint`, `c_float`, `c_double`, `c_char`, `c_varchar`, `c_date`, `c_datetime`, `c_decimal`)
 VALUES
@@ -735,181 +733,181 @@ VALUES
   (55, 3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 -- query 120
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_tinyint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 121
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_smallint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 122
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_int) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 123
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_bigint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 124
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_largeint) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 125
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_float) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 126
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_double) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 127
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_char) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 128
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_varchar) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 129
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_date) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 130
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_datetime) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 131
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_decimal) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 132
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_tinyint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 133
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_smallint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 134
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_int, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 135
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_bigint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 136
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_largeint, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 137
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_float, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 138
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_double, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 139
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_char, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 140
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_varchar, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 141
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_date, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 142
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_datetime, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 143
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_decimal, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 144
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_tinyint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 145
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_smallint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 146
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_int, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 147
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_bigint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 148
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_largeint, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 149
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_float, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 150
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_double, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 151
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_char, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 152
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_varchar, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 153
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_date, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 154
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_datetime, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 155
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_decimal, 3, 10) FROM t_partition GROUP BY c_partition ORDER BY c_partition;
 
 -- query 156
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_int) OVER(PARTITION BY c_partition) FROM t_partition ORDER BY c_partition;
 
 -- query 157
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_varchar, 10) OVER(PARTITION BY c_partition) FROM t_partition ORDER BY c_partition;
 
 -- query 158
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_datetime, 3, 10) OVER(PARTITION BY c_partition) FROM t_partition ORDER BY c_partition;
 
 -- query 159
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_decimal, 1) OVER(PARTITION BY c_partition) FROM t_partition ORDER BY c_partition;
 
 -- query 160
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT APPROX_TOP_K(c_decimal) FROM t_partition WHERE c_id > 10000;
 
 -- query 161
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT APPROX_TOP_K(c_decimal) FROM t_partition WHERE c_id > 10000 GROUP BY c_partition;
 
 -- query 162
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT APPROX_TOP_K(c_decimal) over() FROM t_partition WHERE c_id > 10000;
 
 -- name: test_approx_top_k_for_boolean
 -- query 163
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 CREATE TABLE `t_bool` (
   `c_id` INT(11) NOT NULL,
   `c_partition` INT(11) NOT NULL,
@@ -923,7 +921,7 @@ PROPERTIES (
 
 -- query 164
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 INSERT INTO `t_bool` (
   `c_id`, `c_partition`, `c_bool`)
 VALUES
@@ -959,51 +957,51 @@ VALUES
   (35, 3, NULL);
 
 -- query 165
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ APPROX_TOP_K(c_bool) FROM t_bool;
 
 -- query 166
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ APPROX_TOP_K(c_bool, 1) FROM t_bool;
 
 -- query 167
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ APPROX_TOP_K(c_bool, 3, 100) FROM t_bool;
 
 -- query 168
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='auto')*/ c_partition, APPROX_TOP_K(c_bool) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
 
 -- query 169
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_preaggregation')*/ c_partition, APPROX_TOP_K(c_bool, 1) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
 
 -- query 170
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT /*+ SET_VAR(streaming_preaggregation_mode='force_streaming')*/ c_partition, APPROX_TOP_K(c_bool, 3, 100) FROM t_bool GROUP BY c_partition ORDER BY c_partition;
 
 -- query 171
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_bool) OVER() FROM t_bool ORDER BY c_id;
 
 -- query 172
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_bool, 10) OVER() FROM t_bool ORDER BY c_id;
 
 -- query 173
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_id, APPROX_TOP_K(c_bool, 3, 10) OVER() FROM t_bool ORDER BY c_id;
 
 -- query 174
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_bool) OVER(PARTITION BY c_partition) FROM t_bool ORDER BY c_partition;
 
 -- query 175
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_bool, 10) OVER(PARTITION BY c_partition) FROM t_bool ORDER BY c_partition;
 
 -- query 176
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT c_partition, APPROX_TOP_K(c_bool, 3, 10) OVER(PARTITION BY c_partition) FROM t_bool ORDER BY c_partition;
 
 -- name: test_approx_top_k_tpch @sequential
@@ -1011,7 +1009,7 @@ SELECT c_partition, APPROX_TOP_K(c_bool, 3, 10) OVER(PARTITION BY c_partition) F
 -- The aggregate logic stays the same without relying on the Python SQL-tester loader.
 -- query 177
 -- @skip_result_check=true
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 DROP TABLE IF EXISTS lineitem;
 CREATE TABLE lineitem (
     L_RETURNFLAG CHAR(1),
@@ -1043,38 +1041,38 @@ UNION ALL SELECT 'R', 5 FROM TABLE(generate_series(1, 4))
 UNION ALL SELECT 'R', 6 FROM TABLE(generate_series(1, 2));
 
 -- query 178
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT APPROX_TOP_K(L_LINENUMBER) FROM lineitem;
 
 -- query 179
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT APPROX_TOP_K(L_LINENUMBER, 1) FROM lineitem;
 
 -- query 180
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT APPROX_TOP_K(L_LINENUMBER, 10) FROM lineitem;
 
 -- query 181
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT L_RETURNFLAG, APPROX_TOP_K(L_LINENUMBER) FROM lineitem GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG;
 
 -- query 182
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT L_RETURNFLAG, APPROX_TOP_K(L_LINENUMBER, 2) FROM lineitem GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG;
 
 -- query 183
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT L_RETURNFLAG, APPROX_TOP_K(L_LINENUMBER, 20) FROM lineitem GROUP BY L_RETURNFLAG ORDER BY L_RETURNFLAG;
 
 -- name: test_approx_top_k_const
 -- query 184
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT approx_top_k(col1) FROM (VALUES (1)) AS tmp(col1);
 
 -- query 185
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT approx_top_k(col1) FROM (VALUES (1),(1),(1),(1),(1),(1)) AS tmp(col1);
 
 -- query 186
-USE sql_tests_test_approx_top_k;
+USE ${case_db};
 SELECT approx_top_k(1);

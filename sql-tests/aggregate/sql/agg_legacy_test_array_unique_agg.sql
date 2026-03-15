@@ -3,14 +3,12 @@
 -- Preserve legacy aggregate coverage in a self-contained sql-tests case.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_test_array_unique_agg FORCE;
-CREATE DATABASE sql_tests_test_array_unique_agg;
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 
 -- name: testArrayUniqueAgg
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 CREATE TABLE `array_unique_agg_test` (
 id    int,
 s_1   Array<String>,
@@ -30,7 +28,7 @@ PROPERTIES (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 insert into array_unique_agg_test values
 (1, ['a', 'a'], [1.0], [1.2, 1.2], [1.3], [[1]]),
 (2, ['1'], [2.0], [2.1], [100.0], [[2]]),
@@ -38,25 +36,25 @@ insert into array_unique_agg_test values
 (2, ['1'], [2.0], [2.1, 2.1], [100.0], [[2]]);
 
 -- query 4
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 select array_unique_agg(s_1) from array_unique_agg_test group by id order by id;
 
 -- query 5
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 select array_unique_agg(i_1) from array_unique_agg_test group by id order by id;
 
 -- query 6
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 select array_unique_agg(f_1) from array_unique_agg_test group by id order by id;
 
 -- query 7
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 select array_unique_agg(d_1) from array_unique_agg_test group by id order by id;
 
 -- name: test_array_unique_agg_different_types
 -- query 8
 -- @skip_result_check=true
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 create table test_array_agg (
     id INT,
     col_boolean ARRAY<BOOLEAN>,
@@ -79,7 +77,7 @@ PROPERTIES ("replication_num" = "1");
 
 -- query 9
 -- @skip_result_check=true
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 insert into test_array_agg values
 (1, [true, false, true], [10, 20, 10], [100, 200, 100], [1000, 2000, 1000], [10000, 20000, 10000], [100000, 200000, 100000], [1.1, 2.2, 1.1], [2.2, 3.3, 2.2], ['hello', 'world', 'hello'], ['char1', 'char2', 'char1'], ['2024-01-01 12:00:00', '2024-02-02 13:00:00', '2024-01-01 12:00:00'], ['2024-01-01', '2024-02-02', '2024-01-01'], [[1,2,3,1]], [map{"key1": 1, "key2": 2}], [row(1, "test1")]),
 (2, [false, true, false], [20, 30, 20], [200, 300, 200], [2000, 3000, 2000], [20000, 30000, 20000], [200000, 300000, 200000], [3.3, 4.4, 3.3], [4.4, 5.5, 4.4], ['world', 'hello', 'world'], ['char2', 'char3', 'char2'], ['2024-02-02 13:00:00', '2024-03-03 14:00:00', '2024-02-02 13:00:00'], ['2024-02-02', '2024-03-03', '2024-02-02'], [[4,5,6,4]], [map{"key3": 3, "key4": 4}], [row(2, "test2")]),
@@ -90,49 +88,49 @@ insert into test_array_agg values
 (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
 -- query 10
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_boolean)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_boolean)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 11
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_tinyint)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_tinyint)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 12
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_smallint)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_smallint)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 13
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_int)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_int)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 14
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_bigint)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_bigint)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 15
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_largeint)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_largeint)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 16
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_float)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_float)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 17
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_double)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_double)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 18
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_varchar)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_varchar)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 19
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_char)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_char)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 20
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_datetime)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_datetime)) FROM test_array_agg GROUP BY id ORDER BY id;
 
 -- query 21
-USE sql_tests_test_array_unique_agg;
+USE ${case_db};
 SELECT id, ARRAY_MIN(ARRAY_UNIQUE_AGG(col_date)), ARRAY_MAX(ARRAY_UNIQUE_AGG(col_date)) FROM test_array_agg GROUP BY id ORDER BY id;

@@ -6,9 +6,7 @@
 
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_drop_part_dist_${uuid0} FORCE;
-CREATE DATABASE sc_drop_part_dist_${uuid0};
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 CREATE TABLE t9 (
     c0 int(11) NULL COMMENT "",
     c1 int(11) NOT NULL COMMENT ""
@@ -24,12 +22,12 @@ PROPERTIES ("fast_schema_evolution" = "true", "replication_num"="1");
 -- query 2
 -- Cannot drop partition column (LIST partition, fast_schema_evolution=true).
 -- @expect_error=Partition column
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 ALTER TABLE t9 DROP COLUMN c1;
 
 -- query 3
 -- @skip_result_check=true
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 CREATE TABLE t10 (
     c0 int(11) NULL COMMENT "",
     c1 int(11) NOT NULL COMMENT ""
@@ -45,12 +43,12 @@ PROPERTIES ("fast_schema_evolution" = "false", "replication_num"="1");
 -- query 4
 -- Cannot drop partition column (LIST partition, fast_schema_evolution=false).
 -- @expect_error=Partition column
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 ALTER TABLE t10 DROP COLUMN c1;
 
 -- query 5
 -- @skip_result_check=true
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 CREATE TABLE site_access1 (
     event_day DATETIME NOT NULL,
     site_id INT DEFAULT '10',
@@ -66,15 +64,14 @@ PROPERTIES('replication_num'='1');
 -- query 6
 -- Cannot drop partition column (date_trunc partition).
 -- @expect_error=Partition column
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 ALTER TABLE site_access1 DROP COLUMN event_day;
 
 -- query 7
 -- Cannot drop distribution column.
 -- @expect_error=Distribution column
-USE sc_drop_part_dist_${uuid0};
+USE ${case_db};
 ALTER TABLE site_access1 DROP COLUMN site_id;
 
 -- query 8
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sc_drop_part_dist_${uuid0} FORCE;

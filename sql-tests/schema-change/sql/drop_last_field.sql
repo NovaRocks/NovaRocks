@@ -2,9 +2,7 @@
 -- 1. Preserve the negative coverage for dropping the final remaining nested field.
 -- query 1
 -- @expect_error=can not drop any more
-DROP DATABASE IF EXISTS sc_last_field_${uuid0} FORCE;
-CREATE DATABASE sc_last_field_${uuid0};
-USE sc_last_field_${uuid0};
+USE ${case_db};
 CREATE TABLE tab1 (
   c0 INT NULL,
   c1 STRUCT<v1 INT>

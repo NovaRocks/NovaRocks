@@ -7,14 +7,13 @@
 -- 1. Create/reset source table.
 -- 2. Insert deterministic rows across groups.
 -- 3. Apply GROUP BY + HAVING and assert ordered output.
-CREATE DATABASE IF NOT EXISTS sql_tests_d06;
-DROP TABLE IF EXISTS sql_tests_d06.t_agg_having_threshold;
-CREATE TABLE sql_tests_d06.t_agg_having_threshold (
+DROP TABLE IF EXISTS ${case_db}.t_agg_having_threshold;
+CREATE TABLE ${case_db}.t_agg_having_threshold (
     g INT,
     v INT
 );
 
-INSERT INTO sql_tests_d06.t_agg_having_threshold VALUES
+INSERT INTO ${case_db}.t_agg_having_threshold VALUES
     (1, 5),
     (1, 7),
     (2, 9),
@@ -24,7 +23,7 @@ INSERT INTO sql_tests_d06.t_agg_having_threshold VALUES
 SELECT
     g,
     SUM(v) AS s_v
-FROM sql_tests_d06.t_agg_having_threshold
+FROM ${case_db}.t_agg_having_threshold
 GROUP BY g
 HAVING SUM(v) >= 20
 ORDER BY g;
