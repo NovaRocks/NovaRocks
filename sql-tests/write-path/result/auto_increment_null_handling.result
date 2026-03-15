@@ -1,0 +1,7 @@
+-- query 2
+id	name	job1	job2
+1	1	NULL	2
+
+-- query 6
+id	name	job1	job2
+1	1	NULL	2

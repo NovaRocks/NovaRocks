@@ -977,7 +977,13 @@ fn resolve_upsert_batch_for_mode(
     match mode {
         ResolvedPartialWriteMode::Row => {
             if data_batch.num_columns() == full_schema_col_count {
-                if ctx.partial_update.merge_condition.is_none() {
+                // When miss_auto_increment_column is true, the batch has all columns
+                // but the auto-increment column has placeholder 0 values.  We must go
+                // through the partial upsert path so existing auto-increment values are
+                // preserved for existing rows and new IDs are allocated for new rows.
+                if ctx.partial_update.merge_condition.is_none()
+                    && !ctx.partial_update.auto_increment.miss_auto_increment_column
+                {
                     return Ok(LakeBatchWriteRouting::Upsert { data_batch });
                 }
                 let materialized = materialize_partial_upsert_batch(
@@ -1114,6 +1120,11 @@ fn materialize_present_auto_increment_column(
     let Some(auto_col_idx) = auto_policy.auto_increment_column_idx else {
         return Ok(batch.clone());
     };
+    // When miss_auto_increment_column is true, the partial upsert path handles
+    // allocation.  Do not allocate here to avoid double allocation.
+    if auto_policy.miss_auto_increment_column {
+        return Ok(batch.clone());
+    }
     let schema_to_batch = resolve_schema_column_batch_indexes(ctx, batch, batch_slot_ids)?;
     let Some(batch_idx) = schema_to_batch.get(auto_col_idx).and_then(|idx| *idx) else {
         return Ok(batch.clone());
@@ -2190,7 +2201,18 @@ fn materialize_partial_upsert_batch(
 
         let mut materialized_row = Vec::with_capacity(output_schema.fields().len());
         for col_idx in 0..output_schema.fields().len() {
-            if let Some(src_idx) = schema_to_batch.get(col_idx).and_then(|v| *v) {
+            // When miss_auto_increment_column is true, the auto-increment column in
+            // the batch has a 0 placeholder.  For existing rows use the existing value;
+            // for new rows allocate a fresh ID (fall through below).
+            let is_auto_placeholder = auto_policy.miss_auto_increment_column
+                && auto_col_idx == Some(col_idx);
+            if is_auto_placeholder {
+                if let Some(old_row) = existing_row.as_ref() {
+                    materialized_row.push(old_row[col_idx].clone());
+                    continue;
+                }
+                // New row — fall through to auto_increment allocation below.
+            } else if let Some(src_idx) = schema_to_batch.get(col_idx).and_then(|v| *v) {
                 materialized_row.push(data_batch.column(src_idx).slice(row_idx, 1));
                 continue;
             }

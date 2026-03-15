@@ -97,6 +97,13 @@ pub(crate) struct OlapTableSinkPlan {
     pub(crate) index_write_plans: Vec<SinkIndexWritePlan>,
     pub(crate) output_projection: Option<SinkOutputProjectionPlan>,
     pub(crate) auto_partition: Option<AutomaticPartitionPlan>,
+    /// Slot ID of the auto-increment column **in the sink chunk** (output projection space).
+    /// Resolved from schema_slot_bindings using auto_increment_column_idx.
+    /// Used to fill auto-increment NULLs before hash distribution, matching StarRocks
+    /// C++ BE behavior where IDs are assigned in original INSERT row order.
+    pub(crate) auto_increment_output_slot_id: Option<SlotId>,
+    pub(crate) null_expr_in_auto_increment: bool,
+    pub(crate) miss_auto_increment_column: bool,
 }
 
 #[derive(Clone)]
@@ -396,6 +403,23 @@ impl OlapTableSinkFactory {
             index_write_plans,
             output_projection,
             auto_partition,
+            auto_increment_output_slot_id: {
+                // Find the output-projection slot ID for the auto-increment column
+                // by looking up the schema_slot_bindings at the auto_increment_column_idx.
+                let auto_idx = primary_plan
+                    .write_targets
+                    .values()
+                    .next()
+                    .and_then(|t| t.context.partial_update.auto_increment.auto_increment_column_idx);
+                auto_idx.and_then(|idx| {
+                    primary_plan
+                        .schema_slot_bindings
+                        .get(idx)
+                        .and_then(|s| *s)
+                })
+            },
+            null_expr_in_auto_increment: sink.null_expr_in_auto_increment.unwrap_or(false),
+            miss_auto_increment_column: sink.miss_auto_increment_column.unwrap_or(false),
         };
 
         Ok(Self {

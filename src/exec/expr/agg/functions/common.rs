@@ -501,6 +501,7 @@ pub(in crate::exec::expr::agg) fn scalar_to_string(
 }
 
 fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
+    // Align with StarRocks: omit fractional part when zero (e.g. "2020-01-01 00:10:00" not "2020-01-01 00:10:00.000000")
     let timestamp_str = match unit {
         TimeUnit::Second => {
             let dt = DateTime::from_timestamp(value, 0)
@@ -509,24 +510,38 @@ fn format_timestamp(unit: TimeUnit, value: i64, tz: Option<&str>) -> String {
         }
         TimeUnit::Millisecond => {
             let seconds = value / 1_000;
-            let nanos = ((value % 1_000) * 1_000_000) as u32;
+            let millis = value.rem_euclid(1_000) as u32;
+            let nanos = millis * 1_000_000;
             let dt = DateTime::from_timestamp(seconds, nanos)
                 .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+            if millis == 0 {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
+            } else {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+            }
         }
         TimeUnit::Microsecond => {
-            let seconds = value / 1_000_000;
-            let nanos = ((value % 1_000_000) * 1_000) as u32;
+            let seconds = value.div_euclid(1_000_000);
+            let micros = value.rem_euclid(1_000_000) as u32;
+            let nanos = micros * 1_000;
             let dt = DateTime::from_timestamp(seconds, nanos)
                 .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            if micros == 0 {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
+            } else {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
         }
         TimeUnit::Nanosecond => {
-            let seconds = value / 1_000_000_000;
-            let nanos = (value % 1_000_000_000) as u32;
+            let seconds = value.div_euclid(1_000_000_000);
+            let nanos = value.rem_euclid(1_000_000_000) as u32;
             let dt = DateTime::from_timestamp(seconds, nanos)
                 .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string()
+            if nanos == 0 {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
+            } else {
+                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string()
+            }
         }
     };
     if let Some(tz) = tz {

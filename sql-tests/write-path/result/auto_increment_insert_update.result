@@ -1,0 +1,32 @@
+-- query 2
+id	name	job1	job2
+1	0	0	0
+
+-- query 3
+id	name	job1	job2
+1	0	0	0
+2	1	1	1
+
+-- query 4
+id	name	job1	job2
+1	0	0	99
+2	1	1	1
+
+-- query 5
+id	name	job1	job2
+1	0	0	99
+2	1	1	1
+100	5	5	5
+
+-- query 6
+id	name	job1	job2
+1	0	0	99
+2	1	1	1
+100	5	5	5
+3	7	7	7
+
+-- query 7
+k	v1
+1	1
+2	2
+3	300

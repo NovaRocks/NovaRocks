@@ -1,0 +1,17 @@
+
+-- query 4
+id	idx
+10	1
+20	2
+
+-- query 5
+id	idx
+10	1
+20	2
+
+-- query 6
+id	idx
+1	5
+2	6
+10	1
+20	2

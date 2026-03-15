@@ -118,17 +118,15 @@ impl ProcessorOperator for ValuesSourceOperator {
         if len == 0 {
             return Ok(None);
         }
-        let dop = self.dop.max(1) as usize;
+        // Emit all rows from driver 0 only. VALUES chunks are small literal
+        // data and do not benefit from parallelism.  Concentrating all rows in
+        // a single driver preserves the original INSERT row order, which is
+        // critical for deterministic AUTO_INCREMENT ID assignment.
         let driver_id = self.driver_id.max(0) as usize;
-        if driver_id >= dop {
+        if driver_id != 0 {
             return Ok(None);
         }
-        let start = (len * driver_id) / dop;
-        let end = (len * (driver_id + 1)) / dop;
-        if start >= end {
-            return Ok(None);
-        }
-        Ok(Some(self.chunk.slice(start, end - start)))
+        Ok(Some(self.chunk.clone()))
     }
 
     fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {

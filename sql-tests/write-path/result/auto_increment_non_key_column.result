@@ -1,0 +1,28 @@
+-- query 2
+id	name	job1	job2
+1	1	1	1
+
+-- query 3
+id	name	job1	job2
+1	1	1	1
+2	2	2	2
+
+-- query 4
+id	name	job1	job2
+1	1	1	1
+2	2	2	2
+5	5	100	5
+
+-- query 5
+id	name	job1	job2
+0	0	3	0
+1	1	1	1
+2	2	2	2
+5	5	100	5
+
+-- query 6
+id	name	job1	job2
+0	0	3	99
+1	1	1	1
+2	2	2	2
+5	5	100	5

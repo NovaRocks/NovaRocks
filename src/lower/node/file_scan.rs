@@ -564,19 +564,15 @@ pub(crate) fn lower_file_scan_node(
                 node.node_id, source_slot_id
             )
         })?;
-        let slot_desc = slot_descs
-            .iter()
-            .find(|slot_desc| {
-                slot_desc.parent == Some(params.src_tuple_id)
-                    && slot_desc.id == Some(source_slot_id_i32)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "FILE_SCAN_NODE node_id={} missing source slot descriptor for tuple_id={} slot_id={}",
-                    node.node_id, params.src_tuple_id, source_slot_id
-                )
-            })?;
-        let field_name = slot_name_from_desc(slot_desc)
+        let slot_desc = slot_descs.iter().find(|slot_desc| {
+            slot_desc.parent == Some(params.src_tuple_id)
+                && slot_desc.id == Some(source_slot_id_i32)
+        });
+        // Some source slots (e.g. ignored columns in stream load `columns:"k,v2,xx"`)
+        // may not have descriptors in the source tuple.  Use a fallback name so the
+        // CSV reader still sees the correct number of columns.
+        let field_name = slot_desc
+            .and_then(slot_name_from_desc)
             .unwrap_or_else(|| format!("src_col_{}", source_slot_id.as_u32()));
         source_field_names.push(field_name);
     }

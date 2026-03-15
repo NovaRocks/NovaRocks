@@ -400,6 +400,14 @@ fn materialize_auto_increment_for_sink_batch(
     if auto_column.null_count() == 0 {
         return Ok(batch.clone());
     }
+    // When miss_auto_increment_column is true, the auto-increment column is a
+    // placeholder NULL.  Do not allocate IDs here — the lake writer's partial
+    // upsert path handles it: existing rows keep their value, new rows get a
+    // fresh ID.  We must keep the NULLs so the non-nullable filter below
+    // skips this column (handled by the auto-increment column exemption).
+    if auto_policy.miss_auto_increment_column {
+        return Ok(batch.clone());
+    }
     let auto_col_name = auto_policy
         .auto_increment_column_name
         .as_deref()
@@ -413,6 +421,10 @@ fn materialize_auto_increment_for_sink_batch(
         })
         .unwrap_or("<auto_increment>");
 
+    // When null_expr_in_auto_increment is true, mark null rows as rejected and
+    // return early.  The auto-increment counter was already advanced by the
+    // pre-routing fill (fill_auto_increment_in_chunk_before_routing), so we
+    // must NOT allocate again here.
     if auto_policy.null_expr_in_auto_increment {
         for row_idx in 0..batch.num_rows() {
             if !auto_column.is_null(row_idx) || rejected[row_idx] {
@@ -533,6 +545,156 @@ fn materialize_auto_increment_for_sink_batch(
         .map_err(|e| format!("OLAP_TABLE_SINK build auto_increment batch failed: {e}"))
 }
 
+/// Fills auto-increment NULLs in a sink chunk BEFORE hash distribution, so that
+/// IDs are assigned in the original INSERT row order. This matches StarRocks C++ BE
+/// behavior where `_fill_auto_increment_id` is called before row routing.
+///
+/// When `miss_auto_increment_column` is true (partial update that does not include
+/// the auto-increment column), NULLs are filled with 0 and real allocation is
+/// deferred to the lake writer (DeltaWriter equivalent).
+/// Merges multiple sink chunks into a single chunk so that auto-increment IDs
+/// are allocated in one sequential batch. The FE may split a single INSERT
+/// statement into multiple per-row chunks; merging them here ensures the
+/// auto-increment counter advances in the original row order.
+fn merge_sink_chunks_for_auto_increment(chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
+    if chunks.len() <= 1 {
+        return Ok(chunks);
+    }
+    // All chunks should share the same schema.
+    let first = match chunks.first() {
+        Some(c) if !c.is_empty() => c,
+        _ => return Ok(chunks),
+    };
+    let schema = first.batch.schema();
+    let chunk_schema = first.chunk_schema_ref();
+
+    let merged = concat_batches(&schema, chunks.iter().map(|c| &c.batch))
+        .map_err(|e| format!("merge sink chunks for auto_increment failed: {e}"))?;
+    let merged_chunk = Chunk::try_new_with_chunk_schema(merged, chunk_schema)?;
+    Ok(vec![merged_chunk])
+}
+
+fn fill_auto_increment_in_chunk_before_routing(
+    chunk: &Chunk,
+    plan: &OlapTableSinkPlan,
+) -> Result<Chunk, String> {
+    let Some(auto_slot_id) = plan.auto_increment_output_slot_id else {
+        return Ok(chunk.clone());
+    };
+    if plan.miss_auto_increment_column {
+        // Partial update without auto-increment column in input —
+        // real allocation is deferred to the lake writer (DeltaWriter equivalent).
+        return Ok(chunk.clone());
+    }
+    // Note: null_expr_in_auto_increment does NOT skip allocation here.
+    // IDs must still be allocated to advance the counter, matching StarRocks
+    // C++ BE where _fill_auto_increment_id always allocates and _validate_data
+    // rejects null rows afterwards.
+    let Some(&batch_idx) = chunk.slot_id_to_index().get(&auto_slot_id) else {
+        return Ok(chunk.clone());
+    };
+    let auto_column = chunk.batch.column(batch_idx);
+    if auto_column.null_count() == 0 {
+        return Ok(chunk.clone());
+    }
+
+    // Build delete-row mask: delete rows get value 0 (same as C++ BE).
+    let delete_rows = delete_row_mask_for_auto_increment(&chunk.batch)?;
+    let alloc_rows = (0..chunk.batch.num_rows())
+        .filter(|i| {
+            auto_column.is_null(*i)
+                && !delete_rows
+                    .as_ref()
+                    .is_some_and(|m| m.get(*i).copied().unwrap_or(false))
+        })
+        .count();
+
+    // Allocate IDs from FE.
+    let allocated_ids = if alloc_rows == 0 {
+        Vec::new()
+    } else {
+        let fe_addr = plan
+            .write_targets
+            .values()
+            .next()
+            .and_then(|t| t.context.partial_update.auto_increment.fe_addr.as_ref())
+            .ok_or_else(|| {
+                "OLAP_TABLE_SINK cannot allocate auto_increment id without FE address".to_string()
+            })?;
+        allocate_auto_increment_ids(fe_addr, plan.table_id, alloc_rows)?
+    };
+
+    // When null_expr_in_auto_increment is true, we consumed IDs from the counter
+    // (above) but must NOT fill them into the column.  Keeping the NULLs allows
+    // the per-tablet non-nullable check to reject these rows — matching StarRocks
+    // C++ BE where _fill_auto_increment_id writes to the data column but the null
+    // bitmap is preserved, and _validate_data rejects based on that bitmap.
+    if plan.null_expr_in_auto_increment {
+        return Ok(chunk.clone());
+    }
+
+    let mut next_alloc = 0usize;
+    let filled: ArrayRef = match auto_column.data_type() {
+        DataType::Int64 => {
+            let typed = auto_column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "downcast Int64Array failed".to_string())?;
+            let values: Vec<i64> = (0..typed.len())
+                .map(|i| {
+                    if typed.is_null(i) {
+                        let is_delete = delete_rows
+                            .as_ref()
+                            .is_some_and(|m| m.get(i).copied().unwrap_or(false));
+                        if is_delete {
+                            0i64
+                        } else {
+                            let v = allocated_ids.get(next_alloc).copied().unwrap_or(0);
+                            next_alloc += 1;
+                            v
+                        }
+                    } else {
+                        typed.value(i)
+                    }
+                })
+                .collect();
+            Arc::new(Int64Array::from(values))
+        }
+        DataType::Int32 => {
+            let typed = auto_column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| "downcast Int32Array failed".to_string())?;
+            let values: Vec<i32> = (0..typed.len())
+                .map(|i| {
+                    if typed.is_null(i) {
+                        let is_delete = delete_rows
+                            .as_ref()
+                            .is_some_and(|m| m.get(i).copied().unwrap_or(false));
+                        if is_delete {
+                            0i32
+                        } else {
+                            let v = allocated_ids.get(next_alloc).copied().unwrap_or(0);
+                            next_alloc += 1;
+                            v as i32
+                        }
+                    } else {
+                        typed.value(i)
+                    }
+                })
+                .collect();
+            Arc::new(Int32Array::from(values))
+        }
+        _ => return Ok(chunk.clone()),
+    };
+
+    let mut columns = chunk.batch.columns().to_vec();
+    columns[batch_idx] = filled;
+    let new_batch = RecordBatch::try_new(chunk.batch.schema(), columns)
+        .map_err(|e| format!("build auto_increment pre-routing batch failed: {e}"))?;
+    Chunk::try_new_with_chunk_schema(new_batch, chunk.chunk_schema_ref())
+}
+
 fn filter_rows_for_tablet_schema(
     batch: &RecordBatch,
     tablet_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
@@ -560,9 +722,22 @@ fn filter_rows_for_tablet_schema(
     let column_count = materialized_batch
         .num_columns()
         .min(tablet_schema.column.len());
+    let auto_increment_schema_idx = auto_increment
+        .and_then(|p| p.auto_increment_column_idx);
     for column_idx in 0..column_count {
         let schema_col = &tablet_schema.column[column_idx];
         if schema_col.is_nullable.unwrap_or(true) {
+            continue;
+        }
+        // Skip non-nullable check for auto-increment column ONLY when
+        // miss_auto_increment_column is true (the column has placeholder NULLs
+        // that the lake writer will fill).  For normal INSERT paths, NULLs in
+        // auto-increment columns are already filled by the pre-routing fill or
+        // per-tablet materialize; remaining NULLs indicate data-level NULLs
+        // (e.g. INSERT...SELECT from a nullable source) and should be rejected.
+        if auto_increment_schema_idx == Some(column_idx)
+            && auto_increment.is_some_and(|p| p.miss_auto_increment_column)
+        {
             continue;
         }
         let column = materialized_batch.column(column_idx);
@@ -1587,11 +1762,20 @@ impl OlapTableSinkOperator {
             let sink_chunks = self.prepare_sink_chunks(&pending_chunks)?;
             self.ensure_auto_partitions_for_chunks(&sink_chunks)?;
             let index_write_plans = self.index_write_plans.clone();
+            // Merge all sink chunks into one so that auto-increment IDs are
+            // allocated in a single sequential batch, matching the original
+            // INSERT row order.  StarRocks C++ BE receives all rows in a single
+            // chunk; NovaRocks may receive per-row chunks from the FE.
+            let sink_chunks = merge_sink_chunks_for_auto_increment(sink_chunks)?;
             let mut buffered_by_tablet = BTreeMap::<i64, TabletBufferedState>::new();
             for sink_chunk in &sink_chunks {
                 if sink_chunk.is_empty() {
                     continue;
                 }
+                // Fill auto-increment NULLs before hash distribution so that IDs
+                // are assigned in the original INSERT row order (matching C++ BE).
+                let sink_chunk =
+                    &fill_auto_increment_in_chunk_before_routing(sink_chunk, &self.plan)?;
                 let chunk_random_hash_seed = self.next_random_hash;
                 let mut first_plan_next_random_hash = chunk_random_hash_seed;
                 for (plan_idx, index_plan) in index_write_plans.iter().enumerate() {
@@ -1708,10 +1892,7 @@ impl OlapTableSinkOperator {
                             flush_tracking_logs
                                 .extend(filtered_batch.tracking_logs.iter().cloned());
                         }
-                        let routed_chunk = if filtered_batch.batch.num_rows() == routed_chunk.len()
-                        {
-                            routed_chunk
-                        } else {
+                        let routed_chunk = {
                             let filtered_schema = routed_chunk.chunk_schema_ref();
                             Chunk::try_new_with_chunk_schema(filtered_batch.batch, filtered_schema)?
                         };

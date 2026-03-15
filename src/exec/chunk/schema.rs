@@ -516,9 +516,15 @@ pub(super) fn validate_chunk_schema_against_batch(
         let expected = chunk_schema
             .field(idx)
             .ok_or_else(|| format!("missing chunk schema slot at index {}", idx))?;
+        // Allow nullable batch fields to satisfy a non-nullable contract.
+        // Source operators (e.g. FILE_SCAN for CSV) always produce nullable
+        // columns; the actual NOT-NULL constraint is enforced downstream
+        // (e.g. by the sink's row validation or the storage layer).
+        let nullable_ok =
+            field.is_nullable() == expected.is_nullable() || field.is_nullable();
         if field.name() != expected.name()
             || field.data_type() != expected.data_type()
-            || field.is_nullable() != expected.is_nullable()
+            || !nullable_ok
         {
             return Err(format!(
                 "chunk schema field mismatch at index {}: batch=({}, {:?}, {}) contract=({}, {:?}, {})",
