@@ -112,6 +112,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
                     .with_context(|| format!("invalid retry_interval_ms: {}", raw_value))?;
                 meta.retry_interval_ms = Some(value);
             }
+            "wait_alter_column" => {
+                meta.wait_alter_column = Some(raw_value);
+            }
+            "wait_alter_rollup" => {
+                meta.wait_alter_rollup = Some(raw_value);
+            }
             _ => {}
         }
     }
@@ -150,6 +156,14 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         skip_result_check: override_meta.skip_result_check || base.skip_result_check,
         retry_count: override_meta.retry_count.or(base.retry_count),
         retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
+        wait_alter_column: override_meta
+            .wait_alter_column
+            .clone()
+            .or_else(|| base.wait_alter_column.clone()),
+        wait_alter_rollup: override_meta
+            .wait_alter_rollup
+            .clone()
+            .or_else(|| base.wait_alter_rollup.clone()),
     }
 }
 

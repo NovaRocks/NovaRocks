@@ -1,0 +1,58 @@
+-- query 2
+id	user_id	recharge_money	province	dt
+1	1	1.00	hangzhou	2022-04-01
+
+-- query 4
+id	user_id	recharge_money	province	dt
+1	1	1.00	beijing	2022-03-01
+1	1	1.00	hangzhou	2022-04-01
+
+-- query 5
+id	user_id	recharge_money	province	dt
+1	1	1.00	hangzhou	2022-04-01
+
+-- query 6
+dt	user_id	recharge_money	province	id
+2022-04-01 00:00:00	1	1.00	hangzhou	1
+
+-- query 7
+dt	user_id	recharge_money	province	id
+2022-04-01	1	1.00	hangzhou	1
+
+-- query 11
+c1	c2	c3
+2025-12-01	0	0
+2025-12-01	1	1
+
+-- query 12
+c1	c2	c3
+2025-12-01	0	0
+2025-12-01	0	0
+2025-12-01	1	1
+2025-12-01	1	1
+
+-- query 20
+col1	col2	col3
+A.COM	val1	200
+A.COm	val1	300
+A.Com	val1	300
+A.coM	val1	200
+A.com	val1	200
+a.COM	val1	300
+a.cOM	val1	100
+a.cOm	val1	100
+a.com	val1	100
+b.cOm	val1	100
+
+-- query 21
+col1	col2	col3
+a.com	val1	100
+
+-- query 22
+col1	col2	col3
+A.com	val1	200
+
+-- query 23
+col1	col2	col3
+A.com	val1	200
+a.com	val1	100

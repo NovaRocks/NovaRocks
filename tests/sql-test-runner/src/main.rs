@@ -248,6 +248,107 @@ struct PreparedSuite {
 }
 
 // ---------------------------------------------------------------------------
+// wait_alter helper – polls SHOW ALTER TABLE until the latest job is FINISHED
+// ---------------------------------------------------------------------------
+
+fn execute_wait_alter(
+    session: &mut MysqlSession,
+    query_timeout: u64,
+    db_name: &str,
+    table_name: &str,
+    kind: &str, // "COLUMN" or "ROLLUP"
+    max_retries: usize,
+    interval: Duration,
+    log: &mut String,
+) -> (bool, Duration) {
+    let show_sql = format!(
+        "SHOW ALTER TABLE {} FROM `{}` WHERE TableName = '{}' ORDER BY CreateTime DESC LIMIT 1",
+        kind, db_name, table_name,
+    );
+    let mut total_elapsed = Duration::ZERO;
+    for attempt in 0..max_retries {
+        let (ok, execution, _err) = session.execute_query(query_timeout, &show_sql, None);
+        if let Some(ref exec) = execution {
+            total_elapsed += exec.elapsed;
+        }
+        if ok {
+            if let Some(exec) = &execution {
+                if exec.text_output.contains("FINISHED") {
+                    let _ = writeln!(
+                        log,
+                        "    ✅ wait_alter_{} on `{}` finished (attempt {}/{})",
+                        kind.to_lowercase(),
+                        table_name,
+                        attempt + 1,
+                        max_retries,
+                    );
+                    return (true, total_elapsed);
+                }
+            }
+        }
+        if attempt + 1 < max_retries {
+            let _ = writeln!(
+                log,
+                "    ⏳ wait_alter_{} on `{}`: attempt {}/{}, retrying after {}ms",
+                kind.to_lowercase(),
+                table_name,
+                attempt + 1,
+                max_retries,
+                interval.as_millis(),
+            );
+            sleep(interval);
+        }
+    }
+    let _ = writeln!(
+        log,
+        "    ❌ wait_alter_{} on `{}` timed out after {} retries",
+        kind.to_lowercase(),
+        table_name,
+        max_retries,
+    );
+    (false, total_elapsed)
+}
+
+/// Run all wait_alter annotations on a step.  Returns (ok, extra_elapsed).
+fn run_step_wait_alters(
+    step: &SqlStep,
+    session: &mut MysqlSession,
+    query_timeout: u64,
+    primary_case_db: Option<&str>,
+    log: &mut String,
+) -> (bool, Duration) {
+    let mut total = Duration::ZERO;
+    let db = step
+        .meta
+        .db
+        .as_deref()
+        .or(primary_case_db)
+        .unwrap_or("");
+    for (table, kind, default_retries) in [
+        (&step.meta.wait_alter_column, "COLUMN", 60usize),
+        (&step.meta.wait_alter_rollup, "ROLLUP", 120usize),
+    ] {
+        if let Some(table_name) = table {
+            let (ok, elapsed) = execute_wait_alter(
+                session,
+                query_timeout,
+                db,
+                table_name,
+                kind,
+                default_retries,
+                Duration::from_secs(1),
+                log,
+            );
+            total += elapsed;
+            if !ok {
+                return (false, total);
+            }
+        }
+    }
+    (true, total)
+}
+
+// ---------------------------------------------------------------------------
 // Per-case execution
 // ---------------------------------------------------------------------------
 
@@ -657,7 +758,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = expected_error;
                     }
                 } else if let Some(execution) = passed_execution {
-                    if !ctx.verify_enabled {
+                    // Run wait_alter post-execution polling if annotated.
+                    let (wait_ok, wait_elapsed) = run_step_wait_alters(
+                        step,
+                        &mut target_session,
+                        ctx.query_timeout,
+                        primary_case_db,
+                        &mut log,
+                    );
+                    case_elapsed += wait_elapsed;
+                    if !wait_ok {
+                        case_failed = true;
+                    } else if !ctx.verify_enabled {
                         let _ = writeln!(
                             log,
                             "    ✅ PASS (verify disabled) ({:.2}s)",
@@ -829,28 +941,41 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {}", last_failure);
                     }
                 } else if let Some(execution) = recorded_execution {
-                    if step_requires_recorded_result(step) {
-                        recorded_results.insert(
-                            step.query_number,
-                            ResultSet {
-                                header: execution.header.clone(),
-                                rows: execution.rows.clone(),
-                            },
-                        );
-                    }
-                    if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ STEP RECORDED ({:.2}s, skip_result_check)",
-                            execution.elapsed.as_secs_f64()
-                        );
+                    // Run wait_alter post-execution polling if annotated.
+                    let (wait_ok, wait_elapsed) = run_step_wait_alters(
+                        step,
+                        &mut target_session,
+                        ctx.query_timeout,
+                        primary_case_db,
+                        &mut log,
+                    );
+                    case_elapsed += wait_elapsed;
+                    if !wait_ok {
+                        case_failed = true;
                     } else {
-                        let _ = writeln!(
-                            log,
-                            "    ✅ STEP RECORDED ({:.2}s, rows={})",
-                            execution.elapsed.as_secs_f64(),
-                            execution.rows.len()
-                        );
+                        if step_requires_recorded_result(step) {
+                            recorded_results.insert(
+                                step.query_number,
+                                ResultSet {
+                                    header: execution.header.clone(),
+                                    rows: execution.rows.clone(),
+                                },
+                            );
+                        }
+                        if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
+                            let _ = writeln!(
+                                log,
+                                "    ✅ STEP RECORDED ({:.2}s, skip_result_check)",
+                                execution.elapsed.as_secs_f64()
+                            );
+                        } else {
+                            let _ = writeln!(
+                                log,
+                                "    ✅ STEP RECORDED ({:.2}s, rows={})",
+                                execution.elapsed.as_secs_f64(),
+                                execution.rows.len()
+                            );
+                        }
                     }
                 } else {
                     case_failed = true;

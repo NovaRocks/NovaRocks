@@ -1,0 +1,47 @@
+-- query 2
+count(*)
+2
+
+-- query 4
+count(*)
+4
+
+-- query 6
+count(*)
+8
+
+-- query 8
+count(*)
+16
+
+-- query 10
+count(*)
+32
+
+-- query 11
+event_day	pv
+2000-01-01	2
+
+-- query 13
+event_day	pv
+2002-01-01	2
+
+-- query 14
+count(*)
+1
+
+-- query 16
+count(*)
+2
+
+-- query 18
+count(*)
+3
+
+-- query 20
+count(*)
+12
+
+-- query 21
+count(*)
+12

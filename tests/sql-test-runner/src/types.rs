@@ -29,6 +29,12 @@ pub struct QueryMeta {
     pub skip_result_check: bool,
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
+    /// After the step SQL executes, poll `SHOW ALTER TABLE COLUMN` until FINISHED.
+    /// Value is the table name.
+    pub wait_alter_column: Option<String>,
+    /// After the step SQL executes, poll `SHOW ALTER TABLE ROLLUP` until FINISHED.
+    /// Value is the table name.
+    pub wait_alter_rollup: Option<String>,
 }
 
 #[derive(Debug, Clone)]
