@@ -1,0 +1,48 @@
+-- query 3
+@@time_zone
+Asia/Shanghai
+
+-- query 4
+to_datetime(1598306400, 0)
+2020-08-25 06:00:00
+
+-- query 5
+to_datetime(1598306400)
+2020-08-25 06:00:00
+
+-- query 6
+to_datetime(1598306400123, 3)
+2020-08-25 06:00:00.123000
+
+-- query 7
+to_datetime(1598306400123456, 6)
+2020-08-25 06:00:00.123456
+
+-- query 8
+to_datetime(0, 0)
+1970-01-01 08:00:00
+
+-- query 9
+to_datetime(253402243199, 0)
+9999-12-31 15:59:59
+
+-- query 10
+to_datetime(1598306400, 10)
+NULL
+
+-- query 11
+to_datetime(1598306400, NULL)
+NULL
+
+-- query 12
+to_datetime(NULL, NULL)
+NULL
+
+-- query 13
+dyn_scale_timezone_aware
+2020-08-25 06:00:00.123456
+2020-08-25 06:00:00.123000
+2020-08-25 06:00:00
+1970-01-01 07:59:58.999000
+NULL
+NULL

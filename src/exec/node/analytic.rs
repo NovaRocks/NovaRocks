@@ -73,6 +73,7 @@ pub enum WindowFunctionKind {
     Min,
     Max,
     BitmapUnion,
+    BitmapUnionCount,
     MinBy,
     MinByV2,
     VarianceSamp,

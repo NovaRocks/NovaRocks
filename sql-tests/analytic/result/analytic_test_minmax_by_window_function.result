@@ -1,0 +1,59 @@
+-- query 2
+count(mb)	sum(mb)
+40960	838881280
+
+-- query 3
+count(mb)	sum(mb)
+40960	838881280
+
+-- query 4
+count(mb)	sum(mb)
+40960	838881280
+
+-- query 5
+count(mb)	max(mb)
+40960	9999
+
+-- query 6
+count(mb)	max(get_json_int(mb, '$'))
+40960	40960
+
+-- query 8
+count(mb)	sum(mb)
+40960	838881280
+
+-- query 9
+count(mb)	sum(mb)
+40960	838881280
+
+-- query 10
+count(mb)	sum(mb)
+40960	838881280
+
+-- query 11
+count(mb)	max(mb)
+40960	9999
+
+-- query 12
+count(mb)	max(get_json_int(mb, '$'))
+40960	40960
+
+-- query 13
+count(mb)
+40960
+
+-- query 14
+count(mb)
+40960
+
+-- query 15
+count(mb)
+40960
+
+-- query 16
+count(mb)
+40960
+
+-- query 17
+count(mb)
+40960
