@@ -1027,13 +1027,34 @@ fn chunk_schema_for_wire_meta(
         if let Some(type_desc) = expected_slot.type_desc() {
             if let Some(expected_arrow_type) = arrow_type_from_desc(type_desc) {
                 if field.data_type() != &expected_arrow_type {
-                    return Err(format!(
-                        "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?}",
-                        idx,
-                        slot_id,
+                    // Allow a numeric type flowing where a Binary opaque slot is expected.
+                    // This occurs in PARTITION-TOP-N pre-aggregation: avg/hll/percentile
+                    // intermediate states are declared as VARBINARY in the FE slot descriptor,
+                    // but the pre-agg passthrough sends the raw numeric input column directly.
+                    // The analytic window operator accepts numeric inputs for these functions.
+                    use arrow::datatypes::DataType;
+                    let is_opaque_binary_expected = matches!(
+                        expected_arrow_type,
+                        DataType::Binary | DataType::LargeBinary
+                    );
+                    let is_numeric_actual = matches!(
                         field.data_type(),
-                        expected_arrow_type
-                    ));
+                        DataType::Int8
+                            | DataType::Int16
+                            | DataType::Int32
+                            | DataType::Int64
+                            | DataType::Float32
+                            | DataType::Float64
+                    );
+                    if !(is_opaque_binary_expected && is_numeric_actual) {
+                        return Err(format!(
+                            "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?}",
+                            idx,
+                            slot_id,
+                            field.data_type(),
+                            expected_arrow_type
+                        ));
+                    }
                 }
             }
         }

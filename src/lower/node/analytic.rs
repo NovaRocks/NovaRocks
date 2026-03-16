@@ -262,6 +262,7 @@ fn lower_window_function(
         "min" => WindowFunctionKind::Min,
         "max" => WindowFunctionKind::Max,
         "bitmap_union" => WindowFunctionKind::BitmapUnion,
+        "bitmap_union_count" => WindowFunctionKind::BitmapUnionCount,
         "min_by" => WindowFunctionKind::MinBy,
         "min_by_v2" => WindowFunctionKind::MinByV2,
         "var_samp" | "variance_samp" => WindowFunctionKind::VarianceSamp,
@@ -560,9 +561,9 @@ fn validate_window_function_signature(
                 return Err("count expects 0 or 1 arguments".to_string());
             }
         }
-        WindowFunctionKind::BitmapUnion => {
+        WindowFunctionKind::BitmapUnion | WindowFunctionKind::BitmapUnionCount => {
             if args.len() != 1 {
-                return Err("bitmap_union expects 1 argument".to_string());
+                return Err("bitmap_union/bitmap_union_count expects 1 argument".to_string());
             }
         }
         WindowFunctionKind::MinBy | WindowFunctionKind::MinByV2 => {

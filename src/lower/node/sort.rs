@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use arrow::datatypes::DataType;
+
 use crate::exec::expr::ExprArena;
 use crate::exec::expr::ExprNode;
 use crate::exec::node::project::ProjectNode;
@@ -25,6 +27,7 @@ use crate::descriptors;
 use crate::lower::expr::lower_t_expr;
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
+use crate::lower::type_lowering::arrow_type_from_desc;
 
 use crate::{exprs, plan_nodes, types};
 
@@ -456,7 +459,28 @@ fn lower_pre_agg_fallback_expr(
     let child_expr = exprs::TExpr {
         nodes: agg_expr.nodes[first_child_start..first_child_end].to_vec(),
     };
-    lower_t_expr(&child_expr, arena, input_layout, last_query_id, fe_addr)
+    let child_id = lower_t_expr(&child_expr, arena, input_layout, last_query_id, fe_addr)?;
+
+    // Cast the passthrough to the aggregate's declared output type if they differ.
+    // For example, sum(INT) has BIGINT output type but the raw passthrough is INT.
+    // The exchange receiver uses the slot descriptor type (BIGINT), so we must upcast here.
+    //
+    // Skip the cast for opaque binary types (e.g., avg/hll intermediate states declared as
+    // VARBINARY). Those cannot be meaningfully cast from numeric input; the exchange decode
+    // is responsible for tolerating the type mismatch in that case.
+    if let Some(agg_output_type) = arrow_type_from_desc(&root.type_) {
+        let child_type = arena.data_type(child_id).cloned().unwrap_or(DataType::Null);
+        if child_type != agg_output_type
+            && !matches!(
+                agg_output_type,
+                DataType::Null | DataType::Binary | DataType::LargeBinary
+            )
+        {
+            return Ok(arena.push_typed(ExprNode::Cast(child_id), agg_output_type));
+        }
+    }
+
+    Ok(child_id)
 }
 
 fn walk_subtree_end(nodes: &[exprs::TExprNode], idx: &mut usize) -> Result<(), String> {

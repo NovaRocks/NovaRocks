@@ -1,0 +1,31 @@
+-- query 2
+c1	bitmap_to_string(bitmap_union(c2) OVER ())
+1	11,22,55
+2	11,22,55
+3	11,22,55
+4	11,22,55
+5	11,22,55
+
+-- query 3
+c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 ))
+1	11
+2	22
+3	NULL
+4	
+5	55
+
+-- query 4
+c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 % 2 ))
+1	11,55
+2	22
+3	11,55
+4	22
+5	11,55
+
+-- query 5
+c1	bitmap_to_string(bitmap_union(c2) OVER (PARTITION BY c1 % 2 ORDER BY c1 ASC ))
+1	11
+2	22
+3	11
+4	22
+5	11,55

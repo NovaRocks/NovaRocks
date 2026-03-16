@@ -263,8 +263,39 @@ impl AnalyticSharedState {
                 }
             }
         }
+
+        // If any column's actual type or nullability differs from the pre-declared schema
+        // (e.g., a pass-through pre-agg slot declared as VARBINARY/non-nullable but carrying
+        // numeric or nullable data), rebuild the output schema from the actual columns.
+        let needs_schema_adjustment = columns.iter().zip(output_chunk_schema.slots()).any(
+            |(col, slot)| {
+                let f = slot.field();
+                col.data_type() != f.data_type()
+                    || (col.null_count() > 0 && !f.is_nullable())
+            },
+        );
+        let effective_schema = if needs_schema_adjustment {
+            let fields: Vec<arrow::datatypes::Field> = columns
+                .iter()
+                .zip(output_chunk_schema.slots())
+                .map(|(col, slot)| {
+                    let f = slot.field();
+                    let nullable = f.is_nullable() || col.null_count() > 0;
+                    if col.data_type() != f.data_type() || nullable != f.is_nullable() {
+                        arrow::datatypes::Field::new(f.name(), col.data_type().clone(), nullable)
+                    } else {
+                        f.clone()
+                    }
+                })
+                .collect();
+            Arc::new(output_chunk_schema.with_fields_in_order(fields)
+                .map_err(|e| format!("build analytic adjusted schema: {}", e))?)
+        } else {
+            output_chunk_schema
+        };
+
         Ok(VecDeque::from(vec![
-            Chunk::try_new_with_columns(output_chunk_schema, columns)
+            Chunk::try_new_with_columns(effective_schema, columns)
                 .map_err(|e| format!("build analytic output batch: {}", e))?,
         ]))
     }
@@ -323,6 +354,7 @@ fn should_reorder_window_input(
                 | WindowFunctionKind::Min
                 | WindowFunctionKind::Max
                 | WindowFunctionKind::BitmapUnion
+                | WindowFunctionKind::BitmapUnionCount
                 | WindowFunctionKind::MinBy
                 | WindowFunctionKind::MinByV2
                 | WindowFunctionKind::VarianceSamp
@@ -672,6 +704,15 @@ fn compute_window_function(
         ),
         WindowFunctionKind::BitmapUnion => compute_window_custom_aggregate(
             "bitmap_union",
+            args,
+            partitions,
+            order_keys,
+            window,
+            &func.return_type,
+            total_rows,
+        ),
+        WindowFunctionKind::BitmapUnionCount => compute_window_custom_aggregate(
+            "bitmap_union_count",
             args,
             partitions,
             order_keys,

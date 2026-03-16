@@ -1,0 +1,44 @@
+-- query 2
+to_datetime_ntz(1598306400, 0)
+2020-08-24 22:00:00
+
+-- query 3
+to_datetime_ntz(1598306400)
+2020-08-24 22:00:00
+
+-- query 4
+to_datetime_ntz(1598306400123, 3)
+2020-08-24 22:00:00.123000
+
+-- query 5
+to_datetime_ntz(1598306400123456, 6)
+2020-08-24 22:00:00.123456
+
+-- query 6
+to_datetime_ntz(0, 0)
+1970-01-01 00:00:00
+
+-- query 7
+to_datetime_ntz(253402243199, 0)
+9999-12-31 07:59:59
+
+-- query 8
+to_datetime_ntz(1598306400, 10)
+NULL
+
+-- query 9
+to_datetime_ntz(1598306400, NULL)
+NULL
+
+-- query 10
+to_datetime_ntz(NULL, NULL)
+NULL
+
+-- query 11
+dyn_scale
+2020-08-24 22:00:00.123456
+2020-08-24 22:00:00.123000
+2020-08-24 22:00:00
+1969-12-31 23:59:58.999000
+NULL
+NULL
