@@ -1,0 +1,62 @@
+-- query 3
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{"1":'1',"2":'true',"3":'null',"4":'[5, 6, 7]',"5":'{"k51": "v51", "k52": "v52"}'}
+
+-- query 4
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{1:'1',2:'true',3:'null',4:'[5, 6, 7]',5:'{"k51": "v51", "k52": "v52"}'}
+
+-- query 5
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{"1":"1","2":"true","3":null,"4":"[5, 6, 7]","5":"{\"k51\": \"v51\", \"k52\": \"v52\"}"}
+
+-- query 6
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{1:"1",2:"true",3:null,4:"[5, 6, 7]",5:"{\"k51\": \"v51\", \"k52\": \"v52\"}"}
+
+-- query 7
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{"1":null,"2":null,"3":null,"4":[5,6,7],"5":null}
+
+-- query 8
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{"1":null,"2":null,"3":null,"4":{"k51":"5","k52":"6"},"5":{"k51":"v51","k52":"v52"}}
+
+-- query 9
+c1	m
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+6	{"1":null,"2":null,"3":null,"4":null,"5":{"k51":"v51","k52":"v52"}}

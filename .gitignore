@@ -17,3 +17,4 @@
 /tests/sql-test-runner/target
 thirdparty/installed
 .DS_Store
+nosetests.xml

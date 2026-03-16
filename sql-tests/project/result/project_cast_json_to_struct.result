@@ -1,0 +1,47 @@
+-- query 1
+CAST((parse_json('[1,2,3]')) AS struct<col1 int(11), col2 int(11), col3 int(11)>)
+{"col1":1,"col2":2,"col3":3}
+
+-- query 2
+CAST((parse_json('[1,2,3]')) AS struct<col1 int(11), col2 int(11)>)
+{"col1":1,"col2":2}
+
+-- query 3
+CAST((parse_json('[1,2,3]')) AS struct<col1 int(11), col2 int(11), col3 int(11), col4 int(11)>)
+{"col1":1,"col2":2,"col3":3,"col4":null}
+
+-- query 4
+CAST((parse_json('[1,   2,    3, "a"]')) AS struct<col1 int(11), col2 int(11), col3 int(11), col4 int(11)>)
+{"col1":1,"col2":2,"col3":3,"col4":null}
+
+-- query 5
+CAST((parse_json('[1.1, 2.2, 3.3]')) AS struct<col1 double, col2 double, col3 double>)
+{"col1":1.1,"col2":2.2,"col3":3.3}
+
+-- query 6
+CAST((parse_json('[1.1, 2.2, 3.3]')) AS struct<col1 double, col2 double, col3 int(11)>)
+{"col1":1.1,"col2":2.2,"col3":3}
+
+-- query 7
+CAST((parse_json('{"star": "rocks", "number": 1}')) AS struct<number int(11), star varchar>)
+{"number":1,"star":"rocks"}
+
+-- query 8
+CAST((parse_json('{"star": "rocks", "number": 1}')) AS struct<number int(11), not_found varchar>)
+{"number":1,"not_found":null}
+
+-- query 9
+CAST((parse_json('{"star": "rocks", "number": [1, 2, 3]}')) AS struct<number array<int(11)>, not_found varchar>)
+{"number":[1,2,3],"not_found":null}
+
+-- query 10
+CAST((parse_json('[1, [{"star": "rocks"}, {"star": "rocks"}]]')) AS struct<col1 int(11), col2 array<json>>)
+{"col1":1,"col2":['{"star": "rocks"}','{"star": "rocks"}']}
+
+-- query 11
+CAST((parse_json('{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}')) AS struct<star varchar(10), length int(11), numbers array<int(11)>, nest struct<col1 int(11), col2 int(11), col3 int(11)>>)
+{"star":"rocks","length":5,"numbers":[1,4,7],"nest":{"col1":1,"col2":2,"col3":3}}
+
+-- query 12
+CAST((parse_json('[{"star" : "rocks", "length": 5, "numbers": [1, 4, 7], "nest": [1, 2, 3]}, {"star" : "rockses", "length": 33, "numbers": [2, 5, 9], "nest": [3, 6, 9]}]')) AS ARRAY<struct<star varchar(10), length int(11), numbers array<int(11)>, nest struct<col1 int(11), col2 int(11), col3 int(11)>>>)
+[{"star":"rocks","length":5,"numbers":[1,4,7],"nest":{"col1":1,"col2":2,"col3":3}},{"star":"rockses","length":33,"numbers":[2,5,9],"nest":{"col1":3,"col2":6,"col3":9}}]

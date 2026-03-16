@@ -1,0 +1,258 @@
+-- query 1
+bitmap_to_string(sub_bitmap(bitmap_from_string(''), 0, 3))
+NULL
+
+-- query 2
+bitmap_to_string(sub_bitmap(bitmap_from_string(''), -1, 3))
+NULL
+
+-- query 3
+bitmap_to_string(sub_bitmap(bitmap_from_string('1'), 0, 3))
+1
+
+-- query 4
+bitmap_to_string(sub_bitmap(bitmap_from_string('1'), -1, 3))
+1
+
+-- query 5
+bitmap_to_string(sub_bitmap(bitmap_from_string('1'), 1, 3))
+NULL
+
+-- query 6
+bitmap_to_string(sub_bitmap(bitmap_from_string('1,0,1,2,3,1,5'), 0, 3))
+0,1,2
+
+-- query 7
+bitmap_to_string(sub_bitmap(bitmap_from_string('1,0,1,2,3,1,5'), 3, 6))
+3,5
+
+-- query 8
+bitmap_to_string(sub_bitmap(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, 3))
+1,2,3
+
+-- query 9
+bitmap_to_string(sub_bitmap(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, 3))
+11,12,13
+
+-- query 10
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(''), 0, 3))
+NULL
+
+-- query 11
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(''), -1, 3))
+NULL
+
+-- query 12
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1'), 0, 3))
+1
+
+-- query 13
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1'), -1, 3))
+1
+
+-- query 14
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1'), 1, 3))
+1
+
+-- query 15
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 0, 3))
+0,1,2
+
+-- query 16
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 3, 6))
+3,5
+
+-- query 17
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, 3))
+1,2,3
+
+-- query 18
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, 3))
+10,11,12
+
+-- query 19
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 0, -3))
+0
+
+-- query 20
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 0, -1))
+0
+
+-- query 21
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string('1,0,1,2,3,1,5'), 3, -6))
+0,1,2,3
+
+-- query 22
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, -3))
+NULL
+
+-- query 23
+bitmap_to_string(bitmap_subset_limit(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, -3))
+8,9,10
+
+-- query 24
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(''), 0, 3))
+NULL
+
+-- query 25
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(''), -1, 3))
+NULL
+
+-- query 26
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1'), 0, 3))
+1
+
+-- query 27
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1'), -1, 3))
+1
+
+-- query 28
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1'), 1, 3))
+1
+
+-- query 29
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1,0,1,2,3,1,5'), 0, 3))
+0,1,2
+
+-- query 30
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1,0,1,2,3,1,5'), 3, 6))
+3,5
+
+-- query 31
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 0, 3))
+1,2
+
+-- query 32
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 10, 3))
+NULL
+
+-- query 33
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(''), 3, 0))
+NULL
+
+-- query 34
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string('1,0,1,2,3,1,5'), 3, 0))
+NULL
+
+-- query 35
+bitmap_to_string(bitmap_subset_in_range(bitmap_from_string(group_concat(CAST(x AS VARCHAR(65533)),',' SEPARATOR ',')), 3, 0))
+NULL
+
+-- query 41
+bitmap_to_string(sub_bitmap(v1, -2, 3))
+NULL
+NULL
+9,10
+99,100
+
+-- query 42
+bitmap_to_string(sub_bitmap(v1, -1, 3))
+NULL
+1
+10
+100
+
+-- query 43
+bitmap_to_string(sub_bitmap(v1, 0, 3))
+NULL
+1
+1,2,3
+1,2,3
+
+-- query 44
+bitmap_to_string(sub_bitmap(v1, 1, 3))
+NULL
+NULL
+2,3,4
+2,3,4
+
+-- query 45
+bitmap_to_string(sub_bitmap(v1, 2, 3))
+NULL
+NULL
+3,4,5
+3,4,5
+
+-- query 46
+bitmap_to_string(bitmap_subset_limit(v1, 0, 3))
+NULL
+1
+1,2,3
+1,2,3
+
+-- query 47
+bitmap_to_string(bitmap_subset_limit(v1, 1, 3))
+NULL
+1
+1,2,3
+1,2,3
+
+-- query 48
+bitmap_to_string(bitmap_subset_limit(v1, 1, -3))
+NULL
+1
+1
+1
+
+-- query 49
+bitmap_to_string(bitmap_subset_limit(v1, 2, 3))
+NULL
+NULL
+2,3,4
+2,3,4
+
+-- query 50
+bitmap_to_string(bitmap_subset_limit(v1, 2, -3))
+NULL
+1
+1,2
+1,2
+
+-- query 51
+bitmap_to_string(bitmap_subset_limit(v1, 3, -3))
+NULL
+1
+1,2,3
+1,2,3
+
+-- query 52
+bitmap_to_string(bitmap_subset_in_range(v1, 0, 3))
+NULL
+1
+1,2
+1,2
+
+-- query 53
+bitmap_to_string(bitmap_subset_in_range(v1, -1, 3))
+NULL
+1
+1,2
+1,2
+
+-- query 54
+bitmap_to_string(bitmap_subset_in_range(v1, 1, 3))
+NULL
+1
+1,2
+1,2
+
+-- query 55
+bitmap_to_string(bitmap_subset_in_range(v1, 3, 2))
+NULL
+NULL
+NULL
+NULL
+
+-- query 56
+bitmap_to_string(bitmap_subset_in_range(v1, 2, 3))
+NULL
+NULL
+2
+2
+
+-- query 57
+bitmap_to_string(bitmap_subset_in_range(v1, -2, 3))
+NULL
+1
+1,2
+1,2

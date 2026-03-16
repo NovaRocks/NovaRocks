@@ -1,0 +1,7 @@
+-- query 1
+bitmap_to_base64(NULL)
+NULL
+
+-- query 2
+bitmap_to_base64(bitmap_from_string('abc'))
+NULL

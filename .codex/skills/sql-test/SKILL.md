@@ -130,31 +130,53 @@ mysql -h 127.0.0.1 -P<query_port_from_fe_conf> -u root -e "select 1"
 
 先在 `dev/test/sql` 下定位已有 case，再按目录执行，不要为常规验证重新造 case。
 
-通用检索方式：
+### 给定 case 名快速定位 T 文件路径
+
+T 文件位于 `dev/test/sql/*/T/` 下。给定 case 名（完整名或关键词），用以下命令找到完整路径：
 
 ```bash
-find dev/test/sql -maxdepth 3 -type f | sort
+# 精确查找（case 名就是文件夹名或文件名）
+find dev/test/sql -path "*/T/*" -name "*test_bucket_shuffle_right_join*"
+
+# 模糊查找（只记得关键词）
+find dev/test/sql -path "*/T/*" -name "*bucket_shuffle*"
+```
+
+输出示例：
+```
+dev/test/sql/test_bucket_shuffle_right_join/T/test_bucket_shuffle_right_join
+```
+
+从路径推断 `-d` 参数（**重要**：validate 模式读 R 文件，不是 T 文件）：
+- **整个文件夹**（跑该 case 下所有子 case）：`-d sql/test_bucket_shuffle_right_join/`（父目录，含 T/ 和 R/）
+- **单个文件**（精确跑某个 case）：`-d sql/test_bucket_shuffle_right_join/R/test_bucket_shuffle_right_join`
+
+> ⚠️ 禁止用 `-d sql/.../T/` 或 `-d sql/.../T/xxx`：validate 模式只使用 R 文件，给 T 路径会导致 `case num: 0`（零 case，静默跳过）。
+
+通用检索方式（按内容搜索）：
+
+```bash
 rg -n "<keyword>" dev/test/sql -S
 ```
 
 常见调用方式：
 
-- 跑一个目录：
+- 跑一个目录（父目录，包含 T/ 和 R/）：
 
 ```bash
 cd dev/test
 .venv311/bin/python run.py \
-  -d sql/test_profile/T/ \
+  -d sql/test_profile/ \
   --skip_reruns \
   -v -c 1 -t 300
 ```
 
-- 跑一个具体 case 文件：
+- 跑一个具体 case 文件（指向 R/ 文件）：
 
 ```bash
 cd dev/test
 .venv311/bin/python run.py \
-  -d sql/test_profile/T/test_profile_analysis \
+  -d sql/test_profile/R/test_profile_analysis \
   --skip_reruns \
   -v -c 1 -t 300
 ```
@@ -164,7 +186,7 @@ cd dev/test
 ```bash
 cd dev/test
 .venv311/bin/python run.py \
-  -d sql/test_profile/T/ \
+  -d sql/test_profile/ \
   --case_filter profile \
   --skip_reruns \
   -v -c 1 -t 300
@@ -180,6 +202,8 @@ cd dev/test
 
 ## 7) 失败分流（fail-fast）
 
+- `case num: 0`（零 case 静默跳过）
+  - 原因：给了 T 路径但 validate 模式读 R 文件。改用**父目录**（`-d sql/test_xxx/`）或 R 路径（`-d sql/test_xxx/R/xxx`）
 - `ModuleNotFoundError: no module named ...`
   - 在 `dev/test/.venv311` 内重装 `requirements.txt`
 - `Can't connect to MySQL server`

@@ -34,10 +34,6 @@ type DistinctSet = HashSet<Vec<u8>>;
 
 pub(super) struct CountDistinctAgg;
 
-fn canonical_agg_name(name: &str) -> &str {
-    name.split_once('|').map(|(base, _)| base).unwrap_or(name)
-}
-
 fn set_slot(ptr: *mut u8) -> *mut *mut DistinctSet {
     ptr as *mut *mut DistinctSet
 }
@@ -250,17 +246,16 @@ fn deserialize_set(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 impl AggregateFunction for CountDistinctAgg {
     fn build_spec_from_type(
         &self,
-        func: &AggFunction,
+        _func: &AggFunction,
         input_type: Option<&DataType>,
         _input_is_intermediate: bool,
     ) -> Result<AggSpec, String> {
         if input_type.is_none() {
             return Err("count_distinct requires 1 argument".to_string());
         }
-        let kind = match canonical_agg_name(func.name.as_str()) {
-            "multi_distinct_count" => AggKind::CountDistinctNonNegative,
-            _ => AggKind::CountDistinct,
-        };
+        // multi_distinct_count is the FE-internal name for all COUNT(DISTINCT) operations.
+        // Count all non-null distinct values regardless of sign.
+        let kind = AggKind::CountDistinct;
         Ok(AggSpec {
             kind,
             output_type: DataType::Int64,
@@ -272,7 +267,7 @@ impl AggregateFunction for CountDistinctAgg {
 
     fn state_layout_for(&self, kind: &AggKind) -> (usize, usize) {
         match kind {
-            AggKind::CountDistinct | AggKind::CountDistinctNonNegative => (
+            AggKind::CountDistinct => (
                 std::mem::size_of::<*mut DistinctSet>(),
                 std::mem::align_of::<*mut DistinctSet>(),
             ),
@@ -328,8 +323,6 @@ impl AggregateFunction for CountDistinctAgg {
         let AggInputView::Any(array) = input else {
             return Err("count_distinct batch input type mismatch".to_string());
         };
-        let non_negative_only = matches!(spec.kind, AggKind::CountDistinctNonNegative);
-
         match array.data_type() {
             DataType::Int64 => {
                 let arr = array
@@ -338,9 +331,6 @@ impl AggregateFunction for CountDistinctAgg {
                     .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
                 for (row, &base) in state_ptrs.iter().enumerate() {
                     if arr.is_null(row) {
-                        continue;
-                    }
-                    if non_negative_only && arr.value(row) < 0 {
                         continue;
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
@@ -358,9 +348,6 @@ impl AggregateFunction for CountDistinctAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    if non_negative_only && arr.value(row) < 0 {
-                        continue;
-                    }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
                     set.insert(encode_le(arr.value(row)));
@@ -376,9 +363,6 @@ impl AggregateFunction for CountDistinctAgg {
                     if arr.is_null(row) {
                         continue;
                     }
-                    if non_negative_only && arr.value(row) < 0 {
-                        continue;
-                    }
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let set = unsafe { get_or_init_set(ptr) };
                     set.insert(encode_le(arr.value(row)));
@@ -392,9 +376,6 @@ impl AggregateFunction for CountDistinctAgg {
                     .ok_or_else(|| "failed to downcast to Int8Array".to_string())?;
                 for (row, &base) in state_ptrs.iter().enumerate() {
                     if arr.is_null(row) {
-                        continue;
-                    }
-                    if non_negative_only && arr.value(row) < 0 {
                         continue;
                     }
                     let ptr = unsafe { (base as *mut u8).add(offset) };

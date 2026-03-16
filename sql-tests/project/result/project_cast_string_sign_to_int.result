@@ -1,0 +1,39 @@
+-- query 1
+CAST('-' AS TINYINT)
+NULL
+
+-- query 2
+CAST('-' AS SMALLINT)
+NULL
+
+-- query 3
+CAST('-' AS INT)
+NULL
+
+-- query 4
+CAST('-' AS BIGINT)
+NULL
+
+-- query 5
+CAST('-' AS LARGEINT)
+NULL
+
+-- query 6
+CAST('+' AS TINYINT)
+NULL
+
+-- query 7
+CAST('+' AS SMALLINT)
+NULL
+
+-- query 8
+CAST('+' AS INT)
+NULL
+
+-- query 9
+CAST('+' AS BIGINT)
+NULL
+
+-- query 10
+CAST('+' AS LARGEINT)
+NULL

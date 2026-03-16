@@ -25,7 +25,6 @@ use super::{AggInputView, AggSpec, AggStatePtr};
 pub(super) enum AggKind {
     Count,
     CountDistinct,
-    CountDistinctNonNegative,
     CountIf,
     SumInt,
     SumLargeInt,
@@ -302,7 +301,7 @@ fn resolve_by_func(func: &AggFunction) -> Result<&'static dyn AggregateFunction,
 fn resolve_by_kind(kind: &AggKind) -> &'static dyn AggregateFunction {
     match kind {
         AggKind::Count => &COUNT,
-        AggKind::CountDistinct | AggKind::CountDistinctNonNegative => &COUNT_DISTINCT,
+        AggKind::CountDistinct => &COUNT_DISTINCT,
         AggKind::CountIf => &COUNT_IF,
         AggKind::GroupConcat { .. } => &GROUP_CONCAT,
         AggKind::SumInt

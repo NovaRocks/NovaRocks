@@ -1,0 +1,94 @@
+-- query 2
+to_binary('ab', 'HEX')
+�
+
+-- query 3
+to_binary('ab', 'hex')
+�
+
+-- query 4
+to_binary('qw==', 'ENCODE64')
+�
+
+-- query 5
+to_binary('qw==', 'encode64')
+�
+
+-- query 6
+to_binary('ab', 'utf8')
+ab
+
+-- query 7
+to_binary('ab', 'UTF8')
+ab
+
+-- query 8
+from_binary(to_binary('ab', 'utf8'), 'utf8')
+ab
+
+-- query 9
+from_binary(to_binary('ab', 'hex'), 'hex')
+AB
+
+-- query 10
+from_binary(to_binary('ab', 'hex'), 'encode64')
+qw==
+
+-- query 13
+to_binary('', 'encode64')
+NULL
+
+-- query 14
+to_binary('1', 'hex')
+NULL
+
+-- query 15
+to_binary('XY', 'hex')
+NULL
+
+-- query 16
+to_binary('XYZ0', 'hex')
+NULL
+
+-- query 17
+to_binary('1', 'encode64')
+NULL
+
+-- query 18
+from_binary(to_binary('X', 'hex'), 'hex')
+NULL
+
+-- query 19
+from_binary(to_binary('0X', 'hex'), 'hex')
+NULL
+
+-- query 20
+from_binary(to_binary('1', 'encode64'), 'hex')
+NULL
+
+-- query 23
+from_binary(c1, 'hex')	from_binary(to_binary(c2, 'hex'), 'hex')
+AB01	AB01
+
+-- query 24
+hex(from_binary(c1, 'utf8'))	from_binary(to_binary(c2, 'encode64'), 'hex')
+AB01	69BD35
+
+-- query 25
+from_binary(c1, 'encode64')	from_binary(to_binary(c2, 'utf8'), 'hex')
+qwE=	61623031
+
+-- query 27
+from_binary(c1, 'hex')	from_binary(to_binary(c2, 'hex'), 'hex')
+AB01	AB01
+ABAB	ABAB
+
+-- query 28
+hex(from_binary(c1, 'utf8'))	from_binary(to_binary(c2, 'encode64'), 'hex')
+AB01	69BD35
+ABAB	69B69B
+
+-- query 29
+from_binary(c1, 'encode64')	from_binary(to_binary(c2, 'utf8'), 'hex')
+qwE=	61623031
+q6s=	61626162

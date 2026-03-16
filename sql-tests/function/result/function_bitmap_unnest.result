@@ -1,0 +1,37 @@
+-- query 3
+sum(c1)	sum(unnest_bitmap)
+36904	75405543
+
+-- query 4
+c1	c3
+2	2
+3	3
+3	4
+3	5
+3	6
+
+-- query 5
+c1	c3
+4	20
+4	19
+4	18
+4	17
+4	16
+
+-- query 9
+tag_name	row_id_
+a	57
+a	57,22253296,29101576,43027104
+
+-- query 10
+tag_name	row_id_
+a	[57]
+a	[57,22253296,29101576,43027104]
+
+-- query 11
+tag_name	row_id_
+a	57
+a	57
+a	22253296
+a	29101576
+a	43027104
