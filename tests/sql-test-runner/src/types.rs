@@ -35,6 +35,9 @@ pub struct QueryMeta {
     /// After the step SQL executes, poll `SHOW ALTER TABLE ROLLUP` until FINISHED.
     /// Value is the table name.
     pub wait_alter_rollup: Option<String>,
+    /// After the step SQL executes, poll `SHOW ALTER TABLE OPTIMIZE` until FINISHED.
+    /// Value is the table name.
+    pub wait_alter_optimize: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,9 @@ pub struct SqlCase {
     /// Index 0 is the primary (`${case_db}`), subsequent entries are `${case_db_2}`, etc.
     /// Empty when the case does not use per-case database isolation.
     pub case_dbs: Vec<String>,
+    /// When true, this case must run sequentially (not in parallel with other cases).
+    /// Set by file-level `@sequential = true` metadata.
+    pub sequential: bool,
 }
 
 #[derive(Debug, Clone)]

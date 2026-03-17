@@ -327,6 +327,7 @@ fn run_step_wait_alters(
     for (table, kind, default_retries) in [
         (&step.meta.wait_alter_column, "COLUMN", 60usize),
         (&step.meta.wait_alter_rollup, "ROLLUP", 120usize),
+        (&step.meta.wait_alter_optimize, "OPTIMIZE", 300usize),
     ] {
         if let Some(table_name) = table {
             let (ok, elapsed) = execute_wait_alter(
@@ -1337,37 +1338,50 @@ fn run_suite(
         }
     }
 
-    // --- run cases in parallel ---
-    let outcomes: Vec<CaseOutcome> = ps
-        .cases
+    // --- split cases into parallel and sequential groups ---
+    let (sequential_cases, parallel_cases): (Vec<&SqlCase>, Vec<&SqlCase>) =
+        ps.cases.iter().partition(|c| c.sequential);
+
+    let report_outcome = |outcome: &CaseOutcome| {
+        match outcome.status {
+            CaseStatus::Pass => {
+                pass_count.fetch_add(1, Ordering::Relaxed);
+            }
+            CaseStatus::Fail => {
+                fail_count.fetch_add(1, Ordering::Relaxed);
+            }
+            CaseStatus::Skipped => {}
+        }
+        let p = pass_count.load(Ordering::Relaxed);
+        let f = fail_count.load(Ordering::Relaxed);
+        {
+            let _guard = stdout_lock.lock().unwrap();
+            print!("{}", outcome.log);
+            if outcome.status != CaseStatus::Skipped {
+                println!(
+                    "    [{}] progress: pass={}, fail={}, total={}",
+                    ctx.suite_name, p, f, total
+                );
+            }
+        }
+    };
+
+    // Run parallel cases first
+    let mut outcomes: Vec<CaseOutcome> = parallel_cases
         .par_iter()
         .map(|case| {
             let outcome = run_case(ctx, case, abort);
-            match outcome.status {
-                CaseStatus::Pass => {
-                    pass_count.fetch_add(1, Ordering::Relaxed);
-                }
-                CaseStatus::Fail => {
-                    fail_count.fetch_add(1, Ordering::Relaxed);
-                }
-                CaseStatus::Skipped => {}
-            }
-            let p = pass_count.load(Ordering::Relaxed);
-            let f = fail_count.load(Ordering::Relaxed);
-            // Flush case log atomically
-            {
-                let _guard = stdout_lock.lock().unwrap();
-                print!("{}", outcome.log);
-                if outcome.status != CaseStatus::Skipped {
-                    println!(
-                        "    [{}] progress: pass={}, fail={}, total={}",
-                        ctx.suite_name, p, f, total
-                    );
-                }
-            }
+            report_outcome(&outcome);
             outcome
         })
         .collect();
+
+    // Then run sequential cases one by one
+    for case in &sequential_cases {
+        let outcome = run_case(ctx, case, abort);
+        report_outcome(&outcome);
+        outcomes.push(outcome);
+    }
 
     // --- suite cleanup hook ---
     let mut cleanup_errors = Vec::new();
@@ -1794,7 +1808,17 @@ fn main() -> Result<()> {
         if let Some(hook) = suite_cleanup_hook.as_ref() {
             println!("suite_cleanup={}", hook.path.display());
         }
-        println!("cases={}", cases.len());
+        let seq_count = cases.iter().filter(|c| c.sequential).count();
+        if seq_count > 0 {
+            println!(
+                "cases={} (parallel={}, sequential={})",
+                cases.len(),
+                cases.len() - seq_count,
+                seq_count
+            );
+        } else {
+            println!("cases={}", cases.len());
+        }
         println!("{}", "=".repeat(72));
 
         if cli.dry_run {
@@ -1805,10 +1829,12 @@ fn main() -> Result<()> {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or_default();
+                let seq_tag = if case.sequential { " [sequential]" } else { "" };
                 println!(
-                    "  {} ({}, steps={})",
+                    "  {} ({}, steps={}{})",
                     case.case_id, file_name,
-                    case.steps.len()
+                    case.steps.len(),
+                    seq_tag,
                 );
             }
             continue;

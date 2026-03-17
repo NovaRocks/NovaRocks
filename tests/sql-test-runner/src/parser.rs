@@ -118,6 +118,12 @@ pub fn parse_meta(lines: &[String], meta_re: &Regex) -> Result<QueryMeta> {
             "wait_alter_rollup" => {
                 meta.wait_alter_rollup = Some(raw_value);
             }
+            "wait_alter_optimize" => {
+                meta.wait_alter_optimize = Some(raw_value);
+            }
+            "sequential" => {
+                // Parsed here but ignored in merge_meta; handled at case level.
+            }
             _ => {}
         }
     }
@@ -164,6 +170,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .wait_alter_rollup
             .clone()
             .or_else(|| base.wait_alter_rollup.clone()),
+        wait_alter_optimize: override_meta
+            .wait_alter_optimize
+            .clone()
+            .or_else(|| base.wait_alter_optimize.clone()),
     }
 }
 
@@ -253,6 +263,13 @@ pub fn load_sql_case_from_file(
     let (file_meta, _) = extract_meta_and_sql(&file_meta_lines, meta_re)
         .with_context(|| format!("{}: invalid file-level metadata", sql_path.display()))?;
 
+    // Detect file-level @sequential flag (case-level, not step-level).
+    let is_sequential = file_meta_lines.iter().any(|line| {
+        parse_meta_line(line, meta_re)
+            .map(|(k, v)| k == "sequential" && parse_bool(&v).unwrap_or(false))
+            .unwrap_or(false)
+    });
+
     let sections: Vec<(usize, Vec<String>)> = if markers.is_empty() {
         vec![(1, lines.clone())]
     } else {
@@ -302,6 +319,7 @@ pub fn load_sql_case_from_file(
         case_id: base_name,
         steps,
         case_dbs,
+        sequential: is_sequential,
     }))
 }
 

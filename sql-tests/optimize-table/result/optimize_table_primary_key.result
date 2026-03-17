@@ -1,0 +1,4 @@
+-- query 5
+user_name	city_code	from	pv
+alice	BJ	web	10
+bob	SH	app	20

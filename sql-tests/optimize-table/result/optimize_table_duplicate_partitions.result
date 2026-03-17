@@ -1,0 +1,2 @@
+-- query 3
+PartitionId	PartitionName	CompactVersion	VisibleVersion	NextVersion	State	PartitionKey	Range	DistributionKey	Buckets	DataSize	StorageSize	RowCount	EnableDataCache	AsyncWrite	AvgCS	P50CS	MaxCS	DataVersion	VersionEpoch	VersionTxnType	MetaSwitchVersion
