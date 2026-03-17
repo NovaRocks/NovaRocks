@@ -242,7 +242,32 @@ fn embedded_jvm_feature_enabled() -> bool {
     env::var_os("CARGO_FEATURE_EMBEDDED_JVM").is_some()
 }
 
+fn emit_git_version() {
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs");
+
+    let commit_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let commit_time = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%ci"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    println!("cargo:rustc-env=NOVAROCKS_GIT_HASH={}", commit_hash);
+    println!("cargo:rustc-env=NOVAROCKS_GIT_TIME={}", commit_time);
+}
+
 fn main() {
+    emit_git_version();
     println!("cargo:rerun-if-changed=src/shim/compat.cpp");
     println!("cargo:rerun-if-changed=src/shim/compat.h");
     println!("cargo:rerun-if-changed=src/shim/brpc_server.cpp");

@@ -375,6 +375,8 @@ fn main() {
 
             novarocks_logging::init_with_level(filter);
 
+            eprintln!("NovaRocks {}", novarocks::version::full_version());
+
             let page_cache_initialized = if cfg.runtime.cache.page_cache_enable {
                 novarocks::cache::DataCacheManager::instance().init_page_cache(
                     novarocks::cache::DataCachePageCacheOptions {

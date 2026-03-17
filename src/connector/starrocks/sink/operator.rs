@@ -2233,7 +2233,13 @@ fn collect_partition_values_from_arrays(
         let mut values = Vec::with_capacity(arrays.len());
         for array in arrays {
             if array.is_null(row) {
-                values.push(STARROCKS_DEFAULT_PARTITION_VALUE.to_string());
+                // For expression-based range partitions, FE expects the literal string "NULL"
+                // (handled by AnalyzerUtils.getAddPartitionClauseForRangePartition which maps
+                // "NULL" → "0000-01-01"). This matches StarRocks C++ BE behavior where
+                // NullableColumn::raw_item_value returns "NULL" via debug_item.
+                // Note: list partitions use STARROCKS_DEFAULT_PARTITION_VALUE instead,
+                // which is handled by PartitionValue.getValue() in a different FE code path.
+                values.push("NULL".to_string());
             } else {
                 values.push(partition_scalar_value_to_string(array.as_ref(), row)?);
             }

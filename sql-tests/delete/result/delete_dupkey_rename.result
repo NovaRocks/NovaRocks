@@ -1,0 +1,17 @@
+-- query 1
+name1
+mon
+tue
+
+-- query 2
+name1
+tue
+
+-- query 4
+name2
+thu
+wed
+
+-- query 5
+name2
+thu

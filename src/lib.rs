@@ -25,6 +25,7 @@ pub mod fs;
 pub mod lower;
 pub mod runtime;
 pub mod service;
+pub mod version;
 // StarRocks-BE-like folder layout, with `novarocks_*` convenience aliases.
 pub use common::app_config as novarocks_config;
 pub use common::logging as novarocks_logging;

@@ -1,0 +1,48 @@
+-- query 2
+table_name	column_name	usage
+
+-- query 6
+table_name	column_name	usage
+t1	c1	normal,predicate
+t1	c2	normal
+t1	c3	normal
+t1	c4	normal
+
+-- query 8
+table	array_join(array_sort(split(columns, ',')), ',')
+t1	ALL
+t1	c1
+
+-- query 11
+table_name	column_name	usage
+t1	c1	normal,predicate,group_by
+t1	c2	normal,group_by
+t1	c3	normal
+t1	c4	normal
+
+-- query 13
+table	array_join(array_sort(split(columns, ',')), ',')
+t1	ALL
+t1	c1
+t1	c1,c2
+
+-- query 17
+table_name	column_name	usage
+t1	c1	normal,predicate,join,group_by
+t1	c2	normal,predicate,group_by
+t1	c3	normal,predicate
+t1	c4	normal
+
+-- query 18
+table_name	column_name	usage
+t2	c5	normal,predicate,join
+t2	c6	normal
+t2	c7	normal
+t2	c8	normal
+
+-- query 20
+table	array_join(array_sort(split(columns, ',')), ',')
+t1	ALL
+t1	c1
+t1	c1,c2
+t1	c1,c2,c3

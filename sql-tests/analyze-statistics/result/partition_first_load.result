@@ -1,0 +1,4 @@
+-- query 2
+column_name	partition_name	row_count	max	min
+event_day	p20200101	3000000	2020-01-01 00:00:00	2020-01-01 00:00:00
+k1	p20200101	3000000	3000000	1

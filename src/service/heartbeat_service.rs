@@ -94,7 +94,7 @@ impl HeartbeatServiceSyncHandler for HeartbeatHandler {
             self.config.http_port as i32,
             Some(self.config.brpc_port as i32),
             Some(self.config.brpc_port as i32),
-            Some("novarocks".to_string()),
+            Some(crate::version::short_version().to_string()),
             Some(num_cores),
             Some(self.config.starlet_port as i32),
             Some(reboot_time),
