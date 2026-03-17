@@ -31,6 +31,7 @@ use arrow::array::{
 use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
+use num_traits::ToPrimitive;
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -1826,6 +1827,12 @@ fn cast_with_special_rules_with_field_schema(
         (DataType::Decimal256(_, source_scale), DataType::Utf8) => {
             cast_decimal256_to_utf8_array(array, *source_scale)
         }
+        (DataType::Decimal256(_, source_scale), DataType::Float32) => {
+            cast_decimal256_to_float32(array, *source_scale)
+        }
+        (DataType::Decimal256(_, source_scale), DataType::Float64) => {
+            cast_decimal256_to_float64(array, *source_scale)
+        }
         (DataType::Decimal256(_, source_scale), DataType::Boolean) => {
             cast_decimal256_to_boolean(array, *source_scale)
         }
@@ -1879,14 +1886,22 @@ fn cast_with_special_rules_with_field_schema(
             cast_decimal_to_decimal_relaxed(array, *source_scale, *target_precision, *target_scale)
         }
         (
-            DataType::Decimal256(_, source_scale),
+            DataType::Decimal256(source_precision, source_scale),
             DataType::Decimal256(target_precision, target_scale),
-        ) => cast_decimal256_to_decimal256_relaxed(
-            array,
-            *source_scale,
-            *target_precision,
-            *target_scale,
-        ),
+        ) => {
+            // Same-type cast: source and target have identical precision and scale.
+            // No scale adjustment or precision check needed; pass through unchanged.
+            // This matches StarRocks behavior where the write path handles overflow.
+            if source_precision == target_precision && source_scale == target_scale {
+                return Ok(Arc::clone(array));
+            }
+            cast_decimal256_to_decimal256_relaxed(
+                array,
+                *source_scale,
+                *target_precision,
+                *target_scale,
+            )
+        }
         (DataType::FixedSizeBinary(width), DataType::Utf8)
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
@@ -2177,10 +2192,6 @@ fn retag_decimal256_array(
     Ok(make_array(data))
 }
 
-fn fits_i128_precision(value: i128, precision: u8) -> bool {
-    value.unsigned_abs().to_string().len() <= usize::from(precision)
-}
-
 fn cast_integral_to_decimal128_relaxed(
     child_array: &ArrayRef,
     target_precision: u8,
@@ -2248,17 +2259,22 @@ fn cast_integral_to_decimal128_relaxed(
             value /= factor;
         }
 
-        // StarRocks keeps a BIGINT-compatible window for narrow DECIMAL targets.
-        // For wider targets, honor FE-declared precision to allow large scaled BIGINTs
-        // (for example BIGINT -> DECIMAL(27,1)).
-        let effective_precision = if target_precision <= 18 {
-            19
-        } else {
-            target_precision
-        };
-        if !fits_i128_precision(value, effective_precision) {
-            values.push(None);
-            continue;
+        // For narrow targets (precision ≤ 18), StarRocks uses a BIGINT-compatible overflow
+        // window: any value that exceeds a 19-digit range is returned as NULL.  This matches
+        // the observed StarRocks behaviour for SELECT casts such as
+        //   cast(c_bigint as DECIMAL(9,1))  -- i64::MAX * 10 (20 digits) → NULL.
+        //
+        // For wider targets (precision > 18), the pipeline CAST does NOT enforce precision.
+        // Overflow values that fit in i128 pass through as non-null, and the write-path filter
+        // (filter_decimal_cast_overflow_rows) is responsible for detecting and dropping rows
+        // whose unscaled value exceeds the declared precision.  Values that truly overflow i128
+        // during upscaling are already NULL from the checked_mul guard above.
+        if target_precision <= 18 {
+            // BIGINT-window: reject values that exceed a 19-digit (i64) range.
+            if value.unsigned_abs().to_string().len() > 19 {
+                values.push(None);
+                continue;
+            }
         }
         values.push(Some(value));
     }
@@ -2314,16 +2330,9 @@ fn cast_decimal_to_decimal_relaxed(
         // Keep downscale casts (higher scale -> lower scale) even when the rounded
         // integer part exceeds declared target precision, to match StarRocks
         // decimal regression behavior. Enforce precision only for same-scale and
-        // upscale casts where overflow should still null out. For DECIMAL32/64
-        // families (precision <= 18), StarRocks allows wider integral parts in
-        // array-literal cast paths, so use an 18-digit effective precision window.
+        // upscale casts where overflow should still null out.
         let enforce_precision = source_scale <= target_scale;
-        let effective_target_precision = if target_precision <= 18 {
-            18
-        } else {
-            target_precision
-        };
-        if enforce_precision && !decimal_value_within_precision(value, effective_target_precision) {
+        if enforce_precision && !decimal_value_within_precision(value, target_precision) {
             values.push(None);
             continue;
         }
@@ -2414,11 +2423,14 @@ fn cast_decimal256_to_decimal256_relaxed(
                 quotient
             };
         }
-        // StarRocks keeps DECIMAL256 downscale casts (higher scale -> lower scale)
-        // even when the rounded integer part exceeds the declared target precision.
-        // Enforce precision bounds for same-scale/upscale casts, but keep downscale
-        // values to match FE regression expectations.
-        let enforce_precision = source_scale <= target_scale;
+        // For upscale casts (source_scale < target_scale) we multiplied the value and
+        // need to enforce precision so that values which would overflow the target type
+        // become NULL.  For same-scale and downscale casts the value is unchanged or
+        // smaller, so we skip pipeline-level precision enforcement and let the write-path
+        // filter (filter_decimal_cast_overflow_rows) detect and drop overflow rows.
+        // This matches StarRocks behaviour where the pipeline CAST is a pass-through and
+        // the BE write path owns the overflow-rejection decision.
+        let enforce_precision = source_scale < target_scale;
         if enforce_precision && !decimal256_value_within_precision(value, target_precision) {
             values.push(None);
             continue;
@@ -2551,6 +2563,55 @@ fn decimal256_integral_values(arr: &Decimal256Array, source_scale: i8) -> Vec<Op
         values.push(decimal256_to_i128_literal(arr.value(row), source_scale));
     }
     values
+}
+
+fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
+    // Convert i256 to f64 using the same arithmetic approach as StarRocks BE:
+    // (double)unscaled / (double)scale_factor.
+    // This matches StarRocks's to_float() implementation in decimalv3.h which does:
+    //   *to_value = static_cast<To>(static_cast<double>(value) / static_cast<double>(scale_factor));
+    let unscaled_f64 = value.to_f64().unwrap_or(f64::NAN);
+    if scale <= 0 {
+        let factor = 10f64.powi((-scale) as i32);
+        unscaled_f64 * factor
+    } else {
+        let factor = 10f64.powi(scale as i32);
+        unscaled_f64 / factor
+    }
+}
+
+fn cast_decimal256_to_float64(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
+    let arr = child_array
+        .as_any()
+        .downcast_ref::<Decimal256Array>()
+        .ok_or_else(|| "failed to downcast to Decimal256Array for float64 cast".to_string())?;
+    let mut values: Vec<Option<f64>> = Vec::with_capacity(arr.len());
+    for row in 0..arr.len() {
+        if arr.is_null(row) {
+            values.push(None);
+        } else {
+            values.push(Some(decimal256_to_f64(arr.value(row), scale)));
+        }
+    }
+    Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
+}
+
+fn cast_decimal256_to_float32(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
+    let arr = child_array
+        .as_any()
+        .downcast_ref::<Decimal256Array>()
+        .ok_or_else(|| "failed to downcast to Decimal256Array for float32 cast".to_string())?;
+    let mut values: Vec<Option<f32>> = Vec::with_capacity(arr.len());
+    for row in 0..arr.len() {
+        if arr.is_null(row) {
+            values.push(None);
+        } else {
+            // Convert to f64 first for precision, then narrow to f32.
+            // f64->f32 narrowing preserves +inf/-inf for out-of-range values.
+            values.push(Some(decimal256_to_f64(arr.value(row), scale) as f32));
+        }
+    }
+    Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
 }
 
 fn cast_decimal256_to_boolean(
@@ -3045,6 +3106,27 @@ pub fn eval(
                 )
             })?;
             return sanitize_non_finite_cast_result(casted, &target_type).map_err(|e| {
+                format!(
+                    "CAST failed: from {:?} to {:?}: {e}",
+                    child_array.data_type(),
+                    target_type
+                )
+            });
+        }
+        // Decimal256 → Float32/Float64: use our custom conversion that preserves +/-inf,
+        // and return early to skip the sanitize_non_finite_cast_result step below which
+        // would convert infinity to null.
+        (DataType::Decimal256(_, source_scale), DataType::Float32) => {
+            return cast_decimal256_to_float32(&child_array, *source_scale).map_err(|e| {
+                format!(
+                    "CAST failed: from {:?} to {:?}: {e}",
+                    child_array.data_type(),
+                    target_type
+                )
+            });
+        }
+        (DataType::Decimal256(_, source_scale), DataType::Float64) => {
+            return cast_decimal256_to_float64(&child_array, *source_scale).map_err(|e| {
                 format!(
                     "CAST failed: from {:?} to {:?}: {e}",
                     child_array.data_type(),

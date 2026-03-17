@@ -606,9 +606,7 @@ fn append_http_json_value_with_schema(
             let key_schema = field_schema.and_then(|schema| schema.map_key());
             let value_schema = field_schema.and_then(|schema| schema.map_value());
             let mut entry_indices: Vec<usize> = (start..end).collect();
-            if !matches!(keys.data_type(), DataType::Utf8) {
-                sort_map_entry_indices(keys, &mut entry_indices)?;
-            }
+            sort_map_entry_indices(keys, &mut entry_indices)?;
             out.push('{');
             for (idx, entry_idx) in entry_indices.into_iter().enumerate() {
                 if idx > 0 {
@@ -1086,9 +1084,7 @@ fn format_mysql_container_value_with_schema(
             let value_schema = field_schema.and_then(|schema| schema.map_value());
             let mut out = String::from("{");
             let mut entry_indices: Vec<usize> = (start..end).collect();
-            if !matches!(keys.data_type(), DataType::Utf8) {
-                sort_map_entry_indices(keys, &mut entry_indices)?;
-            }
+            sort_map_entry_indices(keys, &mut entry_indices)?;
             for (idx, entry_idx) in entry_indices.into_iter().enumerate() {
                 if idx > 0 {
                     out.push(',');

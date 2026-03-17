@@ -21,10 +21,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray,
-    TimestampMicrosecondArray, UInt32Array, new_null_array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array,
 };
+use arrow_buffer::i256;
 use arrow::compute::{cast, concat, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -129,6 +130,7 @@ fn append_lake_txn_log_with_rowset_impl(
     partition_id: i64,
     load_id: Option<&PUniqueId>,
 ) -> Result<(), String> {
+    tracing::info!("append_lake_txn_log_with_rowset_impl: rows={} columns={} schema_columns={} tablet_id={}", batch.num_rows(), batch.num_columns(), ctx.tablet_schema.column.len(), ctx.tablet_id);
     let begin_time_ms = unix_millis_now();
     if ctx.table_id <= 0 {
         return Err(format!("invalid table_id for lake write: {}", ctx.table_id));
@@ -3183,6 +3185,7 @@ fn native_writer_supports_column(column: &ColumnPb) -> bool {
             | "DECIMAL32"
             | "DECIMAL64"
             | "DECIMAL128"
+            | "DECIMAL256"
             | "DATE"
             | "DATE_V2"
             | "DATETIME"
@@ -3332,6 +3335,26 @@ pub(crate) fn build_rowset_for_upsert_batch(
     })
 }
 
+/// Return 10^precision as i256. Used to check whether a DECIMAL256 unscaled value
+/// exceeds the declared precision (valid range is |value| < 10^precision).
+fn decimal256_max_unscaled(precision: u8) -> i256 {
+    let mut result = i256::ONE;
+    let ten = i256::from_i128(10);
+    for _ in 0..precision {
+        result = result.wrapping_mul(ten);
+    }
+    result
+}
+
+/// Return 10^exp as i128. Returns None if the result overflows i128.
+fn pow10_i128(exp: u32) -> Option<i128> {
+    let mut out: i128 = 1;
+    for _ in 0..exp {
+        out = out.checked_mul(10)?;
+    }
+    Some(out)
+}
+
 fn filter_decimal_cast_overflow_rows(
     batch: &RecordBatch,
     tablet_schema: &TabletSchemaPb,
@@ -3395,6 +3418,45 @@ fn filter_decimal_cast_overflow_rows(
             DataType::Decimal128(precision, scale)
         };
         let source = batch.column(column_idx);
+
+        // For DECIMAL256 columns, Arrow's cast is a no-op when the source type already
+        // matches the target (same precision and scale). In this case, values that exceed
+        // the declared precision (but fit in i256) would not be detected by the cast-based
+        // approach. Directly validate each non-null i256 value against the precision bound.
+        if precision > 38 {
+            if let Some(dec256) = source.as_any().downcast_ref::<Decimal256Array>() {
+                let max_unscaled = decimal256_max_unscaled(precision);
+                for row in 0..batch.num_rows() {
+                    if !dec256.is_null(row) {
+                        let val = dec256.value(row);
+                        let abs_val = val.wrapping_abs();
+                        if abs_val >= max_unscaled {
+                            rejected[row] = true;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        // For DECIMAL128 columns, Arrow's cast is a no-op when source and target types match
+        // (same precision and scale), so it cannot detect values that exceed the declared
+        // precision.  Directly validate each non-null i128 value against the precision bound.
+        if precision <= 38 {
+            if let Some(dec128) = source.as_any().downcast_ref::<Decimal128Array>() {
+                let max_unscaled = pow10_i128(u32::from(precision)).unwrap_or(i128::MAX);
+                for row in 0..batch.num_rows() {
+                    if !dec128.is_null(row) {
+                        let abs_val = dec128.value(row).unsigned_abs();
+                        if abs_val >= max_unscaled as u128 {
+                            rejected[row] = true;
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
         let casted = cast(source.as_ref(), &target_type).map_err(|e| {
             format!(
                 "cast decimal column while filtering overflow rows failed: column_index={}, column_name={}, target={:?}, error={}",

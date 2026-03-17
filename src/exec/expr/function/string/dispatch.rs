@@ -442,7 +442,9 @@ mod tests {
     use super::*;
     use crate::exec::expr::function::string::test_utils::*;
     use arrow::array::Array;
-    use arrow::array::{BinaryArray, BooleanArray, Int64Array, MapArray, StringArray, StructArray};
+    use arrow::array::{
+        BinaryArray, BooleanArray, Int32Array, Int64Array, MapArray, StringArray, StructArray,
+    };
     use arrow::datatypes::DataType;
 
     fn eval_str(
@@ -466,6 +468,18 @@ mod tests {
     ) -> i64 {
         let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
         let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+        arr.value(0)
+    }
+
+    fn eval_i32(
+        name: &str,
+        arena: &ExprArena,
+        expr: ExprId,
+        args: &[ExprId],
+        chunk: &Chunk,
+    ) -> i32 {
+        let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
+        let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
         arr.value(0)
     }
 
@@ -586,25 +600,26 @@ mod tests {
         let lo = literal_string(&mut arena, "lo");
         assert!(eval_bool("ends_with", &arena, expr_bool, &[s2, lo], &chunk));
 
+        let expr_i32 = typed_null(&mut arena, DataType::Int32);
         let s3 = literal_string(&mut arena, "hello");
         let sub = literal_string(&mut arena, "lo");
-        assert_eq!(eval_i64("locate", &arena, expr_i64, &[sub, s3], &chunk), 4);
+        assert_eq!(eval_i32("locate", &arena, expr_i32, &[sub, s3], &chunk), 4);
         let s3_2 = literal_string(&mut arena, "hello");
         let sub_2 = literal_string(&mut arena, "l");
         let start = literal_i64(&mut arena, 4);
         assert_eq!(
-            eval_i64("locate", &arena, expr_i64, &[sub_2, s3_2, start], &chunk),
+            eval_i32("locate", &arena, expr_i32, &[sub_2, s3_2, start], &chunk),
             4
         );
         let s3_3 = literal_string(&mut arena, "aébc");
         let sub_3 = literal_string(&mut arena, "é");
         assert_eq!(
-            eval_i64("locate", &arena, expr_i64, &[sub_3, s3_3], &chunk),
+            eval_i32("locate", &arena, expr_i32, &[sub_3, s3_3], &chunk),
             2
         );
         let s4 = literal_string(&mut arena, "hello");
         let sub2 = literal_string(&mut arena, "lo");
-        assert_eq!(eval_i64("instr", &arena, expr_i64, &[s4, sub2], &chunk), 4);
+        assert_eq!(eval_i32("instr", &arena, expr_i32, &[s4, sub2], &chunk), 4);
     }
 
     #[test]

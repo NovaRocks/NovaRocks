@@ -3205,6 +3205,9 @@ mod tests {
             index_write_plans: Vec::new(),
             output_projection: None,
             auto_partition: None,
+            auto_increment_output_slot_id: None,
+            null_expr_in_auto_increment: false,
+            miss_auto_increment_column: false,
         })
     }
 
@@ -3315,6 +3318,9 @@ mod tests {
             index_write_plans: Vec::new(),
             output_projection: None,
             auto_partition: None,
+            auto_increment_output_slot_id: None,
+            null_expr_in_auto_increment: false,
+            miss_auto_increment_column: false,
         })
     }
 

@@ -2532,6 +2532,7 @@ dependencies = [
  "md-5",
  "moka",
  "mysql",
+ "num-traits",
  "num_cpus",
  "once_cell",
  "opendal",
