@@ -39,10 +39,10 @@ pub fn eval_ascii(
             continue;
         }
         let s = s_arr.value(i);
-        let code = s.as_bytes().first().copied().unwrap_or(0) as i64;
+        let code = s.as_bytes().first().copied().unwrap_or(0) as i32;
         out.push(Some(code));
     }
-    Ok(Arc::new(arrow::array::Int64Array::from(out)) as ArrayRef)
+    Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
 }
 #[cfg(test)]
 mod tests {

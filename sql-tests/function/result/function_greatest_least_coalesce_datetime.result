@@ -1,0 +1,43 @@
+-- query 1
+date(greatest(date('2026-01-14'), timestamp('2026-01-11 00:00:00')))
+2026-01-14
+
+-- query 2
+greatest(date('2026-01-11'), timestamp('2026-01-14 00:00:00'))
+2026-01-14 00:00:00
+
+-- query 3
+typeof(greatest(date('2026-01-11'), timestamp('2026-01-14 00:00:00')))
+datetime
+
+-- query 4
+least(date('2026-01-14'), timestamp('2026-01-11 00:00:00'))
+2026-01-11 00:00:00
+
+-- query 5
+typeof(least(date('2026-01-14'), timestamp('2026-01-11 00:00:00')))
+datetime
+
+-- query 6
+coalesce(NULL, date('2026-01-11'), timestamp('2026-01-14 00:00:00'))
+2026-01-11 00:00:00
+
+-- query 7
+typeof(coalesce(NULL, date('2026-01-11'), timestamp('2026-01-14 00:00:00')))
+datetime
+
+-- query 8
+greatest(date('2026-01-11'), date('2026-01-14'), date('2026-01-09'))
+2026-01-14 00:00:00
+
+-- query 9
+typeof(greatest(date('2026-01-11'), date('2026-01-14'), date('2026-01-09')))
+datetime
+
+-- query 10
+typeof(greatest(CAST(100 AS INT), CAST(200 AS BIGINT)))
+bigint
+
+-- query 11
+typeof(greatest(20260114, 20260115))
+int

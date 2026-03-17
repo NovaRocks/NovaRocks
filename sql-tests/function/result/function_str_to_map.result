@@ -1,0 +1,3 @@
+-- query 3
+sum(cardinality(str_to_map(c2, ',', ':')))
+10000

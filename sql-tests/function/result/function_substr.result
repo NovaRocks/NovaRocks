@@ -1,0 +1,35 @@
+-- query 11
+substr('', v)
+NULL
+NULL
+NULL
+
+-- query 12
+substr('', v, id)
+NULL
+NULL
+NULL
+
+-- query 13
+substr('STARROCKS', v, id)
+NULL
+NULL
+NULL
+
+-- query 14
+substring('', v)
+NULL
+NULL
+NULL
+
+-- query 15
+substring('', v, id)
+NULL
+NULL
+NULL
+
+-- query 16
+substring('STARROCKS', v, id)
+NULL
+NULL
+NULL

@@ -45,20 +45,20 @@ pub fn eval_find_in_set(
         }
         let target = s_arr.value(row);
         if target.contains(',') {
-            out.push(Some(0_i64));
+            out.push(Some(0_i32));
             continue;
         }
         let set = set_arr.value(row);
-        let mut idx = 0_i64;
+        let mut idx = 0_i32;
         for (i, part) in set.split(',').enumerate() {
             if part == target {
-                idx = (i + 1) as i64;
+                idx = (i + 1) as i32;
                 break;
             }
         }
         out.push(Some(idx));
     }
-    Ok(Arc::new(arrow::array::Int64Array::from(out)) as ArrayRef)
+    Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
 }
 #[cfg(test)]
 mod tests {

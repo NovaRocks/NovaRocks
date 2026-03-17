@@ -1,0 +1,15 @@
+-- query 3
+date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.%f')
+2023-10-11 00:00:01.030000
+
+-- query 4
+length(date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f'))
+126
+
+-- query 5
+ifnull(length(date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%f')), -1)
+-1
+
+-- query 6
+ifnull(length(date_format(reset_period_data, '%Y-%m-%d %H:%i:%s.ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt%ftttttttt')), -1)
+-1

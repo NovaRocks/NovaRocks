@@ -57,20 +57,20 @@ pub fn eval_field(
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
         if first_arr.is_null(row) {
-            out.push(Some(0_i64));
+            out.push(Some(0_i32));
             continue;
         }
         let target = first_arr.value(row);
-        let mut idx = 0_i64;
+        let mut idx = 0_i32;
         for (i, arr) in arrays.iter().enumerate() {
             if !arr.is_null(row) && arr.value(row) == target {
-                idx = (i + 1) as i64;
+                idx = (i + 1) as i32;
                 break;
             }
         }
         out.push(Some(idx));
     }
-    Ok(Arc::new(arrow::array::Int64Array::from(out)) as ArrayRef)
+    Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
 }
 #[cfg(test)]
 mod tests {
@@ -80,7 +80,7 @@ mod tests {
     use crate::exec::expr::function::string::test_utils::{
         chunk_len_1, literal_string, typed_null,
     };
-    use arrow::array::Int64Array;
+    use arrow::array::Int32Array;
     use arrow::datatypes::DataType;
 
     #[test]
@@ -91,12 +91,12 @@ mod tests {
     #[test]
     fn test_field_null_first_argument_with_null_type_returns_zero() {
         let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Int64);
+        let expr = typed_null(&mut arena, DataType::Int32);
         let first = typed_null(&mut arena, DataType::Null);
         let a = literal_string(&mut arena, "a");
         let b = literal_string(&mut arena, "b");
         let out = eval_field(&arena, expr, &[first, a, b], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(out.value(0), 0);
     }
 }

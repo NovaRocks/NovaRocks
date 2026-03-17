@@ -1,0 +1,31 @@
+-- query 3
+(round(id_double)) <=> (round(NULL))
+1
+
+-- query 4
+(dround(id_double)) <=> (dround(NULL))
+1
+
+-- query 5
+(round(id_double, id_int)) <=> (round(NULL, NULL))
+1
+
+-- query 6
+(round(id_double, id_int)) <=> (round(id_double, NULL))
+1
+
+-- query 7
+(round(id_double, id_int)) <=> (round(NULL, id_int))
+1
+
+-- query 8
+(dround(id_double, id_int)) <=> (dround(NULL, NULL))
+1
+
+-- query 9
+(dround(id_double, id_int)) <=> (dround(id_double, NULL))
+1
+
+-- query 10
+(dround(id_double, id_int)) <=> (dround(NULL, id_int))
+1

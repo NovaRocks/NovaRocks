@@ -1,0 +1,23 @@
+-- query 1
+cbrt(27)
+3
+
+-- query 2
+cbrt(0.0)
+0
+
+-- query 3
+cbrt(-27)
+-3
+
+-- query 4
+cbrt(3.1415)
+1.4645774892350487
+
+-- query 5
+cbrt(-3.1415)
+-1.4645774892350487
+
+-- query 6
+cbrt(NULL)
+NULL

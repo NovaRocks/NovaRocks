@@ -61,6 +61,10 @@ pub fn eval_nullif(
                 eval_nullif_primitive::<TimestampNanosecondType>(&left_arr, &right_arr)
             }
         },
+        DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::Map(_, _)
+        | DataType::Struct(_) => eval_nullif_generic(&left_arr, &right_arr),
         other => Err(format!("nullif unsupported type: {:?}", other)),
     }
 }
@@ -154,6 +158,41 @@ fn eval_nullif_string(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, Str
         }
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+}
+
+/// Generic nullif for complex types (List, Map, Struct) using display-based comparison.
+fn eval_nullif_generic(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, String> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let len = left.len();
+    // Use a distinctive null marker so null elements are not confused with empty strings.
+    let fmt_opts = FormatOptions::default().with_null("\\N");
+    let left_fmt = ArrayFormatter::try_new(left.as_ref(), &fmt_opts)
+        .map_err(|e| format!("nullif: {e}"))?;
+    let right_fmt = ArrayFormatter::try_new(right.as_ref(), &fmt_opts)
+        .map_err(|e| format!("nullif: {e}"))?;
+
+    let mut valid = vec![true; len];
+    for i in 0..len {
+        if left.is_null(i) {
+            valid[i] = false;
+        } else if !right.is_null(i) {
+            let l_str = left_fmt.value(i).to_string();
+            let r_str = right_fmt.value(i).to_string();
+            if l_str == r_str {
+                valid[i] = false;
+            }
+        }
+    }
+
+    let null_buffer = arrow::buffer::NullBuffer::from(valid);
+    let data = left.to_data();
+    let new_data = data
+        .into_builder()
+        .null_bit_buffer(Some(null_buffer.inner().inner().clone()))
+        .build()
+        .map_err(|e| format!("nullif: {e}"))?;
+    Ok(arrow::array::make_array(new_data))
 }
 
 fn eval_nullif_decimal(

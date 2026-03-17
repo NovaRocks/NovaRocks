@@ -1,0 +1,42 @@
+-- query 1
+generate_series
+2
+3
+4
+5
+
+-- query 2
+generate_series
+2
+3
+4
+5
+
+-- query 3
+generate_series
+2
+4
+
+-- query 4
+generate_series
+2
+4
+
+-- query 6
+generate_series
+2
+4
+
+-- query 17
+generate_series
+1
+2
+3
+4
+5
+
+-- query 18
+generate_series
+1
+3
+5

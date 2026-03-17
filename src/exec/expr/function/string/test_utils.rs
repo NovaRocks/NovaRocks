@@ -119,6 +119,7 @@ pub fn assert_string_function_logic(name: &str) {
     let chunk = chunk_len_1();
     let expr_str = typed_null(&mut arena, DataType::Utf8);
     let expr_i64 = typed_null(&mut arena, DataType::Int64);
+    let expr_i32 = typed_null(&mut arena, DataType::Int32);
     let expr_bool = typed_null(&mut arena, DataType::Boolean);
 
     match canonical {
@@ -132,7 +133,7 @@ pub fn assert_string_function_logic(name: &str) {
         }
         "ascii" => {
             let s = literal_string(&mut arena, "A");
-            assert_eq!(string_eval_i64(name, &arena, expr_i64, &[s], &chunk), 65);
+            assert_eq!(string_eval_i32(name, &arena, expr_i32, &[s], &chunk), 65);
         }
         "bar" => {
             let size = literal_i64(&mut arena, 1);
@@ -178,7 +179,7 @@ pub fn assert_string_function_logic(name: &str) {
             let b = literal_string(&mut arena, "b");
             let c = literal_string(&mut arena, "c");
             assert_eq!(
-                string_eval_i64(name, &arena, expr_i64, &[target, a, b, c], &chunk),
+                string_eval_i32(name, &arena, expr_i32, &[target, a, b, c], &chunk),
                 2
             );
         }
@@ -186,7 +187,7 @@ pub fn assert_string_function_logic(name: &str) {
             let target = literal_string(&mut arena, "b");
             let set = literal_string(&mut arena, "a,b,c");
             assert_eq!(
-                string_eval_i64(name, &arena, expr_i64, &[target, set], &chunk),
+                string_eval_i32(name, &arena, expr_i32, &[target, set], &chunk),
                 2
             );
         }
@@ -318,7 +319,7 @@ pub fn assert_string_function_logic(name: &str) {
             let pos = literal_i64(&mut arena, 4);
             let occ = literal_i64(&mut arena, 2);
             assert_eq!(
-                string_eval_i64(name, &arena, expr_i64, &[text, pat, pos, occ], &chunk),
+                string_eval_i32(name, &arena, expr_i32, &[text, pat, pos, occ], &chunk),
                 6
             );
         }

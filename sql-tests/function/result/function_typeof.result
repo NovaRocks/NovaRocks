@@ -1,0 +1,103 @@
+-- query 1
+typeof(CAST(1 AS TINYINT))
+tinyint
+
+-- query 2
+typeof(CAST(1 AS SMALLINT))
+smallint
+
+-- query 3
+typeof(CAST(1 AS INT))
+int
+
+-- query 4
+typeof(CAST(1 AS BIGINT))
+bigint
+
+-- query 5
+typeof(CAST(1 AS LARGEINT))
+largeint
+
+-- query 6
+typeof(CAST(1 AS DECIMAL128(19,2)))
+decimal128(19, 2)
+
+-- query 7
+typeof(CAST(1 AS DOUBLE))
+double
+
+-- query 8
+typeof(CAST(1 AS FLOAT))
+float
+
+-- query 9
+typeof(CAST(1 AS BOOLEAN))
+boolean
+
+-- query 10
+typeof(CAST(1 AS CHAR))
+char
+
+-- query 11
+typeof(CAST(1 AS VARCHAR(65533)))
+varchar
+
+-- query 12
+typeof(CAST(1 AS VARCHAR))
+varchar
+
+-- query 13
+typeof(CAST('s' AS VARBINARY))
+varbinary
+
+-- query 14
+typeof(CAST('2023-03-07' AS DATE))
+date
+
+-- query 15
+typeof(CAST('2023-03-07 11:22:33' AS DATETIME))
+datetime
+
+-- query 16
+typeof([1, 2, 3])
+array<tinyint>
+
+-- query 17
+typeof(get_json_object('{"k1":1, "k2":"v2"}', '$.k1'))
+varchar
+
+-- query 18
+typeof(map{1:'apple',2:'orange',3:'pear'})
+map<tinyint,varchar>
+
+-- query 19
+typeof(row(1, 2, 3, 4))
+struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>
+
+-- query 20
+typeof(bitmap_empty())
+bitmap
+
+-- query 21
+typeof(hll_empty())
+hll
+
+-- query 22
+typeof(parse_json('{"a": 1, "b": true}'))
+json
+
+-- query 23
+typeof(NULL)
+null_type
+
+-- query 25
+typeof(c1)	typeof(c2)	typeof(c3)	typeof(c4)	typeof(c5)	typeof(c6)	typeof(c7)	typeof(c8)	typeof(c9)	typeof(c10)	typeof(c11)	typeof(c12)	typeof(c13)	typeof(c14)	typeof(c15)	typeof(c16)	typeof(c17)	typeof(c18)	typeof(c19)	typeof(c20)
+tinyint	smallint	int	bigint	largeint	decimal128(19, 2)	decimal128(38, 9)	decimal128(38, 9)	boolean	varchar	varchar	varchar	varbinary	date	datetime	array<tinyint>	varchar	map<tinyint,varchar>	struct<col1 tinyint, col2 tinyint, col3 tinyint, col4 tinyint>	json
+
+-- query 28
+typeof(user_id)
+bitmap
+
+-- query 31
+typeof(uv_set)
+hll

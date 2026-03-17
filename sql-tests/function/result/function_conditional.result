@@ -1,0 +1,139 @@
+-- query 6
+CASE i WHEN 1 THEN ai WHEN 3 THEN ass ELSE ai END
+["1","2"]
+["1","2"]
+["a","b"]
+NULL
+
+-- query 7
+CASE i WHEN 1 THEN ai WHEN 3 THEN ass END
+["1","2"]
+NULL
+["a","b"]
+NULL
+
+-- query 8
+CASE i WHEN 1 THEN mi WHEN 3 THEN ms ELSE mi END
+{null:"2",1:"1"}
+{null:"2",1:"1"}
+{null:null,1:null}
+NULL
+
+-- query 9
+CASE i WHEN 1 THEN mi WHEN 3 THEN ms END
+{null:"2",1:"1"}
+NULL
+{null:null,1:null}
+NULL
+
+-- query 10
+CASE WHEN (i = 1) THEN ai WHEN (i = 3) THEN ass END
+["1","2"]
+NULL
+["a","b"]
+NULL
+
+-- query 11
+CASE WHEN (i = 1) THEN ai WHEN (i = 3) THEN ass ELSE ai END
+["1","2"]
+["1","2"]
+["a","b"]
+NULL
+
+-- query 12
+CASE WHEN (i = 1) THEN mi WHEN (i = 3) THEN ms END
+{null:"2",1:"1"}
+NULL
+{null:null,1:null}
+NULL
+
+-- query 13
+CASE WHEN (i = 1) THEN mi WHEN (i = 3) THEN ms ELSE ms END
+{null:"2",1:"1"}
+{null:null,1:"b"}
+{null:null,1:null}
+NULL
+
+-- query 14
+coalesce(ai, ass)
+["1","2"]
+["1","2"]
+["a","b"]
+NULL
+
+-- query 15
+coalesce(mi, ms)
+{null:"2",1:"1"}
+{null:"2",1:"1"}
+{null:null,1:null}
+NULL
+
+-- query 16
+coalesce(NULL, ms, mi)
+{null:"2",1:"1"}
+{null:null,1:"b"}
+{null:null,1:null}
+NULL
+
+-- query 17
+ifnull(ms, mi)	ms	mi
+{null:"2",1:"1"}	NULL	{null:2,1:1}
+{null:null,1:"b"}	{null:null,1:"b"}	{null:2,1:1}
+{null:null,1:null}	{null:null,1:null}	NULL
+NULL	NULL	NULL
+
+-- query 18
+ifnull(ass, ai)	ass	ai
+["1","2"]	NULL	[1,2]
+["a","b"]	["a","b"]	[1,2]
+["a","b"]	["a","b"]	NULL
+NULL	NULL	NULL
+
+-- query 19
+ifnull(ai, NULL)
+[1,2]
+[1,2]
+NULL
+NULL
+
+-- query 20
+if(i > 2, ms, mi)
+{null:"2",1:"1"}
+{null:"2",1:"1"}
+{null:null,1:null}
+NULL
+
+-- query 21
+if(i > 2, ass, ai)
+["1","2"]
+["1","2"]
+["a","b"]
+NULL
+
+-- query 22
+if(ai IS NOT NULL, map_from_arrays(['a', 'b'], [1, 2]), NULL)
+{"a":1,"b":2}
+{"a":1,"b":2}
+NULL
+NULL
+
+-- query 23
+nullif(ai, ass)	ai	ass
+["1","2"]	[1,2]	NULL
+["1","2"]	[1,2]	["a","b"]
+NULL	NULL	["a","b"]
+NULL	NULL	NULL
+
+-- query 24
+nullif(ms, mi)	ms	mi
+NULL	NULL	{null:2,1:1}
+{null:null,1:"b"}	{null:null,1:"b"}	{null:2,1:1}
+{null:null,1:null}	{null:null,1:null}	NULL
+NULL	NULL	NULL
+
+-- query 25
+if(i > 5, i, NULL)
+NULL
+NULL
+NULL
+NULL

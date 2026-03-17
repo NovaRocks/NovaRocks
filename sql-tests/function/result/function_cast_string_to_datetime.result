@@ -1,0 +1,271 @@
+-- query 1
+(((ifnull(sum(murmur_hash3_32(CAST(date_str AS DATETIME))), 0)) + (ifnull(sum(murmur_hash3_32(CAST(date_str_with_whitespace AS DATETIME))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str AS DATETIME))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str_with_whitespace AS DATETIME))), 0))
+-1396525594308
+
+-- query 2
+(((ifnull(sum(murmur_hash3_32(CAST(date_str AS DATETIME))), 0)) + (ifnull(sum(murmur_hash3_32(CAST(date_str_with_whitespace AS DATETIME))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str AS DATETIME))), 0))) + (ifnull(sum(murmur_hash3_32(CAST(datetime_str_with_whitespace AS DATETIME))), 0))
+-1396525594308
+
+-- query 3
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 4
+CAST(column_0 AS DATETIME)
+2020-01-01 00:00:00
+
+-- query 5
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 6
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 7
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 8
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 9
+CAST(column_0 AS DATETIME)
+2020-01-01 00:00:00
+
+-- query 10
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 11
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 12
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 13
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 14
+CAST(column_0 AS DATETIME)
+2020-01-01 00:00:00
+
+-- query 15
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 16
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 17
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 18
+CAST(column_0 AS DATETIME)
+2020-01-01 00:00:00
+
+-- query 19
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 20
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 21
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 22
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 23
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 24
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 25
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 26
+CAST(column_0 AS DATETIME)
+2020-02-29 00:00:00
+
+-- query 27
+CAST(column_0 AS DATETIME)
+2020-02-28 00:00:00
+
+-- query 28
+CAST(column_0 AS DATETIME)
+2000-02-29 00:00:00
+
+-- query 29
+CAST(column_0 AS DATETIME)
+2000-02-28 00:00:00
+
+-- query 30
+CAST(column_0 AS DATETIME)
+2021-02-28 00:00:00
+
+-- query 31
+CAST(column_0 AS DATETIME)
+2100-02-28 00:00:00
+
+-- query 32
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 33
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 34
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 35
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 36
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 37
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 38
+CAST(column_0 AS DATETIME)
+0210-02-28 00:00:00
+
+-- query 39
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 40
+CAST(column_0 AS DATETIME)
+2100-02-28 00:00:00
+
+-- query 41
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 42
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 43
+CAST(column_0 AS DATETIME)
+2100-02-08 00:00:00
+
+-- query 44
+CAST(column_0 AS DATETIME)
+2100-02-02 00:00:00
+
+-- query 45
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 46
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 47
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123456
+
+-- query 48
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.100000
+
+-- query 49
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 50
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123000
+
+-- query 51
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 52
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 53
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03
+
+-- query 54
+CAST(column_0 AS DATETIME)
+2020-01-01 01:02:03.123456
+
+-- query 55
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 56
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 57
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 58
+CAST(column_0 AS DATETIME)
+2024-01-01 01:31:00
+
+-- query 59
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 60
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 61
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 62
+CAST(column_0 AS DATETIME)
+2024-01-01 23:59:59
+
+-- query 63
+CAST(column_0 AS DATETIME)
+2024-01-01 00:00:00
+
+-- query 64
+CAST(column_0 AS DATETIME)
+2024-01-01 01:59:00
+
+-- query 65
+CAST(column_0 AS DATETIME)
+2024-01-01 01:30:59
+
+-- query 66
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 67
+CAST(column_0 AS DATETIME)
+NULL
+
+-- query 68
+CAST(column_0 AS DATETIME)
+NULL

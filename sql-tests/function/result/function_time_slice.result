@@ -1,0 +1,303 @@
+-- query 1
+time_slice('9999-12-31 23:59:59', INTERVAL 5 year, ceil)
+NULL
+
+-- query 2
+time_slice('9999-12-31 23:59:59', INTERVAL 5 month, ceil)
+NULL
+
+-- query 3
+time_slice('9999-12-31 23:59:59', INTERVAL 5 day, ceil)
+NULL
+
+-- query 4
+time_slice('9999-12-31 23:59:59', INTERVAL 5 quarter, ceil)
+NULL
+
+-- query 5
+time_slice('9999-12-31 23:59:59', INTERVAL 5 week, ceil)
+NULL
+
+-- query 6
+time_slice('9999-12-31 23:59:59', INTERVAL 5 hour, ceil)
+NULL
+
+-- query 7
+time_slice('9999-12-31 23:59:59', INTERVAL 5 minute, ceil)
+NULL
+
+-- query 8
+time_slice('9999-12-31 23:59:59', INTERVAL 5 second, ceil)
+NULL
+
+-- query 9
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 year, floor)
+0001-01-01 00:00:00
+
+-- query 10
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 month, floor)
+0001-01-01 00:00:00
+
+-- query 11
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 day, floor)
+0001-01-01 00:00:00
+
+-- query 12
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 quarter, floor)
+0001-01-01 00:00:00
+
+-- query 13
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 week, floor)
+0001-01-01 00:00:00
+
+-- query 14
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 hour, floor)
+0001-01-01 00:00:00
+
+-- query 15
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 minute, floor)
+0001-01-01 00:00:00
+
+-- query 16
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 second, floor)
+1974-06-25 21:49:23
+
+-- query 22
+time_slice('9999-12-31', INTERVAL 5 year, ceil)
+NULL
+
+-- query 23
+time_slice('9999-12-31', INTERVAL 5 month, ceil)
+NULL
+
+-- query 24
+time_slice('9999-12-31', INTERVAL 5 day, ceil)
+NULL
+
+-- query 25
+time_slice('9999-12-31', INTERVAL 5 quarter, ceil)
+NULL
+
+-- query 26
+time_slice('9999-12-31', INTERVAL 5 week, ceil)
+NULL
+
+-- query 27
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 year, floor)
+0001-01-01 00:00:00
+
+-- query 28
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 month, floor)
+0001-01-01 00:00:00
+
+-- query 29
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 day, floor)
+0001-01-01 00:00:00
+
+-- query 30
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 quarter, floor)
+0001-01-01 00:00:00
+
+-- query 31
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 week, floor)
+0001-01-01 00:00:00
+
+-- query 38
+time_slice('9999-12-31 23:59:59', INTERVAL 5 year, ceil)
+NULL
+
+-- query 39
+time_slice('9999-12-31 23:59:59', INTERVAL 5 month, ceil)
+NULL
+
+-- query 40
+time_slice('9999-12-31 23:59:59', INTERVAL 5 day, ceil)
+NULL
+
+-- query 41
+time_slice('9999-12-31 23:59:59', INTERVAL 5 quarter, ceil)
+NULL
+
+-- query 42
+time_slice('9999-12-31 23:59:59', INTERVAL 5 week, ceil)
+NULL
+
+-- query 43
+time_slice('9999-12-31 23:59:59', INTERVAL 5 hour, ceil)
+NULL
+
+-- query 44
+time_slice('9999-12-31 23:59:59', INTERVAL 5 minute, ceil)
+NULL
+
+-- query 45
+time_slice('9999-12-31 23:59:59', INTERVAL 5 second, ceil)
+NULL
+
+-- query 46
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 year, floor)
+0001-01-01 00:00:00
+
+-- query 47
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 month, floor)
+0001-01-01 00:00:00
+
+-- query 48
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 day, floor)
+0001-01-01 00:00:00
+
+-- query 49
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 quarter, floor)
+0001-01-01 00:00:00
+
+-- query 50
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 week, floor)
+0001-01-01 00:00:00
+
+-- query 51
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 hour, floor)
+0001-01-01 00:00:00
+
+-- query 52
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 minute, floor)
+0001-01-01 00:00:00
+
+-- query 53
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 second, floor)
+1974-06-25 21:49:23
+
+-- query 59
+time_slice('9999-12-31', INTERVAL 5 year, ceil)
+NULL
+
+-- query 60
+time_slice('9999-12-31', INTERVAL 5 month, ceil)
+NULL
+
+-- query 61
+time_slice('9999-12-31', INTERVAL 5 day, ceil)
+NULL
+
+-- query 62
+time_slice('9999-12-31', INTERVAL 5 quarter, ceil)
+NULL
+
+-- query 63
+time_slice('9999-12-31', INTERVAL 5 week, ceil)
+NULL
+
+-- query 64
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 year, floor)
+0001-01-01 00:00:00
+
+-- query 65
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 month, floor)
+0001-01-01 00:00:00
+
+-- query 66
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 day, floor)
+0001-01-01 00:00:00
+
+-- query 67
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 quarter, floor)
+0001-01-01 00:00:00
+
+-- query 68
+time_slice('2023-12-31 03:12:04', INTERVAL 2147483647 week, floor)
+0001-01-01 00:00:00
+
+-- query 75
+time_slice('2023-10-31 23:59:59', INTERVAL 1 millisecond, floor)
+2023-10-31 23:59:59
+
+-- query 76
+time_slice('2023-10-31 23:59:59', INTERVAL 1 millisecond, ceil)
+2023-10-31 23:59:59.001000
+
+-- query 77
+time_slice('2023-10-31 23:59:59', INTERVAL 17 millisecond, floor)
+2023-10-31 23:59:58.984000
+
+-- query 78
+time_slice('2023-10-31 23:59:59', INTERVAL 17 millisecond, ceil)
+2023-10-31 23:59:59.001000
+
+-- query 79
+time_slice('2023-10-31 23:59:59', INTERVAL 1000 millisecond, floor)
+2023-10-31 23:59:59
+
+-- query 80
+time_slice('2023-10-31 23:59:59', INTERVAL 1000 millisecond, ceil)
+2023-11-01 00:00:00
+
+-- query 81
+time_slice('2023-10-31 23:59:59', INTERVAL 1001 millisecond, floor)
+2023-10-31 23:59:58.976000
+
+-- query 82
+time_slice('2023-10-31 23:59:59', INTERVAL 1001 millisecond, ceil)
+2023-10-31 23:59:59.977000
+
+-- query 83
+time_slice('2023-10-31 23:59:59', INTERVAL 86400000 millisecond, floor)
+2023-10-31 00:00:00
+
+-- query 84
+time_slice('2023-10-31 23:59:59', INTERVAL 86400000 millisecond, ceil)
+2023-11-01 00:00:00
+
+-- query 85
+time_slice('2023-10-31 23:59:59', INTERVAL 172800000 millisecond, floor)
+2023-10-30 00:00:00
+
+-- query 86
+time_slice('2023-10-31 23:59:59', INTERVAL 172800000 millisecond, ceil)
+2023-11-01 00:00:00
+
+-- query 87
+time_slice('2023-10-31 23:59:59', INTERVAL 1 microsecond, floor)
+2023-10-31 23:59:59
+
+-- query 88
+time_slice('2023-10-31 23:59:59', INTERVAL 1 microsecond, ceil)
+2023-10-31 23:59:59.000001
+
+-- query 89
+time_slice('2023-10-31 23:59:59', INTERVAL 17 microsecond, floor)
+2023-10-31 23:59:58.999997
+
+-- query 90
+time_slice('2023-10-31 23:59:59', INTERVAL 17 microsecond, ceil)
+2023-10-31 23:59:59.000014
+
+-- query 91
+time_slice('2023-10-31 23:59:59', INTERVAL 1000 microsecond, floor)
+2023-10-31 23:59:59
+
+-- query 92
+time_slice('2023-10-31 23:59:59', INTERVAL 1000 microsecond, ceil)
+2023-10-31 23:59:59.001000
+
+-- query 93
+time_slice('2023-10-31 23:59:59', INTERVAL 1001 microsecond, floor)
+2023-10-31 23:59:58.999023
+
+-- query 94
+time_slice('2023-10-31 23:59:59', INTERVAL 1001 microsecond, ceil)
+2023-10-31 23:59:59.000024
+
+-- query 95
+time_slice('2023-10-31 23:59:59', INTERVAL 1000000 microsecond, floor)
+2023-10-31 23:59:59
+
+-- query 96
+time_slice('2023-10-31 23:59:59', INTERVAL 1000000 microsecond, ceil)
+2023-11-01 00:00:00
+
+-- query 97
+time_slice('2023-10-31 23:59:59', INTERVAL 1000001 microsecond, floor)
+2023-10-31 23:59:58.329764
+
+-- query 98
+time_slice('2023-10-31 23:59:59', INTERVAL 1000001 microsecond, ceil)
+2023-10-31 23:59:59.329765

@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use regex::Regex;
 use std::sync::Arc;
 
@@ -74,10 +74,10 @@ pub fn eval_regexp_position(
         let start_pos = start_arr.as_ref().map_or(1, |arr| arr.value(row));
         let occurrence = occurrence_arr.as_ref().map_or(1, |arr| arr.value(row));
         let pos = eval_row(s_arr.value(row), p_arr.value(row), start_pos, occurrence)?;
-        out.push(Some(pos));
+        out.push(Some(pos as i32));
     }
 
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+    Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
 }
 
 fn eval_row(input: &str, pattern: &str, start_pos: i64, occurrence: i64) -> Result<i64, String> {
@@ -146,7 +146,7 @@ mod tests {
     use crate::exec::expr::function::string::test_utils::{
         chunk_len_1, literal_i64, literal_string, typed_null,
     };
-    use arrow::array::Int64Array;
+    use arrow::array::Int32Array;
     use arrow::datatypes::DataType;
 
     #[test]
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn test_regexp_position_unicode_and_occurrence() {
         let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Int64);
+        let expr = typed_null(&mut arena, DataType::Int32);
         let input = literal_string(&mut arena, "有朋$%X自9远方9来");
         let pat = literal_string(&mut arena, "[0-9]");
         let start = literal_i64(&mut arena, 10);
@@ -165,7 +165,7 @@ mod tests {
 
         let out =
             eval_regexp_position(&arena, expr, &[input, pat, start, occ], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(out.value(0), -1);
     }
 }

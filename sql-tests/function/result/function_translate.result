@@ -1,0 +1,777 @@
+-- query 1
+ifnull(sum(murmur_hash3_32(translate(repeat('a', 1024 * 1024), 'a', 'b'))), 0)
+1624733713
+
+-- query 2
+ifnull(sum(murmur_hash3_32(translate(concat(repeat('a', (1024 * 1024) - (1024 * 3)), repeat('膨', 1024)), '膨', 'p'))), 0)
+-308607422
+
+-- query 3
+ifnull(sum(murmur_hash3_32(translate(concat('a', repeat('b', ((1024 * 1024) - 1) - 2)), 'a', '膨'))), 0)
+777398045
+
+-- query 7
+ifnull(sum(murmur_hash3_32(translate(repeat('a', 1024 * 1024), from_str, to_str))), 0)
+1624733713
+
+-- query 10
+ifnull(sum(murmur_hash3_32(translate(concat(repeat('a', (1024 * 1024) - (1024 * 3)), repeat('膨', 1024)), from_str, to_str))), 0)
+-308607422
+
+-- query 13
+ifnull(sum(murmur_hash3_32(translate(concat('a', repeat('b', ((1024 * 1024) - 1) - 2)), from_str, to_str))), 0)
+777398045
+
+-- query 16
+ifnull(sum(murmur_hash3_32(translate(repeat('a', 1024 * 1024), from_str, to_str))), 0)
+0
+
+-- query 18
+translate('a|b|c', 'ab', '123')
+1|2|c
+
+-- query 19
+translate('a|b|c', 'abc', '12')
+1|2|
+
+-- query 20
+translate('C|S', 'CS', '测试')
+测|试
+
+-- query 21
+translate('测|试', '测试', 'CS')
+C|S
+
+-- query 22
+translate('测|试', '测试', 'C')
+C|
+
+-- query 25
+translate(src, from_str, to_str)
+测|试
+1|2|c
+1|2|
+C|S
+C|
+
+-- query 33
+ifnull(sum(murmur_hash3_32(translate(src, from_str, to_str))), 0)
+-86245165969
+
+-- query 34
+ifnull(sum(murmur_hash3_32(translate(src, 'ab', '123'))), 0)
+86181275310
+
+-- query 35
+ifnull(sum(murmur_hash3_32(translate(src, 'abc', '12'))), 0)
+39300678040
+
+-- query 36
+ifnull(sum(murmur_hash3_32(translate(src, 'CS', '测试'))), 0)
+291352620470
+
+-- query 37
+ifnull(sum(murmur_hash3_32(translate(src, '测试', 'CS'))), 0)
+-473683291648
+
+-- query 38
+ifnull(sum(murmur_hash3_32(translate(src, '测试', 'C'))), 0)
+-261631635524
+
+-- query 40
+translate('abc', 'ab', '')
+c
+
+-- query 41
+translate('abc', '', 'ab')
+abc
+
+-- query 49
+translate('abc', 'ab', NULL)
+NULL
+
+-- query 50
+translate('abc', NULL, 'ab')
+NULL
+
+-- query 51
+translate(NULL, 'CS', '测试')
+NULL
+
+-- query 54
+translate(src, from_str, to_str)
+NULL
+NULL
+NULL
+
+-- query 63
+ifnull(sum(murmur_hash3_32(translate(src, from_str, to_str))), 0)
+-9273119353
+
+-- query 64
+ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', to_str))), 0)
+-22759771935
+
+-- query 65
+ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', NULL))), 0)
+0
+
+-- query 66
+ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', '1d44cdQjCX'))), 0)
+-15403808815
+
+-- query 67
+ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', 'hdA4ZE'))), 0)
+-24092076350
+
+-- query 68
+ifnull(sum(murmur_hash3_32(translate(src, 'ù七[I%10', '4AlJzF'))), 0)
+-1691897153
+
+-- query 69
+ifnull(sum(murmur_hash3_32(translate(src, 'AaPWie', to_str))), 0)
+-6047668112
+
+-- query 70
+ifnull(sum(murmur_hash3_32(translate(src, 'AaPWie', NULL))), 0)
+0
+
+-- query 71
+ifnull(sum(murmur_hash3_32(translate(src, 'AaPWie', '1d44cdQjCX'))), 0)
+-14679810324
+
+-- query 72
+ifnull(sum(murmur_hash3_32(translate(src, 'D不b06&😄0IF😂˜', to_str))), 0)
+6117043467
+
+-- query 73
+ifnull(sum(murmur_hash3_32(translate(src, 'D不b06&😄0IF😂˜', '1d44cdQjCX'))), 0)
+-15175674670
+
+-- query 74
+ifnull(sum(murmur_hash3_32(translate(src, 'D不b06&😄0IF😂˜', 'hdA4ZE'))), 0)
+1122895566
+
+-- query 75
+ifnull(sum(murmur_hash3_32(translate(src, 'Jf😄dJeCc😂f六˜', to_str))), 0)
+-9201369252
+
+-- query 76
+ifnull(sum(murmur_hash3_32(translate(src, 'Jf😄dJeCc😂f六˜', NULL))), 0)
+0
+
+-- query 77
+ifnull(sum(murmur_hash3_32(translate(src, 'Jf😄dJeCc😂f六˜', '4AlJzF'))), 0)
+32149779
+
+-- query 78
+ifnull(sum(murmur_hash3_32(translate(src, from_str, '1d44cdQjCX'))), 0)
+8038977823
+
+-- query 79
+ifnull(sum(murmur_hash3_32(translate(src, NULL, '1d44cdQjCX'))), 0)
+0
+
+-- query 80
+ifnull(sum(murmur_hash3_32(translate(src, from_str, 'hdA4ZE'))), 0)
+-3519052013
+
+-- query 81
+ifnull(sum(murmur_hash3_32(translate(src, NULL, 'hdA4ZE'))), 0)
+0
+
+-- query 82
+ifnull(sum(murmur_hash3_32(translate(src, from_str, NULL))), 0)
+0
+
+-- query 83
+ifnull(sum(murmur_hash3_32(translate(src, NULL, NULL))), 0)
+0
+
+-- query 84
+ifnull(sum(murmur_hash3_32(translate(src, from_str, '4AlJzF'))), 0)
+3752409022
+
+-- query 85
+ifnull(sum(murmur_hash3_32(translate(src, NULL, '4AlJzF'))), 0)
+0
+
+-- query 86
+ifnull(sum(murmur_hash3_32(translate('4*一测1-F六g五八G八😇I测iJ😂id3-b二j(试&九e^二h&H二cæB%AæB]g0六[', from_str, to_str))), 0)
+-20138841983
+
+-- query 87
+ifnull(sum(murmur_hash3_32(translate('æ˜三3h(DIä1j七F试a四G1I›43e›🙂GA二˜##ac五HjD😄jä', from_str, to_str))), 0)
+10595944852
+
+-- query 88
+ifnull(sum(murmur_hash3_32(translate('[˜一Gi', from_str, to_str))), 0)
+70372815234
+
+-- query 89
+ifnull(sum(murmur_hash3_32(translate('e四i)1😄eJD^*C2ù-Fj]测七', from_str, to_str))), 0)
+11079547357
+
+-- query 90
+ifnull(sum(murmur_hash3_32(translate('^😂2æ六d]iBdcc五4?a(😂B1七八1[DC三四])(E0æIæ八一', from_str, to_str))), 0)
+-3203593422
+
+-- query 91
+ifnull(sum(murmur_hash3_32(translate('', from_str, to_str))), 0)
+-87849464430
+
+-- query 92
+ifnull(sum(murmur_hash3_32(translate(NULL, from_str, to_str))), 0)
+0
+
+-- query 93
+ifnull(sum(murmur_hash3_32(translate('›gH六🙂九›-一B#二EC(', from_str, to_str))), 0)
+-30345492435
+
+-- query 94
+ifnull(sum(murmur_hash3_32(translate('f^ä?]GhB三˜&Hb]A😂七七æ六?', from_str, to_str))), 0)
+28728196157
+
+-- query 95
+ifnull(sum(murmur_hash3_32(translate('J😇D]&4', from_str, to_str))), 0)
+-78344961444
+
+-- query 96
+ifnull(sum(murmur_hash3_32(translate('试ù^d二八0', from_str, to_str))), 0)
+-119311709439
+
+-- query 97
+ifnull(sum(murmur_hash3_32(translate('四1h', from_str, to_str))), 0)
+91564110027
+
+-- query 98
+ifnull(sum(murmur_hash3_32(translate('0', from_str, to_str))), 0)
+-116630637114
+
+-- query 99
+ifnull(sum(murmur_hash3_32(translate('七', from_str, to_str))), 0)
+-88010173341
+
+-- query 100
+ifnull(sum(murmur_hash3_32(translate(']一', from_str, to_str))), 0)
+-58659638217
+
+-- query 101
+translate('f›˜IGi?hB?😄二E[-E$›)😂›f)0六2e)八2d测Ih四]四c九DFa^', ')0f)›Z', 'ldbcEEDFIG')
+bE˜IGi?hB?😄二E[-E$El😂Ebld六2el八2d测Ih四]四c九DFa^
+
+-- query 102
+translate('3bh$^)g(G八?八-cd4一I3D三cFe二#AICâ😄cB#五ää', '在4A7三g', 'tbDbkc')
+3bh$^)c(G八?八-cdb一I3DkcFe二#DICâ😄cB#五ää
+
+-- query 103
+translate('七ca&+âDù三˜六九#ûc+%六h$›B测æ四🙂七â*1*', NULL, 'a1B1DhDhgDc')
+NULL
+
+-- query 104
+translate('hC😇😇3?', 'hCCChh5C3DH3y', '3ChC03Chl3h3')
+3C😇😇l?
+
+-- query 105
+translate('试&4😂', 'T4😂😂&试t&&试4', '4&&试ä&试xHZ&K4')
+&ä&&
+
+-- query 106
+translate('-二c%🙂G九c%^#C-^h四›九0三', 'b›不%G试0九cd二cc', '3GCChhc')
+-C🙂hC^#C-^h四Gc三
+
+-- query 107
+translate('九Bb-jâC2三Eû🙂F*)0😄æEbjû四八九😂d*â˜D1ceJ🙂›八+-32ùG˜试4', 'bbbF1DI', NULL)
+NULL
+
+-- query 108
+translate('?h*I3hD›j测八â]fG1🙂GBB4试dijæ0gg1😄F🙂â四三&e*[九', NULL, '›âx3&B')
+NULL
+
+-- query 109
+translate('æ˜😂😂gD›E测JE一˜3😄i四五äF3^ùHâ)九geHF😄˜1h五&I#a', 'MFivH3', 'ggFUEEa3')
+æ˜😂😂gD›E测JE一˜E😄F四五ägE^ùEâ)九geEg😄˜1h五&I#a
+
+-- query 110
+translate(')AI😂#æ?Fûg2äDû试九', 'gggwA2uVFUd3D', 'Y4RFIx2I')
+)II😂#æ?ûYxäû试九
+
+-- query 111
+translate(NULL, 'USYiLqixr', '7iext05GARPW4A')
+NULL
+
+-- query 112
+translate('ie4eC[g-2九*I😄八jfI😄八)a九âäE🙂4?1一æ六😄4🙂ù四3九3j一?', 'Jg😍9😂😍I一?😄ùC', '3Najg2ei44I')
+ie4e[N-2九*e4八jfe4八)a九âäE🙂441iæ六44🙂I四3九3ji4
+
+-- query 113
+translate('E2#›&I+%', 'I2EIE2C2222II', '试I😄%›E+EI😍测&')
+😄I#›&试+%
+
+-- query 114
+translate('(Fd$bFfäF五九二Ij', 'FFNj九bd试jf九ä', NULL)
+NULL
+
+-- query 115
+translate(']3😇😂二五I+IGa##E八Hæah', '二五#Ea]', 'caIhVya3HIIfGJ')
+y3😇😂caI+IGVIIh八HæVh
+
+-- query 116
+translate('六eJH五C九^', 'eAYeeCJH', '^五e九九C')
+六^五C九^
+
+-- query 117
+translate('六😄1C›+eJ二%â七😂H[]›aHù一', 'HoaAmFe1JN', NULL)
+NULL
+
+-- query 118
+translate(NULL, 'bCb0r0NTh', 'DJBQcsGL99EDOU')
+NULL
+
+-- query 119
+translate('😄4jCdha九?😇3H]Fef4试八hgF五五J三c)🙂七2%hF🙂a-If😂a›[#j˜J', '4cxIhufm3hn', '5GxFgChdkHdIa')
+😄5jCdga九?😇kH]Feh5试八ggF五五J三G)🙂七2%gF🙂a-Fh😂a›[#j˜J
+
+-- query 120
+translate('h', 'hhzhhhhhChFh', 'hhhh8hhh')
+h
+
+-- query 121
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜â测😄a试'))), 0)
+-18777612328
+
+-- query 122
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜试'))), 0)
+-24312133682
+
+-- query 123
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜âa试'))), 0)
+-17664875903
+
+-- query 124
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜a'))), 0)
+-7748478770
+
+-- query 125
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', 'â测😄a'))), 0)
+-5671249146
+
+-- query 126
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', 'â测试'))), 0)
+-21220295577
+
+-- query 127
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '测😄a试'))), 0)
+-18656381789
+
+-- query 128
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '测😄'))), 0)
+-20066567366
+
+-- query 129
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜😄试'))), 0)
+-10705596896
+
+-- query 130
+ifnull(sum(murmur_hash3_32(translate(src, '˜›âä测试😄😂ab', '˜测😄'))), 0)
+-6254708075
+
+-- query 131
+translate('˜›âä测试😄😂ab', 'â测😄', '测')
+˜›测ä试😂ab
+
+-- query 132
+translate('˜›âä测试😄😂ab', 'â测😄', 'b')
+˜›bä试😂ab
+
+-- query 133
+translate('˜›âä测试😄😂ab', 'â测😄', 'b测')
+˜›bä测试😂ab
+
+-- query 134
+translate('˜›âä测试😄😂ab', 'â测😄', '😂')
+˜›😂ä试😂ab
+
+-- query 135
+translate('˜›âä测试😄😂ab', 'â测😄', '😂测')
+˜›😂ä测试😂ab
+
+-- query 136
+translate('˜›âä测试😄😂ab', 'â测😄', '😂b')
+˜›😂äb试😂ab
+
+-- query 137
+translate('˜›âä测试😄😂ab', 'â测😄', '😂b测')
+˜›😂äb试测😂ab
+
+-- query 138
+translate('˜›âä测试😄😂ab', 'â测😄', '试')
+˜›试ä试😂ab
+
+-- query 139
+translate('˜›âä测试😄😂ab', 'â测😄', '试测')
+˜›试ä测试😂ab
+
+-- query 140
+translate('˜›âä测试😄😂ab', 'â测😄', '试b')
+˜›试äb试😂ab
+
+-- query 141
+translate('˜›âä测试😄😂ab', '测试', '测')
+˜›âä测😄😂ab
+
+-- query 142
+translate('˜›âä测试😄😂ab', '测试', 'b')
+˜›âäb😄😂ab
+
+-- query 143
+translate('˜›âä测试😄😂ab', '测试', 'b测')
+˜›âäb测😄😂ab
+
+-- query 144
+translate('˜›âä测试😄😂ab', '测试', '😂')
+˜›âä😂😄😂ab
+
+-- query 145
+translate('˜›âä测试😄😂ab', '测试', '😂测')
+˜›âä😂测😄😂ab
+
+-- query 146
+translate('˜›âä测试😄😂ab', '测试', '😂b')
+˜›âä😂b😄😂ab
+
+-- query 147
+translate('˜›âä测试😄😂ab', '测试', '😂b测')
+˜›âä😂b😄😂ab
+
+-- query 148
+translate('˜›âä测试😄😂ab', '测试', '试')
+˜›âä试😄😂ab
+
+-- query 149
+translate('˜›âä测试😄😂ab', '测试', '试测')
+˜›âä试测😄😂ab
+
+-- query 150
+translate('˜›âä测试😄😂ab', '测试', '试b')
+˜›âä试b😄😂ab
+
+-- query 151
+translate('˜›âä测试😄😂ab', '˜â😄', '测')
+测›ä测试😂ab
+
+-- query 152
+translate('˜›âä测试😄😂ab', '˜â😄', 'b')
+b›ä测试😂ab
+
+-- query 153
+translate('˜›âä测试😄😂ab', '˜â😄', 'b测')
+b›测ä测试😂ab
+
+-- query 154
+translate('˜›âä测试😄😂ab', '˜â😄', '😂')
+😂›ä测试😂ab
+
+-- query 155
+translate('˜›âä测试😄😂ab', '˜â😄', '😂测')
+😂›测ä测试😂ab
+
+-- query 156
+translate('˜›âä测试😄😂ab', '˜â😄', '😂b')
+😂›bä测试😂ab
+
+-- query 157
+translate('˜›âä测试😄😂ab', '˜â😄', '😂b测')
+😂›bä测试测😂ab
+
+-- query 158
+translate('˜›âä测试😄😂ab', '˜â😄', '试')
+试›ä测试😂ab
+
+-- query 159
+translate('˜›âä测试😄😂ab', '˜â😄', '试测')
+试›测ä测试😂ab
+
+-- query 160
+translate('˜›âä测试😄😂ab', '˜â😄', '试b')
+试›bä测试😂ab
+
+-- query 161
+translate('˜›âä测试😄😂ab', 'âa试', '测')
+˜›测ä测😄😂b
+
+-- query 162
+translate('˜›âä测试😄😂ab', 'âa试', 'b')
+˜›bä测😄😂b
+
+-- query 163
+translate('˜›âä测试😄😂ab', 'âa试', 'b测')
+˜›bä测😄😂测b
+
+-- query 164
+translate('˜›âä测试😄😂ab', 'âa试', '😂')
+˜›😂ä测😄😂b
+
+-- query 165
+translate('˜›âä测试😄😂ab', 'âa试', '😂测')
+˜›😂ä测😄😂测b
+
+-- query 166
+translate('˜›âä测试😄😂ab', 'âa试', '😂b')
+˜›😂ä测😄😂bb
+
+-- query 167
+translate('˜›âä测试😄😂ab', 'âa试', '😂b测')
+˜›😂ä测测😄😂bb
+
+-- query 168
+translate('˜›âä测试😄😂ab', 'âa试', '试')
+˜›试ä测😄😂b
+
+-- query 169
+translate('˜›âä测试😄😂ab', 'âa试', '试测')
+˜›试ä测😄😂测b
+
+-- query 170
+translate('˜›âä测试😄😂ab', 'âa试', '试b')
+˜›试ä测😄😂bb
+
+-- query 171
+translate('˜›âä测试😄😂ab', '˜试', '测')
+测›âä测😄😂ab
+
+-- query 172
+translate('˜›âä测试😄😂ab', '˜试', 'b')
+b›âä测😄😂ab
+
+-- query 173
+translate('˜›âä测试😄😂ab', '˜试', 'b测')
+b›âä测测😄😂ab
+
+-- query 174
+translate('˜›âä测试😄😂ab', '˜试', '😂')
+😂›âä测😄😂ab
+
+-- query 175
+translate('˜›âä测试😄😂ab', '˜试', '😂测')
+😂›âä测测😄😂ab
+
+-- query 176
+translate('˜›âä测试😄😂ab', '˜试', '😂b')
+😂›âä测b😄😂ab
+
+-- query 177
+translate('˜›âä测试😄😂ab', '˜试', '😂b测')
+😂›âä测b😄😂ab
+
+-- query 178
+translate('˜›âä测试😄😂ab', '˜试', '试')
+试›âä测😄😂ab
+
+-- query 179
+translate('˜›âä测试😄😂ab', '˜试', '试测')
+试›âä测测😄😂ab
+
+-- query 180
+translate('˜›âä测试😄😂ab', '˜试', '试b')
+试›âä测b😄😂ab
+
+-- query 181
+translate('˜›âä测试😄😂ab', '˜â测', '测')
+测›ä试😄😂ab
+
+-- query 182
+translate('˜›âä测试😄😂ab', '˜â测', 'b')
+b›ä试😄😂ab
+
+-- query 183
+translate('˜›âä测试😄😂ab', '˜â测', 'b测')
+b›测ä试😄😂ab
+
+-- query 184
+translate('˜›âä测试😄😂ab', '˜â测', '😂')
+😂›ä试😄😂ab
+
+-- query 185
+translate('˜›âä测试😄😂ab', '˜â测', '😂测')
+😂›测ä试😄😂ab
+
+-- query 186
+translate('˜›âä测试😄😂ab', '˜â测', '😂b')
+😂›bä试😄😂ab
+
+-- query 187
+translate('˜›âä测试😄😂ab', '˜â测', '😂b测')
+😂›bä测试😄😂ab
+
+-- query 188
+translate('˜›âä测试😄😂ab', '˜â测', '试')
+试›ä试😄😂ab
+
+-- query 189
+translate('˜›âä测试😄😂ab', '˜â测', '试测')
+试›测ä试😄😂ab
+
+-- query 190
+translate('˜›âä测试😄😂ab', '˜â测', '试b')
+试›bä试😄😂ab
+
+-- query 191
+translate('˜›âä测试😄😂ab', 'â', '测')
+˜›测ä测试😄😂ab
+
+-- query 192
+translate('˜›âä测试😄😂ab', 'â', 'b')
+˜›bä测试😄😂ab
+
+-- query 193
+translate('˜›âä测试😄😂ab', 'â', 'b测')
+˜›bä测试😄😂ab
+
+-- query 194
+translate('˜›âä测试😄😂ab', 'â', '😂')
+˜›😂ä测试😄😂ab
+
+-- query 195
+translate('˜›âä测试😄😂ab', 'â', '😂测')
+˜›😂ä测试😄😂ab
+
+-- query 196
+translate('˜›âä测试😄😂ab', 'â', '😂b')
+˜›😂ä测试😄😂ab
+
+-- query 197
+translate('˜›âä测试😄😂ab', 'â', '😂b测')
+˜›😂ä测试😄😂ab
+
+-- query 198
+translate('˜›âä测试😄😂ab', 'â', '试')
+˜›试ä测试😄😂ab
+
+-- query 199
+translate('˜›âä测试😄😂ab', 'â', '试测')
+˜›试ä测试😄😂ab
+
+-- query 200
+translate('˜›âä测试😄😂ab', 'â', '试b')
+˜›试ä测试😄😂ab
+
+-- query 201
+translate('˜›âä测试😄😂ab', 'â测a试', '测')
+˜›测ä😄😂b
+
+-- query 202
+translate('˜›âä测试😄😂ab', 'â测a试', 'b')
+˜›bä😄😂b
+
+-- query 203
+translate('˜›âä测试😄😂ab', 'â测a试', 'b测')
+˜›bä测😄😂b
+
+-- query 204
+translate('˜›âä测试😄😂ab', 'â测a试', '😂')
+˜›😂ä😄😂b
+
+-- query 205
+translate('˜›âä测试😄😂ab', 'â测a试', '😂测')
+˜›😂ä测😄😂b
+
+-- query 206
+translate('˜›âä测试😄😂ab', 'â测a试', '😂b')
+˜›😂äb😄😂b
+
+-- query 207
+translate('˜›âä测试😄😂ab', 'â测a试', '😂b测')
+˜›😂äb😄😂测b
+
+-- query 208
+translate('˜›âä测试😄😂ab', 'â测a试', '试')
+˜›试ä😄😂b
+
+-- query 209
+translate('˜›âä测试😄😂ab', 'â测a试', '试测')
+˜›试ä测😄😂b
+
+-- query 210
+translate('˜›âä测试😄😂ab', 'â测a试', '试b')
+˜›试äb😄😂b
+
+-- query 211
+translate('˜›âä测试😄😂ab', '😄a试', '测')
+˜›âä测测😂b
+
+-- query 212
+translate('˜›âä测试😄😂ab', '😄a试', 'b')
+˜›âä测b😂b
+
+-- query 213
+translate('˜›âä测试😄😂ab', '😄a试', 'b测')
+˜›âä测b😂测b
+
+-- query 214
+translate('˜›âä测试😄😂ab', '😄a试', '😂')
+˜›âä测😂😂b
+
+-- query 215
+translate('˜›âä测试😄😂ab', '😄a试', '😂测')
+˜›âä测😂😂测b
+
+-- query 216
+translate('˜›âä测试😄😂ab', '😄a试', '😂b')
+˜›âä测😂😂bb
+
+-- query 217
+translate('˜›âä测试😄😂ab', '😄a试', '😂b测')
+˜›âä测测😂😂bb
+
+-- query 218
+translate('˜›âä测试😄😂ab', '😄a试', '试')
+˜›âä测试😂b
+
+-- query 219
+translate('˜›âä测试😄😂ab', '😄a试', '试测')
+˜›âä测试😂测b
+
+-- query 220
+translate('˜›âä测试😄😂ab', '😄a试', '试b')
+˜›âä测试😂bb
+
+-- query 221
+translate('˜›âä测试😄😂ab', 'a', '测')
+˜›âä测试😄😂测b
+
+-- query 222
+translate('˜›âä测试😄😂ab', 'a', 'b')
+˜›âä测试😄😂bb
+
+-- query 223
+translate('˜›âä测试😄😂ab', 'a', 'b测')
+˜›âä测试😄😂bb
+
+-- query 224
+translate('˜›âä测试😄😂ab', 'a', '😂')
+˜›âä测试😄😂😂b
+
+-- query 225
+translate('˜›âä测试😄😂ab', 'a', '😂测')
+˜›âä测试😄😂😂b
+
+-- query 226
+translate('˜›âä测试😄😂ab', 'a', '😂b')
+˜›âä测试😄😂😂b
+
+-- query 227
+translate('˜›âä测试😄😂ab', 'a', '😂b测')
+˜›âä测试😄😂😂b
+
+-- query 228
+translate('˜›âä测试😄😂ab', 'a', '试')
+˜›âä测试😄😂试b
+
+-- query 229
+translate('˜›âä测试😄😂ab', 'a', '试测')
+˜›âä测试😄😂试b
+
+-- query 230
+translate('˜›âä测试😄😂ab', 'a', '试b')
+˜›âä测试😄😂试b
