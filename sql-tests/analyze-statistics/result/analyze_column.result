@@ -1,0 +1,40 @@
+-- query 3
+column_name	row_count
+
+-- query 5
+column_name	row_count
+k1	5
+k2	5
+
+-- query 7
+column_name	row_count
+k3	5
+k4	5
+
+-- query 9
+column_name	row_count
+
+-- query 11
+column_name	row_count
+
+-- query 13
+column_name	row_count
+k1	5
+k10	5
+k11	5
+k12	5
+k13	5
+k2	5
+k3	5
+k4	5
+k5	5
+k6	5
+k7	5
+k8	5
+k9	5
+
+-- query 14
+column_name	row_count
+
+-- query 16
+column_name	row_count

@@ -1,0 +1,27 @@
+-- query 3
+count(*)
+3
+
+-- query 5
+count(*)
+4
+
+-- query 7
+count(*)
+20
+
+-- query 9
+count(*)
+22
+
+-- query 20
+count(*)
+12
+
+-- query 22
+count(*)
+12
+
+-- query 24
+count(*)
+14

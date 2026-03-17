@@ -1,0 +1,12 @@
+-- query 1
+k1	v1
+guangzhou	4
+hefei	7
+jinan	6
+shenzhen	5
+
+-- query 3
+k1	v1
+hefei	7
+jinan	6
+shenzhen	5

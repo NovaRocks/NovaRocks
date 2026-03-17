@@ -1,0 +1,35 @@
+-- query 3
+column_name	partition_name	row_count	max	min
+k2	test_update_stats	1000000	1000000	1
+k3	test_update_stats	1000000	data	data
+
+-- query 5
+column_name	partition_name	row_count	max	min
+k2	test_update_stats	1000000	1000000	1
+k3	test_update_stats	1000000	data	data
+
+-- query 6
+Table	Columns	Type	is_new
+test_update_stats	ALL	SAMPLE	no analyze
+
+-- query 8
+column_name	partition_name	row_count	max	min
+k2	test_update_stats	1000000	1000000	1
+k3	test_update_stats	1000000	data	data
+
+-- query 9
+Table	Columns	Type	is_new
+test_update_stats	ALL	SAMPLE	no analyze
+
+-- query 11
+column_name	partition_name	row_count	max	min
+k2	test_update_stats	1000000	1000000	1
+k3	test_update_stats	1000000	data	3updated3
+
+-- query 12
+Table	Columns	Type	is_new
+test_update_stats	ALL	FULL	new analyze
+
+-- query 14
+Table	Columns	Type	is_new
+test_update_stats	ALL	SAMPLE	new analyze

@@ -1,0 +1,23 @@
+-- query 1
+count(1)
+1
+
+-- query 2
+count(1)
+1
+
+-- query 4
+count(1)
+2
+
+-- query 6
+count(1)
+1
+
+-- query 7
+count(1)
+1
+
+-- query 9
+count(1)
+2
