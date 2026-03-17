@@ -1,0 +1,28 @@
+-- query 1
+id	bitmap_to_string(bm)	bitmap_count(bm)
+1		0
+2		0
+3	100	1
+
+-- query 2
+id	hll_cardinality(h)
+1	0
+2	0
+3	1
+
+-- query 3
+id	name	bitmap_to_string(bm)	bitmap_count(bm)
+1	alice		0
+2	bob		0
+3	charlie		0
+
+-- query 4
+id	name	hll_cardinality(h)
+1	alice	0
+2	bob	0
+3	charlie	0
+
+-- query 7
+type	id	name	bitmap_count(bm)
+with_default	1	alice	0
+without_default	1	alice	0

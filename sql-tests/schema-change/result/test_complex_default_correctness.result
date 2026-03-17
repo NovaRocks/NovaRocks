@@ -1,0 +1,194 @@
+-- query 1
+id	arr_tinyint	arr_smallint	arr_int	arr_bigint	arr_float	arr_double	arr_varchar	arr_char	arr_bool	arr_decimal32	arr_decimal64	arr_decimal128	arr_decimal256
+1	[1,2,127]	[100,200,32767]	[1000,2000,2147483647]	[1000000,2000000,9223372036854775807]	[1.1,2.2,3.3]	[1.123456789,2.987654321,3.141592653]	["hello","world","你好世界"]	["abc","def","ghi"]	[1,0,1,0]	[123.45,678.90,999.99]	[12345678.1234,87654321.4321]	[1234567890.1234567890,9876543210.0987654321]	[1123123234567890123412345678901234.1234567890,98765432109876.0987654321]
+2	[1,2,127]	[100,200,32767]	[1000,2000,2147483647]	[1000000,2000000,9223372036854775807]	[1.1,2.2,3.3]	[1.123456789,2.987654321,3.141592653]	["hello","world","你好世界"]	["abc","def","ghi"]	[1,0,1,0]	[123.45,678.90,999.99]	[12345678.1234,87654321.4321]	[1234567890.1234567890,9876543210.0987654321]	[1123123234567890123412345678901234.1234567890,98765432109876.0987654321]
+
+-- query 2
+id	map_int_str	map_str_int	map_int_double	map_str_bool	map_int_decimal
+1	{1:"one",2:"two",100:"hundred"}	{"alice":25,"bob":30,"charlie":35}	{1:1.1,2:2.2,3:3.3}	{"active":1,"disabled":0}	{1:99.99,2:199.99,3:299.99}
+2	{1:"one",2:"two",100:"hundred"}	{"alice":25,"bob":30,"charlie":35}	{1:1.1,2:2.2,3:3.3}	{"active":1,"disabled":0}	{1:99.99,2:199.99,3:299.99}
+
+-- query 3
+id	st1	st2	st3	st4
+1	{"z":999,"a":"test"}	{"field_c":100,"field_b":"middle","field_a":3.14}	{"s4":2,"ks":[1,2,3,4]}	{"zebra":10,"apple":"fruit","monkey":1,"banana":2.5}
+2	{"z":999,"a":"test"}	{"field_c":100,"field_b":"middle","field_a":3.14}	{"s4":2,"ks":[1,2,3,4]}	{"zebra":10,"apple":"fruit","monkey":1,"banana":2.5}
+
+-- query 4
+id	arr2_int	arr2_str	arr3_int	arr2_empty
+1	[[1,2,3],[4,5],[6,7,8,9]]	[["a","b"],["c","d","e"],["f"]]	[[[1,2],[3]],[[4,5,6]],[[7],[8,9]]]	[[],[1,2],[]]
+2	[[1,2,3],[4,5],[6,7,8,9]]	[["a","b"],["c","d","e"],["f"]]	[[[1,2],[3]],[[4,5,6]],[[7],[8,9]]]	[[],[1,2],[]]
+
+-- query 5
+id	arr_st1	arr_st2	arr_st3
+1	[{"id":1,"name":"alice"},{"id":2,"name":"bob"},{"id":3,"name":"charlie"}]	[{"score":95,"age":25,"name":"student1"},{"score":88,"age":26,"name":"student2"}]	[{"id":1,"tags":["tag1","tag2"]},{"id":2,"tags":["tag3","tag4","tag5"]}]
+2	[{"id":1,"name":"alice"},{"id":2,"name":"bob"},{"id":3,"name":"charlie"}]	[{"score":95,"age":25,"name":"student1"},{"score":88,"age":26,"name":"student2"}]	[{"id":1,"tags":["tag1","tag2"]},{"id":2,"tags":["tag3","tag4","tag5"]}]
+
+-- query 6
+id	mp_arr1	mp_arr2	mp_arr3
+1	{1:["a","b","c"],2:["d","e"],3:["f","g","h","i"]}	{"ages":[25,30,35],"scores":[90,85,92]}	{1:[[1,2],[3,4]],2:[[5],[6,7,8]]}
+2	{1:["a","b","c"],2:["d","e"],3:["f","g","h","i"]}	{"ages":[25,30,35],"scores":[90,85,92]}	{1:[[1,2],[3,4]],2:[[5],[6,7,8]]}
+
+-- query 7
+id	mp_st1	mp_st2	mp_st3	mp_st4
+1	{1:{"name":"alice","age":25},2:{"name":"bob","age":30}}	{10:{"z":999,"a":"test"},20:{"z":888,"a":"demo"}}	{1:{"s4":2,"ks":[1,2,3,4]},2:{"s4":5,"ks":[10,20,30]}}	{10:{"field_b":"hello","field_a":100,"nested":{"z":null,"a":null}}}
+2	{1:{"name":"alice","age":25},2:{"name":"bob","age":30}}	{10:{"z":999,"a":"test"},20:{"z":888,"a":"demo"}}	{1:{"s4":2,"ks":[1,2,3,4]},2:{"s4":5,"ks":[10,20,30]}}	{10:{"field_b":"hello","field_a":100,"nested":{"z":null,"a":null}}}
+
+-- query 8
+id	st_arr	st_map	st_both	st_deep
+1	{"id":1,"scores":[90,85,95],"name":"student"}	{"id":1,"attributes":{"color":"red","size":"large"}}	{"tags":["tag1","tag2"],"id":100,"metadata":{"priority":5,"version":1}}	{"name":"container","items":[{"id":null,"value":null},{"id":null,"value":null}]}
+2	{"id":1,"scores":[90,85,95],"name":"student"}	{"id":1,"attributes":{"color":"red","size":"large"}}	{"tags":["tag1","tag2"],"id":100,"metadata":{"priority":5,"version":1}}	{"name":"container","items":[{"id":null,"value":null},{"id":null,"value":null}]}
+
+-- query 9
+id	arr3	arr_map_arr	map_arr_st	st_map_arr	map_st_arr
+1	[[[1,2],[3]],[[4,5]]]	[{1:[1,2],2:[3,4]},{10:[10,20]}]	{1:[{"id":1,"name":"a"},{"id":2,"name":"b"}]}	{"id":1,"data":{"scores":[90,95,100]}}	{1:{"name":"test","vals":[1,2,3]}}
+2	[[[1,2],[3]],[[4,5]]]	[{1:[1,2],2:[3,4]},{10:[10,20]}]	{1:[{"id":1,"name":"a"},{"id":2,"name":"b"}]}	{"id":1,"data":{"scores":[90,95,100]}}	{1:{"name":"test","vals":[1,2,3]}}
+
+-- query 10
+id	arr_empty	map_empty	st_empty_arr	st_empty_map	st_all_empty	arr_mixed	map_empty_arr
+1	[]	{}	{"id":1,"tags":[]}	{"id":1,"attrs":{}}	{"id":0,"arr":[],"mp":{}}	[[],[1,2],[],[3,4,5]]	{1:[],2:["a","b"],3:[]}
+2	[]	{}	{"id":1,"tags":[]}	{"id":1,"attrs":{}}	{"id":0,"arr":[],"mp":{}}	[[],[1,2],[],[3,4,5]]	{1:[],2:["a","b"],3:[]}
+
+-- query 11
+id	arr_dec32	arr_dec64	arr_dec128	arr_dec256	map_dec	map_dec256	st_dec	arr_st_dec
+1	[99.99,199.99,299.99]	[9999.9999,19999.9999]	[123456.1234567890,654321.0987654321]	[123456789012.1234567890,987654321098.0987654321]	{"price":99.99,"tax":8.25,"total":108.24}	{1:99999999999.9999999999,2:12345678901.1234567890}	{"amount":1000.50,"rate":0.0525,"result":52.526250,"large":123456789012.1234567890}	[{"id":1,"price":99.99},{"id":2,"price":199.99},{"id":3,"price":299.99}]
+2	[99.99,199.99,299.99]	[9999.9999,19999.9999]	[123456.1234567890,654321.0987654321]	[123456789012.1234567890,987654321098.0987654321]	{"price":99.99,"tax":8.25,"total":108.24}	{1:99999999999.9999999999,2:12345678901.1234567890}	{"amount":1000.50,"rate":0.0525,"result":52.526250,"large":123456789012.1234567890}	[{"id":1,"price":99.99},{"id":2,"price":199.99},{"id":3,"price":299.99}]
+
+-- query 12
+id	large_arr	large_map	large_struct	complex_combo
+1	[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]	{1:"one",2:"two",3:"three",4:"four",5:"five",6:"six",7:"seven",8:"eight",9:"nine",10:"ten"}	{"f1":1,"f2":2,"f3":3,"f4":4,"f5":5,"f6":"six","f7":"seven","f8":8.8,"f9":1,"f10":10.50}	{1:{"id":100,"tags":["tag1","tag2","tag3"],"scores":[90,85,95],"metadata":{"level":"high","type":"A"}},2:{"id":200,"tags":["tag4","tag5"],"scores":[80,88],"metadata":{"level":"medium","type":"B"}}}
+
+-- query 13
+id	arr_unicode	arr_special	map_unicode	st_unicode
+1	["你好","世界","こんにちは","안녕하세요","🚀","⭐"]	["it's","path\\to\\file","\"quoted\""]	{"emoji":"😀🎉","中文":"测试"}	{"name":"用户名","description":"这是一个包含中文的描述信息"}
+
+-- query 14
+id	arr_st_map_arr	map_st_arr_map	st_map_st_arr
+1	[{"id":1,"data":{10:[1,2,3],20:[4,5]}},{"id":2,"data":{30:[6,7,8,9]}}]	{1:{"tags":["tag1","tag2"],"attrs":{"level":5,"score":90}},2:{"tags":["tag3"],"attrs":{"level":3,"score":85}}}	{"name":"test","data":{1:{"id":null,"vals":null},2:{"id":null,"vals":null}}}
+
+-- query 15
+id	st_map_arr_map	arr_map_st_map_arr	map_arr_st_arr_st
+1	{"id":1,"nested":{10:[{"a":1,"b":2},{"c":3}],20:[{"d":4,"e":5,"f":6}]}}	[{1:{"name":"item1","data":{"ages":[25,30],"scores":[90,85]}}},{2:{"name":"item2","data":{"scores":[95,92,88]}}}]	{1:[{"id":10,"items":[{"k":null,"v":null},{"k":null,"v":null}]}],2:[{"id":20,"items":[{"k":null,"v":null}]},{"id":30,"items":[{"k":null,"v":null},{"k":null,"v":null}]}]}
+
+-- query 16
+id	arr_st_order	map_st_nested	st_map_st
+1	[{"zebra":10,"apple":"fruit","monkey":1,"banana":[1,2,3]},{"zebra":20,"apple":"animal","monkey":0,"banana":[4,5]}]	{1:{"outer_z":100,"outer_a":"test","nested_st":{"inner_y":null,"inner_b":null}}}	NULL
+
+-- query 17
+id	arr3_mixed	map_arr_st_empty	st_mixed_empty	arr_map_st_empty
+1	[[[1,2],[]],[[]],[[3],[4,5]]]	{1:[{"id":null,"tags":null},{"id":2,"tags":["tag1","tag2"]}],2:[]}	{"id":1,"empty_arr":[],"empty_map":{},"non_empty_arr":[1,2],"non_empty_map":{"k":100}}	[{},{1:{"id":10,"data":[1,2,3]}},{},{2:{"id":null,"data":null}}]
+
+-- query 18
+id	level6_1	level6_2	level6_3
+1	[{1:{"id":100,"nested":[{1:[1,2]},{2:[3,4]}]}}]	{1:{"name":"test","data":{10:[{"id":null,"vals":null}]}}}	{"id":1,"deep":[{1:{"name":null,"data":null}}]}
+
+-- query 19
+id	arr_st_dec256	map_st_dec256	st_map_arr_dec256
+1	[{"id":1,"amount":12345678901234.1234567890},{"id":2,"amount":98765432109876.0987654321}]	{1:{"price":99999999999.9999999999,"history":[11111111111.1111111111,22222222222.2222222222]}}	{"name":"test","data":{1:[{"id":null,"val":null},{"id":null,"val":null}]}}
+
+-- query 20
+id	first_tinyint	second_tinyint	first_varchar	first_decimal256
+1	1	2	hello	1123123234567890123412345678901234.1234567890
+2	1	2	hello	1123123234567890123412345678901234.1234567890
+
+-- query 21
+id	first_subarray	first_elem_of_first_subarray	second_elem_of_second_subarray	deeply_nested_element
+1	[1,2,3]	1	5	1
+2	[1,2,3]	1	5	1
+
+-- query 22
+id	value_for_key_1	value_for_key_100	alice_value	decimal_for_key_2
+1	one	hundred	25	199.99
+2	one	hundred	25	199.99
+
+-- query 23
+id	st1_field_z	st1_field_a	st3_field_s4	st3_field_ks_array	st3_first_ks_element
+1	999	test	2	[1,2,3,4]	1
+2	999	test	2	[1,2,3,4]	1
+
+-- query 24
+id	struct_id	scores_array	first_score	color_value	first_item_id	second_item_value
+1	1	[90,85,95]	90	red	NULL	NULL
+2	1	[90,85,95]	90	red	NULL	NULL
+
+-- query 25
+id	first_person_id	first_person_name	second_student_score	first_record_second_tag
+1	1	alice	88	tag2
+2	1	alice	88	tag2
+
+-- query 26
+id	array_for_key_1	second_elem_of_array_for_key_1	first_score	nested_array_element
+1	["a","b","c"]	b	90	2
+2	["a","b","c"]	b	90	2
+
+-- query 27
+id	person_1_name	person_2_age	key_1_s4_value	key_1_ks_third_element	nested_struct_z_field
+1	alice	30	2	3	NULL
+2	alice	30	2	3	NULL
+
+-- query 28
+id	deep_array_access	map_struct_array_elem	struct_map_struct_array_elem	very_deep_struct_field
+1	2	tag1	NULL	NULL
+
+-- query 29
+id	first_amount	price_for_key_1	second_history_value	nested_decimal_value
+1	12345678901234.1234567890	99999999999.9999999999	22222222222.2222222222	NULL
+
+-- query 30
+id	mid	sub
+1	{"a":null,"sub":null}	NULL
+2	{"a":null,"sub":null}	NULL
+
+-- query 31
+id	mid	x
+1	{"a":null,"sub":null}	NULL
+2	{"a":null,"sub":null}	NULL
+
+-- query 32
+id	sub
+1	NULL
+2	NULL
+
+-- query 33
+id	first_elem	first_elem_meta_x
+1	{"s":null,"meta":null}	NULL
+2	{"s":null,"meta":null}	NULL
+
+-- query 34
+id	second_elem_meta_y
+1	NULL
+2	NULL
+
+-- query 35
+id	m1	mp1_vals_2
+1	NULL	NULL
+2	NULL	NULL
+
+-- query 36
+id	mp_all	mp2_vals
+1	{1:{"m":null,"vals":null},2:{"m":null,"vals":null}}	NULL
+2	{1:{"m":null,"vals":null},2:{"m":null,"vals":null}}	NULL
+
+-- query 37
+id	name	first_s
+1	n	NULL
+2	n	NULL
+
+-- query 38
+id	y_2
+1	NULL
+2	NULL
+
+-- query 39
+id	v1	v1_b_x
+1	{"a":10,"b":{"x":null,"y":null}}	NULL
+2	{"a":10,"b":{"x":null,"y":null}}	NULL
+
+-- query 40
+id	q2
+1	NULL
+2	NULL
+
+-- query 41
+id	e1	e1_p
+1	{"id":1,"meta":{"p":null,"q":null}}	NULL
+2	{"id":1,"meta":{"p":null,"q":null}}	NULL

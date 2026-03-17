@@ -1,0 +1,109 @@
+-- query 1
+id	email	status	role	country	notes
+1	alice@example.com	active	user	US	no notes
+2	bob@example.com	active	user	US	no notes
+3	charlie@example.com	active	user	US	no notes
+
+-- query 2
+id	test_status	test_role	test_country	test_notes
+1	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS
+
+-- query 3
+id	email	status	role	country	notes
+1	alice@example.com	active	user	US	no notes
+2	bob@example.com	active	user	US	no notes
+3	charlie@example.com	active	user	US	no notes
+4	david@example.com	inactive	admin	CN	important user
+
+-- query 4
+count(*)
+3
+
+-- query 5
+order_id	customer_name	status	payment_method	shipping_address	notes
+1	alice	pending	cash	not specified	
+2	bob	pending	cash	not specified	
+3	charlie	pending	cash	not specified	
+
+-- query 6
+order_id	customer_name	status	payment_method	shipping_address	notes
+1	alice	pending	cash	not specified	
+2	bob	pending	cash	not specified	
+3	charlie	pending	cash	not specified	
+4	david	shipped	cash	not specified	
+5	eve	pending	credit_card	not specified	
+
+-- query 7
+order_id	customer_name	status	payment_method	shipping_address	notes	tracking_number
+1	alice	pending	cash	not specified		N/A
+2	bob	pending	cash	not specified		N/A
+3	charlie	pending	cash	not specified		N/A
+4	david	shipped	cash	not specified		N/A
+5	eve	pending	credit_card	not specified		N/A
+6	frank	pending	cash	not specified		N/A
+7	grace	delivered	cash	not specified		N/A
+
+-- query 8
+1
+1
+
+-- query 9
+user_id	username	status	role	bio
+1	alice	active	member	No bio available
+2	bob	active	member	No bio available
+3	charlie	active	member	No bio available
+
+-- query 10
+user_id	username	status	role	bio
+1	alice_updated	premium	member	No bio available
+2	bob_updated	active	admin	No bio available
+3	charlie	active	member	No bio available
+
+-- query 11
+user_id	username	status	role	bio	email
+1	alice_v2	premium	member	No bio available	alice@example.com
+2	bob_updated	active	admin	No bio available	unknown@example.com
+3	charlie	active	member	No bio available	unknown@example.com
+4	david	active	member	No bio available	unknown@example.com
+
+-- query 12
+user_id	username	status	role	bio	email
+1	alice_v2	premium	member	No bio available	alice@example.com
+2	bob_updated	active	admin	No bio available	unknown@example.com
+3	charlie	active	member	No bio available	unknown@example.com
+4	david	active	member	No bio available	unknown@example.com
+
+-- query 13
+log_id	message	severity
+1	event_1	INFO
+2	event_2	INFO
+
+-- query 14
+log_id	message	severity
+1	event_1	INFO
+2	event_2	INFO
+3	event_3	INFO
+
+-- query 15
+id	varchar_short	varchar_long	char_fixed	string_type	empty_varchar	special_chars	unicode_str
+1	test	This is a longer default value for testing	ABCDE	String type default		Special: @#$%^&*()	测试中文
+2	test	This is a longer default value for testing	ABCDE	String type default		Special: @#$%^&*()	测试中文
+3	test	This is a longer default value for testing	ABCDE	String type default		Special: @#$%^&*()	测试中文
+
+-- query 16
+id	test_short	test_long	test_char	test_string	test_empty	test_special	test_unicode
+1	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+
+-- query 17
+product_id	region	last_status	total_quantity	last_updated_by
+1	North	unknown	0	system
+2	South	unknown	0	system
+
+-- query 18
+item_id	item_name	location	supplier	barcode
+1	widget	warehouse	default supplier	NO_BARCODE
+2	gadget	warehouse	default supplier	NO_BARCODE

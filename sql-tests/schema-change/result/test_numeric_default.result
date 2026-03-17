@@ -1,0 +1,109 @@
+-- query 1
+id	name	age	score	salary	revenue	rating	percentage
+1	alice	25	100	50000	1000000	4.5	95.5
+2	bob	25	100	50000	1000000	4.5	95.5
+3	charlie	25	100	50000	1000000	4.5	95.5
+
+-- query 2
+id	test_age	test_score	test_salary	test_revenue	test_rating	test_percentage
+1	PASS	PASS	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS	PASS	PASS
+
+-- query 3
+id	name	age	score	salary	revenue	rating	percentage
+1	alice	25	100	50000	1000000	4.5	95.5
+2	bob	25	100	50000	1000000	4.5	95.5
+3	charlie	25	100	50000	1000000	4.5	95.5
+4	david	30	200	60000	2000000	3.8	88.9
+
+-- query 4
+count(*)
+3
+
+-- query 5
+order_id	product_name	quantity	price	discount	amount
+1	laptop	1	0	0	0
+2	phone	1	0	0	0
+3	tablet	1	0	0	0
+
+-- query 6
+order_id	product_name	quantity	price	discount	amount
+1	laptop	1	0	0	0
+2	phone	1	0	0	0
+3	tablet	1	0	0	0
+4	monitor	2	0	0	0
+5	keyboard	1	299.99	0	0
+
+-- query 7
+order_id	product_name	quantity	price	discount	amount	tax_rate
+1	laptop	1	0	0	0	0.08
+2	phone	1	0	0	0	0.08
+3	tablet	1	0	0	0	0.08
+4	monitor	2	0	0	0	0.08
+5	keyboard	1	299.99	0	0	0.08
+6	mouse	1	0	0	0	0.08
+7	headset	3	0	0	0	0.08
+
+-- query 8
+1
+1
+
+-- query 9
+user_id	username	age	score	balance
+1	alice	18	0	1000
+2	bob	18	0	1000
+3	charlie	18	0	1000
+
+-- query 10
+user_id	username	age	score	balance
+1	alice_updated	18	100	1000
+2	bob_updated	25	0	1000
+3	charlie	18	0	1000
+
+-- query 11
+user_id	username	age	score	balance	credit_limit
+1	alice_v2	18	100	1000	10000
+2	bob_updated	25	0	1000	5000
+3	charlie	18	0	1000	5000
+4	david	18	0	1000	5000
+
+-- query 12
+user_id	username	age	score	balance	credit_limit
+1	alice_v2	18	100	1000	10000
+2	bob_updated	25	0	1000	5000
+3	charlie	18	0	1000	5000
+4	david	18	0	1000	5000
+
+-- query 13
+log_id	message	event_count
+1	event_1	1
+2	event_2	1
+
+-- query 14
+log_id	message	event_count
+1	event_1	1
+2	event_2	1
+3	event_3	1
+
+-- query 15
+id	tiny_val	small_val	int_val	big_val	float_val	double_val	zero_val	negative_val
+1	127	32767	2147483647	9223372036854775807	3.14159	2.718281828	0	-100
+2	127	32767	2147483647	9223372036854775807	3.14159	2.718281828	0	-100
+3	127	32767	2147483647	9223372036854775807	3.14159	2.718281828	0	-100
+
+-- query 16
+id	test_tiny	test_small	test_int	test_big	test_float	test_double	test_zero	test_negative
+1	PASS	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+
+-- query 17
+product_id	region	total_quantity	total_revenue	max_price	min_price	avg_discount
+1	North	0	0	0	999999.99	0.05
+2	South	0	0	0	999999.99	0.05
+
+-- query 18
+item_id	item_name	stock_quantity	reorder_point	max_stock
+1	widget	100	20	1000
+2	gadget	100	20	1000
