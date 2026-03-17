@@ -357,6 +357,31 @@ pub(crate) fn build_decimal_literal(
         .ok_or_else(|| "DECIMAL_LITERAL missing/unsupported type descriptor".to_string())?;
     match data_type {
         DataType::Decimal128(precision, scale) => {
+            // When the FE provides the exact binary representation, use it directly.
+            // The string `value` field may be truncated (fewer fractional digits than
+            // `scale`), causing string parsing to infer a narrower type that triggers
+            // an unnecessary precision-checking upscale cast.
+            // `integer_value` is sent as little-endian bytes (i128 layout, up to 16 bytes).
+            let integer_bytes = node
+                .decimal_literal
+                .as_ref()
+                .and_then(|dl| dl.integer_value.as_deref())
+                .filter(|b| !b.is_empty());
+            if let Some(bytes) = integer_bytes {
+                let sign_byte = if bytes.last().map(|b| b & 0x80 != 0).unwrap_or(false) {
+                    0xFF_u8
+                } else {
+                    0x00
+                };
+                let mut le_bytes = [sign_byte; 16];
+                let len = bytes.len().min(16);
+                le_bytes[..len].copy_from_slice(&bytes[..len]);
+                return Ok(LiteralValue::Decimal128 {
+                    value: i128::from_le_bytes(le_bytes),
+                    precision,
+                    scale,
+                });
+            }
             let (parsed, precision, scale) = match parse_decimal_literal(value, precision, scale) {
                 Ok(parsed) => (parsed, precision, scale),
                 Err(err) if err.contains("exceeds scale") || err.contains("exceeds precision") => {
@@ -376,6 +401,31 @@ pub(crate) fn build_decimal_literal(
             })
         }
         DataType::Decimal256(precision, scale) => {
+            // When the FE provides the exact binary representation, use it directly.
+            // The string `value` field may be truncated (fewer fractional digits than
+            // `scale`), causing parse_decimal_literal_i256 to produce a narrower type
+            // that triggers an unnecessary precision-checking upscale cast.
+            // `integer_value` is sent as little-endian bytes (Arrow i256 layout).
+            let integer_bytes = node
+                .decimal_literal
+                .as_ref()
+                .and_then(|dl| dl.integer_value.as_deref())
+                .filter(|b| !b.is_empty());
+            if let Some(bytes) = integer_bytes {
+                let sign_byte = if bytes.last().map(|b| b & 0x80 != 0).unwrap_or(false) {
+                    0xFF_u8
+                } else {
+                    0x00
+                };
+                let mut le_bytes = [sign_byte; 32];
+                let len = bytes.len().min(32);
+                le_bytes[..len].copy_from_slice(&bytes[..len]);
+                return Ok(LiteralValue::Decimal256 {
+                    value: i256::from_le_bytes(le_bytes),
+                    precision,
+                    scale,
+                });
+            }
             let (parsed, precision, scale) =
                 match parse_decimal_literal_i256(value, precision, scale) {
                     Ok(parsed) => (parsed, precision, scale),

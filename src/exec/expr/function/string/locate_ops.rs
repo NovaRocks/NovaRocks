@@ -16,7 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
 use std::sync::Arc;
 
 fn eval_locate_impl(
@@ -73,7 +73,7 @@ fn eval_locate_impl(
         }
     }
 
-    let mut out = Vec::with_capacity(rows);
+    let mut out: Vec<Option<i32>> = Vec::with_capacity(rows);
     for row in 0..rows {
         let haystack_row = if haystack_arr.len() == 1 { 0 } else { row };
         let needle_row = if needle_arr.len() == 1 { 0 } else { row };
@@ -96,9 +96,9 @@ fn eval_locate_impl(
         };
         let haystack = haystack_arr.value(haystack_row);
         let needle = needle_arr.value(needle_row);
-        out.push(Some(locate_utf8(haystack, needle, start_pos)));
+        out.push(Some(locate_utf8(haystack, needle, start_pos) as i32));
     }
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+    Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
 }
 
 fn locate_utf8(haystack: &str, needle: &str, start_pos: i64) -> i64 {
@@ -255,7 +255,7 @@ pub fn eval_strpos(
         rows = rows.max(instance.len());
     }
 
-    let mut out = Vec::with_capacity(rows);
+    let mut out: Vec<Option<i32>> = Vec::with_capacity(rows);
     for row in 0..rows {
         let haystack_idx = resolve_row_index(haystack_arr.len(), rows, row, "strpos haystack")?;
         let needle_idx = resolve_row_index(needle_arr.len(), rows, row, "strpos needle")?;
@@ -285,9 +285,9 @@ pub fn eval_strpos(
             (Some(arr), Some(idx)) => arr.value(idx),
             _ => 1,
         };
-        out.push(Some(strpos_impl(haystack, needle, instance)));
+        out.push(Some(strpos_impl(haystack, needle, instance) as i32));
     }
-    Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+    Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
 }
 
 #[cfg(test)]

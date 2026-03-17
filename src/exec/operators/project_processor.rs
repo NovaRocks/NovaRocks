@@ -70,6 +70,35 @@ fn synthetic_slot_schema(slot_id: SlotId, field: &Field) -> ChunkSlotSchema {
     ChunkSlotSchema::new_with_field(slot_id, field.clone(), None, None)
 }
 
+/// Upgrade slot schemas to nullable where the actual array data contains null values.
+///
+/// The FE may declare a column as non-nullable (e.g., key columns in duplicate-key tables)
+/// but still send rows with null values (e.g., when a cast overflows). The scan operator
+/// tolerates this via `validate_chunk_schema_against_batch`, allowing nullable arrays to
+/// satisfy a non-nullable schema contract. However, Arrow's `RecordBatch::try_new` validates
+/// strictly: a non-nullable field cannot have an array with null_count > 0. This function
+/// upgrades affected slot schemas so that the rebuilt RecordBatch passes Arrow validation.
+fn slots_adjusted_for_actual_nullability(
+    slot_schemas: &[ChunkSlotSchema],
+    columns: &[ArrayRef],
+) -> Vec<ChunkSlotSchema> {
+    slot_schemas
+        .iter()
+        .zip(columns.iter())
+        .map(|(schema, array)| {
+            if !schema.nullable() && array.null_count() > 0 {
+                let nullable_field =
+                    Field::new(schema.name(), schema.data_type().clone(), true);
+                schema
+                    .with_field(nullable_field)
+                    .unwrap_or_else(|_| schema.clone())
+            } else {
+                schema.clone()
+            }
+        })
+        .collect()
+}
+
 /// Factory for projection processors that evaluate expression lists into projected chunks.
 pub struct ProjectProcessorFactory {
     name: String,
@@ -259,6 +288,7 @@ impl ProjectProcessorOperator {
 
                 // Some FE plans intentionally project into an existing slot id.
                 // Replace the existing column so subsequent expressions read the updated value.
+                let array_has_nulls = array.null_count() > 0;
                 let mut columns = working_chunk.batch.columns().to_vec();
                 columns[existing_idx] = array;
 
@@ -271,10 +301,20 @@ impl ProjectProcessorOperator {
                     .or_else(|| working_chunk.chunk_schema().slot(*slot_id).cloned());
                 let replaced = preferred_slot_schema
                     .as_ref()
-                    .map(|schema| field_from_slot_schema(schema, data_type))
+                    .map(|schema| {
+                        let f = field_from_slot_schema(schema, data_type);
+                        if array_has_nulls && !f.is_nullable() {
+                            Field::new(f.name(), f.data_type().clone(), true)
+                        } else {
+                            f
+                        }
+                    })
                     .unwrap_or_else(|| projected_field_from_existing(old_field, data_type));
                 fields[existing_idx] = Arc::new(replaced.clone());
-                let mut slot_schemas = working_chunk.chunk_schema().slots().to_vec();
+                let mut slot_schemas = slots_adjusted_for_actual_nullability(
+                    working_chunk.chunk_schema().slots(),
+                    &columns,
+                );
                 slot_schemas[existing_idx] = preferred_slot_schema
                     .map(|schema| projected_slot_schema_from_existing(&schema, *slot_id, &replaced))
                     .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &replaced));
@@ -284,6 +324,7 @@ impl ProjectProcessorOperator {
                 continue;
             }
 
+            let array_has_nulls = array.null_count() > 0;
             let mut columns = working_chunk.batch.columns().to_vec();
             columns.push(array);
 
@@ -292,7 +333,12 @@ impl ProjectProcessorOperator {
             let data_type = computed_columns.last().unwrap().data_type();
             let declared_slot_schema = self.declared_slot_schema(*slot_id);
             let field = if let Some(slot_schema) = declared_slot_schema.as_ref() {
-                field_from_slot_schema(slot_schema, data_type)
+                let f = field_from_slot_schema(slot_schema, data_type);
+                if array_has_nulls && !f.is_nullable() {
+                    Field::new(f.name(), f.data_type().clone(), true)
+                } else {
+                    f
+                }
             } else if let Some(ExprNode::SlotId(source_slot)) = self.arena.node(*expr_id) {
                 if let Some(source_idx) = working_chunk.slot_id_to_index().get(source_slot) {
                     projected_field_from_existing(
@@ -329,7 +375,10 @@ impl ProjectProcessorOperator {
                     }
                 })
                 .unwrap_or_else(|| synthetic_slot_schema(*slot_id, &field));
-            let mut slot_schemas = working_chunk.chunk_schema().slots().to_vec();
+            let mut slot_schemas = slots_adjusted_for_actual_nullability(
+                working_chunk.chunk_schema().slots(),
+                working_chunk.batch.columns(),
+            );
             slot_schemas.push(slot_schema);
 
             working_chunk =

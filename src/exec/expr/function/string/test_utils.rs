@@ -17,7 +17,7 @@
 use crate::common::ids::SlotId;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -80,6 +80,18 @@ fn string_eval_i64(
 ) -> i64 {
     let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    arr.value(0)
+}
+
+fn string_eval_i32(
+    name: &str,
+    arena: &ExprArena,
+    expr: ExprId,
+    args: &[ExprId],
+    chunk: &Chunk,
+) -> i32 {
+    let arr = eval_string_function(name, arena, expr, args, chunk).unwrap();
+    let arr = arr.as_any().downcast_ref::<Int32Array>().unwrap();
     arr.value(0)
 }
 
@@ -206,10 +218,11 @@ pub fn assert_string_function_logic(name: &str) {
             );
         }
         "instr" => {
+            let expr_i32 = typed_null(&mut arena, DataType::Int32);
             let s = literal_string(&mut arena, "hello");
             let sub = literal_string(&mut arena, "lo");
             assert_eq!(
-                string_eval_i64(name, &arena, expr_i64, &[s, sub], &chunk),
+                string_eval_i32(name, &arena, expr_i32, &[s, sub], &chunk),
                 4
             );
         }
@@ -226,10 +239,11 @@ pub fn assert_string_function_logic(name: &str) {
             assert_eq!(string_eval_i64(name, &arena, expr_i64, &[s], &chunk), 3);
         }
         "locate" => {
+            let expr_i32 = typed_null(&mut arena, DataType::Int32);
             let s = literal_string(&mut arena, "hello");
             let sub = literal_string(&mut arena, "lo");
             assert_eq!(
-                string_eval_i64(name, &arena, expr_i64, &[sub, s], &chunk),
+                string_eval_i32(name, &arena, expr_i32, &[sub, s], &chunk),
                 4
             );
         }
