@@ -1,0 +1,113 @@
+-- query 1
+id	name	flag_true	flag_false	flag_1	flag_0
+1	alice	1	0	1	0
+2	bob	1	0	1	0
+3	charlie	1	0	1	0
+
+-- query 2
+id	test_true	test_false	test_1	test_0
+1	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS
+
+-- query 3
+id	name	flag_true	flag_false	flag_1	flag_0
+1	alice	1	0	1	0
+2	bob	1	0	1	0
+3	charlie	1	0	1	0
+4	david	0	1	0	1
+
+-- query 4
+count(*)
+3
+
+-- query 5
+count(*)
+2
+
+-- query 6
+order_id	product_name	is_paid	is_shipped	total_amount
+1	laptop	1	0	100
+2	phone	1	0	100
+3	tablet	1	0	100
+
+-- query 7
+order_id	product_name	is_paid	is_shipped	total_amount
+1	laptop	1	0	100
+2	phone	1	0	100
+3	tablet	1	0	100
+4	monitor	0	0	100
+5	keyboard	1	0	200
+
+-- query 8
+order_id	product_name	is_paid	is_shipped	total_amount	is_delivered
+1	laptop	1	0	100	1
+2	phone	1	0	100	1
+3	tablet	1	0	100	1
+4	monitor	0	0	100	1
+5	keyboard	1	0	200	1
+6	mouse	1	0	100	1
+7	headset	1	0	100	1
+
+-- query 9
+1
+1
+
+-- query 10
+user_id	username	is_active	is_verified	credit_score
+1	alice	1	0	0
+2	bob	1	0	0
+3	charlie	1	0	0
+
+-- query 11
+user_id	username	is_active	is_verified	credit_score
+1	alice_updated	1	0	100
+2	bob_updated	0	0	0
+3	charlie	1	0	0
+
+-- query 12
+user_id	username	is_active	is_verified	credit_score	is_premium
+1	alice_v2	1	0	100	0
+2	bob_updated	0	0	0	1
+3	charlie	1	0	0	1
+4	david	1	0	0	1
+
+-- query 13
+user_id	username	is_active	is_verified	credit_score	is_premium
+1	alice_v2	1	0	100	0
+2	bob_updated	0	0	0	1
+3	charlie	1	0	0	1
+4	david	1	0	0	1
+
+-- query 14
+log_id	message	is_processed
+1	event_1	0
+2	event_2	0
+
+-- query 15
+log_id	message	is_processed
+1	event_1	0
+2	event_2	0
+3	event_3	0
+
+-- query 16
+id	bool_true	bool_false	bool_1	bool_0
+1	1	0	1	0
+2	1	0	1	0
+3	1	0	1	0
+
+-- query 17
+id	true_is_1	false_is_0	one_is_1	zero_is_0	overall_result
+1	1	1	1	1	ALL_PASS
+2	1	1	1	1	ALL_PASS
+3	1	1	1	1	ALL_PASS
+
+-- query 18
+product_id	region	is_active	sales_count	is_verified
+1	North	1	0	0
+2	South	1	0	0
+
+-- query 19
+item_id	item_name	in_stock	is_discontinued
+1	widget	1	0
+2	gadget	1	0

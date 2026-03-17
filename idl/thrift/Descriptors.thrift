@@ -255,9 +255,12 @@ struct TColumn {
                                                                                                       
     // How many bytes used for short key index encoding.
     // For fixed-length column, this value may be ignored by BE when creating a tablet.
-    20: optional i32 index_len                 
+    20: optional i32 index_len
     // column type. If this field is set, the |column_type| will be ignored.
-    21: optional Types.TTypeDesc type_desc         
+    21: optional Types.TTypeDesc type_desc
+    // Default value expression for complex types (ARRAY/MAP/STRUCT).
+    // FE sends this instead of default_value (field 6) for complex type defaults.
+    22: optional Exprs.TExpr default_expr
 }
 
 struct TOlapTableTablet {

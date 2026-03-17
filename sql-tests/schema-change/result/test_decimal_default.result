@@ -1,0 +1,105 @@
+-- query 1
+id	name	balance	interest_rate	score	percentage
+1	alice	1000.50	0.0525	85.125	99.99
+2	bob	1000.50	0.0525	85.125	99.99
+3	charlie	1000.50	0.0525	85.125	99.99
+
+-- query 2
+id	test_balance	test_rate	test_score	test_percentage
+1	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS
+
+-- query 3
+id	name	balance	interest_rate	score	percentage
+1	alice	1000.50	0.0525	85.125	99.99
+2	bob	1000.50	0.0525	85.125	99.99
+3	charlie	1000.50	0.0525	85.125	99.99
+4	david	2500.75	0.0625	92.500	87.65
+
+-- query 4
+order_id	customer_name	unit_price	tax_rate	discount	total_amount
+1	alice	0.00	0.0800	0.00	0.00
+2	bob	0.00	0.0800	0.00	0.00
+3	charlie	0.00	0.0800	0.00	0.00
+
+-- query 5
+order_id	customer_name	unit_price	tax_rate	discount	total_amount
+1	alice	0.00	0.0800	0.00	0.00
+2	bob	0.00	0.0800	0.00	0.00
+3	charlie	0.00	0.0800	0.00	0.00
+4	david	299.99	0.0800	0.00	0.00
+5	eve	0.00	0.1000	0.00	0.00
+
+-- query 6
+order_id	customer_name	unit_price	tax_rate	discount	total_amount	shipping_fee
+1	alice	0.00	0.0800	0.00	0.00	15.50
+2	bob	0.00	0.0800	0.00	0.00	15.50
+3	charlie	0.00	0.0800	0.00	0.00	15.50
+4	david	299.99	0.0800	0.00	0.00	15.50
+5	eve	0.00	0.1000	0.00	0.00	15.50
+6	frank	0.00	0.0800	0.00	0.00	15.50
+7	grace	499.99	0.0800	0.00	0.00	15.50
+
+-- query 7
+1
+1
+
+-- query 8
+user_id	username	account_balance	credit_limit	interest_rate
+1	alice	1000.00	5000.00	0.0350
+2	bob	1000.00	5000.00	0.0350
+3	charlie	1000.00	5000.00	0.0350
+
+-- query 9
+user_id	username	account_balance	credit_limit	interest_rate
+1	alice_updated	2500.00	5000.00	0.0350
+2	bob_updated	1000.00	10000.00	0.0350
+3	charlie	1000.00	5000.00	0.0350
+
+-- query 10
+user_id	username	account_balance	credit_limit	interest_rate	reward_points
+1	alice_v2	2500.00	5000.00	0.0350	500.00
+2	bob_updated	1000.00	10000.00	0.0350	100.00
+3	charlie	1000.00	5000.00	0.0350	100.00
+4	david	1000.00	5000.00	0.0350	100.00
+
+-- query 11
+user_id	username	account_balance	credit_limit	interest_rate	reward_points
+1	alice_v2	2500.00	5000.00	0.0350	500.00
+2	bob_updated	1000.00	10000.00	0.0350	100.00
+3	charlie	1000.00	5000.00	0.0350	100.00
+4	david	1000.00	5000.00	0.0350	100.00
+
+-- query 12
+log_id	message	processing_time
+1	event_1	1.500
+2	event_2	1.500
+
+-- query 13
+log_id	message	processing_time
+1	event_1	1.500
+2	event_2	1.500
+3	event_3	1.500
+
+-- query 14
+id	dec_small	dec_medium	dec_large	dec_zero	dec_negative	dec_high_precision	dec_no_fraction
+1	123.45	12345.6789	123456789.123456	0.00	-999.99	12345678.1234567890	12345
+2	123.45	12345.6789	123456789.123456	0.00	-999.99	12345678.1234567890	12345
+3	123.45	12345.6789	123456789.123456	0.00	-999.99	12345678.1234567890	12345
+
+-- query 15
+id	test_small	test_medium	test_large	test_zero	test_negative	test_high_precision	test_no_fraction
+1	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS	PASS	PASS	PASS
+
+-- query 16
+product_id	region	total_revenue	avg_price	max_discount	avg_tax
+1	North	0.00	0.00	0.00	0.0800
+2	South	0.00	0.00	0.00	0.0800
+
+-- query 17
+item_id	item_name	unit_cost	selling_price	markup_rate
+1	widget	50.00	100.00	20.00
+2	gadget	50.00	100.00	20.00

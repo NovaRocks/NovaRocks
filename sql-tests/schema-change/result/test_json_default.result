@@ -1,0 +1,158 @@
+-- query 1
+id	json_object	json_array	json_string	json_number	json_boolean	json_null	empty_object	empty_array	empty_string	no_default
+1	{"status": "active", "count": 0}	[1, 2, 3]	"hello"	42	true	null	{}	[]		NULL
+
+-- query 2
+table_name	data	is_null
+with_default	{"default": true}	0
+without_default	NULL	1
+
+-- query 3
+id	empty_unquoted	empty_quoted	are_equal
+1		""	0
+2		""	0
+
+-- query 4
+id	name	metadata
+1	alice	{"version": 1, "enabled": true}
+2	bob	{"version": 1, "enabled": true}
+
+-- query 5
+id	name	metadata
+1	alice	{"version": 1, "enabled": true}
+2	bob	{"version": 1, "enabled": true}
+3	charlie	{"version": 2, "enabled": false}
+
+-- query 6
+count(*)
+2
+
+-- query 7
+id	level	vip	first_tag
+1	NULL	NULL	default
+2	NULL	NULL	default
+
+-- query 8
+id	tags	level
+1	["default"]	NULL
+2	["default"]	NULL
+
+-- query 9
+id	user_name	level	vip	first_tag
+1	NULL	NULL	NULL	default
+2	NULL	NULL	NULL	default
+3	NULL	NULL	NULL	premium
+
+-- query 10
+k1	i_str	i_num	b_str	b_bool	d_str	d_num	s	nullv_int	obj_int	arr0_int
+1	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	9
+
+-- query 11
+k1	i_str	i_num	b_str	b_bool	d_str	d_num	s	nullv_int	obj_int	arr0_int
+1	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	9
+2	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	9
+3	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	10
+
+-- query 12
+id	name	level	vip	score	first_tag	second_tag	city	age
+1	alice	NULL	NULL	NULL	gold	premium	NULL	NULL
+2	bob	NULL	NULL	NULL	gold	premium	NULL	NULL
+3	charlie	NULL	NULL	NULL	gold	premium	NULL	NULL
+
+-- query 13
+id	name	level	vip
+1	alice	NULL	NULL
+2	bob	NULL	NULL
+3	charlie	NULL	NULL
+4	david	NULL	NULL
+
+-- query 14
+id	name	theme	lang	views	likes
+1	user1	NULL	NULL	NULL	NULL
+2	user2	NULL	NULL	NULL	NULL
+
+-- query 15
+id	value_field	count_field	name_field
+1	NULL	NULL	NULL
+2	NULL	NULL	NULL
+
+-- query 16
+id	tags	meta	first_tag
+1	[]	{}	NULL
+2	[]	{}	NULL
+
+-- query 17
+id	nested_value	nested_flag	level2_obj
+1	NULL	NULL	{"level3": {"flag": true, "value": 42}}
+2	NULL	NULL	{"level3": {"flag": true, "value": 42}}
+
+-- query 18
+id	product_0	product_1	product_2	price_0	price_1	all_products
+1	apple	banana	orange	1.5	2	["apple", "banana", "orange"]
+2	apple	banana	orange	1.5	2	["apple", "banana", "orange"]
+3	apple	banana	orange	1.5	2	["apple", "banana", "orange"]
+
+-- query 19
+id	name_via_query	name_via_get	score_via_query	score_via_get
+1	"Alice"	NULL	95	NULL
+2	"Alice"	NULL	95	NULL
+
+-- query 20
+user_id	username	profile	settings
+1	user1	{"level": 1, "vip": false, "status": "active"}	{"notifications": true, "theme": "light"}
+2	user2	{"level": 1, "vip": false, "status": "active"}	{"notifications": true, "theme": "light"}
+
+-- query 21
+user_id	username	level	vip	status	notifications
+1	user1	NULL	NULL	NULL	NULL
+2	user2	NULL	NULL	NULL	NULL
+
+-- query 22
+user_id	username	level	vip
+1	user1	NULL	NULL
+2	user2	NULL	NULL
+3	user3	NULL	NULL
+
+-- query 23
+order_id	product_name	quantity	priority	tracking	source	version
+1	laptop	1	NULL	NULL	NULL	NULL
+2	phone	1	NULL	NULL	NULL	NULL
+3	tablet	1	NULL	NULL	NULL	NULL
+
+-- query 24
+order_id	product_name	priority	source
+1	laptop	NULL	NULL
+2	phone	NULL	NULL
+3	tablet	NULL	NULL
+4	monitor	NULL	NULL
+5	keyboard	NULL	NULL
+
+-- query 25
+order_id	product_name	quantity	priority	source	discount	tax
+1	laptop	1	NULL	NULL	NULL	NULL
+2	phone	1	NULL	NULL	NULL	NULL
+3	tablet	1	NULL	NULL	NULL	NULL
+4	monitor	1	NULL	NULL	NULL	NULL
+5	keyboard	1	NULL	NULL	NULL	NULL
+6	mouse	1	NULL	NULL	NULL	NULL
+7	headset	3	NULL	NULL	NULL	NULL
+
+-- query 26
+1
+1
+
+-- query 27
+id	name	optional_field_get	optional_field_query
+1	NULL	NULL	NULL
+2	NULL	NULL	NULL
+3	NULL	NULL	NULL
+4	NULL	NULL	"value1"
+5	NULL	NULL	"value2"
+
+-- query 28
+id	missing_field
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL

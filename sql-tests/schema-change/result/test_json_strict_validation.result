@@ -1,0 +1,19 @@
+-- query 1
+id	data1	data2	data3	data4	data5	data6	data7
+1	{"key": "value"}	{"name": "Alice", "age": 30}	{}	null	""	123	true
+
+-- query 6
+id	data
+1	{"user": {"name": "Bob", "age": 25, "address": {"city": "Beijing", "zip": "100000"}}, "tags": ["a", "b", "c"], "active": true, "score": 95.5}
+
+-- query 7
+id	data
+1	{"level1": {"level2": {"level3": {"level4": {"level5": "deep"}}}}}
+
+-- query 8
+id	data1	data2	data3	data4
+1	[1, 2, 3, 4, 5]	[{"name": "Alice"}, {"name": "Bob"}]	[[1, 2], [3, 4], [5, 6]]	[]
+
+-- query 9
+id	empty_obj	empty_arr	null_val	empty_str	zero_num	neg_num	bool_true	bool_false	unicode	escaped
+1	{}	[]	null	""	0	-123.45	true	false	{"text": "你好世界🌍"}	{"text": "line1\nline2\ttab"}

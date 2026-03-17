@@ -47,7 +47,9 @@ use crate::formats::starrocks::metadata::{
     StarRocksDeletePredicateRaw, StarRocksSegmentFile, StarRocksTabletSnapshot,
     load_bundle_segment_footers, load_tablet_snapshot,
 };
-use crate::formats::starrocks::plan::build_native_read_plan;
+use crate::formats::starrocks::plan::{
+    StarRocksOutputColumnHint, build_native_read_plan_with_output_hints,
+};
 use crate::formats::starrocks::reader::build_native_record_batch;
 use crate::formats::starrocks::writer::bundle_meta::{
     load_latest_tablet_metadata, next_rowset_id, write_bundle_meta_file,
@@ -1709,6 +1711,58 @@ fn resolve_tablet_column_arrow_type(column: &ColumnPb) -> Result<DataType, Strin
             let (precision, scale) = resolve_decimal_precision_scale(column)?;
             Ok(DataType::Decimal128(precision, scale))
         }
+        "ARRAY" => {
+            let item_col = column.children_columns.first().ok_or_else(|| {
+                format!(
+                    "ARRAY column '{}' has no children in tablet schema",
+                    column.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })?;
+            let item_type = resolve_tablet_column_arrow_type(item_col)?;
+            let item_nullable = item_col.is_nullable.unwrap_or(true);
+            Ok(DataType::List(Arc::new(Field::new(
+                "item",
+                item_type,
+                item_nullable,
+            ))))
+        }
+        "MAP" => {
+            let key_col = column.children_columns.first().ok_or_else(|| {
+                format!(
+                    "MAP column '{}' has no key child in tablet schema",
+                    column.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })?;
+            let val_col = column.children_columns.get(1).ok_or_else(|| {
+                format!(
+                    "MAP column '{}' has no value child in tablet schema",
+                    column.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })?;
+            let key_type = resolve_tablet_column_arrow_type(key_col)?;
+            let val_type = resolve_tablet_column_arrow_type(val_col)?;
+            let key_nullable = key_col.is_nullable.unwrap_or(false);
+            let val_nullable = val_col.is_nullable.unwrap_or(true);
+            let entries_field = Field::new(
+                "entries",
+                DataType::Struct(arrow::datatypes::Fields::from(vec![
+                    Field::new("key", key_type, key_nullable),
+                    Field::new("value", val_type, val_nullable),
+                ])),
+                false,
+            );
+            Ok(DataType::Map(Arc::new(entries_field), false))
+        }
+        "STRUCT" => {
+            let mut fields = Vec::with_capacity(column.children_columns.len());
+            for child in &column.children_columns {
+                let child_name = child.name.as_deref().unwrap_or("field").to_string();
+                let child_type = resolve_tablet_column_arrow_type(child)?;
+                let child_nullable = child.is_nullable.unwrap_or(true);
+                fields.push(Field::new(child_name, child_type, child_nullable));
+            }
+            Ok(DataType::Struct(arrow::datatypes::Fields::from(fields)))
+        }
         other => Err(format!(
             "unsupported column type for partial update materialization: column='{}' type='{}'",
             column
@@ -1852,6 +1906,50 @@ fn build_partial_update_base_rows(
     Ok(rows)
 }
 
+// Build output column hints for partial-update read by mapping each output field to
+// the unique_id and default_value from the current (post-ALTER) tablet schema.
+// This allows reading old rowsets that lack newly-added columns: the read plan will
+// fill the missing column using the schema default via build_missing_output_schema_column_plan.
+fn build_partial_update_column_hints(
+    output_schema: &SchemaRef,
+    current_schema: &crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+) -> Vec<StarRocksOutputColumnHint> {
+    let schema_map: HashMap<String, (Option<u32>, Option<String>)> = current_schema
+        .column
+        .iter()
+        .filter_map(|col| {
+            let name = col.name.as_deref()?;
+            let normalized = name.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return None;
+            }
+            let unique_id = if col.unique_id > 0 {
+                u32::try_from(col.unique_id).ok()
+            } else {
+                None
+            };
+            let default_value = col
+                .default_value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).into_owned());
+            Some((normalized, (unique_id, default_value)))
+        })
+        .collect();
+    output_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let normalized = field.name().trim().to_ascii_lowercase();
+            let (schema_unique_id, fallback_default_literal) =
+                schema_map.get(&normalized).cloned().unwrap_or((None, None));
+            StarRocksOutputColumnHint {
+                schema_unique_id,
+                fallback_default_literal,
+            }
+        })
+        .collect()
+}
+
 fn load_published_visible_batch(
     ctx: &TabletWriteContext,
     output_schema: &SchemaRef,
@@ -1887,7 +1985,14 @@ fn load_published_visible_batch(
         &ctx.tablet_root_path,
         object_store_profile.as_ref(),
     )?;
-    let plan = build_native_read_plan(&snapshot, &segment_footers, output_schema, None)?;
+    let output_hints = build_partial_update_column_hints(output_schema, &ctx.tablet_schema);
+    let plan = build_native_read_plan_with_output_hints(
+        &snapshot,
+        &segment_footers,
+        output_schema,
+        &output_hints,
+        None,
+    )?;
     build_native_record_batch(
         &plan,
         &segment_footers,
@@ -1979,7 +2084,14 @@ fn load_rowset_batch_from_partial_update_snapshot(
         &ctx.tablet_root_path,
         object_store_profile.as_ref(),
     )?;
-    let plan = build_native_read_plan(&snapshot, &segment_footers, output_schema, None)?;
+    let output_hints = build_partial_update_column_hints(output_schema, &ctx.tablet_schema);
+    let plan = build_native_read_plan_with_output_hints(
+        &snapshot,
+        &segment_footers,
+        output_schema,
+        &output_hints,
+        None,
+    )?;
     build_native_record_batch(
         &plan,
         &segment_footers,
@@ -2213,7 +2325,22 @@ fn materialize_partial_upsert_batch(
                 }
                 // New row — fall through to auto_increment allocation below.
             } else if let Some(src_idx) = schema_to_batch.get(col_idx).and_then(|v| *v) {
-                materialized_row.push(data_batch.column(src_idx).slice(row_idx, 1));
+                let col = data_batch.column(src_idx).slice(row_idx, 1);
+                let expected_type = output_schema.field(col_idx).data_type();
+                let col = if col.data_type() != expected_type {
+                    cast(&col, expected_type).map_err(|e| {
+                        format!(
+                            "cast partial-update column {} from {:?} to {:?} failed: {}",
+                            col_idx,
+                            col.data_type(),
+                            expected_type,
+                            e
+                        )
+                    })?
+                } else {
+                    col
+                };
+                materialized_row.push(col);
                 continue;
             }
             if let Some(old_row) = existing_row.as_ref() {
@@ -2453,14 +2580,245 @@ pub(crate) fn parse_default_literal_to_singleton_array(
                 .map_err(|e| format!("build DECIMAL default array failed: {}", e))?;
             Ok(Arc::new(array))
         }
+        DataType::Decimal256(precision, scale) => {
+            use arrow::array::Decimal256Array;
+            let parsed = parse_decimal256_default_literal(unquoted, *precision, *scale)?;
+            let array = Decimal256Array::from(vec![Some(parsed)])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| format!("build DECIMAL256 default array failed: {}", e))?;
+            Ok(Arc::new(array))
+        }
         DataType::Utf8 => Ok(Arc::new(StringArray::from(vec![Some(
             unquoted.to_string(),
         )]))),
         DataType::Binary => Ok(Arc::new(BinaryArray::from(vec![Some(unquoted.as_bytes())]))),
+        // Complex types (ARRAY, MAP, STRUCT): StarRocks serializes them as JSON in ColumnPB.
+        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+            let json: serde_json::Value = serde_json::from_str(normalized)
+                .map_err(|e| format!("parse complex default literal as JSON failed: '{}' error={}", normalized, e))?;
+            json_value_to_arrow_singleton_array(&json, data_type)
+        }
         other => Err(format!(
             "unsupported default literal type for partial update: {:?}",
             other
         )),
+    }
+}
+
+/// Build a singleton (1-row) Arrow array from a JSON value for a given Arrow DataType.
+/// Used to materialize complex-type column default values from their JSON representation
+/// stored in StarRocks ColumnPB (serialized via `cast_type_to_json_str` on the BE).
+fn json_value_to_arrow_singleton_array(
+    json: &serde_json::Value,
+    data_type: &DataType,
+) -> Result<ArrayRef, String> {
+    use arrow::array::{
+        ListArray, MapArray, StructArray,
+        Decimal256Array,
+        Int8Array, Int16Array, Int32Array, Int64Array,
+        Float32Array, Float64Array,
+    };
+    use arrow::datatypes::{Fields, i256};
+    use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
+
+    if json.is_null() {
+        return Ok(new_null_array(data_type, 1));
+    }
+
+    match data_type {
+        // ── Scalar types ──────────────────────────────────────────────────────────
+        DataType::Boolean => {
+            let v = match json {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0).ok_or_else(|| {
+                    format!("cannot parse JSON number as boolean: {}", n)
+                })?,
+                serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    other => return Err(format!("cannot parse JSON string as boolean: '{}'", other)),
+                },
+                other => return Err(format!("unexpected JSON type for boolean: {:?}", other)),
+            };
+            Ok(Arc::new(BooleanArray::from(vec![Some(v)])))
+        }
+        DataType::Int8 => {
+            let s = json_value_to_string(json)?;
+            let v = s.trim().parse::<i8>().map_err(|e| format!("parse JSON '{}' as Int8 failed: {}", s, e))?;
+            Ok(Arc::new(Int8Array::from(vec![Some(v)])))
+        }
+        DataType::Int16 => {
+            let s = json_value_to_string(json)?;
+            let v = s.trim().parse::<i16>().map_err(|e| format!("parse JSON '{}' as Int16 failed: {}", s, e))?;
+            Ok(Arc::new(Int16Array::from(vec![Some(v)])))
+        }
+        DataType::Int32 => {
+            let s = json_value_to_string(json)?;
+            let v = s.trim().parse::<i32>().map_err(|e| format!("parse JSON '{}' as Int32 failed: {}", s, e))?;
+            Ok(Arc::new(Int32Array::from(vec![Some(v)])))
+        }
+        DataType::Int64 => {
+            let s = json_value_to_string(json)?;
+            let v = s.trim().parse::<i64>().map_err(|e| format!("parse JSON '{}' as Int64 failed: {}", s, e))?;
+            Ok(Arc::new(Int64Array::from(vec![Some(v)])))
+        }
+        DataType::Float32 => {
+            let s = json_value_to_string(json)?;
+            let v = s.trim().parse::<f32>().map_err(|e| format!("parse JSON '{}' as Float32 failed: {}", s, e))?;
+            Ok(Arc::new(Float32Array::from(vec![Some(v)])))
+        }
+        DataType::Float64 => {
+            let s = json_value_to_string(json)?;
+            let v = s.trim().parse::<f64>().map_err(|e| format!("parse JSON '{}' as Float64 failed: {}", s, e))?;
+            Ok(Arc::new(Float64Array::from(vec![Some(v)])))
+        }
+        DataType::Utf8 => {
+            let s = json_value_to_string(json)?;
+            Ok(Arc::new(StringArray::from(vec![Some(s)])))
+        }
+        DataType::Binary => {
+            let s = json_value_to_string(json)?;
+            Ok(Arc::new(BinaryArray::from(vec![Some(s.as_bytes())])))
+        }
+        DataType::Date32 => {
+            let s = json_value_to_string(json)?;
+            Ok(Arc::new(Date32Array::from(vec![Some(parse_date32_default_literal(&s)?)])))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            let s = json_value_to_string(json)?;
+            Ok(Arc::new(TimestampMicrosecondArray::from(vec![Some(
+                parse_timestamp_default_literal(&s)?,
+            )])))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let s = json_value_to_string(json)?;
+            let v = parse_decimal128_default_literal(&s, *precision, *scale)?;
+            let array = Decimal128Array::from(vec![Some(v)])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| format!("build Decimal128 array failed: {}", e))?;
+            Ok(Arc::new(array))
+        }
+        DataType::Decimal256(precision, scale) => {
+            let s = json_value_to_string(json)?;
+            let v = parse_decimal256_default_literal(&s, *precision, *scale)?;
+            let array = Decimal256Array::from(vec![Some(v)])
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| format!("build Decimal256 array failed: {}", e))?;
+            Ok(Arc::new(array))
+        }
+        DataType::FixedSizeBinary(width)
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            let s = json_value_to_string(json)?;
+            let parsed = s.trim().parse::<i128>().map_err(|e| {
+                format!("parse LARGEINT default literal '{}' failed: {}", s, e)
+            })?;
+            crate::common::largeint::array_from_i128(&[Some(parsed)])
+        }
+        // ── ARRAY ─────────────────────────────────────────────────────────────────
+        DataType::List(item_field) => {
+            let arr = json.as_array().ok_or_else(|| {
+                format!("expected JSON array for List type, got: {}", json)
+            })?;
+            let mut element_arrays: Vec<ArrayRef> = Vec::with_capacity(arr.len());
+            for item in arr {
+                element_arrays.push(json_value_to_arrow_singleton_array(item, item_field.data_type())?);
+            }
+            // Concatenate all element singletons into a values array.
+            let values: ArrayRef = if element_arrays.is_empty() {
+                arrow::array::new_empty_array(item_field.data_type())
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> = element_arrays.iter().map(|a| a.as_ref()).collect();
+                concat(&refs).map_err(|e| format!("concat List element arrays failed: {}", e))?
+            };
+            let n = values.len() as i32;
+            let offsets = OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, n]));
+            let list = ListArray::new(item_field.clone(), offsets, values, None);
+            Ok(Arc::new(list))
+        }
+        // ── MAP ───────────────────────────────────────────────────────────────────
+        DataType::Map(entry_field, sorted) => {
+            // entry_field is a non-nullable Struct with exactly two fields: key and value.
+            let (key_field, value_field) = match entry_field.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => {
+                    (fields[0].clone(), fields[1].clone())
+                }
+                other => {
+                    return Err(format!(
+                        "unexpected Map entry field type (expected 2-field struct): {:?}",
+                        other
+                    ))
+                }
+            };
+            let obj = json.as_object().ok_or_else(|| {
+                format!("expected JSON object for Map type, got: {}", json)
+            })?;
+            let mut key_arrays: Vec<ArrayRef> = Vec::with_capacity(obj.len());
+            let mut val_arrays: Vec<ArrayRef> = Vec::with_capacity(obj.len());
+            for (k, v) in obj {
+                // Keys in JSON are always strings; parse to key_field type.
+                let key_json = serde_json::Value::String(k.clone());
+                key_arrays.push(json_value_to_arrow_singleton_array(&key_json, key_field.data_type())?);
+                val_arrays.push(json_value_to_arrow_singleton_array(v, value_field.data_type())?);
+            }
+            let keys: ArrayRef = if key_arrays.is_empty() {
+                arrow::array::new_empty_array(key_field.data_type())
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> = key_arrays.iter().map(|a| a.as_ref()).collect();
+                concat(&refs).map_err(|e| format!("concat Map key arrays failed: {}", e))?
+            };
+            let vals: ArrayRef = if val_arrays.is_empty() {
+                arrow::array::new_empty_array(value_field.data_type())
+            } else {
+                let refs: Vec<&dyn arrow::array::Array> = val_arrays.iter().map(|a| a.as_ref()).collect();
+                concat(&refs).map_err(|e| format!("concat Map value arrays failed: {}", e))?
+            };
+            let n = keys.len() as i32;
+            let offsets = OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, n]));
+            let entry_struct = StructArray::new(
+                Fields::from(vec![key_field.as_ref().clone(), value_field.as_ref().clone()]),
+                vec![keys, vals],
+                None,
+            );
+            let map = MapArray::try_new(
+                entry_field.clone(),
+                offsets,
+                entry_struct,
+                None,
+                *sorted,
+            )
+            .map_err(|e| format!("build Map singleton array failed: {}", e))?;
+            Ok(Arc::new(map))
+        }
+        // ── STRUCT ────────────────────────────────────────────────────────────────
+        DataType::Struct(fields) => {
+            let obj = json.as_object().ok_or_else(|| {
+                format!("expected JSON object for Struct type, got: {}", json)
+            })?;
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+            let mut null_builder = NullBufferBuilder::new(1);
+            null_builder.append_non_null();
+            for field in fields.iter() {
+                let v = obj.get(field.name()).unwrap_or(&serde_json::Value::Null);
+                columns.push(json_value_to_arrow_singleton_array(v, field.data_type())?);
+            }
+            let null_buf = null_builder.finish();
+            let struct_array = StructArray::new(fields.clone(), columns, null_buf);
+            Ok(Arc::new(struct_array))
+        }
+        other => Err(format!(
+            "unsupported JSON default literal type: {:?}",
+            other
+        )),
+    }
+}
+
+fn json_value_to_string(json: &serde_json::Value) -> Result<String, String> {
+    match json {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
+        other => Err(format!("cannot convert JSON value to string: {:?}", other)),
     }
 }
 
@@ -2551,6 +2909,69 @@ fn parse_decimal128_default_literal(raw: &str, precision: u8, scale: i8) -> Resu
         ));
     }
     Ok(parsed)
+}
+
+fn parse_decimal256_default_literal(
+    raw: &str,
+    precision: u8,
+    scale: i8,
+) -> Result<arrow::datatypes::i256, String> {
+    use arrow::datatypes::i256;
+    if scale < 0 {
+        return Err(format!(
+            "invalid decimal scale for default literal: {}",
+            scale
+        ));
+    }
+    let scale_usize = usize::try_from(scale)
+        .map_err(|_| format!("invalid decimal scale for default literal: {}", scale))?;
+    let mut value = raw.trim();
+    let negative = value.starts_with('-');
+    if negative || value.starts_with('+') {
+        value = &value[1..];
+    }
+    let parts = value.split('.').collect::<Vec<_>>();
+    if parts.len() > 2 {
+        return Err(format!("parse DECIMAL256 default literal failed: '{}'", raw));
+    }
+    let integer_digits = parts[0].chars().filter(|c| *c != '_').collect::<String>();
+    let mut fractional_digits = if parts.len() == 2 {
+        parts[1].chars().filter(|c| *c != '_').collect::<String>()
+    } else {
+        String::new()
+    };
+    if fractional_digits.len() > scale_usize {
+        return Err(format!(
+            "decimal256 default literal scale overflow: literal='{}' scale={}",
+            raw, scale
+        ));
+    }
+    while fractional_digits.len() < scale_usize {
+        fractional_digits.push('0');
+    }
+    let combined = format!("{integer_digits}{fractional_digits}");
+    let digit_count = combined.chars().filter(|c| c.is_ascii_digit()).count();
+    if digit_count > usize::from(precision) {
+        return Err(format!(
+            "decimal256 default literal precision overflow: literal='{}' precision={}",
+            raw, precision
+        ));
+    }
+    // Parse combined digit string as i256
+    let mut result = i256::ZERO;
+    let ten = i256::from_i128(10);
+    for ch in combined.chars() {
+        let d = ch.to_digit(10).ok_or_else(|| {
+            format!("non-digit character '{}' in decimal literal '{}'", ch, raw)
+        })?;
+        result = result
+            .wrapping_mul(ten)
+            .wrapping_add(i256::from_i128(d as i128));
+    }
+    if negative {
+        result = result.wrapping_neg();
+    }
+    Ok(result)
 }
 
 fn build_auto_increment_singleton_array(

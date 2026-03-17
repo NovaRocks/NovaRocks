@@ -1,0 +1,45 @@
+-- query 1
+id	name	binary_col	col_is_null	hex(binary_col)	col_len	binary_no_default	no_default_is_null	no_default_len	col_hex
+1	user1		0		0	NULL	1	NULL	
+2	user2		0		0	custom	0	6	
+3	user3	explicit	0	6578706C69636974	8	data	0	4	6578706C69636974
+4	user4		0		0	NULL	1	NULL	
+
+-- query 2
+id	name	binary_col	is_null	len
+1	alice		0	0
+2	bob		0	0
+3	charlie		0	0
+
+-- query 3
+id	name	binary_str	len
+1	alice		0
+2	bob		0
+3	charlie		0
+4	david	new_data	8
+
+-- query 4
+count(*)
+2
+
+-- query 5
+order_id	customer	sign_str	sign_len	is_null
+1	customer1		0	0
+2	customer2	sign123	7	0
+3	customer3		0	0
+
+-- query 6
+id	is_null	len	hex	str
+1	0	0		
+2	1	NULL	NULL	NULL
+3	0	0		
+
+-- query 9
+id	small_val	small_len	large_val	large_len
+1		0		0
+2	short	5	this_is_longer	14
+
+-- query 10
+type	is_null	len
+without_default	1	NULL
+with_default	0	0

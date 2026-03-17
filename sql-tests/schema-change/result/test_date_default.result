@@ -1,0 +1,109 @@
+-- query 1
+id	name	birth_date	created_at	updated_at
+1	alice	2000-01-01	2024-01-01 00:00:00	2024-12-17 10:00:00
+2	bob	2000-01-01	2024-01-01 00:00:00	2024-12-17 10:00:00
+3	charlie	2000-01-01	2024-01-01 00:00:00	2024-12-17 10:00:00
+
+-- query 2
+id	test_date	test_datetime1	test_datetime2
+1	PASS	PASS	PASS
+2	PASS	PASS	PASS
+3	PASS	PASS	PASS
+
+-- query 3
+id	name	birth_date	created_at	updated_at
+1	alice	2000-01-01	2024-01-01 00:00:00	2024-12-17 10:00:00
+2	bob	2000-01-01	2024-01-01 00:00:00	2024-12-17 10:00:00
+3	charlie	2000-01-01	2024-01-01 00:00:00	2024-12-17 10:00:00
+4	david	1995-05-15	2024-06-01 12:30:00	2024-12-18 15:45:30
+
+-- query 4
+count(*)
+3
+
+-- query 5
+order_id	customer_name	order_date	shipped_date	created_at	updated_at
+1	alice	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+2	bob	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+3	charlie	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+
+-- query 6
+order_id	customer_name	order_date	shipped_date	created_at	updated_at
+1	alice	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+2	bob	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+3	charlie	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+4	david	2024-06-15	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00
+5	eve	2024-01-01	2024-01-02	2024-07-20 10:30:00	2024-01-01 00:00:00
+
+-- query 7
+order_id	customer_name	order_date	shipped_date	created_at	updated_at	delivery_date
+1	alice	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00	2024-01-10
+2	bob	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00	2024-01-10
+3	charlie	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00	2024-01-10
+4	david	2024-06-15	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00	2024-01-10
+5	eve	2024-01-01	2024-01-02	2024-07-20 10:30:00	2024-01-01 00:00:00	2024-01-10
+6	frank	2024-01-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00	2024-01-10
+7	grace	2024-08-01	2024-01-02	2024-01-01 00:00:00	2024-01-01 00:00:00	2024-01-10
+
+-- query 8
+1
+1
+
+-- query 9
+user_id	username	registered_date	last_login	birth_date
+1	alice	2024-01-01	2024-01-01 00:00:00	2000-01-01
+2	bob	2024-01-01	2024-01-01 00:00:00	2000-01-01
+3	charlie	2024-01-01	2024-01-01 00:00:00	2000-01-01
+
+-- query 10
+user_id	username	registered_date	last_login	birth_date
+1	alice_updated	2024-06-01	2024-01-01 00:00:00	2000-01-01
+2	bob_updated	2024-01-01	2024-12-17 10:30:00	2000-01-01
+3	charlie	2024-01-01	2024-01-01 00:00:00	2000-01-01
+
+-- query 11
+user_id	username	registered_date	last_login	birth_date	account_expires
+1	alice_v2	2024-06-01	2024-01-01 00:00:00	2000-01-01	2026-06-30
+2	bob_updated	2024-01-01	2024-12-17 10:30:00	2000-01-01	2025-12-31
+3	charlie	2024-01-01	2024-01-01 00:00:00	2000-01-01	2025-12-31
+4	david	2024-01-01	2024-01-01 00:00:00	2000-01-01	2025-12-31
+
+-- query 12
+user_id	username	registered_date	last_login	birth_date	account_expires
+1	alice_v2	2024-06-01	2024-01-01 00:00:00	2000-01-01	2026-06-30
+2	bob_updated	2024-01-01	2024-12-17 10:30:00	2000-01-01	2025-12-31
+3	charlie	2024-01-01	2024-01-01 00:00:00	2000-01-01	2025-12-31
+4	david	2024-01-01	2024-01-01 00:00:00	2000-01-01	2025-12-31
+
+-- query 13
+log_id	message	event_date
+1	event_1	2024-01-01
+2	event_2	2024-01-01
+
+-- query 14
+log_id	message	event_date
+1	event_1	2024-01-01
+2	event_2	2024-01-01
+3	event_3	2024-01-01
+
+-- query 15
+id	date_early	date_recent	datetime_midnight	datetime_noon	datetime_full
+1	1970-01-01	2024-12-17	2024-01-01 00:00:00	2024-06-15 12:00:00	2024-12-17 23:59:59
+2	1970-01-01	2024-12-17	2024-01-01 00:00:00	2024-06-15 12:00:00	2024-12-17 23:59:59
+3	1970-01-01	2024-12-17	2024-01-01 00:00:00	2024-06-15 12:00:00	2024-12-17 23:59:59
+
+-- query 16
+id	test_early	test_recent	test_midnight	test_noon	test_full
+1	PASS	PASS	PASS	PASS	PASS
+2	PASS	PASS	PASS	PASS	PASS
+3	PASS	PASS	PASS	PASS	PASS
+
+-- query 17
+product_id	region	last_sale_date	total_quantity	first_sale_date
+1	North	2024-01-01	0	2023-01-01
+2	South	2024-01-01	0	2023-01-01
+
+-- query 18
+item_id	item_name	added_date	last_checked	expiry_date
+1	widget	2024-01-01	2024-01-01 00:00:00	2025-12-31
+2	gadget	2024-01-01	2024-01-01 00:00:00	2025-12-31

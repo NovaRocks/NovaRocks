@@ -260,6 +260,7 @@ fn main() {
     println!("cargo:rerun-if-changed=idl/thrift/Types.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/AgentService.thrift");
     println!("cargo:rerun-if-changed=idl/thrift/StarrocksExternalService.thrift");
+    println!("cargo:rerun-if-changed=idl/thrift/Descriptors.thrift");
     println!("cargo:rerun-if-changed=idl/proto/internal_service.proto");
     println!("cargo:rerun-if-changed=idl/proto/data.proto");
     println!("cargo:rerun-if-changed=idl/proto/status.proto");
