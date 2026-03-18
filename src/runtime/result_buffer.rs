@@ -259,18 +259,22 @@ pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
     };
 
     if block.cancelled {
+        let msg = block
+            .cancel_message
+            .clone()
+            .unwrap_or_else(|| "Cancelled".to_string());
+        guard.remove(&finst_id);
         return TryFetchResult::Error(FetchError {
             kind: FetchErrorKind::Cancelled,
-            message: block
-                .cancel_message
-                .clone()
-                .unwrap_or_else(|| "Cancelled".to_string()),
+            message: msg,
         });
     }
     if let Some(msg) = block.status_error.as_ref() {
+        let msg = msg.clone();
+        guard.remove(&finst_id);
         return TryFetchResult::Error(FetchError {
             kind: FetchErrorKind::Failed,
-            message: msg.clone(),
+            message: msg,
         });
     }
     if let Some(result) = block.pop_next() {
@@ -281,6 +285,7 @@ pub(crate) fn try_fetch(finst_id: UniqueId) -> TryFetchResult {
         return TryFetchResult::Ready(block.make_eos_result());
     }
     if block.closed_ok && block.eos_sent {
+        guard.remove(&finst_id);
         return TryFetchResult::Error(FetchError {
             kind: FetchErrorKind::NotFound,
             message: "result stream already reached eos".to_string(),
