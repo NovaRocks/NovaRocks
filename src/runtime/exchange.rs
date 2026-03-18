@@ -188,6 +188,25 @@ fn get_or_create(key: ExchangeKey) -> Arc<Receiver> {
     receiver
 }
 
+/// Remove all exchange entries for a fragment instance after normal completion.
+/// Adds tombstones so late-arriving sender data is rejected, but does NOT
+/// wake any blocked waiters (none should exist on the success path).
+pub fn remove_fragment(finst_id_hi: i64, finst_id_lo: i64) {
+    let mut guard = exchange().lock().expect("exchange lock");
+    let keys: Vec<ExchangeKey> = guard
+        .keys()
+        .copied()
+        .filter(|k| k.finst_id_hi == finst_id_hi && k.finst_id_lo == finst_id_lo)
+        .collect();
+    for k in keys {
+        mark_key_canceled(k);
+        guard.remove(&k);
+    }
+}
+
+/// Cancel all exchange receivers for a fragment instance on error or FE cancel.
+/// Wakes blocked waiters so they can observe the cancellation, then removes
+/// entries from the global map.
 pub fn cancel_fragment(finst_id_hi: i64, finst_id_lo: i64) {
     let mut guard = exchange().lock().expect("exchange lock");
     let keys: Vec<ExchangeKey> = guard

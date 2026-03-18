@@ -1121,6 +1121,7 @@ fn spawn_exec_fragment(
             }
         }
         fe_report::report_fragment_done(finst_id, report_error);
+        exchange::remove_fragment(finst_id.hi, finst_id.lo);
         mgr.unregister_finst(finst_id);
         mgr.finish_fragment(query_id);
     });
@@ -1561,6 +1562,7 @@ pub(crate) fn execute_plan_fragment_sync(
         one.backend_num,
         Some(fragment_mem_tracker),
     );
+    exchange::remove_fragment(finst_id.hi, finst_id.lo);
     mgr.finish_fragment(query_id);
 
     match exec_result {
