@@ -1,0 +1,47 @@
+-- query 7
+count(*)
+65
+
+-- query 8
+count(*)
+62
+
+-- query 9
+count(*)
+63
+
+-- query 10
+count(*)
+54
+
+-- query 11
+count(*)
+81
+
+-- query 12
+count(*)
+62
+
+-- query 13
+count(*)
+54
+
+-- query 14
+count(*)
+63
+
+-- query 15
+count(*)
+63
+
+-- query 16
+count(*)
+24
+
+-- query 17
+count(*)
+81
+
+-- query 18
+count(*)
+33

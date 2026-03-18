@@ -1,0 +1,111 @@
+-- query 8
+map2	map2
+{0:["1","2"]}	{0:["1","2"]}
+{1:[]}	{1:[]}
+{null:null}	{null:null}
+{3:["3",null],null:null}	{3:["3",null],null:null}
+
+-- query 9
+map3	map3
+{"1":{1:"abc"}}	{"1":{1:"abc"}}
+{"11":{1:"abc"},"":{2:null}}	{"11":{1:"abc"},"":{2:null}}
+{null:{null:null}}	{null:{null:null}}
+{"3":{3:"a33c"},null:null}	{"3":{3:"a33c"},null:null}
+
+-- query 10
+map5	map5
+{0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:null,3:{"c":3,"b":"a"}}	{null:null,3:{"c":3,"b":"a"}}
+
+-- query 11
+map0	map0
+{0:"ab"}	{0:"ab"}
+{1:null}	{1:null}
+{null:null}	{null:null}
+{3:"",null:null}	{3:"",null:null}
+
+-- query 12
+map1	map1
+{0.000:"ab"}	{0.000:"ab"}
+{null:""}	{null:""}
+{null:null}	{null:null}
+{3.000:"",null:null}	{3.000:"",null:null}
+
+-- query 16
+map3	map3
+{"1":{1:"abc"}}	{"1":{1:"abc"}}
+{"11":{1:"abc"},"":{2:null}}	{"11":{1:"abc"},"":{2:null}}
+{null:{null:null}}	{null:{null:null}}
+{"3":{3:"a33c"},null:null}	{"3":{3:"a33c"},null:null}
+NULL	NULL
+
+-- query 17
+map5	map5
+{0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:null,3:{"c":3,"b":"a"}}	{null:null,3:{"c":3,"b":"a"}}
+NULL	NULL
+
+-- query 18
+map5	map5
+NULL	NULL
+{0:{"c":1,"b":"a"}}	{0:{"c":1,"b":"a"}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}	{null:{"c":null,"b":null}}
+{null:null,3:{"c":3,"b":"a"}}	{null:null,3:{"c":3,"b":"a"}}
+
+-- query 19
+map3
+{"1":{1:"abc"}}
+{"11":{1:"abc"},"":{2:null}}
+{null:{null:null}}
+{"3":{3:"a33c"},null:null}
+
+-- query 20
+map0
+NULL
+
+-- query 21
+map1
+{null:""}
+NULL
+
+-- query 22
+map3
+{"1":{1:"abc"}}
+{"11":{1:"abc"},"":{2:null}}
+{null:{null:null}}
+{"3":{3:"a33c"},null:null}
+
+-- query 23
+map5
+{0:{"c":1,"b":"a"}}
+{null:{"c":null,"b":null}}
+{null:{"c":null,"b":null}}
+{null:null,3:{"c":3,"b":"a"}}
+
+-- query 24
+map5
+
+-- query 30
+map2	map2
+{0:["1","2"]}	{0:["1","2"]}
+{1:[]}	{1:[]}
+{null:null}	{null:null}
+{3:["3",null],null:null}	{3:["3",null],null:null}
+
+-- query 31
+map2	map2
+{0:["1","2"]}	{0:["1","2"]}
+{1:[]}	{1:[]}
+{null:null}	{null:null}
+{3:["3",null],null:null}	{3:["3",null],null:null}

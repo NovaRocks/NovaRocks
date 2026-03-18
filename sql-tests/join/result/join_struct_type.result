@@ -1,0 +1,155 @@
+-- query 9
+s0	s0
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+
+-- query 10
+s1	s1
+{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
+{"c0":null,"c1":""}	{"c0":null,"c1":""}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+
+-- query 11
+s2	s2
+{"c0":0,"c1":["1","2"]}	{"c0":0,"c1":["1","2"]}
+{"c0":1,"c1":[]}	{"c0":1,"c1":[]}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":["3",null,null,null]}	{"c0":3,"c1":["3",null,null,null]}
+
+-- query 12
+s5	s5
+{"c0":0,"c1":{"c":1,"b":"a"}}	{"c0":0,"c1":{"c":1,"b":"a"}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":3,"b":"a"}}	{"c0":null,"c1":{"c":3,"b":"a"}}
+
+-- query 13
+s0	s0
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+
+-- query 14
+s1	s1
+{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
+{"c0":null,"c1":""}	{"c0":null,"c1":""}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+
+-- query 15
+s2	s2
+{"c0":0,"c1":["1","2"]}	{"c0":0,"c1":["1","2"]}
+{"c0":1,"c1":[]}	{"c0":1,"c1":[]}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":["3",null,null,null]}	{"c0":3,"c1":["3",null,null,null]}
+
+-- query 16
+s3	s3
+{"c0":"1","c1":{1:"abc"}}	{"c0":"1","c1":{1:"abc"}}
+{"c0":"11","c1":{1:"abc",null:null}}	{"c0":"11","c1":{1:"abc",null:null}}
+{"c0":null,"c1":{null:null}}	{"c0":null,"c1":{null:null}}
+{"c0":"3","c1":{3:"a33c",null:null}}	{"c0":"3","c1":{3:"a33c",null:null}}
+
+-- query 18
+s0	s0
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+NULL	NULL
+
+-- query 19
+s1	s1
+{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
+{"c0":null,"c1":""}	{"c0":null,"c1":""}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+NULL	NULL
+
+-- query 20
+s5	s5
+{"c0":0,"c1":{"c":1,"b":"a"}}	{"c0":0,"c1":{"c":1,"b":"a"}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":null,"b":null}}	{"c0":null,"c1":{"c":null,"b":null}}
+{"c0":null,"c1":{"c":3,"b":"a"}}	{"c0":null,"c1":{"c":3,"b":"a"}}
+NULL	NULL
+
+-- query 21
+s0	s0
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+NULL	NULL
+
+-- query 22
+s1	s1
+{"c0":0.000,"c1":"ab"}	{"c0":0.000,"c1":"ab"}
+{"c0":null,"c1":""}	{"c0":null,"c1":""}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3.000,"c1":""}	{"c0":3.000,"c1":""}
+NULL	NULL
+
+-- query 23
+s2	s2
+{"c0":0,"c1":["1","2"]}	{"c0":0,"c1":["1","2"]}
+{"c0":1,"c1":[]}	{"c0":1,"c1":[]}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":["3",null,null,null]}	{"c0":3,"c1":["3",null,null,null]}
+NULL	NULL
+
+-- query 24
+s3	s3
+{"c0":"1","c1":{1:"abc"}}	{"c0":"1","c1":{1:"abc"}}
+{"c0":"11","c1":{1:"abc",null:null}}	{"c0":"11","c1":{1:"abc",null:null}}
+{"c0":null,"c1":{null:null}}	{"c0":null,"c1":{null:null}}
+{"c0":"3","c1":{3:"a33c",null:null}}	{"c0":"3","c1":{3:"a33c",null:null}}
+NULL	NULL
+
+-- query 31
+s4
+{"c0":null,"c1":null}
+
+-- query 32
+s5
+
+-- query 33
+s0	s0
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+NULL	NULL
+
+-- query 34
+s0	s0
+NULL	NULL
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+
+-- query 35
+s0	s0
+NULL	NULL
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+
+-- query 36
+s0	s0
+NULL	NULL
+{"c0":0,"c1":"ab"}	{"c0":0,"c1":"ab"}
+{"c0":1,"c1":null}	{"c0":1,"c1":null}
+{"c0":null,"c1":null}	{"c0":null,"c1":null}
+{"c0":3,"c1":""}	{"c0":3,"c1":""}
+NULL	NULL

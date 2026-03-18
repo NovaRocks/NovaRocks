@@ -1,0 +1,499 @@
+-- query 18
+id	int_col	value
+1	1000	value1
+2	2000	value2
+3	3000	value3
+4	4000	value4
+
+-- query 19
+id	int_col	value
+5	5000	value5
+6	6000	value6
+7	7000	value7
+8	8000	value8
+9	9000	value9
+10	10000	value10
+11	-1000	negative1
+12	-2000	negative2
+13	0	zero
+15	1500	extra1
+
+-- query 20
+id	varchar_col	category
+1	apple	food
+2	banana	food
+3	carrot	food
+4	dog	pet
+
+-- query 21
+id	varchar_col	category
+5	elephant	wild
+6	fish	aquatic
+7	grape	food
+8	house	shelter
+9	ice	cold
+10	jungle	wild
+11	a'b	test
+12	c"d	test
+13	e\f	test
+14		test
+
+-- query 22
+id	tinyint_col
+1	10
+2	20
+3	30
+4	40
+
+-- query 23
+id	smallint_col
+1	100
+2	200
+3	300
+4	400
+
+-- query 24
+id	bigint_col
+1	10000
+2	20000
+3	30000
+4	40000
+
+-- query 25
+id	char_col
+1	fruit
+2	fruit
+4	animal
+5	animal
+6	animal
+7	fruit
+8	building
+10	nature
+
+-- query 26
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+
+-- query 27
+id	varchar_col
+1	apple
+2	banana
+3	carrot
+4	dog
+
+-- query 28
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+
+-- query 29
+id	int_col
+6	6000
+7	7000
+8	8000
+9	9000
+
+-- query 30
+id	tinyint_col
+1	10
+2	20
+3	30
+4	40
+
+-- query 31
+int_col	cnt
+1000	1
+2000	1
+3000	1
+4000	1
+
+-- query 32
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+
+-- query 33
+id	varchar_col
+1	apple
+2	banana
+3	carrot
+4	dog
+5	elephant
+
+-- query 34
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+7	7000
+8	8000
+9	9000
+10	10000
+11	-1000
+12	-2000
+13	0
+14	NULL
+15	1500
+
+-- query 35
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+
+-- query 36
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+
+-- query 37
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+7	7000
+8	8000
+9	9000
+10	10000
+11	-1000
+12	-2000
+13	0
+14	NULL
+15	1500
+
+-- query 38
+id	int_col
+1	1000
+3	3000
+4	4000
+5	5000
+7	7000
+8	8000
+9	9000
+11	-1000
+12	-2000
+13	0
+14	NULL
+
+-- query 39
+id	int_col
+1	1000
+5	5000
+7	7000
+9	9000
+11	-1000
+12	-2000
+14	NULL
+
+-- query 40
+id	int_col
+1	1000
+3	3000
+5	5000
+7	7000
+9	9000
+11	-1000
+12	-2000
+14	NULL
+
+-- query 41
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+
+-- query 42
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+
+-- query 43
+id	int_col	avg_score
+1	1000	80.35
+2	2000	80.35
+3	3000	80.35
+4	4000	80.35
+5	5000	80.35
+
+-- query 44
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+
+-- query 45
+id	int_col
+1	1000
+3	3000
+5	5000
+7	7000
+9	9000
+11	-1000
+12	-2000
+
+-- query 46
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+7	7000
+8	8000
+9	9000
+10	10000
+11	-1000
+12	-2000
+13	0
+14	NULL
+15	1500
+
+-- query 47
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+
+-- query 48
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+7	7000
+8	8000
+9	9000
+10	10000
+11	-1000
+12	-2000
+13	0
+14	NULL
+15	1500
+
+-- query 49
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+11	-1000
+12	-2000
+13	0
+
+-- query 50
+id	int_col
+1	1000
+3	3000
+5	5000
+7	7000
+9	9000
+11	-1000
+12	-2000
+14	NULL
+
+-- query 51
+id	int_col	value
+1	1000	value1
+2	2000	value2
+3	3000	value3
+4	4000	value4
+
+-- query 52
+id	int_col	dim_name
+1	1000	Category A
+2	2000	Category B
+3	3000	Category C
+4	4000	Category D
+
+-- query 53
+id	int_col	bigint_col
+2	2000	20000
+3	3000	30000
+4	4000	40000
+
+-- query 54
+id	int_col	rn
+1	1000	1
+2	2000	2
+3	3000	3
+4	4000	4
+
+-- query 55
+id	int_col
+1	1000
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+7	7000
+8	8000
+
+-- query 56
+count(*)	sum(int_col)	avg(int_col)	min(int_col)	max(int_col)
+6	21000	3500	1000	6000
+
+-- query 57
+id	int_col	value
+8	8000	value8
+7	7000	value7
+6	6000	value6
+5	5000	value5
+4	4000	value4
+
+-- query 58
+id	int_col
+1	1000
+2	2000
+3	3000
+
+-- query 59
+id	varchar_col
+11	a'b
+12	c"d
+13	e\f
+
+-- query 60
+id	varchar_col
+1	apple
+2	banana
+3	carrot
+14	
+
+-- query 61
+id	category_id
+1	1
+2	1
+3	2
+4	2
+5	3
+6	3
+7	4
+8	4
+9	5
+10	5
+11	1
+12	2
+13	3
+14	4
+15	5
+16	1
+17	2
+18	3
+19	4
+20	5
+
+-- query 62
+id	int_col
+
+-- query 63
+id	int_col
+
+-- query 64
+id	int_col
+5	5000
+6	6000
+7	7000
+8	8000
+9	9000
+
+-- query 65
+id	int_col
+2	2000
+3	3000
+4	4000
+5	5000
+6	6000
+
+-- query 66
+id	date_val
+1	2024-01-01
+2	2024-01-02
+3	2024-01-03
+4	2024-01-04
+
+-- query 67
+id	varchar_col
+
+-- query 68
+id	category_id	status	score	rank_in_category
+11	1	active	89.3	1
+1	1	active	85.5	2
+16	1	pending	78.9	3
+2	1	inactive	72.3	4
+12	2	active	95.7	1
+17	2	active	93.2	2
+3	2	active	91.2	3
+4	2	pending	68.7	4
+5	3	active	94.1	1
+18	3	active	87.1	2
+13	3	pending	71.8	3
+6	3	inactive	55.9	4
+7	4	active	88.8	1
+14	4	active	84.4	2
+8	4	pending	77.4	3
+19	4	inactive	66.5	4
+9	5	active	92.6	1
+20	5	active	90.8	2
+10	5	inactive	63.2	3
+15	5	inactive	59.6	4
+
+-- query 69
+id	int_col	varchar_col	dim_name	status	score
+1	1000	apple	Category A	active	85.5
+2	2000	banana	Category B	inactive	72.3
+3	3000	carrot	Category C	active	91.2
+4	4000	dog	Category D	pending	68.7
+5	5000	elephant	Category E	active	94.1
+
+-- query 70
+id	int_col
+5	5000
+6	6000
+7	7000
+8	8000
+9	9000
+10	10000
+11	-1000
+12	-2000
+13	0
+15	1500
+
+-- query 72
+dim_id	count(dim_id)
+1	1
+2	1
+3	1
+4	1
+5	1

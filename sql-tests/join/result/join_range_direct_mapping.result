@@ -1,0 +1,223 @@
+-- query 17
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+1280000	1280000	1280000	1280000
+
+-- query 18
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+1280000	1280000	1280000	1280000
+
+-- query 19
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+98461	98461	98461	98461
+
+-- query 20
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+1280000	1280000	91428	91428
+
+-- query 21
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+5120000	5120000	5120000	5120000
+
+-- query 22
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+5120000	5120000	5120000	5120000
+
+-- query 23
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+5120000	5120000	5120000	5120000
+
+-- query 24
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+5120000	5120000	5120000	5120000
+
+-- query 25
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+1152000	1152000	1152000	1152000
+
+-- query 26
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+1152000	1152000	1152000	1152000
+
+-- query 27
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+88615	88615	88615	88615
+
+-- query 28
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+73143	73143	73143	73143
+
+-- query 29
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+4608000	4608000	4608000	4608000
+
+-- query 30
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+4608000	4608000	4608000	4608000
+
+-- query 31
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+4608000	4608000	4608000	4608000
+
+-- query 32
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+4608000	4608000	4608000	4608000
+
+-- query 33
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+640000	640000	640000	640000
+
+-- query 34
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+640000	640000	640000	640000
+
+-- query 35
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+49231	49231	49231	49231
+
+-- query 36
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+54857	54857	54857	54857
+
+-- query 37
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+2560000	2560000	2560000	2560000
+
+-- query 38
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+2560000	2560000	2560000	2560000
+
+-- query 39
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+2560000	2560000	2560000	2560000
+
+-- query 40
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+2560000	2560000	2560000	2560000
+
+-- query 41
+count(t1.c_int)	count(t1.c_bigint)
+1280000	1280000
+
+-- query 42
+count(t1.c_int)	count(t1.c_bigint)
+1280000	1280000
+
+-- query 43
+count(t1.c_int)	count(t1.c_bigint)
+98461	98461
+
+-- query 44
+count(t1.c_int)	count(t1.c_bigint)
+91428	91428
+
+-- query 45
+count(t1.c_int)	count(t1.c_bigint)
+2560000	2560000
+
+-- query 46
+count(t1.c_int)	count(t1.c_bigint)
+2560000	2560000
+
+-- query 47
+count(t1.c_int)	count(t1.c_bigint)
+2560000	2560000
+
+-- query 48
+count(t1.c_int)	count(t1.c_bigint)
+2560000	2560000
+
+-- query 49
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 50
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 51
+count(t1.c_int)	count(t1.c_bigint)
+1181539	1181539
+
+-- query 52
+count(t1.c_int)	count(t1.c_bigint)
+1188572	1188572
+
+-- query 53
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 54
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 55
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 56
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 58
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+640000	640000	640000	640000
+
+-- query 59
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+640000	640000	640000	640000
+
+-- query 60
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+49231	49231	49231	49231
+
+-- query 61
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+54857	54857	54857	54857
+
+-- query 62
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+640000	640000	640000	640000
+
+-- query 63
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+640000	640000	640000	640000
+
+-- query 64
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+49231	49231	49231	49231
+
+-- query 65
+count(t1.c_int)	count(t1.c_bigint)	count(t2.c_int)	count(t2.c_bigint)
+54857	54857	54857	54857
+
+-- query 66
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 67
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 68
+count(t1.c_int)	count(t1.c_bigint)
+1181539	1181539
+
+-- query 69
+count(t1.c_int)	count(t1.c_bigint)
+1188572	1188572
+
+-- query 70
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 71
+count(t1.c_int)	count(t1.c_bigint)
+0	0
+
+-- query 72
+count(t1.c_int)	count(t1.c_bigint)
+1181539	1181539
+
+-- query 73
+count(t1.c_int)	count(t1.c_bigint)
+1188572	1188572

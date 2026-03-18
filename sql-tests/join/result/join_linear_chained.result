@@ -1,0 +1,179 @@
+-- query 17
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 18
+count(tt1.k1)	count(tt2.k1)
+1280000	1280000
+
+-- query 19
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 20
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 21
+count(tt1.k1)	count(tt2.k1)
+1280000	1280000
+
+-- query 22
+count(tt1.k1)	count(tt2.k1)
+25600	25600
+
+-- query 23
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 24
+count(tt1.k1)	count(tt2.k1)
+1280000	1280000
+
+-- query 25
+count(tt1.k1)	count(tt2.k1)
+25600	25600
+
+-- query 26
+count(tt1.c_string)
+2560000
+
+-- query 27
+count(tt1.c_string)
+1280000
+
+-- query 28
+count(tt1.c_string)
+25600
+
+-- query 29
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 30
+count(tt1.k1)	count(tt2.k1)
+0	0
+
+-- query 31
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 32
+count(tt1.k1)
+2560000
+
+-- query 33
+count(tt1.k1)
+1280000
+
+-- query 34
+count(tt1.k1)
+2560000
+
+-- query 35
+count(tt1.k1)
+2560000
+
+-- query 36
+count(tt1.k1)
+1280000
+
+-- query 37
+count(tt1.k1)
+25600
+
+-- query 38
+count(tt1.k1)
+2560000
+
+-- query 39
+count(tt1.k1)
+1280000
+
+-- query 40
+count(tt1.k1)
+25600
+
+-- query 41
+count(tt1.c_string)
+2560000
+
+-- query 42
+count(tt1.c_string)
+1280000
+
+-- query 43
+count(tt1.c_string)
+25600
+
+-- query 44
+count(tt1.k1)
+2560000
+
+-- query 45
+count(tt1.k1)
+0
+
+-- query 46
+count(tt1.k1)
+2560000
+
+-- query 47
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 48
+count(tt1.k1)	count(tt2.k1)
+1280000	1280000
+
+-- query 49
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 50
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 51
+count(tt1.k1)	count(tt2.k1)
+1280000	1280000
+
+-- query 52
+count(tt1.k1)	count(tt2.k1)
+25600	25600
+
+-- query 53
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 54
+count(tt1.k1)	count(tt2.k1)
+1280000	1280000
+
+-- query 55
+count(tt1.k1)	count(tt2.k1)
+25600	25600
+
+-- query 56
+count(tt1.c_string)
+2560000
+
+-- query 57
+count(tt1.c_string)
+1280000
+
+-- query 58
+count(tt1.c_string)
+25600
+
+-- query 59
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000
+
+-- query 60
+count(tt1.k1)	count(tt2.k1)
+2560000	0
+
+-- query 61
+count(tt1.k1)	count(tt2.k1)
+2560000	2560000

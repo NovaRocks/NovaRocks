@@ -1,0 +1,35 @@
+-- query 4
+count(*)	count(a.v1)	count(b.v1)
+3	3	3
+
+-- query 5
+count(*)	count(a.v1)	count(b.v1)
+7	7	6
+
+-- query 6
+count(*)	count(a.v1)	count(b.v1)
+7	6	7
+
+-- query 7
+count(*)	count(a.v1)	count(b.v1)
+8	7	7
+
+-- query 8
+count(*)	count(a.v1)
+3	3
+
+-- query 9
+count(*)	count(a.v1)
+2	2
+
+-- query 10
+count(*)	count(b.v1)
+3	3
+
+-- query 11
+count(*)	count(b.v1)
+2	2
+
+-- query 12
+count(*)	count(a.v1)
+0	0

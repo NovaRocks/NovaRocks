@@ -1,0 +1,347 @@
+-- query 17
+count(1)	count(t1.k1)	count(t1.c_bool_null)
+1279999	1279999	1279999
+
+-- query 18
+count(1)	count(t1.k1)	count(t1.c_bool_null)
+2377227	2377142	1279999
+
+-- query 19
+count(1)	count(t1.k1)	count(t1.c_bool_null)
+182857	182857	182857
+
+-- query 20
+count(1)	count(t1.k1)	count(t1.c_tinyint_null)
+26672	26672	26672
+
+-- query 21
+count(1)	count(t1.k1)	count(t1.c_tinyint_null)
+1280091	1280000	106666
+
+-- query 22
+count(1)	count(t1.k1)	count(t1.c_tinyint_null)
+26672	26672	26672
+
+-- query 23
+count(1)	count(t1.k1)	count(t1.c_smallint_null)
+2464	2464	2464
+
+-- query 24
+count(1)	count(t1.k1)	count(t1.c_smallint_null)
+1289230	1280000	98461
+
+-- query 25
+count(1)	count(t1.k1)	count(t1.c_smallint_null)
+2464	2464	2464
+
+-- query 26
+count(1)	count(t1.k1)	count(t1.c_int)
+2559998	2559998	2559998
+
+-- query 27
+count(1)	count(t1.k1)	count(t1.c_int)
+2559998	2559998	2559998
+
+-- query 28
+count(1)	count(t1.k1)	count(t1.c_int)
+1280000	1280000	1280000
+
+-- query 29
+count(1)	count(t1.k1)	count(t1.c_int_null)
+91428	91428	91428
+
+-- query 30
+count(1)	count(t1.k1)	count(t1.c_int_null)
+2468572	1280000	91428
+
+-- query 31
+count(1)	count(t1.k1)	count(t1.c_int_null)
+91428	91428	91428
+
+-- query 32
+count(1)	count(t1.k1)	count(t1.c_bigint)
+2559998	2559998	2559998
+
+-- query 33
+count(1)	count(t1.k1)	count(t1.c_bigint)
+2559998	2559998	2559998
+
+-- query 34
+count(1)	count(t1.k1)	count(t1.c_bigint)
+1280000	1280000	1280000
+
+-- query 35
+count(1)	count(t1.k1)	count(t1.c_bigint_null)
+85333	85333	85333
+
+-- query 36
+count(1)	count(t1.k1)	count(t1.c_bigint_null)
+2474667	1280000	85333
+
+-- query 37
+count(1)	count(t1.k1)	count(t1.c_bigint_null)
+85333	85333	85333
+
+-- query 38
+count(1)	count(t1.k1)	count(t1.c_largeint)
+2559998	2559998	2559998
+
+-- query 39
+count(1)	count(t1.k1)	count(t1.c_largeint)
+2559998	2559998	2559998
+
+-- query 40
+count(1)	count(t1.k1)	count(t1.c_largeint)
+1280000	1280000	1280000
+
+-- query 41
+count(1)	count(t1.k1)	count(t1.c_largeint_null)
+80000	80000	80000
+
+-- query 42
+count(1)	count(t1.k1)	count(t1.c_largeint_null)
+2480000	1280000	80000
+
+-- query 43
+count(1)	count(t1.k1)	count(t1.c_largeint_null)
+80000	80000	80000
+
+-- query 44
+count(1)	count(t1.k1)	count(t1.c_float)
+1280000	1280000	1280000
+
+-- query 45
+count(1)	count(t1.k1)	count(t1.c_float)
+1280000	1280000	1280000
+
+-- query 46
+count(1)	count(t1.k1)	count(t1.c_float)
+1280000	1280000	1280000
+
+-- query 47
+count(1)	count(t1.k1)	count(t1.c_float_null)
+75294	75294	75294
+
+-- query 48
+count(1)	count(t1.k1)	count(t1.c_float_null)
+2484706	1280000	75294
+
+-- query 49
+count(1)	count(t1.k1)	count(t1.c_float_null)
+75294	75294	75294
+
+-- query 50
+count(1)	count(t1.k1)	count(t1.c_double)
+1280000	1280000	1280000
+
+-- query 51
+count(1)	count(t1.k1)	count(t1.c_double)
+1280000	1280000	1280000
+
+-- query 52
+count(1)	count(t1.k1)	count(t1.c_double)
+1280000	1280000	1280000
+
+-- query 53
+count(1)	count(t1.k1)	count(t1.c_double_null)
+71111	71111	71111
+
+-- query 54
+count(1)	count(t1.k1)	count(t1.c_double_null)
+2488889	1280000	71111
+
+-- query 55
+count(1)	count(t1.k1)	count(t1.c_double_null)
+71111	71111	71111
+
+-- query 56
+count(1)	count(t1.k1)	count(t1.c_decimalv2)
+2560000	2560000	2560000
+
+-- query 57
+count(1)	count(t1.k1)	count(t1.c_decimalv2)
+2560000	2560000	2560000
+
+-- query 58
+count(1)	count(t1.k1)	count(t1.c_decimalv2)
+1280000	1280000	1280000
+
+-- query 59
+count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
+55652	55652	55652
+
+-- query 60
+count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
+2504348	1280000	55652
+
+-- query 61
+count(1)	count(t1.k1)	count(t1.c_decimalv2_null)
+55652	55652	55652
+
+-- query 62
+count(1)	count(t1.k1)	count(t1.c_decimal32)
+2560000	2560000	2560000
+
+-- query 63
+count(1)	count(t1.k1)	count(t1.c_decimal32)
+2560000	2560000	2560000
+
+-- query 64
+count(1)	count(t1.k1)	count(t1.c_decimal32)
+1280000	1280000	1280000
+
+-- query 65
+count(1)	count(t1.k1)	count(t1.c_decimal32_null)
+53333	53333	53333
+
+-- query 66
+count(1)	count(t1.k1)	count(t1.c_decimal32_null)
+2506667	1280000	53333
+
+-- query 67
+count(1)	count(t1.k1)	count(t1.c_decimal32_null)
+53333	53333	53333
+
+-- query 68
+count(1)	count(t1.k1)	count(t1.c_decimal64)
+2560000	2560000	2560000
+
+-- query 69
+count(1)	count(t1.k1)	count(t1.c_decimal64)
+2560000	2560000	2560000
+
+-- query 70
+count(1)	count(t1.k1)	count(t1.c_decimal64)
+1280000	1280000	1280000
+
+-- query 71
+count(1)	count(t1.k1)	count(t1.c_decimal64_null)
+51200	51200	51200
+
+-- query 72
+count(1)	count(t1.k1)	count(t1.c_decimal64_null)
+2508800	1280000	51200
+
+-- query 73
+count(1)	count(t1.k1)	count(t1.c_decimal64_null)
+51200	51200	51200
+
+-- query 74
+count(1)	count(t1.k1)	count(t1.c_decimal128)
+2560000	2560000	2560000
+
+-- query 75
+count(1)	count(t1.k1)	count(t1.c_decimal128)
+2560000	2560000	2560000
+
+-- query 76
+count(1)	count(t1.k1)	count(t1.c_decimal128)
+1280000	1280000	1280000
+
+-- query 77
+count(1)	count(t1.k1)	count(t1.c_decimal128_null)
+49230	49230	49230
+
+-- query 78
+count(1)	count(t1.k1)	count(t1.c_decimal128_null)
+2510770	1280000	49230
+
+-- query 79
+count(1)	count(t1.k1)	count(t1.c_decimal128_null)
+49230	49230	49230
+
+-- query 80
+count(1)	count(t1.k1)	count(t1.c_date)
+2559998	2559998	2559998
+
+-- query 81
+count(1)	count(t1.k1)	count(t1.c_date)
+2559998	2559998	2559998
+
+-- query 82
+count(1)	count(t1.k1)	count(t1.c_date)
+1280000	1280000	1280000
+
+-- query 83
+count(1)	count(t1.k1)	count(t1.c_date_null)
+67368	67368	67368
+
+-- query 84
+count(1)	count(t1.k1)	count(t1.c_date_null)
+2492632	1280000	67368
+
+-- query 85
+count(1)	count(t1.k1)	count(t1.c_date_null)
+67368	67368	67368
+
+-- query 86
+count(1)	count(t1.k1)	count(t1.c_datetime)
+2559998	2559998	2559998
+
+-- query 87
+count(1)	count(t1.k1)	count(t1.c_datetime)
+2559998	2559998	2559998
+
+-- query 88
+count(1)	count(t1.k1)	count(t1.c_datetime)
+1280000	1280000	1280000
+
+-- query 89
+count(1)	count(t1.k1)	count(t1.c_datetime_null)
+64000	64000	64000
+
+-- query 90
+count(1)	count(t1.k1)	count(t1.c_datetime_null)
+2496000	1280000	64000
+
+-- query 91
+count(1)	count(t1.k1)	count(t1.c_datetime_null)
+64000	64000	64000
+
+-- query 92
+count(1)	count(t1.k1)	count(t1.c_char)
+1280000	1280000	1280000
+
+-- query 93
+count(1)	count(t1.k1)	count(t1.c_char)
+1280000	1280000	1280000
+
+-- query 94
+count(1)	count(t1.k1)	count(t1.c_char)
+1280000	1280000	1280000
+
+-- query 95
+count(1)	count(t1.k1)	count(t1.c_char_null)
+60952	60952	60952
+
+-- query 96
+count(1)	count(t1.k1)	count(t1.c_char_null)
+2499048	1280000	60952
+
+-- query 97
+count(1)	count(t1.k1)	count(t1.c_char_null)
+60952	60952	60952
+
+-- query 98
+count(1)	count(t1.k1)	count(t1.c_varchar)
+1280000	1280000	1280000
+
+-- query 99
+count(1)	count(t1.k1)	count(t1.c_varchar)
+1280000	1280000	1280000
+
+-- query 100
+count(1)	count(t1.k1)	count(t1.c_varchar)
+1280000	1280000	1280000
+
+-- query 101
+count(1)	count(t1.k1)	count(t1.c_varchar_null)
+58181	58181	58181
+
+-- query 102
+count(1)	count(t1.k1)	count(t1.c_varchar_null)
+2501819	1280000	58181
+
+-- query 103
+count(1)	count(t1.k1)	count(t1.c_varchar_null)
+58181	58181	58181

@@ -261,6 +261,19 @@ impl ChunkSlotSchema {
         })
     }
 
+    /// Return a copy of this slot schema with nullable set to the given value.
+    pub fn with_nullable(&self, nullable: bool) -> Self {
+        if self.field.is_nullable() == nullable {
+            return self.clone();
+        }
+        Self {
+            slot_id: self.slot_id,
+            field: self.field.clone().with_nullable(nullable),
+            field_schema: self.field_schema.clone(),
+            unique_id: self.unique_id,
+        }
+    }
+
     pub fn try_from_type_desc(
         slot_id: SlotId,
         name: impl Into<String>,

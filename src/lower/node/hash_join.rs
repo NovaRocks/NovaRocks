@@ -358,15 +358,13 @@ pub(crate) fn lower_hash_join_node(
         }
     }
 
-    let output_layout = match join_type {
-        JoinType::Inner | JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter => {
-            layout.clone()
-        }
-        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::NullAwareLeftAnti => {
-            left.layout.clone()
-        }
-        JoinType::RightSemi | JoinType::RightAnti => right.layout.clone(),
-    };
+    // Use the full join-scope layout for all join types.  For SEMI/ANTI joins
+    // the FE's sort_tuple_slot_exprs / analytic output columns may reference
+    // slots from the pruned (build or probe) side.  StarRocks BE handles this
+    // by emitting NULL-filled placeholder columns for the pruned side in the
+    // join output chunk.  We do the same, so downstream nodes (SORT, ANALYTIC,
+    // EXCHANGE) always find every declared slot in the chunk.
+    let output_layout = layout.clone();
 
     // For SEMI/ANTI joins, FE may still attach both tuples in row_tuples (join-scope),
     // while the logical output is output-side only. Accept that, but require the output-side

@@ -1,0 +1,98 @@
+-- query 3
+l_orderkey	l_partkey	l_suppkey
+2	3	NULL
+
+-- query 4
+l_orderkey	l_partkey	l_suppkey
+2	3	NULL
+2	3	2
+
+-- query 7
+l_orderkey	l_partkey	l_suppkey
+
+-- query 8
+l_orderkey	l_partkey	l_suppkey
+1	1	1
+1	2	1
+1	3	2
+2	3	NULL
+2	3	2
+11	1	11
+11	2	1
+
+-- query 9
+l_orderkey	l_partkey	l_suppkey
+NULL	NULL	NULL
+2	3	NULL
+
+-- query 10
+l_orderkey	l_partkey	l_suppkey
+NULL	NULL	NULL
+2	3	NULL
+2	3	2
+
+-- query 11
+l_orderkey	l_partkey	l_suppkey
+NULL	NULL	NULL
+2	3	NULL
+2	3	2
+
+-- query 13
+count(*)
+7192
+
+-- query 14
+count(*)
+7192
+
+-- query 19
+count(*)
+4093
+
+-- query 20
+count(*)
+0
+
+-- query 21
+count(*)
+4096
+
+-- query 22
+count(*)
+0
+
+-- query 23
+count(*)
+3
+
+-- query 24
+count(*)
+4096
+
+-- query 27
+count(*)
+0
+
+-- query 28
+count(*)
+0
+
+-- query 29
+count(*)
+0
+
+-- query 30
+count(*)
+4095
+
+-- query 31
+count(*)
+3
+
+-- query 32
+count(*)
+4095
+
+-- query 33
+count(*)
+3

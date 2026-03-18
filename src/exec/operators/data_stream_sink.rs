@@ -1333,6 +1333,20 @@ impl DataStreamSinkOperator {
             .unwrap_or(&[])
     }
 
+    /// Returns true if the destination at index `i` is a pseudo (pruned-bucket) destination.
+    ///
+    /// In bucket shuffle joins, FE creates one destination per bucket of the probe-side table.
+    /// When predicates prune away all tablets in some buckets, FE still emits destination entries
+    /// to keep the bucket index ↔ destination index mapping correct for the hash partitioner,
+    /// but marks them with `fragment_instance_id.lo == -1` and an invalid (zero) port.
+    /// No fragment instance runs for these buckets, so the sender must skip them entirely:
+    /// no data buffering, no serialization, no EOS packet.
+    /// StarRocks BE applies the same `lo == -1` check in DataStreamSender::send_chunk(),
+    /// ExchangeSinkOperator::push_chunk(), and Channel::close().
+    fn is_pseudo_destination(dest: &data_sinks::TPlanFragmentDestination) -> bool {
+        dest.fragment_instance_id.lo == -1
+    }
+
     fn partition_chunk(&mut self, chunk: &Chunk) -> Result<Vec<Vec<Chunk>>, String> {
         // Get destinations first to avoid borrowing self
         let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
@@ -1600,9 +1614,10 @@ impl DataStreamSinkOperator {
 
     fn buffer_chunk(&mut self, chunk: Chunk) -> Result<(), String> {
         self.ensure_pending_buffers_initialized();
+        let dests = self.destinations().to_vec();
         let per_dest_chunks = self.partition_chunk(&chunk)?;
         for (i, mut chunks) in per_dest_chunks.into_iter().enumerate() {
-            if chunks.is_empty() {
+            if chunks.is_empty() || Self::is_pseudo_destination(&dests[i]) {
                 continue;
             }
             if let Some(tracker) = self.pending_chunks_mem_tracker.as_ref() {
@@ -1657,6 +1672,9 @@ impl DataStreamSinkOperator {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
         for (i, dest) in dests.iter().enumerate() {
+            if Self::is_pseudo_destination(dest) {
+                continue;
+            }
             let pending_payload = self
                 .pending_payloads_per_dest
                 .get_mut(i)
@@ -1703,6 +1721,10 @@ impl DataStreamSinkOperator {
         self.ensure_pending_buffers_initialized();
         let dests: Vec<data_sinks::TPlanFragmentDestination> = self.destinations().to_vec();
         for (i, dest) in dests.iter().enumerate() {
+            // No fragment instance is running for pseudo destinations — do not send EOS.
+            if Self::is_pseudo_destination(dest) {
+                continue;
+            }
             match self.transmit_partition(i, dest, &[], true, true)? {
                 PayloadEnqueue::Enqueued => {}
                 PayloadEnqueue::NoCapacity(_) => {

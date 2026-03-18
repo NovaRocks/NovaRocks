@@ -1,0 +1,11 @@
+-- query 5
+count(l1)	count(l2)	count(l3)	count(l4)
+1100000	1100000	1100000	1100000
+
+-- query 7
+count(l1)	count(l2)	count(l3)	count(l4)
+1100000	1100000	1100000	1100000
+
+-- query 8
+count(l1)	count(l2)	count(l3)	count(l4)
+1100000	1100000	1100000	1100000

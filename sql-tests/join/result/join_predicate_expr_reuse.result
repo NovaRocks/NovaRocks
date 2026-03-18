@@ -1,0 +1,69 @@
+-- query 7
+count(*)
+0
+
+-- query 8
+count(*)
+1
+
+-- query 9
+count(*)
+0
+
+-- query 10
+count(*)
+1
+
+-- query 11
+count(*)
+0
+
+-- query 12
+count(*)
+6
+
+-- query 13
+count(*)
+0
+
+-- query 14
+count(*)
+2
+
+-- query 15
+count(*)
+0
+
+-- query 16
+count(*)
+44
+
+-- query 17
+count(*)
+0
+
+-- query 18
+count(*)
+0
+
+-- query 19
+count(*)
+0
+
+-- query 20
+count(*)
+0
+
+-- query 21
+count(*)
+0
+
+-- query 22
+count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)
+1	6
+1	7
+1	8
+1	9
+
+-- query 23
+count(*)	abs(db_sqlt_55db4456f5f2bda2.pre_t0.v1)

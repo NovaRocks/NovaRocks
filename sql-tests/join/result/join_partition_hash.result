@@ -1,0 +1,55 @@
+-- query 19
+count(tt1.k1)
+5120000
+
+-- query 20
+count(tt1.k1)
+2560000
+
+-- query 21
+count(tt1.k1)
+1706666
+
+-- query 22
+count(tt1.k1)
+1024000
+
+-- query 23
+count(tt1.k1)
+512000
+
+-- query 24
+count(tt1.k1)
+51200
+
+-- query 25
+count(tt1.c_string)
+5120000
+
+-- query 26
+count(tt1.c_string)
+2560000
+
+-- query 27
+count(tt1.c_string)
+512000
+
+-- query 28
+count(tt1.c_string)
+51200
+
+-- query 29
+count(tt2.c_string)
+5120000
+
+-- query 30
+count(tt2.c_string)
+2560000
+
+-- query 31
+count(tt2.c_string)
+512000
+
+-- query 32
+count(tt2.c_string)
+51200

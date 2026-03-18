@@ -1083,9 +1083,9 @@ fn format_mysql_container_value_with_schema(
             let key_schema = field_schema.and_then(|schema| schema.map_key());
             let value_schema = field_schema.and_then(|schema| schema.map_value());
             let mut out = String::from("{");
-            let mut entry_indices: Vec<usize> = (start..end).collect();
-            sort_map_entry_indices(keys, &mut entry_indices)?;
-            for (idx, entry_idx) in entry_indices.into_iter().enumerate() {
+            // Do not sort map keys for MySQL text output — StarRocks BE outputs MAP entries
+            // in storage (insertion) order via put_mysql_row_buffer(), not sorted by key.
+            for (idx, entry_idx) in (start..end).enumerate() {
                 if idx > 0 {
                     out.push(',');
                 }

@@ -1,0 +1,240 @@
+-- query 7
+id1	id2	name	age	city	salary	status	dept	bonus
+1	100	Alice	25	New York	5000.00	Active	Engineering	1000.00
+2	200	Bob	30	Boston	6000.00	Active	Marketing	800.00
+
+-- query 8
+id1	id2
+1	100
+2	200
+
+-- query 9
+id1	id2	name	age	city	salary	status	dept	bonus
+1	100	Alice	25	New York	5000.00	Active	Engineering	1000.00
+2	200	Bob	30	Boston	6000.00	Active	Marketing	800.00
+3	300	Charlie	35	Chicago	7000.00	Inactive	NULL	NULL
+4	NULL	David	28	Denver	5500.00	Active	NULL	NULL
+5	500	Eve	32	Seattle	6500.00	Active	NULL	NULL
+6	600	Frank	40	NULL	8000.00	Inactive	NULL	NULL
+
+-- query 10
+id1	id2
+1	100
+2	200
+3	300
+4	NULL
+5	500
+6	600
+
+-- query 11
+id1	id2	name	age	city	salary	status	dept	bonus
+1	100	Alice	25	New York	5000.00	Active	Engineering	1000.00
+2	200	Bob	30	Boston	6000.00	Active	Marketing	800.00
+7	700	NULL	NULL	NULL	NULL	NULL	Sales	1200.00
+8	NULL	NULL	NULL	NULL	NULL	NULL	HR	900.00
+9	900	NULL	NULL	NULL	NULL	NULL	Finance	NULL
+
+-- query 12
+id1	id2
+1	100
+2	200
+7	700
+8	NULL
+9	900
+
+-- query 13
+id1	id2	name	age	city	salary	status	dept	bonus
+3	300	Charlie	35	Chicago	7000.00	Inactive	NULL	NULL
+4	NULL	David	28	Denver	5500.00	Active	NULL	NULL
+5	500	Eve	32	Seattle	6500.00	Active	NULL	NULL
+6	600	Frank	40	NULL	8000.00	Inactive	NULL	NULL
+1	100	Alice	25	New York	5000.00	Active	Engineering	1000.00
+9	900	NULL	NULL	NULL	NULL	NULL	Finance	NULL
+8	NULL	NULL	NULL	NULL	NULL	NULL	HR	900.00
+2	200	Bob	30	Boston	6000.00	Active	Marketing	800.00
+7	700	NULL	NULL	NULL	NULL	NULL	Sales	1200.00
+
+-- query 14
+id1	name	age	city	id2	salary	status	dept	bonus	id2
+1	Alice	25	New York	100	5000.00	Active	Engineering	1000.00	100
+2	Bob	30	Boston	200	6000.00	Active	Marketing	800.00	200
+
+-- query 15
+id1	id2	name	age	city	salary	status	dept	bonus
+4	NULL	David	28	Denver	5500.00	Active	NULL	NULL
+
+-- query 16
+id1	id2	dept	bonus
+1	100	Engineering	1000.00
+2	200	Marketing	800.00
+
+-- query 17
+id1	id2	dept	bonus
+7	700	Sales	1200.00
+8	NULL	HR	900.00
+9	900	Finance	NULL
+
+-- query 18
+name	id1	age	city	id2	salary	status	dept	id1	bonus	id2
+Alice	1	25	New York	100	5000.00	Active	Engineering	1	1000.00	100
+Alice	1	25	New York	100	5000.00	Active	Marketing	2	800.00	200
+Alice	1	25	New York	100	5000.00	Active	Sales	7	1200.00	700
+Alice	1	25	New York	100	5000.00	Active	HR	8	900.00	NULL
+Alice	1	25	New York	100	5000.00	Active	Finance	9	NULL	900
+
+-- query 19
+id1	id2	name	age	city	salary	status
+1	100	Alice	25	New York	5000.00	Active
+2	200	Bob	30	Boston	6000.00	Active
+
+-- query 20
+id1	id2	name	age	city	salary	status
+3	300	Charlie	35	Chicago	7000.00	Inactive
+4	NULL	David	28	Denver	5500.00	Active
+5	500	Eve	32	Seattle	6500.00	Active
+6	600	Frank	40	NULL	8000.00	Inactive
+
+-- query 21
+id1	name	age	city	id2	salary	status	dept	bonus	id2
+1	Alice	25	New York	100	5000.00	Active	Engineering	1000.00	100
+2	Bob	30	Boston	200	6000.00	Active	Marketing	800.00	200
+3	Charlie	35	Chicago	300	7000.00	Inactive	NULL	NULL	NULL
+4	David	28	Denver	NULL	5500.00	Active	NULL	NULL	NULL
+5	Eve	32	Seattle	500	6500.00	Active	NULL	NULL	NULL
+6	Frank	40	NULL	600	8000.00	Inactive	NULL	NULL	NULL
+
+-- query 22
+id1	name	age	city	id2	salary	status	dept	bonus	id2
+1	Alice	25	New York	100	5000.00	Active	Engineering	1000.00	100
+2	Bob	30	Boston	200	6000.00	Active	Marketing	800.00	200
+7	NULL	NULL	NULL	NULL	NULL	NULL	Sales	1200.00	700
+8	NULL	NULL	NULL	NULL	NULL	NULL	HR	900.00	NULL
+9	NULL	NULL	NULL	NULL	NULL	NULL	Finance	NULL	900
+
+-- query 23
+id1	name	age	city	id2	salary	status	dept	bonus	id2
+3	Charlie	35	Chicago	300	7000.00	Inactive	NULL	NULL	NULL
+5	Eve	32	Seattle	500	6500.00	Active	NULL	NULL	NULL
+4	David	28	Denver	NULL	5500.00	Active	NULL	NULL	NULL
+6	Frank	40	NULL	600	8000.00	Inactive	NULL	NULL	NULL
+1	Alice	25	New York	100	5000.00	Active	Engineering	1000.00	100
+9	NULL	NULL	NULL	NULL	NULL	NULL	Finance	NULL	900
+8	NULL	NULL	NULL	NULL	NULL	NULL	HR	900.00	NULL
+2	Bob	30	Boston	200	6000.00	Active	Marketing	800.00	200
+7	NULL	NULL	NULL	NULL	NULL	NULL	Sales	1200.00	700
+
+-- query 24
+id1	name	age	city	id2	salary	status
+1	Alice	25	New York	100	5000.00	Active
+2	Bob	30	Boston	200	6000.00	Active
+
+-- query 25
+id1	name	age	city	id2	salary	status
+3	Charlie	35	Chicago	300	7000.00	Inactive
+4	David	28	Denver	NULL	5500.00	Active
+5	Eve	32	Seattle	500	6500.00	Active
+6	Frank	40	NULL	600	8000.00	Inactive
+
+-- query 26
+id1	dept	bonus	id2
+1	Engineering	1000.00	100
+2	Marketing	800.00	200
+
+-- query 27
+id1	dept	bonus	id2
+7	Sales	1200.00	700
+8	HR	900.00	NULL
+9	Finance	NULL	900
+
+-- query 28
+join_key
+1
+2
+
+-- query 29
+l_id1
+1
+2
+
+-- query 30
+l_id1
+NULL
+NULL
+NULL
+100
+200
+
+-- query 31
+l_id1
+NULL
+100
+200
+700
+900
+
+-- query 32
+key1	key2
+1	100
+2	200
+
+-- query 33
+right_preferred_key
+1
+2
+7
+8
+9
+
+-- query 34
+main_id	emp_name	department	emp_salary	emp_bonus
+1	Alice	Engineering	5000.00	1000.00
+2	Bob	Marketing	6000.00	800.00
+3	Charlie	NULL	7000.00	NULL
+4	David	NULL	5500.00	NULL
+5	Eve	NULL	6500.00	NULL
+6	Frank	NULL	8000.00	NULL
+
+-- query 35
+pk	name	dept
+3	Charlie	NULL
+4	David	NULL
+5	Eve	NULL
+6	Frank	NULL
+
+-- query 36
+name	id1	age	city	id2	salary	status
+Charlie	3	35	Chicago	300	7000.00	Inactive
+David	4	28	Denver	NULL	5500.00	Active
+Eve	5	32	Seattle	500	6500.00	Active
+Frank	6	40	NULL	600	8000.00	Inactive
+
+-- query 37
+dept	id1	name
+Engineering	1	Alice
+Marketing	2	Bob
+NULL	3	Charlie
+NULL	4	David
+NULL	5	Eve
+NULL	6	Frank
+
+-- query 38
+id1	name	age	dept
+1	Alice	25	Engineering
+2	Bob	30	Marketing
+
+-- query 39
+id1	total_count
+1	1
+2	1
+
+-- query 40
+id1	name	dept
+
+-- query 41
+id1	id2	emp_info	dept_info
+1	100	Alice-25	Engineering
+
+-- query 42
+id1	avg_salary	total_bonus
+1	5000.00000000	1000.00
+2	6000.00000000	800.00

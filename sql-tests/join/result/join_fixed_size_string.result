@@ -1,0 +1,47 @@
+-- query 17
+count(1)	sum(murmur_hash3_32(t1.c_str4))	sum(murmur_hash3_32(t2.c_str4))
+319680	-3096761756800	-3096761756800
+
+-- query 18
+count(1)	sum(murmur_hash3_32(t1.c_str4))	sum(murmur_hash3_32(t2.c_str4))
+319681	-3096761756800	-3096761756800
+
+-- query 19
+count(1)	sum(murmur_hash3_32(t1.c_str4))	sum(murmur_hash3_32(t2.c_str4))
+319680	-3096761756800	-3096761756800
+
+-- query 20
+count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+319680	13357060748480	13357060748480
+
+-- query 21
+count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+319681	13357060748480	13357060748480
+
+-- query 22
+count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+319680	13357060748480	13357060748480
+
+-- query 23
+count(1)	sum(murmur_hash3_32(t1.c_str16))	sum(murmur_hash3_32(t2.c_str16))
+319680	-20821759700800	-20821759700800
+
+-- query 24
+count(1)	sum(murmur_hash3_32(t1.c_str16))	sum(murmur_hash3_32(t2.c_str16))
+319681	-20821759700800	-20821759700800
+
+-- query 25
+count(1)	sum(murmur_hash3_32(t1.c_str16))	sum(murmur_hash3_32(t2.c_str16))
+319680	-20821759700800	-20821759700800
+
+-- query 26
+count(1)	sum(murmur_hash3_32(t1.c_str32))	sum(murmur_hash3_32(t2.c_str32))
+319680	886564872640	886564872640
+
+-- query 28
+count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+319681	13357060748480	13357060748480
+
+-- query 30
+count(1)	sum(murmur_hash3_32(t1.c_str8))	sum(murmur_hash3_32(t2.c_str8))
+319682	13356360567154	13356360567154
