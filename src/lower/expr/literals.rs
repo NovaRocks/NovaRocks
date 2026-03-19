@@ -36,7 +36,7 @@ pub(crate) fn parse_date_literal(value: &str) -> Result<i32, String> {
 }
 
 /// Parse decimal literal string to i128 value.
-pub(crate) fn parse_decimal_literal(value: &str, precision: u8, scale: i8) -> Result<i128, String> {
+pub(crate) fn parse_decimal_literal(value: &str, _precision: u8, scale: i8) -> Result<i128, String> {
     if scale < 0 {
         return Err(format!("invalid decimal scale: {}", scale));
     }
@@ -92,12 +92,10 @@ pub(crate) fn parse_decimal_literal(value: &str, precision: u8, scale: i8) -> Re
     } else {
         digits_trim
     };
-    if digits_final.len() > precision as usize {
-        return Err(format!(
-            "DECIMAL_LITERAL '{}' exceeds precision {}",
-            value, precision
-        ));
-    }
+    // Do not enforce precision here: StarRocks allows overflow decimal values at query
+    // execution time (e.g., 100 stored in DECIMAL64(4,3) as integer 100000 even though
+    // precision=4 allows max 9999). Rejecting the value would produce a wrong inferred
+    // type (scale=0 instead of the declared scale) that causes NULL after the cast.
     let unsigned = digits_final
         .parse::<i128>()
         .map_err(|_| format!("failed to parse DECIMAL_LITERAL '{}'", value))?;
@@ -362,11 +360,24 @@ pub(crate) fn build_decimal_literal(
             // `scale`), causing string parsing to infer a narrower type that triggers
             // an unnecessary precision-checking upscale cast.
             // `integer_value` is sent as little-endian bytes (i128 layout, up to 16 bytes).
-            let integer_bytes = node
-                .decimal_literal
-                .as_ref()
-                .and_then(|dl| dl.integer_value.as_deref())
-                .filter(|b| !b.is_empty());
+            //
+            // Exception: DECIMALV2 literals must NOT use the integer_value fast path.
+            // StarRocks FE packDecimal() serializes the integer at the DECLARED scale of the
+            // literal type (e.g. scale=2 for DECIMALV2(10,2)), but arrow_type_from_desc always
+            // normalizes DECIMALV2 to LEGACY_DECIMALV2_SCALE=9. Reading the FE-packed integer
+            // at scale=9 produces values off by 10^(9 - declared_scale). Use string parsing
+            // instead, which correctly interprets the decimal string at scale=9.
+            let is_decimalv2 = primitive_type_from_node(node)
+                .map(|t| t == types::TPrimitiveType::DECIMALV2)
+                .unwrap_or(false);
+            let integer_bytes = if is_decimalv2 {
+                None
+            } else {
+                node.decimal_literal
+                    .as_ref()
+                    .and_then(|dl| dl.integer_value.as_deref())
+                    .filter(|b| !b.is_empty())
+            };
             if let Some(bytes) = integer_bytes {
                 let sign_byte = if bytes.last().map(|b| b & 0x80 != 0).unwrap_or(false) {
                     0xFF_u8

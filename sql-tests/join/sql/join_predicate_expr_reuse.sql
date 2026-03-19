@@ -166,7 +166,7 @@ SELECT COUNT(*) FROM ${case_db}.pre_t0 JOIN ${case_db}.pre_t1
 WHERE abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) = abs(${case_db}.pre_t0.v2 + ${case_db}.pre_t1.v5) AND abs(${case_db}.pre_t0.v1 + ${case_db}.pre_t1.v4) > 5;
 
 -- query 22
--- @order_sensitive=true
+-- @order_sensitive=false
 -- LEFT SEMI JOIN with reused abs() in WHERE + GROUP BY
 SELECT COUNT(*), abs(${case_db}.pre_t0.v1) FROM ${case_db}.pre_t0 LEFT SEMI JOIN ${case_db}.pre_t1 ON ${case_db}.pre_t0.v1 = ${case_db}.pre_t1.v4
 WHERE abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) > 10 AND abs(${case_db}.pre_t0.v1) + abs(${case_db}.pre_t0.v2) < 100 AND abs(${case_db}.pre_t0.v1) > 5

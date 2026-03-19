@@ -1,0 +1,29 @@
+-- query 2
+map_concat(map{'a':1,'b':2}, c1)
+{"a":1,"b":2}
+
+-- query 3
+map_concat(c1, map{'a':1,'b':2})
+{"a":1,"b":2}
+
+-- query 4
+map_concat(c1, map{})
+{}
+
+-- query 5
+map_concat(c1, map{1:2})
+{1:2}
+
+-- query 9
+col_int	map_entries(col_map)
+1	[{"key":"a","value":1},{"key":"b","value":2}]
+2	[{"key":"c","value":3}]
+3	[{"key":"d","value":4},{"key":"e","value":5}]
+
+-- query 10
+col_int	map_entries(col_map)	unnest
+1	[{"key":"a","value":1},{"key":"b","value":2}]	{"key":"a","value":1}
+1	[{"key":"a","value":1},{"key":"b","value":2}]	{"key":"b","value":2}
+2	[{"key":"c","value":3}]	{"key":"c","value":3}
+3	[{"key":"d","value":4},{"key":"e","value":5}]	{"key":"d","value":4}
+3	[{"key":"d","value":4},{"key":"e","value":5}]	{"key":"e","value":5}

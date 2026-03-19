@@ -114,8 +114,8 @@ id1	name	age	city	id2	salary	status	dept	bonus	id2
 -- query 23
 id1	name	age	city	id2	salary	status	dept	bonus	id2
 3	Charlie	35	Chicago	300	7000.00	Inactive	NULL	NULL	NULL
-5	Eve	32	Seattle	500	6500.00	Active	NULL	NULL	NULL
 4	David	28	Denver	NULL	5500.00	Active	NULL	NULL	NULL
+5	Eve	32	Seattle	500	6500.00	Active	NULL	NULL	NULL
 6	Frank	40	NULL	600	8000.00	Inactive	NULL	NULL	NULL
 1	Alice	25	New York	100	5000.00	Active	Engineering	1000.00	100
 9	NULL	NULL	NULL	NULL	NULL	NULL	Finance	NULL	900

@@ -61,153 +61,203 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
     }
 }
 
-fn encode_scalar(value: &Option<AggScalarValue>, buf: &mut Vec<u8>) -> Result<(), String> {
+fn encode_scalar_value(value: &AggScalarValue, buf: &mut Vec<u8>) -> Result<(), String> {
     match value {
-        None => {
-            buf.push(0);
-            Ok(())
-        }
-        Some(AggScalarValue::Bool(v)) => {
+        AggScalarValue::Bool(v) => {
             buf.push(1);
-            buf.push(if *v { 1 } else { 0 });
-            Ok(())
+            buf.push(*v as u8);
         }
-        Some(AggScalarValue::Int64(v)) => {
+        AggScalarValue::Int64(v) => {
             buf.push(2);
             buf.extend_from_slice(&v.to_le_bytes());
-            Ok(())
         }
-        Some(AggScalarValue::Float64(v)) => {
+        AggScalarValue::Float64(v) => {
             buf.push(3);
-            buf.extend_from_slice(&v.to_le_bytes());
-            Ok(())
+            buf.extend_from_slice(&v.to_bits().to_le_bytes());
         }
-        Some(AggScalarValue::Utf8(v)) => {
+        AggScalarValue::Utf8(v) => {
             buf.push(4);
             let len = u32::try_from(v.len()).map_err(|_| "string too large".to_string())?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(v.as_bytes());
-            Ok(())
         }
-        Some(AggScalarValue::Date32(v)) => {
+        AggScalarValue::Date32(v) => {
             buf.push(5);
             buf.extend_from_slice(&v.to_le_bytes());
-            Ok(())
         }
-        Some(AggScalarValue::Timestamp(v)) => {
+        AggScalarValue::Timestamp(v) => {
             buf.push(6);
             buf.extend_from_slice(&v.to_le_bytes());
-            Ok(())
         }
-        Some(AggScalarValue::Decimal128(v)) => {
+        AggScalarValue::Decimal128(v) => {
             buf.push(7);
             buf.extend_from_slice(&v.to_le_bytes());
-            Ok(())
         }
-        Some(AggScalarValue::Decimal256(v)) => {
+        AggScalarValue::Struct(items) => {
+            buf.push(8);
+            let len =
+                u32::try_from(items.len()).map_err(|_| "max_by/min_by struct too large".to_string())?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            for item in items {
+                encode_scalar(item, buf)?;
+            }
+        }
+        AggScalarValue::Map(items) => {
+            buf.push(9);
+            let len =
+                u32::try_from(items.len()).map_err(|_| "max_by/min_by map too large".to_string())?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            for (key, value) in items {
+                encode_scalar(key, buf)?;
+                encode_scalar(value, buf)?;
+            }
+        }
+        AggScalarValue::List(items) => {
+            buf.push(10);
+            let len =
+                u32::try_from(items.len()).map_err(|_| "max_by/min_by list too large".to_string())?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            for item in items {
+                encode_scalar(item, buf)?;
+            }
+        }
+        AggScalarValue::Decimal256(v) => {
             buf.push(11);
             let text = v.to_string();
             let len = u32::try_from(text.len()).map_err(|_| "string too large".to_string())?;
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(text.as_bytes());
-            Ok(())
         }
-        Some(AggScalarValue::Struct(_))
-        | Some(AggScalarValue::Map(_))
-        | Some(AggScalarValue::List(_)) => {
-            Err("max_by/min_by does not support complex scalar keys".to_string())
+    }
+    Ok(())
+}
+
+fn encode_scalar(value: &Option<AggScalarValue>, buf: &mut Vec<u8>) -> Result<(), String> {
+    match value {
+        Some(value) => {
+            buf.push(1);
+            encode_scalar_value(value, buf)
+        }
+        None => {
+            buf.push(0);
+            Ok(())
         }
     }
 }
 
-fn decode_scalar(input: &mut &[u8]) -> Result<Option<AggScalarValue>, String> {
-    if input.is_empty() {
-        return Err("max_by/min_by scalar decode failed: empty buffer".to_string());
+fn need_len(input: &[u8], need: usize, label: &str) -> Result<(), String> {
+    if input.len() < need {
+        Err(format!("max_by/min_by {} decode failed", label))
+    } else {
+        Ok(())
     }
+}
+
+fn read_u32(input: &mut &[u8], label: &str) -> Result<u32, String> {
+    need_len(input, 4, label)?;
+    let value = u32::from_le_bytes(input[..4].try_into().unwrap());
+    *input = &input[4..];
+    Ok(value)
+}
+
+fn decode_scalar_value(input: &mut &[u8]) -> Result<AggScalarValue, String> {
+    need_len(input, 1, "scalar")?;
     let tag = input[0];
     *input = &input[1..];
     match tag {
-        0 => Ok(None),
         1 => {
-            if input.is_empty() {
-                return Err("max_by/min_by bool decode failed".to_string());
-            }
+            need_len(input, 1, "bool")?;
             let v = input[0] != 0;
             *input = &input[1..];
-            Ok(Some(AggScalarValue::Bool(v)))
+            Ok(AggScalarValue::Bool(v))
         }
         2 => {
-            if input.len() < 8 {
-                return Err("max_by/min_by int64 decode failed".to_string());
-            }
+            need_len(input, 8, "int64")?;
             let v = i64::from_le_bytes(input[..8].try_into().unwrap());
             *input = &input[8..];
-            Ok(Some(AggScalarValue::Int64(v)))
+            Ok(AggScalarValue::Int64(v))
         }
         3 => {
-            if input.len() < 8 {
-                return Err("max_by/min_by float64 decode failed".to_string());
-            }
-            let v = f64::from_le_bytes(input[..8].try_into().unwrap());
+            need_len(input, 8, "float64")?;
+            let bits = u64::from_le_bytes(input[..8].try_into().unwrap());
             *input = &input[8..];
-            Ok(Some(AggScalarValue::Float64(v)))
+            Ok(AggScalarValue::Float64(f64::from_bits(bits)))
         }
         4 => {
-            if input.len() < 4 {
-                return Err("max_by/min_by utf8 decode failed".to_string());
-            }
-            let len = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
-            *input = &input[4..];
-            if input.len() < len {
-                return Err("max_by/min_by utf8 decode failed".to_string());
-            }
+            let len = read_u32(input, "utf8")? as usize;
+            need_len(input, len, "utf8")?;
             let v = std::str::from_utf8(&input[..len])
                 .map_err(|e| e.to_string())?
                 .to_string();
             *input = &input[len..];
-            Ok(Some(AggScalarValue::Utf8(v)))
+            Ok(AggScalarValue::Utf8(v))
         }
         5 => {
-            if input.len() < 4 {
-                return Err("max_by/min_by date32 decode failed".to_string());
-            }
+            need_len(input, 4, "date32")?;
             let v = i32::from_le_bytes(input[..4].try_into().unwrap());
             *input = &input[4..];
-            Ok(Some(AggScalarValue::Date32(v)))
+            Ok(AggScalarValue::Date32(v))
         }
         6 => {
-            if input.len() < 8 {
-                return Err("max_by/min_by timestamp decode failed".to_string());
-            }
+            need_len(input, 8, "timestamp")?;
             let v = i64::from_le_bytes(input[..8].try_into().unwrap());
             *input = &input[8..];
-            Ok(Some(AggScalarValue::Timestamp(v)))
+            Ok(AggScalarValue::Timestamp(v))
         }
         7 => {
-            if input.len() < 16 {
-                return Err("max_by/min_by decimal128 decode failed".to_string());
-            }
+            need_len(input, 16, "decimal128")?;
             let v = i128::from_le_bytes(input[..16].try_into().unwrap());
             *input = &input[16..];
-            Ok(Some(AggScalarValue::Decimal128(v)))
+            Ok(AggScalarValue::Decimal128(v))
+        }
+        8 => {
+            let len = read_u32(input, "struct")? as usize;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(decode_scalar(input)?);
+            }
+            Ok(AggScalarValue::Struct(items))
+        }
+        9 => {
+            let len = read_u32(input, "map")? as usize;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                let key = decode_scalar(input)?;
+                let value = decode_scalar(input)?;
+                items.push((key, value));
+            }
+            Ok(AggScalarValue::Map(items))
+        }
+        10 => {
+            let len = read_u32(input, "list")? as usize;
+            let mut items = Vec::with_capacity(len);
+            for _ in 0..len {
+                items.push(decode_scalar(input)?);
+            }
+            Ok(AggScalarValue::List(items))
         }
         11 => {
-            if input.len() < 4 {
-                return Err("max_by/min_by decimal256 decode failed".to_string());
-            }
-            let len = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
-            *input = &input[4..];
-            if input.len() < len {
-                return Err("max_by/min_by decimal256 decode failed".to_string());
-            }
+            let len = read_u32(input, "decimal256")? as usize;
+            need_len(input, len, "decimal256")?;
             let text = std::str::from_utf8(&input[..len]).map_err(|e| e.to_string())?;
             *input = &input[len..];
             let v = text
                 .parse::<i256>()
                 .map_err(|_| "max_by/min_by decimal256 decode failed".to_string())?;
-            Ok(Some(AggScalarValue::Decimal256(v)))
+            Ok(AggScalarValue::Decimal256(v))
         }
         _ => Err("max_by/min_by scalar decode failed: unknown tag".to_string()),
+    }
+}
+
+fn decode_scalar(input: &mut &[u8]) -> Result<Option<AggScalarValue>, String> {
+    need_len(input, 1, "scalar")?;
+    let has_value = input[0];
+    *input = &input[1..];
+    match has_value {
+        0 => Ok(None),
+        1 => decode_scalar_value(input).map(Some),
+        _ => Err("max_by/min_by scalar decode failed: invalid null flag".to_string()),
     }
 }
 
@@ -517,5 +567,31 @@ mod tests {
             let out_arr = out.as_any().downcast_ref::<StringArray>().unwrap();
             assert_eq!(out_arr.value(0), expected);
         }
+    }
+
+    #[test]
+    fn test_max_min_by_complex_value_round_trip() {
+        let value = Some(AggScalarValue::Struct(vec![
+            Some(AggScalarValue::Utf8("tag".to_string())),
+            Some(AggScalarValue::List(vec![
+                Some(AggScalarValue::Int64(7)),
+                None,
+                Some(AggScalarValue::Map(vec![(
+                    Some(AggScalarValue::Utf8("k".to_string())),
+                    Some(AggScalarValue::Utf8("v".to_string())),
+                )])),
+            ])),
+        ]));
+
+        let mut encoded = Vec::new();
+        encode_scalar(&value, &mut encoded).unwrap();
+
+        let mut input = encoded.as_slice();
+        let decoded = decode_scalar(&mut input).unwrap();
+        assert!(input.is_empty());
+
+        let mut reencoded = Vec::new();
+        encode_scalar(&decoded, &mut reencoded).unwrap();
+        assert_eq!(encoded, reencoded);
     }
 }

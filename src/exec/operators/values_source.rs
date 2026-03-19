@@ -59,7 +59,7 @@ impl OperatorFactory for ValuesSourceFactory {
         Box::new(ValuesSourceOperator {
             name: self.name.clone(),
             chunk: self.chunk.clone(),
-            dop: dop.max(1),
+            _dop: dop.max(1),
             driver_id: driver_id.max(0),
             emitted: false,
         })
@@ -73,7 +73,7 @@ impl OperatorFactory for ValuesSourceFactory {
 struct ValuesSourceOperator {
     name: String,
     chunk: Chunk,
-    dop: i32,
+    _dop: i32,
     driver_id: i32,
     emitted: bool,
 }

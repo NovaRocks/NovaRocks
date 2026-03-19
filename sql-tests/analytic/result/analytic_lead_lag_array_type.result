@@ -1,0 +1,31 @@
+-- query 2
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 3
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 4
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 5
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 6
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 7
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 8
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1
+
+-- query 9
+assert_true((count(pred)) = (count(if(pred, 1, NULL))))
+1

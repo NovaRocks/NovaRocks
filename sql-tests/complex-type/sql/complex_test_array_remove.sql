@@ -3,14 +3,12 @@
 -- Preserve array test coverage migrated from dev/test.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_remove FORCE;
-CREATE DATABASE sql_tests_complex_test_array_remove;
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 
 -- name: test_array_remove_all_type @mac @no_arrow_flight_sql
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 CREATE TABLE test_array_remove (
     id INT,
     array_boolean ARRAY<BOOLEAN>,
@@ -37,7 +35,7 @@ PROPERTIES (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 INSERT INTO test_array_remove VALUES
 (1, [true, false, NULL], [1, 2, NULL], [100, 200, NULL], [10, 20, NULL], [1000, 2000, NULL], [1234567890123456789, NULL, NULL],
  [12345.67, 89012.34, NULL], [123.45, 678.90, NULL], [12345678.90, 9876543.21, NULL], [1234567890.1234567890, NULL, NULL], 
@@ -81,185 +79,181 @@ INSERT INTO test_array_remove VALUES
  ['2025-01-17', '2025-01-18', NULL], [NULL, '2025-01-17 10:00:00', '2025-01-18 20:00:00']);
 
 -- query 4
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_boolean, true) AS result FROM test_array_remove ORDER BY id;
 
 -- query 5
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_boolean, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 6
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_boolean, false) AS result FROM test_array_remove ORDER BY id;
 
 -- query 7
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_tinyint, 5) AS result FROM test_array_remove ORDER BY id;
 
 -- query 8
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_tinyint, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 9
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_tinyint, 20) AS result FROM test_array_remove ORDER BY id;
 
 -- query 10
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_smallint, 100) AS result FROM test_array_remove ORDER BY id;
 
 -- query 11
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_smallint, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 12
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_smallint, 300) AS result FROM test_array_remove ORDER BY id;
 
 -- query 13
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_int, 50) AS result FROM test_array_remove ORDER BY id;
 
 -- query 14
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_int, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 15
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_int, 90) AS result FROM test_array_remove ORDER BY id;
 
 -- query 16
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_bigint, 4000) AS result FROM test_array_remove ORDER BY id;
 
 -- query 17
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_bigint, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 18
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_bigint, 8000) AS result FROM test_array_remove ORDER BY id;
 
 -- query 19
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_largeint, 1234567890123456789) AS result FROM test_array_remove ORDER BY id;
 
 -- query 20
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_largeint, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 21
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_largeint, 765432198765432109) AS result FROM test_array_remove ORDER BY id;
 
 -- query 22
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimalv2, 12345.67) AS result FROM test_array_remove ORDER BY id;
 
 -- query 23
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimalv2, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 24
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimalv2, 56789.01) AS result FROM test_array_remove ORDER BY id;
 
 -- query 25
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal32, 123.45) AS result FROM test_array_remove ORDER BY id;
 
 -- query 26
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal32, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 27
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal32, 567.89) AS result FROM test_array_remove ORDER BY id;
 
 -- query 28
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal64, 12345678.90) AS result FROM test_array_remove ORDER BY id;
 
 -- query 29
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal64, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 30
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal64, 7890123.45) AS result FROM test_array_remove ORDER BY id;
 
 -- query 31
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal128, 1234567890.1234567890) AS result FROM test_array_remove ORDER BY id;
 
 -- query 32
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal128, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 33
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_decimal128, 8765432109.8765432109) AS result FROM test_array_remove ORDER BY id;
 
 -- query 34
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_float, 1.23) AS result FROM test_array_remove ORDER BY id;
 
 -- query 35
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_float, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 36
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_float, 7.89) AS result FROM test_array_remove ORDER BY id;
 
 -- query 37
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_double, 123.456) AS result FROM test_array_remove ORDER BY id;
 
 -- query 38
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_double, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 39
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_double, 444.333) AS result FROM test_array_remove ORDER BY id;
 
 -- query 40
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_varchar, 'hello') AS result FROM test_array_remove ORDER BY id;
 
 -- query 41
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_varchar, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 42
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_varchar, 'starrocks') AS result FROM test_array_remove ORDER BY id;
 
 -- query 43
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_date, '2025-01-01') AS result FROM test_array_remove ORDER BY id;
 
 -- query 44
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_date, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 45
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_date, '2025-01-13') AS result FROM test_array_remove ORDER BY id;
 
 -- query 46
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_datetime, '2025-01-01 12:00:00') AS result FROM test_array_remove ORDER BY id;
 
 -- query 47
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_datetime, NULL) AS result FROM test_array_remove ORDER BY id;
 
 -- query 48
-USE sql_tests_complex_test_array_remove;
+USE ${case_db};
 SELECT id, array_remove(array_datetime, '2025-01-17 10:00:00') AS result FROM test_array_remove ORDER BY id;
-
--- query 49
--- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_remove FORCE;

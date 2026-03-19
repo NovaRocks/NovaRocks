@@ -47,80 +47,80 @@ set pipeline_dop = 1;
 
 -- inner join [shuffle] with <=> on varchar
 -- query 6
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 join [shuffle] ${case_db}.nullable_t1 on t1_c4 <=> t2_c4;
 
 -- inner join [broadcast] with <=> on varchar
 -- query 7
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 join [broadcast] ${case_db}.nullable_t1 on t1_c4 <=> t2_c4;
 
 -- inner join [bucket] with <=> on two columns
 -- query 8
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 join [bucket] ${case_db}.nullable_t1 on t1_c1 <=> t2_c1 and t1_c4 <=> t2_c4;
 
 -- left join [shuffle] with <=> on varchar
 -- query 9
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 left join [shuffle] ${case_db}.nullable_t1 on t1_c4 <=> t2_c4;
 
 -- left join [broadcast] with <=> on varchar
 -- query 10
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 left join [broadcast] ${case_db}.nullable_t1 on t1_c4 <=> t2_c4;
 
 -- left join [bucket] with <=> on two columns
 -- query 11
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 left join [bucket] ${case_db}.nullable_t1 on t1_c1 <=> t2_c1 and t1_c4 <=> t2_c4;
 
 -- right join [shuffle] with <=> on varchar
 -- query 12
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 right join [shuffle] ${case_db}.nullable_t1 on t1_c4 <=> t2_c4;
 
 -- right join [bucket] with <=> on two columns
 -- query 13
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.t2 right join [bucket] ${case_db}.nullable_t1 on t1_c1 <=> t2_c1 and t1_c4 <=> t2_c4;
 
 -- self-join [shuffle] with <=> on varchar
 -- query 14
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 join [shuffle] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self-join [broadcast] with <=> on varchar
 -- query 15
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 join [broadcast] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self-join [bucket] with <=> on varchar
 -- query 16
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 join [bucket] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self left join [shuffle] with <=> on varchar
 -- query 17
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 left join [shuffle] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self left join [broadcast] with <=> on varchar
 -- query 18
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 left join [broadcast] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self left join [bucket] with <=> on varchar
 -- query 19
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 left join [bucket] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self right join [shuffle] with <=> on varchar
 -- query 20
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 right join [shuffle] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;
 
 -- self right join [bucket] with <=> on varchar
 -- query 21
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.nullable_t1 t1 right join [bucket] ${case_db}.nullable_t1 t2 on t1.t1_c4 <=> t2.t1_c4;

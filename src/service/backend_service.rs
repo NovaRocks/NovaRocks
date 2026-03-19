@@ -1030,6 +1030,7 @@ mod tests {
                 is_key: Some(true),
                 is_allow_null: Some(false),
                 default_value: None,
+                default_expr: None,
                 is_bloom_filter_column: None,
                 define_expr: None,
                 is_auto_increment: Some(false),

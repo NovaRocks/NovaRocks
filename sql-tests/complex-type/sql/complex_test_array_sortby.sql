@@ -1,16 +1,16 @@
 -- Migrated from dev/test/sql/test_array_fn/R/test_array_sortby
 -- Test Objective:
 -- Preserve array test coverage migrated from dev/test.
+-- @sequential=true
+-- Run sequentially because array_sortby overload resolution is unstable under suite-wide concurrency.
 -- query 1
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_sortby FORCE;
-CREATE DATABASE sql_tests_complex_test_array_sortby;
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 
 -- name: test_array_sortby_1 @mac
 -- query 2
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 CREATE TABLE t1 (
     id INT(11) not null,
     array_col1 ARRAY<INT>,
@@ -27,7 +27,7 @@ PROPERTIES (
 
 -- query 3
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 INSERT INTO t1 VALUES
 (1, [4, 3, 5], [1.1, 2.2, 2.2], ['a', 'b', 'c'], ['2023-01-01', '2023-01-02', '2023-01-03']),
 (2, [6, 7, 8], [6.6, 5.5, 6.6], ['d', 'e', 'd'], ['2023-01-04', '2023-01-05', '2023-01-06']),
@@ -41,21 +41,21 @@ INSERT INTO t1 VALUES
 (10, [24, 25, 26], NULL, ['y', 'y', 'z'], ['2023-01-25', NULL, '2023-01-26']);
 
 -- query 4
-USE sql_tests_complex_test_array_sortby;
-select id, array_col1, array_col2, array_sortby(array_col1, array_col2) from t1 order by id asc;
+USE ${case_db};
+select id, array_col1, array_col2, array_col3, array_col4, array_sortby(array_col1, array_col2, array_col3, array_col4) from t1 order by id asc;
 
 -- query 5
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select id, array_col1, array_col2, array_col3, array_sortby(array_col1, array_col2, array_col3) from t1 order by id asc;
 
 -- query 6
-USE sql_tests_complex_test_array_sortby;
-select id, array_col1, array_col2, array_col3, array_col4, array_sortby(array_col1, array_col2, array_col3, array_col4) from t1 order by id asc;
+USE ${case_db};
+select id, array_col1, array_col2, array_sortby(array_col1, array_col2) from t1 order by id asc;
 
 -- name: test_array_sortby_2
 -- query 7
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 CREATE TABLE __row_util_base (
   k1 bigint NULL
 ) ENGINE=OLAP
@@ -67,12 +67,12 @@ PROPERTIES (
 
 -- query 8
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 insert into __row_util_base select generate_series from TABLE(generate_series(0, 10000 - 1));
 
 -- query 9
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 insert into __row_util_base select * from __row_util_base; -- 20000
 insert into __row_util_base select * from __row_util_base; -- 40000
 insert into __row_util_base select * from __row_util_base; -- 80000
@@ -92,7 +92,7 @@ PROPERTIES (
 
 -- query 10
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 insert into __row_util 
 select 
     row_number() over() as idx,
@@ -101,7 +101,7 @@ from __row_util_base;
 
 -- query 11
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 DROP TABLE IF EXISTS t1;
 CREATE TABLE t1 (
     id INT(11) not null,
@@ -119,7 +119,7 @@ PROPERTIES (
 
 -- query 12
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 insert into t1 
 select
     idx,
@@ -130,7 +130,7 @@ select
 from __row_util;
 
 -- query 13
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select *, array_sortby(int_1, int_2) as x from t1
 )
@@ -139,7 +139,7 @@ from w1
 order by id limit 10;
 
 -- query 14
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select *, array_sortby(int_1, int_2, str_1, date_1) as x from t1
 )
@@ -148,7 +148,7 @@ from w1
 order by id limit 10;
 
 -- query 15
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2) as x from t1
 ), w2 as (
@@ -159,7 +159,7 @@ select ifnull(sum(murmur_hash3_32(x)), 0)
 from w2;
 
 -- query 16
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2, str_1, date_1) as x from t1
 ), w2 as (
@@ -171,7 +171,7 @@ from w2;
 
 -- query 17
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 CREATE TABLE t2 (
     id INT(11) not null,
     int_1 ARRAY<INT>,
@@ -188,7 +188,7 @@ PROPERTIES (
 
 -- query 18
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 insert into t2 
 select
     idx,
@@ -199,7 +199,7 @@ select
 from __row_util;
 
 -- query 19
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select *, array_sortby(int_1, int_2) as x from t2
 )
@@ -208,7 +208,7 @@ from w1
 order by id limit 10;
 
 -- query 20
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select *, array_sortby(int_1, int_2, str_1, date_1) as x from t2
 )
@@ -217,7 +217,7 @@ from w1
 order by id limit 10;
 
 -- query 21
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2) as x from t2
 ), w2 as (
@@ -228,7 +228,7 @@ select ifnull(sum(murmur_hash3_32(x)), 0)
 from w2;
 
 -- query 22
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2, str_1, date_1) as x from t2
 ), w2 as (
@@ -240,7 +240,7 @@ from w2;
 
 -- query 23
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 CREATE TABLE t3 (
     id INT(11) not null,
     int_1 ARRAY<INT> not null,
@@ -257,7 +257,7 @@ PROPERTIES (
 
 -- query 24
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 insert into t3 
 select
     idx,
@@ -268,7 +268,7 @@ select
 from __row_util;
 
 -- query 25
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select *, array_sortby(int_1, int_2) as x from t3
 )
@@ -277,7 +277,7 @@ from w1
 order by id limit 10;
 
 -- query 26
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select *, array_sortby(int_1, int_2, str_1, date_1) as x from t3
 )
@@ -286,7 +286,7 @@ from w1
 order by id limit 10;
 
 -- query 27
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2) as x from t3
 ), w2 as (
@@ -297,7 +297,7 @@ select ifnull(sum(murmur_hash3_32(x)), 0)
 from w2;
 
 -- query 28
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2, str_1, date_1) as x from t3
 ), w2 as (
@@ -308,7 +308,7 @@ select ifnull(sum(murmur_hash3_32(x)), 0)
 from w2;
 
 -- query 29
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (
     select id, array_sortby(int_1, int_2) as x from t3 where id < -1
 )
@@ -316,72 +316,72 @@ select count(x)
 from w1;
 
 -- query 30
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], cast(null as array<int>), cast(null as array<int>), cast(null as array<string>));
 
 -- query 31
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(null as array<int>), cast(null as array<string>), [11, 22, 32, 31, 21, 12], cast(null as array<int>));
 
 -- query 32
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby(cast(null as array<int>), cast(null as array<int>), cast(null as array<int>));
 
 -- query 33
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], [11, 22, 32, 31, 21, 12]);
 
 -- query 34
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', '2023-11-06', '2023-11-07'] as array<date>));
 
 -- query 35
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], [11, 22, 32, 31, 21, 12]);
 
 -- query 36
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', '2023-11-06', '2023-11-07'] as array<date>));
 
 -- query 37
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32, 31, 21, 12]);
 
 -- query 38
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32, 31, null, null]);
 
 -- query 39
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', null ,null] as array<date>));
 
 -- query 40
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a'], cast(['2023-11-02', '2023-11-03', '2023-11-04', '2023-11-05', '2023-11-06', '2023-11-07'] as array<date>));
 
 -- query 41
 -- @expect_error=Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a', 1], [11, 22, 32, 31, 21, 12]);
 
 -- query 42
 -- @expect_error=Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,null,4,5,6], ['a', 'b', 'c', 'c', 'b', 'a', 1], cast(null as array<int>), [11, 22, 32, 31, 21, 12]);
 
 -- query 43
 -- @expect_error=Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a', 1], [11, 22, 32, 31, 21, 12]);
 
 -- query 44
 -- @expect_error=Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 select array_sortby([1,2,3,4,5,6], ['a', 'b', null, null, 'b', 'a'], [11, 22, 32, 31, null, null, 1]);
 
 -- name: test_array_sortby_3
 -- query 45
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 with w1 as (select column_0 as source, column_1 as key1, column_2 as key2 from (values
           ([1, 2], null, [1, 1]),
           ([3, 4], [40, 30], [1, 1]),
@@ -392,7 +392,7 @@ select array_sortby(source, key1, key2), source, key1, key2 from w1;
 -- name: test_array_sortby_all_type
 -- query 46
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 CREATE TABLE test_array_sortby (
     id INT,
     array_boolean ARRAY<BOOLEAN>,
@@ -418,7 +418,7 @@ PROPERTIES ("replication_num" = "1");
 
 -- query 47
 -- @skip_result_check=true
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 INSERT INTO test_array_sortby VALUES
 (1, [true, false], [1, 3], [100, 50], [10, 5], [1000, 500], [9223372036854775806, 9223372036854775807], 
  [1.5, 2.5], [2.345, 1.234], [12345.67, 45678.90], [1234567890.12, 987654321.12], 
@@ -478,149 +478,145 @@ INSERT INTO test_array_sortby VALUES
  ['{"key":"value1"}', '{"key":"value2"}', '{"key":"value3"}']);
 
 -- query 48
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_boolean, [false, true]) FROM test_array_sortby WHERE id = 1;
 
 -- query 49
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_boolean, [false, true]) FROM test_array_sortby WHERE id = 7;
 
 -- query 50
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_tinyint, [2, 1]) FROM test_array_sortby WHERE id = 1;
 
 -- query 51
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_tinyint, [2, 1]) FROM test_array_sortby WHERE id = 7;
 
 -- query 52
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_smallint, [50, 100]) FROM test_array_sortby WHERE id = 1;
 
 -- query 53
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_smallint, [50, 100]) FROM test_array_sortby WHERE id = 7;
 
 -- query 54
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_int, [15, 10]) FROM test_array_sortby WHERE id = 1;
 
 -- query 55
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_int, [15, 10]) FROM test_array_sortby WHERE id = 7;
 
 -- query 56
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_bigint, [750, 500]) FROM test_array_sortby WHERE id = 1;
 
 -- query 57
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_bigint, [750, 500]) FROM test_array_sortby WHERE id = 7;
 
 -- query 58
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_largeint, [9223372036854775805, 9223372036854775806]) FROM test_array_sortby WHERE id = 1;
 
 -- query 59
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_largeint, [9223372036854775805, 9223372036854775806]) FROM test_array_sortby WHERE id = 7;
 
 -- query 60
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_float, [0.5, 1.5]) FROM test_array_sortby WHERE id = 1;
 
 -- query 61
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_float, [0.5, 1.5]) FROM test_array_sortby WHERE id = 7;
 
 -- query 62
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_double, [1.234, 2.345]) FROM test_array_sortby WHERE id = 1;
 
 -- query 63
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_double, [1.234, 2.345]) FROM test_array_sortby WHERE id = 7;
 
 -- query 64
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimal32, [45678.90, 12345.67]) FROM test_array_sortby WHERE id = 1;
 
 -- query 65
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimal32, [45678.90, 12345.67]) FROM test_array_sortby WHERE id = 7;
 
 -- query 66
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimal64, [123123123.45, 987654321.12]) FROM test_array_sortby WHERE id = 1;
 
 -- query 67
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimal64, [123123123.45, 987654321.12]) FROM test_array_sortby WHERE id = 7;
 
 -- query 68
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimal128, [9876543210987654321.1234567890, 12345678901234567890.1234567890]) FROM test_array_sortby WHERE id = 1;
 
 -- query 69
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimal128, [9876543210987654321.1234567890, 12345678901234567890.1234567890]) FROM test_array_sortby WHERE id = 7;
 
 -- query 70
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimalv2, [67890.12, 78901.34]) FROM test_array_sortby WHERE id = 1;
 
 -- query 71
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_decimalv2, [67890.12, 78901.34]) FROM test_array_sortby WHERE id = 7;
 
 -- query 72
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_varchar, ['banana', 'cherry']) FROM test_array_sortby WHERE id = 1;
 
 -- query 73
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_varchar, ['banana', 'cherry']) FROM test_array_sortby WHERE id = 7;
 
 -- query 74
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_datetime, ['2025-01-01 00:00:00', '2025-01-24 10:30:00']) FROM test_array_sortby WHERE id = 1;
 
 -- query 75
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_datetime, ['2025-01-01 00:00:00', '2025-01-24 10:30:00']) FROM test_array_sortby WHERE id = 7;
 
 -- query 76
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_date, ['2025-01-01', '2024-12-31']) FROM test_array_sortby WHERE id = 1;
 
 -- query 77
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_date, ['2025-01-01', '2024-12-31']) FROM test_array_sortby WHERE id = 7;
 
 -- query 78
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM test_array_sortby WHERE id = 1;
 
 -- query 79
 -- @expect_error=Expr evaluate meet error: Input arrays' size are not equal in array_sortby
-USE sql_tests_complex_test_array_sortby;
+USE ${case_db};
 SELECT array_sortby(array_json, ['{"key":"value1"}', '{"key":"value2"}']) FROM test_array_sortby WHERE id = 7;
-
--- query 80
--- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_sortby FORCE;

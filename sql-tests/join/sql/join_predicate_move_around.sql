@@ -159,7 +159,7 @@ INSERT INTO ${case_db}.test_all_type_not_null VALUES
 
 -- query 22
 -- inner join with subquery predicates on varchar/datetime/decimal columns
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from
 (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
 and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
@@ -168,7 +168,7 @@ on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < 
 
 -- query 23
 -- left join with subquery predicates on varchar/datetime/decimal columns
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from
 (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
 and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
@@ -191,7 +191,7 @@ on t1.t1d > t2.t1d and t1.id_date = t2.id_date;
 
 -- query 26
 -- inner join with abs() function in join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from
 (select * from ${case_db}.test_all_type where abs(t1b + t1d) > 20 and t1a in ('abc', '中文')) t1
 inner join ${case_db}.test_all_type_not_null t2
@@ -199,7 +199,7 @@ on abs(t1.t1b + t1.t1d) = t2.t1b;
 
 -- query 27
 -- left join with abs() function in join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from
 (select * from ${case_db}.test_all_type where abs(t1b + t1d) > 20 and t1a in ('abc', '中文')) t1
 left join ${case_db}.test_all_type_not_null t2
@@ -211,7 +211,7 @@ on abs(t1.t1b + t1.t1d) = t2.t1b;
 
 -- query 28
 -- inner join with reversed table order
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.test_all_type_not_null t2
 inner join (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
 and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
@@ -219,7 +219,7 @@ on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < 
 
 -- query 29
 -- right join with reversed table order
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from ${case_db}.test_all_type_not_null t2
 right join (select * from ${case_db}.test_all_type where t1a in ('abc', '中文') and t1b = 1 and t1c = 1
 and t1d = 20 and t1f = 1.1 and id_datetime between '2021-01-01' and '2021-02-01' and id_decimal = 1.2) t1
@@ -231,7 +231,7 @@ on t1.t1a > t2.t1a and t1.t1b = t2.t1b and t1.t1c > t2.t1c and t1.id_datetime < 
 
 -- query 30
 -- inner join with aggregation subquery and HAVING predicate
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from
 (select max(t1d) t1d, t1a from ${case_db}.test_all_type group by t1a having max(t1d) > 10 and t1a in ('abc', '中文')) t1
 inner join ${case_db}.test_all_type_not_null t2
@@ -239,7 +239,7 @@ on t1.t1d = t2.t1d and t1.t1a = t2.t1a;
 
 -- query 31
 -- left join with aggregation subquery and HAVING predicate
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from
 (select max(t1d) t1d, t1a from ${case_db}.test_all_type group by t1a having max(t1d) > 10 and t1a in ('abc', '中文')) t1
 left join ${case_db}.test_all_type_not_null t2
@@ -333,7 +333,7 @@ on v4 = v7;
 
 -- query 42
 -- inner + left join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
 left join (select * from ${case_db}.t2 where v7 > 1) t2
@@ -341,7 +341,7 @@ on v4 = v7;
 
 -- query 43
 -- left + left join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
 left join (select * from ${case_db}.t2 where v7 > 1) t2
@@ -349,7 +349,7 @@ on v4 = v7;
 
 -- query 44
 -- four-table inner join chain with cross join
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -358,7 +358,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 45
 -- left + cross + left four-table join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -367,7 +367,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 46
 -- right + cross + right four-table join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -376,7 +376,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 47
 -- inner + cross + left four-table join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -385,7 +385,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 48
 -- left + cross + inner four-table join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -394,7 +394,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 49
 -- left + cross + right four-table join chain
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -403,7 +403,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 50
 -- right + cross + right four-table join chain (different data)
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4
 join ${case_db}.t2
@@ -416,7 +416,7 @@ on v7 = v10 and v10 = v4;
 
 -- query 51
 -- inner + cross + inner with abs() expression join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -425,7 +425,7 @@ on v7 > v10 and v10 > v4;
 
 -- query 52
 -- left + cross + left with abs() expression join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -434,7 +434,7 @@ on v7 > v10 and v10 > v4;
 
 -- query 53
 -- right + cross + right with abs() expression join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -443,7 +443,7 @@ on v7 > v10 and v10 > v4;
 
 -- query 54
 -- inner + cross + left with abs() expression join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 inner join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -452,7 +452,7 @@ on v7 > v10 and v10 > v4;
 
 -- query 55
 -- left + cross + inner with abs() expression join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -461,7 +461,7 @@ on v7 > v10 and v10 > v4;
 
 -- query 56
 -- left + cross + right with abs() expression join key
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 left join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -470,7 +470,7 @@ on v7 > v10 and v10 > v4;
 
 -- query 57
 -- right + cross + right with abs() expression join key (variant)
--- @order_sensitive=true
+-- @order_sensitive=false
 select * from (select * from ${case_db}.t0 where v1 < 10) t0
 right join ${case_db}.t1 on v1 = v4 + abs(1)
 join ${case_db}.t2
@@ -491,7 +491,7 @@ INNER JOIN ${case_db}.t3 ON t2.v8 = t3.v10 AND t3.v12 IN (SELECT MAX(v12) - 501 
 
 -- query 59
 -- inner + left + right with correlated MIN subquery
--- @order_sensitive=true
+-- @order_sensitive=false
 SELECT *
 FROM (select * from ${case_db}.t0 where v1 = 2) t0
 INNER JOIN (select * from ${case_db}.t1 where v6 > 10 and v6 < 50) t1

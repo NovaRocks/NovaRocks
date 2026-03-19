@@ -1,0 +1,1503 @@
+-- query 2
+wv
+1
+1
+1
+1
+1
+
+-- query 3
+wv
+127
+127
+127
+127
+127
+
+-- query 4
+wv
+32000
+32000
+32000
+32000
+32000
+
+-- query 5
+wv
+2147483647
+2147483647
+2147483647
+2147483647
+2147483647
+
+-- query 6
+wv
+9223372036854775807
+9223372036854775807
+9223372036854775807
+9223372036854775807
+9223372036854775807
+
+-- query 7
+wv
+170141183460469231731687303715884105727
+170141183460469231731687303715884105727
+170141183460469231731687303715884105727
+170141183460469231731687303715884105727
+170141183460469231731687303715884105727
+
+-- query 8
+wv
+12345.6789
+12345.6789
+12345.6789
+12345.6789
+12345.6789
+
+-- query 9
+wv
+12345.67
+12345.67
+12345.67
+12345.67
+12345.67
+
+-- query 10
+wv
+123.46
+123.46
+123.46
+123.46
+123.46
+
+-- query 11
+wv
+ExampleCharData
+ExampleCharData
+ExampleCharData
+ExampleCharData
+ExampleCharData
+
+-- query 12
+wv
+2024-01-02
+2024-01-02
+2024-01-02
+2024-01-02
+2024-01-02
+
+-- query 13
+wv
+2024-01-01 12:34:56
+2024-01-01 12:34:56
+2024-01-01 12:34:56
+2024-01-01 12:34:56
+2024-01-01 12:34:56
+
+-- query 14
+wv
+[1,0,1]
+[1,0,1]
+[1,0,1]
+[1,0,1]
+[1,0,1]
+
+-- query 15
+wv
+[1,-1,127]
+[1,-1,127]
+[1,-1,127]
+[1,-1,127]
+[1,-1,127]
+
+-- query 16
+wv
+[100,-100,32767]
+[100,-100,32767]
+[100,-100,32767]
+[100,-100,32767]
+[100,-100,32767]
+
+-- query 17
+wv
+[100000,-100000,2147483647]
+[100000,-100000,2147483647]
+[100000,-100000,2147483647]
+[100000,-100000,2147483647]
+[100000,-100000,2147483647]
+
+-- query 18
+wv
+[10000000000,-10000000000,9223372036854775807]
+[10000000000,-10000000000,9223372036854775807]
+[10000000000,-10000000000,9223372036854775807]
+[10000000000,-10000000000,9223372036854775807]
+[10000000000,-10000000000,9223372036854775807]
+
+-- query 19
+wv
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+
+-- query 20
+wv
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+
+-- query 21
+wv
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+
+-- query 22
+wv
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+
+-- query 23
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+7698522700
+
+-- query 24
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+9489753355
+
+-- query 25
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+-2908793330
+
+-- query 26
+wv
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+
+-- query 27
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 28
+wv
+MyVarbinaryData
+MyVarbinaryData
+MyVarbinaryData
+MyVarbinaryData
+MyVarbinaryData
+
+-- query 31
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 32
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 33
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 34
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 35
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 36
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 37
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 38
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 39
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 40
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 41
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 42
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 43
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 44
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 45
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 46
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 47
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 48
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 49
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 50
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 51
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 52
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 53
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 54
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 55
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 56
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 57
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 58
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 59
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 60
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 61
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 62
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 63
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 64
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 65
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 66
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 67
+wv
+1
+0
+0
+0
+NULL
+
+-- query 68
+wv
+127
+NULL
+NULL
+NULL
+NULL
+
+-- query 69
+wv
+32000
+32100
+32100
+32100
+NULL
+
+-- query 70
+wv
+2147483647
+2047483647
+2047483647
+2047483647
+NULL
+
+-- query 71
+wv
+9223372036854775807
+9023372036854775807
+9023372036854775807
+9023372036854775807
+NULL
+
+-- query 72
+wv
+170141183460469231731687303715884105727
+100141183460469231731687303715884105727
+100141183460469231731687303715884105727
+100141183460469231731687303715884105727
+NULL
+
+-- query 73
+wv
+12345.6789
+123450.6789
+123450.6789
+123450.6789
+NULL
+
+-- query 74
+wv
+12345.67
+123450.67
+123450.67
+123450.67
+NULL
+
+-- query 75
+wv
+123.46
+1230.46
+1230.46
+1230.46
+NULL
+
+-- query 76
+wv
+ExampleCharData
+a
+a
+a
+NULL
+
+-- query 77
+wv
+2024-01-02
+2024-01-01
+2024-01-01
+2024-01-01
+NULL
+
+-- query 78
+wv
+2024-01-01 12:34:56
+2024-01-01 13:34:56
+2024-01-01 13:34:56
+2024-01-01 13:34:56
+NULL
+
+-- query 79
+wv
+[1,0,1]
+[0,0,0]
+[0,0,0]
+[0,0,0]
+NULL
+
+-- query 80
+wv
+[1,-1,127]
+[1,1,127]
+[1,1,127]
+[1,1,127]
+NULL
+
+-- query 81
+wv
+[100,-100,32767]
+[100,100,32767]
+[100,100,32767]
+[100,100,32767]
+NULL
+
+-- query 82
+wv
+[100000,-100000,2147483647]
+[100000,100000,2147483647]
+[100000,100000,2147483647]
+[100000,100000,2147483647]
+NULL
+
+-- query 83
+wv
+[10000000000,-10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+NULL
+
+-- query 84
+wv
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+NULL
+
+-- query 85
+wv
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+NULL
+
+-- query 86
+wv
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+NULL
+
+-- query 87
+wv
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+NULL
+
+-- query 88
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+6158818160
+
+-- query 89
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+7591802684
+
+-- query 90
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+-2327034664
+
+-- query 91
+wv
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+NULL
+
+-- query 92
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 93
+wv
+MyVarbinaryData
+MyVarbinaryData
+MyVarbinaryData
+MyVarbinaryData
+NULL
+
+-- query 96
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 97
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 98
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 99
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 100
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 101
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 102
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 103
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 104
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 105
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 106
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 107
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 108
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 109
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 110
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 111
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 112
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 113
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 114
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 115
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 116
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 117
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 118
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 119
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 120
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 121
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 122
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 123
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 124
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 125
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 126
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 127
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 128
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 129
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 130
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 131
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+
+-- query 132
+wv
+0
+0
+0
+NULL
+NULL
+
+-- query 133
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 134
+wv
+32100
+32100
+32100
+NULL
+NULL
+
+-- query 135
+wv
+2047483647
+2047483647
+2047483647
+NULL
+NULL
+
+-- query 136
+wv
+9023372036854775807
+9023372036854775807
+9023372036854775807
+NULL
+NULL
+
+-- query 137
+wv
+100141183460469231731687303715884105727
+100141183460469231731687303715884105727
+100141183460469231731687303715884105727
+NULL
+NULL
+
+-- query 138
+wv
+123450.6789
+123450.6789
+123450.6789
+NULL
+NULL
+
+-- query 139
+wv
+123450.67
+123450.67
+123450.67
+NULL
+NULL
+
+-- query 140
+wv
+1230.46
+1230.46
+1230.46
+NULL
+NULL
+
+-- query 141
+wv
+a
+a
+a
+NULL
+NULL
+
+-- query 142
+wv
+2024-01-01
+2024-01-01
+2024-01-01
+NULL
+NULL
+
+-- query 143
+wv
+2024-01-01 13:34:56
+2024-01-01 13:34:56
+2024-01-01 13:34:56
+NULL
+NULL
+
+-- query 144
+wv
+[0,0,0]
+[0,0,0]
+[0,0,0]
+NULL
+NULL
+
+-- query 145
+wv
+[1,1,127]
+[1,1,127]
+[1,1,127]
+NULL
+NULL
+
+-- query 146
+wv
+[100,100,32767]
+[100,100,32767]
+[100,100,32767]
+NULL
+NULL
+
+-- query 147
+wv
+[100000,100000,2147483647]
+[100000,100000,2147483647]
+[100000,100000,2147483647]
+NULL
+NULL
+
+-- query 148
+wv
+[10000000000,10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+NULL
+NULL
+
+-- query 149
+wv
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+NULL
+NULL
+
+-- query 150
+wv
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+NULL
+NULL
+
+-- query 151
+wv
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+NULL
+NULL
+
+-- query 152
+wv
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+NULL
+NULL
+
+-- query 153
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+4619113620
+
+-- query 154
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+5693852013
+
+-- query 155
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+-1745275998
+
+-- query 156
+wv
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+NULL
+NULL
+
+-- query 157
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+NULL
+
+-- query 161
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+NULL
+
+-- query 162
+wv
+{"key": "value"}
+NULL
+NULL
+NULL
+NULL
+
+-- query 164
+wv
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+NULL
+NULL
+
+-- query 165
+wv
+{"key": "value"}
+NULL
+NULL
+NULL
+NULL
+
+-- query 167
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 168
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 170
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 171
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 173
+wv
+NULL
+1
+0
+0
+0
+
+-- query 174
+wv
+NULL
+127
+NULL
+NULL
+NULL
+
+-- query 175
+wv
+NULL
+32000
+32100
+32100
+32100
+
+-- query 176
+wv
+NULL
+2147483647
+2047483647
+2047483647
+2047483647
+
+-- query 177
+wv
+NULL
+9223372036854775807
+9023372036854775807
+9023372036854775807
+9023372036854775807
+
+-- query 178
+wv
+NULL
+170141183460469231731687303715884105727
+100141183460469231731687303715884105727
+100141183460469231731687303715884105727
+100141183460469231731687303715884105727
+
+-- query 179
+wv
+NULL
+12345.6789
+123450.6789
+123450.6789
+123450.6789
+
+-- query 180
+wv
+NULL
+12345.67
+123450.67
+123450.67
+123450.67
+
+-- query 181
+wv
+NULL
+123.46
+1230.46
+1230.46
+1230.46
+
+-- query 182
+wv
+NULL
+ExampleCharData
+a
+a
+a
+
+-- query 183
+wv
+NULL
+2024-01-02
+2024-01-01
+2024-01-01
+2024-01-01
+
+-- query 184
+wv
+NULL
+2024-01-01 12:34:56
+2024-01-01 13:34:56
+2024-01-01 13:34:56
+2024-01-01 13:34:56
+
+-- query 185
+wv
+NULL
+[1,0,1]
+[0,0,0]
+[0,0,0]
+[0,0,0]
+
+-- query 186
+wv
+NULL
+[1,-1,127]
+[1,1,127]
+[1,1,127]
+[1,1,127]
+
+-- query 187
+wv
+NULL
+[100,-100,32767]
+[100,100,32767]
+[100,100,32767]
+[100,100,32767]
+
+-- query 188
+wv
+NULL
+[100000,-100000,2147483647]
+[100000,100000,2147483647]
+[100000,100000,2147483647]
+[100000,100000,2147483647]
+
+-- query 189
+wv
+NULL
+[10000000000,-10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+[10000000000,10000000000,9223372036854775807]
+
+-- query 190
+wv
+NULL
+[12345678901234567890,-12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+[12345678901234567890,12345678901234567890,170141183460469231731687303715884105727]
+
+-- query 191
+wv
+NULL
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+
+-- query 192
+wv
+NULL
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+[1.23,4.56,7.89]
+
+-- query 193
+wv
+NULL
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+[1.23,2.35,3.46]
+
+-- query 194
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+6158818160
+
+-- query 195
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+7591802684
+
+-- query 196
+sum(murmur_hash3_32(array_join(array_map(x -> murmur_hash3_32(x), wv), ',')))
+-2327034664
+
+-- query 197
+wv
+NULL
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+ExampleVarcharData
+
+-- query 198
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 202
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 203
+wv
+NULL
+NULL
+NULL
+{"key": "value"}
+{"key": "value"}
+
+-- query 205
+wv
+NULL
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+{"key": "value"}
+
+-- query 206
+wv
+NULL
+NULL
+NULL
+{"key": "value"}
+{"key": "value"}
+
+-- query 208
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 209
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 211
+wv
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 212
+wv
+NULL
+NULL
+NULL
+NULL
+NULL

@@ -1,0 +1,79 @@
+-- query 2
+count(*)
+20
+
+-- query 3
+count(*)
+13
+
+-- query 4
+count(*)
+0
+
+-- query 5
+count(*)
+0
+
+-- query 6
+count(*)
+2
+
+-- query 7
+count(*)
+13
+
+-- query 8
+count(*)
+0
+
+-- query 9
+count(*)
+0
+
+-- query 10
+count(*)
+0
+
+-- query 11
+count(*)
+2
+
+-- query 12
+count(*)
+1
+
+-- query 13
+count(*)
+2
+
+-- query 14
+count(*)
+10
+
+-- query 15
+count(*)
+0
+
+-- query 16
+count(*)
+0
+
+-- query 17
+count(*)
+10
+
+-- query 18
+count(*)
+10000
+
+-- query 19
+count(*)
+1000
+
+-- query 21
+count(*)
+7
+
+-- query 24
+count(*)
+7

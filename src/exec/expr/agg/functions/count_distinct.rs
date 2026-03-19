@@ -315,7 +315,7 @@ impl AggregateFunction for CountDistinctAgg {
 
     fn update_batch(
         &self,
-        spec: &AggSpec,
+        _spec: &AggSpec,
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,

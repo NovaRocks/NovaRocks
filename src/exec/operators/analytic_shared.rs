@@ -355,6 +355,8 @@ fn should_reorder_window_input(
                 | WindowFunctionKind::Max
                 | WindowFunctionKind::BitmapUnion
                 | WindowFunctionKind::BitmapUnionCount
+                | WindowFunctionKind::MaxBy
+                | WindowFunctionKind::MaxByV2
                 | WindowFunctionKind::MinBy
                 | WindowFunctionKind::MinByV2
                 | WindowFunctionKind::VarianceSamp
@@ -713,6 +715,24 @@ fn compute_window_function(
         ),
         WindowFunctionKind::BitmapUnionCount => compute_window_custom_aggregate(
             "bitmap_union_count",
+            args,
+            partitions,
+            order_keys,
+            window,
+            &func.return_type,
+            total_rows,
+        ),
+        WindowFunctionKind::MaxBy => compute_window_custom_aggregate(
+            "max_by",
+            args,
+            partitions,
+            order_keys,
+            window,
+            &func.return_type,
+            total_rows,
+        ),
+        WindowFunctionKind::MaxByV2 => compute_window_custom_aggregate(
+            "max_by_v2",
             args,
             partitions,
             order_keys,
