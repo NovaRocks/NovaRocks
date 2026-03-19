@@ -1,0 +1,7 @@
+-- query 2
+count(1)
+0
+
+-- query 3
+count(1)
+1

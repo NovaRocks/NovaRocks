@@ -1,0 +1,14 @@
+-- query 2
+c2_sub1	C2_SUB2
+1	1
+2	2
+
+-- query 3
+C2_SUB1	c2_sub2
+1	1
+2	2
+
+-- query 4
+C2_SUB1	c2_sub2
+1	1
+2	2

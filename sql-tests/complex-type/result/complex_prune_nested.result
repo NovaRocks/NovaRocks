@@ -1,0 +1,202 @@
+-- query 2
+array_length(a1)
+3
+3
+3
+
+-- query 3
+array_length(a1)
+3
+3
+3
+
+-- query 4
+array_length(a1)	a1
+3	[2,2,3]
+3	[3,2,3]
+3	[1,2,3]
+
+-- query 5
+array_length(a2)	a2[1].a
+3	1
+3	1
+3	1
+
+-- query 6
+array_length(a2)	a2[1].a
+3	1
+
+-- query 7
+array_length(a2)	a2[1].a
+3	1
+
+-- query 8
+a2[1].a
+1
+
+-- query 9
+cardinality(a2)	a2[1].a
+3	1
+3	1
+3	1
+
+-- query 10
+map_size(m1)
+2
+2
+2
+
+-- query 11
+map_size(m1)	map_keys(m1)
+2	[1,2]
+2	[1,2]
+2	[1,2]
+
+-- query 12
+map_values(m1)	map_keys(m1)
+[12,22]	[1,2]
+[13,23]	[1,2]
+[11,21]	[1,2]
+
+-- query 13
+map_size(m1)
+2
+
+-- query 14
+map_size(m1)	map_values(m1)
+2	[13,23]
+
+-- query 15
+map_size(m1)	m1[3]
+2	NULL
+
+-- query 16
+cardinality(m1)
+2
+
+-- query 17
+m2[1].c	array_length(m2[2].b)
+11	3
+12	3
+13	3
+
+-- query 18
+m2[1].c	array_length(m2[2].b)
+11	3
+
+-- query 19
+m2[1].c	m2[2].b
+12	[222,222,332]
+
+-- query 20
+s1.s2[1].a
+1
+1
+1
+
+-- query 21
+s1.s2[1].a	s1.s3[1]	f
+1	12	2
+1	13	3
+1	11	1
+
+-- query 22
+s1.s2[1].a	s1.s3[1]	f
+1	13	3
+
+-- query 23
+s1.s2[1].a	s1.s3[1]	f
+
+-- query 24
+s1.s2[1].a	s1.s3[1]	f
+1	12	2
+
+-- query 25
+v1
+1
+2
+3
+
+-- query 27
+a1	v1
+[1,2,3]	1
+[1,2,3]	1
+
+-- query 28
+array_length(a1)	a2[1].a
+3	1
+3	1
+
+-- query 29
+map_size(m1)	s1.s2[1].a	s1.s3[1]	f
+2	1	11	1
+2	1	11	1
+
+-- query 30
+a1	a2[1]
+[1,2,3]	{"a":1,"b":11}
+[1,2,3]	{"a":1,"b":11}
+
+-- query 31
+array_length(a1)	a2[1].a
+3	1
+3	1
+
+-- query 32
+map_size(m1)	s1.s2[1].a	s1.s3[1]	f
+2	1	11	1
+2	1	11	1
+
+-- query 33
+a1	s3
+[1,2,3]	{1:11,2:21}
+[1,2,3]	{1:11,2:21}
+
+-- query 34
+array_length(a1)	a2[1].a
+3	1
+3	1
+
+-- query 35
+map_size(m1)	s1.s2[1].a	s1.s3[1]	f
+2	1	11	1
+2	1	11	1
+
+-- query 36
+a1	m1
+[1,2,3]	{1:11,2:21}
+[1,2,3]	{1:11,2:21}
+
+-- query 37
+array_length(a1)	a2[1].a
+
+-- query 38
+map_size(m1)	s1.s2[1].a	s1.s3[1]	f
+2	1	11	1
+2	1	11	1
+
+-- query 39
+a1	m1
+[1,2,3]	{1:11,2:21}
+[1,2,3]	{1:11,2:21}
+
+-- query 40
+array_length(a1)	a2[1].a
+
+-- query 41
+map_size(m1)	s1.s2[1].a	s1.s3[1]	f
+2	1	11	1
+2	1	11	1
+
+-- query 42
+a1	m1
+[1,2,3]	{1:11,2:21}
+[1,2,3]	{1:11,2:21}
+
+-- query 43
+array_length(a1)	a2[1].a
+
+-- query 44
+map_size(m1)	s1.s2[1].a	s1.s3[1]	f
+2	1	12	2
+2	1	12	2

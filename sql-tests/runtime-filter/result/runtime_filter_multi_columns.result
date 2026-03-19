@@ -1,0 +1,365 @@
+-- query 2
+count(*)
+40961
+
+-- query 3
+count(*)
+40961
+
+-- query 4
+count(*)
+0
+
+-- query 5
+count(*)
+100
+
+-- query 6
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40860	20530.5	40860	40860	40860
+
+-- query 7
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40860	20530.5	40860	40860	40860
+
+-- query 8
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1023	512	1023	1023	1023
+
+-- query 9
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1023	512	1023	1023	1023
+
+-- query 10
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1023	512	1023	1023	1023
+
+-- query 11
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+100	50.5	100	100	100
+
+-- query 12
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+100	50.5	100	100	100
+
+-- query 13
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 14
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 15
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 16
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 17
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 18
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 19
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 20
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 21
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+0	NULL	0	0	0
+
+-- query 22
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+9	5	9	9	9
+
+-- query 23
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40960	20480.5	40960	40960	40960
+
+-- query 24
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+9999	5000	9999	9999	9999
+
+-- query 25
+c0	c1	c2	c3	c0	c1	c2	c3
+1	1	1	1	1	1	1	1
+2	2	2	2	2	2	2	2
+3	3	3	3	3	3	3	3
+4	4	4	4	4	4	4	4
+5	5	5	5	5	5	5	5
+6	6	6	6	6	6	6	6
+7	7	7	7	7	7	7	7
+8	8	8	8	8	8	8	8
+9	9	9	9	9	9	9	9
+
+-- query 26
+c0	c1	c2	c3	c0	c1	c2	c3
+1	1	1	1	1	1	1	1
+2	2	2	2	2	2	2	2
+3	3	3	3	3	3	3	3
+4	4	4	4	4	4	4	4
+5	5	5	5	5	5	5	5
+6	6	6	6	6	6	6	6
+7	7	7	7	7	7	7	7
+8	8	8	8	8	8	8	8
+9	9	9	9	9	9	9	9
+
+-- query 27
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+9	5	9	9	9
+
+-- query 28
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+18	5	18	18	18
+
+-- query 29
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+18	5	18	18	18
+
+-- query 30
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+9	5	9	9	9
+
+-- query 31
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+9	5	9	9	9
+
+-- query 32
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40960	838881280	838881280	838881280	838881280
+
+-- query 33
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40960	838881280	838881280	838881280	838881280
+
+-- query 34
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40960	838881280	838881280	838881280	838881280
+
+-- query 35
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40960	838881280	838881280	838881280	838881280
+
+-- query 36
+count(*)	sum(l.c0)	sum(l.c1)
+100	5050	5050
+
+-- query 37
+count(*)	sum(l.c0)	sum(l.c1)
+100	5050	5050
+
+-- query 38
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40960	838881280	838881280	838881280	838881280
+
+-- query 39
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40961	838881280	838881280	838881280	838881280
+
+-- query 40
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+40961	838881280	838881280	838881280	838881280
+
+-- query 41
+c0	c1	count(*)
+10001	10001	1
+10002	10002	1
+
+-- query 42
+c0	c1	count(*)
+10000	10000	1
+10001	10001	1
+
+-- query 43
+c0	c1	count(*)
+10000	10000	1
+10001	10001	1
+
+-- query 44
+count(*)	sum(l.c0)	sum(r.c0)	sum(l.c1)	sum(r.c1)
+99	4950	4950	4950	4950
+
+-- query 45
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40960	20480.5	40960	40960	40960
+
+-- query 46
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40960	20480.5	40960	40960	40960
+
+-- query 47
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)	count(s.c0)
+100	50.5	100	100	100	100
+
+-- query 48
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)	count(s.c0)
+100	50.5	100	100	100	100
+
+-- query 49
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)	count(s.c0)
+100	50.5	100	100	100	100
+
+-- query 50
+count(l.c0)	count(l.c1)
+40960	40960
+
+-- query 51
+count(l.c0)	count(l.c1)
+40960	40960
+
+-- query 52
+count(*)	sum(c0)	sum(c1)
+40960	838881280	838881280
+
+-- query 53
+c0	c1	c1
+10001	10001	10001
+10002	10002	10002
+10003	10003	10003
+10004	10004	10004
+10005	10005	10005
+10006	10006	10006
+10007	10007	10007
+10008	10008	10008
+10009	10009	10009
+10010	10010	10010
+
+-- query 54
+count(*)
+10
+
+-- query 55
+c0	c1	c1	row_number() OVER (PARTITION BY l.c0 )
+1	1	1	1
+2	2	2	1
+3	3	3	1
+4	4	4	1
+5	5	5	1
+6	6	6	1
+7	7	7	1
+8	8	8	1
+9	9	9	1
+10	10	10	1
+
+-- query 56
+c0	c1	c1	row_number() OVER (PARTITION BY l.c0, l.c1 )
+1	1	1	1
+2	2	2	1
+3	3	3	1
+4	4	4	1
+5	5	5	1
+6	6	6	1
+7	7	7	1
+8	8	8	1
+9	9	9	1
+10	10	10	1
+
+-- query 57
+count(*)	count(lc0)	count(lc1)	count(rc1)
+9	9	9	9
+
+-- query 58
+count(*)	sum(lc0)	sum(lc1)	sum(rc1)
+40960	838881280	838881280	838881280
+
+-- query 59
+count(*)	sum(lc0)	sum(lc1)	sum(rc1)
+40960	838881280	838881280	838881280
+
+-- query 60
+count(*)
+0
+
+-- query 61
+c0l	c1l
+2001	2001
+
+-- query 62
+c0l	c1l
+2001	2001
+
+-- query 63
+c0	c1 IN (((SELECT c1 FROM db_sqlt_ff9e4987cc6cea9c.t1 WHERE c0 = 10)))
+10001	0
+
+-- query 64
+c0	c1 = ((SELECT c1 FROM db_sqlt_ff9e4987cc6cea9c.t1 WHERE c0 = 10))
+10001	0
+
+-- query 65
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 66
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 67
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 68
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 69
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 70
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 71
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 72
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 73
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 74
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 75
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	40960
+
+-- query 76
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	40960
+
+-- query 77
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 78
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40960	20480.5	40960	40960	1
+
+-- query 79
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+1	1	1	1	1
+
+-- query 80
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+40960	20480.5	40960	40960	1
+
+-- query 81
+count(l.c0)	avg(l.c0)	count(l.c1)	count(l.c0)	count(r.c1)
+100	50.5	100	100	100

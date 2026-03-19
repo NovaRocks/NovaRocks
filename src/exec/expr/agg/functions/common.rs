@@ -883,6 +883,7 @@ pub(crate) fn build_scalar_array(
             let mut offsets = Vec::with_capacity(values.len() + 1);
             offsets.push(0_i32);
             let mut current: i64 = 0;
+            let mut nulls = NullBufferBuilder::new(values.len());
             for value in values {
                 match value {
                     Some(AggScalarValue::List(items)) => {
@@ -893,15 +894,23 @@ pub(crate) fn build_scalar_array(
                         }
                         flat_values.extend(items);
                         offsets.push(current as i32);
+                        nulls.append_non_null();
                     }
-                    None => offsets.push(current as i32),
+                    None => {
+                        offsets.push(current as i32);
+                        nulls.append_null();
+                    }
                     _ => return Err("scalar output type mismatch for List".to_string()),
                 }
             }
             let child = build_scalar_array(item.data_type(), flat_values)?;
-            let out =
-                ListArray::try_new(item.clone(), OffsetBuffer::new(offsets.into()), child, None)
-                    .map_err(|e| format!("list output build failed: {}", e))?;
+            let out = ListArray::try_new(
+                item.clone(),
+                OffsetBuffer::new(offsets.into()),
+                child,
+                nulls.finish(),
+            )
+            .map_err(|e| format!("list output build failed: {}", e))?;
             Ok(Arc::new(out))
         }
         DataType::Struct(fields) => {

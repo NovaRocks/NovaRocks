@@ -1,0 +1,25 @@
+-- query 2
+product_id	price
+id_100	100
+id_200	200
+
+-- query 3
+a	b
+1	hello
+2	world
+
+-- query 4
+x	y	z
+10	20	30
+11	22	33
+111	222	333
+
+-- query 5
+outer_a	inner_x	inner_y
+1	100	200
+2	300	400
+
+-- query 6
+a	b
+1	test
+2	NULL
