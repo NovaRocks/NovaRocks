@@ -2343,15 +2343,11 @@ fn cast_decimal_to_decimal_relaxed(
                 quotient
             };
         }
-        // Keep downscale casts (higher scale -> lower scale) even when the rounded
-        // integer part exceeds declared target precision, to match StarRocks
-        // decimal regression behavior. Enforce precision only for same-scale and
-        // upscale casts where overflow should still null out.
-        let enforce_precision = source_scale <= target_scale;
-        if enforce_precision && !decimal_value_within_precision(value, target_precision) {
-            values.push(None);
-            continue;
-        }
+        // StarRocks does not enforce decimal precision at query execution time:
+        // columns like DECIMAL64(4,3) can legitimately store values like 10.000 or
+        // 100.000 that exceed the declared precision. Imposing a precision check here
+        // would NULL out valid stored values during comparisons and aggregate functions.
+        // Overflow beyond i128 range is already guarded by the checked_mul above.
         values.push(Some(value));
     }
 

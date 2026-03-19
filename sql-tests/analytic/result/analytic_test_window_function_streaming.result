@@ -1,0 +1,63 @@
+-- query 2
+count(*)	sum(rk)	min(rk)	max(rk)
+9	9	1	1
+
+-- query 3
+count(*)	sum(rk)	min(rk)	max(rk)
+49167	386195551	2	24588
+
+-- query 4
+count(*)	sum(rk)	min(rk)	max(rk)
+49176	386195560	1	24588
+
+-- query 5
+count(*)	sum(rk)	min(rk)	max(rk)
+24588	24588	1	1
+
+-- query 6
+count(*)	sum(rk)	min(rk)	max(rk)
+24588	235167812	3	24585
+
+-- query 7
+count(*)	sum(rk)	min(rk)	max(rk)
+49176	235192400	1	24585
+
+-- query 8
+count(*)	sum(rk)	min(rk)	max(rk)
+24588	24588	1	1
+
+-- query 9
+count(*)	sum(rk)	min(rk)	max(rk)
+24588	57388	2	5
+
+-- query 10
+count(*)	sum(rk)	min(rk)	max(rk)
+49176	81976	1	5
+
+-- query 11
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	537198720	2	24588
+
+-- query 12
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	476568	1	121
+
+-- query 13
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	3410736	2	124
+
+-- query 14
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	7799945536	203	333138
+
+-- query 15
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	715012.2492279809	1.5	121.5
+
+-- query 16
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	36879.23668	0.33333	1.00000
+
+-- query 17
+count(*)	sum(wv)	min(wv)	max(wv)
+49176	12298.17356	0.00000	0.99988

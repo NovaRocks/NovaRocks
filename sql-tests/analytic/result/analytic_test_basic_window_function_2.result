@@ -1,0 +1,2711 @@
+-- query 2
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294328.00000000544	2.993084933290	2.99308493329	2.99308493329
+
+-- query 3
+sum(wv)	avg(wv)	min(wv)	max(wv)
+246255.82497088979	3.005025442609	2.51232759673	3.52440810349
+
+-- query 4
+sum(wv)	avg(wv)	min(wv)	max(wv)
+246225.95750541570	3.005027673429	2.51232759673	3.52440810349
+
+-- query 5
+sum(wv)	avg(wv)	min(wv)	max(wv)
+246285.75582022269	3.005023985703	2.51232759673	3.52440810349
+
+-- query 6
+sum(wv)	avg(wv)	min(wv)	max(wv)
+152321.36666666668	3.097158794385	1.00000000000	2222.00000000000
+
+-- query 7
+sum(wv)	avg(wv)	min(wv)	max(wv)
+156505.08787878790	3.180933068002	1.00000000000	2222.00000000000
+
+-- query 8
+sum(wv)	avg(wv)	min(wv)	max(wv)
+153354.36666666668	3.117528951773	1.00000000000	2222.00000000000
+
+-- query 9
+sum(wv)	avg(wv)	min(wv)	max(wv)
+152835.70000000001	3.107300857968	1.00000000000	2222.00000000000
+
+-- query 10
+sum(wv)	avg(wv)	min(wv)	max(wv)
+153354.36666666668	3.117528951773	1.00000000000	2222.00000000000
+
+-- query 11
+sum(wv)	avg(wv)	min(wv)	max(wv)
+229385.91087224623	3.574325462357	1.00000000000	2222.00000000000
+
+-- query 12
+sum(wv)	avg(wv)	min(wv)	max(wv)
+267615.81990488963	3.607849168260	1.00000000000	2222.00000000000
+
+-- query 13
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294225.94072140718	3.716100089944	1.00000000000	2222.00000000000
+
+-- query 14
+sum(wv)	avg(wv)	min(wv)	max(wv)
+247240.38285822929	3.574077467015	1.00000000000	2222.00000000000
+
+-- query 15
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294225.94072140718	3.716100089944	1.00000000000	2222.00000000000
+
+-- query 16
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294328.00000000544	2.993084933290	2.99308493329	2.99308493329
+
+-- query 17
+sum(wv)	avg(wv)	min(wv)	max(wv)
+246255.82497088979	3.005025442609	2.51232759673	3.52440810349
+
+-- query 18
+sum(wv)	avg(wv)	min(wv)	max(wv)
+5167454.20288784488	52.559646475526	2.36604817708	102.50000000000
+
+-- query 19
+sum(wv)	avg(wv)	min(wv)	max(wv)
+311787.83292639279	3.170637741279	2.83333333333	3.91309669523
+
+-- query 20
+sum(wv)	avg(wv)	min(wv)	max(wv)
+302274.77003585924	3.073897352301	2.83333333333	3.40086705202
+
+-- query 21
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294328.00000000544	2.993084933290	2.99308493329	2.99308493329
+
+-- query 22
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294327.99999984160	2.993084933288	1.90639492311	103.50000000000
+
+-- query 23
+sum(wv)	avg(wv)	min(wv)	max(wv)
+123068.57288201312	2.503021739384	1.00000000000	103.50000000000
+
+-- query 24
+sum(wv)	avg(wv)	min(wv)	max(wv)
+122164.96715722671	2.486565584312	1.00000000000	3.49981682745
+
+-- query 25
+sum(wv)	avg(wv)	min(wv)	max(wv)
+123980.21424561246	2.519615783555	1.00000000000	103.50000000000
+
+-- query 26
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139230.50000000000	2.833055244684	1.00000000000	4.00000000000
+
+-- query 27
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146918.72121212121	2.986699217583	1.00000000000	1111.66666666667
+
+-- query 28
+sum(wv)	avg(wv)	min(wv)	max(wv)
+152281.70000000002	3.096352249853	1.00000000000	2222.00000000000
+
+-- query 29
+sum(wv)	avg(wv)	min(wv)	max(wv)
+142667.50000000000	2.901633176049	1.00000000000	1111.66666666667
+
+-- query 30
+sum(wv)	avg(wv)	min(wv)	max(wv)
+153305.36666666668	3.116532834597	1.00000000000	2222.00000000000
+
+-- query 31
+sum(wv)	avg(wv)	min(wv)	max(wv)
+81267.81176509747	2.379034302257	1.00000000000	3.31956804320
+
+-- query 32
+sum(wv)	avg(wv)	min(wv)	max(wv)
+180820.18397740598	2.817567065218	1.00000000000	103.50000000000
+
+-- query 33
+sum(wv)	avg(wv)	min(wv)	max(wv)
+287004.37177739772	3.625623696026	1.00000000000	2222.00000000000
+
+-- query 34
+sum(wv)	avg(wv)	min(wv)	max(wv)
+125628.91568803954	2.555095096161	1.00000000000	103.50000000000
+
+-- query 35
+sum(wv)	avg(wv)	min(wv)	max(wv)
+288646.70511073106	3.645633842461	1.00000000000	2222.00000000000
+
+-- query 36
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294327.99999984160	2.993084933288	1.90639492311	103.50000000000
+
+-- query 37
+sum(wv)	avg(wv)	min(wv)	max(wv)
+123068.57288201312	2.503021739384	1.00000000000	103.50000000000
+
+-- query 38
+sum(wv)	avg(wv)	min(wv)	max(wv)
+123068.57288201312	2.503021739384	1.00000000000	103.50000000000
+
+-- query 39
+sum(wv)	avg(wv)	min(wv)	max(wv)
+310052.00105496737	3.153242220476	1.50000000000	103.50000000000
+
+-- query 40
+sum(wv)	avg(wv)	min(wv)	max(wv)
+300586.89065163836	3.056981639529	1.50000000000	103.50000000000
+
+-- query 41
+sum(wv)	avg(wv)	min(wv)	max(wv)
+294327.99999984160	2.993084933288	1.90639492311	103.50000000000
+
+-- query 42
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000044832	12.930117149370	12.93011714937	12.93011714937
+
+-- query 43
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1606063.03221259257	16.332401482800	12.86135274277	21.52440810349
+
+-- query 44
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1605933.77656290997	16.332747966590	12.86135274277	21.52440810349
+
+-- query 45
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1606002.33338408627	16.331784223317	12.86135274277	21.52440810349
+
+-- query 46
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270702.66666666666	12.922706640497	1.00000000000	4076.33333333333
+
+-- query 47
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.10721500721	12.930118239658	1.00000000000	2227.09090909091
+
+-- query 48
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271636.23333333332	12.932200764086	1.00000000000	4076.33333333333
+
+-- query 49
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271262.49999999999	12.927742637488	1.00000000000	4076.33333333333
+
+-- query 50
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271731.23333333332	12.932509287884	1.00000000000	4076.33333333333
+
+-- query 51
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1238693.46606912609	13.271336526840	2.13308669133	22.90750924908
+
+-- query 52
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271035.76462988037	12.925436916591	2.13308669133	22.90750924908
+
+-- query 53
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1147472.12605336473	12.293992950773	2.13308669133	114.00000000000
+
+-- query 54
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1297738.64795093873	13.196984298232	2.13308669133	22.90750924908
+
+-- query 55
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1253463.09415655359	12.746736639243	2.13308669133	114.00000000000
+
+-- query 56
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000044832	12.930117149370	12.93011714937	12.93011714937
+
+-- query 57
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1606063.03221259257	16.332401482800	12.86135274277	21.52440810349
+
+-- query 58
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1230608.70700541077	12.514325445467	11.12678803641	50.40000000000
+
+-- query 59
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1326444.81049519674	13.488903458501	12.50000000000	15.61811505508
+
+-- query 60
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1312823.72131968312	13.350387663925	12.50000000000	14.16519250780
+
+-- query 61
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000044832	12.930117149370	12.93011714937	12.93011714937
+
+-- query 62
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271495.99999987608	12.930117149364	5.71918476934	112.50000000000
+
+-- query 63
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1218530.81180553347	12.391502723372	3.00000000000	113.50000000000
+
+-- query 64
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1216414.89115724329	12.375774658228	3.00000000000	21.52440810349
+
+-- query 65
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1218591.80963902367	12.392123023501	3.00000000000	112.50000000000
+
+-- query 66
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254253.83333333334	12.758021313315	1.00000000000	4076.33333333333
+
+-- query 67
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1268562.87157287158	12.900289533567	1.00000000000	2594.33333333333
+
+-- query 68
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1284353.16666666664	13.064185764224	1.00000000000	6666.00000000000
+
+-- query 69
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1260516.36666666666	12.818462889142	1.00000000000	4076.33333333333
+
+-- query 70
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1285600.96666666664	13.073553598546	1.00000000000	6666.00000000000
+
+-- query 71
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1040100.79376782438	12.483206838308	2.13308669133	22.90750924908
+
+-- query 72
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1266614.35572967806	12.880474655565	2.13308669133	112.50000000000
+
+-- query 73
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1237061.23306273204	14.847110334406	2.13308669133	6666.00000000000
+
+-- query 74
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1218880.75191106015	12.395061339805	2.13308669133	113.50000000000
+
+-- query 75
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1436773.69927706052	14.610861731991	2.13308669133	6666.00000000000
+
+-- query 76
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271495.99999987608	12.930117149364	5.71918476934	112.50000000000
+
+-- query 77
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1218530.81180553347	12.391502723372	3.00000000000	113.50000000000
+
+-- query 78
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1218530.81180553347	12.391502723372	3.00000000000	113.50000000000
+
+-- query 79
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1325381.22457332066	13.478087623793	4.50000000000	113.50000000000
+
+-- query 80
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1311291.31760560480	13.334804319940	4.50000000000	113.50000000000
+
+-- query 81
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271495.99999987608	12.930117149364	5.71918476934	112.50000000000
+
+-- query 82
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 83
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 84
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 85
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 86
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 87
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 88
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 89
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 90
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 91
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 92
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 93
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 94
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 95
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 96
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 97
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 98
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 99
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 100
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 101
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 102
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 103
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 104
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 105
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 106
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 107
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 108
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 109
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 110
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 111
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 112
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 113
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 114
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 115
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 116
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 117
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 118
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 119
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 120
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 121
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 122
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 123
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147500.00000	1.79992190169	1.00000	3.00000
+
+-- query 124
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147490.00000	1.80001952696	1.00000	3.00000
+
+-- query 125
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147510.00000	1.79982430025	1.00000	3.00000
+
+-- query 126
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146985.00000	2.98865415506	1.00000	2222.00000
+
+-- query 127
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147533.00000	2.99857726469	1.00000	2222.00000
+
+-- query 128
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148015.00000	3.00898538351	1.00000	2222.00000
+
+-- query 129
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147498.00000	2.99878014069	1.00000	2222.00000
+
+-- query 130
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148015.00000	3.00898538351	1.00000	2222.00000
+
+-- query 131
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 132
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147500.00000	1.79992190169	1.00000	3.00000
+
+-- query 133
+sum(wv)	avg(wv)	min(wv)	max(wv)
+5013140.00000	50.99007282640	1.00000	101.00000
+
+-- query 134
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 135
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 136
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 137
+sum(wv)	avg(wv)	min(wv)	max(wv)
+231040.00000	2.34949560690	1.00000	103.00000
+
+-- query 138
+sum(wv)	avg(wv)	min(wv)	max(wv)
+115520.00000	2.34949560690	1.00000	103.00000
+
+-- query 139
+sum(wv)	avg(wv)	min(wv)	max(wv)
+114634.00000	2.33327905557	1.00000	3.00000
+
+-- query 140
+sum(wv)	avg(wv)	min(wv)	max(wv)
+116406.00000	2.36568711133	1.00000	103.00000
+
+-- query 141
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139223.00000	2.83290263506	1.00000	4.00000
+
+-- query 142
+sum(wv)	avg(wv)	min(wv)	max(wv)
+140940.00000	2.86515826066	1.00000	103.00000
+
+-- query 143
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146995.00000	2.98885748561	1.00000	2222.00000
+
+-- query 144
+sum(wv)	avg(wv)	min(wv)	max(wv)
+140089.00000	2.84919053043	1.00000	103.00000
+
+-- query 145
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148015.00000	3.00898538351	1.00000	2222.00000
+
+-- query 146
+sum(wv)	avg(wv)	min(wv)	max(wv)
+231040.00000	2.34949560690	1.00000	103.00000
+
+-- query 147
+sum(wv)	avg(wv)	min(wv)	max(wv)
+115520.00000	2.34949560690	1.00000	103.00000
+
+-- query 148
+sum(wv)	avg(wv)	min(wv)	max(wv)
+115520.00000	2.34949560690	1.00000	103.00000
+
+-- query 149
+sum(wv)	avg(wv)	min(wv)	max(wv)
+230224.00000	2.34138800749	1.00000	103.00000
+
+-- query 150
+sum(wv)	avg(wv)	min(wv)	max(wv)
+230224.00000	2.34138800749	1.00000	103.00000
+
+-- query 151
+sum(wv)	avg(wv)	min(wv)	max(wv)
+231040.00000	2.34949560690	1.00000	103.00000
+
+-- query 152
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 153
+sum(wv)	avg(wv)	min(wv)	max(wv)
+688304.00000	6.99951187764	1.00000	19.00000
+
+-- query 154
+sum(wv)	avg(wv)	min(wv)	max(wv)
+688294.00000	7.00012204300	1.00000	19.00000
+
+-- query 155
+sum(wv)	avg(wv)	min(wv)	max(wv)
+688124.00000	6.99768141881	1.00000	19.00000
+
+-- query 156
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1229562.00000	12.50431705159	1.00000	102.00000
+
+-- query 157
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1229900.00000	12.50711845103	1.00000	109.00000
+
+-- query 158
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1230465.00000	12.51350032035	1.00000	114.00000
+
+-- query 159
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1230100.00000	12.50915229418	1.00000	109.00000
+
+-- query 160
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1230560.00000	12.51383013342	1.00000	114.00000
+
+-- query 161
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 162
+sum(wv)	avg(wv)	min(wv)	max(wv)
+688304.00000	6.99951187764	1.00000	19.00000
+
+-- query 163
+sum(wv)	avg(wv)	min(wv)	max(wv)
+196696.00000	2.00024406118	1.00000	3.00000
+
+-- query 164
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 165
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 166
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336.00000	1.00000000000	1.00000	1.00000
+
+-- query 167
+sum(wv)	avg(wv)	min(wv)	max(wv)
+886560.00000	9.01561991539	1.00000	109.00000
+
+-- query 168
+sum(wv)	avg(wv)	min(wv)	max(wv)
+984896.00000	10.01561991539	1.00000	111.00000
+
+-- query 169
+sum(wv)	avg(wv)	min(wv)	max(wv)
+982930.00000	10.00030521925	1.00000	19.00000
+
+-- query 170
+sum(wv)	avg(wv)	min(wv)	max(wv)
+984820.00000	10.01484705500	1.00000	109.00000
+
+-- query 171
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1229322.00000	12.50441964785	1.00000	111.00000
+
+-- query 172
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1230465.00000	12.51286405792	1.00000	109.00000
+
+-- query 173
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1245340.00000	12.66735156798	1.00000	6666.00000
+
+-- query 174
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1230586.00000	12.51409453303	1.00000	111.00000
+
+-- query 175
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1246555.00000	12.67648673934	1.00000	6666.00000
+
+-- query 176
+sum(wv)	avg(wv)	min(wv)	max(wv)
+886560.00000	9.01561991539	1.00000	109.00000
+
+-- query 177
+sum(wv)	avg(wv)	min(wv)	max(wv)
+984896.00000	10.01561991539	1.00000	111.00000
+
+-- query 178
+sum(wv)	avg(wv)	min(wv)	max(wv)
+984896.00000	10.01561991539	1.00000	111.00000
+
+-- query 179
+sum(wv)	avg(wv)	min(wv)	max(wv)
+886576.00000	9.01578262284	1.00000	111.00000
+
+-- query 180
+sum(wv)	avg(wv)	min(wv)	max(wv)
+886576.00000	9.01578262284	1.00000	111.00000
+
+-- query 181
+sum(wv)	avg(wv)	min(wv)	max(wv)
+886560.00000	9.01561991539	1.00000	109.00000
+
+-- query 182
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 183
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 184
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 185
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 186
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 187
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 188
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 189
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 190
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 191
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 192
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 193
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 194
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 195
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 196
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 197
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 198
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 199
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 200
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 201
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 202
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 203
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 204
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 205
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 206
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 207
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 208
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 209
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 210
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 211
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 212
+sum(wv)	avg(wv)	min(wv)	max(wv)
+218502592.00000	2222.00000000000	2222.00000	2222.00000
+
+-- query 213
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76318760.00000	931.30717040074	3.00000	2222.00000
+
+-- query 214
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76296540.00000	931.14964973517	3.00000	2222.00000
+
+-- query 215
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76340980.00000	931.46465262696	3.00000	2222.00000
+
+-- query 216
+sum(wv)	avg(wv)	min(wv)	max(wv)
+158702.00000	3.22689656575	1.00000	2222.00000
+
+-- query 217
+sum(wv)	avg(wv)	min(wv)	max(wv)
+171368.00000	3.48301863783	1.00000	2222.00000
+
+-- query 218
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159738.00000	3.24730133561	1.00000	2222.00000
+
+-- query 219
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159218.00000	3.23705932582	1.00000	2222.00000
+
+-- query 220
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159738.00000	3.24730133561	1.00000	2222.00000
+
+-- query 221
+sum(wv)	avg(wv)	min(wv)	max(wv)
+218502592.00000	2222.00000000000	2222.00000	2222.00000
+
+-- query 222
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76318760.00000	931.30717040074	3.00000	2222.00000
+
+-- query 223
+sum(wv)	avg(wv)	min(wv)	max(wv)
+10237354.00000	104.12703934253	103.00000	2222.00000
+
+-- query 224
+sum(wv)	avg(wv)	min(wv)	max(wv)
+195236408.00000	1985.40115522291	4.00000	2222.00000
+
+-- query 225
+sum(wv)	avg(wv)	min(wv)	max(wv)
+177563752.00000	1805.68410348194	4.00000	2222.00000
+
+-- query 226
+sum(wv)	avg(wv)	min(wv)	max(wv)
+218502592.00000	2222.00000000000	2222.00000	2222.00000
+
+-- query 227
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76369696.00000	776.61991539212	4.00000	2222.00000
+
+-- query 228
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 229
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139188.00000	2.83305515978	1.00000	4.00000
+
+-- query 230
+sum(wv)	avg(wv)	min(wv)	max(wv)
+171292.00000	3.48112018859	1.00000	2222.00000
+
+-- query 231
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139238.00000	2.83320785431	1.00000	4.00000
+
+-- query 232
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159640.00000	3.24530910126	1.00000	2222.00000
+
+-- query 233
+sum(wv)	avg(wv)	min(wv)	max(wv)
+158612.00000	3.22506659076	1.00000	2222.00000
+
+-- query 234
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 235
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159640.00000	3.24530910126	1.00000	2222.00000
+
+-- query 236
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76369696.00000	776.61991539212	4.00000	2222.00000
+
+-- query 237
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 238
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 239
+sum(wv)	avg(wv)	min(wv)	max(wv)
+68271860.00000	694.32776014970	2.00000	2222.00000
+
+-- query 240
+sum(wv)	avg(wv)	min(wv)	max(wv)
+62201588.00000	632.59283215361	2.00000	2222.00000
+
+-- query 241
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76369696.00000	776.61991539212	4.00000	2222.00000
+
+-- query 242
+sum(wv)	avg(wv)	min(wv)	max(wv)
+874010368.00000	8888.00000000000	8888.00000	8888.00000
+
+-- query 243
+sum(wv)	avg(wv)	min(wv)	max(wv)
+441481648.00000	4489.52212821347	19.00000	8888.00000
+
+-- query 244
+sum(wv)	avg(wv)	min(wv)	max(wv)
+441392768.00000	4489.07479201839	19.00000	8888.00000
+
+-- query 245
+sum(wv)	avg(wv)	min(wv)	max(wv)
+441570338.00000	4490.42403595835	19.00000	8888.00000
+
+-- query 246
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1349827.00000	13.72737997173	1.00000	8888.00000
+
+-- query 247
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1429767.00000	14.53960909535	1.00000	8888.00000
+
+-- query 248
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1350789.00000	13.73716325472	1.00000	8888.00000
+
+-- query 249
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1350407.00000	13.73258013342	1.00000	8888.00000
+
+-- query 250
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1350884.00000	13.73743084933	1.00000	8888.00000
+
+-- query 251
+sum(wv)	avg(wv)	min(wv)	max(wv)
+874010368.00000	8888.00000000000	8888.00000	8888.00000
+
+-- query 252
+sum(wv)	avg(wv)	min(wv)	max(wv)
+441481648.00000	4489.52212821347	19.00000	8888.00000
+
+-- query 253
+sum(wv)	avg(wv)	min(wv)	max(wv)
+442675292.00000	4501.66055157826	111.00000	8888.00000
+
+-- query 254
+sum(wv)	avg(wv)	min(wv)	max(wv)
+804735408.00000	8183.52798568174	24.00000	8888.00000
+
+-- query 255
+sum(wv)	avg(wv)	min(wv)	max(wv)
+812605800.00000	8263.56369996746	24.00000	8888.00000
+
+-- query 256
+sum(wv)	avg(wv)	min(wv)	max(wv)
+874010368.00000	8888.00000000000	8888.00000	8888.00000
+
+-- query 257
+sum(wv)	avg(wv)	min(wv)	max(wv)
+295903392.00000	3009.10543442890	16.00000	8888.00000
+
+-- query 258
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148641052.00000	1511.56292710706	3.00000	8888.00000
+
+-- query 259
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148549000.00000	1511.33380811883	3.00000	8888.00000
+
+-- query 260
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148731022.00000	1512.47785144810	3.00000	8888.00000
+
+-- query 261
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1299287.00000	13.21608975598	1.00000	8888.00000
+
+-- query 262
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1395407.00000	14.19019484217	1.00000	8888.00000
+
+-- query 263
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1349105.00000	13.72282857463	1.00000	8888.00000
+
+-- query 264
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1316537.00000	13.38814879596	1.00000	8888.00000
+
+-- query 265
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1350386.00000	13.73236657989	1.00000	8888.00000
+
+-- query 266
+sum(wv)	avg(wv)	min(wv)	max(wv)
+295903392.00000	3009.10543442890	16.00000	8888.00000
+
+-- query 267
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148641052.00000	1511.56292710706	3.00000	8888.00000
+
+-- query 268
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148641052.00000	1511.56292710706	3.00000	8888.00000
+
+-- query 269
+sum(wv)	avg(wv)	min(wv)	max(wv)
+272560412.00000	2771.72563455906	8.00000	8888.00000
+
+-- query 270
+sum(wv)	avg(wv)	min(wv)	max(wv)
+275309852.00000	2799.68528311097	8.00000	8888.00000
+
+-- query 271
+sum(wv)	avg(wv)	min(wv)	max(wv)
+295903392.00000	3009.10543442890	16.00000	8888.00000
+
+-- query 272
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 273
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 274
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 275
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 276
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 277
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 278
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 279
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 280
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 281
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 282
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 283
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 284
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 285
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 286
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 287
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 288
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 289
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 290
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 291
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 292
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 293
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 294
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 295
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 296
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 297
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 298
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 299
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 300
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 301
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 302
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 303
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 304
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 305
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 306
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146546.00000	2.98087954111	1.00000	2222.00000
+
+-- query 307
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146750.00000	2.98490765601	1.00000	2222.00000
+
+-- query 308
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 309
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146750.00000	2.98490765601	1.00000	2222.00000
+
+-- query 310
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 311
+sum(wv)	avg(wv)	min(wv)	max(wv)
+295008.00000	3.00000000000	3.00000	3.00000
+
+-- query 312
+sum(wv)	avg(wv)	min(wv)	max(wv)
+245844.00000	3.00000000000	3.00000	3.00000
+
+-- query 313
+sum(wv)	avg(wv)	min(wv)	max(wv)
+245814.00000	3.00000000000	3.00000	3.00000
+
+-- query 314
+sum(wv)	avg(wv)	min(wv)	max(wv)
+245874.00000	3.00000000000	3.00000	3.00000
+
+-- query 315
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146985.00000	2.98865415506	1.00000	2222.00000
+
+-- query 316
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147533.00000	2.99857726469	1.00000	2222.00000
+
+-- query 317
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148015.00000	3.00898538351	1.00000	2222.00000
+
+-- query 318
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147498.00000	2.99878014069	1.00000	2222.00000
+
+-- query 319
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148015.00000	3.00898538351	1.00000	2222.00000
+
+-- query 320
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 321
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 322
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 323
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 324
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139188.00000	2.83305515978	1.00000	4.00000
+
+-- query 325
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139238.00000	2.83320785431	1.00000	4.00000
+
+-- query 326
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146960.00000	2.98905747875	1.00000	2222.00000
+
+-- query 327
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139238.00000	2.83320785431	1.00000	4.00000
+
+-- query 328
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 329
+sum(wv)	avg(wv)	min(wv)	max(wv)
+231040.00000	2.34949560690	1.00000	103.00000
+
+-- query 330
+sum(wv)	avg(wv)	min(wv)	max(wv)
+115520.00000	2.34949560690	1.00000	103.00000
+
+-- query 331
+sum(wv)	avg(wv)	min(wv)	max(wv)
+114634.00000	2.33327905557	1.00000	3.00000
+
+-- query 332
+sum(wv)	avg(wv)	min(wv)	max(wv)
+116406.00000	2.36568711133	1.00000	103.00000
+
+-- query 333
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139223.00000	2.83290263506	1.00000	4.00000
+
+-- query 334
+sum(wv)	avg(wv)	min(wv)	max(wv)
+140940.00000	2.86515826066	1.00000	103.00000
+
+-- query 335
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146995.00000	2.98885748561	1.00000	2222.00000
+
+-- query 336
+sum(wv)	avg(wv)	min(wv)	max(wv)
+140089.00000	2.84919053043	1.00000	103.00000
+
+-- query 337
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148015.00000	3.00898538351	1.00000	2222.00000
+
+-- query 338
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868384.00000	19.00000000000	19.00000	19.00000
+
+-- query 339
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868384.00000	19.00000000000	19.00000	19.00000
+
+-- query 340
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868194.00000	19.00000000000	19.00000	19.00000
+
+-- query 341
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868384.00000	19.00000000000	19.00000	19.00000
+
+-- query 342
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270480.00000	12.92044217998	1.00000	8888.00000
+
+-- query 343
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271029.00000	12.92536812561	1.00000	8888.00000
+
+-- query 344
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271401.00000	12.92980850393	1.00000	8888.00000
+
+-- query 345
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271029.00000	12.92536812561	1.00000	8888.00000
+
+-- query 346
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 347
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868384.00000	19.00000000000	19.00000	19.00000
+
+-- query 348
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868384.00000	19.00000000000	19.00000	19.00000
+
+-- query 349
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868194.00000	19.00000000000	19.00000	19.00000
+
+-- query 350
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1868384.00000	19.00000000000	19.00000	19.00000
+
+-- query 351
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270480.00000	12.92044217998	1.00000	8888.00000
+
+-- query 352
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271029.00000	12.92536812561	1.00000	8888.00000
+
+-- query 353
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271401.00000	12.92980850393	1.00000	8888.00000
+
+-- query 354
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271029.00000	12.92536812561	1.00000	8888.00000
+
+-- query 355
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 356
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1083232.00000	11.01561991539	3.00000	111.00000
+
+-- query 357
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1083232.00000	11.01561991539	3.00000	111.00000
+
+-- query 358
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1081190.00000	11.00000000000	3.00000	19.00000
+
+-- query 359
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1083232.00000	11.01561991539	3.00000	111.00000
+
+-- query 360
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254227.00000	12.75774836997	1.00000	8888.00000
+
+-- query 361
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1255517.00000	12.76762325089	1.00000	8888.00000
+
+-- query 362
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270245.00000	12.92068029010	1.00000	8888.00000
+
+-- query 363
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1255517.00000	12.76762325089	1.00000	8888.00000
+
+-- query 364
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 365
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1083232.00000	11.01561991539	3.00000	111.00000
+
+-- query 366
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1083232.00000	11.01561991539	3.00000	111.00000
+
+-- query 367
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1081190.00000	11.00000000000	3.00000	19.00000
+
+-- query 368
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1083232.00000	11.01561991539	3.00000	111.00000
+
+-- query 369
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254227.00000	12.75774836997	1.00000	8888.00000
+
+-- query 370
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1255517.00000	12.76762325089	1.00000	8888.00000
+
+-- query 371
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270245.00000	12.92068029010	1.00000	8888.00000
+
+-- query 372
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1255517.00000	12.76762325089	1.00000	8888.00000
+
+-- query 373
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 374
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 375
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 376
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 377
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 378
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 379
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 380
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 381
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 382
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 383
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 384
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 385
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 386
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 387
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 388
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 389
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 390
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 391
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 392
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 393
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 394
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 395
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 396
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 397
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 398
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 399
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 400
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 401
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 402
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 403
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 404
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 405
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 406
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 407
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 408
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 409
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 410
+sum(wv)	avg(wv)	min(wv)	max(wv)
+10226944.00000	104.00000000000	104.00000	104.00000
+
+-- query 411
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 412
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146546.00000	2.98087954111	1.00000	2222.00000
+
+-- query 413
+sum(wv)	avg(wv)	min(wv)	max(wv)
+148204.00000	3.01362397820	1.00000	2222.00000
+
+-- query 414
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146750.00000	2.98490765601	1.00000	2222.00000
+
+-- query 415
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147684.00000	3.00335549997	1.00000	2222.00000
+
+-- query 416
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147684.00000	3.00335549997	1.00000	2222.00000
+
+-- query 417
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 418
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147684.00000	3.00335549997	1.00000	2222.00000
+
+-- query 419
+sum(wv)	avg(wv)	min(wv)	max(wv)
+10226944.00000	104.00000000000	104.00000	104.00000
+
+-- query 420
+sum(wv)	avg(wv)	min(wv)	max(wv)
+38257188.00000	466.84712256553	1.00000	2222.00000
+
+-- query 421
+sum(wv)	avg(wv)	min(wv)	max(wv)
+38256162.00000	466.89157655789	1.00000	2222.00000
+
+-- query 422
+sum(wv)	avg(wv)	min(wv)	max(wv)
+38258228.00000	466.80285024037	1.00000	2222.00000
+
+-- query 423
+sum(wv)	avg(wv)	min(wv)	max(wv)
+158702.00000	3.22689656575	1.00000	2222.00000
+
+-- query 424
+sum(wv)	avg(wv)	min(wv)	max(wv)
+171368.00000	3.48301863783	1.00000	2222.00000
+
+-- query 425
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159738.00000	3.24730133561	1.00000	2222.00000
+
+-- query 426
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159218.00000	3.23705932582	1.00000	2222.00000
+
+-- query 427
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159738.00000	3.24730133561	1.00000	2222.00000
+
+-- query 428
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76369696.00000	776.61991539212	4.00000	2222.00000
+
+-- query 429
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 430
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139188.00000	2.83305515978	1.00000	4.00000
+
+-- query 431
+sum(wv)	avg(wv)	min(wv)	max(wv)
+171292.00000	3.48112018859	1.00000	2222.00000
+
+-- query 432
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139238.00000	2.83320785431	1.00000	4.00000
+
+-- query 433
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159640.00000	3.24530910126	1.00000	2222.00000
+
+-- query 434
+sum(wv)	avg(wv)	min(wv)	max(wv)
+158612.00000	3.22506659076	1.00000	2222.00000
+
+-- query 435
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 436
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159640.00000	3.24530910126	1.00000	2222.00000
+
+-- query 437
+sum(wv)	avg(wv)	min(wv)	max(wv)
+76369696.00000	776.61991539212	4.00000	2222.00000
+
+-- query 438
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 439
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139188.00000	2.83305515978	1.00000	4.00000
+
+-- query 440
+sum(wv)	avg(wv)	min(wv)	max(wv)
+171292.00000	3.48112018859	1.00000	2222.00000
+
+-- query 441
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139238.00000	2.83320785431	1.00000	4.00000
+
+-- query 442
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159640.00000	3.24530910126	1.00000	2222.00000
+
+-- query 443
+sum(wv)	avg(wv)	min(wv)	max(wv)
+158612.00000	3.22506659076	1.00000	2222.00000
+
+-- query 444
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 445
+sum(wv)	avg(wv)	min(wv)	max(wv)
+159640.00000	3.24530910126	1.00000	2222.00000
+
+-- query 446
+sum(wv)	avg(wv)	min(wv)	max(wv)
+11210304.00000	114.00000000000	114.00000	114.00000
+
+-- query 447
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 448
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270385.00000	12.92013302687	1.00000	8888.00000
+
+-- query 449
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1272446.00000	12.93977790433	1.00000	8888.00000
+
+-- query 450
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270934.00000	12.92505923869	1.00000	8888.00000
+
+-- query 451
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271971.00000	12.93494752685	1.00000	8888.00000
+
+-- query 452
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271876.00000	12.93463912703	1.00000	8888.00000
+
+-- query 453
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 454
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271971.00000	12.93494752685	1.00000	8888.00000
+
+-- query 455
+sum(wv)	avg(wv)	min(wv)	max(wv)
+11210304.00000	114.00000000000	114.00000	114.00000
+
+-- query 456
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 457
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270385.00000	12.92013302687	1.00000	8888.00000
+
+-- query 458
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1272446.00000	12.93977790433	1.00000	8888.00000
+
+-- query 459
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270934.00000	12.92505923869	1.00000	8888.00000
+
+-- query 460
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271971.00000	12.93494752685	1.00000	8888.00000
+
+-- query 461
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271876.00000	12.93463912703	1.00000	8888.00000
+
+-- query 462
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 463
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271971.00000	12.93494752685	1.00000	8888.00000
+
+-- query 464
+sum(wv)	avg(wv)	min(wv)	max(wv)
+222944000.00000	2267.16563618614	14.00000	6666.00000
+
+-- query 465
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 466
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1253420.00000	12.75226370943	1.00000	8888.00000
+
+-- query 467
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1339210.00000	13.61871542467	1.00000	8888.00000
+
+-- query 468
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254282.00000	12.75830781906	1.00000	8888.00000
+
+-- query 469
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1305355.00000	13.27443662545	1.00000	8888.00000
+
+-- query 470
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1304100.00000	13.26504663771	1.00000	8888.00000
+
+-- query 471
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 472
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1305355.00000	13.27443662545	1.00000	8888.00000
+
+-- query 473
+sum(wv)	avg(wv)	min(wv)	max(wv)
+222944000.00000	2267.16563618614	14.00000	6666.00000
+
+-- query 474
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 475
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1253420.00000	12.75226370943	1.00000	8888.00000
+
+-- query 476
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1339210.00000	13.61871542467	1.00000	8888.00000
+
+-- query 477
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254282.00000	12.75830781906	1.00000	8888.00000
+
+-- query 478
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1305355.00000	13.27443662545	1.00000	8888.00000
+
+-- query 479
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1304100.00000	13.26504663771	1.00000	8888.00000
+
+-- query 480
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271496.00000	12.93011714937	1.00000	8888.00000
+
+-- query 481
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1305355.00000	13.27443662545	1.00000	8888.00000
+
+-- query 482
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 483
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 484
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 485
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 486
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 487
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 488
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 489
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 490
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 491
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 492
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 493
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 494
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 495
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 496
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 497
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 498
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 499
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 500
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 501
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 502
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 503
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 504
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 505
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 506
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 507
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 508
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 509
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 510
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 511
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 512
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 513
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 514
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 515
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 516
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 517
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 518
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 519
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 520
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 521
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 522
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 523
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 524
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 525
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 526
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 527
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 528
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 529
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 530
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 531
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 532
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 533
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 534
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 535
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 536
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 537
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 538
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 539
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 540
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 541
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 542
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 543
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 544
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 545
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 546
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 547
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 548
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 549
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 550
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4834935248	49167.499674585095	1	98335
+
+-- query 551
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4797309456	48784.874877969414	1	97569
+
+-- query 552
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4683989472	47632.49951187764	1	95265
+
+-- query 553
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 554
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 555
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 556
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 557
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1598648464	16257.001138952164	1	32521
+
+-- query 558
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1560887440	15873.001138952164	1	31753
+
+-- query 559
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 560
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 561
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 562
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544274064	15704.056134070941	1	49167
+
+-- query 563
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1532324008	15582.533436381385	1	48785
+
+-- query 564
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1496129676	15214.465465343314	1	47633
+
+-- query 565
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 566
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 567
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 568
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 569
+sum(wv)	avg(wv)	min(wv)	max(wv)
+199852064	2032.3387569150666	1	4065
+
+-- query 570
+sum(wv)	avg(wv)	min(wv)	max(wv)
+195133472	1984.354376830459	1	3969
+
+-- query 571
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 572
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 573
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 574
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4834935248	49167.499674585095	1	98335
+
+-- query 575
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4797309456	48784.874877969414	1	97569
+
+-- query 576
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4683989472	47632.49951187764	1	95265
+
+-- query 577
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 578
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 579
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 580
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 581
+sum(wv)	avg(wv)	min(wv)	max(wv)
+6341168	64.48470549951188	1	128
+
+-- query 582
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1622192	16.49642043605597	1	32
+
+-- query 583
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 584
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 585
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 586
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 587
+sum(wv)	avg(wv)	min(wv)	max(wv)
+6340832	64.48128864301985	1	128
+
+-- query 588
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1622176	16.49625772860397	1	32
+
+-- query 589
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 590
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 591
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1544339624	15704.722827855516	1	49168
+
+-- query 592
+sum(wv)	avg(wv)	min(wv)	max(wv)
+604225608	6144.500569476082	1	16388
+
+-- query 593
+sum(wv)	avg(wv)	min(wv)	max(wv)
+6340888	64.48185811910186	1	128
+
+-- query 594
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1622096	16.495444191343964	1	32
+
+-- query 595
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 596
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 597
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 598
+sum(wv)	avg(wv)	min(wv)	max(wv)
+201375776	2047.8337129840547	1	4096
+
+-- query 599
+sum(wv)	avg(wv)	min(wv)	max(wv)
+6340640	64.47933615359584	1	128
+
+-- query 600
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1622048	16.49495606898796	1	32
+
+-- query 601
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 602
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 603
+sum(wv)	avg(wv)	min(wv)	max(wv)
+4835033616	49168.5	1	98336
+
+-- query 604
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1611186320	16384.501301659617	1	32776
+
+-- query 605
+sum(wv)	avg(wv)	min(wv)	max(wv)
+6341168	64.48470549951188	1	128
+
+-- query 606
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1622192	16.49642043605597	1	32
+
+-- query 607
+sum(wv)	avg(wv)	min(wv)	max(wv)
+98336	1	1	1
+
+-- query 608
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 609
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 610
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147159.00000	2.99267890916	-1.00000	2222.00000
+
+-- query 611
+sum(wv)	avg(wv)	min(wv)	max(wv)
+262681.00000	2.67128692734	1.00000	2222.00000
+
+-- query 612
+sum(wv)	avg(wv)	min(wv)	max(wv)
+262683.00000	2.67136159784	1.00000	2222.00000
+
+-- query 613
+sum(wv)	avg(wv)	min(wv)	max(wv)
+262256.00000	2.66693784575	-1.00000	2222.00000
+
+-- query 614
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 615
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147164.00000	2.99308493329	1.00000	2222.00000
+
+-- query 616
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146935.00000	2.98703014779	-1.00000	2222.00000
+
+-- query 617
+sum(wv)	avg(wv)	min(wv)	max(wv)
+262473.00000	2.66928028801	1.00000	2222.00000
+
+-- query 618
+sum(wv)	avg(wv)	min(wv)	max(wv)
+262057.00000	2.66532073514	1.00000	2222.00000
+
+-- query 619
+sum(wv)	avg(wv)	min(wv)	max(wv)
+260982.00000	2.65398226489	-1.00000	2222.00000
+
+-- query 620
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271477.00000	12.93005542279	1.00000	8888.00000
+
+-- query 621
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271439.00000	12.92993196587	1.00000	8888.00000
+
+-- query 622
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271396.00000	12.92910022779	-1.00000	8888.00000
+
+-- query 623
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271477.00000	12.93005542279	1.00000	8888.00000
+
+-- query 624
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271439.00000	12.92993196587	1.00000	8888.00000
+
+-- query 625
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271396.00000	12.92910022779	-1.00000	8888.00000
+
+-- query 626
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271249.00000	12.92826270454	1.00000	8888.00000
+
+-- query 627
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270745.00000	12.92445154138	1.00000	8888.00000
+
+-- query 628
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270220.00000	12.91714123007	-1.00000	8888.00000
+
+-- query 629
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271249.00000	12.92826270454	1.00000	8888.00000
+
+-- query 630
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270745.00000	12.92445154138	1.00000	8888.00000
+
+-- query 631
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270220.00000	12.91714123007	-1.00000	8888.00000
+
+-- query 632
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 633
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 634
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-5.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 635
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 636
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 637
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-98336.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 638
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 639
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 640
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-25.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 641
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 642
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 643
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-98336.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 644
+sum(wv)	avg(wv)	min(wv)	max(wv)
+147060.00000	2.99103056928	1.00000	2222.00000
+
+-- query 645
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146853.00000	2.98694193023	1.00000	2222.00000
+
+-- query 646
+sum(wv)	avg(wv)	min(wv)	max(wv)
+146745.00000	2.98450243039	-1.00000	2222.00000
+
+-- query 647
+sum(wv)	avg(wv)	min(wv)	max(wv)
+38257084.00000	466.85155039233	1.00000	2222.00000
+
+-- query 648
+sum(wv)	avg(wv)	min(wv)	max(wv)
+20037861.00000	244.52817133443	1.00000	2222.00000
+
+-- query 649
+sum(wv)	avg(wv)	min(wv)	max(wv)
+228607.00000	2.32475390498	-1.00000	2222.00000
+
+-- query 650
+sum(wv)	avg(wv)	min(wv)	max(wv)
+144628.00000	2.94180582959	1.00000	2222.00000
+
+-- query 651
+sum(wv)	avg(wv)	min(wv)	max(wv)
+140670.00000	2.86188025146	1.00000	1111.00000
+
+-- query 652
+sum(wv)	avg(wv)	min(wv)	max(wv)
+139213.00000	2.83125889770	-1.00000	4.00000
+
+-- query 653
+sum(wv)	avg(wv)	min(wv)	max(wv)
+144628.00000	2.94180582959	1.00000	2222.00000
+
+-- query 654
+sum(wv)	avg(wv)	min(wv)	max(wv)
+140670.00000	2.86188025146	1.00000	1111.00000
+
+-- query 655
+sum(wv)	avg(wv)	min(wv)	max(wv)
+90047.00000	0.91570737065	-1.00000	4.00000
+
+-- query 656
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271382.00000	12.92908933747	1.00000	8888.00000
+
+-- query 657
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271159.00000	12.92708449859	1.00000	8888.00000
+
+-- query 658
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270929.00000	12.92435120404	-1.00000	8888.00000
+
+-- query 659
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271382.00000	12.92908933747	1.00000	8888.00000
+
+-- query 660
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1271159.00000	12.92708449859	1.00000	8888.00000
+
+-- query 661
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1270929.00000	12.92435120404	-1.00000	8888.00000
+
+-- query 662
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1264474.00000	12.85936276454	1.00000	8888.00000
+
+-- query 663
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1256000.00000	12.77448357930	1.00000	8888.00000
+
+-- query 664
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254257.00000	12.75481003905	-1.00000	8888.00000
+
+-- query 665
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1264474.00000	12.85936276454	1.00000	8888.00000
+
+-- query 666
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1256000.00000	12.77448357930	1.00000	8888.00000
+
+-- query 667
+sum(wv)	avg(wv)	min(wv)	max(wv)
+1254257.00000	12.75481003905	-1.00000	8888.00000
+
+-- query 668
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 669
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 670
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-5.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 671
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 672
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 673
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-98336.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 674
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 675
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 676
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-25.00000	-1.00000000000	-1.00000	-1.00000
+
+-- query 677
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 678
+sum(wv)	avg(wv)	min(wv)	max(wv)
+NULL	NULL	NULL	NULL
+
+-- query 679
+sum(wv)	avg(wv)	min(wv)	max(wv)
+-98336.00000	-1.00000000000	-1.00000	-1.00000

@@ -2620,7 +2620,7 @@ fn json_value_to_arrow_singleton_array(
         Int8Array, Int16Array, Int32Array, Int64Array,
         Float32Array, Float64Array,
     };
-    use arrow::datatypes::{Fields, i256};
+    use arrow::datatypes::Fields;
     use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 
     if json.is_null() {

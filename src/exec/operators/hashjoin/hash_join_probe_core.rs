@@ -821,7 +821,6 @@ impl HashJoinProbeCore {
             return Ok(Some(self.extend_with_null_probe_columns(build_batch)?));
         }
 
-        let probe_chunk_schema = Arc::clone(self.probe_chunk_schema());
         let output_schema = probe_chunks[0].schema();
 
         let is_semi = matches!(self.join_type, JoinType::LeftSemi | JoinType::RightSemi);

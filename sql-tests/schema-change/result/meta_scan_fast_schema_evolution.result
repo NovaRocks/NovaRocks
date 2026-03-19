@@ -1,0 +1,25 @@
+-- query 5
+dict_merge(v2, 255)
+{"2":{"lst":["str",2,"LTEwMDA","OQ"]},"3":{"lst":["i32",2,1,2]}}
+
+-- query 6
+Table	Op	Msg_type	Msg_text
+db_sqlt_6584f4d760e3e36e.reproducex4	analyze	status	OK
+
+-- query 8
+v2	count(*)
+-1000	3
+9	1
+
+-- query 13
+dict_merge(v2, 255)
+{"2":{"lst":["str",2,"LTEwMDA","OQ"]},"3":{"lst":["i32",2,1,2]}}
+
+-- query 14
+Table	Op	Msg_type	Msg_text
+db_sqlt_6584f4d760e3e36e.reproducex4	analyze	status	OK
+
+-- query 16
+v2	count(*)
+-1000	3
+9	1

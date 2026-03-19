@@ -314,6 +314,11 @@ fn select_aggregate_inputs(
         "dict_merge" if is_merge => {
             return select_first_for_merge(args, "dict_merge");
         }
+        // Merge max_by/min_by consumes serialized intermediate state only; FE may still keep
+        // original value/key arguments on the merge node.
+        "max_by" | "max_by_v2" | "min_by" | "min_by_v2" if is_merge => {
+            return select_first_for_merge(args, fn_name);
+        }
         // Merge percentile_approx consumes serialized intermediate state; FE may still carry
         // constant quantile/compression arguments in the merge-stage function call.
         "percentile_approx" | "percentile_approx_weighted" if is_merge => {

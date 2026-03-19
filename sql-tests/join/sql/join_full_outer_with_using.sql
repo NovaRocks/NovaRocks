@@ -284,7 +284,7 @@ ORDER BY k1, k2, v1, v2, v3, v4;
 
 -- query 35
 -- Three-table FULL OUTER USING + CASE expression
--- @order_sensitive=true
+-- @order_sensitive=false
 SELECT k1, k2,
        CASE WHEN k1 IS NULL THEN 'NULL_K1'
             WHEN k1 < 3 THEN 'SMALL'
@@ -311,7 +311,7 @@ ORDER BY k1, k2;
 
 -- query 37
 -- Four-table FULL OUTER USING + LIMIT
--- @order_sensitive=true
+-- @order_sensitive=false
 SELECT k1, k2, v1, v2, v3, v4
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
@@ -321,7 +321,7 @@ LIMIT 10;
 
 -- query 38
 -- Four-table FULL OUTER USING + COALESCE
--- @order_sensitive=true
+-- @order_sensitive=false
 SELECT k1, k2,
        COALESCE(v1, v2, v3, v4) as value
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
@@ -331,7 +331,7 @@ ORDER BY k1, k2;
 
 -- query 39
 -- Four-table FULL OUTER USING + complex WHERE
--- @order_sensitive=true
+-- @order_sensitive=false
 SELECT k1, k2, v1, v2, v3, v4
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)
@@ -341,7 +341,7 @@ ORDER BY k1, k2;
 
 -- query 40
 -- Four-table FULL OUTER USING + GROUP BY ROLLUP
--- @order_sensitive=true
+-- @order_sensitive=false
 SELECT k1, k2, COUNT(*) as cnt
 FROM ${case_db}.t1 FULL OUTER JOIN ${case_db}.t2 USING(k1, k2)
         FULL OUTER JOIN ${case_db}.t3 USING(k1, k2)

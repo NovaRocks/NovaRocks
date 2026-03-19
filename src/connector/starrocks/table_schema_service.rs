@@ -556,6 +556,7 @@ mod tests {
                 is_key: Some(true),
                 is_allow_null: Some(false),
                 default_value: Some("1".to_string()),
+                default_expr: None,
                 is_bloom_filter_column: Some(false),
                 define_expr: None,
                 is_auto_increment: Some(false),

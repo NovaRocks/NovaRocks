@@ -263,6 +263,8 @@ fn lower_window_function(
         "max" => WindowFunctionKind::Max,
         "bitmap_union" => WindowFunctionKind::BitmapUnion,
         "bitmap_union_count" => WindowFunctionKind::BitmapUnionCount,
+        "max_by" => WindowFunctionKind::MaxBy,
+        "max_by_v2" => WindowFunctionKind::MaxByV2,
         "min_by" => WindowFunctionKind::MinBy,
         "min_by_v2" => WindowFunctionKind::MinByV2,
         "var_samp" | "variance_samp" => WindowFunctionKind::VarianceSamp,
@@ -336,6 +338,8 @@ fn lower_window_function(
     if matches!(
         kind,
         WindowFunctionKind::ArrayAgg { .. }
+            | WindowFunctionKind::MaxBy
+            | WindowFunctionKind::MaxByV2
             | WindowFunctionKind::MinBy
             | WindowFunctionKind::MinByV2
     ) {
@@ -566,28 +570,34 @@ fn validate_window_function_signature(
                 return Err("bitmap_union/bitmap_union_count expects 1 argument".to_string());
             }
         }
-        WindowFunctionKind::MinBy | WindowFunctionKind::MinByV2 => {
+        WindowFunctionKind::MaxBy
+        | WindowFunctionKind::MaxByV2
+        | WindowFunctionKind::MinBy
+        | WindowFunctionKind::MinByV2 => {
             if args.len() != 1 {
-                return Err("min_by/min_by_v2 expects 1 packed struct argument".to_string());
+                return Err(
+                    "max_by/max_by_v2/min_by/min_by_v2 expects 1 packed struct argument"
+                        .to_string(),
+                );
             }
             let arg0_type = arena
                 .data_type(args[0])
                 .ok_or_else(|| "missing arg type in arena".to_string())?;
             let DataType::Struct(fields) = arg0_type else {
                 return Err(format!(
-                    "min_by/min_by_v2 expects packed struct input, got {:?}",
+                    "max_by/max_by_v2/min_by/min_by_v2 expects packed struct input, got {:?}",
                     arg0_type
                 ));
             };
             if fields.len() != 2 {
                 return Err(format!(
-                    "min_by/min_by_v2 expects 2 struct fields, got {}",
+                    "max_by/max_by_v2/min_by/min_by_v2 expects 2 struct fields, got {}",
                     fields.len()
                 ));
             }
             if fields[0].data_type() != return_type {
                 return Err(format!(
-                    "min_by/min_by_v2 return type mismatch: arg={:?} ret={:?}",
+                    "max_by/max_by_v2/min_by/min_by_v2 return type mismatch: arg={:?} ret={:?}",
                     fields[0].data_type(),
                     return_type
                 ));

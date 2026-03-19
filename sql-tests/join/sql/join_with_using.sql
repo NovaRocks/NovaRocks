@@ -86,7 +86,7 @@ SELECT id1, id2 FROM ${case_db}.left_table RIGHT JOIN ${case_db}.right_table USI
 -- query 13
 -- FULL OUTER JOIN with multi-key USING
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table FULL OUTER JOIN ${case_db}.right_table USING(id1, id2) ORDER BY right_table.dept, right_table.bonus;
+SELECT * FROM ${case_db}.left_table FULL OUTER JOIN ${case_db}.right_table USING(id1, id2) ORDER BY right_table.dept, right_table.bonus, id1;
 
 -- query 14
 -- INNER JOIN with single-key USING
@@ -135,7 +135,7 @@ SELECT * FROM ${case_db}.left_table RIGHT JOIN ${case_db}.right_table USING(id1)
 -- query 23
 -- Single-key USING: FULL OUTER JOIN
 -- @order_sensitive=true
-SELECT * FROM ${case_db}.left_table FULL OUTER JOIN ${case_db}.right_table USING(id1) ORDER BY right_table.dept, right_table.bonus;
+SELECT * FROM ${case_db}.left_table FULL OUTER JOIN ${case_db}.right_table USING(id1) ORDER BY right_table.dept, right_table.bonus, id1;
 
 -- query 24
 -- Single-key USING: LEFT SEMI JOIN
