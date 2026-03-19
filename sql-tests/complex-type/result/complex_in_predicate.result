@@ -1,0 +1,671 @@
+-- query 2
+js IN ((parse_json('{}')), (json_object('a', 1)))
+NULL
+NULL
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+1
+1
+
+-- query 3
+js NOT IN ((parse_json('{}')), (json_object('a', 1)))
+NULL
+NULL
+NULL
+0
+0
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 4
+(parse_json('{}')) IN (js, (json_object('a', 1)))
+NULL
+NULL
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+1
+
+-- query 5
+(parse_json('{}')) NOT IN (js, (json_object('a', 1)))
+NULL
+NULL
+NULL
+0
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 6
+js IN (NULL, (json_object('a', 1)))
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+1
+
+-- query 7
+js NOT IN (NULL)
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 8
+NULL IN (js, (json_object('a', 1)))
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 9
+NULL NOT IN (js, (json_object('a', 3)))
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+NULL
+
+-- query 10
+js IN (1, 3, (json_object('a', 2)))
+NULL
+NULL
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+-- query 11
+js NOT IN (2, 3)
+NULL
+NULL
+NULL
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 12
+js IN (1, 3, v1, (json_object('a', 11)))
+NULL
+NULL
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+-- query 13
+js NOT IN (2, 3, v1)
+NULL
+NULL
+NULL
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 14
+js IN ((json_object('a', 1)), (json_object('ab', 12, 'bc', 4)), (json_object('ab', 14)), (json_object('ac', 15, '6b', 46)))
+NULL
+NULL
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+1
+
+-- query 15
+js NOT IN ((json_object('a', 1)), (json_object('ab', 13, 'b', 4)))
+NULL
+NULL
+NULL
+0
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 18
+array1 IN (([]), ([1]))
+NULL
+0
+0
+0
+0
+0
+0
+0
+1
+0
+0
+0
+1
+
+-- query 19
+array1 NOT IN (([]), ([1]))
+NULL
+1
+1
+1
+1
+1
+1
+1
+0
+1
+1
+1
+0
+
+-- query 20
+array1 IN (([NULL]), ([]))
+NULL
+0
+0
+0
+0
+0
+0
+0
+1
+0
+0
+0
+1
+
+-- query 21
+array1 NOT IN (([NULL]), ([3]))
+NULL
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 22
+array1 IN (([1, NULL, 2]), ([]))
+NULL
+0
+0
+0
+0
+0
+0
+0
+1
+0
+0
+0
+1
+
+-- query 23
+array1 NOT IN (([1, NULL, 2]), ([]))
+NULL
+1
+1
+1
+1
+1
+1
+1
+0
+1
+1
+1
+0
+
+-- query 24
+([]) IN (array1)	([]) NOT IN (array1)	([NULL]) IN (array1)	([NULL]) NOT IN (array1)	([]) IN (array2)	([]) NOT IN (array2)	([NULL]) IN (array2)	([NULL]) NOT IN (array2)	([]) IN (array3)	([]) NOT IN (array3)	([NULL]) IN (array3)	([NULL]) NOT IN (array3)
+NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	1	0	0	1	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	1	0	0	1
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+0	1	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+1	0	0	1	0	1	NULL	NULL	0	1	0	1
+1	0	0	1	0	1	NULL	NULL	0	1	NULL	NULL
+
+-- query 25
+array2 IN (([]), ([map{}]))	array2 IN (([NULL]), ([map{1:3}]))	array2 IN (([map{1:10,3:30,2:20}]), ([map{}]))
+NULL	NULL	NULL
+0	0	0
+0	0	0
+0	0	1
+0	0	0
+0	0	0
+0	1	0
+0	0	1
+0	0	1
+0	0	0
+0	0	0
+1	0	0
+1	0	1
+
+-- query 26
+array2 NOT IN (([]), ([map{}]))	array2 NOT IN (([NULL]), ([map{1:3}]))	array2 NOT IN (([map{1:10,3:30,2:20}]), ([map{3:3}]))
+NULL	NULL	NULL
+0	1	1
+0	1	1
+1	1	1
+1	1	0
+1	1	1
+1	1	1
+1	1	1
+1	0	1
+1	1	0
+1	1	0
+1	1	1
+1	1	1
+
+-- query 27
+array3 IN (([]))	array3 NOT IN (([]))	array3 IN (([NULL]))	array3 NOT IN (([NULL]))	array3 IN (([row(1, 2)]), ([NULL]))	array3 NOT IN (([row(1, 2)]), ([NULL]))
+NULL	NULL	NULL	NULL	NULL	NULL
+0	1	NULL	NULL	0	1
+0	1	NULL	NULL	0	1
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	NULL	NULL	1	0
+0	1	0	1	0	1
+1	0	0	1	0	1
+
+-- query 28
+array1 IN (NULL)	array1 NOT IN (NULL)	array2 IN (NULL)	array2 NOT IN (NULL)	array3 IN (NULL)	array3 NOT IN (NULL)
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 29
+NULL IN (array1)	NULL NOT IN (array1)	NULL IN (array2)	NULL NOT IN (array2)	NULL IN (array3)	NULL NOT IN (array3)
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 32
+map1 IN ((map{}))	map1 NOT IN ((map{}))	map2 IN ((map{}))	map2 NOT IN ((map{}))	map3 IN ((map{}))	map3 NOT IN ((map{}))
+NULL	NULL	NULL	NULL	NULL	NULL
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	1	0
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+1	0	0	1	0	1
+1	0	0	1	0	1
+1	0	0	1	0	1
+
+-- query 33
+map1 IN (NULL)	map1 NOT IN (NULL)	map2 IN (NULL)	map2 NOT IN (NULL)	map3 IN (NULL)	map3 NOT IN (NULL)
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 34
+NULL IN (map1)	NULL NOT IN (map1)	NULL IN (map2)	NULL NOT IN (map2)	NULL IN (map3)	NULL NOT IN (map3)
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL	NULL	NULL
+
+-- query 35
+(map{}) IN (map1)	(map{}) NOT IN (map1)	(map{}) IN (map2)	(map{}) NOT IN (map2)	(map{}) IN (map3)	(map{}) NOT IN (map3)
+NULL	NULL	NULL	NULL	NULL	NULL
+0	1	0	1	1	0
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+0	1	0	1	0	1
+1	0	0	1	0	1
+1	0	0	1	0	1
+1	0	0	1	0	1
+
+-- query 36
+map1 IN ((map{1:10,2:20,4:40}), (map{}))	map2 IN ((map{2:[2, 3, 4],1:[1, 2, 3]}), (map{2:[2, 3, 4],1:[1, 22, 3]}))	map3 NOT IN ((map{2:row(2, 4),1:row(1, 2)}), (map{2:row(2, 4),1:row(1, 22)}))
+NULL	NULL	NULL
+0	1	0
+0	0	0
+0	0	1
+0	0	1
+0	0	0
+0	0	1
+0	0	1
+0	0	0
+1	0	1
+1	0	1
+1	0	0
+1	0	1
+
+-- query 37
+map2 NOT IN ((map{2:[2, 3, 4],1:[1, 2, 3]}), NULL)	map3 IN ((map{2:row(2, 4),1:row(1, 2)}), NULL)
+NULL	1
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	1
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	1
+NULL	1
+0	1
+
+-- query 38
+map2 IN ((map{1:[1, 2, NULL],2:[2, 4, NULL]}), (map{2:[2, 3, 4],1:[1, 2, 3]}))
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+1
+
+-- query 39
+map2 NOT IN ((map{1:[1, 2, NULL],2:[2, 4, NULL]}), (map{2:[2, 3, 4],1:[1, 2, 3]}))
+NULL
+0
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 40
+map1 IN ((map{'a':'b'}))
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+-- query 41
+map2 IN ((map{'2':[3]}))
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+
+-- query 43
+st1 IN (NULL)	st1 NOT IN (NULL)
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+
+-- query 44
+NULL IN (st1)	NULL NOT IN (st1)
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+NULL	NULL
+
+-- query 47
+st1 IN ((row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))), (row(12, [2, NULL, 3], map{11:1,2:2}, row(31, 2))))
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+1
+
+-- query 48
+st1 NOT IN ((row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))), (row(12, [2, NULL, 3], map{11:1,2:2}, row(31, 2))))
+NULL
+0
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+
+-- query 49
+st1 IN ((row(1, [2, 1, NULL], map{1:1,2:2}, row(1, 2))), (row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))))
+NULL
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+0
+1
+
+-- query 50
+st1 NOT IN ((row(1, [2, 1, 3], map{1:1,2:2}, row(1, 2))), (row(1, [2, 1, 3], map{1:1,2:2}, row(3, 2))))
+NULL
+0
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1

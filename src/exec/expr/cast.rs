@@ -1566,10 +1566,26 @@ fn cast_struct_to_struct(array: &ArrayRef, target_fields: &Fields) -> Result<Arr
         ));
     }
 
+    // Build a name-to-index map for source fields to support by-name matching
+    // when field names differ in order but all target names exist in source.
+    let source_name_to_idx: std::collections::HashMap<&str, usize> = source_fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name().as_str(), i))
+        .collect();
+    let use_by_name = target_fields
+        .iter()
+        .all(|f| source_name_to_idx.contains_key(f.name().as_str()));
+
     let mut casted_columns = Vec::with_capacity(target_fields.len());
     let mut out_fields = target_fields.iter().cloned().collect::<Vec<_>>();
     for (idx, target_field) in target_fields.iter().enumerate() {
-        let source_col = source.column(idx).clone();
+        let source_idx = if use_by_name {
+            *source_name_to_idx.get(target_field.name().as_str()).unwrap()
+        } else {
+            idx
+        };
+        let source_col = source.column(source_idx).clone();
         let casted = if source_col.data_type() == target_field.data_type() {
             source_col
         } else if source_col.null_count() == source_col.len() {
