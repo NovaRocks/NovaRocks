@@ -56,12 +56,3 @@ pub fn eval_timediff(
         Ok(Arc::new(TimestampMicrosecondArray::from(ts_out)) as ArrayRef)
     }
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_timediff_logic() {
-        assert_date_function_logic("timediff");
-    }
-}

@@ -72,12 +72,3 @@ pub fn eval_timestampdiff(
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_timestampdiff_logic() {
-        assert_date_function_logic("timestampdiff");
-    }
-}

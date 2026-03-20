@@ -67,34 +67,3 @@ pub fn eval_sha2(
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_sha2;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::encryption::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use crate::exec::expr::{ExprId, ExprNode, LiteralValue};
-    use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
-
-    fn literal_i64(arena: &mut ExprArena, v: i64) -> ExprId {
-        arena.push(ExprNode::Literal(LiteralValue::Int64(v)))
-    }
-
-    #[test]
-    fn test_sha2_256_basic() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Utf8);
-        let s = literal_string(&mut arena, "abc");
-        let len = literal_i64(&mut arena, 256);
-
-        let out = eval_sha2(&arena, expr, &[s, len], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(
-            out.value(0),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-}

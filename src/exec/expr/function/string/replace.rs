@@ -53,12 +53,3 @@ pub fn eval_replace(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_replace_logic() {
-        assert_string_function_logic("replace");
-    }
-}

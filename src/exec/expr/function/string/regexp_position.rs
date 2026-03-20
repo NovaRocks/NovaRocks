@@ -137,35 +137,3 @@ fn char_pos_to_byte_offset(input: &str, pos_1_based: usize) -> Option<usize> {
         .nth(target_zero_based)
         .map(|(idx, _)| idx)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_regexp_position;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-    use crate::exec::expr::function::string::test_utils::{
-        chunk_len_1, literal_i64, literal_string, typed_null,
-    };
-    use arrow::array::Int32Array;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_regexp_position_logic() {
-        assert_string_function_logic("regexp_position");
-    }
-
-    #[test]
-    fn test_regexp_position_unicode_and_occurrence() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Int32);
-        let input = literal_string(&mut arena, "有朋$%X自9远方9来");
-        let pat = literal_string(&mut arena, "[0-9]");
-        let start = literal_i64(&mut arena, 10);
-        let occ = literal_i64(&mut arena, 2);
-
-        let out =
-            eval_regexp_position(&arena, expr, &[input, pat, start, occ], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(out.value(0), -1);
-    }
-}

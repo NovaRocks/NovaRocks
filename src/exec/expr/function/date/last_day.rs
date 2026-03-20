@@ -98,12 +98,3 @@ pub fn eval_last_day(
     }
     Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_last_day_logic() {
-        assert_date_function_logic("last_day");
-    }
-}

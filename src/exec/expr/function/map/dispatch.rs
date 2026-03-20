@@ -165,30 +165,3 @@ static MAP_METADATA: &[FunctionMeta] = &[
         max_args: 1,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_register_map_functions() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(m.get("map"), Some(&FunctionKind::Map("map_from_arrays")));
-        assert_eq!(m.get("map_size"), Some(&FunctionKind::Map("map_size")));
-        assert_eq!(
-            m.get("transform_keys"),
-            Some(&FunctionKind::Map("map_apply"))
-        );
-        assert_eq!(
-            m.get("transform_values"),
-            Some(&FunctionKind::Map("map_apply"))
-        );
-        assert_eq!(
-            m.get("cardinality"),
-            Some(&FunctionKind::Map("cardinality"))
-        );
-    }
-}

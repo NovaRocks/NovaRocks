@@ -27,8 +27,11 @@ mod ds_hll_functions;
 mod hll_codec;
 mod hll_hash;
 mod json_object;
-pub(crate) mod percentile_functions;
+pub mod percentile_functions;
 mod to_bitmap;
 mod utility_functions;
 
 pub use dispatch::{eval_object_function, metadata, register};
+pub use hll_hash::eval_hll_hash;
+pub use to_bitmap::eval_to_bitmap;
+pub use percentile_functions::{eval_percentile_hash};

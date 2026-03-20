@@ -22,8 +22,14 @@ mod dispatch;
 mod get_variant;
 mod json_keys;
 mod parse_json;
-#[cfg(test)]
-mod test_utils;
 mod variant_typeof;
 
 pub use dispatch::{eval_variant_function, metadata, register};
+pub use get_variant::{
+    eval_get_variant_bool, eval_get_variant_date, eval_get_variant_datetime,
+    eval_get_variant_double, eval_get_variant_int, eval_get_variant_string, eval_get_variant_time,
+    eval_json_exists, eval_json_length, eval_json_query, eval_variant_query,
+};
+pub use json_keys::eval_json_keys;
+pub use parse_json::eval_parse_json;
+pub use variant_typeof::eval_variant_typeof;

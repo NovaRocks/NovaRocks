@@ -198,19 +198,3 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .windows(needle.len())
         .position(|window| window == needle)
 }
-#[cfg(test)]
-mod tests {
-    use super::split_part_impl;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_split_part_logic() {
-        assert_string_function_logic("split_part");
-    }
-
-    #[test]
-    fn test_split_part_overlapped_delimiter_from_right() {
-        assert_eq!(split_part_impl("abc##567###234", "##", -1), "234");
-        assert_eq!(split_part_impl("abc##567###234", "##", -2), "567#");
-    }
-}

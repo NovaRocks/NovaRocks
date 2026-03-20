@@ -60,12 +60,3 @@ pub fn eval_find_in_set(
     }
     Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_find_in_set_logic() {
-        assert_string_function_logic("find_in_set");
-    }
-}

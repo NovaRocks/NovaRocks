@@ -43,25 +43,3 @@ pub fn eval_md5(
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_md5;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::encryption::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_md5_basic() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Utf8);
-        let input = literal_string(&mut arena, "abc");
-
-        let out = eval_md5(&arena, expr, &[input], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(out.value(0), "900150983cd24fb0d6963f7d28e17f72");
-    }
-}

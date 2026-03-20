@@ -72,12 +72,3 @@ pub fn eval_timestampadd(
     }
     Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_timestampadd_logic() {
-        assert_date_function_logic("timestampadd");
-    }
-}

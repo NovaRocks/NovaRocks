@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 const SEC_TO_TIME_CAP_SECONDS: i64 = 839 * 3600 + 59 * 60 + 59;
 
-fn format_sec_to_time(seconds: i64) -> String {
+pub fn format_sec_to_time(seconds: i64) -> String {
     let clamped = seconds.clamp(-SEC_TO_TIME_CAP_SECONDS, SEC_TO_TIME_CAP_SECONDS);
     let sign = if clamped < 0 { "-" } else { "" };
     let abs = clamped.abs();
@@ -51,25 +51,4 @@ pub fn eval_sec_to_time(
         }
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
-}
-#[cfg(test)]
-mod tests {
-    use super::format_sec_to_time;
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_sec_to_time_logic() {
-        assert_date_function_logic("sec_to_time");
-    }
-
-    #[test]
-    fn test_sec_to_time_boundaries() {
-        assert_eq!(format_sec_to_time(-1), "-00:00:01");
-        assert_eq!(format_sec_to_time(0), "00:00:00");
-        assert_eq!(format_sec_to_time(90061), "25:01:01");
-        assert_eq!(format_sec_to_time(3020399), "838:59:59");
-        assert_eq!(format_sec_to_time(3020400), "839:00:00");
-        assert_eq!(format_sec_to_time(3023999), "839:59:59");
-        assert_eq!(format_sec_to_time(3024000), "839:59:59");
-    }
 }

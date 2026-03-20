@@ -113,37 +113,3 @@ pub fn eval_aes_encrypt(
 
     super::common::build_bytes_output_latin1(out, arena.data_type(expr))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_aes_encrypt;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::encryption::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_aes_encrypt_basic_roundtrip_raw() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Utf8);
-        let data = literal_string(&mut arena, "hello world");
-        let key = literal_string(&mut arena, "starrocks-key");
-
-        let out = eval_aes_encrypt(&arena, expr, &[data, key], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
-
-        let cipher = super::super::common::latin1_string_to_bytes(out.value(0)).unwrap();
-        let plain = super::super::common::aes_decrypt_raw(
-            super::super::common::AesMode::Aes128Ecb,
-            &cipher,
-            b"starrocks-key",
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(plain, b"hello world");
-    }
-}

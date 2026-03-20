@@ -18,19 +18,19 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 
 // Function implementations
-mod array;
-mod bit;
-mod conditional;
-mod date;
-mod encryption;
-mod iceberg;
-pub(crate) mod map;
-mod matching;
-mod math;
-pub(crate) mod object;
-mod string;
-mod struct_fn;
-mod variant;
+pub mod array;
+pub mod bit;
+pub mod conditional;
+pub mod date;
+pub mod encryption;
+pub mod iceberg;
+pub mod map;
+pub mod matching;
+pub mod math;
+pub mod object;
+pub mod string;
+pub mod struct_fn;
+pub mod variant;
 
 // Re-export function implementations
 pub(crate) use array::compare_values_with_null;

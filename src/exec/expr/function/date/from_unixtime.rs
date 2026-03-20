@@ -362,18 +362,3 @@ pub fn eval_from_unixtime_ms(
 ) -> Result<ArrayRef, String> {
     eval_from_unixtime_inner(arena, expr, args, chunk, 1_000)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_from_unixtime_logic() {
-        assert_date_function_logic("from_unixtime");
-    }
-
-    #[test]
-    fn test_from_unixtime_ms_logic() {
-        assert_date_function_logic("from_unixtime_ms");
-    }
-}

@@ -278,31 +278,3 @@ static ARRAY_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_register_array_functions() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(
-            m.get("array_length"),
-            Some(&FunctionKind::Array("array_length"))
-        );
-        assert_eq!(
-            m.get("array_contains"),
-            Some(&FunctionKind::Array("array_contains"))
-        );
-    }
-
-    #[test]
-    fn test_array_metadata() {
-        let meta = metadata("array_slice").unwrap();
-        assert_eq!(meta.min_args, 2);
-        assert_eq!(meta.max_args, 3);
-    }
-}

@@ -107,12 +107,3 @@ fn convert_tz_with_zone(
     };
     Some(out)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_convert_tz_logic() {
-        assert_date_function_logic("convert_tz");
-    }
-}

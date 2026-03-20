@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 const SEC_TO_TIME_CAP_SECONDS: i64 = 839 * 3600 + 59 * 60 + 59;
 
-fn parse_hms_duration_to_seconds(raw: &str) -> Option<i64> {
+pub fn parse_hms_duration_to_seconds(raw: &str) -> Option<i64> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -137,7 +137,7 @@ fn parse_from_immediate_cast_string_source(
     Ok(parse_direct_string_array(&source))
 }
 
-fn parse_from_cast_source(
+pub fn parse_from_cast_source(
     arena: &ExprArena,
     arg_expr: ExprId,
     chunk: &Chunk,
@@ -214,145 +214,4 @@ pub fn eval_time_to_sec(
     }
 
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_hms_duration_to_seconds;
-    use crate::exec::expr::ExprNode;
-    use crate::exec::expr::function::FunctionKind;
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-    use crate::exec::expr::function::date::test_utils::{
-        chunk_len_1, literal_i64, literal_string, typed_null,
-    };
-    use crate::exec::expr::{ExprArena, ExprId};
-    use arrow::array::{Array, Int64Array};
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    #[test]
-    fn test_time_to_sec_logic() {
-        assert_date_function_logic("time_to_sec");
-    }
-
-    #[test]
-    fn test_time_to_sec_duration_parser() {
-        assert_eq!(parse_hms_duration_to_seconds("00:00:00"), Some(0));
-        assert_eq!(parse_hms_duration_to_seconds("23:59:59"), Some(86399));
-        assert_eq!(parse_hms_duration_to_seconds("25:00:00"), Some(90000));
-        assert_eq!(parse_hms_duration_to_seconds("-00:00:01"), None);
-        assert_eq!(parse_hms_duration_to_seconds("0000-00-00 23:59:59"), None);
-        assert_eq!(parse_hms_duration_to_seconds("1970-01-01 01:01:01"), None);
-    }
-
-    #[test]
-    fn test_time_to_sec_recovers_from_failed_cast_time_literal() {
-        let mut arena = ExprArena::default();
-        let chunk = chunk_len_1();
-        let expr_i64: ExprId = typed_null(&mut arena, DataType::Int64);
-        let literal = literal_string(&mut arena, "00:00:00");
-        let cast_time = arena.push_typed(
-            ExprNode::Cast(literal),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-        );
-        let parsed_from_source =
-            super::parse_from_cast_source(&arena, cast_time, &chunk).expect("parse cast source");
-        assert_eq!(parsed_from_source, Some(vec![Some(0)]));
-        let out = super::eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk)
-            .expect("time_to_sec eval");
-        let arr = out
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
-        assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), 0);
-    }
-
-    #[test]
-    fn test_time_to_sec_cast_string_with_datetime_prefix_returns_null() {
-        let mut arena = ExprArena::default();
-        let chunk = chunk_len_1();
-        let expr_i64: ExprId = typed_null(&mut arena, DataType::Int64);
-        let literal = literal_string(&mut arena, "1970-01-01 01:01:01");
-        let cast_time = arena.push_typed(
-            ExprNode::Cast(literal),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-        );
-        let out = super::eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk)
-            .expect("time_to_sec eval");
-        let arr = out
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn test_time_to_sec_explicit_datetime_cast_preserves_time_part() {
-        let mut arena = ExprArena::default();
-        let chunk = chunk_len_1();
-        let expr_i64: ExprId = typed_null(&mut arena, DataType::Int64);
-        let literal = literal_string(&mut arena, "1970-01-01 01:01:01");
-        let cast_datetime = arena.push_typed(
-            ExprNode::Cast(literal),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-        );
-        let cast_time = arena.push_typed(
-            ExprNode::Cast(cast_datetime),
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-        );
-        let out = super::eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk)
-            .expect("time_to_sec eval");
-        let arr = out
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
-        assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), 3661);
-    }
-
-    #[test]
-    fn test_time_to_sec_sec_to_time_negative_roundtrip() {
-        let mut arena = ExprArena::default();
-        let chunk = chunk_len_1();
-        let expr_i64: ExprId = typed_null(&mut arena, DataType::Int64);
-        let seconds = literal_i64(&mut arena, -1);
-        let sec_to_time = arena.push_typed(
-            ExprNode::FunctionCall {
-                kind: FunctionKind::Date("sec_to_time"),
-                args: vec![seconds],
-            },
-            DataType::Utf8,
-        );
-        let out = super::eval_time_to_sec(&arena, expr_i64, &[sec_to_time], &chunk)
-            .expect("time_to_sec eval");
-        let arr = out
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
-        assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), -1);
-    }
-
-    #[test]
-    fn test_time_to_sec_sec_to_time_negative_clamps_like_sec_to_time() {
-        let mut arena = ExprArena::default();
-        let chunk = chunk_len_1();
-        let expr_i64: ExprId = typed_null(&mut arena, DataType::Int64);
-        let seconds = literal_i64(&mut arena, -2_147_483_648);
-        let sec_to_time = arena.push_typed(
-            ExprNode::FunctionCall {
-                kind: FunctionKind::Date("sec_to_time"),
-                args: vec![seconds],
-            },
-            DataType::Utf8,
-        );
-        let out = super::eval_time_to_sec(&arena, expr_i64, &[sec_to_time], &chunk)
-            .expect("time_to_sec eval");
-        let arr = out
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("int64 output");
-        assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), -3_023_999);
-    }
 }

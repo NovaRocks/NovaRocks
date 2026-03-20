@@ -47,12 +47,3 @@ pub fn eval_log(
     let out = Arc::new(Float64Array::from(values)) as ArrayRef;
     super::common::cast_output(out, arena.data_type(expr))
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_log_logic() {
-        assert_math_function_logic("log");
-    }
-}

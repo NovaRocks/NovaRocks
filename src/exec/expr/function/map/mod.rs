@@ -31,8 +31,17 @@ mod map_from_arrays;
 mod map_keys;
 mod map_size;
 mod map_values;
-#[cfg(test)]
-mod test_utils;
-
 pub(crate) use common::sorted_map_offsets_and_indices;
+pub use arrays_zip::eval_arrays_zip;
+pub use cardinality::eval_cardinality;
 pub use dispatch::{eval_map_function, metadata, register};
+pub use distinct_map_keys::eval_distinct_map_keys;
+pub use element_at::eval_element_at;
+pub use map_apply::eval_map_apply;
+pub use map_concat::eval_map_concat;
+pub use map_entries::eval_map_entries;
+pub use map_filter::eval_map_filter;
+pub use map_from_arrays::eval_map_from_arrays;
+pub use map_keys::eval_map_keys;
+pub use map_size::eval_map_size;
+pub use map_values::eval_map_values;

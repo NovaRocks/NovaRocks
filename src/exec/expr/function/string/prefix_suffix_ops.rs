@@ -70,18 +70,3 @@ pub fn eval_ends_with(
 ) -> Result<ArrayRef, String> {
     eval_starts_ends_with_impl(arena, args, chunk, false)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_starts_with_logic() {
-        assert_string_function_logic("starts_with");
-    }
-
-    #[test]
-    fn test_ends_with_logic() {
-        assert_string_function_logic("ends_with");
-    }
-}

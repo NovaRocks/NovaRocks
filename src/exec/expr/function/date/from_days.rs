@@ -20,7 +20,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array};
 use std::sync::Arc;
 
-const FROM_DAYS_MAX_VALID: i64 = 3_652_424;
+pub const FROM_DAYS_MAX_VALID: i64 = 3_652_424;
 const ZERO_DATE_TO_DAYS: i64 = -32;
 
 pub fn eval_from_days(
@@ -53,7 +53,7 @@ pub fn eval_from_days(
     Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
 }
 
-fn zero_date_sentinel_date32() -> i32 {
+pub fn zero_date_sentinel_date32() -> i32 {
     let julian = BC_EPOCH_JULIAN + ZERO_DATE_TO_DAYS as i32;
     match date_from_julian(julian) {
         Some(date) => naive_to_date32(date),
@@ -61,7 +61,7 @@ fn zero_date_sentinel_date32() -> i32 {
     }
 }
 
-fn from_days_value(days: i64) -> Option<i32> {
+pub fn from_days_value(days: i64) -> Option<i32> {
     if days < i32::MIN as i64 || days > i32::MAX as i64 {
         return None;
     }
@@ -73,29 +73,4 @@ fn from_days_value(days: i64) -> Option<i32> {
     }
 
     Some(zero_date_sentinel_date32())
-}
-#[cfg(test)]
-mod tests {
-    use super::{FROM_DAYS_MAX_VALID, from_days_value, zero_date_sentinel_date32};
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_from_days_logic() {
-        assert_date_function_logic("from_days");
-    }
-
-    #[test]
-    fn test_from_days_out_of_calendar_range_returns_zero_date_sentinel() {
-        let sentinel = zero_date_sentinel_date32();
-        assert_eq!(from_days_value(-1), Some(sentinel));
-        assert_eq!(from_days_value(FROM_DAYS_MAX_VALID + 1), Some(sentinel));
-        assert_eq!(from_days_value(i32::MAX as i64), Some(sentinel));
-        assert_eq!(from_days_value(i32::MIN as i64), Some(sentinel));
-    }
-
-    #[test]
-    fn test_from_days_out_of_i32_range_returns_null() {
-        assert_eq!(from_days_value(i32::MAX as i64 + 1), None);
-        assert_eq!(from_days_value(i32::MIN as i64 - 1), None);
-    }
 }

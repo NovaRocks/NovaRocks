@@ -68,12 +68,3 @@ pub fn eval_concat(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_concat_logic() {
-        assert_string_function_logic("concat");
-    }
-}

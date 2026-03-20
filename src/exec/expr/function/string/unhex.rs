@@ -43,37 +43,3 @@ pub fn eval_unhex(
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use super::eval_unhex;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-    use crate::exec::expr::function::string::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::{Array, BinaryArray};
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_unhex_logic() {
-        assert_string_function_logic("unhex");
-    }
-
-    #[test]
-    fn test_unhex_invalid_input_returns_empty_string() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Binary);
-        let bad = literal_string(&mut arena, "ZZ");
-        let odd = literal_string(&mut arena, "F");
-
-        let out_bad = eval_unhex(&arena, expr, &[bad], &chunk_len_1()).unwrap();
-        let out_bad = out_bad.as_any().downcast_ref::<BinaryArray>().unwrap();
-        assert!(!out_bad.is_null(0));
-        assert_eq!(out_bad.value(0), b"");
-
-        let out_odd = eval_unhex(&arena, expr, &[odd], &chunk_len_1()).unwrap();
-        let out_odd = out_odd.as_any().downcast_ref::<BinaryArray>().unwrap();
-        assert!(!out_odd.is_null(0));
-        assert_eq!(out_odd.value(0), b"");
-    }
-}

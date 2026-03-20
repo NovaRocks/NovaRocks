@@ -227,18 +227,3 @@ pub fn eval_tan(
     eval_unary_f64(arena, expr, args, chunk, |v| v.tan())
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_unary_math_logic() {
-        for name in [
-            "acos", "asin", "atan", "ceil", "ceiling", "dceil", "cos", "cot", "degress", "dexp",
-            "dlog1", "dlog10", "exp", "floor", "dfloor", "ln", "log10", "log2", "radians", "sin",
-            "sqrt", "dsqrt", "square", "tan", "cbrt", "positive",
-        ] {
-            assert_math_function_logic(name);
-        }
-    }
-}

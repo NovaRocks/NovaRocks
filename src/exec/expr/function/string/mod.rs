@@ -57,8 +57,6 @@ mod split_part;
 mod str_to_map;
 mod substring;
 mod substring_index;
-#[cfg(test)]
-mod test_utils;
 mod translate;
 mod trim_ops;
 mod unhex;

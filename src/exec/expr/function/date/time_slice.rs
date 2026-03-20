@@ -237,18 +237,3 @@ pub fn eval_date_slice(
 ) -> Result<ArrayRef, String> {
     eval_time_slice_inner(arena, expr, args, chunk)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_time_slice_logic() {
-        assert_date_function_logic("time_slice");
-    }
-
-    #[test]
-    fn test_date_slice_logic() {
-        assert_date_function_logic("date_slice");
-    }
-}

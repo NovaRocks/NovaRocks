@@ -17,7 +17,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-pub(crate) mod common;
+pub mod common;
 mod dispatch;
 
 mod add_months;
@@ -41,8 +41,6 @@ mod sec_to_time;
 mod seconds_add;
 mod str_to_date;
 mod substitute;
-#[cfg(test)]
-mod test_utils;
 mod time_format;
 mod time_slice;
 mod time_to_sec;
@@ -54,5 +52,11 @@ mod to_iso8601;
 mod unix_timestamp;
 mod year;
 
+pub use date::{TeraToken, compile_tera_format, parse_tera_datetime};
 pub use dispatch::{eval_date_function, metadata, register};
+pub use from_days::{FROM_DAYS_MAX_VALID, from_days_value, zero_date_sentinel_date32};
+pub use makedate::eval_makedate;
+pub use sec_to_time::format_sec_to_time;
+pub use time_to_sec::{eval_time_to_sec, parse_from_cast_source, parse_hms_duration_to_seconds};
 pub use year::eval_year;
+pub use common::parse_datetime;

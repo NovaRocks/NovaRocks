@@ -48,13 +48,3 @@ pub fn eval_to_iso8601(
     };
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_to_iso8601_logic() {
-        assert_date_function_logic("to_iso8601");
-    }
-}

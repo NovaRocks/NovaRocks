@@ -76,17 +76,3 @@ static MATCHING_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-
-    #[test]
-    fn test_register_matching_functions() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(m.get("ilike"), Some(&FunctionKind::Matching("ilike")));
-        assert_eq!(m.get("rlike"), Some(&FunctionKind::Matching("regexp")));
-    }
-}

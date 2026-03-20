@@ -139,7 +139,7 @@ fn epoch_to_datetime(seconds: i64, micros: u32, timezone_aware: bool) -> Option<
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TeraToken {
+pub enum TeraToken {
     Year4,
     Year2,
     Month,
@@ -158,7 +158,7 @@ fn invalid_tera_format_error(fmt: &str) -> String {
     format!("The format parameter {} is invalid format", fmt)
 }
 
-fn compile_tera_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
+pub fn compile_tera_format(fmt: &str) -> Result<Vec<TeraToken>, String> {
     let bytes = fmt.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::with_capacity(bytes.len());
@@ -375,7 +375,7 @@ fn parse_am_pm(input: &[u8], pos: &mut usize, expect_pm: bool) -> Option<bool> {
     }
 }
 
-fn parse_tera_datetime(input: &str, tokens: &[TeraToken]) -> Option<NaiveDateTime> {
+pub fn parse_tera_datetime(input: &str, tokens: &[TeraToken]) -> Option<NaiveDateTime> {
     let bytes = input.as_bytes();
     let mut pos = 0usize;
 
@@ -676,81 +676,4 @@ pub fn eval_timestamp(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     eval_to_datetime_inner(arena, expr, args, chunk, true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{compile_tera_format, parse_tera_datetime};
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-    use chrono::NaiveDate;
-
-    #[test]
-    fn test_date_logic() {
-        assert_date_function_logic("date");
-    }
-
-    #[test]
-    fn test_to_date_logic() {
-        assert_date_function_logic("to_date");
-    }
-
-    #[test]
-    fn test_to_tera_date_logic() {
-        assert_date_function_logic("to_tera_date");
-    }
-
-    #[test]
-    fn test_to_datetime_logic() {
-        assert_date_function_logic("to_datetime");
-    }
-
-    #[test]
-    fn test_timestamp_logic() {
-        assert_date_function_logic("timestamp");
-    }
-
-    #[test]
-    fn test_tera_datetime_parser_basic_patterns() {
-        let fmt = compile_tera_format("yyyy/mm/dd hh24:mi:ss").expect("compile format");
-        let dt = parse_tera_datetime("1988/04/08 2:3:4", &fmt).expect("parse datetime");
-        assert_eq!(
-            dt,
-            NaiveDate::from_ymd_opt(1988, 4, 8)
-                .expect("valid date")
-                .and_hms_opt(2, 3, 4)
-                .expect("valid time")
-        );
-
-        let fmt_year = compile_tera_format("yyyy").expect("compile year format");
-        let dt_year = parse_tera_datetime("1988", &fmt_year).expect("parse year-only");
-        assert_eq!(
-            dt_year,
-            NaiveDate::from_ymd_opt(1988, 1, 1)
-                .expect("valid date")
-                .and_hms_opt(0, 0, 0)
-                .expect("valid time")
-        );
-    }
-
-    #[test]
-    fn test_tera_datetime_parser_am_pm() {
-        let fmt = compile_tera_format("yyyy/mm/dd hh pm:mi:ss").expect("compile format");
-        let dt = parse_tera_datetime("1988/04/08 02 pm:3:4", &fmt).expect("parse pm datetime");
-        assert_eq!(
-            dt,
-            NaiveDate::from_ymd_opt(1988, 4, 8)
-                .expect("valid date")
-                .and_hms_opt(14, 3, 4)
-                .expect("valid time")
-        );
-
-        let fmt_am = compile_tera_format("yyyy/mm/dd hh am:mi:ss").expect("compile format");
-        assert!(parse_tera_datetime("1988/04/08 02 pm:3:4", &fmt_am).is_none());
-    }
-
-    #[test]
-    fn test_tera_datetime_format_validation() {
-        let err = compile_tera_format(";YYYYmm:dd").expect_err("format should be invalid");
-        assert_eq!(err, "The format parameter ;YYYYmm:dd is invalid format");
-    }
 }

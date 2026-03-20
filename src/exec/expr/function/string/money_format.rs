@@ -224,36 +224,3 @@ fn format_grouped_integer(v: u128) -> String {
     }
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_money_format_logic() {
-        assert_string_function_logic("money_format");
-    }
-
-    #[test]
-    fn test_money_format_float_style() {
-        assert_eq!(super::format_currency(2, true, false), ".02");
-        assert_eq!(super::format_currency(0, true, true), "-.00");
-        assert_eq!(super::format_currency(50, true, false), ".50");
-    }
-
-    #[test]
-    fn test_money_format_decimal_rounding() {
-        assert_eq!(
-            super::format_currency(
-                super::decimal_to_cents(12_345_678, 3).unwrap(),
-                false,
-                false
-            ),
-            "12,345.68"
-        );
-        assert_eq!(
-            super::format_currency(super::decimal_to_cents(5, 3).unwrap(), false, false),
-            "0.01"
-        );
-    }
-}

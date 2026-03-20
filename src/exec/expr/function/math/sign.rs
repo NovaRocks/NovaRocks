@@ -46,12 +46,3 @@ pub fn eval_sign(
     let out = Arc::new(Int64Array::from(values)) as ArrayRef;
     super::common::cast_output(out, arena.data_type(expr))
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_sign_logic() {
-        assert_math_function_logic("sign");
-    }
-}

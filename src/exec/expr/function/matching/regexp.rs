@@ -53,26 +53,3 @@ pub fn eval_regexp(
 
     Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_regexp;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::matching::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::BooleanArray;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_regexp_partial_match() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Boolean);
-        let a = literal_string(&mut arena, "abc123xyz");
-        let p = literal_string(&mut arena, "\\d+");
-
-        let out = eval_regexp(&arena, expr, &[a, p], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert!(out.value(0));
-    }
-}

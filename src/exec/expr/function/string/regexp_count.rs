@@ -74,32 +74,3 @@ pub fn eval_regexp_count(
 
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_regexp_count;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-    use crate::exec::expr::function::string::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::Int64Array;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_regexp_count_logic() {
-        assert_string_function_logic("regexp_count");
-    }
-
-    #[test]
-    fn test_regexp_count_special_pattern_returns_zero() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Int64);
-        let input = literal_string(&mut arena, "test string");
-        let pat = literal_string(&mut arena, "a{,}");
-
-        let out = eval_regexp_count(&arena, expr, &[input, pat], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
-        assert_eq!(out.value(0), 0);
-    }
-}

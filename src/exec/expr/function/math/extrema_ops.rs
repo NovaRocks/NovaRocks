@@ -178,13 +178,3 @@ pub fn eval_least(
     eval_greatest_least(arena, expr, args, chunk, false)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_extrema_logic() {
-        assert_math_function_logic("greatest");
-        assert_math_function_logic("least");
-    }
-}

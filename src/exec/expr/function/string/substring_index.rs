@@ -81,12 +81,3 @@ fn substring_index_impl(s: &str, delim: &str, count: i64) -> String {
         s[pos + delim.len()..].to_string()
     }
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_substring_index_logic() {
-        assert_string_function_logic("substring_index");
-    }
-}

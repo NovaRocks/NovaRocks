@@ -66,12 +66,3 @@ pub fn eval_null_or_empty(
         input.data_type()
     ))
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_null_or_empty_logic() {
-        assert_string_function_logic("null_or_empty");
-    }
-}

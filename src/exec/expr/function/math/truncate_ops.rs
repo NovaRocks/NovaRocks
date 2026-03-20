@@ -82,17 +82,3 @@ pub fn eval_dround(
     eval_truncate_impl(arena, expr, args, chunk)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_truncate_logic() {
-        assert_math_function_logic("truncate");
-    }
-
-    #[test]
-    fn test_dround_logic() {
-        assert_math_function_logic("dround");
-    }
-}

@@ -55,17 +55,3 @@ pub fn eval_lcase(
     eval_lower_impl(arena, args, chunk)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_lower_logic() {
-        assert_string_function_logic("lower");
-    }
-
-    #[test]
-    fn test_lcase_logic() {
-        assert_string_function_logic("lcase");
-    }
-}

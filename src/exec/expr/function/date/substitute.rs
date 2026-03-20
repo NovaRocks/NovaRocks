@@ -36,12 +36,3 @@ pub fn eval_substitute(
             .map_err(|e| format!("substitute cast error: {}", e))
     }
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_substitute_logic() {
-        assert_date_function_logic("substitute");
-    }
-}

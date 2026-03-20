@@ -79,14 +79,3 @@ pub fn eval_pow(
     eval_binary_f64(arena, expr, args, chunk, |a, b| a.powf(b))
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_binary_math_logic() {
-        for name in ["atan2", "fmod", "pow", "power", "dpow", "fpow"] {
-            assert_math_function_logic(name);
-        }
-    }
-}

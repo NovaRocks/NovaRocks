@@ -21,4 +21,9 @@ mod bit_ops;
 mod dispatch;
 mod xx_hash3_128;
 
+pub use bit_ops::{
+    eval_bit_shift_left, eval_bit_shift_right, eval_bit_shift_right_logical, eval_bitand,
+    eval_bitnot, eval_bitor, eval_bitxor,
+};
 pub use dispatch::{eval_bit_function, metadata, register};
+pub use xx_hash3_128::eval_xx_hash3_128;

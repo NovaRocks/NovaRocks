@@ -132,18 +132,3 @@ pub fn eval_str2date(
 ) -> Result<ArrayRef, String> {
     eval_str_to_date_inner(arena, expr, args, chunk)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_str_to_date_logic() {
-        assert_date_function_logic("str_to_date");
-    }
-
-    #[test]
-    fn test_str2date_logic() {
-        assert_date_function_logic("str2date");
-    }
-}

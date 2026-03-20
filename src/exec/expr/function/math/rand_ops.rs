@@ -56,17 +56,3 @@ pub fn eval_rand(
     eval_rand_impl(arena, expr, args, chunk)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_rand_logic() {
-        assert_math_function_logic("rand");
-    }
-
-    #[test]
-    fn test_random_logic() {
-        assert_math_function_logic("random");
-    }
-}

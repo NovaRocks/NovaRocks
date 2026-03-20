@@ -77,37 +77,3 @@ pub fn eval_to_binary(
 
     super::common::build_bytes_output_latin1(out, arena.data_type(expr))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_to_binary;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::encryption::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::BinaryArray;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_to_binary_hex_default() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Binary);
-        let input = literal_string(&mut arena, "4142");
-
-        let out = eval_to_binary(&arena, expr, &[input], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<BinaryArray>().unwrap();
-        assert_eq!(out.value(0), b"AB");
-    }
-
-    #[test]
-    fn test_to_binary_utf8_format() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Binary);
-        let input = literal_string(&mut arena, "AB");
-        let format = literal_string(&mut arena, "utf8");
-
-        let out = eval_to_binary(&arena, expr, &[input, format], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<BinaryArray>().unwrap();
-        assert_eq!(out.value(0), b"AB");
-    }
-}

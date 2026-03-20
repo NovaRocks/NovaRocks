@@ -82,32 +82,3 @@ pub fn eval_split(
 
     Ok(Arc::new(list_builder.finish()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::string::test_utils::*;
-    use arrow::array::{ListArray, StringArray};
-
-    #[test]
-    fn test_split_basic() {
-        let mut arena = ExprArena::default();
-        let chunk = chunk_len_1();
-        let s = literal_string(&mut arena, "a,b,c");
-        let delim = literal_string(&mut arena, ",");
-
-        let out = eval_split(&arena, s, delim, &chunk).unwrap();
-        let list = out.as_any().downcast_ref::<ListArray>().unwrap();
-        let values = list
-            .values()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let start = list.offsets()[0] as usize;
-        let end = list.offsets()[1] as usize;
-        assert_eq!(end - start, 3);
-        assert_eq!(values.value(start), "a");
-        assert_eq!(values.value(start + 1), "b");
-        assert_eq!(values.value(start + 2), "c");
-    }
-}

@@ -111,17 +111,3 @@ pub fn eval_rpad(
     eval_pad_impl(arena, args, chunk, false)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_lpad_logic() {
-        assert_string_function_logic("lpad");
-    }
-
-    #[test]
-    fn test_rpad_logic() {
-        assert_string_function_logic("rpad");
-    }
-}

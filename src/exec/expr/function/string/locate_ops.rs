@@ -289,30 +289,3 @@ pub fn eval_strpos(
     }
     Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::strpos_impl;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_locate_logic() {
-        assert_string_function_logic("locate");
-    }
-
-    #[test]
-    fn test_instr_logic() {
-        assert_string_function_logic("instr");
-    }
-
-    #[test]
-    fn test_strpos_logic() {
-        assert_eq!(strpos_impl("abc", "b", 1), 2);
-        assert_eq!(strpos_impl("abcabc", "abc", 2), 4);
-        assert_eq!(strpos_impl("abcabc", "abc", -1), 4);
-        assert_eq!(strpos_impl("abcabc", "abc", -2), 1);
-        assert_eq!(strpos_impl("abcabc", "abc", -3), 0);
-        assert_eq!(strpos_impl("abc", "", 1), 1);
-        assert_eq!(strpos_impl("abc", "abc", 0), 0);
-    }
-}

@@ -70,17 +70,3 @@ pub fn eval_pmod(
     eval_mod_impl(arena, expr, args, chunk, true)
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_mod_logic() {
-        assert_math_function_logic("mod");
-    }
-
-    #[test]
-    fn test_pmod_logic() {
-        assert_math_function_logic("pmod");
-    }
-}

@@ -52,13 +52,3 @@ pub fn eval_pi(
     eval_const_f64(chunk.len(), std::f64::consts::PI, arena.data_type(expr))
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_const_logic() {
-        assert_math_function_logic("e");
-        assert_math_function_logic("pi");
-    }
-}

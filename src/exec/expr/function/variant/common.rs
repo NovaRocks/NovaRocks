@@ -44,13 +44,3 @@ pub(super) fn downcast_variant_arg<'a>(
         .downcast_ref::<LargeBinaryArray>()
         .ok_or_else(|| format!("{} expects LargeBinary for variant argument", fn_name))
 }
-
-#[cfg(test)]
-pub(crate) fn variant_primitive_serialized(type_id: u8, payload: &[u8]) -> Vec<u8> {
-    let metadata = crate::exec::variant::VariantMetadata::empty();
-    let mut value = vec![type_id << 2];
-    value.extend_from_slice(payload);
-    crate::exec::variant::VariantValue::create(metadata.raw(), &value)
-        .unwrap()
-        .serialize()
-}

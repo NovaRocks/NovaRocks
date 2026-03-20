@@ -68,25 +68,3 @@ pub fn eval_to_base64(
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_to_base64;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::encryption::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_to_base64_basic() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Utf8);
-        let input = literal_string(&mut arena, "Hello");
-
-        let out = eval_to_base64(&arena, expr, &[input], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(out.value(0), "SGVsbG8=");
-    }
-}

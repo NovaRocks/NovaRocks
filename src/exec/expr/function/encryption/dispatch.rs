@@ -159,28 +159,3 @@ static ENCRYPTION_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-
-    #[test]
-    fn test_register_encryption_functions() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(m.get("md5"), Some(&FunctionKind::Encryption("md5")));
-        assert_eq!(
-            m.get("encode_fingerprint_sha256"),
-            Some(&FunctionKind::Encryption("encode_fingerprint_sha256"))
-        );
-        assert_eq!(
-            m.get("encode_sort_key"),
-            Some(&FunctionKind::Encryption("encode_sort_key"))
-        );
-        assert_eq!(
-            m.get("base64_decode_binary"),
-            Some(&FunctionKind::Encryption("from_base64"))
-        );
-    }
-}

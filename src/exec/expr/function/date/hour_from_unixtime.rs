@@ -48,12 +48,3 @@ pub fn eval_hour_from_unixtime(
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_hour_from_unixtime_logic() {
-        assert_date_function_logic("hour_from_unixtime");
-    }
-}

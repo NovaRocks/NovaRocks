@@ -68,34 +68,3 @@ pub fn eval_regexp_extract_all(
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::eval_regexp_extract_all;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-    use crate::exec::expr::function::string::test_utils::{
-        chunk_len_1, literal_i64, literal_string, typed_null,
-    };
-    use arrow::array::StringArray;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_regexp_extract_all_logic() {
-        assert_string_function_logic("regexp_extract_all");
-    }
-
-    #[test]
-    fn test_regexp_extract_all_out_of_range_group_returns_empty_json_array() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Utf8);
-        let input = literal_string(&mut arena, "AbCdExCeF");
-        let pat = literal_string(&mut arena, "([[:lower:]]+)C([[:lower:]]+)");
-        let idx = literal_i64(&mut arena, 3);
-
-        let out =
-            eval_regexp_extract_all(&arena, expr, &[input, pat, idx], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(out.value(0), "[]");
-    }
-}

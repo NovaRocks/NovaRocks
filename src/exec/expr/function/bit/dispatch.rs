@@ -119,24 +119,3 @@ static BIT_METADATA: &[FunctionMeta] = &[
         max_args: usize::MAX,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-
-    #[test]
-    fn test_register_bit_functions() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(m.get("bitand"), Some(&FunctionKind::Bit("bitand")));
-        assert_eq!(
-            m.get("bit_shift_right_logical"),
-            Some(&FunctionKind::Bit("bit_shift_right_logical"))
-        );
-        assert_eq!(
-            m.get("xx_hash3_128"),
-            Some(&FunctionKind::Bit("xx_hash3_128"))
-        );
-    }
-}

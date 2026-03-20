@@ -62,12 +62,3 @@ pub fn eval_append_trailing_char_if_absent(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_append_trailing_char_if_absent_logic() {
-        assert_string_function_logic("append_trailing_char_if_absent");
-    }
-}

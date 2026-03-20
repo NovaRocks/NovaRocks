@@ -72,31 +72,3 @@ pub fn eval_field(
     }
     Ok(Arc::new(arrow::array::Int32Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use super::eval_field;
-    use crate::exec::expr::ExprArena;
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-    use crate::exec::expr::function::string::test_utils::{
-        chunk_len_1, literal_string, typed_null,
-    };
-    use arrow::array::Int32Array;
-    use arrow::datatypes::DataType;
-
-    #[test]
-    fn test_field_logic() {
-        assert_string_function_logic("field");
-    }
-
-    #[test]
-    fn test_field_null_first_argument_with_null_type_returns_zero() {
-        let mut arena = ExprArena::default();
-        let expr = typed_null(&mut arena, DataType::Int32);
-        let first = typed_null(&mut arena, DataType::Null);
-        let a = literal_string(&mut arena, "a");
-        let b = literal_string(&mut arena, "b");
-        let out = eval_field(&arena, expr, &[first, a, b], &chunk_len_1()).unwrap();
-        let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
-        assert_eq!(out.value(0), 0);
-    }
-}

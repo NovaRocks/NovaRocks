@@ -94,12 +94,3 @@ fn convert_base(s: &str, from_base: i32, to_base: i32) -> Option<String> {
     }
     Some(out)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_conv_logic() {
-        assert_math_function_logic("conv");
-    }
-}

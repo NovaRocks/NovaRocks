@@ -139,13 +139,3 @@ pub fn eval_time_format(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_time_format_logic() {
-        assert_date_function_logic("time_format");
-    }
-}

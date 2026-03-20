@@ -35,12 +35,3 @@ pub fn eval_to_days(
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_to_days_logic() {
-        assert_date_function_logic("to_days");
-    }
-}

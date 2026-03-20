@@ -14,14 +14,18 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use crate::common::ids::SlotId;
-use crate::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use arrow::datatypes::DataType;
+#[path = "../common/mod.rs"]
+mod common;
 
-pub fn slot_id_expr(arena: &mut ExprArena, slot: i32, data_type: DataType) -> ExprId {
-    arena.push_typed(ExprNode::SlotId(SlotId::new(slot as u32)), data_type)
-}
-
-pub fn typed_null(arena: &mut ExprArena, data_type: DataType) -> ExprId {
-    arena.push_typed(ExprNode::Literal(LiteralValue::Null), data_type)
-}
+mod array;
+mod bit;
+mod conditional;
+mod date;
+mod encryption;
+mod map;
+mod matching;
+mod math;
+mod object;
+mod string;
+mod struct_fn;
+mod variant;

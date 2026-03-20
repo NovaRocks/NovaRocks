@@ -20,7 +20,6 @@
 mod dispatch;
 mod struct_func;
 mod subfield;
-#[cfg(test)]
-mod test_utils;
-
 pub use dispatch::{eval_struct_function, metadata, register};
+pub use struct_func::{eval_named_struct, eval_row, eval_struct};
+pub use subfield::eval_subfield;

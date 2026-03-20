@@ -192,32 +192,3 @@ static VARIANT_METADATA: &[FunctionMeta] = &[
         max_args: 1,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_register_variant_functions() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(
-            m.get("json_query"),
-            Some(&FunctionKind::Variant("json_query"))
-        );
-        assert_eq!(
-            m.get("variant_typeof"),
-            Some(&FunctionKind::Variant("variant_typeof"))
-        );
-        assert_eq!(
-            m.get("get_json_object"),
-            Some(&FunctionKind::Variant("get_variant_string"))
-        );
-        assert_eq!(
-            m.get("get_json_int"),
-            Some(&FunctionKind::Variant("get_variant_int"))
-        );
-    }
-}

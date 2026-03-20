@@ -97,28 +97,3 @@ pub fn eval_strright(
 ) -> Result<ArrayRef, String> {
     eval_left_right_impl(arena, args, chunk, false)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_left_logic() {
-        assert_string_function_logic("left");
-    }
-
-    #[test]
-    fn test_right_logic() {
-        assert_string_function_logic("right");
-    }
-
-    #[test]
-    fn test_strleft_logic() {
-        assert_string_function_logic("strleft");
-    }
-
-    #[test]
-    fn test_strright_logic() {
-        assert_string_function_logic("strright");
-    }
-}

@@ -167,23 +167,3 @@ pub fn eval_alignment_timestamp(
     }
     eval_date_trunc_inner(arena, expr, args, chunk)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_date_trunc_logic() {
-        assert_date_function_logic("date_trunc");
-    }
-
-    #[test]
-    fn test_date_floor_logic() {
-        assert_date_function_logic("date_floor");
-    }
-
-    #[test]
-    fn test_alignment_timestamp_logic() {
-        assert_date_function_logic("alignment_timestamp");
-    }
-}

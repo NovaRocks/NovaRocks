@@ -201,35 +201,3 @@ pub fn eval_url_extract_host(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{extract_host_impl, url_decode_impl, url_encode_impl};
-
-    #[test]
-    fn test_url_encode_decode_logic() {
-        let encoded = url_encode_impl("https://docs.starrocks.io/en-us/latest/quick_start/Deploy");
-        assert_eq!(
-            encoded,
-            "https%3A%2F%2Fdocs.starrocks.io%2Fen-us%2Flatest%2Fquick_start%2FDeploy"
-        );
-        let decoded = url_decode_impl(&encoded).unwrap();
-        assert_eq!(
-            decoded,
-            "https://docs.starrocks.io/en-us/latest/quick_start/Deploy"
-        );
-    }
-
-    #[test]
-    fn test_url_extract_host_logic() {
-        assert_eq!(
-            extract_host_impl("https://starrocks.com/test/api/v1").as_deref(),
-            Some("starrocks.com")
-        );
-        assert_eq!(
-            extract_host_impl("https://starrocks.快速.com/test/api/v1").as_deref(),
-            Some("starrocks.快速.com")
-        );
-        assert_eq!(extract_host_impl("bad-url"), None);
-    }
-}

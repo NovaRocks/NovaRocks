@@ -72,23 +72,3 @@ pub fn eval_utc_time(
 ) -> Result<ArrayRef, String> {
     eval_current_time_inner(arena, expr, chunk, true)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_current_time_logic() {
-        assert_date_function_logic("current_time");
-    }
-
-    #[test]
-    fn test_curtime_logic() {
-        assert_date_function_logic("curtime");
-    }
-
-    #[test]
-    fn test_utc_time_logic() {
-        assert_date_function_logic("utc_time");
-    }
-}

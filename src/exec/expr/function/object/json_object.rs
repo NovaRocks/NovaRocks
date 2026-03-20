@@ -197,20 +197,3 @@ pub fn eval_json_object(
 
     Ok(Arc::new(builder.finish()))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{AggScalarValue, json_value_from_scalar};
-
-    #[test]
-    fn test_json_value_from_utf8_json_number() {
-        let out = json_value_from_scalar(&AggScalarValue::Utf8("23".to_string())).unwrap();
-        assert_eq!(out, "23");
-    }
-
-    #[test]
-    fn test_json_value_from_utf8_plain_string() {
-        let out = json_value_from_scalar(&AggScalarValue::Utf8("abc".to_string())).unwrap();
-        assert_eq!(out, "\"abc\"");
-    }
-}

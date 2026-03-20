@@ -21,8 +21,7 @@ mod dispatch;
 mod ilike;
 mod like;
 mod regexp;
-#[cfg(test)]
-mod test_utils;
-
 pub use dispatch::{eval_matching_function, metadata, register};
+pub use ilike::eval_ilike;
 pub use like::eval_like;
+pub use regexp::eval_regexp;

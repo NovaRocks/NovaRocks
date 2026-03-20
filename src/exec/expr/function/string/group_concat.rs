@@ -26,12 +26,3 @@ pub fn eval_group_concat(
 ) -> Result<ArrayRef, String> {
     Err("group_concat is an aggregate function".to_string())
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_group_concat_logic() {
-        assert_string_function_logic("group_concat");
-    }
-}

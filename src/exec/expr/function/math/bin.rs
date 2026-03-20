@@ -38,12 +38,3 @@ pub fn eval_bin(
     }
     Ok(Arc::new(StringArray::from(values)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::math::test_utils::assert_math_function_logic;
-
-    #[test]
-    fn test_bin_logic() {
-        assert_math_function_logic("bin");
-    }
-}

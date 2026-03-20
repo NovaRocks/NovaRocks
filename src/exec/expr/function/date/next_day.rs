@@ -107,18 +107,3 @@ pub fn eval_previous_day(
 ) -> Result<ArrayRef, String> {
     eval_next_previous_day_inner(arena, args, chunk, false)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_next_day_logic() {
-        assert_date_function_logic("next_day");
-    }
-
-    #[test]
-    fn test_previous_day_logic() {
-        assert_date_function_logic("previous_day");
-    }
-}

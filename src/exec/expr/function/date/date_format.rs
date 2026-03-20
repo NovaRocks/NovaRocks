@@ -235,18 +235,3 @@ pub fn eval_jodatime_format(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_date_format_logic() {
-        assert_date_function_logic("date_format");
-    }
-
-    #[test]
-    fn test_strftime_logic() {
-        assert_date_function_logic("strftime");
-    }
-}

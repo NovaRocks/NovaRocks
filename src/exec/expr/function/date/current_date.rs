@@ -43,18 +43,3 @@ pub fn eval_curdate(
     let values = vec![Some(days); chunk.len()];
     Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_current_date_logic() {
-        assert_date_function_logic("current_date");
-    }
-
-    #[test]
-    fn test_curdate_logic() {
-        assert_date_function_logic("curdate");
-    }
-}

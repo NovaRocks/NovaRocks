@@ -87,33 +87,3 @@ pub fn eval_utc_timestamp(
 ) -> Result<ArrayRef, String> {
     eval_current_timestamp_inner(arena, expr, chunk, true)
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_current_timestamp_logic() {
-        assert_date_function_logic("current_timestamp");
-    }
-
-    #[test]
-    fn test_localtime_logic() {
-        assert_date_function_logic("localtime");
-    }
-
-    #[test]
-    fn test_localtimestamp_logic() {
-        assert_date_function_logic("localtimestamp");
-    }
-
-    #[test]
-    fn test_now_logic() {
-        assert_date_function_logic("now");
-    }
-
-    #[test]
-    fn test_utc_timestamp_logic() {
-        assert_date_function_logic("utc_timestamp");
-    }
-}

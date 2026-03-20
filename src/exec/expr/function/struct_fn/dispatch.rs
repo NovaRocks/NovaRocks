@@ -82,18 +82,3 @@ static STRUCT_METADATA: &[FunctionMeta] = &[
         max_args: 2,
     },
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::exec::expr::function::FunctionKind;
-    use std::collections::HashMap;
-
-    #[test]
-    fn test_struct_register() {
-        let mut m = HashMap::new();
-        register(&mut m);
-        assert_eq!(m.get("row"), Some(&FunctionKind::StructFn("row")));
-        assert_eq!(m.get("struct"), Some(&FunctionKind::StructFn("row")));
-    }
-}

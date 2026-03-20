@@ -84,12 +84,3 @@ pub fn eval_parse_url(
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_parse_url_logic() {
-        assert_string_function_logic("parse_url");
-    }
-}

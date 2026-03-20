@@ -659,34 +659,3 @@ pub fn convert_tz_fixed(
     let utc = dt_from.with_timezone(&Utc);
     utc.with_timezone(&to).naive_local()
 }
-
-#[cfg(test)]
-mod tests {
-    use chrono::NaiveDate;
-
-    use super::parse_datetime;
-
-    #[test]
-    fn parse_datetime_accepts_lenient_second_field_width() {
-        let dt = parse_datetime("2023-08-17 08:00:006").expect("parse datetime");
-        assert_eq!(
-            dt,
-            NaiveDate::from_ymd_opt(2023, 8, 17)
-                .unwrap()
-                .and_hms_opt(8, 0, 6)
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn parse_datetime_accepts_compact_timestamp() {
-        let dt = parse_datetime("20230817T080006").expect("parse compact datetime");
-        assert_eq!(
-            dt,
-            NaiveDate::from_ymd_opt(2023, 8, 17)
-                .unwrap()
-                .and_hms_opt(8, 0, 6)
-                .unwrap()
-        );
-    }
-}

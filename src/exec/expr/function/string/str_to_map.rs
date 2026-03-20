@@ -69,12 +69,3 @@ pub fn eval_str_to_map(
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::string::test_utils::assert_string_function_logic;
-
-    #[test]
-    fn test_str_to_map_logic() {
-        assert_string_function_logic("str_to_map");
-    }
-}

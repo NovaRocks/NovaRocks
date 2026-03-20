@@ -40,12 +40,3 @@ pub fn eval_unix_timestamp(
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }
-#[cfg(test)]
-mod tests {
-    use crate::exec::expr::function::date::test_utils::assert_date_function_logic;
-
-    #[test]
-    fn test_unix_timestamp_logic() {
-        assert_date_function_logic("unix_timestamp");
-    }
-}
