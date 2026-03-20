@@ -29,6 +29,7 @@ use novarocks::novarocks_connector_jdbc::{JdbcScanConfig, JdbcScanOp};
 use novarocks::types;
 use std::sync::Arc;
 
+#[path = "../common/mod.rs"]
 mod common;
 
 fn test_cache_options() -> CacheOptions {

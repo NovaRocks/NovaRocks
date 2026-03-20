@@ -175,12 +175,15 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
 }
 
 pub fn parse_datetime(s: &str) -> Option<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+    // chrono's %S accepts 60 (leap second) and normalizes it to the next minute;
+    // reject that to match StarRocks behavior (second=60 is invalid).
+    let from_chrono = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
         .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()
-        .or_else(|| parse_datetime_flexible(s))
+        .filter(|dt| dt.nanosecond() < 1_000_000_000);
+    from_chrono.or_else(|| parse_datetime_flexible(s))
 }
 
 pub fn parse_time(s: &str) -> Option<NaiveTime> {

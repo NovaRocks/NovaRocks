@@ -512,6 +512,33 @@ fn test_log_logic() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests from unary_ops.rs (cbrt specific values)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cbrt_specific_values() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr = common::typed_null(&mut arena, DataType::Float64);
+
+    let x27 = common::literal_f64(&mut arena, 27.0);
+    let result = math_eval_f64("cbrt", &arena, expr, &[x27], &chunk);
+    assert_eq!(result, 3.0, "cbrt(27)");
+
+    let xneg27 = common::literal_f64(&mut arena, -27.0);
+    let result = math_eval_f64("cbrt", &arena, expr, &[xneg27], &chunk);
+    assert_eq!(result, -3.0, "cbrt(-27)");
+
+    let x0 = common::literal_f64(&mut arena, 0.0);
+    let result = math_eval_f64("cbrt", &arena, expr, &[x0], &chunk);
+    assert_eq!(result, 0.0, "cbrt(0)");
+
+    let x_pi = common::literal_f64(&mut arena, 3.1415);
+    let result = math_eval_f64("cbrt", &arena, expr, &[x_pi], &chunk);
+    assert!((result - 1.4645774892350487).abs() < 1e-12, "cbrt(3.1415)");
+}
+
+// ---------------------------------------------------------------------------
 // Tests from abs.rs
 // ---------------------------------------------------------------------------
 

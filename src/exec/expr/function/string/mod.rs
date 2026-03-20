@@ -62,6 +62,7 @@ mod trim_ops;
 mod unhex;
 mod upper;
 mod url_ops;
+mod raise_error;
 mod uuid;
 
 pub use dispatch::{eval_string_function, metadata, register};

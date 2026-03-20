@@ -20,6 +20,7 @@ use crate::common::{TestConfig, test_query_id, unique_query_id};
 use novarocks::common::types::UniqueId;
 use novarocks::service::internal_service;
 
+#[path = "../common/mod.rs"]
 mod common;
 
 #[test]

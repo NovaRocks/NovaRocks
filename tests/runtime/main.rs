@@ -24,6 +24,7 @@ use novarocks::runtime::exchange::{self, ExchangeKey};
 use novarocks::runtime::exchange_scan::ExchangeScanOp;
 use novarocks::runtime::profile::Profiler;
 
+#[path = "../common/mod.rs"]
 mod common;
 
 fn sample_exchange_key(node_id: i32) -> ExchangeKey {

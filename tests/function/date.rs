@@ -1471,6 +1471,18 @@ fn test_unix_timestamp_logic() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_parse_datetime_rejects_second_60() {
+    use novarocks::exec::expr::function::date::parse_datetime;
+    // second=60 is a chrono leap-second; StarRocks treats it as invalid → None.
+    assert!(parse_datetime("2024-01-01 01:30:60").is_none());
+    assert!(parse_datetime("2024-01-01T01:30:60").is_none());
+    // second=61 and beyond must also be rejected
+    assert!(parse_datetime("2024-01-01 01:30:61").is_none());
+    // Valid boundary: second=59 is accepted
+    assert!(parse_datetime("2024-01-01 01:30:59").is_some());
+}
+
+#[test]
 fn parse_datetime_accepts_lenient_second_field_width() {
     use novarocks::exec::expr::function::date::parse_datetime;
     let dt = parse_datetime("2023-08-17 08:00:006").expect("parse datetime");
@@ -2472,3 +2484,266 @@ fn test_current_and_utc() {
     let actual_utc_time = date_eval_ts("utc_time", &arena, expr_ts, &[], &chunk);
     assert!((actual_utc_time - expected_utc_time).abs() < 5_000_000);
 }
+
+// ---------------------------------------------------------------------------
+// Tests migrated from dev/test/sql/test_time_fn
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_week_iso_year_boundary() {
+    // 2023-01-01 (Sunday) is ISO week 52 of 2022
+    // 2023-01-02 (Monday) is ISO week 1 of 2023
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
+
+    let d1 = common::literal_string(&mut arena, "2023-01-01");
+    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[d1], &chunk), 52);
+
+    let d2 = common::literal_string(&mut arena, "2023-01-02");
+    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[d2], &chunk), 1);
+
+    let d3 = common::literal_string(&mut arena, "2023-01-03");
+    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[d3], &chunk), 1);
+
+    let empty = common::literal_string(&mut arena, "");
+    let arr = eval_date_function("week_iso", &arena, expr_i64, &[empty], &chunk).unwrap();
+    let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(arr.is_null(0));
+
+    let null_val = common::typed_null(&mut arena, DataType::Utf8);
+    let arr = eval_date_function("week_iso", &arena, expr_i64, &[null_val], &chunk).unwrap();
+    let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(arr.is_null(0));
+}
+
+#[test]
+fn test_dayofweek_iso_values() {
+    // ISO: Mon=1 … Sun=7
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
+
+    let d1 = common::literal_string(&mut arena, "2023-01-01"); // Sunday
+    assert_eq!(date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d1], &chunk), 7);
+
+    let d2 = common::literal_string(&mut arena, "2023-01-02"); // Monday
+    assert_eq!(date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d2], &chunk), 1);
+
+    let d3 = common::literal_string(&mut arena, "2023-01-03"); // Tuesday
+    assert_eq!(date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d3], &chunk), 2);
+
+    let empty = common::literal_string(&mut arena, "");
+    let arr = eval_date_function("dayofweek_iso", &arena, expr_i64, &[empty], &chunk).unwrap();
+    let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(arr.is_null(0));
+
+    let null_val = common::typed_null(&mut arena, DataType::Utf8);
+    let arr = eval_date_function("dayofweek_iso", &arena, expr_i64, &[null_val], &chunk).unwrap();
+    let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(arr.is_null(0));
+}
+
+#[test]
+fn test_weekday_values() {
+    // MySQL weekday: Mon=0 … Sun=6
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
+
+    let d1 = common::literal_string(&mut arena, "2023-01-01"); // Sunday
+    assert_eq!(date_eval_i64("weekday", &arena, expr_i64, &[d1], &chunk), 6);
+
+    let d2 = common::literal_string(&mut arena, "2023-01-02"); // Monday
+    assert_eq!(date_eval_i64("weekday", &arena, expr_i64, &[d2], &chunk), 0);
+
+    let d3 = common::literal_string(&mut arena, "2023-01-03"); // Tuesday
+    assert_eq!(date_eval_i64("weekday", &arena, expr_i64, &[d3], &chunk), 1);
+
+    let empty = common::literal_string(&mut arena, "");
+    let arr = eval_date_function("weekday", &arena, expr_i64, &[empty], &chunk).unwrap();
+    let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(arr.is_null(0));
+}
+
+#[test]
+fn test_timestampadd_millisecond() {
+    // timestampadd(MILLISECOND, 1, '2019-01-02 00:00:00') => 2019-01-02 00:00:00.001000
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_ts = common::typed_null(&mut arena, DataType::Timestamp(TimeUnit::Microsecond, None));
+
+    let unit = common::literal_string(&mut arena, "millisecond");
+    let interval = common::literal_i64(&mut arena, 1);
+    let dt = common::literal_string(&mut arena, "2019-01-02 00:00:00");
+    assert_eq!(
+        date_eval_ts("timestampadd", &arena, expr_ts, &[unit, interval, dt], &chunk),
+        dt_micros("2019-01-02 00:00:00") + 1_000
+    );
+}
+
+#[test]
+fn test_timestampdiff_millisecond() {
+    // timestampdiff(MILLISECOND, '2003-02-01 00:00:00', '2003-05-01 12:05:55') => 7733155000
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
+
+    let unit = common::literal_string(&mut arena, "millisecond");
+    let dt1 = common::literal_string(&mut arena, "2003-02-01 00:00:00");
+    let dt2 = common::literal_string(&mut arena, "2003-05-01 12:05:55");
+    assert_eq!(
+        date_eval_i64("timestampdiff", &arena, expr_i64, &[unit, dt1, dt2], &chunk),
+        7_733_155_000
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for sub-second precision
+// ---------------------------------------------------------------------------
+
+fn dt_micros_us(s: &str) -> i64 {
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .unwrap_or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap())
+        .and_utc()
+        .timestamp_micros()
+}
+
+// ---------------------------------------------------------------------------
+// test_date_trunc — migrated from dev/test/sql/test_function/R/test_date_trunc
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_date_trunc_specific_values() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_ts = common::typed_null(&mut arena, DataType::Timestamp(TimeUnit::Microsecond, None));
+
+    macro_rules! trunc {
+        ($unit:expr, $dt:expr, $expected:expr) => {{
+            let unit = common::literal_string(&mut arena, $unit);
+            let dt = common::literal_string(&mut arena, $dt);
+            assert_eq!(
+                date_eval_ts("date_trunc", &arena, expr_ts, &[unit, dt], &chunk),
+                dt_micros_us($expected),
+                "date_trunc('{}', '{}')",
+                $unit,
+                $dt
+            );
+        }};
+    }
+
+    trunc!("year",        "2023-10-31 23:59:59.001002", "2023-01-01 00:00:00");
+    trunc!("year",        "2023-10-31",                 "2023-01-01 00:00:00");
+    trunc!("quarter",     "2023-10-31 23:59:59.001002", "2023-10-01 00:00:00");
+    trunc!("quarter",     "2023-10-31",                 "2023-10-01 00:00:00");
+    trunc!("quarter",     "2023-09-15 23:59:59.001002", "2023-07-01 00:00:00");
+    trunc!("quarter",     "2023-09-15",                 "2023-07-01 00:00:00");
+    trunc!("month",       "2023-10-31 23:59:59.001002", "2023-10-01 00:00:00");
+    trunc!("month",       "2023-10-31",                 "2023-10-01 00:00:00");
+    trunc!("week",        "2023-10-31 23:59:59.001002", "2023-10-30 00:00:00");
+    trunc!("week",        "2023-10-31",                 "2023-10-30 00:00:00");
+    trunc!("day",         "2023-10-31 23:59:59.001002", "2023-10-31 00:00:00");
+    trunc!("day",         "2023-10-31",                 "2023-10-31 00:00:00");
+    trunc!("hour",        "2023-10-31 23:59:59.001002", "2023-10-31 23:00:00");
+    trunc!("hour",        "2023-10-31",                 "2023-10-31 00:00:00");
+    trunc!("minute",      "2023-10-31 23:59:59.001002", "2023-10-31 23:59:00");
+    trunc!("minute",      "2023-10-31",                 "2023-10-31 00:00:00");
+    trunc!("second",      "2023-10-31 23:59:59.001002", "2023-10-31 23:59:59");
+    trunc!("second",      "2023-10-31",                 "2023-10-31 00:00:00");
+    trunc!("millisecond", "2023-10-31 23:59:59.001002", "2023-10-31 23:59:59.001000");
+    trunc!("millisecond", "2023-10-31",                 "2023-10-31 00:00:00");
+    trunc!("microsecond", "2023-10-31 23:59:59.001002", "2023-10-31 23:59:59.001002");
+    trunc!("microsecond", "2023-10-31",                 "2023-10-31 00:00:00");
+}
+
+// ---------------------------------------------------------------------------
+// test_days_add — migrated from dev/test/sql/test_function/R/test_days_add
+// (INTERVAL x UNIT is lowered by FE to the corresponding _add function)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_days_add_all_intervals() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_ts = common::typed_null(&mut arena, DataType::Timestamp(TimeUnit::Microsecond, None));
+
+    macro_rules! add {
+        ($fn:expr, $dt:expr, $n:expr, $expected:expr) => {{
+            let dt = common::literal_string(&mut arena, $dt);
+            let n = common::literal_i64(&mut arena, $n);
+            assert_eq!(
+                date_eval_ts($fn, &arena, expr_ts, &[dt, n], &chunk),
+                dt_micros_us($expected),
+                "{}('{}', {})",
+                $fn,
+                $dt,
+                $n
+            );
+        }};
+    }
+
+    // days_add / adddate with integer (adds days)
+    add!("days_add", "2023-10-31 23:59:59", 1,    "2023-11-01 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 1000,  "2026-07-27 23:59:59");
+
+    // INTERVAL n YEAR → years_add
+    add!("years_add", "2023-10-31 23:59:59", 1,   "2024-10-31 23:59:59");
+    add!("years_add", "2023-10-31 23:59:59", 100,  "2123-10-31 23:59:59");
+
+    // INTERVAL n MONTH → months_add (month-end clamping)
+    add!("months_add", "2023-10-31 23:59:59", 1,  "2023-11-30 23:59:59");
+    add!("months_add", "2023-10-31 23:59:59", 11, "2024-09-30 23:59:59");
+    add!("months_add", "2023-10-31 23:59:59", 25, "2025-11-30 23:59:59");
+
+    // INTERVAL n DAY → days_add
+    add!("days_add", "2023-10-31 23:59:59", 1,   "2023-11-01 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 15,  "2023-11-15 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 100, "2024-02-08 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 1000,"2026-07-27 23:59:59");
+
+    // INTERVAL n HOUR → hours_add
+    add!("hours_add", "2023-10-31 23:59:59", 1,  "2023-11-01 00:59:59");
+    add!("hours_add", "2023-10-31 23:59:59", 12, "2023-11-01 11:59:59");
+    add!("hours_add", "2023-10-31 23:59:59", 25, "2023-11-02 00:59:59");
+
+    // INTERVAL n MINUTE → minutes_add
+    add!("minutes_add", "2023-10-31 23:59:59", 1,  "2023-11-01 00:00:59");
+    add!("minutes_add", "2023-10-31 23:59:59", 30, "2023-11-01 00:29:59");
+    add!("minutes_add", "2023-10-31 23:59:59", 80, "2023-11-01 01:19:59");
+
+    // INTERVAL n SECOND → seconds_add
+    add!("seconds_add", "2023-10-31 23:59:59", 1,  "2023-11-01 00:00:00");
+    add!("seconds_add", "2023-10-31 23:59:59", 30, "2023-11-01 00:00:29");
+    add!("seconds_add", "2023-10-31 23:59:59", 70, "2023-11-01 00:01:09");
+
+    // INTERVAL n MILLISECOND → milliseconds_add
+    add!("milliseconds_add", "2023-10-31 23:59:59", 1,    "2023-10-31 23:59:59.001000");
+    add!("milliseconds_add", "2023-10-31 23:59:59", 500,  "2023-10-31 23:59:59.500000");
+    add!("milliseconds_add", "2023-10-31 23:59:59", 3000, "2023-11-01 00:00:02");
+
+    // INTERVAL n MICROSECOND → microseconds_add
+    add!("microseconds_add", "2023-10-31 23:59:59", 1,    "2023-10-31 23:59:59.000001");
+    add!("microseconds_add", "2023-10-31 23:59:59", 500,  "2023-10-31 23:59:59.000500");
+    add!("microseconds_add", "2023-10-31 23:59:59", 3000, "2023-10-31 23:59:59.003000");
+}
+
+// ---------------------------------------------------------------------------
+// test_date_format — %f microsecond specifier
+// (migrated from dev/test/sql/test_function/R/test_date_format)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_date_format_microseconds() {
+    let mut arena = ExprArena::default();
+    let chunk = common::chunk_len_1();
+    let expr_str = common::typed_null(&mut arena, DataType::Utf8);
+
+    let dt = common::literal_string(&mut arena, "2023-10-11 00:00:01.030");
+    let fmt = common::literal_string(&mut arena, "%Y-%m-%d %H:%i:%s.%f");
+    assert_eq!(
+        date_eval_str("date_format", &arena, expr_str, &[dt, fmt], &chunk),
+        "2023-10-11 00:00:01.030000"
+    );
+}
+

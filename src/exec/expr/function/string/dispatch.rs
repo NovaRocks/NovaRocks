@@ -111,6 +111,7 @@ pub fn eval_string_function(
         "url_encode" => super::url_ops::eval_url_encode(arena, expr, args, chunk),
         "url_extract_host" => super::url_ops::eval_url_extract_host(arena, expr, args, chunk),
         "uuid" => super::uuid::eval_uuid(arena, expr, args, chunk),
+        "raise_error" => super::raise_error::eval_raise_error(arena, expr, args, chunk),
         other => Err(format!("unsupported string function: {}", other)),
     }
 }
@@ -177,6 +178,7 @@ static STRING_FUNCTIONS: &[(&str, &str)] = &[
     ("url_extract_", "url_extract_host"),
     ("url_extract_host", "url_extract_host"),
     ("uuid", "uuid"),
+    ("raise_error", "raise_error"),
 ];
 
 static STRING_METADATA: &[FunctionMeta] = &[
@@ -434,5 +436,10 @@ static STRING_METADATA: &[FunctionMeta] = &[
         name: "uuid",
         min_args: 0,
         max_args: 0,
+    },
+    FunctionMeta {
+        name: "raise_error",
+        min_args: 1,
+        max_args: 1,
     },
 ];

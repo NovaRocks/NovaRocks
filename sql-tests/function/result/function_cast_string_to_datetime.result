@@ -228,7 +228,7 @@ NULL
 
 -- query 58
 CAST(column_0 AS DATETIME)
-2024-01-01 01:31:00
+NULL
 
 -- query 59
 CAST(column_0 AS DATETIME)

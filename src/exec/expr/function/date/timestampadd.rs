@@ -62,10 +62,13 @@ pub fn eval_timestampadd(
         let new_dt = match unit.as_str() {
             "year" => super::add_months::add_months_to_datetime(dt, interval as i32 * 12),
             "month" => super::add_months::add_months_to_datetime(dt, interval as i32),
+            "week" => dt + Duration::weeks(interval),
             "day" => dt + Duration::days(interval),
             "hour" => dt + Duration::hours(interval),
             "minute" => dt + Duration::minutes(interval),
             "second" => dt + Duration::seconds(interval),
+            "millisecond" => dt + Duration::milliseconds(interval),
+            "microsecond" => dt + Duration::microseconds(interval),
             _ => dt,
         };
         out.push(to_timestamp_value(new_dt, &output_type).ok());
