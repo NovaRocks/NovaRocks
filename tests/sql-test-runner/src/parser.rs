@@ -9,10 +9,7 @@ use std::path::Path;
 /// Scan raw SQL content (before placeholder substitution) for `${case_db}` and
 /// `${case_db_N}` references.  Returns the resolved database names in order.
 /// Index 0 is the primary `${case_db}`, index 1 is `${case_db_2}`, etc.
-pub fn detect_case_dbs(
-    raw_content: &str,
-    variables: &HashMap<String, String>,
-) -> Vec<String> {
+pub fn detect_case_dbs(raw_content: &str, variables: &HashMap<String, String>) -> Vec<String> {
     let mut indices: BTreeSet<usize> = BTreeSet::new();
 
     if raw_content.contains("${case_db}") {

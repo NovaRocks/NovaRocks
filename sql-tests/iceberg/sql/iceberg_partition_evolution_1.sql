@@ -1,8 +1,8 @@
 -- @order_sensitive=true
 -- Validate Iceberg bucket partition evolution query correctness and pruning explain text.
 -- query 1
-CREATE DATABASE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
-USE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
+CREATE DATABASE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 DROP TABLE IF EXISTS test_users_bucketed;
 CREATE TABLE test_users_bucketed (
   user_id BIGINT,
@@ -27,21 +27,21 @@ SELECT COUNT(*) AS cnt, SUM(score) AS sum_score
 FROM test_users_bucketed;
 
 -- query 2
-USE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 SELECT country, COUNT(*) AS country_cnt, SUM(score) AS score_sum
 FROM test_users_bucketed
 GROUP BY country
 ORDER BY country;
 
 -- query 3
-USE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 SELECT COUNT(*) AS cnt, SUM(score) AS sum_score
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
 
 -- query 4
 -- @result_contains=partitions=7/8
-USE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 EXPLAIN VERBOSE
 SELECT COUNT(*), SUM(score)
 FROM test_users_bucketed
@@ -49,11 +49,11 @@ WHERE user_id IN (1, 2, 3, 4, 5, 6, 7, 16, 32);
 
 -- query 5
 -- @result_contains=partitions=3/8
-USE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};
 EXPLAIN VERBOSE
 SELECT COUNT(*), SUM(score)
 FROM test_users_bucketed
 WHERE user_id IN (1, 2, 3, 4);
 SET catalog default_catalog;
-DROP TABLE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0}.test_users_bucketed FORCE;
-DROP DATABASE iceberg_cat_${uuid0}.iceberg_part_db_${uuid0};
+DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0}.test_users_bucketed FORCE;
+DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_part_db_${uuid0};

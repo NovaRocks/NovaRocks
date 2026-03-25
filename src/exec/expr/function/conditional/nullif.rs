@@ -61,10 +61,9 @@ pub fn eval_nullif(
                 eval_nullif_primitive::<TimestampNanosecondType>(&left_arr, &right_arr)
             }
         },
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::Map(_, _)
-        | DataType::Struct(_) => eval_nullif_generic(&left_arr, &right_arr),
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) | DataType::Struct(_) => {
+            eval_nullif_generic(&left_arr, &right_arr)
+        }
         other => Err(format!("nullif unsupported type: {:?}", other)),
     }
 }
@@ -167,10 +166,10 @@ fn eval_nullif_generic(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, St
     let len = left.len();
     // Use a distinctive null marker so null elements are not confused with empty strings.
     let fmt_opts = FormatOptions::default().with_null("\\N");
-    let left_fmt = ArrayFormatter::try_new(left.as_ref(), &fmt_opts)
-        .map_err(|e| format!("nullif: {e}"))?;
-    let right_fmt = ArrayFormatter::try_new(right.as_ref(), &fmt_opts)
-        .map_err(|e| format!("nullif: {e}"))?;
+    let left_fmt =
+        ArrayFormatter::try_new(left.as_ref(), &fmt_opts).map_err(|e| format!("nullif: {e}"))?;
+    let right_fmt =
+        ArrayFormatter::try_new(right.as_ref(), &fmt_opts).map_err(|e| format!("nullif: {e}"))?;
 
     let mut valid = vec![true; len];
     for i in 0..len {

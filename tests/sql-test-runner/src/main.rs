@@ -19,9 +19,7 @@ use crate::results::{
     write_mismatch_artifacts, write_result_file,
 };
 use crate::runner::{error_message_matches, parse_selector_list, summarize_connection};
-use crate::session::{
-    MysqlSession, drop_case_database, execute_suite_hook, reset_case_database,
-};
+use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
 use crate::types::*;
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, ValueEnum};
@@ -31,8 +29,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -318,12 +316,7 @@ fn run_step_wait_alters(
     log: &mut String,
 ) -> (bool, Duration) {
     let mut total = Duration::ZERO;
-    let db = step
-        .meta
-        .db
-        .as_deref()
-        .or(primary_case_db)
-        .unwrap_or("");
+    let db = step.meta.db.as_deref().or(primary_case_db).unwrap_or("");
     for (table, kind, default_retries) in [
         (&step.meta.wait_alter_column, "COLUMN", 60usize),
         (&step.meta.wait_alter_rollup, "ROLLUP", 120usize),
@@ -501,14 +494,22 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         vec![]
     };
     let primary_case_db: Option<&str> = case_dbs.first().map(|s| s.as_str());
+    let target_case_db_admin_conn = ConnectionConfig {
+        db: None,
+        ..ctx.target_conn_base.clone()
+    };
+    let reference_case_db_admin_conn = ConnectionConfig {
+        db: None,
+        ..ctx.reference_conn_base.clone()
+    };
 
     // Helper closure: drop all case databases (best-effort).
     let drop_all_case_dbs = |ctx: &SuiteRunContext, dbs: &[String]| {
         for db in dbs {
-            let _ = drop_case_database(&ctx.target_admin_conn, ctx.query_timeout, db, "target");
+            let _ = drop_case_database(&target_case_db_admin_conn, ctx.query_timeout, db, "target");
             if ctx.reference_required {
                 let _ = drop_case_database(
-                    &ctx.reference_admin_conn,
+                    &reference_case_db_admin_conn,
                     ctx.query_timeout,
                     db,
                     "reference",
@@ -518,9 +519,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     };
 
     for db_name in &case_dbs {
-        if let Err(exc) =
-            reset_case_database(&ctx.target_admin_conn, ctx.query_timeout, db_name, "target")
-        {
+        if let Err(exc) = reset_case_database(
+            &target_case_db_admin_conn,
+            ctx.query_timeout,
+            db_name,
+            "target",
+        ) {
             drop_all_case_dbs(ctx, &case_dbs);
             let _ = writeln!(
                 log,
@@ -539,7 +543,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         }
         if ctx.reference_required {
             if let Err(exc) = reset_case_database(
-                &ctx.reference_admin_conn,
+                &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
@@ -647,8 +651,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
-                        let cmd =
-                            step.sql.trim_start().strip_prefix("shell:").unwrap_or("").trim();
+                        let cmd = step
+                            .sql
+                            .trim_start()
+                            .strip_prefix("shell:")
+                            .unwrap_or("")
+                            .trim();
                         let exec = shell::execute_shell_command(cmd);
                         (true, Some(exec), String::new())
                     } else {
@@ -692,8 +700,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         } else if !ctx.verify_enabled {
                             passed_execution = Some(execution);
                             break;
-                        } else if step.meta.skip_result_check
-                            || step_has_implicit_skip_result(step)
+                        } else if step.meta.skip_result_check || step_has_implicit_skip_result(step)
                         {
                             passed_execution = Some(execution);
                             break;
@@ -776,9 +783,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             "    ✅ PASS (verify disabled) ({:.2}s)",
                             execution.elapsed.as_secs_f64()
                         );
-                    } else if step.meta.skip_result_check
-                        || step_has_implicit_skip_result(step)
-                    {
+                    } else if step.meta.skip_result_check || step_has_implicit_skip_result(step) {
                         let _ = writeln!(
                             log,
                             "    ✅ PASS ({:.2}s, skip_result_check)",
@@ -818,8 +823,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         if last_failure.starts_with("VERIFY FAILED: ") {
                             let artifact_id =
                                 format!("{}-query{}", case.case_id, step.query_number);
-                            let reason =
-                                last_failure.trim_start_matches("VERIFY FAILED: ").to_string();
+                            let reason = last_failure
+                                .trim_start_matches("VERIFY FAILED: ")
+                                .to_string();
                             if let Err(exc) = write_mismatch_artifacts(
                                 root,
                                 &ctx.suite_name,
@@ -878,11 +884,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         reference_session
                             .as_mut()
                             .expect("reference session required in record-from=reference")
-                            .execute_query(
-                                ctx.query_timeout,
-                                &step.sql,
-                                step.meta.db.as_deref(),
-                            )
+                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
                     };
                     let elapsed = execution
                         .as_ref()
@@ -935,8 +937,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
                 if step.meta.expect_error.is_some() {
                     if matched_expected_error {
-                        let _ =
-                            writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
+                        let _ = writeln!(log, "    ✅ RECORDED EXPECTED ERROR: {}", last_failure);
                     } else {
                         case_failed = true;
                         let _ = writeln!(log, "    ❌ {}", last_failure);
@@ -1014,26 +1015,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         reference_session
                             .as_mut()
                             .expect("reference session required in diff mode")
-                            .execute_query(
-                                ctx.query_timeout,
-                                &step.sql,
-                                step.meta.db.as_deref(),
-                            )
+                            .execute_query(ctx.query_timeout, &step.sql, step.meta.db.as_deref())
                     };
-                    let elapsed = execution_t
-                        .as_ref()
-                        .map(|r| r.elapsed)
-                        .unwrap_or_default()
-                        + execution_r
-                            .as_ref()
-                            .map(|r| r.elapsed)
-                            .unwrap_or_default();
+                    let elapsed = execution_t.as_ref().map(|r| r.elapsed).unwrap_or_default()
+                        + execution_r.as_ref().map(|r| r.elapsed).unwrap_or_default();
                     case_elapsed += elapsed;
 
-                    let target_matched =
-                        !ok_t && error_message_matches(&err_t, expected_error);
-                    let reference_matched =
-                        !ok_r && error_message_matches(&err_r, expected_error);
+                    let target_matched = !ok_t && error_message_matches(&err_t, expected_error);
+                    let reference_matched = !ok_r && error_message_matches(&err_r, expected_error);
                     if target_matched && reference_matched {
                         let _ = writeln!(
                             log,
@@ -1092,8 +1081,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         if !ok_r || execution_r.is_none() {
                             case_failed = true;
                             case_elapsed += execution_t.elapsed;
-                            let _ =
-                                writeln!(log, "    ❌ reference execute failed: {}", err_r);
+                            let _ = writeln!(log, "    ❌ reference execute failed: {}", err_r);
                         } else {
                             let execution_r = execution_r.expect("checked above");
                             let elapsed = execution_t.elapsed + execution_r.elapsed;
@@ -1118,10 +1106,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 case_failed = true;
                                 let _ = writeln!(log, "    ❌ DIFF FAILED: {}", reason);
                                 if let Some(root) = &ctx.actual_artifact_dir {
-                                    let artifact_id = format!(
-                                        "{}-query{}",
-                                        case.case_id, step.query_number
-                                    );
+                                    let artifact_id =
+                                        format!("{}-query{}", case.case_id, step.query_number);
                                     if let Err(exc) = write_mismatch_artifacts(
                                         root,
                                         &ctx.suite_name,
@@ -1147,11 +1133,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         }
 
         if case_failed {
-            let _ = writeln!(
-                log,
-                "    ⏭️ skipping remaining steps in {}",
-                case.case_id
-            );
+            let _ = writeln!(log, "    ⏭️ skipping remaining steps in {}", case.case_id);
             break;
         }
     }
@@ -1161,9 +1143,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     drop(reference_session);
 
     for db_name in &case_dbs {
-        if let Err(exc) =
-            drop_case_database(&ctx.target_admin_conn, ctx.query_timeout, db_name, "target")
-        {
+        if let Err(exc) = drop_case_database(
+            &target_case_db_admin_conn,
+            ctx.query_timeout,
+            db_name,
+            "target",
+        ) {
             case_failed = true;
             let _ = writeln!(
                 log,
@@ -1173,7 +1158,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         }
         if ctx.reference_required {
             if let Err(exc) = drop_case_database(
-                &ctx.reference_admin_conn,
+                &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
@@ -1221,11 +1206,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 // Per-suite execution (init -> parallel cases -> cleanup)
 // ---------------------------------------------------------------------------
 
-fn run_suite(
-    ps: &PreparedSuite,
-    abort: &AtomicBool,
-    stdout_lock: &Mutex<()>,
-) -> SuiteOutcome {
+fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) -> SuiteOutcome {
     let wall_start = Instant::now();
     let ctx = &ps.ctx;
     let total = ps.cases.len();
@@ -1475,8 +1456,7 @@ fn main() -> Result<()> {
 
     // Validate: per-suite path overrides conflict with multi-suite
     let multi_suite = suite_names.len() > 1;
-    if multi_suite
-        && (cli.sql_dir.is_some() || cli.result_dir.is_some() || cli.sql_glob.is_some())
+    if multi_suite && (cli.sql_dir.is_some() || cli.result_dir.is_some() || cli.sql_glob.is_some())
     {
         println!(
             "❌ ERROR: --sql-dir, --result-dir, --sql-glob cannot be used with multiple suites"
@@ -1567,14 +1547,12 @@ fn main() -> Result<()> {
             .expect("suite already validated");
 
         let sql_dir = if !multi_suite {
-            resolve_path(cli.sql_dir.as_deref(), &base_dir)
-                .unwrap_or_else(|| suite.sql_dir.clone())
+            resolve_path(cli.sql_dir.as_deref(), &base_dir).unwrap_or_else(|| suite.sql_dir.clone())
         } else {
             suite.sql_dir.clone()
         };
         let result_dir = if !multi_suite {
-            resolve_path(cli.result_dir.as_deref(), &base_dir)
-                .or_else(|| suite.result_dir.clone())
+            resolve_path(cli.result_dir.as_deref(), &base_dir).or_else(|| suite.result_dir.clone())
         } else {
             suite.result_dir.clone()
         };
@@ -1592,9 +1570,7 @@ fn main() -> Result<()> {
                 .with_context(|| format!("failed to load suite init hook for {}", suite.name))?;
         let suite_cleanup_hook =
             load_suite_hook(suite.cleanup_sql.as_deref(), &meta_re, &placeholder_vars)
-                .with_context(|| {
-                    format!("failed to load suite cleanup hook for {}", suite.name)
-                })?;
+                .with_context(|| format!("failed to load suite cleanup hook for {}", suite.name))?;
 
         let suite_catalog_override = suite_init_hook
             .as_ref()
@@ -1704,12 +1680,9 @@ fn main() -> Result<()> {
             }
         }
 
-        let available_case_ids: HashSet<String> =
-            cases.iter().map(|c| c.case_id.clone()).collect();
-        let only_set =
-            parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
-        let skip_set =
-            parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
+        let available_case_ids: HashSet<String> = cases.iter().map(|c| c.case_id.clone()).collect();
+        let only_set = parse_selector_list(cli.only.as_deref(), &available_case_ids, "--only")?;
+        let skip_set = parse_selector_list(cli.skip.as_deref(), &available_case_ids, "--skip")?;
 
         cases.retain(|case| {
             if !only_set.is_empty() && !only_set.contains(&case.case_id) {
@@ -1725,10 +1698,7 @@ fn main() -> Result<()> {
         }
 
         if cases.is_empty() {
-            println!(
-                "⚠️ WARNING: no queries selected for suite {}",
-                suite.name
-            );
+            println!("⚠️ WARNING: no queries selected for suite {}", suite.name);
             continue;
         }
 
@@ -1781,10 +1751,7 @@ fn main() -> Result<()> {
             println!("result_dir={}", dir.display());
         }
         println!("query_timeout={}s", query_timeout);
-        println!(
-            "{}",
-            summarize_connection("target", &target_conn_base)
-        );
+        println!("{}", summarize_connection("target", &target_conn_base));
         if cli.mode == Mode::Diff
             || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
         {
@@ -1832,7 +1799,8 @@ fn main() -> Result<()> {
                 let seq_tag = if case.sequential { " [sequential]" } else { "" };
                 println!(
                     "  {} ({}, steps={}{})",
-                    case.case_id, file_name,
+                    case.case_id,
+                    file_name,
                     case.steps.len(),
                     seq_tag,
                 );
@@ -1927,7 +1895,10 @@ fn main() -> Result<()> {
             mode_name(cli.mode)
         );
     } else {
-        let names: Vec<&str> = suite_outcomes.iter().map(|s| s.suite_name.as_str()).collect();
+        let names: Vec<&str> = suite_outcomes
+            .iter()
+            .map(|s| s.suite_name.as_str())
+            .collect();
         println!(
             "summary ({} suites: {}, mode={})",
             names.len(),
@@ -1980,10 +1951,10 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::substitute_placeholders;
     use crate::parser::extract_suite_hook;
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
-    use crate::config::substitute_placeholders;
     use crate::types::ResultSet;
     use regex::Regex;
     use std::collections::BTreeMap;

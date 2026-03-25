@@ -904,7 +904,10 @@ impl NlJoinProbeProcessorOperator {
         }
 
         let matched_mask = if let Some(pred) = self.join_conjunct {
-            let chunk = Chunk::try_new_with_chunk_schema(batch.clone(), Arc::clone(&self.join_scope_chunk_schema))?;
+            let chunk = Chunk::try_new_with_chunk_schema(
+                batch.clone(),
+                Arc::clone(&self.join_scope_chunk_schema),
+            )?;
             let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
             mask_arr
                 .as_any()
@@ -1118,7 +1121,8 @@ impl NlJoinProbeProcessorOperator {
                 continue;
             };
 
-            let joined_chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
+            let joined_chunk =
+                Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
             let key_masks = self.eval_conjunct_masks(&joined_chunk, key_conjuncts)?;
             let residual_masks = self.eval_conjunct_masks(&joined_chunk, residual_conjuncts)?;
 
@@ -1171,7 +1175,13 @@ impl NlJoinProbeProcessorOperator {
 
             let mask_arr = self
                 .arena
-                .eval(pred, &Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?)
+                .eval(
+                    pred,
+                    &Chunk::try_new_with_chunk_schema(
+                        batch,
+                        Arc::clone(&self.join_scope_chunk_schema),
+                    )?,
+                )
                 .map_err(|e| e.to_string())?;
             let mask = mask_arr
                 .as_any()
@@ -1202,7 +1212,8 @@ impl NlJoinProbeProcessorOperator {
             return Ok(batch);
         };
 
-        let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
+        let chunk =
+            Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
         let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
         let mask = mask_arr
             .as_any()

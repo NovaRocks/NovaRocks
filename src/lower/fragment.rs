@@ -36,7 +36,7 @@ use crate::exec::operators::{
 };
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
 use crate::lower::layout::{build_tuple_slot_order, infer_tuple_slot_order, reorder_tuple_slots};
-use crate::lower::{Lowered, lower_plan};
+use crate::lower::thrift::{Lowered, lower_plan};
 use crate::runtime::profile::Profiler;
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;

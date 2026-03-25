@@ -832,7 +832,14 @@ fn build_projected_columns(
                     .default_value
                     .as_ref()
                     .map(|raw| String::from_utf8_lossy(raw).to_string());
-                (schema, schema_unique_id, None, false, dv, schema_col.is_nullable.unwrap_or(field.is_nullable()))
+                (
+                    schema,
+                    schema_unique_id,
+                    None,
+                    false,
+                    dv,
+                    schema_col.is_nullable.unwrap_or(field.is_nullable()),
+                )
             }
         } else if allow_flat_json_fallback {
             if let Some((schema_col, projection)) =

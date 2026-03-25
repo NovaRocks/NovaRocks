@@ -31,8 +31,8 @@ use arrow::array::{
 use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
-use num_traits::ToPrimitive;
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
+use num_traits::ToPrimitive;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 

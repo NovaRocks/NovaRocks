@@ -25,10 +25,12 @@ arrow-data = { version = "57.1.0" }
 parquet = { version = "57.1.0", features = ["arrow"] }
 orc-rust = { version = "0.7.1", default-features = false }
 apache-avro = "0.21.0"
+iceberg = "0.9.0"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native"] }
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = "25"
+mysql_common = "0.32"
 jni = { version = "0.21", features = ["invocation"], optional = true }
 url = "2"
 rand = "0.8"
@@ -36,6 +38,8 @@ regex = "1.10"
 hex = "0.4"
 libm = "0.2"
 num-traits = "0.2"
+async-trait = "0.1"
+opensrv-mysql = { version = "0.7", default-features = false }
 
 # starust core
 thrift = "0.17"
@@ -45,7 +49,7 @@ bytes = "1"
 csv = "1"
 hashbrown = { version = "0.14", features = ["raw"] }
 prost = "0.13"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
 tonic = { version = "0.12", features = ["transport"] }
 axum = "0.7"
 tokio-stream = "0.1"

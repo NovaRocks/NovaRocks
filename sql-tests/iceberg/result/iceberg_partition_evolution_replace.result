@@ -1,0 +1,25 @@
+-- query 1
+cnt	sum_val
+6	210
+
+-- query 2
+ym	cnt	sum_val
+2024-01	3	70
+2024-02	2	80
+2024-03	1	60
+
+-- query 3
+id	val
+1	10
+2	20
+4	40
+
+-- query 4
+cnt	total
+5	1000
+
+-- query 5
+city	cnt	total
+Beijing	3	500
+Guangzhou	1	300
+Shanghai	1	200

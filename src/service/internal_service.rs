@@ -36,8 +36,8 @@ use crate::common::types::UniqueId;
 use crate::common::util::{
     http_json_row_from_arrays_with_primitives, mysql_text_row_from_arrays_with_primitives,
 };
-use crate::lower::cache_iceberg_table_locations;
 use crate::lower::fragment::execute_fragment;
+use crate::lower::thrift::cache_iceberg_table_locations;
 use crate::lower::type_lowering::primitive_type_from_desc;
 use crate::runtime::exchange;
 use crate::runtime::mem_tracker::MemTracker;

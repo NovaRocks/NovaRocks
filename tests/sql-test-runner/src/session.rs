@@ -183,7 +183,11 @@ impl MysqlSession {
                                     return (
                                         false,
                                         None,
-                                        format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
+                                        format!(
+                                            "FAIL ({:.2}s): {}",
+                                            elapsed.as_secs_f64(),
+                                            clipped
+                                        ),
                                     );
                                 }
                             }
@@ -239,7 +243,11 @@ impl MysqlSession {
     }
 }
 
-pub fn run_mysql_sql(conn: &ConnectionConfig, sql: &str, skip_column_names: bool) -> Result<String> {
+pub fn run_mysql_sql(
+    conn: &ConnectionConfig,
+    sql: &str,
+    skip_column_names: bool,
+) -> Result<String> {
     let mut cmd = Command::new(&conn.mysql);
     cmd.arg(format!("-h{}", conn.host))
         .arg(format!("-P{}", conn.port))
@@ -288,12 +296,10 @@ pub fn reset_case_database(
     label: &str,
 ) -> Result<()> {
     let sql = build_statements(
-        &format!(
-            "DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;"
-        ),
+        &format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;"),
         query_timeout,
-        None,
-        None,
+        conn.catalog.as_deref(),
+        conn.db.as_deref(),
     );
     run_mysql_sql(conn, &sql, true)
         .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
@@ -309,8 +315,8 @@ pub fn drop_case_database(
     let sql = build_statements(
         &format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;"),
         query_timeout,
-        None,
-        None,
+        conn.catalog.as_deref(),
+        conn.db.as_deref(),
     );
     run_mysql_sql(conn, &sql, true)
         .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;

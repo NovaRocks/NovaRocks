@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray,
-    MapArray, StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, ListArray, MapArray,
+    StringArray, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, make_array,
 };
 use arrow::datatypes::DataType;
@@ -270,10 +270,13 @@ fn value_key(values: &ArrayRef, idx: usize) -> Result<IntersectValue, String> {
                 .map_err(|e| format!("array_intersect LARGEINT decode failed: {e}"))?;
             Ok(IntersectValue::LargeInt(decoded))
         }
-        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
-            Ok(IntersectValue::GenericHash(hash_complex_value(values, idx)?))
-        }
-        other => Err(format!("array_intersect unsupported hash key type: {:?}", other)),
+        DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => Ok(
+            IntersectValue::GenericHash(hash_complex_value(values, idx)?),
+        ),
+        other => Err(format!(
+            "array_intersect unsupported hash key type: {:?}",
+            other
+        )),
     }
 }
 
@@ -457,7 +460,12 @@ fn hash_complex_value_impl(
                 hash_complex_value_impl(&vals, i, hasher)?;
             }
         }
-        other => return Err(format!("array_intersect hash unsupported type: {:?}", other)),
+        other => {
+            return Err(format!(
+                "array_intersect hash unsupported type: {:?}",
+                other
+            ));
+        }
     }
     Ok(())
 }

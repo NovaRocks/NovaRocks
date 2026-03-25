@@ -811,6 +811,7 @@ mod tests {
                 agg_state_desc: None,
                 index_len: Some(8),
                 type_desc: None,
+                default_expr: None,
             }],
             bloom_filter_fpp: None,
             indexes: None,

@@ -25,10 +25,10 @@ use arrow::array::{
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, StringArray, TimestampMicrosecondArray, UInt32Array, new_null_array,
 };
-use arrow_buffer::i256;
 use arrow::compute::{cast, concat, take};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use arrow_buffer::i256;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use prost::Message;
 
@@ -130,7 +130,13 @@ fn append_lake_txn_log_with_rowset_impl(
     partition_id: i64,
     load_id: Option<&PUniqueId>,
 ) -> Result<(), String> {
-    tracing::info!("append_lake_txn_log_with_rowset_impl: rows={} columns={} schema_columns={} tablet_id={}", batch.num_rows(), batch.num_columns(), ctx.tablet_schema.column.len(), ctx.tablet_id);
+    tracing::info!(
+        "append_lake_txn_log_with_rowset_impl: rows={} columns={} schema_columns={} tablet_id={}",
+        batch.num_rows(),
+        batch.num_columns(),
+        ctx.tablet_schema.column.len(),
+        ctx.tablet_id
+    );
     let begin_time_ms = unix_millis_now();
     if ctx.table_id <= 0 {
         return Err(format!("invalid table_id for lake write: {}", ctx.table_id));
@@ -2318,8 +2324,8 @@ fn materialize_partial_upsert_batch(
             // When miss_auto_increment_column is true, the auto-increment column in
             // the batch has a 0 placeholder.  For existing rows use the existing value;
             // for new rows allocate a fresh ID (fall through below).
-            let is_auto_placeholder = auto_policy.miss_auto_increment_column
-                && auto_col_idx == Some(col_idx);
+            let is_auto_placeholder =
+                auto_policy.miss_auto_increment_column && auto_col_idx == Some(col_idx);
             if is_auto_placeholder {
                 if let Some(old_row) = existing_row.as_ref() {
                     materialized_row.push(old_row[col_idx].clone());
@@ -2596,8 +2602,12 @@ pub(crate) fn parse_default_literal_to_singleton_array(
         DataType::Binary => Ok(Arc::new(BinaryArray::from(vec![Some(unquoted.as_bytes())]))),
         // Complex types (ARRAY, MAP, STRUCT): StarRocks serializes them as JSON in ColumnPB.
         DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => {
-            let json: serde_json::Value = serde_json::from_str(normalized)
-                .map_err(|e| format!("parse complex default literal as JSON failed: '{}' error={}", normalized, e))?;
+            let json: serde_json::Value = serde_json::from_str(normalized).map_err(|e| {
+                format!(
+                    "parse complex default literal as JSON failed: '{}' error={}",
+                    normalized, e
+                )
+            })?;
             json_value_to_arrow_singleton_array(&json, data_type)
         }
         other => Err(format!(
@@ -2615,10 +2625,8 @@ fn json_value_to_arrow_singleton_array(
     data_type: &DataType,
 ) -> Result<ArrayRef, String> {
     use arrow::array::{
+        Decimal256Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
         ListArray, MapArray, StructArray,
-        Decimal256Array,
-        Int8Array, Int16Array, Int32Array, Int64Array,
-        Float32Array, Float64Array,
     };
     use arrow::datatypes::Fields;
     use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -2632,13 +2640,16 @@ fn json_value_to_arrow_singleton_array(
         DataType::Boolean => {
             let v = match json {
                 serde_json::Value::Bool(b) => *b,
-                serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0).ok_or_else(|| {
-                    format!("cannot parse JSON number as boolean: {}", n)
-                })?,
+                serde_json::Value::Number(n) => n
+                    .as_i64()
+                    .map(|i| i != 0)
+                    .ok_or_else(|| format!("cannot parse JSON number as boolean: {}", n))?,
                 serde_json::Value::String(s) => match s.to_ascii_lowercase().as_str() {
                     "true" | "1" => true,
                     "false" | "0" => false,
-                    other => return Err(format!("cannot parse JSON string as boolean: '{}'", other)),
+                    other => {
+                        return Err(format!("cannot parse JSON string as boolean: '{}'", other));
+                    }
                 },
                 other => return Err(format!("unexpected JSON type for boolean: {:?}", other)),
             };
@@ -2646,32 +2657,50 @@ fn json_value_to_arrow_singleton_array(
         }
         DataType::Int8 => {
             let s = json_value_to_string(json)?;
-            let v = s.trim().parse::<i8>().map_err(|e| format!("parse JSON '{}' as Int8 failed: {}", s, e))?;
+            let v = s
+                .trim()
+                .parse::<i8>()
+                .map_err(|e| format!("parse JSON '{}' as Int8 failed: {}", s, e))?;
             Ok(Arc::new(Int8Array::from(vec![Some(v)])))
         }
         DataType::Int16 => {
             let s = json_value_to_string(json)?;
-            let v = s.trim().parse::<i16>().map_err(|e| format!("parse JSON '{}' as Int16 failed: {}", s, e))?;
+            let v = s
+                .trim()
+                .parse::<i16>()
+                .map_err(|e| format!("parse JSON '{}' as Int16 failed: {}", s, e))?;
             Ok(Arc::new(Int16Array::from(vec![Some(v)])))
         }
         DataType::Int32 => {
             let s = json_value_to_string(json)?;
-            let v = s.trim().parse::<i32>().map_err(|e| format!("parse JSON '{}' as Int32 failed: {}", s, e))?;
+            let v = s
+                .trim()
+                .parse::<i32>()
+                .map_err(|e| format!("parse JSON '{}' as Int32 failed: {}", s, e))?;
             Ok(Arc::new(Int32Array::from(vec![Some(v)])))
         }
         DataType::Int64 => {
             let s = json_value_to_string(json)?;
-            let v = s.trim().parse::<i64>().map_err(|e| format!("parse JSON '{}' as Int64 failed: {}", s, e))?;
+            let v = s
+                .trim()
+                .parse::<i64>()
+                .map_err(|e| format!("parse JSON '{}' as Int64 failed: {}", s, e))?;
             Ok(Arc::new(Int64Array::from(vec![Some(v)])))
         }
         DataType::Float32 => {
             let s = json_value_to_string(json)?;
-            let v = s.trim().parse::<f32>().map_err(|e| format!("parse JSON '{}' as Float32 failed: {}", s, e))?;
+            let v = s
+                .trim()
+                .parse::<f32>()
+                .map_err(|e| format!("parse JSON '{}' as Float32 failed: {}", s, e))?;
             Ok(Arc::new(Float32Array::from(vec![Some(v)])))
         }
         DataType::Float64 => {
             let s = json_value_to_string(json)?;
-            let v = s.trim().parse::<f64>().map_err(|e| format!("parse JSON '{}' as Float64 failed: {}", s, e))?;
+            let v = s
+                .trim()
+                .parse::<f64>()
+                .map_err(|e| format!("parse JSON '{}' as Float64 failed: {}", s, e))?;
             Ok(Arc::new(Float64Array::from(vec![Some(v)])))
         }
         DataType::Utf8 => {
@@ -2684,7 +2713,9 @@ fn json_value_to_arrow_singleton_array(
         }
         DataType::Date32 => {
             let s = json_value_to_string(json)?;
-            Ok(Arc::new(Date32Array::from(vec![Some(parse_date32_default_literal(&s)?)])))
+            Ok(Arc::new(Date32Array::from(vec![Some(
+                parse_date32_default_literal(&s)?,
+            )])))
         }
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             let s = json_value_to_string(json)?;
@@ -2712,25 +2743,30 @@ fn json_value_to_arrow_singleton_array(
             if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let s = json_value_to_string(json)?;
-            let parsed = s.trim().parse::<i128>().map_err(|e| {
-                format!("parse LARGEINT default literal '{}' failed: {}", s, e)
-            })?;
+            let parsed = s
+                .trim()
+                .parse::<i128>()
+                .map_err(|e| format!("parse LARGEINT default literal '{}' failed: {}", s, e))?;
             crate::common::largeint::array_from_i128(&[Some(parsed)])
         }
         // ── ARRAY ─────────────────────────────────────────────────────────────────
         DataType::List(item_field) => {
-            let arr = json.as_array().ok_or_else(|| {
-                format!("expected JSON array for List type, got: {}", json)
-            })?;
+            let arr = json
+                .as_array()
+                .ok_or_else(|| format!("expected JSON array for List type, got: {}", json))?;
             let mut element_arrays: Vec<ArrayRef> = Vec::with_capacity(arr.len());
             for item in arr {
-                element_arrays.push(json_value_to_arrow_singleton_array(item, item_field.data_type())?);
+                element_arrays.push(json_value_to_arrow_singleton_array(
+                    item,
+                    item_field.data_type(),
+                )?);
             }
             // Concatenate all element singletons into a values array.
             let values: ArrayRef = if element_arrays.is_empty() {
                 arrow::array::new_empty_array(item_field.data_type())
             } else {
-                let refs: Vec<&dyn arrow::array::Array> = element_arrays.iter().map(|a| a.as_ref()).collect();
+                let refs: Vec<&dyn arrow::array::Array> =
+                    element_arrays.iter().map(|a| a.as_ref()).collect();
                 concat(&refs).map_err(|e| format!("concat List element arrays failed: {}", e))?
             };
             let n = values.len() as i32;
@@ -2749,54 +2785,59 @@ fn json_value_to_arrow_singleton_array(
                     return Err(format!(
                         "unexpected Map entry field type (expected 2-field struct): {:?}",
                         other
-                    ))
+                    ));
                 }
             };
-            let obj = json.as_object().ok_or_else(|| {
-                format!("expected JSON object for Map type, got: {}", json)
-            })?;
+            let obj = json
+                .as_object()
+                .ok_or_else(|| format!("expected JSON object for Map type, got: {}", json))?;
             let mut key_arrays: Vec<ArrayRef> = Vec::with_capacity(obj.len());
             let mut val_arrays: Vec<ArrayRef> = Vec::with_capacity(obj.len());
             for (k, v) in obj {
                 // Keys in JSON are always strings; parse to key_field type.
                 let key_json = serde_json::Value::String(k.clone());
-                key_arrays.push(json_value_to_arrow_singleton_array(&key_json, key_field.data_type())?);
-                val_arrays.push(json_value_to_arrow_singleton_array(v, value_field.data_type())?);
+                key_arrays.push(json_value_to_arrow_singleton_array(
+                    &key_json,
+                    key_field.data_type(),
+                )?);
+                val_arrays.push(json_value_to_arrow_singleton_array(
+                    v,
+                    value_field.data_type(),
+                )?);
             }
             let keys: ArrayRef = if key_arrays.is_empty() {
                 arrow::array::new_empty_array(key_field.data_type())
             } else {
-                let refs: Vec<&dyn arrow::array::Array> = key_arrays.iter().map(|a| a.as_ref()).collect();
+                let refs: Vec<&dyn arrow::array::Array> =
+                    key_arrays.iter().map(|a| a.as_ref()).collect();
                 concat(&refs).map_err(|e| format!("concat Map key arrays failed: {}", e))?
             };
             let vals: ArrayRef = if val_arrays.is_empty() {
                 arrow::array::new_empty_array(value_field.data_type())
             } else {
-                let refs: Vec<&dyn arrow::array::Array> = val_arrays.iter().map(|a| a.as_ref()).collect();
+                let refs: Vec<&dyn arrow::array::Array> =
+                    val_arrays.iter().map(|a| a.as_ref()).collect();
                 concat(&refs).map_err(|e| format!("concat Map value arrays failed: {}", e))?
             };
             let n = keys.len() as i32;
             let offsets = OffsetBuffer::new(arrow_buffer::ScalarBuffer::from(vec![0i32, n]));
             let entry_struct = StructArray::new(
-                Fields::from(vec![key_field.as_ref().clone(), value_field.as_ref().clone()]),
+                Fields::from(vec![
+                    key_field.as_ref().clone(),
+                    value_field.as_ref().clone(),
+                ]),
                 vec![keys, vals],
                 None,
             );
-            let map = MapArray::try_new(
-                entry_field.clone(),
-                offsets,
-                entry_struct,
-                None,
-                *sorted,
-            )
-            .map_err(|e| format!("build Map singleton array failed: {}", e))?;
+            let map = MapArray::try_new(entry_field.clone(), offsets, entry_struct, None, *sorted)
+                .map_err(|e| format!("build Map singleton array failed: {}", e))?;
             Ok(Arc::new(map))
         }
         // ── STRUCT ────────────────────────────────────────────────────────────────
         DataType::Struct(fields) => {
-            let obj = json.as_object().ok_or_else(|| {
-                format!("expected JSON object for Struct type, got: {}", json)
-            })?;
+            let obj = json
+                .as_object()
+                .ok_or_else(|| format!("expected JSON object for Struct type, got: {}", json))?;
             let mut columns: Vec<ArrayRef> = Vec::with_capacity(fields.len());
             let mut null_builder = NullBufferBuilder::new(1);
             null_builder.append_non_null();
@@ -2819,7 +2860,11 @@ fn json_value_to_string(json: &serde_json::Value) -> Result<String, String> {
     match json {
         serde_json::Value::String(s) => Ok(s.clone()),
         serde_json::Value::Number(n) => Ok(n.to_string()),
-        serde_json::Value::Bool(b) => Ok(if *b { "true".to_string() } else { "false".to_string() }),
+        serde_json::Value::Bool(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
         other => Err(format!("cannot convert JSON value to string: {:?}", other)),
     }
 }
@@ -2934,7 +2979,10 @@ fn parse_decimal256_default_literal(
     }
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.len() > 2 {
-        return Err(format!("parse DECIMAL256 default literal failed: '{}'", raw));
+        return Err(format!(
+            "parse DECIMAL256 default literal failed: '{}'",
+            raw
+        ));
     }
     let integer_digits = parts[0].chars().filter(|c| *c != '_').collect::<String>();
     let mut fractional_digits = if parts.len() == 2 {
@@ -2963,9 +3011,9 @@ fn parse_decimal256_default_literal(
     let mut result = i256::ZERO;
     let ten = i256::from_i128(10);
     for ch in combined.chars() {
-        let d = ch.to_digit(10).ok_or_else(|| {
-            format!("non-digit character '{}' in decimal literal '{}'", ch, raw)
-        })?;
+        let d = ch
+            .to_digit(10)
+            .ok_or_else(|| format!("non-digit character '{}' in decimal literal '{}'", ch, raw))?;
         result = result
             .wrapping_mul(ten)
             .wrapping_add(i256::from_i128(d as i128));

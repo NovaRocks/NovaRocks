@@ -1,5 +1,5 @@
--- @catalog=iceberg_cat_${uuid0}
-CREATE EXTERNAL CATALOG IF NOT EXISTS `iceberg_cat_${uuid0}`
+-- @catalog=iceberg_cat_${suite_uuid0}
+CREATE EXTERNAL CATALOG IF NOT EXISTS `iceberg_cat_${suite_uuid0}`
 PROPERTIES (
     "type"="iceberg",
     "iceberg.catalog.type"="${iceberg_catalog_type}",

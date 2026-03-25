@@ -246,12 +246,9 @@ impl HashJoinProbeCore {
     /// slots must still appear in the output chunk (as NULLs) because
     /// downstream operators (SORT sort_tuple_slot_exprs, EXCHANGE, ANALYTIC)
     /// may reference them.
-    fn extend_with_null_build_columns(
-        &self,
-        probe_batch: RecordBatch,
-    ) -> Result<Chunk, String> {
-        use arrow::array::new_null_array;
+    fn extend_with_null_build_columns(&self, probe_batch: RecordBatch) -> Result<Chunk, String> {
         use crate::exec::chunk::ChunkSchema;
+        use arrow::array::new_null_array;
         let num_rows = probe_batch.num_rows();
         let build_schema = self.build_chunk_schema();
         let probe_col_count = probe_batch.num_columns();
@@ -262,11 +259,18 @@ impl HashJoinProbeCore {
         // Build a ChunkSchema where the NULL-filled build-side slots are nullable,
         // so that downstream operators (LOCAL_EXCHANGE, SORT, etc.) that
         // reconstruct Arrow schemas from ChunkSchema do not reject the NULLs.
-        let adjusted_slots: Vec<_> = self.join_scope_chunk_schema
+        let adjusted_slots: Vec<_> = self
+            .join_scope_chunk_schema
             .slots()
             .iter()
             .enumerate()
-            .map(|(i, slot)| if i >= probe_col_count { slot.with_nullable(true) } else { slot.clone() })
+            .map(|(i, slot)| {
+                if i >= probe_col_count {
+                    slot.with_nullable(true)
+                } else {
+                    slot.clone()
+                }
+            })
             .collect();
         let chunk_schema = Arc::new(
             ChunkSchema::try_new(adjusted_slots)
@@ -279,27 +283,30 @@ impl HashJoinProbeCore {
 
     /// Extend a build-only batch with NULL-filled probe-side columns.
     /// Mirror of `extend_with_null_build_columns` for RIGHT SEMI/ANTI.
-    fn extend_with_null_probe_columns(
-        &self,
-        build_batch: RecordBatch,
-    ) -> Result<Chunk, String> {
-        use arrow::array::new_null_array;
+    fn extend_with_null_probe_columns(&self, build_batch: RecordBatch) -> Result<Chunk, String> {
         use crate::exec::chunk::ChunkSchema;
+        use arrow::array::new_null_array;
         let num_rows = build_batch.num_rows();
         let probe_schema = self.probe_chunk_schema();
         let probe_col_count = probe_schema.slots().len();
-        let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(
-            probe_col_count + build_batch.num_columns(),
-        );
+        let mut columns: Vec<arrow::array::ArrayRef> =
+            Vec::with_capacity(probe_col_count + build_batch.num_columns());
         for slot in probe_schema.slots() {
             columns.push(new_null_array(slot.field().data_type(), num_rows));
         }
         columns.extend(build_batch.columns().iter().cloned());
-        let adjusted_slots: Vec<_> = self.join_scope_chunk_schema
+        let adjusted_slots: Vec<_> = self
+            .join_scope_chunk_schema
             .slots()
             .iter()
             .enumerate()
-            .map(|(i, slot)| if i < probe_col_count { slot.with_nullable(true) } else { slot.clone() })
+            .map(|(i, slot)| {
+                if i < probe_col_count {
+                    slot.with_nullable(true)
+                } else {
+                    slot.clone()
+                }
+            })
             .collect();
         let chunk_schema = Arc::new(
             ChunkSchema::try_new(adjusted_slots)
@@ -558,7 +565,10 @@ impl HashJoinProbeCore {
                 if batch.num_rows() == 0 {
                     continue;
                 }
-                let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&self.join_scope_chunk_schema))?;
+                let chunk = Chunk::try_new_with_chunk_schema(
+                    batch,
+                    Arc::clone(&self.join_scope_chunk_schema),
+                )?;
                 let mask_arr = self.arena.eval(pred, &chunk).map_err(|e| e.to_string())?;
                 let mask = mask_arr
                     .as_any()
@@ -627,7 +637,12 @@ impl HashJoinProbeCore {
                         &output_schema,
                     )?
                 } else {
-                    build_null_left_with_right(&probe, &indices, &self.left_chunk_schema.arrow_schema_ref(), &output_schema)?
+                    build_null_left_with_right(
+                        &probe,
+                        &indices,
+                        &self.left_chunk_schema.arrow_schema_ref(),
+                        &output_schema,
+                    )?
                 };
                 if let Some(batch) = batch {
                     output_batches.push(batch);
@@ -814,10 +829,13 @@ impl HashJoinProbeCore {
             let Some(output_indices) = output_indices else {
                 return Ok(None);
             };
-            let Some(build_batch) = self.build_right_semi_output_from_indices(&output_indices)? else {
+            let Some(build_batch) = self.build_right_semi_output_from_indices(&output_indices)?
+            else {
                 return Ok(None);
             };
-            self.output_rows = self.output_rows.saturating_add(build_batch.num_rows() as u64);
+            self.output_rows = self
+                .output_rows
+                .saturating_add(build_batch.num_rows() as u64);
             return Ok(Some(self.extend_with_null_probe_columns(build_batch)?));
         }
 
@@ -828,10 +846,7 @@ impl HashJoinProbeCore {
 
         let Some(table) = self.build_table.as_ref() else {
             if is_anti {
-                let batches: Vec<_> = probe_chunks
-                    .into_iter()
-                    .map(|c| c.batch)
-                    .collect();
+                let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
                 if batches.is_empty() {
                     return Ok(None);
                 }
@@ -848,10 +863,7 @@ impl HashJoinProbeCore {
         };
         if table.is_empty() || self.build_batches.is_empty() {
             if is_anti {
-                let batches: Vec<_> = probe_chunks
-                    .into_iter()
-                    .map(|c| c.batch)
-                    .collect();
+                let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
                 if batches.is_empty() {
                     return Ok(None);
                 }
@@ -964,10 +976,7 @@ impl HashJoinProbeCore {
         }
         if self.global_build_row_count == 0 {
             let output_schema = probe_chunks[0].schema();
-            let batches: Vec<_> = probe_chunks
-                .into_iter()
-                .map(|c| c.batch)
-                .collect();
+            let batches: Vec<_> = probe_chunks.into_iter().map(|c| c.batch).collect();
             if batches.is_empty() {
                 return Ok(None);
             }

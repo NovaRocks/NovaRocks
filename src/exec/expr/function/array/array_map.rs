@@ -210,8 +210,7 @@ pub fn eval_array_map(
         source_row_common_sub_exprs[idx] = Some(source_col);
     }
 
-    if let Some(row_level_result) =
-        try_eval_expr_on_source_rows(arena, lambda_body, &source_chunk)?
+    if let Some(row_level_result) = try_eval_expr_on_source_rows(arena, lambda_body, &source_chunk)?
     {
         let flat_result =
             replicate_array_by_row_lengths(&row_level_result, &row_lengths, total_elements)?;

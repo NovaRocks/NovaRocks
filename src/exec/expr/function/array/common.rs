@@ -54,9 +54,10 @@ pub(super) fn adjust_legacy_decimalv2_target_type(
     requested_type: &DataType,
 ) -> DataType {
     match (source_type, requested_type) {
-        (DataType::Decimal128(source_precision, source_scale), DataType::Decimal128(target_precision, target_scale))
-            if *target_scale == LEGACY_DECIMALV2_SCALE && source_scale != target_scale =>
-        {
+        (
+            DataType::Decimal128(source_precision, source_scale),
+            DataType::Decimal128(target_precision, target_scale),
+        ) if *target_scale == LEGACY_DECIMALV2_SCALE && source_scale != target_scale => {
             DataType::Decimal128((*target_precision).max(*source_precision), *source_scale)
         }
         _ => requested_type.clone(),

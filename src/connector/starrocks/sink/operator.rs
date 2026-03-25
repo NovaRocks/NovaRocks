@@ -722,8 +722,7 @@ fn filter_rows_for_tablet_schema(
     let column_count = materialized_batch
         .num_columns()
         .min(tablet_schema.column.len());
-    let auto_increment_schema_idx = auto_increment
-        .and_then(|p| p.auto_increment_column_idx);
+    let auto_increment_schema_idx = auto_increment.and_then(|p| p.auto_increment_column_idx);
     for column_idx in 0..column_count {
         let schema_col = &tablet_schema.column[column_idx];
         if schema_col.is_nullable.unwrap_or(true) {

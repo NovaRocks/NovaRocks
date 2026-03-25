@@ -174,9 +174,12 @@ pub fn placeholder_variables(
     let mut variables = runner_config.values.clone();
     apply_suite_placeholder_defaults(&mut variables, suite_name);
     variables.insert("run_id".to_string(), run_id.clone());
+    variables.insert("suite_run_id".to_string(), run_id.clone());
     variables.insert("suite".to_string(), suite_name.to_string());
     for idx in 0..10 {
-        variables.insert(format!("uuid{}", idx), format!("{}_{}", run_id, idx));
+        let value = format!("{}_{}", run_id, idx);
+        variables.insert(format!("uuid{}", idx), value.clone());
+        variables.insert(format!("suite_uuid{}", idx), value);
     }
     variables
 }
@@ -205,12 +208,14 @@ pub fn case_placeholder_variables(
 ) -> HashMap<String, String> {
     let mut variables = base_variables.clone();
     let suite_run_id = base_variables
-        .get("run_id")
+        .get("suite_run_id")
+        .or_else(|| base_variables.get("run_id"))
         .cloned()
         .unwrap_or_else(|| "sqlt".to_string());
     let case_run_id = format!("{}_{}", suite_run_id, stable_hash_hex(case_id));
     variables.insert("case_id".to_string(), case_id.to_string());
     variables.insert("run_id".to_string(), case_run_id.clone());
+    variables.insert("suite_run_id".to_string(), suite_run_id);
     for idx in 0..10 {
         variables.insert(format!("uuid{}", idx), format!("{}_{}", case_run_id, idx));
     }

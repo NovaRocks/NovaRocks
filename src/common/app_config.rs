@@ -118,6 +118,9 @@ pub struct NovaRocksConfig {
     pub jdbc: Option<JdbcConfig>,
 
     #[serde(default)]
+    pub standalone_server: Option<StandaloneServerConfig>,
+
+    #[serde(default)]
     pub spill: SpillStorageConfig,
 
     #[serde(default)]
@@ -151,6 +154,7 @@ impl Default for NovaRocksConfig {
             iceberg: IcebergConfig::default(),
             debug: DebugConfig::default(),
             jdbc: None,
+            standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
         }
@@ -222,6 +226,43 @@ impl Default for ServerConfig {
             brpc_port: default_brpc_port(),
             http_port: default_http_port(),
             starlet_port: default_starlet_port(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct StandaloneTableConfig {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct StandaloneServerConfig {
+    #[serde(default = "default_standalone_server_mysql_port")]
+    pub mysql_port: u16,
+    #[serde(default = "default_standalone_server_user")]
+    pub user: String,
+    #[serde(default)]
+    pub metadata_db_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tables: Vec<StandaloneTableConfig>,
+}
+
+fn default_standalone_server_mysql_port() -> u16 {
+    9030
+}
+
+fn default_standalone_server_user() -> String {
+    "root".to_string()
+}
+
+impl Default for StandaloneServerConfig {
+    fn default() -> Self {
+        Self {
+            mysql_port: default_standalone_server_mysql_port(),
+            user: default_standalone_server_user(),
+            metadata_db_path: None,
+            tables: Vec::new(),
         }
     }
 }
@@ -927,7 +968,9 @@ impl std::fmt::Debug for JdbcConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{IcebergConfig, NovaRocksConfig, RuntimeConfig};
+    use std::path::PathBuf;
+
+    use super::{IcebergConfig, NovaRocksConfig, RuntimeConfig, StandaloneServerConfig};
 
     #[test]
     fn test_server_priority_networks_default_is_empty() {
@@ -989,6 +1032,52 @@ starlet_port = 19070
         )
         .expect("parse config");
         assert_eq!(cfg.server.starlet_port, 19070);
+    }
+
+    #[test]
+    fn test_standalone_server_defaults() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[standalone_server]
+"#,
+        )
+        .expect("parse config");
+        assert_eq!(
+            cfg.standalone_server,
+            Some(StandaloneServerConfig {
+                mysql_port: 9030,
+                user: "root".to_string(),
+                metadata_db_path: None,
+                tables: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_standalone_server_tables_can_be_overridden() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[standalone_server]
+mysql_port = 19030
+user = "root"
+metadata_db_path = "meta/catalog.db"
+
+[[standalone_server.tables]]
+name = "tbl"
+path = "data/tbl.parquet"
+"#,
+        )
+        .expect("parse config");
+        let standalone = cfg.standalone_server.expect("standalone server config");
+        assert_eq!(standalone.mysql_port, 19030);
+        assert_eq!(standalone.user, "root");
+        assert_eq!(
+            standalone.metadata_db_path,
+            Some(PathBuf::from("meta/catalog.db"))
+        );
+        assert_eq!(standalone.tables.len(), 1);
+        assert_eq!(standalone.tables[0].name, "tbl");
+        assert_eq!(standalone.tables[0].path, PathBuf::from("data/tbl.parquet"));
     }
 
     #[test]

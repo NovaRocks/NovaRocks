@@ -214,14 +214,14 @@ pub(crate) fn mysql_text_row_from_arrays_with_primitives(
                 };
                 append_lenenc_string(&mut out, ts.as_bytes());
             }
-        DataType::Decimal128(_, scale) => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
+            DataType::Decimal128(_, scale) => {
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
                 let value = format_decimal(arr.value(row), *scale);
                 append_lenenc_string(&mut out, value.as_bytes());
-        }
+            }
             DataType::Decimal256(_, scale) => {
                 let arr = col
                     .as_any()

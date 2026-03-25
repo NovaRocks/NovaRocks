@@ -474,7 +474,10 @@ fn primary_key_schema_change_requires_delvec_support(
     let has_delvec_meta = metadata.delvec_meta.as_ref().is_some_and(|delvec_meta| {
         !delvec_meta.version_to_file.is_empty() || !delvec_meta.delvecs.is_empty()
     });
-    let has_rowset_del_files = metadata.rowsets.iter().any(|rowset| !rowset.del_files.is_empty());
+    let has_rowset_del_files = metadata
+        .rowsets
+        .iter()
+        .any(|rowset| !rowset.del_files.is_empty());
     Ok(has_delvec_meta || has_rowset_del_files)
 }
 
@@ -484,8 +487,7 @@ mod tests {
 
     use crate::service::grpc_client::proto::starrocks::{
         ColumnPb, CompactionStrategyPb, DelfileWithRowsetId, KeysType, MetadataUpdateInfoPb,
-        RowsetMetadataPb, TableSchemaKeyPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb,
-        txn_log_pb,
+        RowsetMetadataPb, TableSchemaKeyPb, TabletMetadataPb, TabletSchemaPb, TxnLogPb, txn_log_pb,
     };
 
     use super::{apply_txn_log_to_metadata, primary_key_schema_change_requires_delvec_support};

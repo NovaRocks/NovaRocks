@@ -267,13 +267,14 @@ impl AnalyticSharedState {
         // If any column's actual type or nullability differs from the pre-declared schema
         // (e.g., a pass-through pre-agg slot declared as VARBINARY/non-nullable but carrying
         // numeric or nullable data), rebuild the output schema from the actual columns.
-        let needs_schema_adjustment = columns.iter().zip(output_chunk_schema.slots()).any(
-            |(col, slot)| {
-                let f = slot.field();
-                col.data_type() != f.data_type()
-                    || (col.null_count() > 0 && !f.is_nullable())
-            },
-        );
+        let needs_schema_adjustment =
+            columns
+                .iter()
+                .zip(output_chunk_schema.slots())
+                .any(|(col, slot)| {
+                    let f = slot.field();
+                    col.data_type() != f.data_type() || (col.null_count() > 0 && !f.is_nullable())
+                });
         let effective_schema = if needs_schema_adjustment {
             let fields: Vec<arrow::datatypes::Field> = columns
                 .iter()
@@ -288,8 +289,11 @@ impl AnalyticSharedState {
                     }
                 })
                 .collect();
-            Arc::new(output_chunk_schema.with_fields_in_order(fields)
-                .map_err(|e| format!("build analytic adjusted schema: {}", e))?)
+            Arc::new(
+                output_chunk_schema
+                    .with_fields_in_order(fields)
+                    .map_err(|e| format!("build analytic adjusted schema: {}", e))?,
+            )
         } else {
             output_chunk_schema
         };

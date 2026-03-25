@@ -344,9 +344,16 @@ fn build_create_tablet_schema(
         // For scalar types, FE sends default_value as a plain string.
         // For complex types (ARRAY/MAP/STRUCT), FE sends define_expr (TExpr) instead.
         // Convert define_expr to a JSON string to match what StarRocks BE stores in ColumnPB.
-        column_pb.default_value = col.default_value.as_ref().map(|v| v.as_bytes().to_vec()).or_else(|| {
-            col.default_expr.as_ref().and_then(convert_define_expr_to_json).map(|s| s.into_bytes())
-        });
+        column_pb.default_value = col
+            .default_value
+            .as_ref()
+            .map(|v| v.as_bytes().to_vec())
+            .or_else(|| {
+                col.default_expr
+                    .as_ref()
+                    .and_then(convert_define_expr_to_json)
+                    .map(|s| s.into_bytes())
+            });
         column_pb.is_bf_column = col.is_bloom_filter_column;
         column_pb.has_bitmap_index = col.has_bitmap_index;
         column_pb.is_auto_increment = Some(col.is_auto_increment.unwrap_or(false));
@@ -500,9 +507,16 @@ pub(crate) fn build_tablet_schema_pb_from_thrift(
         // For scalar types, FE sends default_value as a plain string.
         // For complex types (ARRAY/MAP/STRUCT), FE sends define_expr (TExpr) instead.
         // Convert define_expr to a JSON string to match what StarRocks BE stores in ColumnPB.
-        column_pb.default_value = col.default_value.as_ref().map(|v| v.as_bytes().to_vec()).or_else(|| {
-            col.default_expr.as_ref().and_then(convert_define_expr_to_json).map(|s| s.into_bytes())
-        });
+        column_pb.default_value = col
+            .default_value
+            .as_ref()
+            .map(|v| v.as_bytes().to_vec())
+            .or_else(|| {
+                col.default_expr
+                    .as_ref()
+                    .and_then(convert_define_expr_to_json)
+                    .map(|s| s.into_bytes())
+            });
         column_pb.is_bf_column = col.is_bloom_filter_column;
         column_pb.has_bitmap_index = col.has_bitmap_index;
         column_pb.is_auto_increment = Some(col.is_auto_increment.unwrap_or(false));
@@ -1429,6 +1443,7 @@ mod tests {
             agg_state_desc: None,
             index_len: Some(8),
             type_desc: None,
+            default_expr: None,
         };
         let schema = crate::agent_service::TTabletSchema {
             short_key_column_count: 1,
@@ -1502,6 +1517,7 @@ mod tests {
             agg_state_desc: None,
             index_len: Some(8),
             type_desc: None,
+            default_expr: None,
         };
         crate::descriptors::TOlapTableSchemaParam {
             db_id: 1,
@@ -1585,7 +1601,12 @@ fn extract_struct_field_names(type_desc: &crate::types::TTypeDesc) -> Option<Vec
     let nodes = type_desc.types.as_ref()?;
     for type_node in nodes {
         if let Some(fields) = &type_node.struct_fields {
-            return Some(fields.iter().filter_map(|f| f.name.clone()).collect::<Vec<_>>());
+            return Some(
+                fields
+                    .iter()
+                    .filter_map(|f| f.name.clone())
+                    .collect::<Vec<_>>(),
+            );
         }
     }
     None
@@ -1601,7 +1622,11 @@ fn eval_texpr_node(
     struct_fields_hint: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
     if *idx >= nodes.len() {
-        return Err(format!("expr node index {} out of bounds {}", *idx, nodes.len()));
+        return Err(format!(
+            "expr node index {} out of bounds {}",
+            *idx,
+            nodes.len()
+        ));
     }
     let node = &nodes[*idx];
     *idx += 1;
@@ -1610,34 +1635,64 @@ fn eval_texpr_node(
 
     use crate::exprs::TExprNodeType;
     if nt == TExprNodeType::INT_LITERAL {
-        let v = node.int_literal.as_ref().ok_or("INT_LITERAL missing int_literal")?;
+        let v = node
+            .int_literal
+            .as_ref()
+            .ok_or("INT_LITERAL missing int_literal")?;
         Ok(serde_json::Value::Number(v.value.into()))
     } else if nt == TExprNodeType::LARGE_INT_LITERAL {
-        let v = node.large_int_literal.as_ref().ok_or("LARGE_INT_LITERAL missing large_int_literal")?;
+        let v = node
+            .large_int_literal
+            .as_ref()
+            .ok_or("LARGE_INT_LITERAL missing large_int_literal")?;
         Ok(serde_json::Value::String(v.value.clone()))
     } else if nt == TExprNodeType::FLOAT_LITERAL {
-        let v = node.float_literal.as_ref().ok_or("FLOAT_LITERAL missing float_literal")?;
-        let n = serde_json::Number::from_f64(v.value.0)
-            .ok_or_else(|| format!("FLOAT_LITERAL value {} is not JSON-representable", v.value.0))?;
+        let v = node
+            .float_literal
+            .as_ref()
+            .ok_or("FLOAT_LITERAL missing float_literal")?;
+        let n = serde_json::Number::from_f64(v.value.0).ok_or_else(|| {
+            format!(
+                "FLOAT_LITERAL value {} is not JSON-representable",
+                v.value.0
+            )
+        })?;
         Ok(serde_json::Value::Number(n))
     } else if nt == TExprNodeType::BOOL_LITERAL {
-        let v = node.bool_literal.as_ref().ok_or("BOOL_LITERAL missing bool_literal")?;
+        let v = node
+            .bool_literal
+            .as_ref()
+            .ok_or("BOOL_LITERAL missing bool_literal")?;
         Ok(serde_json::Value::Bool(v.value))
     } else if nt == TExprNodeType::STRING_LITERAL {
-        let v = node.string_literal.as_ref().ok_or("STRING_LITERAL missing string_literal")?;
+        let v = node
+            .string_literal
+            .as_ref()
+            .ok_or("STRING_LITERAL missing string_literal")?;
         Ok(serde_json::Value::String(v.value.clone()))
     } else if nt == TExprNodeType::NULL_LITERAL {
         Ok(serde_json::Value::Null)
     } else if nt == TExprNodeType::DATE_LITERAL {
-        let v = node.date_literal.as_ref().ok_or("DATE_LITERAL missing date_literal")?;
+        let v = node
+            .date_literal
+            .as_ref()
+            .ok_or("DATE_LITERAL missing date_literal")?;
         Ok(serde_json::Value::String(v.value.clone()))
     } else if nt == TExprNodeType::DECIMAL_LITERAL {
-        let v = node.decimal_literal.as_ref().ok_or("DECIMAL_LITERAL missing decimal_literal")?;
+        let v = node
+            .decimal_literal
+            .as_ref()
+            .ok_or("DECIMAL_LITERAL missing decimal_literal")?;
         Ok(serde_json::Value::String(v.value.clone()))
     } else if nt == TExprNodeType::BINARY_LITERAL {
         // VARBINARY default: represent as UTF-8 string (lossy)
-        let v = node.binary_literal.as_ref().ok_or("BINARY_LITERAL missing binary_literal")?;
-        Ok(serde_json::Value::String(String::from_utf8_lossy(&v.value).into_owned()))
+        let v = node
+            .binary_literal
+            .as_ref()
+            .ok_or("BINARY_LITERAL missing binary_literal")?;
+        Ok(serde_json::Value::String(
+            String::from_utf8_lossy(&v.value).into_owned(),
+        ))
     } else if nt == TExprNodeType::CAST_EXPR {
         // CAST has one child; pass through its value.
         // For CAST-to-STRUCT, extract field names from the type and pass as hint
@@ -1656,7 +1711,10 @@ fn eval_texpr_node(
     } else if nt == TExprNodeType::MAP_EXPR {
         // MAP_EXPR children alternate key, value, key, value, ...
         if num_children % 2 != 0 {
-            return Err(format!("MAP_EXPR expected even number of children, got {}", num_children));
+            return Err(format!(
+                "MAP_EXPR expected even number of children, got {}",
+                num_children
+            ));
         }
         let mut map = serde_json::Map::new();
         for _ in 0..(num_children / 2) {
@@ -1681,7 +1739,10 @@ fn eval_texpr_node(
             .unwrap_or("");
         if fn_name == "named_struct" {
             if num_children % 2 != 0 {
-                return Err(format!("named_struct expected even children, got {}", num_children));
+                return Err(format!(
+                    "named_struct expected even children, got {}",
+                    num_children
+                ));
             }
             let mut obj = serde_json::Map::new();
             for _ in 0..(num_children / 2) {
@@ -1714,7 +1775,10 @@ fn eval_texpr_node(
             } else {
                 // No type hint: fall back to treating as named_struct (alternating name/value)
                 if num_children % 2 != 0 {
-                    return Err(format!("row() without type hint expected even children, got {}", num_children));
+                    return Err(format!(
+                        "row() without type hint expected even children, got {}",
+                        num_children
+                    ));
                 }
                 let mut obj = serde_json::Map::new();
                 for _ in 0..(num_children / 2) {
@@ -1729,7 +1793,10 @@ fn eval_texpr_node(
                 Ok(serde_json::Value::Object(obj))
             }
         } else {
-            Err(format!("unsupported FUNCTION_CALL '{}' in define_expr", fn_name))
+            Err(format!(
+                "unsupported FUNCTION_CALL '{}' in define_expr",
+                fn_name
+            ))
         }
     } else {
         Err(format!("unsupported TExprNodeType {:?} in define_expr", nt))

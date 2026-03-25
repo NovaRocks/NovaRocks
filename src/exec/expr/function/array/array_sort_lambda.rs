@@ -18,8 +18,8 @@ use crate::common::ids::SlotId;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, ListArray, UInt32Array, make_array,
+    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, ListArray, UInt32Array, make_array,
 };
 use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -214,8 +214,8 @@ fn eval_comparator_matrix(
 
     let left_values =
         take(values.as_ref(), &UInt32Array::from(left_indices), None).map_err(|e| e.to_string())?;
-    let right_values =
-        take(values.as_ref(), &UInt32Array::from(right_indices), None).map_err(|e| e.to_string())?;
+    let right_values = take(values.as_ref(), &UInt32Array::from(right_indices), None)
+        .map_err(|e| e.to_string())?;
 
     let mut fields = vec![
         Field::new("left", values.data_type().clone(), true),
@@ -314,10 +314,12 @@ pub fn eval_array_sort_lambda(
     }
 
     let arr = arena.eval(array_id, chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("array_sort_lambda expects ListArray, got {:?}", arr.data_type()))?;
+    let list = arr.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+        format!(
+            "array_sort_lambda expects ListArray, got {:?}",
+            arr.data_type()
+        )
+    })?;
 
     let output_field = match arena.data_type(expr) {
         Some(DataType::List(field)) => field.clone(),

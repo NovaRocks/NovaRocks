@@ -533,8 +533,7 @@ pub(super) fn validate_chunk_schema_against_batch(
         // Source operators (e.g. FILE_SCAN for CSV) always produce nullable
         // columns; the actual NOT-NULL constraint is enforced downstream
         // (e.g. by the sink's row validation or the storage layer).
-        let nullable_ok =
-            field.is_nullable() == expected.is_nullable() || field.is_nullable();
+        let nullable_ok = field.is_nullable() == expected.is_nullable() || field.is_nullable();
         if field.name() != expected.name()
             || field.data_type() != expected.data_type()
             || !nullable_ok

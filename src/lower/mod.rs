@@ -20,6 +20,9 @@ pub(crate) mod layout;
 pub(crate) mod node;
 pub(crate) mod type_lowering;
 
-// Re-export commonly used items
-pub(crate) use node::hdfs_scan::cache_iceberg_table_locations;
-pub(crate) use node::{Lowered, lower_plan};
+pub(crate) mod thrift {
+    pub(crate) use super::layout;
+    pub(crate) use super::node::hdfs_scan::cache_iceberg_table_locations;
+    pub(crate) use super::node::{Lowered, lower_plan};
+    pub(crate) use super::type_lowering;
+}

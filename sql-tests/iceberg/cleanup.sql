@@ -1,1 +1,1 @@
-DROP CATALOG IF EXISTS `iceberg_cat_${uuid0}`;
+DROP CATALOG IF EXISTS `iceberg_cat_${suite_uuid0}`;

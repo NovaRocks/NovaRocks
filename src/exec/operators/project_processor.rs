@@ -87,8 +87,7 @@ fn slots_adjusted_for_actual_nullability(
         .zip(columns.iter())
         .map(|(schema, array)| {
             if !schema.nullable() && array.null_count() > 0 {
-                let nullable_field =
-                    Field::new(schema.name(), schema.data_type().clone(), true);
+                let nullable_field = Field::new(schema.name(), schema.data_type().clone(), true);
                 schema
                     .with_field(nullable_field)
                     .unwrap_or_else(|_| schema.clone())

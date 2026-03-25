@@ -406,17 +406,13 @@ impl OlapTableSinkFactory {
             auto_increment_output_slot_id: {
                 // Find the output-projection slot ID for the auto-increment column
                 // by looking up the schema_slot_bindings at the auto_increment_column_idx.
-                let auto_idx = primary_plan
-                    .write_targets
-                    .values()
-                    .next()
-                    .and_then(|t| t.context.partial_update.auto_increment.auto_increment_column_idx);
-                auto_idx.and_then(|idx| {
-                    primary_plan
-                        .schema_slot_bindings
-                        .get(idx)
-                        .and_then(|s| *s)
-                })
+                let auto_idx = primary_plan.write_targets.values().next().and_then(|t| {
+                    t.context
+                        .partial_update
+                        .auto_increment
+                        .auto_increment_column_idx
+                });
+                auto_idx.and_then(|idx| primary_plan.schema_slot_bindings.get(idx).and_then(|s| *s))
             },
             null_expr_in_auto_increment: sink.null_expr_in_auto_increment.unwrap_or(false),
             miss_auto_increment_column: sink.miss_auto_increment_column.unwrap_or(false),

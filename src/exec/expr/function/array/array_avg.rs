@@ -108,7 +108,8 @@ fn avg_decimal_rows(
 
         let start = offsets[row_idx] as usize;
         let end = offsets[row_idx + 1] as usize;
-        let count = i128::try_from(end - start).map_err(|_| "array_avg count overflow".to_string())?;
+        let count =
+            i128::try_from(end - start).map_err(|_| "array_avg count overflow".to_string())?;
         let mut sum = 0_i128;
         let mut has_value = false;
         for idx in start..end {

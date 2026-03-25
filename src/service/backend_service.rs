@@ -1039,6 +1039,7 @@ mod tests {
                 agg_state_desc: None,
                 index_len: None,
                 type_desc: None,
+                default_expr: None,
             }],
             bloom_filter_fpp: None,
             indexes: None,

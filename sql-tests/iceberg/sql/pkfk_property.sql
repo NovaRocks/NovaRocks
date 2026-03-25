@@ -2,8 +2,8 @@
 -- query 1
 -- @result_contains=TABLE: iceberg_pkfk_db_${uuid0}.txn
 -- @result_not_contains=TABLE: iceberg_pkfk_db_${uuid0}.payment
-CREATE DATABASE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
-USE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
+CREATE DATABASE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 CREATE TABLE payment (
   id INT,
   created_at DATE,
@@ -42,7 +42,7 @@ LEFT JOIN payment
 -- query 2
 -- @result_contains=TABLE: iceberg_pkfk_db_${uuid0}.payment
 -- @result_contains=TABLE: iceberg_pkfk_db_${uuid0}.txn
-USE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 EXPLAIN
 SELECT txn.id, txn.created_at, txn.payment_id
 FROM txn
@@ -53,7 +53,7 @@ INNER JOIN payment
 -- @result_contains=TABLE: iceberg_pkfk_db_${uuid0}.txn
 -- @result_contains=payment_id IS NOT NULL
 -- @result_not_contains=TABLE: iceberg_pkfk_db_${uuid0}.payment
-USE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 SET enable_ukfk_opt = true;
 SET enable_rbo_table_prune = false;
 SET enable_cbo_table_prune = false;
@@ -66,7 +66,7 @@ INNER JOIN payment
 
 -- query 4
 -- @result_contains=AGGREGATE
-USE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 SET enable_eliminate_agg = false;
 EXPLAIN
 SELECT COUNT(1) AS cnt, payment.id
@@ -75,13 +75,13 @@ GROUP BY payment.id;
 
 -- query 5
 -- @result_not_contains=AGGREGATE
-USE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
+USE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};
 SET enable_eliminate_agg = true;
 EXPLAIN
 SELECT COUNT(1) AS cnt, payment.id
 FROM payment
 GROUP BY payment.id;
 SET catalog default_catalog;
-DROP TABLE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0}.txn FORCE;
-DROP TABLE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0}.payment FORCE;
-DROP DATABASE iceberg_cat_${uuid0}.iceberg_pkfk_db_${uuid0};
+DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.txn FORCE;
+DROP TABLE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0}.payment FORCE;
+DROP DATABASE iceberg_cat_${suite_uuid0}.iceberg_pkfk_db_${uuid0};

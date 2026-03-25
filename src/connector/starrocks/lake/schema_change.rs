@@ -689,7 +689,10 @@ fn ensure_schema_change_base_supported(
     let has_delvec_meta = metadata.delvec_meta.as_ref().is_some_and(|delvec_meta| {
         !delvec_meta.version_to_file.is_empty() || !delvec_meta.delvecs.is_empty()
     });
-    let has_rowset_del_files = metadata.rowsets.iter().any(|rowset| !rowset.del_files.is_empty());
+    let has_rowset_del_files = metadata
+        .rowsets
+        .iter()
+        .any(|rowset| !rowset.del_files.is_empty());
     if has_delvec_meta || has_rowset_del_files {
         return Err(format!(
             "{context} PRIMARY_KEYS with delete vectors is unsupported for SCHEMA_CHANGE V1"
@@ -1659,8 +1662,7 @@ mod tests {
     };
     use crate::descriptors;
     use crate::service::grpc_client::proto::starrocks::{
-        ColumnPb, DelfileWithRowsetId, KeysType, RowsetMetadataPb, TabletMetadataPb,
-        TabletSchemaPb,
+        ColumnPb, DelfileWithRowsetId, KeysType, RowsetMetadataPb, TabletMetadataPb, TabletSchemaPb,
     };
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1911,12 +1913,10 @@ mod tests {
             ..Default::default()
         };
 
-        let err = ensure_schema_change_base_supported(&schema, &metadata, "base_tablet_read_schema")
-            .expect_err("delete files must keep primary key schema change fail-fast");
-        assert!(
-            err.contains("delete vectors"),
-            "unexpected error: {err}"
-        );
+        let err =
+            ensure_schema_change_base_supported(&schema, &metadata, "base_tablet_read_schema")
+                .expect_err("delete files must keep primary key schema change fail-fast");
+        assert!(err.contains("delete vectors"), "unexpected error: {err}");
     }
 
     #[test]
