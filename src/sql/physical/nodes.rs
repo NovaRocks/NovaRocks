@@ -38,18 +38,6 @@ pub(super) fn build_scan_node(
     };
     node.compact_data = true;
 
-    let cloud_config = match &resolved.table.storage {
-        TableStorage::S3ParquetFiles {
-            cloud_properties, ..
-        } => Some(crate::cloud_configuration::TCloudConfiguration::new(
-            None::<crate::cloud_configuration::TCloudType>,
-            None::<Vec<crate::cloud_configuration::TCloudProperty>>,
-            Some(cloud_properties.clone()),
-            None::<bool>,
-        )),
-        _ => None,
-    };
-
     node.hdfs_scan_node = Some(plan_nodes::THdfsScanNode::new(
         Some(scan_tuple_id),
         None::<BTreeMap<types::TTupleId, Vec<exprs::TExpr>>>,
@@ -70,7 +58,7 @@ pub(super) fn build_scan_node(
         None::<String>,
         None::<String>,
         Some(true), // can_use_any_column
-        cloud_config,
+        None::<crate::cloud_configuration::TCloudConfiguration>,
         None::<bool>,
         None::<bool>,
         None::<bool>,
@@ -120,8 +108,8 @@ pub(super) fn build_project_node(
 
 pub(super) fn build_hash_join_node(
     node_id: i32,
-    left_tuple_ids: &[i32],
-    right_tuple_ids: &[i32],
+    left_tuple_id: i32,
+    right_tuple_id: i32,
     join_op: plan_nodes::TJoinOp,
     eq_join_conjuncts: Vec<plan_nodes::TEqJoinCondition>,
     other_join_conjuncts: Vec<exprs::TExpr>,
@@ -131,32 +119,8 @@ pub(super) fn build_hash_join_node(
     node.node_type = plan_nodes::TPlanNodeType::HASH_JOIN_NODE;
     node.num_children = 2;
     node.limit = -1;
-    // row_tuples must include ALL tuples from both sides so the lowering
-    // validation can verify that the output-side tuples are present (required
-    // for SEMI/ANTI joins where the left or right side may have multiple
-    // tuples from nested cross-joins).
-    let mut row_tuples = Vec::with_capacity(left_tuple_ids.len() + right_tuple_ids.len());
-    row_tuples.extend_from_slice(left_tuple_ids);
-    row_tuples.extend_from_slice(right_tuple_ids);
-    // Build nullable_tuples: left side tuples are not nullable for left joins,
-    // right side tuples are nullable, etc.
-    let mut nullable_tuples = Vec::with_capacity(row_tuples.len());
-    let (left_nullable, right_nullable) = match join_op {
-        plan_nodes::TJoinOp::LEFT_OUTER_JOIN | plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (false, true),
-        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
-            (true, false)
-        }
-        plan_nodes::TJoinOp::FULL_OUTER_JOIN => (true, true),
-        _ => (false, false),
-    };
-    for _ in left_tuple_ids {
-        nullable_tuples.push(left_nullable);
-    }
-    for _ in right_tuple_ids {
-        nullable_tuples.push(right_nullable);
-    }
-    node.row_tuples = row_tuples;
-    node.nullable_tuples = nullable_tuples;
+    node.row_tuples = vec![left_tuple_id, right_tuple_id];
+    node.nullable_tuples = vec![false, false];
     node.compact_data = true;
 
     node.hash_join_node = Some(plan_nodes::THashJoinNode {
@@ -194,8 +158,8 @@ pub(super) fn build_hash_join_node(
 
 pub(super) fn build_nestloop_join_node(
     node_id: i32,
-    left_tuple_ids: &[i32],
-    right_tuple_ids: &[i32],
+    left_tuple_id: i32,
+    right_tuple_id: i32,
     join_op: plan_nodes::TJoinOp,
     join_conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
@@ -204,26 +168,8 @@ pub(super) fn build_nestloop_join_node(
     node.node_type = plan_nodes::TPlanNodeType::NESTLOOP_JOIN_NODE;
     node.num_children = 2;
     node.limit = -1;
-    let mut row_tuples = Vec::with_capacity(left_tuple_ids.len() + right_tuple_ids.len());
-    row_tuples.extend_from_slice(left_tuple_ids);
-    row_tuples.extend_from_slice(right_tuple_ids);
-    let mut nullable_tuples = Vec::with_capacity(row_tuples.len());
-    let (left_nullable, right_nullable) = match join_op {
-        plan_nodes::TJoinOp::LEFT_OUTER_JOIN | plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (false, true),
-        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
-            (true, false)
-        }
-        plan_nodes::TJoinOp::FULL_OUTER_JOIN => (true, true),
-        _ => (false, false),
-    };
-    for _ in left_tuple_ids {
-        nullable_tuples.push(left_nullable);
-    }
-    for _ in right_tuple_ids {
-        nullable_tuples.push(right_nullable);
-    }
-    node.row_tuples = row_tuples;
-    node.nullable_tuples = nullable_tuples;
+    node.row_tuples = vec![left_tuple_id, right_tuple_id];
+    node.nullable_tuples = vec![false, false];
     node.compact_data = true;
 
     node.nestloop_join_node = Some(plan_nodes::TNestLoopJoinNode::new(
@@ -373,109 +319,20 @@ pub(super) fn build_exec_params(
     table: &TableDef,
     scan_node_id: i32,
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    let scan_ranges = match &table.storage {
-        TableStorage::LocalParquetFile { path } => {
-            let metadata =
-                std::fs::metadata(path).map_err(|e| format!("stat parquet file failed: {e}"))?;
-            let file_len = i64::try_from(metadata.len())
-                .map_err(|_| "parquet file is too large".to_string())?;
-            vec![build_hdfs_scan_range_params(
-                &path.display().to_string(),
-                file_len,
-            )]
-        }
-        TableStorage::S3ParquetFiles { files, .. } => files
-            .iter()
-            .map(|f| build_hdfs_scan_range_params(&f.path, f.size))
-            .collect(),
-    };
+    let TableStorage::LocalParquetFile { path } = &table.storage;
+    let metadata = std::fs::metadata(path).map_err(|e| format!("stat parquet file failed: {e}"))?;
+    let file_len =
+        i64::try_from(metadata.len()).map_err(|_| "parquet file is too large".to_string())?;
 
-    Ok(internal_service::TPlanFragmentExecParams::new(
-        types::TUniqueId::new(1, 1),
-        types::TUniqueId::new(2, 2),
-        BTreeMap::from([(scan_node_id, scan_ranges)]),
-        BTreeMap::new(),
-        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
-        None::<i32>,
-        None::<i32>,
-        None::<bool>,
-        None::<bool>,
-        None::<crate::runtime_filter::TRuntimeFilterParams>,
-        None::<i32>,
-        None::<bool>,
-        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
-        None::<bool>,
-        None::<i32>,
-        None::<bool>,
-        None::<Vec<internal_service::TExecDebugOption>>,
-    ))
-}
-
-/// Build exec params for multiple scan nodes (used in JOIN queries).
-pub(super) fn build_exec_params_multi(
-    scan_tables: &[(i32, ResolvedTable)],
-) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    let mut per_node_scan_ranges = BTreeMap::new();
-
-    for (scan_node_id, resolved) in scan_tables {
-        let scan_node_id = *scan_node_id;
-        let ranges = match &resolved.table.storage {
-            TableStorage::LocalParquetFile { path } => {
-                let metadata = std::fs::metadata(path)
-                    .map_err(|e| format!("stat parquet file failed: {e}"))?;
-                let file_len = i64::try_from(metadata.len())
-                    .map_err(|_| "parquet file is too large".to_string())?;
-                vec![build_hdfs_scan_range_params(
-                    &path.display().to_string(),
-                    file_len,
-                )]
-            }
-            TableStorage::S3ParquetFiles { files, .. } => files
-                .iter()
-                .map(|f| build_hdfs_scan_range_params(&f.path, f.size))
-                .collect(),
-        };
-        per_node_scan_ranges.insert(scan_node_id, ranges);
-    }
-
-    Ok(internal_service::TPlanFragmentExecParams::new(
-        types::TUniqueId::new(1, 1),
-        types::TUniqueId::new(2, 2),
-        per_node_scan_ranges,
-        BTreeMap::new(),
-        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
-        None::<i32>,
-        None::<i32>,
-        None::<bool>,
-        None::<bool>,
-        None::<crate::runtime_filter::TRuntimeFilterParams>,
-        None::<i32>,
-        None::<bool>,
-        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
-        None::<bool>,
-        None::<i32>,
-        None::<bool>,
-        None::<Vec<internal_service::TExecDebugOption>>,
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Scan range helper
-// ---------------------------------------------------------------------------
-
-fn build_hdfs_scan_range_params(
-    full_path: &str,
-    file_len: i64,
-) -> internal_service::TScanRangeParams {
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
         Some(0_i64),
         Some(file_len),
         None::<i64>,
-        None::<i64>, // file_length: let scan connector determine actual size
+        Some(file_len),
         Some(descriptors::THdfsFileFormat::PARQUET),
         None::<descriptors::TTextFileDesc>,
-        Some(full_path.to_string()),
+        Some(path.display().to_string()),
         None::<Vec<String>>,
         None::<bool>,
         None::<Vec<plan_nodes::TIcebergDeleteFile>>,
@@ -507,7 +364,7 @@ fn build_hdfs_scan_range_params(
         None::<i64>,
     );
 
-    internal_service::TScanRangeParams::new(
+    let scan_range = internal_service::TScanRangeParams::new(
         plan_nodes::TScanRange::new(
             None::<plan_nodes::TInternalScanRange>,
             None::<Vec<u8>>,
@@ -520,34 +377,120 @@ fn build_hdfs_scan_range_params(
         None::<i32>,
         Some(false),
         Some(false),
-    )
+    );
+
+    Ok(internal_service::TPlanFragmentExecParams::new(
+        types::TUniqueId::new(1, 1),
+        types::TUniqueId::new(2, 2),
+        BTreeMap::from([(scan_node_id, vec![scan_range])]),
+        BTreeMap::new(),
+        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
+        None::<i32>,
+        None::<i32>,
+        None::<bool>,
+        None::<bool>,
+        None::<crate::runtime_filter::TRuntimeFilterParams>,
+        None::<i32>,
+        None::<bool>,
+        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
+        None::<bool>,
+        None::<i32>,
+        None::<bool>,
+        None::<Vec<internal_service::TExecDebugOption>>,
+    ))
 }
 
-// ---------------------------------------------------------------------------
-// Exchange node (used for CTE consume)
-// ---------------------------------------------------------------------------
+/// Build exec params for multiple scan nodes (used in JOIN queries).
+pub(super) fn build_exec_params_multi(
+    scan_tables: &[(i32, ResolvedTable)],
+) -> Result<internal_service::TPlanFragmentExecParams, String> {
+    let mut per_node_scan_ranges = BTreeMap::new();
 
-pub(super) fn build_exchange_node(
-    node_id: i32,
-    input_row_tuples: Vec<i32>,
-) -> plan_nodes::TPlanNode {
-    let mut node = default_plan_node();
-    node.node_id = node_id;
-    node.node_type = plan_nodes::TPlanNodeType::EXCHANGE_NODE;
-    node.num_children = 0;
-    node.limit = -1;
-    node.row_tuples = input_row_tuples.clone();
-    node.nullable_tuples = vec![];
-    node.compact_data = true;
-    node.exchange_node = Some(plan_nodes::TExchangeNode::new(
-        input_row_tuples,
-        None::<plan_nodes::TSortInfo>,
-        None::<i64>,
-        Some(partitions::TPartitionType::UNPARTITIONED),
+    for (scan_node_id, resolved) in scan_tables {
+        let scan_node_id = *scan_node_id;
+        let TableStorage::LocalParquetFile { path } = &resolved.table.storage;
+        let metadata =
+            std::fs::metadata(path).map_err(|e| format!("stat parquet file failed: {e}"))?;
+        let file_len =
+            i64::try_from(metadata.len()).map_err(|_| "parquet file is too large".to_string())?;
+
+        let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
+            None::<String>,
+            Some(0_i64),
+            Some(file_len),
+            None::<i64>,
+            Some(file_len),
+            Some(descriptors::THdfsFileFormat::PARQUET),
+            None::<descriptors::TTextFileDesc>,
+            Some(path.display().to_string()),
+            None::<Vec<String>>,
+            None::<bool>,
+            None::<Vec<plan_nodes::TIcebergDeleteFile>>,
+            None::<i64>,
+            None::<bool>,
+            None::<String>,
+            None::<String>,
+            None::<i64>,
+            None::<crate::data_cache::TDataCacheOptions>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<BTreeMap<String, String>>,
+            None::<Vec<types::TSlotId>>,
+            None::<bool>,
+            None::<String>,
+            None::<bool>,
+            None::<String>,
+            None::<String>,
+            None::<plan_nodes::TPaimonDeletionFile>,
+            None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
+            None::<descriptors::THdfsPartition>,
+            None::<types::TTableId>,
+            None::<plan_nodes::TDeletionVectorDescriptor>,
+            None::<String>,
+            None::<i64>,
+            None::<bool>,
+            None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
+            None::<i32>,
+            None::<i64>,
+        );
+
+        let scan_range = internal_service::TScanRangeParams::new(
+            plan_nodes::TScanRange::new(
+                None::<plan_nodes::TInternalScanRange>,
+                None::<Vec<u8>>,
+                None::<plan_nodes::TBrokerScanRange>,
+                None::<plan_nodes::TEsScanRange>,
+                Some(hdfs_scan_range),
+                None::<plan_nodes::TBinlogScanRange>,
+                None::<plan_nodes::TBenchmarkScanRange>,
+            ),
+            None::<i32>,
+            Some(false),
+            Some(false),
+        );
+
+        per_node_scan_ranges.insert(scan_node_id, vec![scan_range]);
+    }
+
+    Ok(internal_service::TPlanFragmentExecParams::new(
+        types::TUniqueId::new(1, 1),
+        types::TUniqueId::new(2, 2),
+        per_node_scan_ranges,
+        BTreeMap::new(),
+        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
+        None::<i32>,
+        None::<i32>,
         None::<bool>,
-        None::<plan_nodes::TLateMaterializeMode>,
-    ));
-    node
+        None::<bool>,
+        None::<crate::runtime_filter::TRuntimeFilterParams>,
+        None::<i32>,
+        None::<bool>,
+        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
+        None::<bool>,
+        None::<i32>,
+        None::<bool>,
+        None::<Vec<internal_service::TExecDebugOption>>,
+    ))
 }
 
 // ---------------------------------------------------------------------------

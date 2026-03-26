@@ -4,46 +4,12 @@
 //! from the analyzed query IR.  A future optimizer would rewrite this tree
 //! before it reaches the Thrift emitter.
 
-use crate::sql::cte::CTERegistry;
-use crate::sql::ir::*;
 use crate::sql::plan::*;
+use crate::sql::ir::*;
 
 // ---------------------------------------------------------------------------
 // Public entry
 // ---------------------------------------------------------------------------
-
-/// Plan a resolved query with shared CTE subtrees into a [`QueryPlan`].
-///
-/// Each CTE entry in the registry is planned independently into a
-/// [`CTEProducePlan`], and references in the main plan appear as
-/// [`LogicalPlan::CTEConsume`] leaf nodes.
-pub(crate) fn plan_query(
-    resolved: ResolvedQuery,
-    cte_registry: CTERegistry,
-) -> Result<QueryPlan, String> {
-    let output_columns = resolved.output_columns.clone();
-    let main_plan = plan(resolved)?;
-
-    // Plan each shared CTE subtree independently.
-    let cte_plans = cte_registry
-        .entries
-        .into_iter()
-        .map(|entry| {
-            let cte_plan = plan(entry.resolved_query)?;
-            Ok(CTEProducePlan {
-                cte_id: entry.id,
-                plan: cte_plan,
-                output_columns: entry.output_columns,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    Ok(QueryPlan {
-        cte_plans,
-        main_plan,
-        output_columns,
-    })
-}
 
 /// Convert a fully-analyzed query into a logical plan tree.
 pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
@@ -54,13 +20,19 @@ pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
         // If ORDER BY references columns not in the projection, we need to
         // extend the project to include them (hidden columns) so the sort can
         // reference them.  After sort, a top-level project strips them.
-        let needs_hidden =
-            has_non_projected_sort_columns(&resolved.order_by, &resolved.output_columns);
+        let needs_hidden = has_non_projected_sort_columns(
+            &resolved.order_by,
+            &resolved.output_columns,
+        );
         if needs_hidden {
             // Collect extra columns needed by ORDER BY
             let mut extra_items = Vec::new();
             for sort_item in &resolved.order_by {
-                collect_extra_columns(&sort_item.expr, &resolved.output_columns, &mut extra_items);
+                collect_extra_columns(
+                    &sort_item.expr,
+                    &resolved.output_columns,
+                    &mut extra_items,
+                );
             }
 
             // Extend the project node at the top of body_plan
@@ -117,7 +89,10 @@ pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
 }
 
 /// Check if any ORDER BY expression references columns not in the output.
-fn has_non_projected_sort_columns(order_by: &[SortItem], output: &[OutputColumn]) -> bool {
+fn has_non_projected_sort_columns(
+    order_by: &[SortItem],
+    output: &[OutputColumn],
+) -> bool {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
     for item in order_by {
@@ -135,7 +110,8 @@ fn has_non_projected_ref(
     match &expr.kind {
         ExprKind::ColumnRef { column, .. } => !output_names.contains(&column.to_lowercase()),
         ExprKind::BinaryOp { left, right, .. } => {
-            has_non_projected_ref(left, output_names) || has_non_projected_ref(right, output_names)
+            has_non_projected_ref(left, output_names)
+                || has_non_projected_ref(right, output_names)
         }
         ExprKind::UnaryOp { expr, .. } => has_non_projected_ref(expr, output_names),
         ExprKind::FunctionCall { args, .. } => {
@@ -150,7 +126,11 @@ fn has_non_projected_ref(
 
 /// Collect ColumnRef items from ORDER BY that aren't in the output,
 /// and build extra ProjectItems for them.
-fn collect_extra_columns(expr: &TypedExpr, output: &[OutputColumn], extra: &mut Vec<ProjectItem>) {
+fn collect_extra_columns(
+    expr: &TypedExpr,
+    output: &[OutputColumn],
+    extra: &mut Vec<ProjectItem>,
+) {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
     let already_added: std::collections::HashSet<String> =
@@ -216,7 +196,7 @@ fn plan_body(body: QueryBody) -> Result<LogicalPlan, String> {
 // ---------------------------------------------------------------------------
 
 /// Produces:  Project( [Aggregate(] [Filter(] from_plan [)] [)] )
-fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
+fn plan_select(select: ResolvedSelect) -> Result<LogicalPlan, String> {
     // 1. FROM clause → base plan
     let mut current = match select.from {
         Some(relation) => plan_relation(relation)?,
@@ -237,36 +217,10 @@ fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
         });
     }
 
-    // 2.5: ROLLUP → Insert Repeat node between filter and aggregate
-    if let Some(repeat_info) = select.repeat.take() {
-        current = LogicalPlan::Repeat(RepeatPlanNode {
-            input: Box::new(current),
-            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
-            grouping_ids: repeat_info.grouping_ids,
-            all_rollup_columns: repeat_info.all_rollup_columns,
-            grouping_fn_args: repeat_info.grouping_fn_args,
-        });
-    }
-
     // 3. GROUP BY / aggregation → Aggregate
     if select.has_aggregation || !select.group_by.is_empty() {
-        // Collect non-aggregate column refs from HAVING that aren't already in
-        // GROUP BY. These come from scalar subquery CROSS JOINs and must pass
-        // through as extra group-by keys so they're available in the
-        // post-aggregate HAVING filter.
-        if let Some(ref having_expr) = select.having {
-            let mut extra_gb = Vec::new();
-            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
-            for col in extra_gb {
-                select.group_by.push(col);
-            }
-        }
-
-        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
-            &select.projection,
-            &select.group_by,
-            select.having.as_ref(),
-        );
+        let (project_items, agg_calls, output_columns) =
+            split_projection_for_aggregate(&select.projection, &select.group_by);
         current = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(current),
             group_by: select.group_by,
@@ -281,54 +235,51 @@ fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
             });
         }
 
-        // The projection after aggregation — may contain window functions
-        current = build_window_and_project(current, project_items, &select.projection)?;
+        // The projection after aggregation
+        if !project_items.is_empty() {
+            current = LogicalPlan::Project(ProjectNode {
+                input: Box::new(current),
+                items: project_items,
+            });
+        }
     } else {
         // 4. No aggregation → check for window functions, then Project
-        current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
+        let has_window = select.projection.iter().any(|item| has_window_call(&item.expr));
+        if has_window {
+            // Extract window function calls → WindowNode, rewrite Project
+            let (window_exprs, rewritten_items) =
+                extract_window_calls(&select.projection);
+            let mut output_columns = Vec::new();
+            // All input columns pass through
+            // (we'll let the emitter figure out the exact scope)
+            for item in &select.projection {
+                output_columns.push(OutputColumn {
+                    name: item.output_name.clone(),
+                    data_type: item.expr.data_type.clone(),
+                    nullable: item.expr.nullable,
+                });
+            }
+            current = LogicalPlan::Window(WindowNode {
+                input: Box::new(current),
+                window_exprs,
+                output_columns,
+            });
+            current = LogicalPlan::Project(ProjectNode {
+                input: Box::new(current),
+                items: rewritten_items,
+            });
+        } else {
+            current = LogicalPlan::Project(ProjectNode {
+                input: Box::new(current),
+                items: select.projection,
+            });
+        }
     }
 
     Ok(current)
 }
 
 /// Check if an expression contains any WindowCall.
-/// Build Window + Project nodes if the projection contains window functions,
-/// otherwise just a Project node.
-fn build_window_and_project(
-    input: LogicalPlan,
-    project_items: Vec<ProjectItem>,
-    original_projection: &[ProjectItem],
-) -> Result<LogicalPlan, String> {
-    let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
-    if has_window {
-        let (window_exprs, rewritten_items) = extract_window_calls(&project_items);
-        let mut output_columns = Vec::new();
-        for item in original_projection {
-            output_columns.push(OutputColumn {
-                name: item.output_name.clone(),
-                data_type: item.expr.data_type.clone(),
-                nullable: item.expr.nullable,
-            });
-        }
-        let windowed = LogicalPlan::Window(WindowNode {
-            input: Box::new(input),
-            window_exprs,
-            output_columns,
-        });
-        Ok(LogicalPlan::Project(ProjectNode {
-            input: Box::new(windowed),
-            items: rewritten_items,
-        }))
-    } else if !project_items.is_empty() {
-        Ok(LogicalPlan::Project(ProjectNode {
-            input: Box::new(input),
-            items: project_items,
-        }))
-    } else {
-        Ok(input)
-    }
-}
-
 fn has_window_call(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::WindowCall { .. } => true,
@@ -343,22 +294,43 @@ fn has_window_call(expr: &TypedExpr) -> bool {
 /// Extract window function calls from the projection items.
 /// Returns (window_exprs, rewritten_projection_items).
 /// Each window call is replaced with a ColumnRef to its output name.
-/// Window calls may be nested inside expressions (e.g., `sum(x) * 100 / sum(sum(x)) OVER (...)`).
-fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
+fn extract_window_calls(
+    items: &[ProjectItem],
+) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
-    let mut counter = 0usize;
 
     for item in items {
-        if has_window_call(&item.expr) {
-            let new_expr = rewrite_window_calls(
-                &item.expr,
-                &item.output_name,
-                &mut window_exprs,
-                &mut counter,
-            );
+        if let ExprKind::WindowCall {
+            ref name,
+            ref args,
+            distinct,
+            ref partition_by,
+            ref order_by,
+            ref window_frame,
+        } = item.expr.kind
+        {
+            let win_output_name = item.output_name.clone();
+            window_exprs.push(WindowExpr {
+                name: name.clone(),
+                args: args.clone(),
+                distinct,
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                window_frame: window_frame.clone(),
+                result_type: item.expr.data_type.clone(),
+                output_name: win_output_name.clone(),
+            });
+            // Replace with a column ref to the window output
             rewritten.push(ProjectItem {
-                expr: new_expr,
+                expr: TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: win_output_name.clone(),
+                    },
+                    data_type: item.expr.data_type.clone(),
+                    nullable: item.expr.nullable,
+                },
                 output_name: item.output_name.clone(),
             });
         } else {
@@ -367,106 +339,6 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
     }
 
     (window_exprs, rewritten)
-}
-
-/// Recursively rewrite an expression tree, replacing each WindowCall node
-/// with a ColumnRef that points to the window function's output column.
-fn rewrite_window_calls(
-    expr: &TypedExpr,
-    base_name: &str,
-    window_exprs: &mut Vec<WindowExpr>,
-    counter: &mut usize,
-) -> TypedExpr {
-    match &expr.kind {
-        ExprKind::WindowCall {
-            name,
-            args,
-            distinct,
-            partition_by,
-            order_by,
-            window_frame,
-        } => {
-            let win_output_name = if *counter == 0 {
-                base_name.to_string()
-            } else {
-                format!("{}__win{}", base_name, counter)
-            };
-            *counter += 1;
-            window_exprs.push(WindowExpr {
-                name: name.clone(),
-                args: args.clone(),
-                distinct: *distinct,
-                partition_by: partition_by.clone(),
-                order_by: order_by.clone(),
-                window_frame: window_frame.clone(),
-                result_type: expr.data_type.clone(),
-                output_name: win_output_name.clone(),
-            });
-            TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    qualifier: None,
-                    column: win_output_name,
-                },
-                data_type: expr.data_type.clone(),
-                nullable: expr.nullable,
-            }
-        }
-        ExprKind::BinaryOp { left, right, op } => TypedExpr {
-            kind: ExprKind::BinaryOp {
-                left: Box::new(rewrite_window_calls(left, base_name, window_exprs, counter)),
-                op: *op,
-                right: Box::new(rewrite_window_calls(
-                    right,
-                    base_name,
-                    window_exprs,
-                    counter,
-                )),
-            },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-        },
-        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            kind: ExprKind::UnaryOp {
-                op: *op,
-                expr: Box::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    window_exprs,
-                    counter,
-                )),
-            },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-        },
-        ExprKind::Cast {
-            expr: inner,
-            target,
-        } => TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(rewrite_window_calls(
-                    inner,
-                    base_name,
-                    window_exprs,
-                    counter,
-                )),
-                target: target.clone(),
-            },
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-        },
-        ExprKind::Nested(inner) => TypedExpr {
-            kind: ExprKind::Nested(Box::new(rewrite_window_calls(
-                inner,
-                base_name,
-                window_exprs,
-                counter,
-            ))),
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-        },
-        // For any other node types, return as-is (no window calls inside)
-        _ => expr.clone(),
-    }
 }
 
 /// Split the SELECT list into post-aggregate projection items and aggregate calls.
@@ -478,7 +350,6 @@ fn rewrite_window_calls(
 fn split_projection_for_aggregate(
     projection: &[ProjectItem],
     _group_by: &[TypedExpr],
-    having: Option<&TypedExpr>,
 ) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
     let mut agg_calls = Vec::new();
     let mut output_columns = Vec::new();
@@ -491,12 +362,6 @@ fn split_projection_for_aggregate(
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
         });
-    }
-
-    // Also collect aggregate calls from HAVING clause so the aggregate node
-    // computes them even when they don't appear in SELECT.
-    if let Some(having_expr) = having {
-        collect_aggregates(having_expr, &mut agg_calls);
     }
 
     // The projection items remain as-is; the thrift emitter will handle
@@ -582,103 +447,8 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
         ExprKind::IsTruthValue { expr: inner, .. } => collect_aggregates(inner, out),
         // Leaves
         ExprKind::ColumnRef { .. } | ExprKind::Literal(_) => {}
-        // Window calls themselves are not aggregates, but their args may
-        // contain aggregate calls that must be collected so the aggregate node
-        // computes them (e.g. sum(sum(x)) OVER (...)).
-        ExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            for arg in args {
-                collect_aggregates(arg, out);
-            }
-            for expr in partition_by {
-                collect_aggregates(expr, out);
-            }
-            for sort_item in order_by {
-                collect_aggregates(&sort_item.expr, out);
-            }
-        }
-        // SubqueryPlaceholder should be rewritten before reaching the planner
-        ExprKind::SubqueryPlaceholder { .. } => {}
-    }
-}
-
-/// Collect ColumnRef expressions from HAVING that appear outside of aggregate calls.
-/// These are typically scalar subquery results (from CROSS JOINs) that need to pass
-/// through the aggregate node as group-by keys.
-fn collect_non_agg_column_refs(expr: &TypedExpr, group_by: &[TypedExpr], out: &mut Vec<TypedExpr>) {
-    collect_non_agg_column_refs_inner(expr, group_by, out, false);
-}
-
-fn collect_non_agg_column_refs_inner(
-    expr: &TypedExpr,
-    group_by: &[TypedExpr],
-    out: &mut Vec<TypedExpr>,
-    inside_agg: bool,
-) {
-    match &expr.kind {
-        ExprKind::AggregateCall { .. } => {
-            // Don't recurse into aggregate calls — columns inside aggregates
-            // are handled by the aggregate function itself, not as pass-through keys.
-        }
-        ExprKind::ColumnRef { qualifier, column } => {
-            if !inside_agg {
-                // Check if this column is already in group_by
-                let already_grouped = group_by.iter().any(|gb| {
-                    matches!(&gb.kind, ExprKind::ColumnRef { qualifier: gq, column: gc }
-                        if gc == column && gq == qualifier)
-                });
-                // Check if already collected
-                let already_collected = out.iter().any(|o| {
-                    matches!(&o.kind, ExprKind::ColumnRef { qualifier: oq, column: oc }
-                        if oc == column && oq == qualifier)
-                });
-                if !already_grouped && !already_collected {
-                    out.push(expr.clone());
-                }
-            }
-        }
-        ExprKind::BinaryOp { left, right, .. } => {
-            collect_non_agg_column_refs_inner(left, group_by, out, inside_agg);
-            collect_non_agg_column_refs_inner(right, group_by, out, inside_agg);
-        }
-        ExprKind::UnaryOp { expr: inner, .. } => {
-            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
-        }
-        ExprKind::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_non_agg_column_refs_inner(arg, group_by, out, inside_agg);
-            }
-        }
-        ExprKind::Cast { expr: inner, .. } => {
-            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
-        }
-        ExprKind::Nested(inner) => {
-            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
-        }
-        ExprKind::IsNull { expr: inner, .. } => {
-            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
-        }
-        ExprKind::Case {
-            operand,
-            when_then,
-            else_expr,
-        } => {
-            if let Some(op) = operand {
-                collect_non_agg_column_refs_inner(op, group_by, out, inside_agg);
-            }
-            for (w, t) in when_then {
-                collect_non_agg_column_refs_inner(w, group_by, out, inside_agg);
-                collect_non_agg_column_refs_inner(t, group_by, out, inside_agg);
-            }
-            if let Some(e) = else_expr {
-                collect_non_agg_column_refs_inner(e, group_by, out, inside_agg);
-            }
-        }
-        _ => {}
+        // Window calls are handled separately, not as aggregates
+        ExprKind::WindowCall { .. } => {}
     }
 }
 
@@ -708,16 +478,9 @@ fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
                 required_columns: None,
             }))
         }
-        Relation::Subquery { query, alias } => {
-            // Recursively plan the subquery, wrapping with alias metadata
-            // so the physical emitter can register qualified columns.
-            let output_columns = query.output_columns.clone();
-            let inner_plan = plan(*query)?;
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-                input: Box::new(inner_plan),
-                alias,
-                output_columns,
-            }))
+        Relation::Subquery { query, alias: _ } => {
+            // Recursively plan the subquery
+            plan(*query)
         }
         Relation::Join(join_rel) => {
             let left = plan_relation(join_rel.left)?;
@@ -735,15 +498,6 @@ fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
             step: gs.step,
             column_name: gs.column_name,
             alias: gs.alias,
-        })),
-        Relation::CTEConsume {
-            cte_id,
-            alias,
-            output_columns,
-        } => Ok(LogicalPlan::CTEConsume(CTEConsumeNode {
-            cte_id,
-            alias,
-            output_columns,
         })),
     }
 }

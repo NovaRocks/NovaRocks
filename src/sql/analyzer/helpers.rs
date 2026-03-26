@@ -19,16 +19,14 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
         sqlast::DataType::Varchar(_)
         | sqlast::DataType::CharVarying(_)
         | sqlast::DataType::Text => Ok(DataType::Utf8),
-        sqlast::DataType::Char(_)
-        | sqlast::DataType::Character(_)
-        | sqlast::DataType::String(_) => Ok(DataType::Utf8),
+        sqlast::DataType::Char(_) | sqlast::DataType::Character(_) | sqlast::DataType::String(_) => {
+            Ok(DataType::Utf8)
+        }
         sqlast::DataType::Date => Ok(DataType::Date32),
         sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         ),
-        sqlast::DataType::Time(_, _) => {
-            Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
-        }
+        sqlast::DataType::Time(_, _) => Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)),
         sqlast::DataType::Decimal(info)
         | sqlast::DataType::Dec(info)
         | sqlast::DataType::Numeric(info) => match info {

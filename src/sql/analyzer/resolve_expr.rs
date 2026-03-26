@@ -2,11 +2,11 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::ir::*;
-use crate::sql::types::{arithmetic_result_type_with_op, wider_type};
+use crate::sql::types::{arithmetic_result_type, wider_type};
 
-use super::functions::*;
-use super::helpers::{eval_const_i64, sql_type_to_arrow};
 use super::scope::AnalyzerScope;
+use super::functions::*;
+use super::helpers::{sql_type_to_arrow, eval_const_i64};
 
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a single expression and produce a TypedExpr.
@@ -59,7 +59,9 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             // Literals
-            sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => self.analyze_literal(value),
+            sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => {
+                self.analyze_literal(value)
+            }
 
             // Binary operations
             sqlast::Expr::BinaryOp { left, op, right } => {
@@ -228,12 +230,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 conditions,
                 else_result,
                 ..
-            } => self.analyze_case(
-                operand.as_deref(),
-                conditions,
-                else_result.as_deref(),
-                scope,
-            ),
+            } => self.analyze_case(operand.as_deref(), conditions, else_result.as_deref(), scope),
 
             // Function call
             sqlast::Expr::Function(func) => self.analyze_function(func, scope),
@@ -300,77 +297,14 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // Subquery expression: EXISTS / NOT EXISTS
+            // Subquery expression (EXISTS, IN subquery, scalar subquery)
             sqlast::Expr::Exists { subquery, negated } => {
-                let id = self.alloc_subquery_id();
-                let kind = SubqueryKind::Exists { negated: *negated };
-                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
-                    id,
-                    kind: kind.clone(),
-                    subquery: subquery.clone(),
-                    data_type: DataType::Boolean,
-                    in_expr: None,
-                });
+                let _resolved = self.analyze_query(subquery)?;
+                // EXISTS returns Boolean. We store it as a nested expression for now.
                 Ok(TypedExpr {
-                    kind: ExprKind::SubqueryPlaceholder {
-                        id,
-                        kind,
-                        data_type: DataType::Boolean,
-                    },
+                    kind: ExprKind::Literal(LiteralValue::Bool(!negated)),
                     data_type: DataType::Boolean,
                     nullable: false,
-                })
-            }
-
-            // Subquery expression: col [NOT] IN (SELECT ...)
-            sqlast::Expr::InSubquery {
-                expr: in_expr,
-                subquery,
-                negated,
-            } => {
-                let id = self.alloc_subquery_id();
-                let kind = SubqueryKind::InSubquery { negated: *negated };
-                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
-                    id,
-                    kind: kind.clone(),
-                    subquery: subquery.clone(),
-                    data_type: DataType::Boolean,
-                    in_expr: Some(in_expr.clone()),
-                });
-                Ok(TypedExpr {
-                    kind: ExprKind::SubqueryPlaceholder {
-                        id,
-                        kind,
-                        data_type: DataType::Boolean,
-                    },
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                })
-            }
-
-            // Scalar subquery: (SELECT ...)
-            sqlast::Expr::Subquery(subquery) => {
-                let id = self.alloc_subquery_id();
-                // We don't know the exact scalar type yet; it will be resolved
-                // during subquery rewriting. Use Null as placeholder.
-                let kind = SubqueryKind::Scalar;
-                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
-                    id,
-                    kind: kind.clone(),
-                    subquery: subquery.clone(),
-                    data_type: DataType::Null,
-                    in_expr: None,
-                });
-                // Return a placeholder with Null type; the rewrite pass will
-                // replace it with a ColumnRef of the proper type.
-                Ok(TypedExpr {
-                    kind: ExprKind::SubqueryPlaceholder {
-                        id,
-                        kind,
-                        data_type: DataType::Null,
-                    },
-                    data_type: DataType::Null,
-                    nullable: true,
                 })
             }
 
@@ -378,19 +312,6 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::Expr::TypedString(typed_str) => {
                 let target = sql_type_to_arrow(&typed_str.data_type)?;
                 let value = typed_str.value.to_string();
-                // For DATE literals, constant-fold to Date32 integer value
-                if target == DataType::Date32 {
-                    let date_str = value.trim_matches('\'');
-                    let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                        .map_err(|e| format!("invalid date literal '{date_str}': {e}"))?
-                        .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                        .num_days() as i64;
-                    return Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(days)),
-                        data_type: DataType::Date32,
-                        nullable: false,
-                    });
-                }
                 Ok(TypedExpr {
                     kind: ExprKind::Cast {
                         expr: Box::new(TypedExpr {
@@ -507,23 +428,9 @@ impl<'a> super::AnalyzerContext<'a> {
         match value {
             sqlast::Value::Number(n, _) => {
                 if let Ok(v) = n.parse::<i64>() {
-                    // Integer without decimal point → Int64
                     Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(v)),
                         data_type: DataType::Int64,
-                        nullable: false,
-                    })
-                } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
-                    // Number with decimal point (no scientific notation) → Decimal
-                    // with precision/scale inferred from the literal text (e.g.
-                    // "100.00" → Decimal(5,2), "7.0" → Decimal(2,1)).
-                    // This matches StarRocks behaviour and avoids the
-                    // Float64→Decimal(38,9) promotion that inflates division
-                    // result scales.
-                    let (precision, scale) = infer_decimal_precision_scale(n);
-                    Ok(TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Decimal(n.clone())),
-                        data_type: DataType::Decimal128(precision, scale),
                         nullable: false,
                     })
                 } else if let Ok(v) = n.parse::<f64>() {
@@ -584,43 +491,23 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Arithmetic operators -> inferred type
             sqlast::BinaryOperator::Plus => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "add",
-                );
+                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
                 (BinOp::Add, dt)
             }
             sqlast::BinaryOperator::Minus => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "add",
-                );
+                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
                 (BinOp::Sub, dt)
             }
             sqlast::BinaryOperator::Multiply => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "mul",
-                );
+                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
                 (BinOp::Mul, dt)
             }
             sqlast::BinaryOperator::Divide => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "div",
-                );
+                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
                 (BinOp::Div, dt)
             }
             sqlast::BinaryOperator::Modulo => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "add",
-                );
+                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
                 (BinOp::Mod, dt)
             }
 
@@ -1035,27 +922,4 @@ impl<'a> super::AnalyzerContext<'a> {
             _ => false,
         }
     }
-}
-
-/// Infer Decimal precision and scale from a numeric literal string containing
-/// a decimal point.  For example `"100.00"` → `(5, 2)`, `"7.0"` → `(2, 1)`,
-/// `"0.2"` → `(2, 1)`.
-fn infer_decimal_precision_scale(s: &str) -> (u8, i8) {
-    let s = s.trim().trim_start_matches('+').trim_start_matches('-');
-    let (int_part, frac_part) = match s.split_once('.') {
-        Some((i, f)) => (i, f),
-        None => (s, ""),
-    };
-    let int_part = int_part.trim_start_matches('0');
-    let int_digits = if int_part.is_empty() {
-        1
-    } else {
-        int_part.len()
-    };
-    let scale = frac_part.len();
-    let precision = int_digits + scale;
-    // Clamp to Decimal128 limits
-    let precision = precision.max(1).min(38) as u8;
-    let scale = scale.min(38) as i8;
-    (precision, scale)
 }

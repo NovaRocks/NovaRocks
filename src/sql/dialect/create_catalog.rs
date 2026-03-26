@@ -6,9 +6,7 @@ use super::peek_word_eq;
 use crate::sql::ast::CreateCatalogStmt;
 
 /// Parse: CREATE [EXTERNAL] CATALOG <name> [COMMENT '...'] PROPERTIES ( "key"="value", ... )
-pub(crate) fn parse_create_catalog_statement(
-    parser: &mut Parser<'_>,
-) -> Result<CreateCatalogStmt, String> {
+pub(crate) fn parse_create_catalog_statement(parser: &mut Parser<'_>) -> Result<CreateCatalogStmt, String> {
     parser
         .expect_keyword(Keyword::CREATE)
         .map_err(|e| e.to_string())?;
@@ -18,9 +16,6 @@ pub(crate) fn parse_create_catalog_statement(
         return Err("expected CATALOG keyword".into());
     }
     parser.next_token(); // consume CATALOG
-
-    // Skip optional IF NOT EXISTS
-    let _ = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
 
     let name = parser.parse_identifier().map_err(|e| e.to_string())?.value;
 
@@ -41,7 +36,10 @@ pub(crate) fn parse_create_catalog_statement(
         vec![]
     };
 
-    Ok(CreateCatalogStmt { name, properties })
+    Ok(CreateCatalogStmt {
+        name,
+        properties,
+    })
 }
 
 fn parse_properties(parser: &mut Parser<'_>) -> Result<Vec<(String, String)>, String> {

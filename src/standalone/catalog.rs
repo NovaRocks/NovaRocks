@@ -8,7 +8,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 // Re-export from sql::catalog so existing `crate::standalone::catalog::*` paths continue to work.
 pub use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct DatabaseDef {
     tables: HashMap<String, TableDef>,
 }
@@ -59,10 +59,11 @@ impl InMemoryCatalog {
             .get_mut(&db_key)
             .ok_or_else(|| format!("unknown database: {database_name}"))?;
         let table_key = normalize_identifier(&table.name)?;
-        if db.tables.contains_key(&table_key) {
-            // Allow re-registration (overwrite) — callers use this to update storage
-            db.tables.insert(table_key, table);
-            return Ok(());
+        if let Some(existing) = db.tables.get(&table_key) {
+            if existing == &table {
+                return Ok(());
+            }
+            return Err(format!("table already exists: {}", table.name));
         }
         db.tables.insert(table_key, table);
         Ok(())
@@ -117,11 +118,6 @@ impl CatalogProvider for InMemoryCatalog {
 
 pub(crate) fn normalize_identifier(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    // Strip backtick quotes if present
-    let trimmed = trimmed
-        .strip_prefix('`')
-        .and_then(|s| s.strip_suffix('`'))
-        .unwrap_or(trimmed);
     if trimmed.is_empty() {
         return Err("identifier is empty".to_string());
     }

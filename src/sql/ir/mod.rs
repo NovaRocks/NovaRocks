@@ -61,21 +61,6 @@ pub(crate) struct ResolvedSelect {
     pub has_aggregation: bool,
     /// Whether SELECT DISTINCT is used.
     pub distinct: bool,
-    /// Repeat metadata for ROLLUP/CUBE/GROUPING SETS expansion.
-    pub repeat: Option<RepeatInfo>,
-}
-
-/// Metadata for ROLLUP/CUBE/GROUPING SETS repeat execution.
-#[derive(Clone, Debug)]
-pub(crate) struct RepeatInfo {
-    /// For each repeat level, the column names that are NON-null.
-    pub repeat_column_ref_list: Vec<Vec<String>>,
-    /// Grouping ID bitmap for each level. Bit=1 means column is NULLed.
-    pub grouping_ids: Vec<u64>,
-    /// All rollup column names.
-    pub all_rollup_columns: Vec<String>,
-    /// GROUPING() function calls: (output_name, arg_column_names).
-    pub grouping_fn_args: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,12 +86,6 @@ pub(crate) enum Relation {
     Join(Box<JoinRelation>),
     /// `TABLE(generate_series(start, end[, step]))`.
     GenerateSeries(GenerateSeriesRelation),
-    /// Reference to a shared CTE (multi-referenced, not inlined).
-    CTEConsume {
-        cte_id: crate::sql::cte::CteId,
-        alias: String,
-        output_columns: Vec<OutputColumn>,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -203,7 +182,10 @@ pub(crate) enum ExprKind {
         right: Box<TypedExpr>,
     },
     /// Unary operation.
-    UnaryOp { op: UnOp, expr: Box<TypedExpr> },
+    UnaryOp {
+        op: UnOp,
+        expr: Box<TypedExpr>,
+    },
     /// Scalar function call (non-aggregate).
     FunctionCall {
         name: String,
@@ -223,7 +205,10 @@ pub(crate) enum ExprKind {
         target: DataType,
     },
     /// IS [NOT] NULL.
-    IsNull { expr: Box<TypedExpr>, negated: bool },
+    IsNull {
+        expr: Box<TypedExpr>,
+        negated: bool,
+    },
     /// [NOT] IN (list).
     InList {
         expr: Box<TypedExpr>,
@@ -266,38 +251,6 @@ pub(crate) enum ExprKind {
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,
     },
-    /// Placeholder for a subquery that will be rewritten into a JOIN.
-    /// This is an intermediate representation created during expression analysis
-    /// and consumed by the subquery rewriting pass before planning.
-    SubqueryPlaceholder {
-        id: usize,
-        kind: SubqueryKind,
-        data_type: DataType,
-    },
-}
-
-/// The kind of subquery encountered in an expression.
-#[derive(Clone, Debug)]
-pub(crate) enum SubqueryKind {
-    /// Scalar subquery: `col op (SELECT agg(...) FROM ...)`
-    /// Stores the subquery AST, comparison operator, and the LHS expression.
-    Scalar,
-    /// EXISTS (SELECT ...) or NOT EXISTS (SELECT ...)
-    Exists { negated: bool },
-    /// col [NOT] IN (SELECT ...)
-    InSubquery { negated: bool },
-}
-
-/// A collected subquery from expression analysis, ready for rewriting.
-#[derive(Clone, Debug)]
-pub(crate) struct SubqueryInfo {
-    pub id: usize,
-    pub kind: SubqueryKind,
-    pub subquery: Box<sqlparser::ast::Query>,
-    /// The resolved data type of the subquery result (scalar).
-    pub data_type: DataType,
-    /// For IN subquery: the left-hand expression from the outer query.
-    pub in_expr: Option<Box<sqlparser::ast::Expr>>,
 }
 
 /// Window frame specification for analytic functions.
@@ -333,9 +286,6 @@ pub(crate) enum LiteralValue {
     Bool(bool),
     Int(i64),
     Float(f64),
-    /// Decimal literal with its original string representation (e.g. "100.00").
-    /// Precision and scale are inferred from the text: `100.00` → precision=5, scale=2.
-    Decimal(String),
     String(String),
 }
 

@@ -32,10 +32,8 @@ impl AnalyzerScope {
         for col in columns {
             let name_lower = col.name.to_lowercase();
             if let Some(q) = qualifier {
-                self.qualified.insert(
-                    (q.to_lowercase(), name_lower.clone()),
-                    (col.data_type.clone(), col.nullable),
-                );
+                self.qualified
+                    .insert((q.to_lowercase(), name_lower.clone()), (col.data_type.clone(), col.nullable));
             }
             self.unqualified
                 .insert(name_lower.clone(), (col.data_type.clone(), col.nullable));
@@ -58,10 +56,8 @@ impl AnalyzerScope {
     ) {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
-            self.qualified.insert(
-                (q.to_lowercase(), name_lower.clone()),
-                (data_type.clone(), nullable),
-            );
+            self.qualified
+                .insert((q.to_lowercase(), name_lower.clone()), (data_type.clone(), nullable));
         }
         self.unqualified
             .insert(name_lower.clone(), (data_type.clone(), nullable));
@@ -111,9 +107,7 @@ impl AnalyzerScope {
     }
 
     /// Iterate columns in declaration order (for SELECT * expansion).
-    pub(super) fn iter_columns(
-        &self,
-    ) -> impl Iterator<Item = &(Option<String>, String, DataType, bool)> {
+    pub(super) fn iter_columns(&self) -> impl Iterator<Item = &(Option<String>, String, DataType, bool)> {
         self.ordered.iter()
     }
 
@@ -136,10 +130,8 @@ impl AnalyzerScope {
         let q_lower = qualifier.to_lowercase();
         for col in columns {
             let name_lower = col.name.to_lowercase();
-            self.qualified.insert(
-                (q_lower.clone(), name_lower),
-                (col.data_type.clone(), col.nullable),
-            );
+            self.qualified
+                .insert((q_lower.clone(), name_lower), (col.data_type.clone(), col.nullable));
         }
     }
 }

@@ -7,7 +7,9 @@ use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 
-use crate::sql::ir::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
+use crate::sql::ir::{
+    JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
+};
 
 // ---------------------------------------------------------------------------
 // Logical plan tree
@@ -28,57 +30,6 @@ pub(crate) enum LogicalPlan {
     Values(ValuesNode),
     GenerateSeries(GenerateSeriesNode),
     Window(WindowNode),
-    /// Wraps a subquery plan with an alias, so that the physical emitter
-    /// can register qualified columns (e.g., `ctr1.ctr_customer_sk` for
-    /// a CTE referenced as `FROM customer_total_return ctr1`).
-    SubqueryAlias(SubqueryAliasNode),
-    /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
-    /// Replicates each input row N times with different null patterns.
-    Repeat(RepeatPlanNode),
-    /// Reference to a shared CTE. Leaf node — execution receives data via exchange.
-    CTEConsume(CTEConsumeNode),
-}
-
-/// Repeat node for ROLLUP/CUBE/GROUPING SETS.
-/// Replicates each input row N times with different null patterns.
-#[derive(Clone, Debug)]
-pub(crate) struct RepeatPlanNode {
-    pub input: Box<LogicalPlan>,
-    pub repeat_column_ref_list: Vec<Vec<String>>,
-    pub grouping_ids: Vec<u64>,
-    pub all_rollup_columns: Vec<String>,
-    pub grouping_fn_args: Vec<(String, Vec<String>)>,
-}
-
-/// Subquery alias node: wraps an inlined subquery (CTE or derived table)
-/// with the alias name and output column metadata.
-#[derive(Clone, Debug)]
-pub(crate) struct SubqueryAliasNode {
-    pub input: Box<LogicalPlan>,
-    pub alias: String,
-    pub output_columns: Vec<OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CTEConsumeNode {
-    pub cte_id: crate::sql::cte::CteId,
-    pub alias: String,
-    pub output_columns: Vec<crate::sql::ir::OutputColumn>,
-}
-
-/// A query plan with optional shared CTE subtrees.
-#[derive(Clone, Debug)]
-pub(crate) struct QueryPlan {
-    pub cte_plans: Vec<CTEProducePlan>,
-    pub main_plan: LogicalPlan,
-    pub output_columns: Vec<crate::sql::ir::OutputColumn>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CTEProducePlan {
-    pub cte_id: crate::sql::cte::CteId,
-    pub plan: LogicalPlan,
-    pub output_columns: Vec<crate::sql::ir::OutputColumn>,
 }
 
 /// Analytic/window function evaluation node.

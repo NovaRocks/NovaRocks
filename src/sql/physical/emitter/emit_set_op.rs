@@ -77,9 +77,13 @@ impl<'a> super::ThriftEmitter<'a> {
 
         for (idx, (name, binding)) in child_cols.iter().enumerate() {
             // Build a slot-ref TExpr pointing to the child's output
-            let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
-            let texpr =
-                expr_compiler::build_slot_ref_texpr(binding.slot_id, binding.tuple_id, type_desc);
+            let type_desc =
+                type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+            let texpr = expr_compiler::build_slot_ref_texpr(
+                binding.slot_id,
+                binding.tuple_id,
+                type_desc,
+            );
             grouping_exprs.push(texpr);
 
             let slot_id = self.alloc_slot();
@@ -174,33 +178,14 @@ impl<'a> super::ThriftEmitter<'a> {
         let mut result_expr_lists = Vec::with_capacity(child_results.len());
         for child_result in &child_results {
             let mut expr_list = Vec::new();
-            for (col_idx, (_, child_binding)) in child_result.scope.iter_columns().enumerate() {
-                let output_type = first_child_cols.get(col_idx).map(|(_, b)| &b.data_type);
-                // If the child column is Null but the output column is a real type
-                // (e.g., ROLLUP NULL vs Utf8), insert a CAST so the executor sees
-                // the correct type instead of DataType::Null.
-                let needs_cast =
-                    matches!(child_binding.data_type, arrow::datatypes::DataType::Null)
-                        && output_type
-                            .is_some_and(|t| !matches!(t, arrow::datatypes::DataType::Null));
-                if needs_cast {
-                    let target_type = output_type.unwrap();
-                    let target_desc = type_infer::arrow_type_to_type_desc(target_type)?;
-                    let child_desc = type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
-                    let slot_ref = expr_compiler::build_slot_ref_texpr(
-                        child_binding.slot_id,
-                        child_binding.tuple_id,
-                        child_desc,
-                    );
-                    expr_list.push(expr_compiler::build_cast_texpr(slot_ref, target_desc));
-                } else {
-                    let type_desc = type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
-                    expr_list.push(expr_compiler::build_slot_ref_texpr(
-                        child_binding.slot_id,
-                        child_binding.tuple_id,
-                        type_desc,
-                    ));
-                }
+            for (_, child_binding) in child_result.scope.iter_columns() {
+                let type_desc =
+                    type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
+                expr_list.push(expr_compiler::build_slot_ref_texpr(
+                    child_binding.slot_id,
+                    child_binding.tuple_id,
+                    type_desc,
+                ));
             }
             result_expr_lists.push(expr_list);
         }

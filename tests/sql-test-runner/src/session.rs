@@ -191,20 +191,9 @@ impl MysqlSession {
                             }
 
                             if !header.is_empty() {
-                                if !saw_tabular_result {
-                                    // First tabular result — use its header
-                                    // (matches `mysql --batch` behavior where
-                                    // the first header line wins).
-                                    saw_tabular_result = true;
-                                    last_header = header;
-                                    last_rows = rows;
-                                } else {
-                                    // Subsequent result sets: the header row
-                                    // becomes a data row in `mysql --batch`
-                                    // output, so append it plus the data rows.
-                                    last_rows.push(header);
-                                    last_rows.extend(rows);
-                                }
+                                saw_tabular_result = true;
+                                last_header = header;
+                                last_rows = rows;
                             } else if !saw_tabular_result {
                                 last_header = header;
                                 last_rows = rows;

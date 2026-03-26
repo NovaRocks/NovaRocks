@@ -103,17 +103,10 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         // Math functions that return Int64
         "ceil" | "ceiling" | "floor" => DataType::Int64,
 
-        // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
-        // (StarRocks FE: getFunctionOfRound preserves Decimal type)
-        "round" | "truncate" => match arg_types.first() {
-            Some(DataType::Decimal128(_, s)) => DataType::Decimal128(38, *s),
-            _ => DataType::Float64,
-        },
-
         // Math functions that return Float64
-        "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2" | "log10" | "sin"
-        | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians" | "degrees" | "pi"
-        | "e" | "sign" | "rand" | "random" => DataType::Float64,
+        "round" | "truncate" | "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log"
+        | "log2" | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
+        | "radians" | "degrees" | "pi" | "e" | "sign" | "rand" | "random" => DataType::Float64,
 
         // String length/position -> Int32
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
@@ -161,37 +154,21 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
 pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataType {
     let first_arg = arg_types.first().cloned().unwrap_or(DataType::Null);
     match name {
-        "count"
-        | "count_if"
-        | "bitmap_union_count"
-        | "bitmap_union_int"
-        | "approx_count_distinct"
-        | "ndv"
-        | "hll_union_agg"
-        | "multi_distinct_count" => DataType::Int64,
+        "count" | "count_if" | "bitmap_union_count" | "bitmap_union_int"
+        | "approx_count_distinct" | "ndv"
+        | "hll_union_agg" | "multi_distinct_count" => DataType::Int64,
 
         "sum" => match &first_arg {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                DataType::Int64
+            }
             DataType::Float32 | DataType::Float64 => DataType::Float64,
-            DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
+            DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
             _ => DataType::Float64,
         },
 
         "avg" => match &first_arg {
-            DataType::Decimal128(_p, s) => {
-                // StarRocks computes avg as sum/count. Division scale rule:
-                // s <= 6  => result_scale = s + 6
-                // s <= 12 => result_scale = 12
-                // else    => result_scale = s
-                let new_scale = if *s <= 6 {
-                    *s + 6
-                } else if *s <= 12 {
-                    12
-                } else {
-                    *s
-                };
-                DataType::Decimal128(38, new_scale)
-            }
+            DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
             _ => DataType::Float64,
         },
         "min" | "max" | "any_value" => first_arg,

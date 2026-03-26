@@ -15,7 +15,8 @@ use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
 use crate::sql::ast::{ArithmeticOp, GenerateSeriesSelect, SqlType, TableColumnDef};
 use crate::sql::ast::{
-    ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName, TableKeyKind,
+    ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName,
+    TableKeyKind,
 };
 
 use super::catalog::{
@@ -160,9 +161,6 @@ impl StandaloneNovaRocks {
         let table = build_parquet_table(table_name, path)?;
         let persisted_path = match &table.storage {
             TableStorage::LocalParquetFile { path } => path.clone(),
-            TableStorage::S3ParquetFiles { .. } => {
-                return Err("register_parquet_table_in_database does not support S3".to_string());
-            }
         };
         let mut guard = self
             .inner
@@ -233,11 +231,11 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        use crate::sql::dialect::{
-            StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
-            looks_like_create_table, looks_like_drop_statement,
-        };
         use sqlparser::ast as sqlast;
+        use crate::sql::dialect::{
+            StarRocksDialect, looks_like_create_table, looks_like_create_catalog,
+            looks_like_create_database, looks_like_drop_statement,
+        };
 
         let normalized = crate::sql::dialect::normalize_for_raw_parse(sql)?;
         let dialect = StarRocksDialect;
@@ -280,46 +278,25 @@ impl StandaloneSession {
             .parse_statement()
             .map_err(|e| format!("sql parser error: {e}"))?;
         match stmt {
-            sqlast::Statement::Explain {
-                statement,
-                verbose,
-                analyze: false,
-                ..
-            } => {
-                let sqlast::Statement::Query(ref query) = *statement else {
-                    return Err("EXPLAIN only supports SELECT queries".to_string());
-                };
-                if let Some(cat_name) = current_catalog {
-                    self.register_iceberg_tables_for_query(cat_name, current_database, query)?;
-                }
-                let level = if verbose {
-                    crate::sql::explain::ExplainLevel::Verbose
-                } else {
-                    crate::sql::explain::ExplainLevel::Normal
-                };
-                let catalog = self
-                    .inner
-                    .catalog
-                    .read()
-                    .expect("standalone catalog read lock");
-                let result = explain_query(query, &catalog, current_database, level)?;
-                drop(catalog);
-                Ok(StatementResult::Query(result))
-            }
             sqlast::Statement::Query(ref query) => {
                 // When current_catalog is an Iceberg catalog, materialize
                 // referenced Iceberg tables into the local catalog first.
                 if let Some(cat_name) = current_catalog {
-                    self.register_iceberg_tables_for_query(cat_name, current_database, query)?;
+                    self.materialize_iceberg_tables_for_query(
+                        cat_name,
+                        current_database,
+                        query,
+                    )?;
                 }
                 let catalog = self
                     .inner
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = execute_query(query, &catalog, current_database)?;
+                let result =
+                    build_query_plan(query, &catalog, current_database)?;
                 drop(catalog);
-                Ok(StatementResult::Query(result))
+                execute_plan(result).map(StatementResult::Query)
             }
             sqlast::Statement::Insert(ref insert) => {
                 self.handle_sqlparser_insert(insert, current_catalog, current_database)
@@ -328,7 +305,11 @@ impl StandaloneSession {
                 for truncate_table in &truncate.table_names {
                     let table_name =
                         crate::sql::dialect::convert_object_name(truncate_table.name.clone())?;
-                    execute_truncate_table_statement(&self.inner, &table_name, current_database)?;
+                    execute_truncate_table_statement(
+                        &self.inner,
+                        &table_name,
+                        current_database,
+                    )?;
                 }
                 Ok(StatementResult::Ok)
             }
@@ -339,10 +320,9 @@ impl StandaloneSession {
         }
     }
 
-    /// Register Iceberg tables referenced by a query into the local catalog.
-    /// Instead of downloading data, this registers S3 file paths directly so the
-    /// execution engine reads parquet files from S3 via TCloudConfiguration.
-    fn register_iceberg_tables_for_query(
+    /// Materialize Iceberg tables referenced by a query into the local catalog.
+    /// This loads data from S3 via Iceberg SDK scan and writes to local parquet.
+    fn materialize_iceberg_tables_for_query(
         &self,
         catalog_name: &str,
         current_database: &str,
@@ -365,7 +345,7 @@ impl StandaloneSession {
         };
 
         for table_name in &table_names {
-            // Skip if already registered in local catalog
+            // Skip if already materialized in local catalog
             {
                 let local = self.inner.catalog.read().expect("catalog read lock");
                 if local.get(current_database, table_name).is_ok() {
@@ -373,80 +353,39 @@ impl StandaloneSession {
                 }
             }
 
-            // Load table metadata from Iceberg (lazy S3 discovery)
+            // Load from Iceberg
             let loaded = match super::iceberg::load_table(&entry, current_database, table_name) {
                 Ok(l) => l,
                 Err(_) => continue, // table not found in iceberg, skip
             };
 
-            // Build the storage variant based on whether this is S3 or local
-            let storage = if entry.is_s3() {
-                // Extract data file paths from Iceberg scan plan
-                let data_files = super::iceberg::extract_data_files(&loaded.table)?;
-                let cloud_properties = entry.cloud_properties_map();
-                crate::sql::catalog::TableStorage::S3ParquetFiles {
-                    files: data_files
-                        .into_iter()
-                        .map(|(path, size, row_count)| crate::sql::catalog::S3FileInfo {
-                            path,
-                            size,
-                            row_count,
-                            column_stats: None,
-                        })
-                        .collect(),
-                    cloud_properties,
-                }
-            } else {
-                // Local Iceberg: extract data files and use LocalParquetFile
-                // For local, there should be exactly one data directory to scan
-                let data_files = super::iceberg::extract_data_files(&loaded.table)?;
-                if let Some((first_path, _, _)) = data_files.first() {
-                    let local_path = first_path.strip_prefix("file://").unwrap_or(first_path);
-                    crate::sql::catalog::TableStorage::LocalParquetFile {
-                        path: std::path::PathBuf::from(local_path),
-                    }
-                } else {
-                    // No data files, create an empty placeholder
-                    let dir = std::env::temp_dir().join("novarocks_iceberg_empty");
-                    std::fs::create_dir_all(&dir).map_err(|e| format!("create empty dir: {e}"))?;
-                    let path = dir.join(format!("{}_{}.parquet", current_database, table_name));
-                    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(
-                        loaded
-                            .columns
-                            .iter()
-                            .map(|c| {
-                                arrow::datatypes::Field::new(
-                                    &c.name,
-                                    c.data_type.clone(),
-                                    c.nullable,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    ));
-                    let empty_arrays: Vec<arrow::array::ArrayRef> = schema
-                        .fields()
-                        .iter()
-                        .map(|f| arrow::array::new_empty_array(f.data_type()))
-                        .collect();
-                    let empty_batch = RecordBatch::try_new(schema, empty_arrays)
-                        .map_err(|e| format!("build empty batch: {e}"))?;
-                    write_parquet_to_path(&path, &empty_batch)?;
-                    crate::sql::catalog::TableStorage::LocalParquetFile { path }
-                }
-            };
+            // Read full data via Iceberg SDK scan (through S3Storage)
+            let batch = load_full_iceberg_batch(&loaded)?;
+
+            // Write to temp parquet
+            let dir = std::env::temp_dir().join("novarocks_iceberg_materialized");
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("create materialized dir: {e}"))?;
+            let path = dir.join(format!(
+                "{}_{}.parquet",
+                current_database, table_name
+            ));
+            write_parquet_to_path(&path, &batch)?;
 
             // Register in local catalog
             let table_def = crate::sql::catalog::TableDef {
                 name: table_name.clone(),
                 columns: loaded.columns,
-                storage,
+                storage: crate::sql::catalog::TableStorage::LocalParquetFile { path },
             };
             let mut guard = self.inner.catalog.write().expect("catalog write lock");
             if guard.get(current_database, table_name).is_err() {
-                guard.create_database(current_database).ok(); // ignore if exists
+                guard
+                    .create_database(current_database)
+                    .ok(); // ignore if exists
                 guard
                     .register(current_database, table_def)
-                    .map_err(|e| format!("register iceberg table: {e}"))?;
+                    .map_err(|e| format!("register materialized table: {e}"))?;
             }
         }
 
@@ -467,25 +406,14 @@ impl StandaloneSession {
             1 => {
                 let cat = current_catalog
                     .ok_or("ADD FILES requires a catalog context (use SET catalog)")?;
-                (
-                    cat.to_string(),
-                    current_database.to_string(),
-                    table_parts[0].clone(),
-                )
+                (cat.to_string(), current_database.to_string(), table_parts[0].clone())
             }
             2 => {
-                let cat = current_catalog.ok_or("ADD FILES requires a catalog context")?;
-                (
-                    cat.to_string(),
-                    table_parts[0].clone(),
-                    table_parts[1].clone(),
-                )
+                let cat = current_catalog
+                    .ok_or("ADD FILES requires a catalog context")?;
+                (cat.to_string(), table_parts[0].clone(), table_parts[1].clone())
             }
-            3 => (
-                table_parts[0].clone(),
-                table_parts[1].clone(),
-                table_parts[2].clone(),
-            ),
+            3 => (table_parts[0].clone(), table_parts[1].clone(), table_parts[2].clone()),
             _ => return Err(format!("invalid table name in ADD FILES")),
         };
 
@@ -498,7 +426,8 @@ impl StandaloneSession {
         drop(guard);
         let count = super::iceberg_add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
         let msg = format!("Added {count} file(s)");
-        build_string_query_result("status", vec![msg]).map(StatementResult::Query)
+        build_string_query_result("status", vec![msg])
+            .map(StatementResult::Query)
     }
 
     /// Handle CREATE CATALOG result.
@@ -574,7 +503,8 @@ impl StandaloneSession {
                     other => return Err(format!("unsupported INSERT target: {other}")),
                 };
                 if let Ok(table_name) = crate::sql::dialect::convert_object_name(raw_name) {
-                    if let Ok(resolved) = resolve_local_table_name(&table_name, current_database) {
+                    if let Ok(resolved) = resolve_local_table_name(&table_name, current_database)
+                    {
                         let guard = self
                             .inner
                             .catalog
@@ -582,8 +512,9 @@ impl StandaloneSession {
                             .expect("standalone catalog read lock");
                         if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
                             drop(guard);
-                            return self
-                                .execute_insert_values_sqlparser(insert, &resolved, &table_def);
+                            return self.execute_insert_values_sqlparser(
+                                insert, &resolved, &table_def,
+                            );
                         }
                     }
                 }
@@ -592,7 +523,11 @@ impl StandaloneSession {
 
         // Fallback: parse INSERT via the custom parser for Iceberg tables
         // (handles generate_series, literal SELECT rows, etc.)
-        self.execute_insert_via_custom_parser(insert, current_catalog, current_database)
+        self.execute_insert_via_custom_parser(
+            insert,
+            current_catalog,
+            current_database,
+        )
     }
 
     /// Handle INSERT INTO ... SELECT ... by executing the SELECT via ThriftPlanBuilder
@@ -616,8 +551,10 @@ impl StandaloneSession {
             .catalog
             .read()
             .expect("standalone catalog read lock");
-        let query_result = execute_query(source_query, &catalog, current_database)?;
+        let plan_result =
+            build_query_plan(source_query, &catalog, current_database)?;
         drop(catalog);
+        let query_result = execute_plan(plan_result)?;
 
         // Resolve target table
         let raw_name = match &insert.table {
@@ -636,9 +573,6 @@ impl StandaloneSession {
 
         let path = match &table_def.storage {
             TableStorage::LocalParquetFile { path } => path.clone(),
-            TableStorage::S3ParquetFiles { .. } => {
-                return Err("INSERT SELECT into S3 tables is not supported".to_string());
-            }
         };
 
         // Read existing data
@@ -743,9 +677,6 @@ impl StandaloneSession {
 
         let path = match &table_def.storage {
             TableStorage::LocalParquetFile { path } => path.clone(),
-            TableStorage::S3ParquetFiles { .. } => {
-                return Err("INSERT VALUES into S3 tables is not supported".to_string());
-            }
         };
 
         let existing_batch = read_local_parquet_data(&path, &table_def.columns)?;
@@ -824,12 +755,11 @@ fn convert_sqlparser_insert_to_custom(
                 // Possible TABLE(generate_series(...)) source
                 let table_with_joins = &select.from[0];
                 if table_with_joins.joins.is_empty() {
-                    if let sqlparser::ast::TableFactor::TableFunction {
-                        ref expr,
-                        ref alias,
-                    } = table_with_joins.relation
+                    if let sqlparser::ast::TableFactor::TableFunction { ref expr, ref alias } =
+                        table_with_joins.relation
                     {
-                        let (start, end, step) = parse_generate_series_function_expr(expr)?;
+                        let (start, end, step) =
+                            parse_generate_series_function_expr(expr)?;
                         let column_name = alias
                             .as_ref()
                             .and_then(|a| a.columns.first().map(|c| c.name.value.clone()))
@@ -841,10 +771,7 @@ fn convert_sqlparser_insert_to_custom(
                                 sqlast::SelectItem::UnnamedExpr(expr) => {
                                     sqlparser_expr_to_custom_expr(expr)
                                 }
-                                _ => {
-                                    Err("INSERT SELECT source only supports unnamed expressions"
-                                        .into())
-                                }
+                                _ => Err("INSERT SELECT source only supports unnamed expressions".into()),
                             })
                             .collect::<Result<_, _>>()?;
                         InsertSource::GenerateSeriesSelect(GenerateSeriesSelect {
@@ -900,14 +827,10 @@ fn parse_generate_series_function_expr(
             sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => {
                 match sqlparser_expr_to_literal(expr)? {
                     Literal::Int(v) => Ok(v),
-                    other => Err(format!(
-                        "generate_series expects integer args, got {other:?}"
-                    )),
+                    other => Err(format!("generate_series expects integer args, got {other:?}")),
                 }
             }
-            other => Err(format!(
-                "generate_series expects positional args, got {other}"
-            )),
+            other => Err(format!("generate_series expects positional args, got {other}")),
         })
         .collect::<Result<_, _>>()?;
     match values.as_slice() {
@@ -1089,13 +1012,7 @@ fn sqlparser_expr_to_literal(expr: &sqlparser::ast::Expr) -> Result<Literal, Str
                         Literal::Int(i) => i.to_string(),
                         Literal::Float(f) => f.to_string(),
                         Literal::String(s) | Literal::Date(s) => format!("\"{s}\""),
-                        Literal::Array(a) => format!(
-                            "[{}]",
-                            a.iter()
-                                .map(|x| format!("{x:?}"))
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ),
+                        Literal::Array(a) => format!("[{}]", a.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>().join(",")),
                     })
                 })
                 .collect();
@@ -1150,9 +1067,6 @@ fn execute_create_table_statement(
             let table = build_parquet_table(stmt.name.leaf(), &path)?;
             let persisted_path = match &table.storage {
                 TableStorage::LocalParquetFile { path } => path.clone(),
-                TableStorage::S3ParquetFiles { .. } => {
-                    return Err("LocalParquet CREATE TABLE does not support S3".to_string());
-                }
             };
             let mut guard = state
                 .catalog
@@ -1355,9 +1269,6 @@ fn execute_truncate_table_statement(
     let table_def = guard.get(&resolved.database, &resolved.table)?;
     let path = match &table_def.storage {
         TableStorage::LocalParquetFile { path } => path.clone(),
-        TableStorage::S3ParquetFiles { .. } => {
-            return Err("TRUNCATE TABLE is not supported for S3 tables".to_string());
-        }
     };
     let schema = Arc::new(arrow::datatypes::Schema::new(
         table_def
@@ -1950,9 +1861,6 @@ fn insert_into_local_table(
 
     let path = match &table_def.storage {
         TableStorage::LocalParquetFile { path } => path.clone(),
-        TableStorage::S3ParquetFiles { .. } => {
-            return Err("INSERT into S3 tables is not supported".to_string());
-        }
     };
 
     // Read existing data if any
@@ -2325,15 +2233,14 @@ fn cast_batch_to_schema(
         if source_col.data_type() == target_field.data_type() {
             columns.push(source_col.clone());
         } else {
-            let casted =
-                arrow::compute::cast(source_col, target_field.data_type()).map_err(|e| {
-                    format!(
-                        "cast column {} from {:?} to {:?} failed: {e}",
-                        target_field.name(),
-                        source_col.data_type(),
-                        target_field.data_type()
-                    )
-                })?;
+            let casted = arrow::compute::cast(source_col, target_field.data_type()).map_err(|e| {
+                format!(
+                    "cast column {} from {:?} to {:?} failed: {e}",
+                    target_field.name(),
+                    source_col.data_type(),
+                    target_field.data_type()
+                )
+            })?;
             columns.push(casted);
         }
     }
@@ -2375,7 +2282,8 @@ fn ensure_dual_in_database(state: &Arc<StandaloneState>, database: &str) -> Resu
 
     // Create a 1-row parquet with a single dummy column
     let dir = std::env::temp_dir().join("novarocks_dual");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create dual table dir failed: {e}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create dual table dir failed: {e}"))?;
     let path = dir.join(format!("dual_{}.parquet", database));
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("__dummy__", arrow::datatypes::DataType::Int8, true),
@@ -2394,10 +2302,7 @@ fn ensure_dual_in_database(state: &Arc<StandaloneState>, database: &str) -> Resu
         }],
         storage: TableStorage::LocalParquetFile { path },
     };
-    let mut guard = state
-        .catalog
-        .write()
-        .expect("standalone catalog write lock");
+    let mut guard = state.catalog.write().expect("standalone catalog write lock");
     guard.register(database, table).ok(); // ignore if already exists
     Ok(())
 }
@@ -3234,12 +3139,6 @@ fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
 /// Extract simple table names from a query AST (for Iceberg table materialization).
 fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> {
     let mut names = Vec::new();
-    // Extract table names from CTEs (WITH clause)
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            extract_table_names_from_subquery(&cte.query, &mut names);
-        }
-    }
     extract_table_names_from_set_expr(query.body.as_ref(), &mut names);
     names.sort();
     names.dedup();
@@ -3255,16 +3154,6 @@ fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut
                     extract_table_names_from_table_factor(&join.relation, names);
                 }
             }
-            // Also extract table names from subqueries in WHERE/HAVING/SELECT
-            extract_table_names_from_expr_opt(s.selection.as_ref(), names);
-            extract_table_names_from_expr_opt(s.having.as_ref(), names);
-            for item in &s.projection {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
-                {
-                    extract_table_names_from_expr(expr, names);
-                }
-            }
         }
         sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
             extract_table_names_from_set_expr(left, names);
@@ -3277,10 +3166,7 @@ fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut
     }
 }
 
-fn extract_table_names_from_table_factor(
-    factor: &sqlparser::ast::TableFactor,
-    names: &mut Vec<String>,
-) {
+fn extract_table_names_from_table_factor(factor: &sqlparser::ast::TableFactor, names: &mut Vec<String>) {
     match factor {
         sqlparser::ast::TableFactor::Table { name, .. } => {
             // Take the last part as the table name (ignore catalog/db qualifiers)
@@ -3299,47 +3185,6 @@ fn extract_table_names_from_table_factor(
     }
 }
 
-fn extract_table_names_from_expr_opt(expr: Option<&sqlparser::ast::Expr>, names: &mut Vec<String>) {
-    if let Some(e) = expr {
-        extract_table_names_from_expr(e, names);
-    }
-}
-
-fn extract_table_names_from_expr(expr: &sqlparser::ast::Expr, names: &mut Vec<String>) {
-    // Use the Display impl to get the SQL string, then recursively look for
-    // subquery patterns. This is simpler than matching every AST variant.
-    // For subquery extraction, we only need to find Subquery/Exists/InSubquery nodes.
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
-            extract_table_names_from_subquery(q, names);
-        }
-        Expr::InSubquery { subquery, expr, .. } => {
-            extract_table_names_from_subquery(subquery, names);
-            extract_table_names_from_expr(expr, names);
-        }
-        Expr::BinaryOp { left, right, .. } => {
-            extract_table_names_from_expr(left, names);
-            extract_table_names_from_expr(right, names);
-        }
-        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
-            extract_table_names_from_expr(expr, names);
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => {
-            extract_table_names_from_expr(expr, names);
-            extract_table_names_from_expr(low, names);
-            extract_table_names_from_expr(high, names);
-        }
-        _ => {} // literals, column refs, functions, etc.
-    }
-}
-
-fn extract_table_names_from_subquery(query: &sqlparser::ast::Query, names: &mut Vec<String>) {
-    extract_table_names_from_set_expr(query.body.as_ref(), names);
-}
-
 // ---------------------------------------------------------------------------
 // ADD FILES SQL parsing
 // ---------------------------------------------------------------------------
@@ -3354,7 +3199,9 @@ fn looks_like_add_files(sql: &str) -> bool {
 fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
     // Extract the part between ALTER TABLE and ADD FILES FROM
     let upper = sql.to_ascii_uppercase();
-    let alter_idx = upper.find("ALTER TABLE").ok_or("missing ALTER TABLE")?;
+    let alter_idx = upper
+        .find("ALTER TABLE")
+        .ok_or("missing ALTER TABLE")?;
     let add_files_idx = upper
         .find("ADD FILES FROM")
         .ok_or("missing ADD FILES FROM")?;
@@ -3388,196 +3235,16 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 
 use crate::sql::physical::PlanBuildResult;
 
-/// Build a single-fragment query plan (no shared CTEs).
-fn build_query_plan_single(
+fn build_query_plan(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,
 ) -> Result<PlanBuildResult, String> {
-    let (resolved, _cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let resolved = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let output_columns = resolved.output_columns.clone();
     let logical = crate::sql::planner::plan(resolved)?;
-    let table_stats = build_table_stats_from_plan(&logical);
-    let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
+    let optimized = crate::sql::optimizer::optimize(logical);
     crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)
-}
-
-/// Execute a query, automatically choosing single-fragment or multi-fragment path.
-///
-/// Queries without shared CTEs (the vast majority) take the existing
-/// single-fragment fast path.  Queries with multi-referenced CTEs are
-/// split into a fragment DAG and executed via the multi-fragment coordinator.
-/// Produce EXPLAIN output for a query without executing it.
-fn explain_query(
-    query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
-    current_database: &str,
-    level: crate::sql::explain::ExplainLevel,
-) -> Result<QueryResult, String> {
-    use crate::sql::explain::{ExplainLevel, explain_plan, explain_query_plan};
-
-    let (resolved, cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
-
-    let mut lines = Vec::new();
-
-    if cte_registry.entries.is_empty() {
-        let logical = crate::sql::planner::plan(resolved)?;
-        let table_stats = build_table_stats_from_plan(&logical);
-        let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
-
-        if matches!(level, ExplainLevel::Costs) {
-            for (table, stats) in &table_stats {
-                lines.push(format!(
-                    "  Statistics: {table} row_count={}",
-                    stats.row_count
-                ));
-            }
-        }
-        lines.extend(explain_plan(&optimized, level));
-    } else {
-        let query_plan =
-            crate::sql::planner::plan_query(resolved, cte_registry)?;
-        let mut all_stats = std::collections::HashMap::new();
-        for cte in &query_plan.cte_plans {
-            all_stats.extend(build_table_stats_from_plan(&cte.plan));
-        }
-        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-        let optimized =
-            crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
-
-        if matches!(level, ExplainLevel::Costs) {
-            for (table, stats) in &all_stats {
-                lines.push(format!(
-                    "  Statistics: {table} row_count={}",
-                    stats.row_count
-                ));
-            }
-        }
-        lines.extend(explain_query_plan(&optimized, level));
-    }
-
-    build_string_query_result("Explain String", lines)
-}
-
-fn execute_query(
-    query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
-    current_database: &str,
-) -> Result<QueryResult, String> {
-    let (resolved, cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
-
-    if cte_registry.entries.is_empty() {
-        // Single-fragment fast path (no shared CTEs)
-        let output_columns = resolved.output_columns.clone();
-        let logical = crate::sql::planner::plan(resolved)?;
-        let table_stats = build_table_stats_from_plan(&logical);
-        let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
-        let plan_result =
-            crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)?;
-        return execute_plan(plan_result);
-    }
-
-    // Multi-fragment CTE path
-    execute_query_multi_fragment(resolved, cte_registry, catalog, current_database)
-}
-
-/// Execute a query with shared CTEs via multi-fragment coordination.
-fn execute_query_multi_fragment(
-    resolved: crate::sql::ir::ResolvedQuery,
-    cte_registry: crate::sql::cte::CTERegistry,
-    catalog: &InMemoryCatalog,
-    current_database: &str,
-) -> Result<QueryResult, String> {
-    // 1. Plan with CTE subtrees
-    let query_plan = crate::sql::planner::plan_query(resolved, cte_registry)?;
-
-    // 2. Collect table stats from ALL plans (CTE + main)
-    let mut all_stats = std::collections::HashMap::new();
-    for cte in &query_plan.cte_plans {
-        let s = build_table_stats_from_plan(&cte.plan);
-        all_stats.extend(s);
-    }
-    all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-
-    // 3. Optimize
-    let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
-
-    // 4. Split into fragments
-    let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
-
-    // 5. Emit per-fragment Thrift
-    let build_result =
-        crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)?;
-
-    // 6. Coordinate execution
-    let exchange_port = crate::common::config::http_port();
-    let coordinator = super::coordinator::ExecutionCoordinator::new(
-        build_result,
-        "127.0.0.1".to_string(),
-        exchange_port,
-    );
-    coordinator.execute()
-}
-
-/// Walk the logical plan tree and collect table-level statistics for all scan
-/// nodes that reference S3ParquetFiles storage.
-fn build_table_stats_from_plan(
-    plan: &crate::sql::plan::LogicalPlan,
-) -> std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
-    let mut stats = std::collections::HashMap::new();
-    collect_scan_stats(plan, &mut stats);
-    stats
-}
-
-/// Recursively visit plan nodes and collect statistics from Scan leaves.
-fn collect_scan_stats(
-    plan: &crate::sql::plan::LogicalPlan,
-    out: &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
-) {
-    use crate::sql::plan::LogicalPlan;
-
-    match plan {
-        LogicalPlan::Scan(s) => {
-            if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } =
-                &s.table.storage
-            {
-                if let Some(ts) = crate::sql::statistics::build_table_statistics(files) {
-                    out.insert(s.table.name.clone(), ts);
-                }
-            }
-        }
-        LogicalPlan::Filter(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Project(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Aggregate(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Sort(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Limit(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Window(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::SubqueryAlias(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Join(n) => {
-            collect_scan_stats(&n.left, out);
-            collect_scan_stats(&n.right, out);
-        }
-        LogicalPlan::Union(n) => {
-            for input in &n.inputs {
-                collect_scan_stats(input, out);
-            }
-        }
-        LogicalPlan::Intersect(n) => {
-            for input in &n.inputs {
-                collect_scan_stats(input, out);
-            }
-        }
-        LogicalPlan::Except(n) => {
-            for input in &n.inputs {
-                collect_scan_stats(input, out);
-            }
-        }
-        LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
-        LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) | LogicalPlan::CTEConsume(_) => {}
-    }
 }
 
 fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
@@ -3621,10 +3288,6 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     let handle = ResultSinkHandle::new();
-    // Use available CPU cores for pipeline parallelism (capped at 8)
-    let pipeline_dop = std::thread::available_parallelism()
-        .map(|p| p.get().min(4))
-        .unwrap_or(4);
     execute_plan_with_pipeline(
         exec_plan,
         false,
@@ -3632,7 +3295,7 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
         Box::new(ResultSinkFactory::new(handle.clone())),
         None,
         None,
-        pipeline_dop as _,
+        1,
         std::sync::Arc::new(RuntimeState::default()),
         None,
         None,

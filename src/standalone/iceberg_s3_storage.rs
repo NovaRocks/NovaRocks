@@ -125,10 +125,9 @@ impl Storage for S3Storage {
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
         let (bucket, key) = Self::parse_path(path)?;
         let op = self.get_operator(&bucket)?;
-        let meta = op
-            .stat(&key)
-            .await
-            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("S3 metadata({path}): {e}")))?;
+        let meta = op.stat(&key).await.map_err(|e| {
+            Error::new(ErrorKind::DataInvalid, format!("S3 metadata({path}): {e}"))
+        })?;
         Ok(FileMetadata {
             size: meta.content_length(),
         })
@@ -137,10 +136,9 @@ impl Storage for S3Storage {
     async fn read(&self, path: &str) -> Result<Bytes> {
         let (bucket, key) = Self::parse_path(path)?;
         let op = self.get_operator(&bucket)?;
-        let data = op
-            .read(&key)
-            .await
-            .map_err(|e| Error::new(ErrorKind::DataInvalid, format!("S3 read({path}): {e}")))?;
+        let data = op.read(&key).await.map_err(|e| {
+            Error::new(ErrorKind::DataInvalid, format!("S3 read({path}): {e}"))
+        })?;
         Ok(data.to_bytes())
     }
 
@@ -153,28 +151,27 @@ impl Storage for S3Storage {
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
         let (bucket, key) = Self::parse_path(path)?;
         let op = self.get_operator(&bucket)?;
-        op.write(&key, bs)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("S3 write({path}): {e}")))?;
+        op.write(&key, bs).await.map_err(|e| {
+            Error::new(ErrorKind::Unexpected, format!("S3 write({path}): {e}"))
+        })?;
         Ok(())
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
         let (bucket, key) = Self::parse_path(path)?;
         let op = self.get_operator(&bucket)?;
-        let w = op
-            .writer(&key)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("S3 writer({path}): {e}")))?;
+        let w = op.writer(&key).await.map_err(|e| {
+            Error::new(ErrorKind::Unexpected, format!("S3 writer({path}): {e}"))
+        })?;
         Ok(Box::new(S3FileWrite { writer: Some(w) }))
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
         let (bucket, key) = Self::parse_path(path)?;
         let op = self.get_operator(&bucket)?;
-        op.delete(&key)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("S3 delete({path}): {e}")))?;
+        op.delete(&key).await.map_err(|e| {
+            Error::new(ErrorKind::Unexpected, format!("S3 delete({path}): {e}"))
+        })?;
         Ok(())
     }
 

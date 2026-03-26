@@ -1,54 +1,21 @@
 //! Logical plan optimizer.
 //!
-//! Applies three optimization passes in order:
+//! Currently supports two rule-based optimizations:
 //!   1. **Predicate pushdown** — moves Filter predicates closer to Scan nodes.
-//!   2. **CBO join reorder** — uses cardinality estimation, a cost model, and
-//!      DP join enumeration to find the cheapest join order for chains of INNER
-//!      JOINs.  Falls back to a heuristic swap for non-INNER joins or when the
-//!      join graph is too large.
-//!   3. **Column pruning** — removes unreferenced columns from Scan nodes.
+//!   2. **Column pruning** — removes unreferenced columns from Scan nodes.
 //!
 //! The optimizer operates on the [`LogicalPlan`] tree before it is handed to
 //! the Thrift emitter.
 
-pub(crate) mod cardinality;
-mod column_pruning;
-pub(crate) mod cost;
-pub(crate) mod expr_utils;
-mod join_reorder;
 mod predicate_pushdown;
+mod column_pruning;
+pub(crate) mod expr_utils;
 
 use crate::sql::plan::*;
 
-/// Optimize a QueryPlan: optimize each CTE subtree and the main plan independently.
-///
-/// CTE subtrees are optimized first so that `CTEConsume` nodes in the main plan
-/// (and in other CTE subtrees) remain opaque leaf nodes — the optimizer never
-/// looks "through" a CTE boundary.
-pub(crate) fn optimize_query_plan(
-    mut query_plan: QueryPlan,
-    table_stats: &std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
-) -> QueryPlan {
-    // Optimize each CTE plan independently.
-    for cte in &mut query_plan.cte_plans {
-        cte.plan = optimize(cte.plan.clone(), table_stats);
-    }
-    // Optimize the main plan.
-    query_plan.main_plan = optimize(query_plan.main_plan, table_stats);
-    query_plan
-}
-
 /// Apply all optimization rules to the logical plan.
-///
-/// `table_stats` provides per-table statistics from Iceberg metadata.
-/// Currently passed through for future use by DP-based join reorder;
-/// the existing heuristic-based reorder does not use it yet.
-pub(crate) fn optimize(
-    plan: LogicalPlan,
-    table_stats: &std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
-) -> LogicalPlan {
+pub(crate) fn optimize(plan: LogicalPlan) -> LogicalPlan {
     let plan = predicate_pushdown::push_down_predicates(plan);
-    let plan = join_reorder::reorder_joins_cbo(plan, table_stats);
     let plan = column_pruning::prune_columns(plan);
     plan
 }
@@ -56,10 +23,7 @@ pub(crate) fn optimize(
 /// Apply a function to all direct children of a LogicalPlan node.
 pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Scan(_)
-        | LogicalPlan::Values(_)
-        | LogicalPlan::GenerateSeries(_)
-        | LogicalPlan::CTEConsume(_) => plan,
+        LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) => plan,
         LogicalPlan::Window(n) => LogicalPlan::Window(WindowNode {
             input: Box::new(f(*n.input)),
             ..n
@@ -101,18 +65,6 @@ pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan)
         LogicalPlan::Except(n) => LogicalPlan::Except(ExceptNode {
             inputs: n.inputs.into_iter().map(f).collect(),
         }),
-        LogicalPlan::SubqueryAlias(n) => LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-            input: Box::new(f(*n.input)),
-            alias: n.alias,
-            output_columns: n.output_columns,
-        }),
-        LogicalPlan::Repeat(n) => LogicalPlan::Repeat(RepeatPlanNode {
-            input: Box::new(f(*n.input)),
-            repeat_column_ref_list: n.repeat_column_ref_list,
-            grouping_ids: n.grouping_ids,
-            all_rollup_columns: n.all_rollup_columns,
-            grouping_fn_args: n.grouping_fn_args,
-        }),
     }
 }
 
@@ -123,9 +75,9 @@ pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::DataType;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::ir::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
-    use arrow::datatypes::DataType;
 
     fn test_table() -> TableDef {
         TableDef {
@@ -213,7 +165,7 @@ mod tests {
             predicate: pred.clone(),
         });
 
-        let optimized = optimize(plan, &std::collections::HashMap::new());
+        let optimized = optimize(plan);
 
         // Filter should be eliminated; predicate should be on the scan
         match &optimized {
@@ -236,7 +188,7 @@ mod tests {
             }],
         });
 
-        let optimized = optimize(proj, &std::collections::HashMap::new());
+        let optimized = optimize(proj);
 
         match &optimized {
             LogicalPlan::Project(proj) => match proj.input.as_ref() {
@@ -257,14 +209,11 @@ mod tests {
     fn combined_pushdown_and_pruning() {
         let table = test_table();
         let scan = LogicalPlan::Scan(scan_node(&table));
-        let pred = eq_pred(
-            col_ref("b", DataType::Utf8),
-            TypedExpr {
-                kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-                data_type: DataType::Utf8,
-                nullable: false,
-            },
-        );
+        let pred = eq_pred(col_ref("b", DataType::Utf8), TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        });
         let filtered = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: pred,
@@ -277,7 +226,7 @@ mod tests {
             }],
         });
 
-        let optimized = optimize(proj, &std::collections::HashMap::new());
+        let optimized = optimize(proj);
 
         // Project → Scan (with predicate on b and required_columns = [a, b])
         match &optimized {

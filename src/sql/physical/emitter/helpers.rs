@@ -47,10 +47,7 @@ pub(crate) fn typed_expr_display_name(expr: &TypedExpr) -> String {
             }
         }
         ExprKind::AggregateCall { name, .. } => name.clone(),
-        ExprKind::Cast {
-            expr: inner,
-            target,
-        } => {
+        ExprKind::Cast { expr: inner, target } => {
             format!("cast({} as {:?})", typed_expr_display_name(inner), target)
         }
         ExprKind::BinaryOp { left, op, right } => {

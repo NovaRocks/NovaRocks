@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use crate::sql::ir::ExprKind;
 use crate::sql::plan::*;
 
-use crate::sql::physical::OutputColumn;
 use crate::sql::physical::expr_compiler::ExprCompiler;
 use crate::sql::physical::nodes;
 use crate::sql::physical::resolve::{ColumnBinding, ExprScope};
+use crate::sql::physical::OutputColumn;
 
 use super::EmitResult;
 

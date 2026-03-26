@@ -16,10 +16,10 @@ impl<'a> super::ThriftEmitter<'a> {
 
         // Determine which columns to emit: use required_columns if the
         // optimizer has pruned, otherwise emit all columns.
-        let required: Option<std::collections::HashSet<String>> = node
-            .required_columns
-            .as_ref()
-            .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
+        let required: Option<std::collections::HashSet<String>> =
+            node.required_columns.as_ref().map(|cols| {
+                cols.iter().map(|c| c.to_lowercase()).collect()
+            });
 
         for (idx, col) in node.table.columns.iter().enumerate() {
             if let Some(ref req) = required {
@@ -53,7 +53,11 @@ impl<'a> super::ThriftEmitter<'a> {
                 .as_deref()
                 .is_some_and(|a| !a.eq_ignore_ascii_case(&node.table.name))
             {
-                scope.add_column(Some(node.table.name.clone()), col.name.clone(), binding);
+                scope.add_column(
+                    Some(node.table.name.clone()),
+                    col.name.clone(),
+                    binding,
+                );
             }
         }
         self.desc_builder.add_tuple(scan_tuple_id);

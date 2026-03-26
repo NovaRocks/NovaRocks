@@ -3,8 +3,8 @@ use sqlparser::ast as sqlast;
 
 use crate::sql::ir::*;
 
-use super::helpers::eval_const_i64;
 use super::scope::AnalyzerScope;
+use super::helpers::eval_const_i64;
 
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a FROM clause (TableWithJoins).
@@ -12,7 +12,8 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         twj: &sqlast::TableWithJoins,
     ) -> Result<(Relation, AnalyzerScope), String> {
-        let (mut current_rel, mut current_scope) = self.analyze_table_factor(&twj.relation)?;
+        let (mut current_rel, mut current_scope) =
+            self.analyze_table_factor(&twj.relation)?;
 
         for join in &twj.joins {
             let (right_rel, right_scope) = self.analyze_table_factor(&join.relation)?;
@@ -117,37 +118,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let db_lower = db.to_lowercase();
                 let tbl_lower = tbl.to_lowercase();
 
-                // Check if this table name refers to a shared CTE (ref_count >= 2).
-                if parts.len() == 1 {
-                    if let Some(&cte_id) = self.shared_cte_ids.get(&tbl_lower) {
-                        let registry = self.cte_registry.borrow();
-                        let entry = registry.get(cte_id).ok_or_else(|| {
-                            format!("internal error: shared CTE id {cte_id} not found in registry")
-                        })?;
-                        let alias_name = alias
-                            .as_ref()
-                            .map(|a| a.name.value.clone())
-                            .unwrap_or_else(|| tbl.clone());
-                        let output_columns = entry.output_columns.clone();
-                        let mut scope = AnalyzerScope::new();
-                        for col in &output_columns {
-                            scope.add_column(
-                                Some(&alias_name),
-                                &col.name,
-                                col.data_type.clone(),
-                                col.nullable,
-                            );
-                        }
-                        let relation = Relation::CTEConsume {
-                            cte_id,
-                            alias: alias_name,
-                            output_columns,
-                        };
-                        return Ok((relation, scope));
-                    }
-                }
-
-                // Check if this table name refers to a CTE (single-ref, inline).
+                // Check if this table name refers to a CTE first.
                 if parts.len() == 1 {
                     if let Some((cte_query, cte_col_aliases)) = self.ctes.get(&tbl_lower) {
                         // Inline-expand the CTE as a subquery.
@@ -159,12 +130,6 @@ impl<'a> super::AnalyzerContext<'a> {
                             catalog: self.catalog,
                             current_database: self.current_database,
                             ctes: child_ctes,
-                            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-                            collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                            shared_cte_ids: self.shared_cte_ids.clone(),
-                            cte_registry: std::cell::RefCell::new(
-                                self.cte_registry.borrow().clone(),
-                            ),
                         };
                         let mut resolved_cte = child_ctx.analyze_query(cte_query)?;
                         // Apply CTE column aliases if present: WITH t(a, b) AS (...)
@@ -175,9 +140,7 @@ impl<'a> super::AnalyzerContext<'a> {
                                 }
                             }
                         }
-                        let alias_name = alias
-                            .as_ref()
-                            .map(|a| a.name.value.clone())
+                        let alias_name = alias.as_ref().map(|a| a.name.value.clone())
                             .unwrap_or_else(|| tbl.clone());
                         let mut scope = AnalyzerScope::new();
                         for col in &resolved_cte.output_columns {
@@ -201,7 +164,9 @@ impl<'a> super::AnalyzerContext<'a> {
 
                 // Build scope
                 let mut scope = AnalyzerScope::new();
-                let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
+                let qualifier = alias_name
+                    .as_deref()
+                    .unwrap_or(&table_def.name);
                 scope.add_table(Some(qualifier), &table_def.columns);
                 // If alias differs from table name, also register with table name
                 if let Some(ref a) = alias_name {
@@ -279,10 +244,10 @@ impl<'a> super::AnalyzerContext<'a> {
             .args
             .iter()
             .map(|arg| match arg {
-                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => eval_const_i64(e),
-                other => Err(format!(
-                    "generate_series expects positional args, got {other}"
-                )),
+                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                    eval_const_i64(e)
+                }
+                other => Err(format!("generate_series expects positional args, got {other}")),
             })
             .collect::<Result<_, _>>()?;
         let (start, end, step) = match values.as_slice() {

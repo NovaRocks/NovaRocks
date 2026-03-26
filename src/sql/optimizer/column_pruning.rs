@@ -24,8 +24,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                         required.insert(col.to_lowercase());
                     }
                 }
-                let mut pruned: Vec<String> = scan
-                    .columns
+                let mut pruned: Vec<String> = scan.columns
                     .iter()
                     .filter(|c| required.contains(&c.name.to_lowercase()))
                     .map(|c| c.name.clone())
@@ -57,8 +56,10 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             for item in &node.items {
                 // If parent restricts needed columns, only include items
                 // whose output name is in the needed set.
-                let dominated =
-                    needed.is_none() || needed.unwrap().contains(&item.output_name.to_lowercase());
+                let dominated = needed.is_none()
+                    || needed
+                        .unwrap()
+                        .contains(&item.output_name.to_lowercase());
                 if dominated {
                     for col in collect_column_refs(&item.expr) {
                         child_needed.insert(col.to_lowercase());
@@ -150,31 +151,18 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
         // Set operations: recurse into each child without column restriction
         // since all branches must produce the same schema.
         LogicalPlan::Union(node) => LogicalPlan::Union(UnionNode {
-            inputs: node
-                .inputs
-                .into_iter()
-                .map(|i| prune_inner(i, None))
-                .collect(),
+            inputs: node.inputs.into_iter().map(|i| prune_inner(i, None)).collect(),
             all: node.all,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
-            inputs: node
-                .inputs
-                .into_iter()
-                .map(|i| prune_inner(i, None))
-                .collect(),
+            inputs: node.inputs.into_iter().map(|i| prune_inner(i, None)).collect(),
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
-            inputs: node
-                .inputs
-                .into_iter()
-                .map(|i| prune_inner(i, None))
-                .collect(),
+            inputs: node.inputs.into_iter().map(|i| prune_inner(i, None)).collect(),
         }),
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),
         LogicalPlan::GenerateSeries(node) => LogicalPlan::GenerateSeries(node),
-        LogicalPlan::CTEConsume(node) => LogicalPlan::CTEConsume(node),
 
         LogicalPlan::Window(node) => {
             // Prune columns in the child, but don't restrict since the window
@@ -183,31 +171,6 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             LogicalPlan::Window(WindowNode {
                 input: Box::new(input),
                 ..node
-            })
-        }
-
-        LogicalPlan::SubqueryAlias(node) => {
-            // Don't propagate outer `needed` into subquery — the inner plan
-            // has its own column namespace (aliases differ from base columns).
-            // Passing `needed` through would incorrectly prune columns that
-            // the inner SELECT references but the outer query doesn't.
-            let input = prune_inner(*node.input, None);
-            LogicalPlan::SubqueryAlias(SubqueryAliasNode {
-                input: Box::new(input),
-                alias: node.alias,
-                output_columns: node.output_columns,
-            })
-        }
-
-        LogicalPlan::Repeat(node) => {
-            // Repeat needs all columns from input (rollup columns + others).
-            let input = prune_inner(*node.input, None);
-            LogicalPlan::Repeat(RepeatPlanNode {
-                input: Box::new(input),
-                repeat_column_ref_list: node.repeat_column_ref_list,
-                grouping_ids: node.grouping_ids,
-                all_rollup_columns: node.all_rollup_columns,
-                grouping_fn_args: node.grouping_fn_args,
             })
         }
     }

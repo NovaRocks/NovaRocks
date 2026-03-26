@@ -25,10 +25,6 @@ impl sqlparser::dialect::Dialect for StarRocksDialect {
     fn supports_filter_during_aggregation(&self) -> bool {
         false
     }
-
-    fn supports_group_by_expr(&self) -> bool {
-        true
-    }
 }
 
 /// Peek at a token by offset and check if it matches a word (case-insensitive).
