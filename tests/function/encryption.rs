@@ -17,14 +17,12 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::exec::expr::function::encryption::eval_encryption_function;
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use novarocks::exec::expr::ExprId;
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, StringArray,
-};
+use arrow::array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Int64Array, StringArray};
 use arrow::datatypes::DataType;
+use novarocks::exec::expr::ExprId;
+use novarocks::exec::expr::function::FunctionKind;
+use novarocks::exec::expr::function::encryption::eval_encryption_function;
+use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -61,7 +59,14 @@ fn test_from_base64_basic() {
     let expr = common::typed_null(&mut arena, DataType::Utf8);
     let input = common::literal_string(&mut arena, "SGVsbG8=");
 
-    let out = eval_encryption_function("from_base64", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
+    let out = eval_encryption_function(
+        "from_base64",
+        &arena,
+        expr,
+        &[input],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "Hello");
 }
@@ -76,7 +81,8 @@ fn test_to_base64_basic() {
     let expr = common::typed_null(&mut arena, DataType::Utf8);
     let input = common::literal_string(&mut arena, "Hello");
 
-    let out = eval_encryption_function("to_base64", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
+    let out = eval_encryption_function("to_base64", &arena, expr, &[input], &common::chunk_len_1())
+        .unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "SGVsbG8=");
 }
@@ -91,7 +97,8 @@ fn test_md5_basic() {
     let expr = common::typed_null(&mut arena, DataType::Utf8);
     let input = common::literal_string(&mut arena, "abc");
 
-    let out = eval_encryption_function("md5", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
+    let out =
+        eval_encryption_function("md5", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "900150983cd24fb0d6963f7d28e17f72");
 }
@@ -108,7 +115,8 @@ fn test_md5sum_concat_and_skip_null() {
     let b = common::literal_string(&mut arena, "b");
     let c = common::typed_null(&mut arena, DataType::Utf8);
 
-    let out = eval_encryption_function("md5sum", &arena, expr, &[a, b, c], &common::chunk_len_1()).unwrap();
+    let out = eval_encryption_function("md5sum", &arena, expr, &[a, b, c], &common::chunk_len_1())
+        .unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "187ef4436122d1cc2f40dc2b92f0eba0");
 }
@@ -123,7 +131,9 @@ fn test_md5sum_numeric_basic() {
     let expr = common::typed_null(&mut arena, DataType::Int64);
     let a = common::literal_string(&mut arena, "ab");
 
-    let out = eval_encryption_function("md5sum_numeric", &arena, expr, &[a], &common::chunk_len_1()).unwrap();
+    let out =
+        eval_encryption_function("md5sum_numeric", &arena, expr, &[a], &common::chunk_len_1())
+            .unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
 
     let expected_u128 = u128::from_str_radix("187ef4436122d1cc2f40dc2b92f0eba0", 16).unwrap();
@@ -136,7 +146,14 @@ fn test_md5sum_numeric_skips_null_arguments() {
     let expr = common::typed_null(&mut arena, DataType::FixedSizeBinary(16));
     let null_arg = common::typed_null(&mut arena, DataType::Utf8);
 
-    let out = eval_encryption_function("md5sum_numeric", &arena, expr, &[null_arg], &common::chunk_len_1()).unwrap();
+    let out = eval_encryption_function(
+        "md5sum_numeric",
+        &arena,
+        expr,
+        &[null_arg],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
     // The value should be the MD5 of empty string (all nulls are skipped)
     assert!(!out.is_null(0));
@@ -154,7 +171,8 @@ fn test_sha2_256_basic() {
     let s = common::literal_string(&mut arena, "abc");
     let len = common::literal_i64(&mut arena, 256);
 
-    let out = eval_encryption_function("sha2", &arena, expr, &[s, len], &common::chunk_len_1()).unwrap();
+    let out =
+        eval_encryption_function("sha2", &arena, expr, &[s, len], &common::chunk_len_1()).unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(
         out.value(0),
@@ -172,7 +190,8 @@ fn test_sm3_basic() {
     let expr = common::typed_null(&mut arena, DataType::Utf8);
     let input = common::literal_string(&mut arena, "abc");
 
-    let out = eval_encryption_function("sm3", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
+    let out =
+        eval_encryption_function("sm3", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(
         out.value(0),
@@ -190,7 +209,8 @@ fn test_to_binary_hex_default() {
     let expr = common::typed_null(&mut arena, DataType::Binary);
     let input = common::literal_string(&mut arena, "4142");
 
-    let out = eval_encryption_function("to_binary", &arena, expr, &[input], &common::chunk_len_1()).unwrap();
+    let out = eval_encryption_function("to_binary", &arena, expr, &[input], &common::chunk_len_1())
+        .unwrap();
     let out = out.as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(out.value(0), b"AB");
 }
@@ -202,7 +222,14 @@ fn test_to_binary_utf8_format() {
     let input = common::literal_string(&mut arena, "AB");
     let format = common::literal_string(&mut arena, "utf8");
 
-    let out = eval_encryption_function("to_binary", &arena, expr, &[input, format], &common::chunk_len_1()).unwrap();
+    let out = eval_encryption_function(
+        "to_binary",
+        &arena,
+        expr,
+        &[input, format],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<BinaryArray>().unwrap();
     assert_eq!(out.value(0), b"AB");
 }

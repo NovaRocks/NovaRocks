@@ -26,6 +26,7 @@ parquet = { version = "57.1.0", features = ["arrow"] }
 orc-rust = { version = "0.7.1", default-features = false }
 apache-avro = "0.21.0"
 iceberg = "0.9.0"
+typetag = "0.2"
 opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native"] }
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -35,6 +36,7 @@ jni = { version = "0.21", features = ["invocation"], optional = true }
 url = "2"
 rand = "0.8"
 regex = "1.10"
+sqlparser = "0.61.0"
 hex = "0.4"
 libm = "0.2"
 num-traits = "0.2"

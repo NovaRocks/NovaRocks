@@ -1443,7 +1443,6 @@ mod tests {
             agg_state_desc: None,
             index_len: Some(8),
             type_desc: None,
-            default_expr: None,
         };
         let schema = crate::agent_service::TTabletSchema {
             short_key_column_count: 1,
@@ -1517,7 +1516,6 @@ mod tests {
             agg_state_desc: None,
             index_len: Some(8),
             type_desc: None,
-            default_expr: None,
         };
         crate::descriptors::TOlapTableSchemaParam {
             db_id: 1,

@@ -2,18 +2,20 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    StringArray, Time64MicrosecondArray, TimestampMicrosecondArray,
+    ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+    Int32Builder, Int64Array, Int64Builder, ListBuilder, StringArray, StringBuilder,
+    Time64MicrosecondArray, TimestampMicrosecondArray,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::spec::{ListType, NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
@@ -31,7 +33,7 @@ use tokio::runtime::Handle;
 use crate::runtime::global_async_runtime::data_block_on;
 
 use super::catalog::{ColumnDef, normalize_identifier};
-use crate::sql::{Literal, SqlType, TableColumnDef};
+use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 #[derive(Default)]
 pub(crate) struct IcebergCatalogRegistry {
@@ -40,16 +42,24 @@ pub(crate) struct IcebergCatalogRegistry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergCatalogEntry {
-    catalog: Arc<MemoryCatalog>,
-    warehouse_path: PathBuf,
-    properties: Vec<(String, String)>,
+    pub(crate) catalog: Arc<MemoryCatalog>,
+    pub(crate) warehouse_path: PathBuf,
+    pub(crate) properties: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct IcebergLoadedTable {
     pub table: iceberg::table::Table,
     pub columns: Vec<ColumnDef>,
+    pub logical_types: HashMap<String, SqlType>,
+    pub key_desc: Option<TableKeyDesc>,
+    pub column_aggregations: HashMap<String, ColumnAggregation>,
 }
+
+const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
+const TABLE_KEY_KIND_PROPERTY: &str = "novarocks.table.key_kind";
+const TABLE_KEY_COLUMNS_PROPERTY: &str = "novarocks.table.key_columns";
+const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
 
 impl IcebergCatalogRegistry {
     pub(crate) fn create_catalog(
@@ -151,15 +161,19 @@ pub(crate) fn create_table(
     namespace_name: &str,
     table_name: &str,
     columns: &[TableColumnDef],
+    key_desc: Option<&TableKeyDesc>,
     properties: &[(String, String)],
 ) -> Result<(), String> {
     let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
     let table_name = normalize_identifier(table_name)?;
     let schema = build_iceberg_schema(columns)?;
+    let mut all_properties = properties.to_vec();
+    all_properties.extend(build_logical_type_properties(columns)?);
+    all_properties.extend(build_table_semantics_properties(columns, key_desc)?);
     let table_creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
-        .properties(properties.iter().cloned())
+        .properties(all_properties)
         .build();
     block_on_iceberg(async { entry.catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
@@ -195,18 +209,38 @@ pub(crate) fn load_table(
     let table = block_on_iceberg(async { entry.catalog.load_table(&table_ident).await })
         .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
         .map_err(|e| format!("load iceberg table failed: {e}"))?;
+    let logical_types = parse_logical_type_properties(table.metadata().properties())?;
+    let key_desc = parse_table_key_desc_properties(table.metadata().properties())?;
+    let column_aggregations = parse_column_aggregation_properties(table.metadata().properties())?;
     let arrow_schema = schema_to_arrow_schema(table.metadata().current_schema())
         .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
     let columns = arrow_schema
         .fields()
         .iter()
-        .map(|field| ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
+        .map(|field| {
+            let field_name = normalize_identifier(field.name()).map_err(|e| {
+                format!(
+                    "normalize iceberg column name `{}` failed: {e}",
+                    field.name()
+                )
+            })?;
+            Ok(ColumnDef {
+                name: field.name().clone(),
+                data_type: apply_logical_type_override(
+                    field.data_type(),
+                    logical_types.get(&field_name),
+                ),
+                nullable: field.is_nullable(),
+            })
         })
-        .collect();
-    Ok(IcebergLoadedTable { table, columns })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(IcebergLoadedTable {
+        table,
+        columns,
+        logical_types,
+        key_desc,
+        column_aggregations,
+    })
 }
 
 pub(crate) fn insert_rows(
@@ -216,12 +250,16 @@ pub(crate) fn insert_rows(
     rows: &[Vec<Literal>],
 ) -> Result<(), String> {
     let loaded = load_table(entry, namespace_name, table_name)?;
-    let batch = build_insert_batch(&loaded.table, rows)?;
+    let batch = build_insert_batch(&loaded, rows)?;
     block_on_iceberg(async {
         let location_generator = DefaultLocationGenerator::new(loaded.table.metadata().clone())
             .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string()))?;
+        let file_name_prefix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| format!("standalone-{}", duration.as_nanos()))
+            .unwrap_or_else(|_| "standalone".to_string());
         let file_name_generator = DefaultFileNameGenerator::new(
-            "standalone".to_string(),
+            file_name_prefix,
             None,
             iceberg::spec::DataFileFormat::Parquet,
         );
@@ -300,13 +338,31 @@ fn build_memory_catalog(
         .ok_or_else(|| {
             "standalone iceberg catalog requires `iceberg.catalog.warehouse`".to_string()
         })?;
-    let (warehouse_uri, warehouse_path) = normalize_warehouse_location(&raw_warehouse)?;
-    std::fs::create_dir_all(&warehouse_path).map_err(|e| {
-        format!(
-            "create iceberg warehouse directory {} failed: {e}",
-            warehouse_path.display()
-        )
-    })?;
+
+    // Detect S3 storage: if warehouse starts with s3:// or oss://, use S3StorageFactory
+    let is_s3 = raw_warehouse.starts_with("s3://")
+        || raw_warehouse.starts_with("s3a://")
+        || raw_warehouse.starts_with("oss://");
+
+    let (warehouse_uri, warehouse_path) = if is_s3 {
+        // S3 warehouse: keep URI as-is, use a temp local path for metadata cache
+        let cache_dir = std::env::temp_dir()
+            .join("novarocks_iceberg_cache")
+            .join(catalog_name);
+        std::fs::create_dir_all(&cache_dir).map_err(|e| {
+            format!("create iceberg cache dir failed: {e}")
+        })?;
+        (raw_warehouse.clone(), cache_dir)
+    } else {
+        let (uri, path) = normalize_warehouse_location(&raw_warehouse)?;
+        std::fs::create_dir_all(&path).map_err(|e| {
+            format!(
+                "create iceberg warehouse directory {} failed: {e}",
+                path.display()
+            )
+        })?;
+        (uri, path)
+    };
 
     props.insert("type".to_string(), "iceberg".to_string());
     props.insert("iceberg.catalog.type".to_string(), "memory".to_string());
@@ -315,9 +371,22 @@ fn build_memory_catalog(
         warehouse_uri.clone(),
     );
 
+    let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if is_s3 {
+        let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
+            properties,
+        )
+        .ok_or_else(|| {
+            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                .to_string()
+        })?;
+        Arc::new(s3_factory)
+    } else {
+        Arc::new(LocalFsStorageFactory)
+    };
+
     let catalog = block_on_iceberg(
         MemoryCatalogBuilder::default()
-            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .with_storage_factory(storage_factory)
             .load(
                 catalog_name.to_string(),
                 HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_uri.clone())]),
@@ -326,14 +395,247 @@ fn build_memory_catalog(
     .map_err(|e| format!("create iceberg catalog runtime failed: {e}"))?
     .map_err(|e| format!("create iceberg catalog failed: {e}"))?;
 
-    Ok(IcebergCatalogEntry {
+    let entry = IcebergCatalogEntry {
         catalog: Arc::new(catalog),
         warehouse_path,
         properties: sorted_properties(&props),
-    })
+    };
+
+    // Auto-discover existing tables in the warehouse
+    if is_s3 {
+        if let Err(e) = auto_discover_s3_tables(&entry, &raw_warehouse) {
+            tracing::warn!("auto-discover iceberg tables: {e}");
+        }
+    } else {
+        auto_discover_local_tables(&entry);
+    }
+
+    Ok(entry)
 }
 
-fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
+/// Auto-discover existing namespaces and tables from an S3 warehouse.
+fn auto_discover_s3_tables(entry: &IcebergCatalogEntry, warehouse_uri: &str) -> Result<(), String> {
+    let s3_factory =
+        super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+            .ok_or("missing S3 properties for auto-discovery")?;
+    let (bucket, root_prefix) = super::iceberg_add_files::parse_s3_path(warehouse_uri)
+        .map_err(|e| format!("parse warehouse URI: {e}"))?;
+
+    let cfg = crate::fs::object_store::ObjectStoreConfig {
+        endpoint: s3_factory.endpoint.clone(),
+        bucket: bucket.clone(),
+        root: String::new(),
+        access_key_id: s3_factory.access_key_id.clone(),
+        access_key_secret: s3_factory.access_key_secret.clone(),
+        session_token: None,
+        enable_path_style_access: Some(s3_factory.enable_path_style),
+        region: Some(s3_factory.region.clone()),
+        retry_max_times: Some(3),
+        retry_min_delay_ms: Some(100),
+        retry_max_delay_ms: Some(2000),
+        timeout_ms: Some(30000),
+        io_timeout_ms: Some(30000),
+    };
+    let op = crate::fs::object_store::build_oss_operator(&cfg)
+        .map_err(|e| format!("build S3 operator for discovery: {e}"))?;
+
+    let root = if root_prefix.ends_with('/') {
+        root_prefix
+    } else {
+        format!("{root_prefix}/")
+    };
+
+    // List top-level directories → namespaces
+    let namespaces = block_on_iceberg(async {
+        let entries = op
+            .list(&root)
+            .await
+            .map_err(|e| format!("list warehouse: {e}"))?;
+        let mut ns = Vec::new();
+        for e in entries {
+            if e.metadata().is_dir() {
+                let name = e.name().trim_end_matches('/').to_string();
+                if !name.is_empty() && !name.starts_with('.') {
+                    ns.push(name);
+                }
+            }
+        }
+        Ok::<Vec<String>, String>(ns)
+    })
+    .map_err(|e| format!("discover namespaces runtime: {e}"))??;
+
+    for ns_name in &namespaces {
+        // Create namespace in catalog
+        let ns_ident = NamespaceIdent::new(ns_name.clone());
+        let _ = block_on_iceberg(async {
+            entry
+                .catalog
+                .create_namespace(&ns_ident, HashMap::new())
+                .await
+        });
+
+        // List tables within this namespace
+        let ns_prefix = format!("{root}{ns_name}/");
+        let tables = block_on_iceberg(async {
+            let entries = op
+                .list(&ns_prefix)
+                .await
+                .map_err(|e| format!("list namespace {ns_name}: {e}"))?;
+            let mut tbls = Vec::new();
+            for e in entries {
+                if e.metadata().is_dir() {
+                    let name = e.name().trim_end_matches('/').to_string();
+                    if !name.is_empty() && !name.starts_with('.') {
+                        tbls.push(name);
+                    }
+                }
+            }
+            Ok::<Vec<String>, String>(tbls)
+        })
+        .map_err(|e| format!("discover tables runtime: {e}"))??;
+
+        for table_name in &tables {
+            // Check if this table has a metadata/ directory
+            let meta_prefix = format!("{ns_prefix}{table_name}/metadata/");
+            let has_metadata = block_on_iceberg(async {
+                let entries = op
+                    .list(&meta_prefix)
+                    .await
+                    .unwrap_or_default();
+                entries
+                    .iter()
+                    .any(|e| e.name().ends_with(".metadata.json"))
+            })
+            .unwrap_or(false);
+
+            if has_metadata {
+                // Find the latest metadata.json
+                let metadata_location = find_latest_s3_metadata(
+                    &op,
+                    &meta_prefix,
+                    warehouse_uri,
+                    ns_name,
+                    table_name,
+                )?;
+
+                let table_ident = TableIdent::from_strs([ns_name.as_str(), table_name.as_str()])
+                    .map_err(|e| format!("build table ident: {e}"))?;
+                match block_on_iceberg(async {
+                    entry
+                        .catalog
+                        .register_table(&table_ident, metadata_location.clone())
+                        .await
+                }) {
+                    Ok(Ok(_)) => {
+                        tracing::info!(
+                            "auto-discovered iceberg table: {ns_name}.{table_name}"
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "register discovered table {ns_name}.{table_name}: {e}"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "register discovered table {ns_name}.{table_name} runtime: {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Find the latest metadata.json file in an S3 metadata directory.
+fn find_latest_s3_metadata(
+    op: &opendal::Operator,
+    meta_prefix: &str,
+    warehouse_uri: &str,
+    ns_name: &str,
+    table_name: &str,
+) -> Result<String, String> {
+    let files = block_on_iceberg(async {
+        let entries = op
+            .list(meta_prefix)
+            .await
+            .map_err(|e| format!("list metadata dir: {e}"))?;
+        let mut json_files: Vec<String> = entries
+            .iter()
+            .filter(|e| e.name().ends_with(".metadata.json"))
+            .map(|e| e.name().to_string())
+            .collect();
+        json_files.sort();
+        Ok::<Vec<String>, String>(json_files)
+    })
+    .map_err(|e| format!("find metadata runtime: {e}"))??;
+
+    let latest = files
+        .last()
+        .ok_or_else(|| format!("no metadata files for {ns_name}.{table_name}"))?;
+
+    // Build the full S3 URI for the metadata file
+    let warehouse_trimmed = warehouse_uri.trim_end_matches('/');
+    Ok(format!(
+        "{warehouse_trimmed}/{ns_name}/{table_name}/metadata/{latest}"
+    ))
+}
+
+/// Auto-discover tables from a local filesystem warehouse.
+fn auto_discover_local_tables(entry: &IcebergCatalogEntry) {
+    let warehouse = &entry.warehouse_path;
+    let Ok(ns_dirs) = std::fs::read_dir(warehouse) else {
+        return;
+    };
+    for ns_entry in ns_dirs.flatten() {
+        let ns_path = ns_entry.path();
+        if !ns_path.is_dir() {
+            continue;
+        }
+        let ns_name = ns_entry.file_name().to_string_lossy().to_string();
+        if ns_name.starts_with('.') {
+            continue;
+        }
+        // Create namespace
+        let ns_ident = NamespaceIdent::new(ns_name.clone());
+        let _ = block_on_iceberg(async {
+            entry
+                .catalog
+                .create_namespace(&ns_ident, HashMap::new())
+                .await
+        });
+
+        let Ok(table_dirs) = std::fs::read_dir(&ns_path) else {
+            continue;
+        };
+        for table_entry in table_dirs.flatten() {
+            let table_path = table_entry.path();
+            if !table_path.is_dir() {
+                continue;
+            }
+            let table_name = table_entry.file_name().to_string_lossy().to_string();
+            if table_name.starts_with('.') {
+                continue;
+            }
+            let metadata_dir = table_path.join("metadata");
+            if !metadata_dir.is_dir() {
+                continue;
+            }
+            match register_existing_table(entry, &ns_name, &table_name) {
+                Ok(()) => {
+                    tracing::info!("auto-discovered local iceberg table: {ns_name}.{table_name}");
+                }
+                Err(e) => {
+                    tracing::warn!("register local table {ns_name}.{table_name}: {e}");
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
 where
     F: Future,
 {
@@ -416,6 +718,8 @@ fn canonicalize_or_join(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
+    let mut next_nested_field_id =
+        i32::try_from(columns.len() + 1).map_err(|_| "too many iceberg columns".to_string())?;
     let fields = columns
         .iter()
         .enumerate()
@@ -425,7 +729,7 @@ fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
             Ok(NestedField::optional(
                 field_id,
                 &column.name,
-                iceberg_type_for_sql_type(column.data_type),
+                iceberg_type_for_sql_type(&column.data_type, &mut next_nested_field_id)?,
             )
             .into())
         })
@@ -436,28 +740,50 @@ fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
         .map_err(|e| format!("build iceberg schema failed: {e}"))
 }
 
-fn iceberg_type_for_sql_type(data_type: SqlType) -> Type {
-    Type::Primitive(match data_type {
-        SqlType::TinyInt | SqlType::SmallInt | SqlType::Int => PrimitiveType::Int,
-        SqlType::Float => PrimitiveType::Float,
-        SqlType::Double => PrimitiveType::Double,
-        SqlType::BigInt => PrimitiveType::Long,
-        SqlType::String => PrimitiveType::String,
-        SqlType::Boolean => PrimitiveType::Boolean,
-        SqlType::Date => PrimitiveType::Date,
-        SqlType::DateTime => PrimitiveType::Timestamp,
-        SqlType::Time => PrimitiveType::Time,
+fn iceberg_type_for_sql_type(data_type: &SqlType, next_field_id: &mut i32) -> Result<Type, String> {
+    Ok(match data_type {
+        SqlType::TinyInt | SqlType::SmallInt | SqlType::Int => Type::Primitive(PrimitiveType::Int),
+        SqlType::Float => Type::Primitive(PrimitiveType::Float),
+        SqlType::Double | SqlType::Decimal { .. } => Type::Primitive(PrimitiveType::Double),
+        SqlType::BigInt => Type::Primitive(PrimitiveType::Long),
+        SqlType::LargeInt => Type::Primitive(PrimitiveType::Decimal {
+            precision: 38,
+            scale: 0,
+        }),
+        SqlType::String => Type::Primitive(PrimitiveType::String),
+        SqlType::Boolean => Type::Primitive(PrimitiveType::Boolean),
+        SqlType::Date => Type::Primitive(PrimitiveType::Date),
+        SqlType::DateTime => Type::Primitive(PrimitiveType::Timestamp),
+        SqlType::Time => Type::Primitive(PrimitiveType::Time),
+        SqlType::Array(inner) => {
+            let element_field_id = *next_field_id;
+            *next_field_id += 1;
+            Type::List(ListType::new(Arc::new(NestedField::optional(
+                element_field_id,
+                "element",
+                iceberg_type_for_sql_type(inner, next_field_id)?,
+            ))))
+        }
     })
 }
 
-fn build_insert_batch(
-    table: &iceberg::table::Table,
+pub(crate) fn build_insert_batch(
+    loaded: &IcebergLoadedTable,
     rows: &[Vec<Literal>],
 ) -> Result<RecordBatch, String> {
-    let arrow_schema = Arc::new(
-        schema_to_arrow_schema(table.metadata().current_schema())
-            .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?,
-    );
+    let base_arrow_schema = schema_to_arrow_schema(loaded.table.metadata().current_schema())
+        .map_err(|e| format!("convert iceberg schema to arrow schema failed: {e}"))?;
+    let arrow_schema = Arc::new(ArrowSchema::new(
+        base_arrow_schema
+            .fields()
+            .iter()
+            .zip(loaded.columns.iter())
+            .map(|(field, column)| {
+                Field::new(field.name(), column.data_type.clone(), field.is_nullable())
+                    .with_metadata(field.metadata().clone())
+            })
+            .collect::<Vec<_>>(),
+    ));
     let fields = arrow_schema.fields();
     for row in rows {
         if row.len() != fields.len() {
@@ -472,22 +798,40 @@ fn build_insert_batch(
     let mut arrays = Vec::with_capacity(fields.len());
     for (idx, field) in fields.iter().enumerate() {
         let values = rows.iter().map(|row| &row[idx]).collect::<Vec<_>>();
-        arrays.push(build_literal_array(field.data_type(), &values)?);
+        let field_name = normalize_identifier(field.name()).map_err(|e| {
+            format!(
+                "normalize iceberg column name `{}` failed: {e}",
+                field.name()
+            )
+        })?;
+        let logical_type = loaded.logical_types.get(&field_name);
+        arrays.push(build_literal_array(
+            field.data_type(),
+            &values,
+            logical_type,
+        )?);
     }
     RecordBatch::try_new(arrow_schema, arrays)
         .map_err(|e| format!("build iceberg insert batch failed: {e}"))
 }
 
-fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<ArrayRef, String> {
+fn build_literal_array(
+    data_type: &DataType,
+    values: &[&Literal],
+    logical_type: Option<&SqlType>,
+) -> Result<ArrayRef, String> {
     match data_type {
         DataType::Int32 => Ok(Arc::new(Int32Array::from(
             values
                 .iter()
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
-                    Literal::Int(value) => i32::try_from(*value)
-                        .map(Some)
-                        .map_err(|_| format!("literal {value} is out of range for INT")),
+                    Literal::Int(value) => coerce_i32_literal(*value, logical_type),
+                    Literal::String(value) => value
+                        .trim()
+                        .parse::<i64>()
+                        .map_err(|_| format!("literal `{value}` is not valid for INT"))
+                        .and_then(|value| coerce_i32_literal(value, logical_type)),
                     other => Err(format!("literal {:?} is not valid for INT", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -498,6 +842,11 @@ fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<Arra
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
                     Literal::Int(value) => Ok(Some(*value)),
+                    Literal::String(value) => value
+                        .trim()
+                        .parse::<i64>()
+                        .map(Some)
+                        .map_err(|_| format!("literal `{value}` is not valid for BIGINT")),
                     other => Err(format!("literal {:?} is not valid for BIGINT", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -520,16 +869,48 @@ fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<Arra
                     Literal::Null => Ok(None),
                     Literal::Float(value) => Ok(Some(*value)),
                     Literal::Int(value) => Ok(Some(*value as f64)),
+                    Literal::String(value) => value
+                        .trim()
+                        .parse::<f64>()
+                        .map(Some)
+                        .map_err(|_| format!("literal `{value}` is not valid for DOUBLE")),
                     other => Err(format!("literal {:?} is not valid for DOUBLE", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
+        DataType::Decimal128(precision, scale) => {
+            let values = values
+                .iter()
+                .map(|literal| match literal {
+                    Literal::Null => Ok(None),
+                    Literal::Int(value) => scale_i128_decimal(i128::from(*value), *scale).map(Some),
+                    Literal::String(value) => {
+                        parse_decimal_literal_to_i128(value, *scale).map(Some)
+                    }
+                    Literal::Float(value) => {
+                        parse_decimal_literal_to_i128(&value.to_string(), *scale).map(Some)
+                    }
+                    other => Err(format!("literal {:?} is not valid for DECIMAL", other)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let array = Decimal128Array::from(values)
+                .with_precision_and_scale(*precision, *scale)
+                .map_err(|e| format!("build DECIMAL array failed: {e}"))?;
+            Ok(Arc::new(array))
+        }
         DataType::Utf8 => Ok(Arc::new(StringArray::from(
             values
                 .iter()
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
-                    Literal::String(value) => Ok(Some(value.as_str())),
+                    Literal::String(value) | Literal::Date(value) => Ok(Some(value.clone())),
+                    Literal::Int(value) => Ok(Some(value.to_string())),
+                    Literal::Float(value) => Ok(Some(value.to_string())),
+                    Literal::Bool(value) => Ok(Some(if *value {
+                        "1".to_string()
+                    } else {
+                        "0".to_string()
+                    })),
                     other => Err(format!("literal {:?} is not valid for STRING", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -540,6 +921,8 @@ fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<Arra
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
                     Literal::Bool(value) => Ok(Some(*value)),
+                    Literal::Int(value) if *value == 0 => Ok(Some(false)),
+                    Literal::Int(value) if *value == 1 => Ok(Some(true)),
                     other => Err(format!("literal {:?} is not valid for BOOLEAN", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -552,6 +935,7 @@ fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<Arra
                     Literal::Date(value) | Literal::String(value) => {
                         parse_date_literal_to_days(value).map(Some)
                     }
+                    Literal::Int(value) => Ok(parse_numeric_date_literal(*value).ok()),
                     other => Err(format!("literal {:?} is not valid for DATE", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -565,6 +949,8 @@ fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<Arra
                         Literal::String(value) => {
                             parse_timestamp_literal_to_micros(value).map(Some)
                         }
+                        Literal::Date(value) => parse_timestamp_literal_to_micros(value).map(Some),
+                        Literal::Int(value) => Ok(parse_numeric_timestamp_literal(*value).ok()),
                         other => Err(format!("literal {:?} is not valid for DATETIME", other)),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -580,6 +966,119 @@ fn build_literal_array(data_type: &DataType, values: &[&Literal]) -> Result<Arra
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ))),
+        DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
+            let mut builder = ListBuilder::new(Int32Builder::new());
+            for literal in values {
+                match literal {
+                    Literal::Null => builder.append(false),
+                    Literal::Array(items) => {
+                        for item in items {
+                            match item {
+                                Literal::Null => builder.values().append_null(),
+                                Literal::Int(value) => {
+                                    let value = i32::try_from(*value).map_err(|_| {
+                                        format!("literal {value} is out of range for ARRAY<INT>")
+                                    })?;
+                                    builder.values().append_value(value);
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "literal {:?} is not valid for ARRAY<INT>",
+                                        other
+                                    ));
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    other => {
+                        return Err(format!("literal {:?} is not valid for ARRAY<INT>", other));
+                    }
+                }
+            }
+            let list = builder.finish();
+            let (_, offsets, values, nulls) = list.into_parts();
+            Ok(Arc::new(arrow::array::ListArray::new(
+                field.clone(),
+                offsets,
+                values,
+                nulls,
+            )))
+        }
+        DataType::List(field) if matches!(field.data_type(), DataType::Int64) => {
+            let mut builder = ListBuilder::new(Int64Builder::new());
+            for literal in values {
+                match literal {
+                    Literal::Null => builder.append(false),
+                    Literal::Array(items) => {
+                        for item in items {
+                            match item {
+                                Literal::Null => builder.values().append_null(),
+                                Literal::Int(value) => builder.values().append_value(*value),
+                                other => {
+                                    return Err(format!(
+                                        "literal {:?} is not valid for ARRAY<BIGINT>",
+                                        other
+                                    ));
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for ARRAY<BIGINT>",
+                            other
+                        ));
+                    }
+                }
+            }
+            let list = builder.finish();
+            let (_, offsets, values, nulls) = list.into_parts();
+            Ok(Arc::new(arrow::array::ListArray::new(
+                field.clone(),
+                offsets,
+                values,
+                nulls,
+            )))
+        }
+        DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
+            let mut builder = ListBuilder::new(StringBuilder::new());
+            for literal in values {
+                match literal {
+                    Literal::Null => builder.append(false),
+                    Literal::Array(items) => {
+                        for item in items {
+                            match item {
+                                Literal::Null => builder.values().append_null(),
+                                Literal::String(value) => builder.values().append_value(value),
+                                other => {
+                                    return Err(format!(
+                                        "literal {:?} is not valid for ARRAY<STRING>",
+                                        other
+                                    ));
+                                }
+                            }
+                        }
+                        builder.append(true);
+                    }
+                    other => {
+                        return Err(format!(
+                            "literal {:?} is not valid for ARRAY<STRING>",
+                            other
+                        ));
+                    }
+                }
+            }
+            let list = builder.finish();
+            let (_, offsets, values, nulls) = list.into_parts();
+            Ok(Arc::new(arrow::array::ListArray::new(
+                field.clone(),
+                offsets,
+                values,
+                nulls,
+            )))
+        }
         other => Err(format!(
             "standalone iceberg insert does not support column type {:?}",
             other
@@ -604,10 +1103,321 @@ fn parse_time_literal_to_micros(value: &str) -> Result<i64, String> {
         .map_err(|_| format!("TIME literal `{value}` is out of range"))
 }
 
+fn build_logical_type_properties(
+    columns: &[TableColumnDef],
+) -> Result<Vec<(String, String)>, String> {
+    let mut properties = Vec::new();
+    for column in columns {
+        let Some(value) = logical_type_property_value(&column.data_type) else {
+            continue;
+        };
+        properties.push((logical_type_property_key(&column.name)?, value.to_string()));
+    }
+    Ok(properties)
+}
+
+fn build_table_semantics_properties(
+    columns: &[TableColumnDef],
+    key_desc: Option<&TableKeyDesc>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut properties = Vec::new();
+    if let Some(key_desc) = key_desc {
+        properties.push((
+            TABLE_KEY_KIND_PROPERTY.to_string(),
+            format_table_key_kind(key_desc.kind).to_string(),
+        ));
+        if !key_desc.columns.is_empty() {
+            let columns = key_desc
+                .columns
+                .iter()
+                .map(|column| normalize_identifier(column))
+                .collect::<Result<Vec<_>, _>>()?;
+            properties.push((TABLE_KEY_COLUMNS_PROPERTY.to_string(), columns.join(",")));
+        }
+    }
+    for column in columns {
+        let Some(aggregation) = column.aggregation else {
+            continue;
+        };
+        properties.push((
+            column_aggregation_property_key(&column.name)?,
+            format_column_aggregation(aggregation).to_string(),
+        ));
+    }
+    Ok(properties)
+}
+
+fn parse_logical_type_properties(
+    properties: &HashMap<String, String>,
+) -> Result<HashMap<String, SqlType>, String> {
+    let mut logical_types = HashMap::new();
+    for (key, value) in properties {
+        let Some(column_name) = key.strip_prefix(LOGICAL_TYPE_PROPERTY_PREFIX) else {
+            continue;
+        };
+        let sql_type = parse_logical_type_property_value(value)
+            .ok_or_else(|| format!("unsupported stored logical type `{value}`"))?;
+        logical_types.insert(column_name.to_string(), sql_type);
+    }
+    Ok(logical_types)
+}
+
+fn parse_table_key_desc_properties(
+    properties: &HashMap<String, String>,
+) -> Result<Option<TableKeyDesc>, String> {
+    let Some(kind) = properties.get(TABLE_KEY_KIND_PROPERTY) else {
+        return Ok(None);
+    };
+    let kind = parse_table_key_kind(kind)
+        .ok_or_else(|| format!("unsupported stored table key kind `{kind}`"))?;
+    let columns = properties
+        .get(TABLE_KEY_COLUMNS_PROPERTY)
+        .map(|columns| {
+            columns
+                .split(',')
+                .filter(|column| !column.trim().is_empty())
+                .map(|column| normalize_identifier(column.trim()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(TableKeyDesc { kind, columns }))
+}
+
+fn parse_column_aggregation_properties(
+    properties: &HashMap<String, String>,
+) -> Result<HashMap<String, ColumnAggregation>, String> {
+    let mut aggregations = HashMap::new();
+    for (key, value) in properties {
+        let Some(column_name) = key.strip_prefix(COLUMN_AGGREGATION_PROPERTY_PREFIX) else {
+            continue;
+        };
+        let aggregation = parse_column_aggregation(value)
+            .ok_or_else(|| format!("unsupported stored column aggregation `{value}`"))?;
+        aggregations.insert(column_name.to_string(), aggregation);
+    }
+    Ok(aggregations)
+}
+
+fn logical_type_property_key(column_name: &str) -> Result<String, String> {
+    Ok(format!(
+        "{LOGICAL_TYPE_PROPERTY_PREFIX}{}",
+        normalize_identifier(column_name)?
+    ))
+}
+
+fn column_aggregation_property_key(column_name: &str) -> Result<String, String> {
+    Ok(format!(
+        "{COLUMN_AGGREGATION_PROPERTY_PREFIX}{}",
+        normalize_identifier(column_name)?
+    ))
+}
+
+fn format_table_key_kind(kind: TableKeyKind) -> &'static str {
+    match kind {
+        TableKeyKind::Duplicate => "duplicate",
+        TableKeyKind::Unique => "unique",
+        TableKeyKind::Aggregate => "aggregate",
+        TableKeyKind::Primary => "primary",
+    }
+}
+
+fn parse_table_key_kind(value: &str) -> Option<TableKeyKind> {
+    match value {
+        "duplicate" => Some(TableKeyKind::Duplicate),
+        "unique" => Some(TableKeyKind::Unique),
+        "aggregate" => Some(TableKeyKind::Aggregate),
+        "primary" => Some(TableKeyKind::Primary),
+        _ => None,
+    }
+}
+
+fn format_column_aggregation(aggregation: ColumnAggregation) -> &'static str {
+    match aggregation {
+        ColumnAggregation::Sum => "sum",
+        ColumnAggregation::Min => "min",
+        ColumnAggregation::Max => "max",
+        ColumnAggregation::Replace => "replace",
+    }
+}
+
+fn parse_column_aggregation(value: &str) -> Option<ColumnAggregation> {
+    match value {
+        "sum" => Some(ColumnAggregation::Sum),
+        "min" => Some(ColumnAggregation::Min),
+        "max" => Some(ColumnAggregation::Max),
+        "replace" => Some(ColumnAggregation::Replace),
+        _ => None,
+    }
+}
+
+fn logical_type_property_value(data_type: &SqlType) -> Option<String> {
+    match data_type {
+        SqlType::TinyInt => Some("tinyint".to_string()),
+        SqlType::SmallInt => Some("smallint".to_string()),
+        SqlType::Date => Some("date".to_string()),
+        SqlType::Decimal { precision, scale } => Some(format!("decimal({precision},{scale})")),
+        _ => None,
+    }
+}
+
+fn parse_logical_type_property_value(value: &str) -> Option<SqlType> {
+    match value {
+        "tinyint" => Some(SqlType::TinyInt),
+        "smallint" => Some(SqlType::SmallInt),
+        "date" => Some(SqlType::Date),
+        _ => parse_decimal_logical_type(value),
+    }
+}
+
+fn parse_decimal_logical_type(value: &str) -> Option<SqlType> {
+    let body = value.strip_prefix("decimal(")?.strip_suffix(')')?.trim();
+    let (precision, scale) = body.split_once(',')?;
+    let precision = precision.trim().parse::<u8>().ok()?;
+    let scale = scale.trim().parse::<i8>().ok()?;
+    Some(SqlType::Decimal { precision, scale })
+}
+
+fn scale_i128_decimal(value: i128, scale: i8) -> Result<i128, String> {
+    if scale < 0 {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+    let factor = 10_i128
+        .checked_pow(scale as u32)
+        .ok_or_else(|| format!("DECIMAL scale {scale} is out of range"))?;
+    value
+        .checked_mul(factor)
+        .ok_or_else(|| format!("DECIMAL literal {value} is out of range"))
+}
+
+fn parse_decimal_literal_to_i128(value: &str, scale: i8) -> Result<i128, String> {
+    const I128_MIN_ABS: &str = "170141183460469231731687303715884105728";
+
+    if scale < 0 {
+        return Err(format!("negative DECIMAL scale {scale} is not supported"));
+    }
+    let trimmed = value.trim();
+    let (negative, raw) = if let Some(raw) = trimmed.strip_prefix('-') {
+        (true, raw)
+    } else if let Some(raw) = trimmed.strip_prefix('+') {
+        (false, raw)
+    } else {
+        (false, trimmed)
+    };
+    let (whole, fraction) = raw.split_once('.').unwrap_or((raw, ""));
+    if fraction.len() > scale as usize {
+        return Err(format!(
+            "DECIMAL literal `{value}` has more than {scale} fractional digits"
+        ));
+    }
+    let padded_fraction = format!("{fraction:0<width$}", width = scale as usize);
+    let combined = format!("{whole}{padded_fraction}");
+    let combined = combined.trim_start_matches('+');
+    let mut parsed = if combined.is_empty() {
+        0_i128
+    } else if negative && scale == 0 && combined == I128_MIN_ABS {
+        i128::MIN
+    } else {
+        combined
+            .parse::<i128>()
+            .map_err(|_| format!("DECIMAL literal `{value}` is out of range"))?
+    };
+    if negative {
+        if parsed != i128::MIN {
+            parsed = -parsed;
+        }
+    }
+    Ok(parsed)
+}
+
+fn coerce_i32_literal(value: i64, logical_type: Option<&SqlType>) -> Result<Option<i32>, String> {
+    match logical_type {
+        Some(SqlType::TinyInt) => {
+            if (i64::from(i8::MIN)..=i64::from(i8::MAX)).contains(&value) {
+                Ok(Some(i32::from(value as i8)))
+            } else {
+                Ok(None)
+            }
+        }
+        Some(SqlType::SmallInt) => {
+            if (i64::from(i16::MIN)..=i64::from(i16::MAX)).contains(&value) {
+                Ok(Some(i32::from(value as i16)))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => i32::try_from(value)
+            .map(Some)
+            .map_err(|_| format!("literal {value} is out of range for INT")),
+    }
+}
+
+fn apply_logical_type_override(data_type: &DataType, logical_type: Option<&SqlType>) -> DataType {
+    match logical_type {
+        Some(SqlType::Date) => DataType::Date32,
+        _ => data_type.clone(),
+    }
+}
+
 fn parse_timestamp_literal_to_micros(value: &str) -> Result<i64, String> {
     let timestamp = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S"))
+        .or_else(|_| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .map(|date| date.and_hms_opt(0, 0, 0).expect("midnight"))
+        })
         .map_err(|e| format!("parse DATETIME literal `{value}` failed: {e}"))?;
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .expect("epoch")
+        .and_hms_opt(0, 0, 0)
+        .expect("epoch timestamp");
+    timestamp
+        .signed_duration_since(epoch)
+        .num_microseconds()
+        .ok_or_else(|| format!("DATETIME literal `{value}` is out of range"))
+}
+
+fn parse_numeric_date_literal(value: i64) -> Result<i32, String> {
+    let raw = value.to_string();
+    let date = if raw.len() == 8 {
+        NaiveDate::parse_from_str(&raw, "%Y%m%d")
+            .map_err(|e| format!("parse numeric DATE literal `{value}` failed: {e}"))?
+    } else if raw.len() == 6 {
+        NaiveDate::parse_from_str(&raw, "%y%m%d")
+            .map_err(|e| format!("parse numeric DATE literal `{value}` failed: {e}"))?
+    } else if raw.len() <= 5 {
+        NaiveDate::parse_from_str(&format!("{value:06}"), "%y%m%d")
+            .map_err(|e| format!("parse numeric DATE literal `{value}` failed: {e}"))?
+    } else {
+        return Err(format!(
+            "parse numeric DATE literal `{value}` failed: unsupported width {}",
+            raw.len()
+        ));
+    };
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+    i32::try_from(date.signed_duration_since(epoch).num_days())
+        .map_err(|_| format!("DATE literal `{value}` is out of range"))
+}
+
+fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
+    let raw = value.to_string();
+    let timestamp = if raw.len() == 14 {
+        NaiveDateTime::parse_from_str(&raw, "%Y%m%d%H%M%S")
+            .map_err(|e| format!("parse numeric DATETIME literal `{value}` failed: {e}"))?
+    } else if raw.len() == 12 {
+        NaiveDateTime::parse_from_str(&raw, "%y%m%d%H%M%S")
+            .map_err(|e| format!("parse numeric DATETIME literal `{value}` failed: {e}"))?
+    } else if matches!(raw.len(), 1..=8) {
+        let days = parse_numeric_date_literal(value)?;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+        let date = epoch + chrono::Duration::days(i64::from(days));
+        date.and_hms_opt(0, 0, 0).expect("midnight")
+    } else {
+        return Err(format!(
+            "parse numeric DATETIME literal `{value}` failed: unsupported width {}",
+            raw.len()
+        ));
+    };
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)
         .expect("epoch")
         .and_hms_opt(0, 0, 0)

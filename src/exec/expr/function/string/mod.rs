@@ -43,6 +43,7 @@ mod null_or_empty;
 mod pad_ops;
 mod parse_url;
 mod prefix_suffix_ops;
+mod raise_error;
 mod regexp_count;
 mod regexp_extract;
 mod regexp_extract_all;
@@ -62,7 +63,6 @@ mod trim_ops;
 mod unhex;
 mod upper;
 mod url_ops;
-mod raise_error;
 mod uuid;
 
 pub use dispatch::{eval_string_function, metadata, register};

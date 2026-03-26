@@ -55,4 +55,3 @@ pub fn eval_rand(
 ) -> Result<ArrayRef, String> {
     eval_rand_impl(arena, expr, args, chunk)
 }
-

@@ -1,17 +1,17 @@
-pub(crate) mod analyzer;
 pub(crate) mod ast;
-pub(crate) mod optimizer;
+pub(crate) mod catalog;
+pub(crate) mod dialect;
+pub(crate) mod ir;
 pub(crate) mod parser;
+pub(crate) mod plan;
+pub(crate) mod types;
+
+pub(crate) mod analyzer;
+pub(crate) mod optimizer;
+pub(crate) mod physical;
 pub(crate) mod planner;
 
-pub(crate) use analyzer::{
-    AnalyzedStatement, AnalyzerContext, BoundOutputColumn, BoundPredicate, BoundQuery,
-    BoundScanColumn, QuerySource, analyze_statement,
-};
 pub(crate) use ast::{
-    ColumnRef, CompareOp, CreateTableKind, CreateTableStmt, Expr, InsertSource, Literal,
-    ObjectName, OrderByExpr, ProjectionItem, QueryStmt, SqlType, Statement, TableColumnDef,
+    ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
-pub(crate) use optimizer::{OptimizedStatement, RelQueryPlan, optimize_statement};
-pub(crate) use parser::parse_sql;
-pub(crate) use planner::{build_local_query_plan_fragment, collect_query_result};
+pub(crate) use catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};

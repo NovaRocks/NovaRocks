@@ -90,4 +90,3 @@ pub fn eval_bar(
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-

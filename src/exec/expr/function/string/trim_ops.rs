@@ -80,4 +80,3 @@ pub fn eval_trim(
 ) -> Result<ArrayRef, String> {
     eval_trim_impl(arena, args, chunk, TrimMode::Both)
 }
-

@@ -78,6 +78,6 @@ pub use array_sortby::eval_array_sortby;
 pub use array_sum::eval_array_sum;
 pub use array_top_n::eval_array_top_n;
 pub use arrays_overlap::eval_arrays_overlap;
-pub use element_at::eval_element_at;
 pub(crate) use common::compare_values_with_null;
 pub use dispatch::{eval_array_function, metadata, register};
+pub use element_at::eval_element_at;

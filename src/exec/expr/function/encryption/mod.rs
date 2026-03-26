@@ -33,9 +33,9 @@ mod sm3;
 mod to_base64;
 mod to_binary;
 
-pub use dispatch::{eval_encryption_function, metadata, register};
 pub use aes_decrypt::eval_aes_decrypt;
 pub use aes_encrypt::eval_aes_encrypt;
+pub use dispatch::{eval_encryption_function, metadata, register};
 pub use encode_fingerprint_sha256::eval_encode_fingerprint_sha256;
 pub use encode_sort_key::eval_encode_sort_key;
 pub use from_base64::eval_from_base64;

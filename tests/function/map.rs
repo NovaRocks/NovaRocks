@@ -17,16 +17,16 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::expr::function::map::eval_map_function;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Int32Array, Int64Array, Int64Builder, ListArray, ListBuilder,
     MapArray, MapBuilder, StringArray, StringBuilder, StructArray,
 };
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks::common::ids::SlotId;
+use novarocks::exec::chunk::Chunk;
+use novarocks::exec::expr::function::map::eval_map_function;
+use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,29 +35,21 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 fn slot_id_expr(arena: &mut ExprArena, slot: i32, data_type: DataType) -> ExprId {
-    arena.push_typed(
-        ExprNode::SlotId(SlotId::new(slot as u32)),
-        data_type,
-    )
+    arena.push_typed(ExprNode::SlotId(SlotId::new(slot as u32)), data_type)
 }
 
 fn typed_null(arena: &mut ExprArena, data_type: DataType) -> ExprId {
     arena.push_typed(ExprNode::Literal(LiteralValue::Null), data_type)
 }
 
-fn make_chunk_from_arrays(
-    fields: Vec<Field>,
-    arrays: Vec<ArrayRef>,
-    slot_ids: &[u32],
-) -> Chunk {
+fn make_chunk_from_arrays(fields: Vec<Field>, arrays: Vec<ArrayRef>, slot_ids: &[u32]) -> Chunk {
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
     let ids: Vec<SlotId> = slot_ids.iter().map(|&id| SlotId::new(id)).collect();
-    let chunk_schema =
-        novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &ids,
-        )
-        .expect("chunk schema");
+    let chunk_schema = novarocks::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
+        batch.schema().as_ref(),
+        &ids,
+    )
+    .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -386,10 +378,7 @@ fn single_map_chunk() -> (Chunk, DataType) {
     let map = Arc::new(b.finish()) as ArrayRef;
     let map_type = map.data_type().clone();
     let fields = vec![Field::new("m", map_type.clone(), true)];
-    (
-        make_chunk_from_arrays(fields, vec![map], &[1]),
-        map_type,
-    )
+    (make_chunk_from_arrays(fields, vec![map], &[1]), map_type)
 }
 
 fn build_lambda_identity_map(arena: &mut ExprArena) -> ExprId {
@@ -480,10 +469,7 @@ fn test_map_apply_transform_values_alias() {
 
     let key_slot = arena.push_typed(ExprNode::SlotId(SlotId::new(101)), DataType::Int64);
     let value_slot = arena.push_typed(ExprNode::SlotId(SlotId::new(102)), DataType::Int64);
-    let one = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Int64(1)),
-        DataType::Int64,
-    );
+    let one = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
     let value_plus_one = arena.push_typed(ExprNode::Add(value_slot, one), DataType::Int64);
     let key_arr = arena.push_typed(
         ExprNode::ArrayExpr {
@@ -516,8 +502,8 @@ fn test_map_apply_transform_values_alias() {
     let map_arg = slot_id_expr(&mut arena, 1, map_type.clone());
     let expr = typed_null(&mut arena, map_type);
 
-    let out = eval_map_function("transform_values", &arena, expr, &[lambda, map_arg], &chunk)
-        .unwrap();
+    let out =
+        eval_map_function("transform_values", &arena, expr, &[lambda, map_arg], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<MapArray>().unwrap();
     let values = out.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.value(0), 11);
@@ -535,10 +521,7 @@ use novarocks::exec::expr::function::map::eval_element_at;
 fn test_element_at_found() {
     let (chunk, map_type) = single_row_map_i64();
     let mut arena = ExprArena::default();
-    let map_arg = arena.push_typed(
-        ExprNode::SlotId(SlotId::new(1)),
-        map_type,
-    );
+    let map_arg = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type);
     let key = arena.push(ExprNode::Literal(LiteralValue::Int64(2)));
     let expr = typed_null(&mut arena, DataType::Int64);
     let out = eval_map_function("element_at", &arena, expr, &[map_arg, key], &chunk).unwrap();
@@ -550,10 +533,7 @@ fn test_element_at_found() {
 fn test_element_at_not_found() {
     let (chunk, map_type) = single_row_map_i64();
     let mut arena = ExprArena::default();
-    let map_arg = arena.push_typed(
-        ExprNode::SlotId(SlotId::new(1)),
-        map_type,
-    );
+    let map_arg = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type);
     let key = arena.push(ExprNode::Literal(LiteralValue::Int64(9)));
     let expr = typed_null(&mut arena, DataType::Int64);
     let out = eval_element_at(&arena, expr, &[map_arg, key], &chunk).unwrap();
@@ -565,10 +545,7 @@ fn test_element_at_not_found() {
 fn test_element_at_not_found_with_check_errors() {
     let (chunk, map_type) = single_row_map_i64();
     let mut arena = ExprArena::default();
-    let map_arg = arena.push_typed(
-        ExprNode::SlotId(SlotId::new(1)),
-        map_type,
-    );
+    let map_arg = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), map_type);
     let key = arena.push(ExprNode::Literal(LiteralValue::Int64(9)));
     let check_true = arena.push_typed(
         ExprNode::Literal(LiteralValue::Bool(true)),
@@ -799,8 +776,7 @@ fn test_map_from_arrays_basic() {
     );
     let expr = typed_null(&mut arena, map_type);
 
-    let out =
-        eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk).unwrap();
+    let out = eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk).unwrap();
     let map = out.as_any().downcast_ref::<MapArray>().unwrap();
     assert_eq!(map.value_length(0), 2);
 }
@@ -839,8 +815,7 @@ fn test_map_from_arrays_length_mismatch() {
     );
     let expr = typed_null(&mut arena, map_type);
 
-    let err =
-        eval_map_from_arrays(&arena, expr, &[keys, values], &chunk).expect_err("must fail");
+    let err = eval_map_from_arrays(&arena, expr, &[keys, values], &chunk).expect_err("must fail");
     assert!(err.contains("same length"));
 }
 
@@ -880,8 +855,7 @@ fn test_map_from_arrays_keeps_null_key_entries() {
     );
     let expr = typed_null(&mut arena, map_type);
 
-    let out =
-        eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk).unwrap();
+    let out = eval_map_function("map_from_arrays", &arena, expr, &[keys, values], &chunk).unwrap();
     let map = out.as_any().downcast_ref::<MapArray>().unwrap();
     assert_eq!(map.value_length(0), 2);
     let key_arr = map.keys();
@@ -896,8 +870,8 @@ use novarocks::exec::expr::function::FunctionKind;
 
 #[test]
 fn test_register_map_functions() {
-    use std::collections::HashMap as StdHashMap;
     use novarocks::exec::expr::function::map::register;
+    use std::collections::HashMap as StdHashMap;
 
     let mut m = StdHashMap::new();
     register(&mut m);

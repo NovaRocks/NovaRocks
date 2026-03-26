@@ -1581,7 +1581,9 @@ fn cast_struct_to_struct(array: &ArrayRef, target_fields: &Fields) -> Result<Arr
     let mut out_fields = target_fields.iter().cloned().collect::<Vec<_>>();
     for (idx, target_field) in target_fields.iter().enumerate() {
         let source_idx = if use_by_name {
-            *source_name_to_idx.get(target_field.name().as_str()).unwrap()
+            *source_name_to_idx
+                .get(target_field.name().as_str())
+                .unwrap()
         } else {
             idx
         };

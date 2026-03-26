@@ -5,24 +5,8 @@ use std::path::{Path, PathBuf};
 use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum TableStorage {
-    LocalParquetFile { path: PathBuf },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TableDef {
-    pub name: String,
-    pub columns: Vec<ColumnDef>,
-    pub storage: TableStorage,
-}
+// Re-export from sql::catalog so existing `crate::standalone::catalog::*` paths continue to work.
+pub use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
 
 #[derive(Clone, Debug, PartialEq)]
 struct DatabaseDef {
@@ -52,7 +36,7 @@ impl InMemoryCatalog {
     pub(crate) fn create_database(&mut self, database_name: &str) -> Result<(), String> {
         let key = normalize_identifier(database_name)?;
         if self.databases.contains_key(&key) {
-            return Err(format!("database already exists: {database_name}"));
+            return Ok(()); // idempotent — matches IF NOT EXISTS semantics
         }
         self.databases.insert(
             key,
@@ -123,6 +107,12 @@ impl InMemoryCatalog {
             .get(&table_key)
             .cloned()
             .ok_or_else(|| format!("unknown table: {table_name}"))
+    }
+}
+
+impl CatalogProvider for InMemoryCatalog {
+    fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String> {
+        self.get(database, table)
     }
 }
 

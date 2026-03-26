@@ -17,12 +17,12 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::exec::expr::function::struct_fn::eval_struct_function;
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use novarocks::exec::expr::ExprId;
 use arrow::array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Fields};
+use novarocks::exec::expr::ExprId;
+use novarocks::exec::expr::function::FunctionKind;
+use novarocks::exec::expr::function::struct_fn::eval_struct_function;
+use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -132,8 +132,14 @@ fn test_named_struct_arg_validation() {
     let name_a = literal_string(&mut arena, "a");
     let value_a = literal_i64(&mut arena, 42);
     let extra = literal_string(&mut arena, "dangling");
-    let err = eval_struct_function("named_struct", &arena, expr, &[name_a, value_a, extra], &chunk)
-        .expect_err("must fail");
+    let err = eval_struct_function(
+        "named_struct",
+        &arena,
+        expr,
+        &[name_a, value_a, extra],
+        &chunk,
+    )
+    .expect_err("must fail");
     assert!(err.contains("even number"));
 }
 
@@ -168,7 +174,14 @@ fn test_subfield_extracts_field() {
         DataType::Utf8,
     );
 
-    let out = eval_struct_function("subfield", &arena, out_expr, &[struct_expr, field_name], &chunk).unwrap();
+    let out = eval_struct_function(
+        "subfield",
+        &arena,
+        out_expr,
+        &[struct_expr, field_name],
+        &chunk,
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "x");
 }
@@ -190,7 +203,14 @@ fn test_subfield_parent_null_propagates() {
         DataType::Utf8,
     );
 
-    let out = eval_struct_function("subfield", &arena, out_expr, &[struct_expr, field_name], &chunk).unwrap();
+    let out = eval_struct_function(
+        "subfield",
+        &arena,
+        out_expr,
+        &[struct_expr, field_name],
+        &chunk,
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(out.is_null(0));
 }

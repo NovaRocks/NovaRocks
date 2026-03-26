@@ -1026,7 +1026,9 @@ fn test_from_days_logic() {
 
 #[test]
 fn test_from_days_out_of_calendar_range_returns_zero_date_sentinel() {
-    use novarocks::exec::expr::function::date::{FROM_DAYS_MAX_VALID, from_days_value, zero_date_sentinel_date32};
+    use novarocks::exec::expr::function::date::{
+        FROM_DAYS_MAX_VALID, from_days_value, zero_date_sentinel_date32,
+    };
     let sentinel = zero_date_sentinel_date32();
     assert_eq!(from_days_value(-1), Some(sentinel));
     assert_eq!(from_days_value(FROM_DAYS_MAX_VALID + 1), Some(sentinel));
@@ -1090,10 +1092,8 @@ fn test_makedate_bounds_and_year_zero() {
         ExprNode::Literal(LiteralValue::Int64(2020)),
         DataType::Int64,
     );
-    let day_over =
-        arena.push_typed(ExprNode::Literal(LiteralValue::Int64(367)), DataType::Int64);
-    let year_zero =
-        arena.push_typed(ExprNode::Literal(LiteralValue::Int64(0)), DataType::Int64);
+    let day_over = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(367)), DataType::Int64);
+    let year_zero = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(0)), DataType::Int64);
     let day_one = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
     let year_over_max = arena.push_typed(
         ExprNode::Literal(LiteralValue::Int64(10000)),
@@ -1105,8 +1105,8 @@ fn test_makedate_bounds_and_year_zero() {
     let expr_date = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Date32);
     let chunk = common::chunk_len_1();
 
-    let out_over = eval_makedate(&arena, expr_date, &[year_over, day_over], &chunk)
-        .expect("makedate eval");
+    let out_over =
+        eval_makedate(&arena, expr_date, &[year_over, day_over], &chunk).expect("makedate eval");
     let out_over = out_over
         .as_any()
         .downcast_ref::<Date32Array>()
@@ -1121,16 +1121,16 @@ fn test_makedate_bounds_and_year_zero() {
         .expect("downcast Date32Array");
     assert!(!out_zero.is_null(0));
 
-    let out_over_max = eval_makedate(&arena, expr_date, &[year_over_max, day_one], &chunk)
-        .expect("makedate eval");
+    let out_over_max =
+        eval_makedate(&arena, expr_date, &[year_over_max, day_one], &chunk).expect("makedate eval");
     let out_over_max = out_over_max
         .as_any()
         .downcast_ref::<Date32Array>()
         .expect("downcast Date32Array");
     assert!(out_over_max.is_null(0));
 
-    let out_negative = eval_makedate(&arena, expr_date, &[year_negative, day_one], &chunk)
-        .expect("makedate eval");
+    let out_negative =
+        eval_makedate(&arena, expr_date, &[year_negative, day_one], &chunk).expect("makedate eval");
     let out_negative = out_negative
         .as_any()
         .downcast_ref::<Date32Array>()
@@ -1307,8 +1307,7 @@ fn test_time_to_sec_recovers_from_failed_cast_time_literal() {
     let parsed_from_source =
         parse_from_cast_source(&arena, cast_time, &chunk).expect("parse cast source");
     assert_eq!(parsed_from_source, Some(vec![Some(0)]));
-    let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk)
-        .expect("time_to_sec eval");
+    let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk).expect("time_to_sec eval");
     let arr = out
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -1328,8 +1327,7 @@ fn test_time_to_sec_cast_string_with_datetime_prefix_returns_null() {
         ExprNode::Cast(literal),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
-    let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk)
-        .expect("time_to_sec eval");
+    let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk).expect("time_to_sec eval");
     let arr = out
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -1352,8 +1350,7 @@ fn test_time_to_sec_explicit_datetime_cast_preserves_time_part() {
         ExprNode::Cast(cast_datetime),
         DataType::Timestamp(TimeUnit::Microsecond, None),
     );
-    let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk)
-        .expect("time_to_sec eval");
+    let out = eval_time_to_sec(&arena, expr_i64, &[cast_time], &chunk).expect("time_to_sec eval");
     let arr = out
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -1364,7 +1361,7 @@ fn test_time_to_sec_explicit_datetime_cast_preserves_time_part() {
 
 #[test]
 fn test_time_to_sec_sec_to_time_negative_roundtrip() {
-    use novarocks::exec::expr::function::{FunctionKind};
+    use novarocks::exec::expr::function::FunctionKind;
     use novarocks::exec::expr::function::date::eval_time_to_sec;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
@@ -1377,8 +1374,7 @@ fn test_time_to_sec_sec_to_time_negative_roundtrip() {
         },
         DataType::Utf8,
     );
-    let out = eval_time_to_sec(&arena, expr_i64, &[sec_to_time], &chunk)
-        .expect("time_to_sec eval");
+    let out = eval_time_to_sec(&arena, expr_i64, &[sec_to_time], &chunk).expect("time_to_sec eval");
     let arr = out
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -1389,7 +1385,7 @@ fn test_time_to_sec_sec_to_time_negative_roundtrip() {
 
 #[test]
 fn test_time_to_sec_sec_to_time_negative_clamps_like_sec_to_time() {
-    use novarocks::exec::expr::function::{FunctionKind};
+    use novarocks::exec::expr::function::FunctionKind;
     use novarocks::exec::expr::function::date::eval_time_to_sec;
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
@@ -1402,8 +1398,7 @@ fn test_time_to_sec_sec_to_time_negative_clamps_like_sec_to_time() {
         },
         DataType::Utf8,
     );
-    let out = eval_time_to_sec(&arena, expr_i64, &[sec_to_time], &chunk)
-        .expect("time_to_sec eval");
+    let out = eval_time_to_sec(&arena, expr_i64, &[sec_to_time], &chunk).expect("time_to_sec eval");
     let arr = out
         .as_any()
         .downcast_ref::<Int64Array>()
@@ -1521,13 +1516,22 @@ fn test_date_parts_and_names() {
     let expr_str = common::typed_null(&mut arena, DataType::Utf8);
 
     assert_eq!(date_eval_i64("day", &arena, expr_i64, &[dt], &chunk), 2);
-    assert_eq!(date_eval_i64("dayofmonth", &arena, expr_i64, &[dt], &chunk), 2);
-    assert_eq!(date_eval_i64("dayofweek", &arena, expr_i64, &[dt], &chunk), 5);
+    assert_eq!(
+        date_eval_i64("dayofmonth", &arena, expr_i64, &[dt], &chunk),
+        2
+    );
+    assert_eq!(
+        date_eval_i64("dayofweek", &arena, expr_i64, &[dt], &chunk),
+        5
+    );
     assert_eq!(
         date_eval_i64("dayofweek_iso", &arena, expr_i64, &[dt], &chunk),
         4
     );
-    assert_eq!(date_eval_i64("dayofyear", &arena, expr_i64, &[dt], &chunk), 2);
+    assert_eq!(
+        date_eval_i64("dayofyear", &arena, expr_i64, &[dt], &chunk),
+        2
+    );
     assert_eq!(date_eval_i64("month", &arena, expr_i64, &[dt], &chunk), 1);
     assert_eq!(date_eval_i64("year", &arena, expr_i64, &[dt], &chunk), 2020);
     assert_eq!(date_eval_i64("hour", &arena, expr_i64, &[dt], &chunk), 3);
@@ -1535,9 +1539,15 @@ fn test_date_parts_and_names() {
     assert_eq!(date_eval_i64("second", &arena, expr_i64, &[dt], &chunk), 5);
     assert_eq!(date_eval_i64("quarter", &arena, expr_i64, &[dt], &chunk), 1);
     assert_eq!(date_eval_i64("week", &arena, expr_i64, &[dt], &chunk), 1);
-    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[dt], &chunk), 1);
+    assert_eq!(
+        date_eval_i64("week_iso", &arena, expr_i64, &[dt], &chunk),
+        1
+    );
     assert_eq!(date_eval_i64("weekday", &arena, expr_i64, &[dt], &chunk), 3);
-    assert_eq!(date_eval_i64("weekofyear", &arena, expr_i64, &[dt], &chunk), 1);
+    assert_eq!(
+        date_eval_i64("weekofyear", &arena, expr_i64, &[dt], &chunk),
+        1
+    );
     assert_eq!(
         date_eval_str("dayname", &arena, expr_str, &[dt], &chunk),
         "Thursday"
@@ -1835,7 +1845,10 @@ fn test_diff_functions() {
 
     let d1 = common::literal_string(&mut arena, "2020-01-03 00:00:00");
     let d2 = common::literal_string(&mut arena, "2020-01-01 00:00:00");
-    assert_eq!(date_eval_i64("datediff", &arena, expr_i64, &[d1, d2], &chunk), 2);
+    assert_eq!(
+        date_eval_i64("datediff", &arena, expr_i64, &[d1, d2], &chunk),
+        2
+    );
     assert_eq!(
         date_eval_i64("days_diff", &arena, expr_i64, &[d1, d2], &chunk),
         2
@@ -2205,8 +2218,8 @@ fn test_last_day_makedate_next_previous() {
         date32_from_ymd(2020, 1, 3)
     );
     let invalid = common::literal_string(&mut arena, "mon");
-    let next_err = eval_date_function("next_day", &arena, expr_date, &[base, invalid], &chunk)
-        .unwrap_err();
+    let next_err =
+        eval_date_function("next_day", &arena, expr_date, &[base, invalid], &chunk).unwrap_err();
     assert!(next_err.contains("mon not supported in next_day dow_string backend"));
     let prev = common::literal_string(&mut arena, "2020-01-02");
     let friday2 = common::literal_string(&mut arena, "Fr");
@@ -2215,9 +2228,8 @@ fn test_last_day_makedate_next_previous() {
         date32_from_ymd(2019, 12, 27)
     );
     let monday2 = common::literal_string(&mut arena, "mon");
-    let prev_err =
-        eval_date_function("previous_day", &arena, expr_date, &[prev, monday2], &chunk)
-            .unwrap_err();
+    let prev_err = eval_date_function("previous_day", &arena, expr_date, &[prev, monday2], &chunk)
+        .unwrap_err();
     assert!(prev_err.contains("mon not supported in previous_day dow_string backend"));
 }
 
@@ -2262,14 +2274,13 @@ fn test_hour_from_unixtime_out_of_range_returns_null() {
     let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
 
     let neg = common::literal_i64(&mut arena, -1);
-    let arr =
-        eval_date_function("hour_from_unixtime", &arena, expr_i64, &[neg], &chunk).unwrap();
+    let arr = eval_date_function("hour_from_unixtime", &arena, expr_i64, &[neg], &chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(arr.is_null(0));
 
     let overflow = common::literal_i64(&mut arena, 253_402_243_200);
-    let arr = eval_date_function("hour_from_unixtime", &arena, expr_i64, &[overflow], &chunk)
-        .unwrap();
+    let arr =
+        eval_date_function("hour_from_unixtime", &arena, expr_i64, &[overflow], &chunk).unwrap();
     let arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(arr.is_null(0));
 }
@@ -2498,13 +2509,22 @@ fn test_week_iso_year_boundary() {
     let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
 
     let d1 = common::literal_string(&mut arena, "2023-01-01");
-    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[d1], &chunk), 52);
+    assert_eq!(
+        date_eval_i64("week_iso", &arena, expr_i64, &[d1], &chunk),
+        52
+    );
 
     let d2 = common::literal_string(&mut arena, "2023-01-02");
-    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[d2], &chunk), 1);
+    assert_eq!(
+        date_eval_i64("week_iso", &arena, expr_i64, &[d2], &chunk),
+        1
+    );
 
     let d3 = common::literal_string(&mut arena, "2023-01-03");
-    assert_eq!(date_eval_i64("week_iso", &arena, expr_i64, &[d3], &chunk), 1);
+    assert_eq!(
+        date_eval_i64("week_iso", &arena, expr_i64, &[d3], &chunk),
+        1
+    );
 
     let empty = common::literal_string(&mut arena, "");
     let arr = eval_date_function("week_iso", &arena, expr_i64, &[empty], &chunk).unwrap();
@@ -2525,13 +2545,22 @@ fn test_dayofweek_iso_values() {
     let expr_i64 = common::typed_null(&mut arena, DataType::Int64);
 
     let d1 = common::literal_string(&mut arena, "2023-01-01"); // Sunday
-    assert_eq!(date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d1], &chunk), 7);
+    assert_eq!(
+        date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d1], &chunk),
+        7
+    );
 
     let d2 = common::literal_string(&mut arena, "2023-01-02"); // Monday
-    assert_eq!(date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d2], &chunk), 1);
+    assert_eq!(
+        date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d2], &chunk),
+        1
+    );
 
     let d3 = common::literal_string(&mut arena, "2023-01-03"); // Tuesday
-    assert_eq!(date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d3], &chunk), 2);
+    assert_eq!(
+        date_eval_i64("dayofweek_iso", &arena, expr_i64, &[d3], &chunk),
+        2
+    );
 
     let empty = common::literal_string(&mut arena, "");
     let arr = eval_date_function("dayofweek_iso", &arena, expr_i64, &[empty], &chunk).unwrap();
@@ -2577,7 +2606,13 @@ fn test_timestampadd_millisecond() {
     let interval = common::literal_i64(&mut arena, 1);
     let dt = common::literal_string(&mut arena, "2019-01-02 00:00:00");
     assert_eq!(
-        date_eval_ts("timestampadd", &arena, expr_ts, &[unit, interval, dt], &chunk),
+        date_eval_ts(
+            "timestampadd",
+            &arena,
+            expr_ts,
+            &[unit, interval, dt],
+            &chunk
+        ),
         dt_micros("2019-01-02 00:00:00") + 1_000
     );
 }
@@ -2633,28 +2668,52 @@ fn test_date_trunc_specific_values() {
         }};
     }
 
-    trunc!("year",        "2023-10-31 23:59:59.001002", "2023-01-01 00:00:00");
-    trunc!("year",        "2023-10-31",                 "2023-01-01 00:00:00");
-    trunc!("quarter",     "2023-10-31 23:59:59.001002", "2023-10-01 00:00:00");
-    trunc!("quarter",     "2023-10-31",                 "2023-10-01 00:00:00");
-    trunc!("quarter",     "2023-09-15 23:59:59.001002", "2023-07-01 00:00:00");
-    trunc!("quarter",     "2023-09-15",                 "2023-07-01 00:00:00");
-    trunc!("month",       "2023-10-31 23:59:59.001002", "2023-10-01 00:00:00");
-    trunc!("month",       "2023-10-31",                 "2023-10-01 00:00:00");
-    trunc!("week",        "2023-10-31 23:59:59.001002", "2023-10-30 00:00:00");
-    trunc!("week",        "2023-10-31",                 "2023-10-30 00:00:00");
-    trunc!("day",         "2023-10-31 23:59:59.001002", "2023-10-31 00:00:00");
-    trunc!("day",         "2023-10-31",                 "2023-10-31 00:00:00");
-    trunc!("hour",        "2023-10-31 23:59:59.001002", "2023-10-31 23:00:00");
-    trunc!("hour",        "2023-10-31",                 "2023-10-31 00:00:00");
-    trunc!("minute",      "2023-10-31 23:59:59.001002", "2023-10-31 23:59:00");
-    trunc!("minute",      "2023-10-31",                 "2023-10-31 00:00:00");
-    trunc!("second",      "2023-10-31 23:59:59.001002", "2023-10-31 23:59:59");
-    trunc!("second",      "2023-10-31",                 "2023-10-31 00:00:00");
-    trunc!("millisecond", "2023-10-31 23:59:59.001002", "2023-10-31 23:59:59.001000");
-    trunc!("millisecond", "2023-10-31",                 "2023-10-31 00:00:00");
-    trunc!("microsecond", "2023-10-31 23:59:59.001002", "2023-10-31 23:59:59.001002");
-    trunc!("microsecond", "2023-10-31",                 "2023-10-31 00:00:00");
+    trunc!("year", "2023-10-31 23:59:59.001002", "2023-01-01 00:00:00");
+    trunc!("year", "2023-10-31", "2023-01-01 00:00:00");
+    trunc!(
+        "quarter",
+        "2023-10-31 23:59:59.001002",
+        "2023-10-01 00:00:00"
+    );
+    trunc!("quarter", "2023-10-31", "2023-10-01 00:00:00");
+    trunc!(
+        "quarter",
+        "2023-09-15 23:59:59.001002",
+        "2023-07-01 00:00:00"
+    );
+    trunc!("quarter", "2023-09-15", "2023-07-01 00:00:00");
+    trunc!("month", "2023-10-31 23:59:59.001002", "2023-10-01 00:00:00");
+    trunc!("month", "2023-10-31", "2023-10-01 00:00:00");
+    trunc!("week", "2023-10-31 23:59:59.001002", "2023-10-30 00:00:00");
+    trunc!("week", "2023-10-31", "2023-10-30 00:00:00");
+    trunc!("day", "2023-10-31 23:59:59.001002", "2023-10-31 00:00:00");
+    trunc!("day", "2023-10-31", "2023-10-31 00:00:00");
+    trunc!("hour", "2023-10-31 23:59:59.001002", "2023-10-31 23:00:00");
+    trunc!("hour", "2023-10-31", "2023-10-31 00:00:00");
+    trunc!(
+        "minute",
+        "2023-10-31 23:59:59.001002",
+        "2023-10-31 23:59:00"
+    );
+    trunc!("minute", "2023-10-31", "2023-10-31 00:00:00");
+    trunc!(
+        "second",
+        "2023-10-31 23:59:59.001002",
+        "2023-10-31 23:59:59"
+    );
+    trunc!("second", "2023-10-31", "2023-10-31 00:00:00");
+    trunc!(
+        "millisecond",
+        "2023-10-31 23:59:59.001002",
+        "2023-10-31 23:59:59.001000"
+    );
+    trunc!("millisecond", "2023-10-31", "2023-10-31 00:00:00");
+    trunc!(
+        "microsecond",
+        "2023-10-31 23:59:59.001002",
+        "2023-10-31 23:59:59.001002"
+    );
+    trunc!("microsecond", "2023-10-31", "2023-10-31 00:00:00");
 }
 
 // ---------------------------------------------------------------------------
@@ -2684,48 +2743,153 @@ fn test_days_add_all_intervals() {
     }
 
     // days_add / adddate with integer (adds days)
-    add!("days_add", "2023-10-31 23:59:59", 1,    "2023-11-01 23:59:59");
-    add!("days_add", "2023-10-31 23:59:59", 1000,  "2026-07-27 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 1, "2023-11-01 23:59:59");
+    add!(
+        "days_add",
+        "2023-10-31 23:59:59",
+        1000,
+        "2026-07-27 23:59:59"
+    );
 
     // INTERVAL n YEAR → years_add
-    add!("years_add", "2023-10-31 23:59:59", 1,   "2024-10-31 23:59:59");
-    add!("years_add", "2023-10-31 23:59:59", 100,  "2123-10-31 23:59:59");
+    add!("years_add", "2023-10-31 23:59:59", 1, "2024-10-31 23:59:59");
+    add!(
+        "years_add",
+        "2023-10-31 23:59:59",
+        100,
+        "2123-10-31 23:59:59"
+    );
 
     // INTERVAL n MONTH → months_add (month-end clamping)
-    add!("months_add", "2023-10-31 23:59:59", 1,  "2023-11-30 23:59:59");
-    add!("months_add", "2023-10-31 23:59:59", 11, "2024-09-30 23:59:59");
-    add!("months_add", "2023-10-31 23:59:59", 25, "2025-11-30 23:59:59");
+    add!(
+        "months_add",
+        "2023-10-31 23:59:59",
+        1,
+        "2023-11-30 23:59:59"
+    );
+    add!(
+        "months_add",
+        "2023-10-31 23:59:59",
+        11,
+        "2024-09-30 23:59:59"
+    );
+    add!(
+        "months_add",
+        "2023-10-31 23:59:59",
+        25,
+        "2025-11-30 23:59:59"
+    );
 
     // INTERVAL n DAY → days_add
-    add!("days_add", "2023-10-31 23:59:59", 1,   "2023-11-01 23:59:59");
-    add!("days_add", "2023-10-31 23:59:59", 15,  "2023-11-15 23:59:59");
-    add!("days_add", "2023-10-31 23:59:59", 100, "2024-02-08 23:59:59");
-    add!("days_add", "2023-10-31 23:59:59", 1000,"2026-07-27 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 1, "2023-11-01 23:59:59");
+    add!("days_add", "2023-10-31 23:59:59", 15, "2023-11-15 23:59:59");
+    add!(
+        "days_add",
+        "2023-10-31 23:59:59",
+        100,
+        "2024-02-08 23:59:59"
+    );
+    add!(
+        "days_add",
+        "2023-10-31 23:59:59",
+        1000,
+        "2026-07-27 23:59:59"
+    );
 
     // INTERVAL n HOUR → hours_add
-    add!("hours_add", "2023-10-31 23:59:59", 1,  "2023-11-01 00:59:59");
-    add!("hours_add", "2023-10-31 23:59:59", 12, "2023-11-01 11:59:59");
-    add!("hours_add", "2023-10-31 23:59:59", 25, "2023-11-02 00:59:59");
+    add!("hours_add", "2023-10-31 23:59:59", 1, "2023-11-01 00:59:59");
+    add!(
+        "hours_add",
+        "2023-10-31 23:59:59",
+        12,
+        "2023-11-01 11:59:59"
+    );
+    add!(
+        "hours_add",
+        "2023-10-31 23:59:59",
+        25,
+        "2023-11-02 00:59:59"
+    );
 
     // INTERVAL n MINUTE → minutes_add
-    add!("minutes_add", "2023-10-31 23:59:59", 1,  "2023-11-01 00:00:59");
-    add!("minutes_add", "2023-10-31 23:59:59", 30, "2023-11-01 00:29:59");
-    add!("minutes_add", "2023-10-31 23:59:59", 80, "2023-11-01 01:19:59");
+    add!(
+        "minutes_add",
+        "2023-10-31 23:59:59",
+        1,
+        "2023-11-01 00:00:59"
+    );
+    add!(
+        "minutes_add",
+        "2023-10-31 23:59:59",
+        30,
+        "2023-11-01 00:29:59"
+    );
+    add!(
+        "minutes_add",
+        "2023-10-31 23:59:59",
+        80,
+        "2023-11-01 01:19:59"
+    );
 
     // INTERVAL n SECOND → seconds_add
-    add!("seconds_add", "2023-10-31 23:59:59", 1,  "2023-11-01 00:00:00");
-    add!("seconds_add", "2023-10-31 23:59:59", 30, "2023-11-01 00:00:29");
-    add!("seconds_add", "2023-10-31 23:59:59", 70, "2023-11-01 00:01:09");
+    add!(
+        "seconds_add",
+        "2023-10-31 23:59:59",
+        1,
+        "2023-11-01 00:00:00"
+    );
+    add!(
+        "seconds_add",
+        "2023-10-31 23:59:59",
+        30,
+        "2023-11-01 00:00:29"
+    );
+    add!(
+        "seconds_add",
+        "2023-10-31 23:59:59",
+        70,
+        "2023-11-01 00:01:09"
+    );
 
     // INTERVAL n MILLISECOND → milliseconds_add
-    add!("milliseconds_add", "2023-10-31 23:59:59", 1,    "2023-10-31 23:59:59.001000");
-    add!("milliseconds_add", "2023-10-31 23:59:59", 500,  "2023-10-31 23:59:59.500000");
-    add!("milliseconds_add", "2023-10-31 23:59:59", 3000, "2023-11-01 00:00:02");
+    add!(
+        "milliseconds_add",
+        "2023-10-31 23:59:59",
+        1,
+        "2023-10-31 23:59:59.001000"
+    );
+    add!(
+        "milliseconds_add",
+        "2023-10-31 23:59:59",
+        500,
+        "2023-10-31 23:59:59.500000"
+    );
+    add!(
+        "milliseconds_add",
+        "2023-10-31 23:59:59",
+        3000,
+        "2023-11-01 00:00:02"
+    );
 
     // INTERVAL n MICROSECOND → microseconds_add
-    add!("microseconds_add", "2023-10-31 23:59:59", 1,    "2023-10-31 23:59:59.000001");
-    add!("microseconds_add", "2023-10-31 23:59:59", 500,  "2023-10-31 23:59:59.000500");
-    add!("microseconds_add", "2023-10-31 23:59:59", 3000, "2023-10-31 23:59:59.003000");
+    add!(
+        "microseconds_add",
+        "2023-10-31 23:59:59",
+        1,
+        "2023-10-31 23:59:59.000001"
+    );
+    add!(
+        "microseconds_add",
+        "2023-10-31 23:59:59",
+        500,
+        "2023-10-31 23:59:59.000500"
+    );
+    add!(
+        "microseconds_add",
+        "2023-10-31 23:59:59",
+        3000,
+        "2023-10-31 23:59:59.003000"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2746,4 +2910,3 @@ fn test_date_format_microseconds() {
         "2023-10-11 00:00:01.030000"
     );
 }
-

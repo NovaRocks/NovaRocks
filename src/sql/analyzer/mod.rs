@@ -1,430 +1,643 @@
-use std::collections::HashMap;
+//! Semantic analyzer: converts `sqlparser::ast::Query` into `ResolvedQuery`.
+//!
+//! This module performs name resolution, type inference, and scope management
+//! without producing any physical plan concepts (tuple_id, slot_id, etc.).
+
+mod scope;
+mod functions;
+mod helpers;
+mod resolve_from;
+mod resolve_expr;
 
 use arrow::datatypes::DataType;
+use sqlparser::ast as sqlast;
 
-use crate::sql::ast::{
-    ColumnRef, CompareOp, Expr, Literal, ObjectName, OrderByExpr, ProjectionItem, QueryStmt,
-    Statement,
+use crate::sql::catalog::CatalogProvider;
+
+use crate::sql::ir::{
+    ExprKind, JoinKind, JoinRelation, OutputColumn,
+    ProjectItem, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
+    ResolvedValues, SetOpKind, SortItem, TypedExpr,
 };
-use crate::standalone::catalog::{ColumnDef, InMemoryCatalog, TableDef, normalize_identifier};
-use crate::standalone::iceberg::{
-    IcebergCatalogRegistry, IcebergLoadedTable, load_table as load_iceberg_table,
-};
+use crate::sql::types::wider_type;
 
-#[derive(Clone, Debug)]
-pub(crate) struct AnalyzerContext<'a> {
-    pub(crate) current_catalog: Option<&'a str>,
-    pub(crate) current_database: &'a str,
-}
+use scope::AnalyzerScope;
+use helpers::{extract_limit, extract_offset, expr_display_name};
 
-#[derive(Clone, Debug)]
-pub(crate) enum AnalyzedStatement {
-    Query(AnalyzedQuery),
-    Passthrough(Statement),
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-pub(crate) struct AnalyzedQuery {
-    pub(crate) source: QuerySource,
-    pub(crate) bound: BoundQuery,
-    pub(crate) order_by: Vec<OrderByExpr>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum QuerySource {
-    Local {
-        resolved: ResolvedLocalTableName,
-        table: TableDef,
-    },
-    Iceberg {
-        #[allow(dead_code)]
-        resolved: ResolvedIcebergTableName,
-        loaded: IcebergLoadedTable,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedLocalTableName {
-    pub(crate) database: String,
-    pub(crate) table: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedIcebergTableName {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundScanColumn {
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
-    pub(crate) scan_slot_id: i32,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundOutputColumn {
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
-    pub(crate) scan_column_index: usize,
-    pub(crate) output_slot_id: Option<i32>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundPredicate {
-    pub(crate) scan_column_index: usize,
-    pub(crate) op: CompareOp,
-    pub(crate) literal: Literal,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundQuery {
-    pub(crate) scan_columns: Vec<BoundScanColumn>,
-    pub(crate) output_columns: Vec<BoundOutputColumn>,
-    pub(crate) predicate: Option<BoundPredicate>,
-    pub(crate) needs_project: bool,
-}
-
-pub(crate) fn analyze_statement(
-    stmt: Statement,
-    ctx: AnalyzerContext<'_>,
-    local_catalog: &InMemoryCatalog,
-    iceberg_catalogs: &IcebergCatalogRegistry,
-) -> Result<AnalyzedStatement, String> {
-    match stmt {
-        Statement::Query(query) => {
-            analyze_query(query, ctx, local_catalog, iceberg_catalogs).map(AnalyzedStatement::Query)
-        }
-        other => Ok(AnalyzedStatement::Passthrough(other)),
-    }
-}
-
-fn analyze_query(
-    query: QueryStmt,
-    ctx: AnalyzerContext<'_>,
-    local_catalog: &InMemoryCatalog,
-    iceberg_catalogs: &IcebergCatalogRegistry,
-) -> Result<AnalyzedQuery, String> {
-    let source = if ctx.current_catalog.is_none() {
-        match query.from.name.parts.len() {
-            1 | 2 => {
-                let resolved = resolve_local_table_name(&query.from.name, ctx.current_database)?;
-                let table = local_catalog.get(&resolved.database, &resolved.table)?;
-                QuerySource::Local { resolved, table }
-            }
-            3 => {
-                let resolved = resolve_iceberg_table_name_explicit(&query.from.name)?;
-                let entry = iceberg_catalogs.get(&resolved.catalog)?;
-                let loaded = load_iceberg_table(&entry, &resolved.namespace, &resolved.table)?;
-                QuerySource::Iceberg { resolved, loaded }
-            }
-            _ => {
-                return Err(format!(
-                    "unsupported table name `{}`; expected `<table>`, `<database>.<table>`, or `<catalog>.<database>.<table>`",
-                    query.from.name.parts.join(".")
-                ));
-            }
-        }
-    } else {
-        let resolved = resolve_iceberg_table_name(
-            query.from.name.clone(),
-            ctx.current_catalog,
-            ctx.current_database,
-        )?;
-        let entry = iceberg_catalogs.get(&resolved.catalog)?;
-        let loaded = load_iceberg_table(&entry, &resolved.namespace, &resolved.table)?;
-        QuerySource::Iceberg { resolved, loaded }
-    };
-
-    let columns = match &source {
-        QuerySource::Local { table, .. } => &table.columns,
-        QuerySource::Iceberg { loaded, .. } => &loaded.columns,
-    };
-    let bound = bind_query(&query, columns)?;
-    Ok(AnalyzedQuery {
-        source,
-        bound,
-        order_by: query.order_by,
-    })
-}
-
-pub(crate) fn resolve_local_table_name(
-    name: &ObjectName,
+/// Analyze a parsed SQL query and produce a fully resolved query IR.
+pub(crate) fn analyze(
+    query: &sqlast::Query,
+    catalog: &impl CatalogProvider,
     current_database: &str,
-) -> Result<ResolvedLocalTableName, String> {
-    match name.parts.as_slice() {
-        [table] => Ok(ResolvedLocalTableName {
-            database: normalize_identifier(current_database)?,
-            table: normalize_identifier(table)?,
-        }),
-        [database, table] => Ok(ResolvedLocalTableName {
-            database: normalize_identifier(database)?,
-            table: normalize_identifier(table)?,
-        }),
-        _ => Err(format!(
-            "local table name must be `<table>` or `<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-pub(crate) fn resolve_iceberg_table_name(
-    name: ObjectName,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<ResolvedIcebergTableName, String> {
-    match (
-        normalize_optional_identifier(current_catalog)?,
-        name.parts.as_slice(),
-    ) {
-        (Some(catalog), [table]) => Ok(ResolvedIcebergTableName {
-            catalog,
-            namespace: normalize_identifier(current_database)?,
-            table: normalize_identifier(table)?,
-        }),
-        (Some(catalog), [namespace, table]) => Ok(ResolvedIcebergTableName {
-            catalog,
-            namespace: normalize_identifier(namespace)?,
-            table: normalize_identifier(table)?,
-        }),
-        (_, [catalog, namespace, table]) => Ok(ResolvedIcebergTableName {
-            catalog: normalize_identifier(catalog)?,
-            namespace: normalize_identifier(namespace)?,
-            table: normalize_identifier(table)?,
-        }),
-        _ => Err(format!(
-            "iceberg table name must be `<table>`/`<database>.<table>` with current catalog or `<catalog>.<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn resolve_iceberg_namespace_name(
-    name: ObjectName,
-    current_catalog: Option<&str>,
-) -> Result<(String, String), String> {
-    match (
-        normalize_optional_identifier(current_catalog)?,
-        name.parts.as_slice(),
-    ) {
-        (Some(catalog), [namespace]) => Ok((catalog, normalize_identifier(namespace)?)),
-        (_, [catalog, namespace]) => Ok((
-            normalize_identifier(catalog)?,
-            normalize_identifier(namespace)?,
-        )),
-        _ => Err(format!(
-            "iceberg database name must be `<database>` with current catalog or `<catalog>.<database>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-pub(crate) fn resolve_iceberg_table_name_explicit(
-    name: &ObjectName,
-) -> Result<ResolvedIcebergTableName, String> {
-    let [catalog, namespace, table] = name.parts.as_slice() else {
-        return Err(format!(
-            "iceberg table name must be `<catalog>.<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        ));
+) -> Result<ResolvedQuery, String> {
+    let ctx = AnalyzerContext {
+        catalog,
+        current_database,
+        ctes: std::collections::HashMap::new(),
     };
-    Ok(ResolvedIcebergTableName {
-        catalog: normalize_identifier(catalog)?,
-        namespace: normalize_identifier(namespace)?,
-        table: normalize_identifier(table)?,
-    })
+    ctx.analyze_query(query)
 }
 
-pub(crate) fn normalize_optional_identifier(raw: Option<&str>) -> Result<Option<String>, String> {
-    raw.map(normalize_identifier).transpose()
+// ---------------------------------------------------------------------------
+// Analyzer context
+// ---------------------------------------------------------------------------
+
+pub(super) struct AnalyzerContext<'a> {
+    pub(super) catalog: &'a dyn CatalogProvider,
+    pub(super) current_database: &'a str,
+    /// CTE definitions from WITH clause, keyed by lowercase name.
+    /// Value is (query, optional column aliases).
+    pub(super) ctes: std::collections::HashMap<String, (sqlast::Query, Vec<String>)>,
 }
 
-fn bind_query(query: &QueryStmt, columns: &[ColumnDef]) -> Result<BoundQuery, String> {
-    let mut column_by_name = HashMap::with_capacity(columns.len());
-    for (idx, column) in columns.iter().enumerate() {
-        column_by_name.insert(normalize_identifier(&column.name)?, idx);
+impl<'a> AnalyzerContext<'a> {
+    /// Top-level query analysis.
+    fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
+        // Register CTEs from WITH clause (if any) into a child context.
+        let child_ctx;
+        let ctx = if let Some(ref with_clause) = query.with {
+            let mut ctes = self.ctes.clone();
+            for cte in &with_clause.cte_tables {
+                let name = cte.alias.name.value.to_lowercase();
+                let col_aliases: Vec<String> = cte
+                    .alias
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.to_lowercase())
+                    .collect();
+                ctes.insert(name, (*cte.query.clone(), col_aliases));
+            }
+            child_ctx = AnalyzerContext {
+                catalog: self.catalog,
+                current_database: self.current_database,
+                ctes,
+            };
+            &child_ctx
+        } else {
+            self
+        };
+
+        // Analyze body (SELECT / SetOperation / VALUES)
+        let (body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
+
+        // Analyze ORDER BY
+        let order_by = ctx.analyze_order_by(query, &body_output, &body)?;
+
+        // Extract LIMIT / OFFSET
+        let limit = extract_limit(query)?;
+        let offset = extract_offset(query)?;
+
+        // Build output columns from the body
+        let output_columns = body_output;
+
+        Ok(ResolvedQuery {
+            body,
+            order_by,
+            limit,
+            offset,
+            output_columns,
+        })
     }
 
-    let projection_indices = expand_projection(&query.projection, columns, &column_by_name)?;
-    let mut scan_columns = Vec::new();
-    let mut scan_index_by_source = HashMap::new();
-    let mut output_columns = Vec::with_capacity(projection_indices.len());
+    /// Analyze a SetExpr and return (QueryBody, output_columns).
+    fn analyze_set_expr(
+        &self,
+        set_expr: &sqlast::SetExpr,
+    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+        match set_expr {
+            sqlast::SetExpr::Select(s) => {
+                let (sel, cols) = self.analyze_select(s)?;
+                Ok((QueryBody::Select(sel), cols))
+            }
+            sqlast::SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                let (left_body, left_cols) = self.analyze_set_expr(left)?;
+                let (right_body, right_cols) = self.analyze_set_expr(right)?;
 
-    for &source_idx in &projection_indices {
-        let scan_column_index = ensure_scan_column(
-            &mut scan_columns,
-            &mut scan_index_by_source,
-            &columns[source_idx],
-            source_idx,
-        )?;
-        let column = &columns[source_idx];
-        output_columns.push(BoundOutputColumn {
-            name: column.name.clone(),
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
-            scan_column_index,
-            output_slot_id: None,
-        });
+                // Validate column count
+                if left_cols.len() != right_cols.len() {
+                    return Err(format!(
+                        "set operation column count mismatch: left has {}, right has {}",
+                        left_cols.len(),
+                        right_cols.len()
+                    ));
+                }
+
+                // Widen types
+                let mut output_cols = Vec::with_capacity(left_cols.len());
+                for (lc, rc) in left_cols.iter().zip(right_cols.iter()) {
+                    let dt = wider_type(&lc.data_type, &rc.data_type);
+                    output_cols.push(OutputColumn {
+                        name: lc.name.clone(),
+                        data_type: dt,
+                        nullable: lc.nullable || rc.nullable,
+                    });
+                }
+
+                let kind = match op {
+                    sqlast::SetOperator::Union => SetOpKind::Union,
+                    sqlast::SetOperator::Intersect => SetOpKind::Intersect,
+                    sqlast::SetOperator::Except | sqlast::SetOperator::Minus => SetOpKind::Except,
+                };
+                let all = matches!(
+                    set_quantifier,
+                    sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName
+                );
+
+                Ok((
+                    QueryBody::SetOperation(ResolvedSetOp {
+                        kind,
+                        all,
+                        left: Box::new(left_body),
+                        right: Box::new(right_body),
+                    }),
+                    output_cols,
+                ))
+            }
+            sqlast::SetExpr::Values(values) => {
+                let (resolved_values, cols) = self.analyze_values(values)?;
+                Ok((QueryBody::Values(resolved_values), cols))
+            }
+            sqlast::SetExpr::Query(q) => {
+                let resolved = self.analyze_query(q)?;
+                let cols = resolved.output_columns.clone();
+                Ok((resolved.body, cols))
+            }
+            other => Err(format!("unsupported set expression: {other}")),
+        }
     }
 
-    let predicate = match query.selection.as_ref() {
-        Some(expr) => Some(bind_predicate(
-            expr,
-            &mut scan_columns,
-            &mut scan_index_by_source,
-            columns,
-            &column_by_name,
-        )?),
-        None => None,
-    };
+    /// Analyze a VALUES clause.
+    fn analyze_values(
+        &self,
+        values: &sqlast::Values,
+    ) -> Result<(ResolvedValues, Vec<OutputColumn>), String> {
+        let scope = AnalyzerScope::new(); // VALUES has no table scope
+        let mut resolved_rows = Vec::with_capacity(values.rows.len());
+        let mut column_types: Vec<DataType> = Vec::new();
 
-    for (idx, column) in scan_columns.iter_mut().enumerate() {
-        column.scan_slot_id =
-            i32::try_from(idx + 1).map_err(|_| "too many scan columns".to_string())?;
-    }
+        for row in &values.rows {
+            let mut resolved_row = Vec::with_capacity(row.len());
+            for (col_idx, expr) in row.iter().enumerate() {
+                let typed = self.analyze_expr(expr, &scope)?;
+                if col_idx < column_types.len() {
+                    column_types[col_idx] = wider_type(&column_types[col_idx], &typed.data_type);
+                } else {
+                    column_types.push(typed.data_type.clone());
+                }
+                resolved_row.push(typed);
+            }
+            resolved_rows.push(resolved_row);
+        }
 
-    let needs_project = output_columns.len() != scan_columns.len()
-        || output_columns
+        let output_cols: Vec<OutputColumn> = column_types
             .iter()
             .enumerate()
-            .any(|(output_idx, column)| column.scan_column_index != output_idx);
+            .map(|(i, dt)| OutputColumn {
+                name: format!("column{}", i),
+                data_type: dt.clone(),
+                nullable: true,
+            })
+            .collect();
 
-    if needs_project {
-        for (idx, column) in output_columns.iter_mut().enumerate() {
-            column.output_slot_id = Some(
-                i32::try_from(scan_columns.len() + idx + 1)
-                    .map_err(|_| "too many output columns".to_string())?,
-            );
+        Ok((
+            ResolvedValues {
+                rows: resolved_rows,
+                column_types,
+            },
+            output_cols,
+        ))
+    }
+
+    /// Analyze a SELECT statement.
+    fn analyze_select(
+        &self,
+        select: &sqlast::Select,
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), String> {
+        // --- FROM clause ---
+        let (from, scope) = if select.from.is_empty() {
+            // SELECT without FROM (dual)
+            (None, AnalyzerScope::new())
+        } else if select.from.len() == 1 {
+            let (rel, scope) = self.analyze_from(&select.from[0])?;
+            (Some(rel), scope)
+        } else {
+            // Multiple comma-separated FROM items → implicit CROSS JOIN
+            let mut iter = select.from.iter();
+            let first = iter.next().unwrap();
+            let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
+            for twj in iter {
+                let (right_rel, right_scope) = self.analyze_from(twj)?;
+                current_scope.merge(&right_scope);
+                current_rel = Relation::Join(Box::new(JoinRelation {
+                    left: current_rel,
+                    right: right_rel,
+                    join_type: JoinKind::Cross,
+                    condition: None,
+                }));
+            }
+            (Some(current_rel), current_scope)
+        };
+
+        // --- WHERE clause ---
+        let filter = match &select.selection {
+            Some(expr) => Some(self.analyze_expr(expr, &scope)?),
+            None => None,
+        };
+
+        // --- SELECT list (before GROUP BY so aliases are available) ---
+        let (projection, output_columns) =
+            self.analyze_projection(&select.projection, &scope)?;
+
+        // --- GROUP BY (with SELECT alias fallback) ---
+        let group_by_exprs = match &select.group_by {
+            sqlast::GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+            sqlast::GroupByExpr::All(_) => {
+                return Err("GROUP BY ALL is not supported".into());
+            }
+        };
+        let mut group_by = Vec::with_capacity(group_by_exprs.len());
+        for gb_expr in &group_by_exprs {
+            match self.analyze_expr(gb_expr, &scope) {
+                Ok(typed) => group_by.push(typed),
+                Err(_) => {
+                    // Try SELECT aliases: GROUP BY alias_name
+                    let mut alias_scope = scope.clone();
+                    for item in &projection {
+                        alias_scope.add_column(
+                            None,
+                            &item.output_name,
+                            item.expr.data_type.clone(),
+                            item.expr.nullable,
+                        );
+                    }
+                    let typed = self.analyze_expr(gb_expr, &alias_scope)?;
+                    // Substitute alias ref with original expression
+                    group_by.push(self.substitute_select_aliases(typed, &projection));
+                }
+            }
+        }
+
+        // --- Detect aggregation ---
+        let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
+        let has_aggregation = !group_by.is_empty() || has_agg_in_select;
+
+        // --- HAVING ---
+        // Resolve against the FROM scope. If a HAVING reference matches a SELECT
+        // alias, substitute with the aliased expression so the emitter sees the
+        // real aggregate call (e.g. `total` → `sum(v)`).
+        let having = match &select.having {
+            Some(expr) => {
+                let analyzed = self.analyze_expr(expr, &scope);
+                match analyzed {
+                    Ok(h) => Some(h),
+                    Err(_) => {
+                        // Maybe references a SELECT alias — build alias scope
+                        let mut alias_scope = scope.clone();
+                        for item in &projection {
+                            alias_scope.add_column(
+                                None,
+                                &item.output_name,
+                                item.expr.data_type.clone(),
+                                item.expr.nullable,
+                            );
+                        }
+                        let h = self.analyze_expr(expr, &alias_scope)?;
+                        // Substitute alias refs with real expressions
+                        Some(self.substitute_select_aliases(h, &projection))
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // --- DISTINCT ---
+        let distinct = matches!(select.distinct, Some(sqlast::Distinct::Distinct));
+
+        Ok((
+            ResolvedSelect {
+                from,
+                filter,
+                group_by,
+                having,
+                projection,
+                has_aggregation,
+                distinct,
+            },
+            output_columns,
+        ))
+    }
+
+    /// Replace ColumnRef nodes that match SELECT aliases with the aliased expression.
+    fn substitute_select_aliases(
+        &self,
+        expr: TypedExpr,
+        projection: &[ProjectItem],
+    ) -> TypedExpr {
+        match expr.kind {
+            ExprKind::ColumnRef {
+                ref qualifier,
+                ref column,
+            } if qualifier.is_none() => {
+                // Check if this column name matches a SELECT alias
+                let col_lower = column.to_lowercase();
+                for item in projection {
+                    if item.output_name.to_lowercase() == col_lower {
+                        return item.expr.clone();
+                    }
+                }
+                expr
+            }
+            ExprKind::BinaryOp { left, op, right } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(self.substitute_select_aliases(*left, projection)),
+                    op,
+                    right: Box::new(self.substitute_select_aliases(*right, projection)),
+                },
+            },
+            ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::UnaryOp {
+                    op,
+                    expr: Box::new(self.substitute_select_aliases(*inner, projection)),
+                },
+            },
+            ExprKind::Nested(inner) => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Nested(Box::new(
+                    self.substitute_select_aliases(*inner, projection),
+                )),
+            },
+            // For other node types, return as-is
+            _ => expr,
         }
     }
 
-    Ok(BoundQuery {
-        scan_columns,
-        output_columns,
-        predicate,
-        needs_project,
-    })
-}
+    /// Analyze the SELECT projection list.
+    fn analyze_projection(
+        &self,
+        items: &[sqlast::SelectItem],
+        scope: &AnalyzerScope,
+    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
+        let mut projection = Vec::new();
+        let mut output_columns = Vec::new();
 
-fn expand_projection(
-    projection: &[ProjectionItem],
-    columns: &[ColumnDef],
-    column_by_name: &HashMap<String, usize>,
-) -> Result<Vec<usize>, String> {
-    match projection {
-        [ProjectionItem::Wildcard] => Ok((0..columns.len()).collect()),
-        _ => projection
-            .iter()
-            .map(|item| match item {
-                ProjectionItem::Wildcard => {
-                    Err("wildcard projection cannot be combined with explicit columns".to_string())
+        for item in items {
+            match item {
+                sqlast::SelectItem::UnnamedExpr(expr) => {
+                    let typed = self.analyze_expr(expr, scope)?;
+                    let name = expr_display_name(expr);
+                    output_columns.push(OutputColumn {
+                        name: name.clone(),
+                        data_type: typed.data_type.clone(),
+                        nullable: typed.nullable,
+                    });
+                    projection.push(ProjectItem {
+                        expr: typed,
+                        output_name: name,
+                    });
                 }
-                ProjectionItem::Column(column) => resolve_column_index(column, column_by_name),
-            })
-            .collect(),
+                sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                    let typed = self.analyze_expr(expr, scope)?;
+                    let name = alias.value.clone();
+                    output_columns.push(OutputColumn {
+                        name: name.clone(),
+                        data_type: typed.data_type.clone(),
+                        nullable: typed.nullable,
+                    });
+                    projection.push(ProjectItem {
+                        expr: typed,
+                        output_name: name,
+                    });
+                }
+                sqlast::SelectItem::Wildcard(_) => {
+                    for (qualifier, col_name, data_type, nullable) in scope.iter_columns() {
+                        let typed = TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: qualifier.clone(),
+                                column: col_name.clone(),
+                            },
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        };
+                        output_columns.push(OutputColumn {
+                            name: col_name.clone(),
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        });
+                        projection.push(ProjectItem {
+                            expr: typed,
+                            output_name: col_name.clone(),
+                        });
+                    }
+                }
+                sqlast::SelectItem::QualifiedWildcard(kind, _) => {
+                    let qualifier_str = match kind {
+                        sqlast::SelectItemQualifiedWildcardKind::ObjectName(obj_name) => {
+                            obj_name.to_string()
+                        }
+                        _ => return Err("unsupported qualified wildcard expression".into()),
+                    };
+                    let mut found = false;
+                    for (qualifier, col_name, data_type, nullable) in
+                        scope.iter_qualified_columns(&qualifier_str)
+                    {
+                        found = true;
+                        let typed = TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: qualifier.clone(),
+                                column: col_name.clone(),
+                            },
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        };
+                        output_columns.push(OutputColumn {
+                            name: col_name.clone(),
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        });
+                        projection.push(ProjectItem {
+                            expr: typed,
+                            output_name: col_name.clone(),
+                        });
+                    }
+                    if !found {
+                        return Err(format!(
+                            "no columns found for qualifier `{qualifier_str}`"
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok((projection, output_columns))
     }
-}
 
-fn resolve_column_index(
-    column: &ColumnRef,
-    column_by_name: &HashMap<String, usize>,
-) -> Result<usize, String> {
-    let name = normalize_identifier(&column.name)?;
-    column_by_name
-        .get(&name)
-        .copied()
-        .ok_or_else(|| format!("unknown column: {}", column.name))
-}
-
-fn ensure_scan_column(
-    scan_columns: &mut Vec<BoundScanColumn>,
-    scan_index_by_source: &mut HashMap<usize, usize>,
-    column: &ColumnDef,
-    source_idx: usize,
-) -> Result<usize, String> {
-    if let Some(&scan_idx) = scan_index_by_source.get(&source_idx) {
-        return Ok(scan_idx);
+    /// Rebuild the FROM scope from an already-resolved Relation tree.
+    /// Used by ORDER BY fallback when the expression doesn't match projection columns.
+    fn rebuild_from_scope(
+        &self,
+        relation: &Relation,
+    ) -> Result<((), AnalyzerScope), String> {
+        let mut scope = AnalyzerScope::new();
+        self.collect_relation_scope(relation, &mut scope)?;
+        Ok(((), scope))
     }
-    let scan_idx = scan_columns.len();
-    scan_columns.push(BoundScanColumn {
-        name: column.name.clone(),
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-        scan_slot_id: 0,
-    });
-    scan_index_by_source.insert(source_idx, scan_idx);
-    Ok(scan_idx)
-}
 
-fn bind_predicate(
-    expr: &Expr,
-    scan_columns: &mut Vec<BoundScanColumn>,
-    scan_index_by_source: &mut HashMap<usize, usize>,
-    columns: &[ColumnDef],
-    column_by_name: &HashMap<String, usize>,
-) -> Result<BoundPredicate, String> {
-    let Expr::Comparison { left, op, right } = expr;
-    let source_idx = resolve_column_index(left, column_by_name)?;
-    let column = &columns[source_idx];
-    validate_literal_for_column(right, &column.data_type)?;
-    let scan_column_index =
-        ensure_scan_column(scan_columns, scan_index_by_source, column, source_idx)?;
-    Ok(BoundPredicate {
-        scan_column_index,
-        op: *op,
-        literal: right.clone(),
-    })
-}
+    fn collect_relation_scope(
+        &self,
+        relation: &Relation,
+        scope: &mut AnalyzerScope,
+    ) -> Result<(), String> {
+        match relation {
+            Relation::Scan(scan) => {
+                let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
+                scope.add_table(Some(qualifier), &scan.table.columns);
+                Ok(())
+            }
+            Relation::Subquery { query, alias } => {
+                for col in &query.output_columns {
+                    scope.add_column(
+                        Some(alias.as_str()),
+                        &col.name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    );
+                }
+                Ok(())
+            }
+            Relation::Join(join_rel) => {
+                self.collect_relation_scope(&join_rel.left, scope)?;
+                self.collect_relation_scope(&join_rel.right, scope)?;
+                Ok(())
+            }
+            Relation::GenerateSeries(gs) => {
+                let qualifier = gs.alias.as_deref().unwrap_or("generate_series");
+                scope.add_column(Some(qualifier), &gs.column_name, DataType::Int64, false);
+                Ok(())
+            }
+        }
+    }
 
-fn validate_literal_for_column(literal: &Literal, column_type: &DataType) -> Result<(), String> {
-    match literal {
-        Literal::Null => Ok(()),
-        Literal::Bool(_) if matches!(column_type, DataType::Boolean) => Ok(()),
-        Literal::Int(_) => match column_type {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64 => Ok(()),
-            other => Err(format!(
-                "integer literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::Float(_) => match column_type {
-            DataType::Float32 | DataType::Float64 => Ok(()),
-            other => Err(format!(
-                "float literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::String(_) => match column_type {
-            DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Date32
-            | DataType::Timestamp(_, _) => Ok(()),
-            other => Err(format!(
-                "string literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::Date(_) => match column_type {
-            DataType::Date32 | DataType::Timestamp(_, _) => Ok(()),
-            other => Err(format!(
-                "date literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::Bool(_) => Err(format!(
-            "boolean literal is not supported for column type {:?}",
-            column_type
-        )),
+    /// Analyze ORDER BY clause.
+    fn analyze_order_by(
+        &self,
+        query: &sqlast::Query,
+        body_output: &[OutputColumn],
+        body: &QueryBody,
+    ) -> Result<Vec<SortItem>, String> {
+        let order_by_exprs = match &query.order_by {
+            Some(sqlast::OrderBy {
+                kind: sqlast::OrderByKind::Expressions(exprs),
+                ..
+            }) => exprs,
+            Some(sqlast::OrderBy {
+                kind: sqlast::OrderByKind::All(_),
+                ..
+            }) => return Err("ORDER BY ALL is not supported".into()),
+            None => return Ok(vec![]),
+        };
+
+        // Build a projection scope from body output columns for ORDER BY resolution.
+        let mut projection_scope = AnalyzerScope::new();
+        for col in body_output {
+            projection_scope.add_column(None, &col.name, col.data_type.clone(), col.nullable);
+        }
+        // Also register qualified column refs from projection items
+        // so ORDER BY a.id works when SELECT has a.id
+        if let QueryBody::Select(sel) = body {
+            for item in &sel.projection {
+                if let ExprKind::ColumnRef {
+                    qualifier: Some(ref q),
+                    ref column,
+                } = item.expr.kind
+                {
+                    projection_scope.add_column(
+                        Some(q),
+                        column,
+                        item.expr.data_type.clone(),
+                        item.expr.nullable,
+                    );
+                }
+            }
+        }
+
+        let mut sort_items = Vec::with_capacity(order_by_exprs.len());
+        for ob in order_by_exprs {
+            // Try resolving against the projection scope first, then fall back
+            // to a numeric literal reference (ORDER BY 1, 2, ...)
+            let typed = match &ob.expr {
+                sqlast::Expr::Value(sqlast::ValueWithSpan {
+                    value: sqlast::Value::Number(n, _),
+                    ..
+                }) => {
+                    // Positional reference: ORDER BY 1
+                    let pos: usize = n
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid ORDER BY position: {e}"))?;
+                    if pos == 0 || pos > body_output.len() {
+                        return Err(format!(
+                            "ORDER BY position {pos} is out of range (1..{})",
+                            body_output.len()
+                        ));
+                    }
+                    let col = &body_output[pos - 1];
+                    TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: None,
+                            column: col.name.clone(),
+                        },
+                        data_type: col.data_type.clone(),
+                        nullable: col.nullable,
+                    }
+                }
+                _ => {
+                    // Try projection scope first, then fall back to FROM scope
+                    match self.analyze_expr(&ob.expr, &projection_scope) {
+                        Ok(typed) => typed,
+                        Err(proj_err) => {
+                            // Try resolving against the FROM scope (for ORDER BY
+                            // on columns not in the SELECT list).
+                            if let QueryBody::Select(sel) = body {
+                                if let Some(ref from_rel) = sel.from {
+                                    let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
+                                    match self.analyze_expr(&ob.expr, &from_scope) {
+                                        Ok(typed) => typed,
+                                        Err(_) => return Err(proj_err),
+                                    }
+                                } else {
+                                    return Err(proj_err);
+                                }
+                            } else {
+                                return Err(proj_err);
+                            }
+                        }
+                    }
+                }
+            };
+
+            let asc = ob.options.asc.unwrap_or(true);
+            let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+
+            sort_items.push(SortItem {
+                expr: typed,
+                asc,
+                nulls_first,
+            });
+        }
+
+        Ok(sort_items)
     }
 }

@@ -357,4 +357,3 @@ static MATH_METADATA: &[FunctionMeta] = &[
         max_args: 1,
     },
 ];
-

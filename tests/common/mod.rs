@@ -189,13 +189,15 @@ pub fn chunk_len_1() -> novarocks::exec::chunk::Chunk {
     use std::sync::Arc;
 
     let array = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
-    let schema = Arc::new(Schema::new(vec![Field::new("dummy", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "dummy",
+        DataType::Int64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
