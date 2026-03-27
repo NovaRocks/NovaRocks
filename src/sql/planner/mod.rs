@@ -4,8 +4,8 @@
 //! from the analyzed query IR.  A future optimizer would rewrite this tree
 //! before it reaches the Thrift emitter.
 
-use crate::sql::plan::*;
 use crate::sql::ir::*;
+use crate::sql::plan::*;
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -20,19 +20,13 @@ pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
         // If ORDER BY references columns not in the projection, we need to
         // extend the project to include them (hidden columns) so the sort can
         // reference them.  After sort, a top-level project strips them.
-        let needs_hidden = has_non_projected_sort_columns(
-            &resolved.order_by,
-            &resolved.output_columns,
-        );
+        let needs_hidden =
+            has_non_projected_sort_columns(&resolved.order_by, &resolved.output_columns);
         if needs_hidden {
             // Collect extra columns needed by ORDER BY
             let mut extra_items = Vec::new();
             for sort_item in &resolved.order_by {
-                collect_extra_columns(
-                    &sort_item.expr,
-                    &resolved.output_columns,
-                    &mut extra_items,
-                );
+                collect_extra_columns(&sort_item.expr, &resolved.output_columns, &mut extra_items);
             }
 
             // Extend the project node at the top of body_plan
@@ -89,10 +83,7 @@ pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
 }
 
 /// Check if any ORDER BY expression references columns not in the output.
-fn has_non_projected_sort_columns(
-    order_by: &[SortItem],
-    output: &[OutputColumn],
-) -> bool {
+fn has_non_projected_sort_columns(order_by: &[SortItem], output: &[OutputColumn]) -> bool {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
     for item in order_by {
@@ -110,8 +101,7 @@ fn has_non_projected_ref(
     match &expr.kind {
         ExprKind::ColumnRef { column, .. } => !output_names.contains(&column.to_lowercase()),
         ExprKind::BinaryOp { left, right, .. } => {
-            has_non_projected_ref(left, output_names)
-                || has_non_projected_ref(right, output_names)
+            has_non_projected_ref(left, output_names) || has_non_projected_ref(right, output_names)
         }
         ExprKind::UnaryOp { expr, .. } => has_non_projected_ref(expr, output_names),
         ExprKind::FunctionCall { args, .. } => {
@@ -126,11 +116,7 @@ fn has_non_projected_ref(
 
 /// Collect ColumnRef items from ORDER BY that aren't in the output,
 /// and build extra ProjectItems for them.
-fn collect_extra_columns(
-    expr: &TypedExpr,
-    output: &[OutputColumn],
-    extra: &mut Vec<ProjectItem>,
-) {
+fn collect_extra_columns(expr: &TypedExpr, output: &[OutputColumn], extra: &mut Vec<ProjectItem>) {
     let output_names: std::collections::HashSet<String> =
         output.iter().map(|c| c.name.to_lowercase()).collect();
     let already_added: std::collections::HashSet<String> =
@@ -244,11 +230,13 @@ fn plan_select(select: ResolvedSelect) -> Result<LogicalPlan, String> {
         }
     } else {
         // 4. No aggregation → check for window functions, then Project
-        let has_window = select.projection.iter().any(|item| has_window_call(&item.expr));
+        let has_window = select
+            .projection
+            .iter()
+            .any(|item| has_window_call(&item.expr));
         if has_window {
             // Extract window function calls → WindowNode, rewrite Project
-            let (window_exprs, rewritten_items) =
-                extract_window_calls(&select.projection);
+            let (window_exprs, rewritten_items) = extract_window_calls(&select.projection);
             let mut output_columns = Vec::new();
             // All input columns pass through
             // (we'll let the emitter figure out the exact scope)
@@ -294,9 +282,7 @@ fn has_window_call(expr: &TypedExpr) -> bool {
 /// Extract window function calls from the projection items.
 /// Returns (window_exprs, rewritten_projection_items).
 /// Each window call is replaced with a ColumnRef to its output name.
-fn extract_window_calls(
-    items: &[ProjectItem],
-) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
+fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
 

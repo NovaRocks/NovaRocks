@@ -8,8 +8,8 @@ use crate::sql::physical::expr_compiler::ExprCompiler;
 use crate::sql::physical::nodes;
 use crate::sql::physical::resolve::ExprScope;
 
-use super::helpers::{join_kind_to_op, split_and_conjuncts_typed};
 use super::EmitResult;
+use super::helpers::{join_kind_to_op, split_and_conjuncts_typed};
 
 impl<'a> super::ThriftEmitter<'a> {
     pub(super) fn emit_join(&mut self, node: JoinNode) -> Result<EmitResult, String> {
@@ -22,9 +22,7 @@ impl<'a> super::ThriftEmitter<'a> {
 
         // Extract equi-join conditions from the join condition
         let (eq_conds, other_conds) = match node.condition {
-            Some(cond) => {
-                self.extract_join_conditions_typed(&cond, &left.scope, &right.scope)?
-            }
+            Some(cond) => self.extract_join_conditions_typed(&cond, &left.scope, &right.scope)?,
             None => (vec![], vec![]),
         };
 

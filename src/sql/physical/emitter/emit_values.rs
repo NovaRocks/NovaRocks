@@ -38,8 +38,7 @@ impl<'a> super::ThriftEmitter<'a> {
             alias: None,
         };
 
-        let scan_plan_node =
-            nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, vec![]);
+        let scan_plan_node = nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, vec![]);
         self.scan_tables.push((scan_node_id, resolved));
 
         let scope = ExprScope::new();
@@ -51,7 +50,10 @@ impl<'a> super::ThriftEmitter<'a> {
         })
     }
 
-    pub(super) fn emit_generate_series(&mut self, node: GenerateSeriesNode) -> Result<EmitResult, String> {
+    pub(super) fn emit_generate_series(
+        &mut self,
+        node: GenerateSeriesNode,
+    ) -> Result<EmitResult, String> {
         use arrow::array::Int64Array;
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
@@ -94,7 +96,11 @@ impl<'a> super::ThriftEmitter<'a> {
 
         // Build a TableDef and emit as a scan
         let table_def = crate::sql::catalog::TableDef {
-            name: node.alias.as_deref().unwrap_or("generate_series").to_string(),
+            name: node
+                .alias
+                .as_deref()
+                .unwrap_or("generate_series")
+                .to_string(),
             columns: vec![crate::sql::catalog::ColumnDef {
                 name: col_name.clone(),
                 data_type: ArrowDataType::Int64,

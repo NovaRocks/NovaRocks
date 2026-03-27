@@ -182,10 +182,7 @@ pub(crate) enum ExprKind {
         right: Box<TypedExpr>,
     },
     /// Unary operation.
-    UnaryOp {
-        op: UnOp,
-        expr: Box<TypedExpr>,
-    },
+    UnaryOp { op: UnOp, expr: Box<TypedExpr> },
     /// Scalar function call (non-aggregate).
     FunctionCall {
         name: String,
@@ -205,10 +202,7 @@ pub(crate) enum ExprKind {
         target: DataType,
     },
     /// IS [NOT] NULL.
-    IsNull {
-        expr: Box<TypedExpr>,
-        negated: bool,
-    },
+    IsNull { expr: Box<TypedExpr>, negated: bool },
     /// [NOT] IN (list).
     InList {
         expr: Box<TypedExpr>,

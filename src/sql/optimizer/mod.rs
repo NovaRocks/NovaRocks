@@ -7,9 +7,9 @@
 //! The optimizer operates on the [`LogicalPlan`] tree before it is handed to
 //! the Thrift emitter.
 
-mod predicate_pushdown;
 mod column_pruning;
 pub(crate) mod expr_utils;
+mod predicate_pushdown;
 
 use crate::sql::plan::*;
 
@@ -75,9 +75,9 @@ pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::DataType;
     use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
     use crate::sql::ir::{BinOp, ExprKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr};
+    use arrow::datatypes::DataType;
 
     fn test_table() -> TableDef {
         TableDef {
@@ -209,11 +209,14 @@ mod tests {
     fn combined_pushdown_and_pruning() {
         let table = test_table();
         let scan = LogicalPlan::Scan(scan_node(&table));
-        let pred = eq_pred(col_ref("b", DataType::Utf8), TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
-        });
+        let pred = eq_pred(
+            col_ref("b", DataType::Utf8),
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::String("x".to_string())),
+                data_type: DataType::Utf8,
+                nullable: false,
+            },
+        );
         let filtered = LogicalPlan::Filter(FilterNode {
             input: Box::new(scan),
             predicate: pred,

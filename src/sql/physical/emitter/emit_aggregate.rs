@@ -4,8 +4,8 @@ use crate::sql::physical::expr_compiler::ExprCompiler;
 use crate::sql::physical::nodes;
 use crate::sql::physical::resolve::{ColumnBinding, ExprScope};
 
-use super::helpers::{agg_call_display_name, typed_expr_display_name};
 use super::EmitResult;
+use super::helpers::{agg_call_display_name, typed_expr_display_name};
 
 impl<'a> super::ThriftEmitter<'a> {
     pub(super) fn emit_aggregate(&mut self, node: AggregateNode) -> Result<EmitResult, String> {
@@ -52,21 +52,14 @@ impl<'a> super::ThriftEmitter<'a> {
 
         for (idx, agg_call) in node.aggregates.iter().enumerate() {
             let mut compiler = ExprCompiler::new(&child.scope);
-            let texpr =
-                compiler.compile_aggregate_call_typed(agg_call)?;
+            let texpr = compiler.compile_aggregate_call_typed(agg_call)?;
             let data_type = agg_call.result_type.clone();
             let nullable = true;
             let name = agg_call_display_name(agg_call);
             let slot_id = self.alloc_slot();
             let col_pos = (agg_start_col + idx) as i32;
-            self.desc_builder.add_slot(
-                slot_id,
-                agg_tuple_id,
-                &name,
-                &data_type,
-                nullable,
-                col_pos,
-            );
+            self.desc_builder
+                .add_slot(slot_id, agg_tuple_id, &name, &data_type, nullable, col_pos);
             agg_scope.add_column(
                 None,
                 name,

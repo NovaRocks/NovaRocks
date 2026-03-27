@@ -24,7 +24,8 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                         required.insert(col.to_lowercase());
                     }
                 }
-                let mut pruned: Vec<String> = scan.columns
+                let mut pruned: Vec<String> = scan
+                    .columns
                     .iter()
                     .filter(|c| required.contains(&c.name.to_lowercase()))
                     .map(|c| c.name.clone())
@@ -56,10 +57,8 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
             for item in &node.items {
                 // If parent restricts needed columns, only include items
                 // whose output name is in the needed set.
-                let dominated = needed.is_none()
-                    || needed
-                        .unwrap()
-                        .contains(&item.output_name.to_lowercase());
+                let dominated =
+                    needed.is_none() || needed.unwrap().contains(&item.output_name.to_lowercase());
                 if dominated {
                     for col in collect_column_refs(&item.expr) {
                         child_needed.insert(col.to_lowercase());
@@ -151,14 +150,26 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
         // Set operations: recurse into each child without column restriction
         // since all branches must produce the same schema.
         LogicalPlan::Union(node) => LogicalPlan::Union(UnionNode {
-            inputs: node.inputs.into_iter().map(|i| prune_inner(i, None)).collect(),
+            inputs: node
+                .inputs
+                .into_iter()
+                .map(|i| prune_inner(i, None))
+                .collect(),
             all: node.all,
         }),
         LogicalPlan::Intersect(node) => LogicalPlan::Intersect(IntersectNode {
-            inputs: node.inputs.into_iter().map(|i| prune_inner(i, None)).collect(),
+            inputs: node
+                .inputs
+                .into_iter()
+                .map(|i| prune_inner(i, None))
+                .collect(),
         }),
         LogicalPlan::Except(node) => LogicalPlan::Except(ExceptNode {
-            inputs: node.inputs.into_iter().map(|i| prune_inner(i, None)).collect(),
+            inputs: node
+                .inputs
+                .into_iter()
+                .map(|i| prune_inner(i, None))
+                .collect(),
         }),
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use arrow::datatypes::DataType;
@@ -9,12 +10,24 @@ pub struct ColumnDef {
     pub nullable: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum TableStorage {
-    LocalParquetFile { path: PathBuf },
+#[derive(Clone, Debug)]
+pub struct S3FileInfo {
+    pub path: String,
+    pub size: i64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+pub enum TableStorage {
+    LocalParquetFile {
+        path: PathBuf,
+    },
+    S3ParquetFiles {
+        files: Vec<S3FileInfo>,
+        cloud_properties: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Clone, Debug)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,

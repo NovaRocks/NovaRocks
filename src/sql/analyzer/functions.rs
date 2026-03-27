@@ -104,9 +104,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "ceil" | "ceiling" | "floor" => DataType::Int64,
 
         // Math functions that return Float64
-        "round" | "truncate" | "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log"
-        | "log2" | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2"
-        | "radians" | "degrees" | "pi" | "e" | "sign" | "rand" | "random" => DataType::Float64,
+        "round" | "truncate" | "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2"
+        | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians"
+        | "degrees" | "pi" | "e" | "sign" | "rand" | "random" => DataType::Float64,
 
         // String length/position -> Int32
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
@@ -154,14 +154,17 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
 pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataType {
     let first_arg = arg_types.first().cloned().unwrap_or(DataType::Null);
     match name {
-        "count" | "count_if" | "bitmap_union_count" | "bitmap_union_int"
-        | "approx_count_distinct" | "ndv"
-        | "hll_union_agg" | "multi_distinct_count" => DataType::Int64,
+        "count"
+        | "count_if"
+        | "bitmap_union_count"
+        | "bitmap_union_int"
+        | "approx_count_distinct"
+        | "ndv"
+        | "hll_union_agg"
+        | "multi_distinct_count" => DataType::Int64,
 
         "sum" => match &first_arg {
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                DataType::Int64
-            }
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
             DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
             _ => DataType::Float64,

@@ -3,11 +3,11 @@
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
-mod scope;
 mod functions;
 mod helpers;
-mod resolve_from;
 mod resolve_expr;
+mod resolve_from;
+mod scope;
 
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
@@ -15,14 +15,13 @@ use sqlparser::ast as sqlast;
 use crate::sql::catalog::CatalogProvider;
 
 use crate::sql::ir::{
-    ExprKind, JoinKind, JoinRelation, OutputColumn,
-    ProjectItem, QueryBody, Relation, ResolvedQuery, ResolvedSelect, ResolvedSetOp,
-    ResolvedValues, SetOpKind, SortItem, TypedExpr,
+    ExprKind, JoinKind, JoinRelation, OutputColumn, ProjectItem, QueryBody, Relation,
+    ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem, TypedExpr,
 };
 use crate::sql::types::wider_type;
 
+use helpers::{expr_display_name, extract_limit, extract_offset};
 use scope::AnalyzerScope;
-use helpers::{extract_limit, extract_offset, expr_display_name};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -254,8 +253,7 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         // --- SELECT list (before GROUP BY so aliases are available) ---
-        let (projection, output_columns) =
-            self.analyze_projection(&select.projection, &scope)?;
+        let (projection, output_columns) = self.analyze_projection(&select.projection, &scope)?;
 
         // --- GROUP BY (with SELECT alias fallback) ---
         let group_by_exprs = match &select.group_by {
@@ -337,11 +335,7 @@ impl<'a> AnalyzerContext<'a> {
     }
 
     /// Replace ColumnRef nodes that match SELECT aliases with the aliased expression.
-    fn substitute_select_aliases(
-        &self,
-        expr: TypedExpr,
-        projection: &[ProjectItem],
-    ) -> TypedExpr {
+    fn substitute_select_aliases(&self, expr: TypedExpr, projection: &[ProjectItem]) -> TypedExpr {
         match expr.kind {
             ExprKind::ColumnRef {
                 ref qualifier,
@@ -474,9 +468,7 @@ impl<'a> AnalyzerContext<'a> {
                         });
                     }
                     if !found {
-                        return Err(format!(
-                            "no columns found for qualifier `{qualifier_str}`"
-                        ));
+                        return Err(format!("no columns found for qualifier `{qualifier_str}`"));
                     }
                 }
             }
@@ -487,10 +479,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Rebuild the FROM scope from an already-resolved Relation tree.
     /// Used by ORDER BY fallback when the expression doesn't match projection columns.
-    fn rebuild_from_scope(
-        &self,
-        relation: &Relation,
-    ) -> Result<((), AnalyzerScope), String> {
+    fn rebuild_from_scope(&self, relation: &Relation) -> Result<((), AnalyzerScope), String> {
         let mut scope = AnalyzerScope::new();
         self.collect_relation_scope(relation, &mut scope)?;
         Ok(((), scope))

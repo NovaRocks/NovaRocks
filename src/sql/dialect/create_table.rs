@@ -3,7 +3,9 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
-use crate::sql::ast::{CreateTableKind, CreateTableStmt, TableColumnDef, TableKeyDesc, TableKeyKind};
+use crate::sql::ast::{
+    CreateTableKind, CreateTableStmt, TableColumnDef, TableKeyDesc, TableKeyKind,
+};
 
 /// Parse StarRocks CREATE TABLE statement:
 /// CREATE TABLE [IF NOT EXISTS] <name> (
@@ -16,7 +18,9 @@ use crate::sql::ast::{CreateTableKind, CreateTableStmt, TableColumnDef, TableKey
 /// [PARTITION BY ...]
 /// [DISTRIBUTED BY HASH(...) [BUCKETS n]]
 /// [PROPERTIES (...)]
-pub(crate) fn parse_create_table_statement(parser: &mut Parser<'_>) -> Result<CreateTableStmt, String> {
+pub(crate) fn parse_create_table_statement(
+    parser: &mut Parser<'_>,
+) -> Result<CreateTableStmt, String> {
     parser
         .expect_keyword(Keyword::CREATE)
         .map_err(|e| e.to_string())?;
