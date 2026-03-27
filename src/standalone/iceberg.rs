@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
@@ -40,11 +41,14 @@ pub(crate) struct IcebergCatalogRegistry {
     catalogs: HashMap<String, IcebergCatalogEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct IcebergCatalogEntry {
-    pub(crate) catalog: Arc<MemoryCatalog>,
-    pub(crate) warehouse_path: PathBuf,
+    pub(crate) name: String,
+    pub(crate) warehouse_uri: String,
     pub(crate) properties: Vec<(String, String)>,
+    s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
+    pub(crate) warehouse_path: PathBuf,
+    table_cache: Arc<std::sync::RwLock<HashMap<(String, String), IcebergLoadedTable>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -69,9 +73,9 @@ impl IcebergCatalogRegistry {
     ) -> Result<(), String> {
         let key = normalize_identifier(catalog_name)?;
         if self.catalogs.contains_key(&key) {
-            return Err(format!("catalog already exists: {catalog_name}"));
+            return Ok(());
         }
-        let entry = build_memory_catalog(catalog_name, properties)?;
+        let entry = build_catalog_entry(catalog_name, properties)?;
         self.catalogs.insert(key, entry);
         Ok(())
     }
@@ -102,58 +106,138 @@ impl IcebergCatalogEntry {
     pub(crate) fn properties(&self) -> &[(String, String)] {
         &self.properties
     }
+
+    pub(crate) fn is_s3(&self) -> bool {
+        self.s3_config.is_some()
+    }
+
+    pub(crate) fn cloud_properties_map(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        for (key, value) in &self.properties {
+            match key.as_str() {
+                "aws.s3.endpoint"
+                | "aws.s3.access_key"
+                | "aws.s3.secret_key"
+                | "aws.s3.enable_path_style_access"
+                | "aws.s3.region" => {
+                    map.insert(key.clone(), value.clone());
+                }
+                _ => {}
+            }
+        }
+        map
+    }
 }
 
 pub(crate) fn create_namespace(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
 ) -> Result<(), String> {
-    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
-    block_on_iceberg(async {
-        entry
-            .catalog
-            .create_namespace(&namespace, HashMap::new())
-            .await
-    })
-    .map_err(|e| format!("create iceberg namespace runtime failed: {e}"))?
-    .map(|_| ())
-    .map_err(|e| format!("create iceberg namespace failed: {e}"))
+    let _ns_name = normalize_identifier(namespace_name)?;
+    // For S3 catalogs, namespace creation is a no-op: the directory structure
+    // is created when tables are written. For local catalogs, create the directory.
+    if !entry.is_s3() {
+        let ns_dir = entry.warehouse_path.join(&_ns_name);
+        std::fs::create_dir_all(&ns_dir).map_err(|e| {
+            format!(
+                "create namespace directory {} failed: {e}",
+                ns_dir.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn namespace_exists(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
 ) -> Result<bool, String> {
-    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
-    block_on_iceberg(async { entry.catalog.namespace_exists(&namespace).await })
-        .map_err(|e| format!("check iceberg namespace runtime failed: {e}"))?
-        .map_err(|e| format!("check iceberg namespace failed: {e}"))
+    let ns_name = normalize_identifier(namespace_name)?;
+    if let Some(s3_config) = &entry.s3_config {
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
+        let (_, root_prefix) = super::iceberg_add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
+        block_on_iceberg(async {
+            match op.list(&ns_prefix).await {
+                Ok(entries) => Ok(!entries.is_empty()),
+                Err(_) => Ok(false),
+            }
+        })
+        .map_err(|e| format!("check namespace runtime: {e}"))?
+    } else {
+        let ns_dir = entry.warehouse_path.join(&ns_name);
+        Ok(ns_dir.is_dir())
+    }
 }
 
 pub(crate) fn drop_namespace(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
 ) -> Result<(), String> {
-    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
-    block_on_iceberg(async { entry.catalog.drop_namespace(&namespace).await })
-        .map_err(|e| format!("drop iceberg namespace runtime failed: {e}"))?
-        .map_err(|e| format!("drop iceberg namespace failed: {e}"))
+    let ns_name = normalize_identifier(namespace_name)?;
+    if entry.is_s3() {
+        // For S3 catalogs, dropping a namespace is a no-op
+        // (we don't recursively delete S3 directories here)
+        Ok(())
+    } else {
+        let ns_dir = entry.warehouse_path.join(&ns_name);
+        if ns_dir.exists() {
+            std::fs::remove_dir_all(&ns_dir).map_err(|e| {
+                format!("drop namespace directory {} failed: {e}", ns_dir.display())
+            })?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn list_tables(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
 ) -> Result<Vec<String>, String> {
-    let namespace = NamespaceIdent::new(normalize_identifier(namespace_name)?);
-    block_on_iceberg(async { entry.catalog.list_tables(&namespace).await })
-        .map_err(|e| format!("list iceberg tables runtime failed: {e}"))?
-        .map(|tables| {
-            tables
-                .into_iter()
-                .map(|table| table.name().to_string())
-                .collect()
+    let ns_name = normalize_identifier(namespace_name)?;
+    if let Some(s3_config) = &entry.s3_config {
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for list tables: {e}"))?;
+        let (_, root_prefix) = super::iceberg_add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
+        block_on_iceberg(async {
+            let entries = op
+                .list(&ns_prefix)
+                .await
+                .map_err(|e| format!("list namespace {ns_name}: {e}"))?;
+            let mut tables = Vec::new();
+            for e in entries {
+                if e.metadata().is_dir() {
+                    let name = e.name().trim_end_matches('/').to_string();
+                    if !name.is_empty() && !name.starts_with('.') {
+                        tables.push(name);
+                    }
+                }
+            }
+            tables.sort();
+            Ok(tables)
         })
-        .map_err(|e| format!("list iceberg tables failed: {e}"))
+        .map_err(|e| format!("list iceberg tables runtime failed: {e}"))?
+    } else {
+        let ns_dir = entry.warehouse_path.join(&ns_name);
+        let entries = std::fs::read_dir(&ns_dir)
+            .map_err(|e| format!("read namespace directory {} failed: {e}", ns_dir.display()))?;
+        let mut tables = Vec::new();
+        for item in entries.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                let name = item.file_name().to_string_lossy().to_string();
+                if !name.starts_with('.') && path.join("metadata").is_dir() {
+                    tables.push(name);
+                }
+            }
+        }
+        tables.sort();
+        Ok(tables)
+    }
 }
 
 pub(crate) fn create_table(
@@ -175,7 +259,15 @@ pub(crate) fn create_table(
         .schema(schema)
         .properties(all_properties)
         .build();
-    block_on_iceberg(async { entry.catalog.create_table(&namespace, table_creation).await })
+
+    // Build a temporary MemoryCatalog for table creation (writes metadata to storage)
+    let temp_catalog = build_temp_memory_catalog(entry)?;
+    let _ = block_on_iceberg(async {
+        temp_catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+    });
+    block_on_iceberg(async { temp_catalog.create_table(&namespace, table_creation).await })
         .map_err(|e| format!("create iceberg table runtime failed: {e}"))?
         .map(|_| ())
         .map_err(|e| format!("create iceberg table failed: {e}"))
@@ -186,14 +278,33 @@ pub(crate) fn drop_table(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<(), String> {
-    let table_ident = TableIdent::from_strs([
-        normalize_identifier(namespace_name)?,
-        normalize_identifier(table_name)?,
-    ])
-    .map_err(|e| format!("build iceberg table ident failed: {e}"))?;
-    block_on_iceberg(async { entry.catalog.drop_table(&table_ident).await })
-        .map_err(|e| format!("drop iceberg table runtime failed: {e}"))?
-        .map_err(|e| format!("drop iceberg table failed: {e}"))
+    let ns_name = normalize_identifier(namespace_name)?;
+    let tbl_name = normalize_identifier(table_name)?;
+
+    // Remove from cache
+    {
+        let mut cache = entry
+            .table_cache
+            .write()
+            .map_err(|e| format!("table cache lock: {e}"))?;
+        cache.remove(&(ns_name.clone(), tbl_name.clone()));
+    }
+
+    if entry.is_s3() {
+        // For S3 catalogs, we don't delete S3 data here.
+        // A proper implementation would use the Iceberg catalog API to purge.
+        tracing::warn!(
+            "drop_table for S3 catalog is a metadata-only operation; S3 data for {ns_name}.{tbl_name} is not deleted"
+        );
+        Ok(())
+    } else {
+        let table_dir = entry.warehouse_path.join(&ns_name).join(&tbl_name);
+        if table_dir.exists() {
+            std::fs::remove_dir_all(&table_dir)
+                .map_err(|e| format!("drop table directory {} failed: {e}", table_dir.display()))?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn load_table(
@@ -201,14 +312,109 @@ pub(crate) fn load_table(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<IcebergLoadedTable, String> {
-    let table_ident = TableIdent::from_strs([
-        normalize_identifier(namespace_name)?,
-        normalize_identifier(table_name)?,
-    ])
-    .map_err(|e| format!("build iceberg table ident failed: {e}"))?;
-    let table = block_on_iceberg(async { entry.catalog.load_table(&table_ident).await })
-        .map_err(|e| format!("load iceberg table runtime failed: {e}"))?
-        .map_err(|e| format!("load iceberg table failed: {e}"))?;
+    let ns_name = normalize_identifier(namespace_name)?;
+    let tbl_name = normalize_identifier(table_name)?;
+
+    // Check cache first
+    {
+        let cache = entry
+            .table_cache
+            .read()
+            .map_err(|e| format!("table cache lock: {e}"))?;
+        if let Some(cached) = cache.get(&(ns_name.clone(), tbl_name.clone())) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let table = if let Some(s3_config) = &entry.s3_config {
+        // S3 path: discover metadata from S3 directly
+        let op = crate::fs::object_store::build_oss_operator(s3_config)
+            .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
+        let (_, root_prefix) = super::iceberg_add_files::parse_s3_path(&entry.warehouse_uri)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let meta_prefix = format!(
+            "{}/{}/{}/metadata/",
+            root_prefix.trim_end_matches('/'),
+            ns_name,
+            tbl_name
+        );
+
+        // Find latest metadata JSON
+        let (metadata_file_name, metadata_bytes) = block_on_iceberg(async {
+            let entries = op
+                .list(&meta_prefix)
+                .await
+                .map_err(|e| format!("list metadata dir {meta_prefix}: {e}"))?;
+            let mut json_files: Vec<String> = entries
+                .iter()
+                .filter(|e| e.name().ends_with(".metadata.json"))
+                .map(|e| e.name().to_string())
+                .collect();
+            json_files.sort();
+            let latest = json_files
+                .last()
+                .ok_or_else(|| format!("no metadata files for {ns_name}.{tbl_name}"))?
+                .clone();
+            let path = format!("{meta_prefix}{latest}");
+            let data = op
+                .read(&path)
+                .await
+                .map_err(|e| format!("read metadata {path}: {e}"))?;
+            Ok::<(String, Vec<u8>), String>((latest, data.to_vec()))
+        })
+        .map_err(|e| format!("load table metadata runtime: {e}"))??;
+
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
+            .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
+
+        let warehouse_trimmed = entry.warehouse_uri.trim_end_matches('/');
+        let metadata_location =
+            format!("{warehouse_trimmed}/{ns_name}/{tbl_name}/metadata/{metadata_file_name}");
+
+        let storage_factory =
+            super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+                .ok_or_else(|| "missing S3 properties for FileIO".to_string())?;
+        let file_io = iceberg::io::FileIOBuilder::new(Arc::new(storage_factory)).build();
+
+        iceberg::table::Table::builder()
+            .file_io(file_io)
+            .metadata(Arc::new(metadata))
+            .identifier(
+                TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
+                    .map_err(|e| format!("build table ident: {e}"))?,
+            )
+            .metadata_location(metadata_location)
+            .build()
+            .map_err(|e| format!("build iceberg table: {e}"))?
+    } else {
+        // Local path: find latest metadata on filesystem
+        let metadata_location = latest_table_metadata_location_local(entry, &ns_name, &tbl_name)?;
+
+        let metadata_path = metadata_location
+            .strip_prefix("file://")
+            .unwrap_or(&metadata_location);
+        let metadata_bytes =
+            std::fs::read(metadata_path).map_err(|e| format!("read local metadata file: {e}"))?;
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_slice(&metadata_bytes)
+            .map_err(|e| format!("deserialize iceberg metadata: {e}"))?;
+
+        let file_io = iceberg::io::FileIOBuilder::new(
+            Arc::new(LocalFsStorageFactory) as Arc<dyn iceberg::io::StorageFactory>
+        )
+        .build();
+
+        iceberg::table::Table::builder()
+            .file_io(file_io)
+            .metadata(Arc::new(metadata))
+            .identifier(
+                TableIdent::from_strs([ns_name.as_str(), tbl_name.as_str()])
+                    .map_err(|e| format!("build table ident: {e}"))?,
+            )
+            .metadata_location(metadata_location)
+            .build()
+            .map_err(|e| format!("build iceberg table: {e}"))?
+    };
+
     let logical_types = parse_logical_type_properties(table.metadata().properties())?;
     let key_desc = parse_table_key_desc_properties(table.metadata().properties())?;
     let column_aggregations = parse_column_aggregation_properties(table.metadata().properties())?;
@@ -234,13 +440,25 @@ pub(crate) fn load_table(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(IcebergLoadedTable {
+
+    let loaded = IcebergLoadedTable {
         table,
         columns,
         logical_types,
         key_desc,
         column_aggregations,
-    })
+    };
+
+    // Cache the loaded table
+    {
+        let mut cache = entry
+            .table_cache
+            .write()
+            .map_err(|e| format!("table cache lock: {e}"))?;
+        cache.insert((ns_name, tbl_name), loaded.clone());
+    }
+
+    Ok(loaded)
 }
 
 pub(crate) fn insert_rows(
@@ -251,6 +469,27 @@ pub(crate) fn insert_rows(
 ) -> Result<(), String> {
     let loaded = load_table(entry, namespace_name, table_name)?;
     let batch = build_insert_batch(&loaded, rows)?;
+
+    // Build a temporary MemoryCatalog for transaction commit
+    let temp_catalog = build_temp_memory_catalog(entry)?;
+    let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
+    let _ = block_on_iceberg(async { temp_catalog.create_namespace(&ns, HashMap::new()).await });
+    let table_ident = TableIdent::from_strs([
+        normalize_identifier(namespace_name)?,
+        normalize_identifier(table_name)?,
+    ])
+    .map_err(|e| format!("build iceberg table ident: {e}"))?;
+    let metadata_location = loaded
+        .table
+        .metadata_location()
+        .ok_or_else(|| "no metadata location for table".to_string())?
+        .to_string();
+    let _ = block_on_iceberg(async {
+        temp_catalog
+            .register_table(&table_ident, metadata_location)
+            .await
+    });
+
     block_on_iceberg(async {
         let location_generator = DefaultLocationGenerator::new(loaded.table.metadata().clone())
             .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e.to_string()))?;
@@ -280,35 +519,68 @@ pub(crate) fn insert_rows(
         let data_files = data_file_writer.close().await?;
         let tx = Transaction::new(&loaded.table);
         let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
-        tx.commit(entry.catalog.as_ref()).await.map(|_| ())
+        tx.commit(&temp_catalog).await.map(|_| ())
     })
     .map_err(|e| format!("insert iceberg rows runtime failed: {e}"))?
-    .map_err(|e| format!("insert iceberg rows failed: {e}"))
+    .map_err(|e| format!("insert iceberg rows failed: {e}"))?;
+
+    // Invalidate cache after insert
+    {
+        let mut cache = entry
+            .table_cache
+            .write()
+            .map_err(|e| format!("table cache lock: {e}"))?;
+        cache.remove(&(
+            normalize_identifier(namespace_name)?,
+            normalize_identifier(table_name)?,
+        ));
+    }
+
+    Ok(())
 }
 
+/// Extract data file paths and sizes from an Iceberg table via scan planning.
+pub(crate) fn extract_data_files(
+    table: &iceberg::table::Table,
+) -> Result<Vec<(String, i64)>, String> {
+    block_on_iceberg(async {
+        let scan = table
+            .scan()
+            .build()
+            .map_err(|e| format!("build scan: {e}"))?;
+        let tasks: Vec<_> = scan
+            .plan_files()
+            .await
+            .map_err(|e| format!("plan files: {e}"))?
+            .try_collect()
+            .await
+            .map_err(|e| format!("collect tasks: {e}"))?;
+        Ok(tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.data_file_path.clone(),
+                    i64::try_from(t.file_size_in_bytes).unwrap_or(i64::MAX),
+                )
+            })
+            .collect())
+    })
+    .map_err(|e| format!("extract data files runtime: {e}"))?
+}
+
+/// Register an existing Iceberg table in the catalog entry by loading it.
+/// This is used by metadata restore to ensure tables are accessible.
 pub(crate) fn register_existing_table(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
     table_name: &str,
 ) -> Result<(), String> {
-    let table_ident = TableIdent::from_strs([
-        normalize_identifier(namespace_name)?,
-        normalize_identifier(table_name)?,
-    ])
-    .map_err(|e| format!("build iceberg table ident failed: {e}"))?;
-    let metadata_location = latest_table_metadata_location(entry, namespace_name, table_name)?;
-    block_on_iceberg(async {
-        entry
-            .catalog
-            .register_table(&table_ident, metadata_location)
-            .await
-    })
-    .map_err(|e| format!("register iceberg table runtime failed: {e}"))?
-    .map(|_| ())
-    .map_err(|e| format!("register iceberg table failed: {e}"))
+    // Simply load the table to populate the cache
+    load_table(entry, namespace_name, table_name)?;
+    Ok(())
 }
 
-fn build_memory_catalog(
+fn build_catalog_entry(
     catalog_name: &str,
     properties: &[(String, String)],
 ) -> Result<IcebergCatalogEntry, String> {
@@ -323,11 +595,13 @@ fn build_memory_catalog(
             "standalone iceberg catalog only supports type=iceberg, got {kind}"
         ));
     }
+    // Accept both "memory" and "hadoop" as valid catalog types (or ignore the field)
     if let Some(catalog_type) = props.get("iceberg.catalog.type")
         && !catalog_type.eq_ignore_ascii_case("memory")
+        && !catalog_type.eq_ignore_ascii_case("hadoop")
     {
         return Err(format!(
-            "standalone iceberg catalog only supports iceberg.catalog.type=memory, got {catalog_type}"
+            "standalone iceberg catalog supports iceberg.catalog.type=memory|hadoop, got {catalog_type}"
         ));
     }
 
@@ -344,15 +618,38 @@ fn build_memory_catalog(
         || raw_warehouse.starts_with("s3a://")
         || raw_warehouse.starts_with("oss://");
 
-    let (warehouse_uri, warehouse_path) = if is_s3 {
+    let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
+        let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
+            properties,
+        )
+        .ok_or_else(|| {
+            "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
+                .to_string()
+        })?;
+        let (bucket, _root_prefix) = super::iceberg_add_files::parse_s3_path(&raw_warehouse)
+            .map_err(|e| format!("parse warehouse URI: {e}"))?;
+        let cfg = crate::fs::object_store::ObjectStoreConfig {
+            endpoint: s3_factory.endpoint.clone(),
+            bucket,
+            root: String::new(),
+            access_key_id: s3_factory.access_key_id.clone(),
+            access_key_secret: s3_factory.access_key_secret.clone(),
+            session_token: None,
+            enable_path_style_access: Some(s3_factory.enable_path_style),
+            region: Some(s3_factory.region.clone()),
+            retry_max_times: Some(3),
+            retry_min_delay_ms: Some(100),
+            retry_max_delay_ms: Some(2000),
+            timeout_ms: Some(30000),
+            io_timeout_ms: Some(30000),
+        };
         // S3 warehouse: keep URI as-is, use a temp local path for metadata cache
         let cache_dir = std::env::temp_dir()
             .join("novarocks_iceberg_cache")
             .join(catalog_name);
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            format!("create iceberg cache dir failed: {e}")
-        })?;
-        (raw_warehouse.clone(), cache_dir)
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("create iceberg cache dir failed: {e}"))?;
+        (raw_warehouse.clone(), cache_dir, Some(cfg))
     } else {
         let (uri, path) = normalize_warehouse_location(&raw_warehouse)?;
         std::fs::create_dir_all(&path).map_err(|e| {
@@ -361,19 +658,33 @@ fn build_memory_catalog(
                 path.display()
             )
         })?;
-        (uri, path)
+        (uri, path, None)
     };
 
     props.insert("type".to_string(), "iceberg".to_string());
-    props.insert("iceberg.catalog.type".to_string(), "memory".to_string());
     props.insert(
         "iceberg.catalog.warehouse".to_string(),
         warehouse_uri.clone(),
     );
 
-    let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if is_s3 {
+    let entry = IcebergCatalogEntry {
+        name: catalog_name.to_string(),
+        warehouse_uri,
+        properties: sorted_properties(&props),
+        s3_config,
+        warehouse_path,
+        table_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+    };
+
+    Ok(entry)
+}
+
+/// Build a temporary MemoryCatalog for operations that need a Catalog impl
+/// (e.g., create_table, insert_rows transaction commit).
+fn build_temp_memory_catalog(entry: &IcebergCatalogEntry) -> Result<MemoryCatalog, String> {
+    let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
         let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
-            properties,
+            &entry.properties,
         )
         .ok_or_else(|| {
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
@@ -384,255 +695,17 @@ fn build_memory_catalog(
         Arc::new(LocalFsStorageFactory)
     };
 
-    let catalog = block_on_iceberg(
+    let warehouse_uri = entry.warehouse_uri.clone();
+    block_on_iceberg(
         MemoryCatalogBuilder::default()
             .with_storage_factory(storage_factory)
             .load(
-                catalog_name.to_string(),
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_uri.clone())]),
+                entry.name.clone(),
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_uri)]),
             ),
     )
-    .map_err(|e| format!("create iceberg catalog runtime failed: {e}"))?
-    .map_err(|e| format!("create iceberg catalog failed: {e}"))?;
-
-    let entry = IcebergCatalogEntry {
-        catalog: Arc::new(catalog),
-        warehouse_path,
-        properties: sorted_properties(&props),
-    };
-
-    // Auto-discover existing tables in the warehouse
-    if is_s3 {
-        if let Err(e) = auto_discover_s3_tables(&entry, &raw_warehouse) {
-            tracing::warn!("auto-discover iceberg tables: {e}");
-        }
-    } else {
-        auto_discover_local_tables(&entry);
-    }
-
-    Ok(entry)
-}
-
-/// Auto-discover existing namespaces and tables from an S3 warehouse.
-fn auto_discover_s3_tables(entry: &IcebergCatalogEntry, warehouse_uri: &str) -> Result<(), String> {
-    let s3_factory =
-        super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
-            .ok_or("missing S3 properties for auto-discovery")?;
-    let (bucket, root_prefix) = super::iceberg_add_files::parse_s3_path(warehouse_uri)
-        .map_err(|e| format!("parse warehouse URI: {e}"))?;
-
-    let cfg = crate::fs::object_store::ObjectStoreConfig {
-        endpoint: s3_factory.endpoint.clone(),
-        bucket: bucket.clone(),
-        root: String::new(),
-        access_key_id: s3_factory.access_key_id.clone(),
-        access_key_secret: s3_factory.access_key_secret.clone(),
-        session_token: None,
-        enable_path_style_access: Some(s3_factory.enable_path_style),
-        region: Some(s3_factory.region.clone()),
-        retry_max_times: Some(3),
-        retry_min_delay_ms: Some(100),
-        retry_max_delay_ms: Some(2000),
-        timeout_ms: Some(30000),
-        io_timeout_ms: Some(30000),
-    };
-    let op = crate::fs::object_store::build_oss_operator(&cfg)
-        .map_err(|e| format!("build S3 operator for discovery: {e}"))?;
-
-    let root = if root_prefix.ends_with('/') {
-        root_prefix
-    } else {
-        format!("{root_prefix}/")
-    };
-
-    // List top-level directories → namespaces
-    let namespaces = block_on_iceberg(async {
-        let entries = op
-            .list(&root)
-            .await
-            .map_err(|e| format!("list warehouse: {e}"))?;
-        let mut ns = Vec::new();
-        for e in entries {
-            if e.metadata().is_dir() {
-                let name = e.name().trim_end_matches('/').to_string();
-                if !name.is_empty() && !name.starts_with('.') {
-                    ns.push(name);
-                }
-            }
-        }
-        Ok::<Vec<String>, String>(ns)
-    })
-    .map_err(|e| format!("discover namespaces runtime: {e}"))??;
-
-    for ns_name in &namespaces {
-        // Create namespace in catalog
-        let ns_ident = NamespaceIdent::new(ns_name.clone());
-        let _ = block_on_iceberg(async {
-            entry
-                .catalog
-                .create_namespace(&ns_ident, HashMap::new())
-                .await
-        });
-
-        // List tables within this namespace
-        let ns_prefix = format!("{root}{ns_name}/");
-        let tables = block_on_iceberg(async {
-            let entries = op
-                .list(&ns_prefix)
-                .await
-                .map_err(|e| format!("list namespace {ns_name}: {e}"))?;
-            let mut tbls = Vec::new();
-            for e in entries {
-                if e.metadata().is_dir() {
-                    let name = e.name().trim_end_matches('/').to_string();
-                    if !name.is_empty() && !name.starts_with('.') {
-                        tbls.push(name);
-                    }
-                }
-            }
-            Ok::<Vec<String>, String>(tbls)
-        })
-        .map_err(|e| format!("discover tables runtime: {e}"))??;
-
-        for table_name in &tables {
-            // Check if this table has a metadata/ directory
-            let meta_prefix = format!("{ns_prefix}{table_name}/metadata/");
-            let has_metadata = block_on_iceberg(async {
-                let entries = op
-                    .list(&meta_prefix)
-                    .await
-                    .unwrap_or_default();
-                entries
-                    .iter()
-                    .any(|e| e.name().ends_with(".metadata.json"))
-            })
-            .unwrap_or(false);
-
-            if has_metadata {
-                // Find the latest metadata.json
-                let metadata_location = find_latest_s3_metadata(
-                    &op,
-                    &meta_prefix,
-                    warehouse_uri,
-                    ns_name,
-                    table_name,
-                )?;
-
-                let table_ident = TableIdent::from_strs([ns_name.as_str(), table_name.as_str()])
-                    .map_err(|e| format!("build table ident: {e}"))?;
-                match block_on_iceberg(async {
-                    entry
-                        .catalog
-                        .register_table(&table_ident, metadata_location.clone())
-                        .await
-                }) {
-                    Ok(Ok(_)) => {
-                        tracing::info!(
-                            "auto-discovered iceberg table: {ns_name}.{table_name}"
-                        );
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            "register discovered table {ns_name}.{table_name}: {e}"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "register discovered table {ns_name}.{table_name} runtime: {e}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Find the latest metadata.json file in an S3 metadata directory.
-fn find_latest_s3_metadata(
-    op: &opendal::Operator,
-    meta_prefix: &str,
-    warehouse_uri: &str,
-    ns_name: &str,
-    table_name: &str,
-) -> Result<String, String> {
-    let files = block_on_iceberg(async {
-        let entries = op
-            .list(meta_prefix)
-            .await
-            .map_err(|e| format!("list metadata dir: {e}"))?;
-        let mut json_files: Vec<String> = entries
-            .iter()
-            .filter(|e| e.name().ends_with(".metadata.json"))
-            .map(|e| e.name().to_string())
-            .collect();
-        json_files.sort();
-        Ok::<Vec<String>, String>(json_files)
-    })
-    .map_err(|e| format!("find metadata runtime: {e}"))??;
-
-    let latest = files
-        .last()
-        .ok_or_else(|| format!("no metadata files for {ns_name}.{table_name}"))?;
-
-    // Build the full S3 URI for the metadata file
-    let warehouse_trimmed = warehouse_uri.trim_end_matches('/');
-    Ok(format!(
-        "{warehouse_trimmed}/{ns_name}/{table_name}/metadata/{latest}"
-    ))
-}
-
-/// Auto-discover tables from a local filesystem warehouse.
-fn auto_discover_local_tables(entry: &IcebergCatalogEntry) {
-    let warehouse = &entry.warehouse_path;
-    let Ok(ns_dirs) = std::fs::read_dir(warehouse) else {
-        return;
-    };
-    for ns_entry in ns_dirs.flatten() {
-        let ns_path = ns_entry.path();
-        if !ns_path.is_dir() {
-            continue;
-        }
-        let ns_name = ns_entry.file_name().to_string_lossy().to_string();
-        if ns_name.starts_with('.') {
-            continue;
-        }
-        // Create namespace
-        let ns_ident = NamespaceIdent::new(ns_name.clone());
-        let _ = block_on_iceberg(async {
-            entry
-                .catalog
-                .create_namespace(&ns_ident, HashMap::new())
-                .await
-        });
-
-        let Ok(table_dirs) = std::fs::read_dir(&ns_path) else {
-            continue;
-        };
-        for table_entry in table_dirs.flatten() {
-            let table_path = table_entry.path();
-            if !table_path.is_dir() {
-                continue;
-            }
-            let table_name = table_entry.file_name().to_string_lossy().to_string();
-            if table_name.starts_with('.') {
-                continue;
-            }
-            let metadata_dir = table_path.join("metadata");
-            if !metadata_dir.is_dir() {
-                continue;
-            }
-            match register_existing_table(entry, &ns_name, &table_name) {
-                Ok(()) => {
-                    tracing::info!("auto-discovered local iceberg table: {ns_name}.{table_name}");
-                }
-                Err(e) => {
-                    tracing::warn!("register local table {ns_name}.{table_name}: {e}");
-                }
-            }
-        }
-    }
+    .map_err(|e| format!("create temp memory catalog runtime: {e}"))?
+    .map_err(|e| format!("create temp memory catalog: {e}"))
 }
 
 pub(crate) fn block_on_iceberg<F>(future: F) -> Result<F::Output, String>
@@ -657,7 +730,7 @@ fn normalize_warehouse_location(raw: &str) -> Result<(String, PathBuf), String> 
     Ok((format!("file://{}", path.display()), path))
 }
 
-fn latest_table_metadata_location(
+fn latest_table_metadata_location_local(
     entry: &IcebergCatalogEntry,
     namespace_name: &str,
     table_name: &str,

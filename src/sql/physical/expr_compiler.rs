@@ -8,10 +8,10 @@ use crate::lower::thrift::type_lowering::scalar_type_desc;
 use crate::opcodes;
 use crate::types;
 
-use crate::sql::plan::AggregateCall;
-use crate::sql::ir::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use super::resolve::ExprScope;
 use super::type_infer::{arithmetic_result_type, arrow_type_to_type_desc, wider_type};
+use crate::sql::ir::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
+use crate::sql::plan::AggregateCall;
 
 /// Compiles sqlparser expressions into Thrift TExpr (flattened pre-order TExprNode list).
 pub(crate) struct ExprCompiler<'a> {
@@ -130,10 +130,8 @@ impl<'a> ExprCompiler<'a> {
                 hdfs_location: None,
                 scalar_fn: None,
                 aggregate_fn: Some({
-                    let asc_order: Vec<bool> =
-                        agg_call.order_by.iter().map(|s| s.asc).collect();
-                    let nf: Vec<bool> =
-                        agg_call.order_by.iter().map(|s| s.nulls_first).collect();
+                    let asc_order: Vec<bool> = agg_call.order_by.iter().map(|s| s.asc).collect();
+                    let nf: Vec<bool> = agg_call.order_by.iter().map(|s| s.nulls_first).collect();
                     types::TAggregateFunction {
                         intermediate_type: intermediate_type_desc,
                         update_fn_symbol: None,
@@ -145,7 +143,11 @@ impl<'a> ExprCompiler<'a> {
                         remove_fn_symbol: None,
                         is_analytic_only_fn: None,
                         symbol: None,
-                        is_asc_order: if asc_order.is_empty() { None } else { Some(asc_order) },
+                        is_asc_order: if asc_order.is_empty() {
+                            None
+                        } else {
+                            Some(asc_order)
+                        },
                         nulls_first: if nf.is_empty() { None } else { Some(nf) },
                         is_distinct: if is_distinct { Some(true) } else { None },
                     }
@@ -171,9 +173,7 @@ impl<'a> ExprCompiler<'a> {
     fn compile_typed_inner(&mut self, expr: &TypedExpr) -> Result<DataType, String> {
         match &expr.kind {
             ExprKind::ColumnRef { qualifier, column } => {
-                let binding =
-                    self.scope
-                        .resolve_column(qualifier.as_deref(), column)?;
+                let binding = self.scope.resolve_column(qualifier.as_deref(), column)?;
                 let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
                 self.nodes
                     .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
@@ -254,7 +254,10 @@ impl<'a> ExprCompiler<'a> {
                     Ok(result_type)
                 }
             },
-            ExprKind::IsNull { expr: inner, negated } => {
+            ExprKind::IsNull {
+                expr: inner,
+                negated,
+            } => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
                 self.nodes.push(exprs::TExprNode {
                     node_type: exprs::TExprNodeType::IS_NULL_PRED,
@@ -478,11 +481,8 @@ impl<'a> ExprCompiler<'a> {
                 let display = typed_expr_display_name(expr);
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
                     let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
-                    self.nodes.push(slot_ref_node(
-                        binding.slot_id,
-                        binding.tuple_id,
-                        type_desc,
-                    ));
+                    self.nodes
+                        .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
                     self.last_type = binding.data_type.clone();
                     self.last_nullable = binding.nullable;
                     Ok(binding.data_type.clone())
@@ -499,16 +499,12 @@ impl<'a> ExprCompiler<'a> {
                 // In a project-over-aggregate context, the scope has aggregate
                 // output columns registered by display name. Try to look up
                 // as a slot reference first.
-                let display = super::emitter::agg_call_display_name_from_parts(
-                    name, args, *distinct,
-                );
+                let display =
+                    super::emitter::agg_call_display_name_from_parts(name, args, *distinct);
                 if let Ok(binding) = self.scope.resolve_column(None, &display) {
                     let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
-                    self.nodes.push(slot_ref_node(
-                        binding.slot_id,
-                        binding.tuple_id,
-                        type_desc,
-                    ));
+                    self.nodes
+                        .push(slot_ref_node(binding.slot_id, binding.tuple_id, type_desc));
                     self.last_type = binding.data_type.clone();
                     self.last_nullable = binding.nullable;
                     Ok(binding.data_type.clone())
@@ -559,7 +555,12 @@ impl<'a> ExprCompiler<'a> {
     ) -> Result<DataType, String> {
         match op {
             // Comparison operators
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
             | BinOp::EqForNull => {
                 let opcode = match op {
                     BinOp::Eq => opcodes::TExprOpcode::EQ,
@@ -1612,14 +1613,16 @@ fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType, String> {
         sqlast::DataType::Varchar(_)
         | sqlast::DataType::CharVarying(_)
         | sqlast::DataType::Text => Ok(DataType::Utf8),
-        sqlast::DataType::Char(_) | sqlast::DataType::Character(_) | sqlast::DataType::String(_) => {
-            Ok(DataType::Utf8)
-        }
+        sqlast::DataType::Char(_)
+        | sqlast::DataType::Character(_)
+        | sqlast::DataType::String(_) => Ok(DataType::Utf8),
         sqlast::DataType::Date => Ok(DataType::Date32),
         sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         ),
-        sqlast::DataType::Time(_, _) => Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond)),
+        sqlast::DataType::Time(_, _) => {
+            Ok(DataType::Time64(arrow::datatypes::TimeUnit::Microsecond))
+        }
         sqlast::DataType::Decimal(info)
         | sqlast::DataType::Dec(info)
         | sqlast::DataType::Numeric(info) => match info {
@@ -1653,34 +1656,90 @@ fn infer_scalar_function_return_type(
 ) -> Result<DataType, String> {
     match name {
         // String functions
-        "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "reverse" | "replace" | "lpad"
-        | "rpad" | "concat" | "concat_ws" | "substr" | "substring" | "left" | "right"
-        | "repeat" | "space" | "hex" | "unhex" | "md5" | "sha2" | "to_base64" | "from_base64"
-        | "url_encode" | "url_decode" | "translate" | "initcap" | "split_part"
-        | "regexp_extract" | "regexp_replace" | "append_trailing_char_if_absent"
-        | "money_format" | "char" | "elt" | "format" | "strleft" | "strright"
-        | "md5sum" | "md5sum_numeric" | "sm3" | "group_concat" | "string_agg"
-        | "substring_index" | "parse_url" | "str_to_map" => {
-            Ok(DataType::Utf8)
-        }
+        "upper"
+        | "lower"
+        | "trim"
+        | "ltrim"
+        | "rtrim"
+        | "reverse"
+        | "replace"
+        | "lpad"
+        | "rpad"
+        | "concat"
+        | "concat_ws"
+        | "substr"
+        | "substring"
+        | "left"
+        | "right"
+        | "repeat"
+        | "space"
+        | "hex"
+        | "unhex"
+        | "md5"
+        | "sha2"
+        | "to_base64"
+        | "from_base64"
+        | "url_encode"
+        | "url_decode"
+        | "translate"
+        | "initcap"
+        | "split_part"
+        | "regexp_extract"
+        | "regexp_replace"
+        | "append_trailing_char_if_absent"
+        | "money_format"
+        | "char"
+        | "elt"
+        | "format"
+        | "strleft"
+        | "strright"
+        | "md5sum"
+        | "md5sum_numeric"
+        | "sm3"
+        | "group_concat"
+        | "string_agg"
+        | "substring_index"
+        | "parse_url"
+        | "str_to_map" => Ok(DataType::Utf8),
 
         // Numeric functions
         "abs" | "negative" => Ok(arg_types.first().cloned().unwrap_or(DataType::Float64)),
         "ceil" | "ceiling" | "floor" => Ok(DataType::Int64),
-        "round" | "truncate" | "mod" | "fmod" | "pow" | "power" | "sqrt" | "cbrt" | "exp"
-        | "ln" | "log" | "log2" | "log10" | "sin" | "cos" | "tan" | "asin" | "acos"
-        | "atan" | "atan2" | "radians" | "degrees" | "pi" | "e" | "sign" | "cot"
-        | "cosine_similarity" | "cosine_similarity_norm" | "l2_distance" => {
-            Ok(DataType::Float64)
-        }
+        "round"
+        | "truncate"
+        | "mod"
+        | "fmod"
+        | "pow"
+        | "power"
+        | "sqrt"
+        | "cbrt"
+        | "exp"
+        | "ln"
+        | "log"
+        | "log2"
+        | "log10"
+        | "sin"
+        | "cos"
+        | "tan"
+        | "asin"
+        | "acos"
+        | "atan"
+        | "atan2"
+        | "radians"
+        | "degrees"
+        | "pi"
+        | "e"
+        | "sign"
+        | "cot"
+        | "cosine_similarity"
+        | "cosine_similarity_norm"
+        | "l2_distance" => Ok(DataType::Float64),
         "rand" | "random" => Ok(DataType::Float64),
         "crc32" => Ok(DataType::Int64),
 
         // String length/position
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
-        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" => {
-            Ok(DataType::Int32)
-        }
+        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" => Ok(DataType::Int32),
 
         // Conditional
         "if" | "ifnull" | "nullif" | "coalesce" | "nvl" | "case" => {
@@ -1696,27 +1755,25 @@ fn infer_scalar_function_return_type(
         }
 
         // Date/time
-        "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" => {
-            Ok(DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                None,
-            ))
-        }
+        "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" => Ok(
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        ),
         "date_format" | "from_unixtime" | "date_add" | "date_sub" | "adddate" | "subdate"
         | "time_format" => Ok(DataType::Utf8),
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
-        | "yearweek"
-        | "dayofyear" | "weekofyear" | "quarter" | "hour_from_unixtime" => Ok(DataType::Int32),
-        "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff"
-        | "months_diff" | "years_diff" | "weeks_diff" | "days_diff" | "hours_diff"
-        | "minutes_diff" | "seconds_diff" | "to_days" | "time_to_sec" => Ok(DataType::Int64),
+        | "yearweek" | "dayofyear" | "weekofyear" | "quarter" | "hour_from_unixtime" => {
+            Ok(DataType::Int32)
+        }
+        "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff" | "months_diff"
+        | "years_diff" | "weeks_diff" | "days_diff" | "hours_diff" | "minutes_diff"
+        | "seconds_diff" | "to_days" | "time_to_sec" => Ok(DataType::Int64),
         "to_date" | "str_to_date" | "from_days" | "makedate" | "last_day" | "next_day" => {
             Ok(DataType::Date32)
         }
-        "days_add" | "days_sub" | "date_trunc" | "timestampadd" | "sec_to_time"
-        | "months_add" | "months_sub" | "years_add" | "years_sub" | "hours_add" | "hours_sub"
-        | "minutes_add" | "minutes_sub" | "seconds_add" | "seconds_sub"
-        | "microseconds_add" | "microseconds_sub" | "weeks_add" | "weeks_sub" => {
+        "days_add" | "days_sub" | "date_trunc" | "timestampadd" | "sec_to_time" | "months_add"
+        | "months_sub" | "years_add" | "years_sub" | "hours_add" | "hours_sub" | "minutes_add"
+        | "minutes_sub" | "seconds_add" | "seconds_sub" | "microseconds_add"
+        | "microseconds_sub" | "weeks_add" | "weeks_sub" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Date32))
         }
 
@@ -1744,10 +1801,13 @@ fn infer_scalar_function_return_type(
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
         "bool_or" | "bool_and" | "every" => Ok(DataType::Boolean),
-        "corr" | "covar_pop" | "covar_samp" | "var_pop" | "var_samp" | "variance"
-        | "stddev" | "stddev_pop" | "stddev_samp" => Ok(DataType::Float64),
-        "percentile_cont" | "percentile_disc" | "percentile_disc_lc"
-        | "percentile_approx" | "percentile_approx_weighted" => Ok(DataType::Float64),
+        "corr" | "covar_pop" | "covar_samp" | "var_pop" | "var_samp" | "variance" | "stddev"
+        | "stddev_pop" | "stddev_samp" => Ok(DataType::Float64),
+        "percentile_cont"
+        | "percentile_disc"
+        | "percentile_disc_lc"
+        | "percentile_approx"
+        | "percentile_approx_weighted" => Ok(DataType::Float64),
         "approx_top_k" | "min_n" | "max_n" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
@@ -1768,9 +1828,7 @@ fn infer_scalar_function_return_type(
             None,
         )),
         "date" | "to_date" => Ok(DataType::Date32),
-        "greatest" | "least" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
-        }
+        "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_length" | "array_position" | "cardinality" => Ok(DataType::Int32),
         "array_contains" | "array_distinct" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
@@ -1783,12 +1841,11 @@ fn infer_scalar_function_return_type(
         "map_keys" | "map_values" | "map_from_arrays" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
-        "json_query" | "json_extract" | "get_json_string" | "get_json_int"
-        | "get_json_double" | "get_json_object" | "json_object" | "json_array"
-        | "to_json" | "parse_json" => Ok(DataType::Utf8),
-        "named_struct" | "struct" => {
-            Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
+        "json_query" | "json_extract" | "get_json_string" | "get_json_int" | "get_json_double"
+        | "get_json_object" | "json_object" | "json_array" | "to_json" | "parse_json" => {
+            Ok(DataType::Utf8)
         }
+        "named_struct" | "struct" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
 
         _ => Err(format!("unknown scalar function: {name}")),
     }
@@ -1840,23 +1897,21 @@ fn infer_agg_function_types(
             Ok((list.clone(), Some(list)))
         }
         "bitmap_union_count" => Ok((DataType::Int64, Some(DataType::Int64))),
-        "approx_count_distinct" | "ndv" => {
-            Ok((DataType::Int64, Some(DataType::Binary)))
-        }
+        "approx_count_distinct" | "ndv" => Ok((DataType::Int64, Some(DataType::Binary))),
         "hll_union_agg" | "hll_raw_agg" => Ok((DataType::Int64, Some(DataType::Int64))),
         "multi_distinct_count" => Ok((DataType::Int64, Some(DataType::Binary))),
         "multi_distinct_sum" => {
             let out = match &first_arg {
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    DataType::Int64
+                }
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
                 DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
                 _ => DataType::Float64,
             };
             Ok((out, Some(DataType::Binary)))
         }
-        "bitmap_union_int" => {
-            Ok((DataType::Int64, Some(DataType::Int64)))
-        }
+        "bitmap_union_int" => Ok((DataType::Int64, Some(DataType::Int64))),
         "max_by" | "min_by" => {
             // max_by(value, key) -> type of value (first arg).
             // Intermediate is serialized binary state.
@@ -1864,10 +1919,12 @@ fn infer_agg_function_types(
         }
         "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance" | "stddev"
         | "stddev_pop" | "stddev_samp" => Ok((DataType::Float64, None)),
-        "percentile_cont" | "percentile_disc" | "percentile_disc_lc"
-        | "percentile_approx" | "percentile_approx_weighted" | "percentile_union" => {
-            Ok((DataType::Float64, None))
-        }
+        "percentile_cont"
+        | "percentile_disc"
+        | "percentile_disc_lc"
+        | "percentile_approx"
+        | "percentile_approx_weighted"
+        | "percentile_union" => Ok((DataType::Float64, None)),
         "approx_top_k" | "min_n" | "max_n" => Ok((first_arg.clone(), None)),
         _ => {
             // Default: assume output same as first arg, intermediate same as output

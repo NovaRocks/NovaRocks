@@ -843,17 +843,26 @@ fn resolve_database_context(
 }
 
 fn parse_object_name(raw: &str) -> Result<Vec<&str>, String> {
-    raw.split('.')
-        .map(str::trim)
-        .map(strip_identifier_quotes)
-        .map(|part| {
-            if part.is_empty() {
-                Err(format!("unsupported identifier `{raw}`"))
-            } else {
-                Ok(part)
-            }
-        })
-        .collect()
+    // MySQL COM_INIT_DB strips the outermost backtick pair, producing strings
+    // like: catalog`.`db  (original was `catalog`.`db`).
+    // Split on the "`.`" pattern first, then fall back to plain '.'.
+    let parts: Vec<&str> = if raw.contains("`.`") {
+        raw.split("`.`")
+            .map(|s| s.trim().trim_matches('`'))
+            .collect()
+    } else {
+        raw.split('.')
+            .map(str::trim)
+            .map(strip_identifier_quotes)
+            .collect()
+    };
+
+    for part in &parts {
+        if part.is_empty() {
+            return Err(format!("unsupported identifier `{raw}`"));
+        }
+    }
+    Ok(parts)
 }
 
 fn strip_identifier_quotes(raw: &str) -> &str {

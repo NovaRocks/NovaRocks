@@ -4,9 +4,9 @@ use sqlparser::ast as sqlast;
 use crate::sql::ir::*;
 use crate::sql::types::{arithmetic_result_type, wider_type};
 
-use super::scope::AnalyzerScope;
 use super::functions::*;
-use super::helpers::{sql_type_to_arrow, eval_const_i64};
+use super::helpers::{eval_const_i64, sql_type_to_arrow};
+use super::scope::AnalyzerScope;
 
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a single expression and produce a TypedExpr.
@@ -59,9 +59,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
 
             // Literals
-            sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => {
-                self.analyze_literal(value)
-            }
+            sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => self.analyze_literal(value),
 
             // Binary operations
             sqlast::Expr::BinaryOp { left, op, right } => {
@@ -230,7 +228,12 @@ impl<'a> super::AnalyzerContext<'a> {
                 conditions,
                 else_result,
                 ..
-            } => self.analyze_case(operand.as_deref(), conditions, else_result.as_deref(), scope),
+            } => self.analyze_case(
+                operand.as_deref(),
+                conditions,
+                else_result.as_deref(),
+                scope,
+            ),
 
             // Function call
             sqlast::Expr::Function(func) => self.analyze_function(func, scope),

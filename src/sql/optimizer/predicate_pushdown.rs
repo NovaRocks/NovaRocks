@@ -34,7 +34,10 @@ fn push_filter_into(predicate: TypedExpr, input: LogicalPlan) -> LogicalPlan {
 
             for conj in conjuncts {
                 let refs = collect_column_refs(&conj);
-                if refs.iter().all(|r| scan_columns.contains(&r.to_lowercase())) {
+                if refs
+                    .iter()
+                    .all(|r| scan_columns.contains(&r.to_lowercase()))
+                {
                     scan.predicates.push(conj);
                 } else {
                     remaining.push(conj);

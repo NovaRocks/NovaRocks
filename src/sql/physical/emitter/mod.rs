@@ -22,10 +22,10 @@ use crate::sql::catalog::CatalogProvider;
 
 use super::descriptors::DescriptorTableBuilder as DescBuilder;
 use super::expr_compiler::ExprCompiler;
-use crate::sql::ir::{self as query_ir, TypedExpr};
-use crate::sql::plan::*;
 use super::nodes;
 use super::resolve::{ExprScope, ResolvedTable};
+use crate::sql::ir::{self as query_ir, TypedExpr};
+use crate::sql::plan::*;
 
 use super::{OutputColumn, PlanBuildResult};
 

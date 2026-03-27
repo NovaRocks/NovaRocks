@@ -77,13 +77,9 @@ impl<'a> super::ThriftEmitter<'a> {
 
         for (idx, (name, binding)) in child_cols.iter().enumerate() {
             // Build a slot-ref TExpr pointing to the child's output
-            let type_desc =
-                type_infer::arrow_type_to_type_desc(&binding.data_type)?;
-            let texpr = expr_compiler::build_slot_ref_texpr(
-                binding.slot_id,
-                binding.tuple_id,
-                type_desc,
-            );
+            let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+            let texpr =
+                expr_compiler::build_slot_ref_texpr(binding.slot_id, binding.tuple_id, type_desc);
             grouping_exprs.push(texpr);
 
             let slot_id = self.alloc_slot();
@@ -179,8 +175,7 @@ impl<'a> super::ThriftEmitter<'a> {
         for child_result in &child_results {
             let mut expr_list = Vec::new();
             for (_, child_binding) in child_result.scope.iter_columns() {
-                let type_desc =
-                    type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
+                let type_desc = type_infer::arrow_type_to_type_desc(&child_binding.data_type)?;
                 expr_list.push(expr_compiler::build_slot_ref_texpr(
                     child_binding.slot_id,
                     child_binding.tuple_id,

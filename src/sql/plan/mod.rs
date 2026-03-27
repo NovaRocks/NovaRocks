@@ -7,9 +7,7 @@ use arrow::datatypes::DataType;
 
 use crate::sql::catalog::TableDef;
 
-use crate::sql::ir::{
-    JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr,
-};
+use crate::sql::ir::{JoinKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
 
 // ---------------------------------------------------------------------------
 // Logical plan tree

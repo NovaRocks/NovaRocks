@@ -3,8 +3,8 @@ use sqlparser::ast as sqlast;
 
 use crate::sql::ir::*;
 
-use super::scope::AnalyzerScope;
 use super::helpers::eval_const_i64;
+use super::scope::AnalyzerScope;
 
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a FROM clause (TableWithJoins).
@@ -12,8 +12,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         twj: &sqlast::TableWithJoins,
     ) -> Result<(Relation, AnalyzerScope), String> {
-        let (mut current_rel, mut current_scope) =
-            self.analyze_table_factor(&twj.relation)?;
+        let (mut current_rel, mut current_scope) = self.analyze_table_factor(&twj.relation)?;
 
         for join in &twj.joins {
             let (right_rel, right_scope) = self.analyze_table_factor(&join.relation)?;
@@ -140,7 +139,9 @@ impl<'a> super::AnalyzerContext<'a> {
                                 }
                             }
                         }
-                        let alias_name = alias.as_ref().map(|a| a.name.value.clone())
+                        let alias_name = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| tbl.clone());
                         let mut scope = AnalyzerScope::new();
                         for col in &resolved_cte.output_columns {
@@ -164,9 +165,7 @@ impl<'a> super::AnalyzerContext<'a> {
 
                 // Build scope
                 let mut scope = AnalyzerScope::new();
-                let qualifier = alias_name
-                    .as_deref()
-                    .unwrap_or(&table_def.name);
+                let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
                 scope.add_table(Some(qualifier), &table_def.columns);
                 // If alias differs from table name, also register with table name
                 if let Some(ref a) = alias_name {
@@ -244,10 +243,10 @@ impl<'a> super::AnalyzerContext<'a> {
             .args
             .iter()
             .map(|arg| match arg {
-                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                    eval_const_i64(e)
-                }
-                other => Err(format!("generate_series expects positional args, got {other}")),
+                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => eval_const_i64(e),
+                other => Err(format!(
+                    "generate_series expects positional args, got {other}"
+                )),
             })
             .collect::<Result<_, _>>()?;
         let (start, end, step) = match values.as_slice() {
