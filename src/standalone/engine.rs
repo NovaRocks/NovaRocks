@@ -3405,6 +3405,10 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
     push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
 
     let handle = ResultSinkHandle::new();
+    // Use available CPU cores for pipeline parallelism (capped at 8)
+    let pipeline_dop = std::thread::available_parallelism()
+        .map(|p| p.get().min(8))
+        .unwrap_or(4);
     execute_plan_with_pipeline(
         exec_plan,
         false,
@@ -3412,7 +3416,7 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
         Box::new(ResultSinkFactory::new(handle.clone())),
         None,
         None,
-        1,
+        pipeline_dop as _,
         std::sync::Arc::new(RuntimeState::default()),
         None,
         None,
