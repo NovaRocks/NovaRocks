@@ -128,6 +128,70 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
     }
 }
 
+/// Collect all column names available from a plan subtree (lowercase).
+///
+/// This is used by predicate pushdown to determine which side of a join a
+/// predicate references.
+pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
+    match plan {
+        LogicalPlan::Scan(s) => s.columns.iter().map(|c| c.name.to_lowercase()).collect(),
+        LogicalPlan::Filter(f) => collect_output_columns(&f.input),
+        LogicalPlan::Project(p) => p
+            .items
+            .iter()
+            .map(|item| item.output_name.to_lowercase())
+            .collect(),
+        LogicalPlan::Join(j) => {
+            let mut cols = collect_output_columns(&j.left);
+            cols.extend(collect_output_columns(&j.right));
+            cols
+        }
+        LogicalPlan::Aggregate(a) => a
+            .output_columns
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect(),
+        LogicalPlan::Sort(s) => collect_output_columns(&s.input),
+        LogicalPlan::Limit(l) => collect_output_columns(&l.input),
+        LogicalPlan::Window(w) => w
+            .output_columns
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect(),
+        LogicalPlan::Union(u) => {
+            if let Some(first) = u.inputs.first() {
+                collect_output_columns(first)
+            } else {
+                HashSet::new()
+            }
+        }
+        LogicalPlan::Intersect(i) => {
+            if let Some(first) = i.inputs.first() {
+                collect_output_columns(first)
+            } else {
+                HashSet::new()
+            }
+        }
+        LogicalPlan::Except(e) => {
+            if let Some(first) = e.inputs.first() {
+                collect_output_columns(first)
+            } else {
+                HashSet::new()
+            }
+        }
+        LogicalPlan::Values(v) => v
+            .columns
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect(),
+        LogicalPlan::GenerateSeries(g) => {
+            let mut cols = HashSet::new();
+            cols.insert(g.column_name.to_lowercase());
+            cols
+        }
+    }
+}
+
 /// Merge a parent's needed columns with additional column names.
 pub(super) fn merge_needed(parent: Option<&HashSet<String>>, extra: &[&str]) -> HashSet<String> {
     let mut result = parent.cloned().unwrap_or_default();
