@@ -3219,6 +3219,16 @@ fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut
                     extract_table_names_from_table_factor(&join.relation, names);
                 }
             }
+            // Also extract table names from subqueries in WHERE/HAVING/SELECT
+            extract_table_names_from_expr_opt(s.selection.as_ref(), names);
+            extract_table_names_from_expr_opt(s.having.as_ref(), names);
+            for item in &s.projection {
+                if let sqlparser::ast::SelectItem::UnnamedExpr(expr)
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = item
+                {
+                    extract_table_names_from_expr(expr, names);
+                }
+            }
         }
         sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
             extract_table_names_from_set_expr(left, names);
@@ -3251,6 +3261,47 @@ fn extract_table_names_from_table_factor(
         }
         _ => {}
     }
+}
+
+fn extract_table_names_from_expr_opt(expr: Option<&sqlparser::ast::Expr>, names: &mut Vec<String>) {
+    if let Some(e) = expr {
+        extract_table_names_from_expr(e, names);
+    }
+}
+
+fn extract_table_names_from_expr(expr: &sqlparser::ast::Expr, names: &mut Vec<String>) {
+    // Use the Display impl to get the SQL string, then recursively look for
+    // subquery patterns. This is simpler than matching every AST variant.
+    // For subquery extraction, we only need to find Subquery/Exists/InSubquery nodes.
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+            extract_table_names_from_subquery(q, names);
+        }
+        Expr::InSubquery { subquery, expr, .. } => {
+            extract_table_names_from_subquery(subquery, names);
+            extract_table_names_from_expr(expr, names);
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            extract_table_names_from_expr(left, names);
+            extract_table_names_from_expr(right, names);
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Nested(expr) => {
+            extract_table_names_from_expr(expr, names);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            extract_table_names_from_expr(expr, names);
+            extract_table_names_from_expr(low, names);
+            extract_table_names_from_expr(high, names);
+        }
+        _ => {} // literals, column refs, functions, etc.
+    }
+}
+
+fn extract_table_names_from_subquery(query: &sqlparser::ast::Query, names: &mut Vec<String>) {
+    extract_table_names_from_set_expr(query.body.as_ref(), names);
 }
 
 // ---------------------------------------------------------------------------

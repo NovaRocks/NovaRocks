@@ -68,4 +68,6 @@ pub(crate) fn arrow_type_to_primitive(
     }
 }
 
-pub(crate) use crate::sql::types::{arithmetic_result_type, wider_type};
+pub(crate) use crate::sql::types::{
+    arithmetic_result_type, arithmetic_result_type_with_op, wider_type,
+};

@@ -2,7 +2,7 @@ use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
 
 use crate::sql::ir::*;
-use crate::sql::types::{arithmetic_result_type, wider_type};
+use crate::sql::types::{arithmetic_result_type_with_op, wider_type};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, sql_type_to_arrow};
@@ -300,14 +300,77 @@ impl<'a> super::AnalyzerContext<'a> {
                 })
             }
 
-            // Subquery expression (EXISTS, IN subquery, scalar subquery)
+            // Subquery expression: EXISTS / NOT EXISTS
             sqlast::Expr::Exists { subquery, negated } => {
-                let _resolved = self.analyze_query(subquery)?;
-                // EXISTS returns Boolean. We store it as a nested expression for now.
+                let id = self.alloc_subquery_id();
+                let kind = SubqueryKind::Exists { negated: *negated };
+                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
+                    id,
+                    kind: kind.clone(),
+                    subquery: subquery.clone(),
+                    data_type: DataType::Boolean,
+                    in_expr: None,
+                });
                 Ok(TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Bool(!negated)),
+                    kind: ExprKind::SubqueryPlaceholder {
+                        id,
+                        kind,
+                        data_type: DataType::Boolean,
+                    },
                     data_type: DataType::Boolean,
                     nullable: false,
+                })
+            }
+
+            // Subquery expression: col [NOT] IN (SELECT ...)
+            sqlast::Expr::InSubquery {
+                expr: in_expr,
+                subquery,
+                negated,
+            } => {
+                let id = self.alloc_subquery_id();
+                let kind = SubqueryKind::InSubquery { negated: *negated };
+                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
+                    id,
+                    kind: kind.clone(),
+                    subquery: subquery.clone(),
+                    data_type: DataType::Boolean,
+                    in_expr: Some(in_expr.clone()),
+                });
+                Ok(TypedExpr {
+                    kind: ExprKind::SubqueryPlaceholder {
+                        id,
+                        kind,
+                        data_type: DataType::Boolean,
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                })
+            }
+
+            // Scalar subquery: (SELECT ...)
+            sqlast::Expr::Subquery(subquery) => {
+                let id = self.alloc_subquery_id();
+                // We don't know the exact scalar type yet; it will be resolved
+                // during subquery rewriting. Use Null as placeholder.
+                let kind = SubqueryKind::Scalar;
+                self.collected_subqueries.borrow_mut().push(SubqueryInfo {
+                    id,
+                    kind: kind.clone(),
+                    subquery: subquery.clone(),
+                    data_type: DataType::Null,
+                    in_expr: None,
+                });
+                // Return a placeholder with Null type; the rewrite pass will
+                // replace it with a ColumnRef of the proper type.
+                Ok(TypedExpr {
+                    kind: ExprKind::SubqueryPlaceholder {
+                        id,
+                        kind,
+                        data_type: DataType::Null,
+                    },
+                    data_type: DataType::Null,
+                    nullable: true,
                 })
             }
 
@@ -315,6 +378,19 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::Expr::TypedString(typed_str) => {
                 let target = sql_type_to_arrow(&typed_str.data_type)?;
                 let value = typed_str.value.to_string();
+                // For DATE literals, constant-fold to Date32 integer value
+                if target == DataType::Date32 {
+                    let date_str = value.trim_matches('\'');
+                    let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                        .map_err(|e| format!("invalid date literal '{date_str}': {e}"))?
+                        .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                        .num_days() as i64;
+                    return Ok(TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Int(days)),
+                        data_type: DataType::Date32,
+                        nullable: false,
+                    });
+                }
                 Ok(TypedExpr {
                     kind: ExprKind::Cast {
                         expr: Box::new(TypedExpr {
@@ -494,23 +570,43 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Arithmetic operators -> inferred type
             sqlast::BinaryOperator::Plus => {
-                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
+                let dt = arithmetic_result_type_with_op(
+                    &left_typed.data_type,
+                    &right_typed.data_type,
+                    "add",
+                );
                 (BinOp::Add, dt)
             }
             sqlast::BinaryOperator::Minus => {
-                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
+                let dt = arithmetic_result_type_with_op(
+                    &left_typed.data_type,
+                    &right_typed.data_type,
+                    "add",
+                );
                 (BinOp::Sub, dt)
             }
             sqlast::BinaryOperator::Multiply => {
-                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
+                let dt = arithmetic_result_type_with_op(
+                    &left_typed.data_type,
+                    &right_typed.data_type,
+                    "mul",
+                );
                 (BinOp::Mul, dt)
             }
             sqlast::BinaryOperator::Divide => {
-                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
+                let dt = arithmetic_result_type_with_op(
+                    &left_typed.data_type,
+                    &right_typed.data_type,
+                    "div",
+                );
                 (BinOp::Div, dt)
             }
             sqlast::BinaryOperator::Modulo => {
-                let dt = arithmetic_result_type(&left_typed.data_type, &right_typed.data_type);
+                let dt = arithmetic_result_type_with_op(
+                    &left_typed.data_type,
+                    &right_typed.data_type,
+                    "add",
+                );
                 (BinOp::Mod, dt)
             }
 

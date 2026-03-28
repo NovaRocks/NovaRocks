@@ -8,6 +8,7 @@ mod helpers;
 mod resolve_expr;
 mod resolve_from;
 mod scope;
+mod subquery_rewrite;
 
 use arrow::datatypes::DataType;
 use sqlparser::ast as sqlast;
@@ -16,7 +17,8 @@ use crate::sql::catalog::CatalogProvider;
 
 use crate::sql::ir::{
     ExprKind, JoinKind, JoinRelation, OutputColumn, ProjectItem, QueryBody, Relation,
-    ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem, TypedExpr,
+    ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
+    SubqueryInfo, TypedExpr,
 };
 use crate::sql::types::wider_type;
 
@@ -37,6 +39,8 @@ pub(crate) fn analyze(
         catalog,
         current_database,
         ctes: std::collections::HashMap::new(),
+        next_subquery_id: std::cell::Cell::new(0),
+        collected_subqueries: std::cell::RefCell::new(Vec::new()),
     };
     ctx.analyze_query(query)
 }
@@ -51,9 +55,21 @@ pub(super) struct AnalyzerContext<'a> {
     /// CTE definitions from WITH clause, keyed by lowercase name.
     /// Value is (query, optional column aliases).
     pub(super) ctes: std::collections::HashMap<String, (sqlast::Query, Vec<String>)>,
+    /// Counter for generating unique subquery placeholder IDs.
+    pub(super) next_subquery_id: std::cell::Cell<usize>,
+    /// Subqueries collected during expression analysis.
+    /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
+    pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
 }
 
 impl<'a> AnalyzerContext<'a> {
+    /// Allocate a unique subquery placeholder ID.
+    pub(super) fn alloc_subquery_id(&self) -> usize {
+        let id = self.next_subquery_id.get();
+        self.next_subquery_id.set(id + 1);
+        id
+    }
+
     /// Top-level query analysis.
     fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
         // Register CTEs from WITH clause (if any) into a child context.
@@ -74,6 +90,8 @@ impl<'a> AnalyzerContext<'a> {
                 catalog: self.catalog,
                 current_database: self.current_database,
                 ctes,
+                next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+                collected_subqueries: std::cell::RefCell::new(Vec::new()),
             };
             &child_ctx
         } else {
@@ -320,18 +338,26 @@ impl<'a> AnalyzerContext<'a> {
         // --- DISTINCT ---
         let distinct = matches!(select.distinct, Some(sqlast::Distinct::Distinct));
 
-        Ok((
-            ResolvedSelect {
-                from,
-                filter,
-                group_by,
-                having,
-                projection,
-                has_aggregation,
-                distinct,
-            },
-            output_columns,
-        ))
+        let mut resolved_select = ResolvedSelect {
+            from,
+            filter,
+            group_by,
+            having,
+            projection,
+            has_aggregation,
+            distinct,
+        };
+
+        // --- Subquery rewriting ---
+        // If the WHERE or HAVING clause contained subqueries (recorded as
+        // SubqueryPlaceholder nodes), rewrite them into JOINs now.
+        let has_subqueries = !self.collected_subqueries.borrow().is_empty();
+        if has_subqueries {
+            let mut mutable_scope = scope;
+            self.rewrite_subqueries(&mut resolved_select, &mut mutable_scope)?;
+        }
+
+        Ok((resolved_select, output_columns))
     }
 
     /// Replace ColumnRef nodes that match SELECT aliases with the aliased expression.
@@ -628,5 +654,456 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(sort_items)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::ir::{ExprKind, JoinKind, Relation};
+
+    struct TestCatalog;
+    impl crate::sql::catalog::CatalogProvider for TestCatalog {
+        fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+            match table {
+                "orders" => Ok(TableDef {
+                    name: "orders".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "o_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "o_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "o_orderstatus".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "o_totalprice".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "o_orderdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "o_orderpriority".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/orders.parquet"),
+                    },
+                }),
+                "lineitem" => Ok(TableDef {
+                    name: "lineitem".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "l_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "l_partkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "l_suppkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "l_quantity".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_extendedprice".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_discount".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_commitdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_receiptdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_shipdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/lineitem.parquet"),
+                    },
+                }),
+                "supplier" => Ok(TableDef {
+                    name: "supplier".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "s_suppkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "s_name".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "s_comment".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/supplier.parquet"),
+                    },
+                }),
+                "part" => Ok(TableDef {
+                    name: "part".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "p_partkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "p_name".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "p_brand".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/part.parquet"),
+                    },
+                }),
+                "partsupp" => Ok(TableDef {
+                    name: "partsupp".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "ps_partkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "ps_suppkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "ps_supplycost".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "ps_availqty".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/partsupp.parquet"),
+                    },
+                }),
+                "customer" => Ok(TableDef {
+                    name: "customer".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "c_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "c_acctbal".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "c_phone".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/customer.parquet"),
+                    },
+                }),
+                "nation" => Ok(TableDef {
+                    name: "nation".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "n_nationkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "n_name".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/nation.parquet"),
+                    },
+                }),
+                _ => Err(format!("table not found: {table}")),
+            }
+        }
+    }
+
+    fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .map_err(|e| format!("parse error: {e}"))?;
+        let stmt = stmts.into_iter().next().ok_or("empty SQL")?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => return Err("expected a query".into()),
+        };
+        analyze(&query, &TestCatalog, "default")
+    }
+
+    /// Helper to check that a Relation tree contains a JOIN of a given kind.
+    fn has_join_kind(rel: &Relation, kind: JoinKind) -> bool {
+        match rel {
+            Relation::Join(jr) => {
+                jr.join_type == kind
+                    || has_join_kind(&jr.left, kind)
+                    || has_join_kind(&jr.right, kind)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn exists_subquery_rewrites_to_left_semi_join() {
+        let sql = "SELECT o_orderpriority, count(*) FROM orders \
+                    WHERE exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey) \
+                    GROUP BY o_orderpriority";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "EXISTS should be rewritten to LEFT SEMI JOIN, got: {from:?}"
+            );
+            // The placeholder should be removed from the filter
+            assert!(
+                sel.filter.is_none() || !filter_has_placeholder(&sel.filter),
+                "filter should not contain SubqueryPlaceholder"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn not_exists_subquery_rewrites_to_left_anti_join() {
+        let sql = "SELECT o_orderpriority FROM orders \
+                    WHERE not exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftAnti),
+                "NOT EXISTS should be rewritten to LEFT ANTI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn in_subquery_rewrites_to_left_semi_join() {
+        let sql = "SELECT o_orderkey FROM orders \
+                    WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "IN should be rewritten to LEFT SEMI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn not_in_subquery_rewrites_to_left_anti_join() {
+        let sql = "SELECT s_suppkey FROM supplier \
+                    WHERE s_suppkey NOT IN (SELECT ps_suppkey FROM partsupp)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftAnti),
+                "NOT IN should be rewritten to LEFT ANTI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn uncorrelated_scalar_subquery_rewrites_to_cross_join() {
+        let sql = "SELECT c_custkey FROM customer \
+                    WHERE c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::Cross),
+                "uncorrelated scalar subquery should be rewritten to CROSS JOIN, got: {from:?}"
+            );
+            // The filter should still exist (the comparison) but no placeholder
+            assert!(
+                sel.filter.is_some(),
+                "filter should still contain the comparison"
+            );
+            assert!(
+                !filter_has_placeholder(&sel.filter),
+                "filter should not contain SubqueryPlaceholder"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn correlated_scalar_subquery_rewrites_to_left_join() {
+        let sql = "SELECT l_orderkey FROM lineitem, part \
+                    WHERE p_partkey = l_partkey \
+                    AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftOuter),
+                "correlated scalar subquery should be rewritten to LEFT OUTER JOIN, got: {from:?}"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn scalar_subquery_in_having_rewrites_to_cross_join() {
+        let sql = "SELECT ps_partkey, sum(ps_supplycost) as value FROM partsupp \
+                    GROUP BY ps_partkey \
+                    HAVING sum(ps_supplycost) > (SELECT sum(ps_supplycost) * 0.0001 FROM partsupp)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::Cross),
+                "scalar subquery in HAVING should be rewritten to CROSS JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn multiple_subqueries_exists_and_not_exists() {
+        // q21 pattern: EXISTS + NOT EXISTS in the same WHERE
+        let sql = "SELECT s_name FROM supplier, lineitem l1, orders, nation \
+                    WHERE s_suppkey = l1.l_suppkey \
+                    AND o_orderkey = l1.l_orderkey \
+                    AND exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) \
+                    AND not exists (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "EXISTS should produce LEFT SEMI JOIN"
+            );
+            assert!(
+                has_join_kind(from, JoinKind::LeftAnti),
+                "NOT EXISTS should produce LEFT ANTI JOIN"
+            );
+            assert!(
+                !filter_has_placeholder(&sel.filter),
+                "filter should not contain SubqueryPlaceholder"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn subquery_in_from_derived_table() {
+        // q22 pattern: subquery inside a derived table in FROM
+        let sql = "SELECT cntrycode FROM \
+                    (SELECT substring(c_phone, 1, 2) as cntrycode, c_acctbal FROM customer \
+                     WHERE c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00)) as custsale";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        // The subquery in the derived table should be rewritten to a CROSS JOIN
+        // within the derived table's ResolvedQuery
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn in_subquery_with_group_by_having() {
+        // q18 pattern: IN subquery with GROUP BY and HAVING
+        let sql = "SELECT o_orderkey FROM orders \
+                    WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 315)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "IN subquery should be rewritten to LEFT SEMI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    fn filter_has_placeholder(filter: &Option<TypedExpr>) -> bool {
+        match filter {
+            Some(expr) => expr_has_placeholder(expr),
+            None => false,
+        }
+    }
+
+    fn expr_has_placeholder(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            ExprKind::SubqueryPlaceholder { .. } => true,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_placeholder(left) || expr_has_placeholder(right)
+            }
+            ExprKind::UnaryOp { expr, .. } => expr_has_placeholder(expr),
+            ExprKind::Nested(inner) => expr_has_placeholder(inner),
+            _ => false,
+        }
     }
 }

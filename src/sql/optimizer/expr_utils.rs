@@ -122,6 +122,9 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
                 collect_column_refs_inner(&ob.expr, out);
             }
         }
+        // SubqueryPlaceholder should be rewritten before reaching here,
+        // but handle gracefully as a no-op.
+        ExprKind::SubqueryPlaceholder { .. } => {}
     }
 }
 

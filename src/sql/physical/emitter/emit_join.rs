@@ -17,8 +17,6 @@ impl<'a> super::ThriftEmitter<'a> {
         let right = self.emit_node(*node.right)?;
 
         let join_op = join_kind_to_op(node.join_type);
-        let left_tuple = *left.tuple_ids.last().unwrap();
-        let right_tuple = *right.tuple_ids.last().unwrap();
 
         // Extract equi-join conditions from the join condition
         let (eq_conds, other_conds) = match node.condition {
@@ -30,8 +28,8 @@ impl<'a> super::ThriftEmitter<'a> {
         let join_plan_node = if join_op == plan_nodes::TJoinOp::CROSS_JOIN {
             nodes::build_nestloop_join_node(
                 join_node_id,
-                left_tuple,
-                right_tuple,
+                &left.tuple_ids,
+                &right.tuple_ids,
                 join_op,
                 other_conds,
             )
@@ -39,16 +37,16 @@ impl<'a> super::ThriftEmitter<'a> {
             // No equality conditions — fall back to nested loop join
             nodes::build_nestloop_join_node(
                 join_node_id,
-                left_tuple,
-                right_tuple,
+                &left.tuple_ids,
+                &right.tuple_ids,
                 join_op,
                 other_conds,
             )
         } else {
             nodes::build_hash_join_node(
                 join_node_id,
-                left_tuple,
-                right_tuple,
+                &left.tuple_ids,
+                &right.tuple_ids,
                 join_op,
                 eq_conds,
                 other_conds,
