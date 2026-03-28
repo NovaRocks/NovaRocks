@@ -73,8 +73,7 @@ impl<'a> AnalyzerContext<'a> {
         sq_info: SubqueryInfo,
         negated: bool,
     ) -> Result<(), String> {
-        let (resolved, inner_scope) =
-            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
+        let resolved = self.analyze_query_in_scope(&sq_info.subquery, scope)?;
 
         let join_type = if negated {
             JoinKind::LeftAnti
@@ -82,71 +81,14 @@ impl<'a> AnalyzerContext<'a> {
             JoinKind::LeftSemi
         };
 
-        // For EXISTS, the subquery FROM becomes the right side of the join.
-        // The subquery WHERE is split into:
-        //   - correlation predicates → join ON condition
-        //   - remaining inner predicates → kept in the subquery WHERE
+        // For EXISTS, the entire subquery WHERE becomes the join ON condition,
+        // and the subquery FROM becomes the right side of the join.
         let (sub_from, sub_filter) = match resolved.body {
             QueryBody::Select(sel) => (sel.from, sel.filter),
             _ => return Err("EXISTS subquery must be a SELECT".into()),
         };
 
         let sub_rel = sub_from.ok_or("EXISTS subquery must have a FROM clause")?;
-
-        // Extract correlation predicates from the subquery WHERE
-        let join_condition = if let Some(ref filter) = sub_filter {
-            let corr_preds = extract_correlation_predicates(filter, &inner_scope, scope);
-            if corr_preds.is_empty() {
-                // No correlation — use full filter as join condition
-                sub_filter
-            } else {
-                // Build join condition from correlation predicates
-                let mut cond = TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(corr_preds[0].outer_col.clone()),
-                        op: corr_preds[0].op,
-                        right: Box::new(corr_preds[0].inner_col.clone()),
-                    },
-                };
-                for pred in &corr_preds[1..] {
-                    cond = TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        kind: ExprKind::BinaryOp {
-                            left: Box::new(cond),
-                            op: BinOp::And,
-                            right: Box::new(TypedExpr {
-                                data_type: DataType::Boolean,
-                                nullable: false,
-                                kind: ExprKind::BinaryOp {
-                                    left: Box::new(pred.outer_col.clone()),
-                                    op: pred.op,
-                                    right: Box::new(pred.inner_col.clone()),
-                                },
-                            }),
-                        },
-                    };
-                }
-                // Also include non-correlation predicates from the filter
-                let remaining = remove_correlation_preds_from_expr(filter, &corr_preds);
-                if let Some(remaining) = remaining {
-                    cond = TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        kind: ExprKind::BinaryOp {
-                            left: Box::new(cond),
-                            op: BinOp::And,
-                            right: Box::new(remaining),
-                        },
-                    };
-                }
-                Some(cond)
-            }
-        } else {
-            None
-        };
 
         let current_from = select
             .from
@@ -157,7 +99,7 @@ impl<'a> AnalyzerContext<'a> {
             left: current_from,
             right: sub_rel,
             join_type,
-            condition: join_condition,
+            condition: sub_filter,
         })));
 
         Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
@@ -333,11 +275,6 @@ impl<'a> AnalyzerContext<'a> {
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
-            Self::replace_placeholder_in_projection(
-                &mut select.projection,
-                sq_info.id,
-                &replacement,
-            );
         } else {
             let scalar_col = resolved_sub.output_columns[0].clone();
             let sub_rel = Relation::Subquery {
@@ -375,11 +312,6 @@ impl<'a> AnalyzerContext<'a> {
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
-            Self::replace_placeholder_in_projection(
-                &mut select.projection,
-                sq_info.id,
-                &replacement,
-            );
         }
 
         Ok(())
@@ -412,8 +344,6 @@ impl<'a> AnalyzerContext<'a> {
             ctes: self.ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
-            shared_cte_ids: self.shared_cte_ids.clone(),
-            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
 
         let result = child_ctx.analyze_query_with_outer_scope_inner(query, outer_scope)?;
@@ -459,8 +389,6 @@ impl<'a> AnalyzerContext<'a> {
                 ctes,
                 next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
                 collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                shared_cte_ids: self.shared_cte_ids.clone(),
-                cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
             };
             &child_ctx
         } else {
@@ -607,7 +535,6 @@ impl<'a> AnalyzerContext<'a> {
             projection,
             has_aggregation,
             distinct,
-            repeat: None,
         };
 
         // Rewrite nested subqueries within this SELECT if any were collected
@@ -760,19 +687,6 @@ impl<'a> AnalyzerContext<'a> {
             *filter = Some(new_expr);
         }
     }
-
-    /// Replace subquery placeholders in projection items (SELECT list).
-    /// This handles scalar subqueries that appear in the SELECT list
-    /// (e.g., TPC-DS q9: CASE WHEN (SELECT ...) > N THEN (SELECT ...) ELSE (SELECT ...) END).
-    fn replace_placeholder_in_projection(
-        projection: &mut [ProjectItem],
-        placeholder_id: usize,
-        replacement: &TypedExpr,
-    ) {
-        for item in projection.iter_mut() {
-            item.expr = replace_placeholder_in_expr(&item.expr, placeholder_id, replacement);
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +728,7 @@ fn extract_corr_preds_inner(
 ) {
     match &expr.kind {
         ExprKind::BinaryOp { left, op, right } => match op {
-            BinOp::And | BinOp::Or => {
+            BinOp::And => {
                 extract_corr_preds_inner(left, inner_scope, outer_scope, out);
                 extract_corr_preds_inner(right, inner_scope, outer_scope, out);
             }
@@ -849,9 +763,6 @@ fn extract_corr_preds_inner(
             }
             _ => {}
         },
-        ExprKind::Nested(inner) => {
-            extract_corr_preds_inner(inner, inner_scope, outer_scope, out);
-        }
         _ => {}
     }
 }
@@ -884,13 +795,16 @@ fn is_placeholder(expr: &TypedExpr, id: usize) -> bool {
 
 fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> TypedExpr {
     match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And | BinOp::Or) => {
-            let identity = matches!(op, BinOp::And); // AND identity = true, OR identity = false
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
             let left_is = is_placeholder(left, placeholder_id);
             let right_is = is_placeholder(right, placeholder_id);
             if left_is && right_is {
                 TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Bool(identity)),
+                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
                     data_type: DataType::Boolean,
                     nullable: false,
                 }
@@ -906,7 +820,7 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                     nullable: false,
                     kind: ExprKind::BinaryOp {
                         left: Box::new(new_left),
-                        op: *op,
+                        op: BinOp::And,
                         right: Box::new(new_right),
                     },
                 }
@@ -1152,31 +1066,6 @@ fn replace_placeholder_in_expr(
                 )),
                 value: *value,
                 negated: *negated,
-            },
-        },
-        ExprKind::WindowCall {
-            name,
-            args,
-            distinct,
-            partition_by,
-            order_by,
-            window_frame,
-        } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::WindowCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
-                    .collect(),
-                distinct: *distinct,
-                partition_by: partition_by
-                    .iter()
-                    .map(|p| replace_placeholder_in_expr(p, placeholder_id, replacement))
-                    .collect(),
-                order_by: order_by.clone(),
-                window_frame: window_frame.clone(),
             },
         },
         _ => expr.clone(),

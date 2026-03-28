@@ -9,7 +9,9 @@ use crate::opcodes;
 use crate::types;
 
 use super::resolve::ExprScope;
-use super::type_infer::{arithmetic_result_type, arrow_type_to_type_desc, wider_type};
+use super::type_infer::{
+    arithmetic_result_type, arithmetic_result_type_with_op, arrow_type_to_type_desc, wider_type,
+};
 use crate::sql::ir::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::plan::AggregateCall;
 
@@ -170,6 +172,28 @@ impl<'a> ExprCompiler<'a> {
         Ok(exprs::TExpr::new(std::mem::take(&mut self.nodes)))
     }
 
+    /// Compile an expression, inserting a CAST wrapper if its type differs from the target.
+    fn compile_with_cast_if_needed(
+        &mut self,
+        expr: &TypedExpr,
+        target_type: &DataType,
+    ) -> Result<DataType, String> {
+        if expr.data_type != *target_type && needs_comparison_cast(&expr.data_type, target_type) {
+            let cast_type_desc = arrow_type_to_type_desc(target_type)?;
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::CAST_EXPR,
+                type_: cast_type_desc,
+                num_children: 1,
+                opcode: None,
+                ..default_expr_node()
+            });
+            self.compile_typed_inner(expr)?;
+            Ok(target_type.clone())
+        } else {
+            self.compile_typed_inner(expr)
+        }
+    }
+
     fn compile_typed_inner(&mut self, expr: &TypedExpr) -> Result<DataType, String> {
         match &expr.kind {
             ExprKind::ColumnRef { qualifier, column } => {
@@ -181,7 +205,7 @@ impl<'a> ExprCompiler<'a> {
                 self.last_nullable = binding.nullable;
                 Ok(binding.data_type.clone())
             }
-            ExprKind::Literal(lit) => self.compile_literal(lit),
+            ExprKind::Literal(lit) => self.compile_literal(lit, &expr.data_type),
             ExprKind::BinaryOp { left, op, right } => {
                 self.compile_typed_binary_op(left, *op, right)
             }
@@ -310,11 +334,11 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     });
                     // LT: expr < low
+                    let lt_child_type = wider_type(&inner.data_type, &low.data_type);
                     let lt_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    let inner_type = self.compile_typed_inner(inner)?;
-                    let low_type = self.compile_typed_inner(low)?;
-                    let lt_child_type = wider_type(&inner_type, &low_type);
+                    self.compile_with_cast_if_needed(inner, &lt_child_type)?;
+                    self.compile_with_cast_if_needed(low, &lt_child_type)?;
                     self.nodes[lt_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc.clone(),
@@ -324,11 +348,11 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     };
                     // GT: expr > high
+                    let gt_child_type = wider_type(&inner.data_type, &high.data_type);
                     let gt_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    let inner_type2 = self.compile_typed_inner(inner)?;
-                    let high_type = self.compile_typed_inner(high)?;
-                    let gt_child_type = wider_type(&inner_type2, &high_type);
+                    self.compile_with_cast_if_needed(inner, &gt_child_type)?;
+                    self.compile_with_cast_if_needed(high, &gt_child_type)?;
                     self.nodes[gt_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc,
@@ -346,12 +370,12 @@ impl<'a> ExprCompiler<'a> {
                         num_children: 2,
                         ..default_expr_node()
                     });
-                    // GE: expr >= low (placeholder, then patch with child_type_desc)
+                    // GE: expr >= low
+                    let ge_child_type = wider_type(&inner.data_type, &low.data_type);
                     let ge_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    let inner_type = self.compile_typed_inner(inner)?;
-                    let low_type = self.compile_typed_inner(low)?;
-                    let ge_child_type = wider_type(&inner_type, &low_type);
+                    self.compile_with_cast_if_needed(inner, &ge_child_type)?;
+                    self.compile_with_cast_if_needed(low, &ge_child_type)?;
                     self.nodes[ge_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc.clone(),
@@ -361,11 +385,11 @@ impl<'a> ExprCompiler<'a> {
                         ..default_expr_node()
                     };
                     // LE: expr <= high
+                    let le_child_type = wider_type(&inner.data_type, &high.data_type);
                     let le_idx = self.nodes.len();
                     self.nodes.push(default_expr_node());
-                    let inner_type2 = self.compile_typed_inner(inner)?;
-                    let high_type = self.compile_typed_inner(high)?;
-                    let le_child_type = wider_type(&inner_type2, &high_type);
+                    self.compile_with_cast_if_needed(inner, &le_child_type)?;
+                    self.compile_with_cast_if_needed(high, &le_child_type)?;
                     self.nodes[le_idx] = exprs::TExprNode {
                         node_type: exprs::TExprNodeType::BINARY_PRED,
                         type_: type_desc,
@@ -384,15 +408,20 @@ impl<'a> ExprCompiler<'a> {
                 negated,
             } => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                let opcode = if *negated {
-                    opcodes::TExprOpcode::FILTER_NOT_IN
-                } else {
-                    opcodes::TExprOpcode::FILTER_IN
-                };
+                // For NOT LIKE, wrap the LIKE_PRED in a COMPOUND_NOT node
+                if *negated {
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::COMPOUND_PRED,
+                        type_: type_desc.clone(),
+                        opcode: Some(opcodes::TExprOpcode::COMPOUND_NOT),
+                        num_children: 1,
+                        ..default_expr_node()
+                    });
+                }
                 self.nodes.push(exprs::TExprNode {
                     node_type: exprs::TExprNodeType::LIKE_PRED,
                     type_: type_desc,
-                    opcode: Some(opcode),
+                    opcode: None,
                     num_children: 2,
                     like_pred: Some(exprs::TLikePredicate {
                         escape_char: "\\".to_string(),
@@ -544,6 +573,14 @@ impl<'a> ExprCompiler<'a> {
                     "unexpected window function call in expression context: {name}"
                 ))
             }
+            ExprKind::SubqueryPlaceholder { id, .. } => {
+                // SubqueryPlaceholder should have been rewritten to JOINs by the
+                // analyzer before reaching the physical compilation stage.
+                Err(format!(
+                    "unexpected SubqueryPlaceholder (id={id}) in expression compilation; \
+                     subquery rewriting may have failed"
+                ))
+            }
         }
     }
 
@@ -572,11 +609,40 @@ impl<'a> ExprCompiler<'a> {
                     BinOp::EqForNull => opcodes::TExprOpcode::EQ_FOR_NULL,
                     _ => unreachable!(),
                 };
+                let compare_type = wider_type(&left.data_type, &right.data_type);
                 let parent_idx = self.nodes.len();
                 self.nodes.push(default_expr_node()); // placeholder
-                let left_type = self.compile_typed_inner(left)?;
-                let right_type = self.compile_typed_inner(right)?;
-                let compare_type = wider_type(&left_type, &right_type);
+
+                // Compile left, inserting cast if needed
+                if left.data_type != compare_type
+                    && needs_comparison_cast(&left.data_type, &compare_type)
+                {
+                    let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::CAST_EXPR,
+                        type_: cast_type_desc,
+                        num_children: 1,
+                        opcode: None,
+                        ..default_expr_node()
+                    });
+                }
+                self.compile_typed_inner(left)?;
+
+                // Compile right, inserting cast if needed
+                if right.data_type != compare_type
+                    && needs_comparison_cast(&right.data_type, &compare_type)
+                {
+                    let cast_type_desc = arrow_type_to_type_desc(&compare_type)?;
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::CAST_EXPR,
+                        type_: cast_type_desc,
+                        num_children: 1,
+                        opcode: None,
+                        ..default_expr_node()
+                    });
+                }
+                self.compile_typed_inner(right)?;
+
                 let child_type_desc = arrow_type_to_type_desc(&compare_type).ok();
                 let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
                 self.nodes[parent_idx] = exprs::TExprNode {
@@ -630,11 +696,42 @@ impl<'a> ExprCompiler<'a> {
                     BinOp::Mod => opcodes::TExprOpcode::MOD,
                     _ => unreachable!(),
                 };
+                // Use op-aware result type for correct Decimal precision/scale.
+                let op_str = match op {
+                    BinOp::Mul => "mul",
+                    BinOp::Div => "div",
+                    _ => "add",
+                };
+                let result_type =
+                    arithmetic_result_type_with_op(&left.data_type, &right.data_type, op_str);
+
                 let parent_idx = self.nodes.len();
                 self.nodes.push(default_expr_node()); // placeholder
-                let left_type = self.compile_typed_inner(left)?;
-                let right_type = self.compile_typed_inner(right)?;
-                let result_type = arithmetic_result_type(&left_type, &right_type);
+
+                // Compile left, wrapping with implicit CAST if needed
+                if needs_arithmetic_cast(&left.data_type, &result_type) {
+                    let cast_type_desc = arrow_type_to_type_desc(&result_type)?;
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::CAST_EXPR,
+                        type_: cast_type_desc,
+                        num_children: 1,
+                        ..default_expr_node()
+                    });
+                }
+                self.compile_typed_inner(left)?;
+
+                // Compile right, wrapping with implicit CAST if needed
+                if needs_arithmetic_cast(&right.data_type, &result_type) {
+                    let cast_type_desc = arrow_type_to_type_desc(&result_type)?;
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::CAST_EXPR,
+                        type_: cast_type_desc,
+                        num_children: 1,
+                        ..default_expr_node()
+                    });
+                }
+                self.compile_typed_inner(right)?;
+
                 let type_desc = arrow_type_to_type_desc(&result_type)?;
                 self.nodes[parent_idx] = exprs::TExprNode {
                     node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
@@ -649,7 +746,11 @@ impl<'a> ExprCompiler<'a> {
         }
     }
 
-    fn compile_literal(&mut self, lit: &LiteralValue) -> Result<DataType, String> {
+    fn compile_literal(
+        &mut self,
+        lit: &LiteralValue,
+        expr_type: &DataType,
+    ) -> Result<DataType, String> {
         match lit {
             LiteralValue::Null => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::NULL_TYPE);
@@ -677,6 +778,26 @@ impl<'a> ExprCompiler<'a> {
                 Ok(DataType::Boolean)
             }
             LiteralValue::Int(v) => {
+                // When the typed expression has Date32 type, emit a DATE_LITERAL
+                if *expr_type == DataType::Date32 {
+                    let type_desc = scalar_type_desc(types::TPrimitiveType::DATE);
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::DATE_LITERAL,
+                        type_: type_desc,
+                        num_children: 0,
+                        date_literal: Some(exprs::TDateLiteral {
+                            value: {
+                                let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                                let date = epoch + chrono::Duration::days(*v);
+                                date.format("%Y-%m-%d").to_string()
+                            },
+                        }),
+                        ..default_expr_node()
+                    });
+                    self.last_type = DataType::Date32;
+                    self.last_nullable = false;
+                    return Ok(DataType::Date32);
+                }
                 self.nodes.push(int_literal_node(*v));
                 self.last_type = DataType::Int64;
                 self.last_nullable = false;
@@ -979,19 +1100,24 @@ impl<'a> ExprCompiler<'a> {
                 ..
             } => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
-                let opcode = if *negated {
-                    opcodes::TExprOpcode::FILTER_NOT_IN
-                } else {
-                    opcodes::TExprOpcode::FILTER_IN
-                };
                 let esc = escape_char
                     .as_ref()
                     .map(|v| format!("{v}"))
                     .unwrap_or_else(|| "\\".to_string());
+                // For NOT LIKE, wrap the LIKE_PRED in a COMPOUND_NOT node
+                if *negated {
+                    self.nodes.push(exprs::TExprNode {
+                        node_type: exprs::TExprNodeType::COMPOUND_PRED,
+                        type_: type_desc.clone(),
+                        opcode: Some(opcodes::TExprOpcode::COMPOUND_NOT),
+                        num_children: 1,
+                        ..default_expr_node()
+                    });
+                }
                 self.nodes.push(exprs::TExprNode {
                     node_type: exprs::TExprNodeType::LIKE_PRED,
                     type_: type_desc,
-                    opcode: Some(opcode),
+                    opcode: None,
                     num_children: 2,
                     like_pred: Some(exprs::TLikePredicate { escape_char: esc }),
                     ..default_expr_node()
@@ -1597,6 +1723,38 @@ pub(super) fn default_expr_node() -> exprs::TExprNode {
     }
 }
 
+/// Check whether an operand with `source` type needs an implicit CAST to
+/// `target` type for arithmetic operations.  This handles cases like
+/// Int64 * Decimal128 where the integer operand must be cast to Decimal.
+fn needs_comparison_cast(source: &DataType, target: &DataType) -> bool {
+    source != target
+        && matches!(
+            (source, target),
+            (
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
+                DataType::Decimal128(_, _)
+            ) | (
+                DataType::Float64 | DataType::Float32,
+                DataType::Decimal128(_, _)
+            ) | (DataType::Decimal128(_, _), DataType::Float64)
+                | (
+                    DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
+                    DataType::Float64
+                )
+        )
+}
+
+fn needs_arithmetic_cast(source: &DataType, target: &DataType) -> bool {
+    source != target
+        && matches!(
+            (source, target),
+            (
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
+                DataType::Decimal128(_, _)
+            ) | (DataType::Decimal128(_, _), DataType::Float64)
+        )
+}
+
 // ---------------------------------------------------------------------------
 // SQL type conversion
 // ---------------------------------------------------------------------------
@@ -1871,15 +2029,27 @@ fn infer_agg_function_types(
                     DataType::Int64
                 }
                 DataType::Float32 | DataType::Float64 => DataType::Float64,
-                DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+                DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
                 _ => DataType::Float64,
             };
             Ok((out.clone(), Some(out)))
         }
         "avg" => {
-            // avg(decimal) → decimal, avg(int/float) → float64
+            // avg(decimal(p,s)) uses division scale rule (sum/count):
+            // s <= 6  => result_scale = s + 6
+            // s <= 12 => result_scale = 12
+            // else    => result_scale = s
             let out = match &first_arg {
-                DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+                DataType::Decimal128(_p, s) => {
+                    let new_scale = if *s <= 6 {
+                        *s + 6
+                    } else if *s <= 12 {
+                        12
+                    } else {
+                        *s
+                    };
+                    DataType::Decimal128(38, new_scale)
+                }
                 _ => DataType::Float64,
             };
             Ok((out, Some(DataType::Utf8))) // intermediate is serialized state

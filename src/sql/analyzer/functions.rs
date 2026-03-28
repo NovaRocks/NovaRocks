@@ -166,12 +166,25 @@ pub(super) fn infer_agg_return_type(name: &str, arg_types: &[DataType]) -> DataT
         "sum" => match &first_arg {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
             DataType::Float32 | DataType::Float64 => DataType::Float64,
-            DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+            DataType::Decimal128(_p, s) => DataType::Decimal128(38, *s),
             _ => DataType::Float64,
         },
 
         "avg" => match &first_arg {
-            DataType::Decimal128(p, s) => DataType::Decimal128(*p, *s),
+            DataType::Decimal128(_p, s) => {
+                // StarRocks computes avg as sum/count. Division scale rule:
+                // s <= 6  => result_scale = s + 6
+                // s <= 12 => result_scale = 12
+                // else    => result_scale = s
+                let new_scale = if *s <= 6 {
+                    *s + 6
+                } else if *s <= 12 {
+                    12
+                } else {
+                    *s
+                };
+                DataType::Decimal128(38, new_scale)
+            }
             _ => DataType::Float64,
         },
         "min" | "max" | "any_value" => first_arg,

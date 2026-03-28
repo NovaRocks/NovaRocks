@@ -120,8 +120,8 @@ pub(super) fn build_project_node(
 
 pub(super) fn build_hash_join_node(
     node_id: i32,
-    left_tuple_id: i32,
-    right_tuple_id: i32,
+    left_tuple_ids: &[i32],
+    right_tuple_ids: &[i32],
     join_op: plan_nodes::TJoinOp,
     eq_join_conjuncts: Vec<plan_nodes::TEqJoinCondition>,
     other_join_conjuncts: Vec<exprs::TExpr>,
@@ -131,8 +131,32 @@ pub(super) fn build_hash_join_node(
     node.node_type = plan_nodes::TPlanNodeType::HASH_JOIN_NODE;
     node.num_children = 2;
     node.limit = -1;
-    node.row_tuples = vec![left_tuple_id, right_tuple_id];
-    node.nullable_tuples = vec![false, false];
+    // row_tuples must include ALL tuples from both sides so the lowering
+    // validation can verify that the output-side tuples are present (required
+    // for SEMI/ANTI joins where the left or right side may have multiple
+    // tuples from nested cross-joins).
+    let mut row_tuples = Vec::with_capacity(left_tuple_ids.len() + right_tuple_ids.len());
+    row_tuples.extend_from_slice(left_tuple_ids);
+    row_tuples.extend_from_slice(right_tuple_ids);
+    // Build nullable_tuples: left side tuples are not nullable for left joins,
+    // right side tuples are nullable, etc.
+    let mut nullable_tuples = Vec::with_capacity(row_tuples.len());
+    let (left_nullable, right_nullable) = match join_op {
+        plan_nodes::TJoinOp::LEFT_OUTER_JOIN | plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (false, true),
+        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
+            (true, false)
+        }
+        plan_nodes::TJoinOp::FULL_OUTER_JOIN => (true, true),
+        _ => (false, false),
+    };
+    for _ in left_tuple_ids {
+        nullable_tuples.push(left_nullable);
+    }
+    for _ in right_tuple_ids {
+        nullable_tuples.push(right_nullable);
+    }
+    node.row_tuples = row_tuples;
+    node.nullable_tuples = nullable_tuples;
     node.compact_data = true;
 
     node.hash_join_node = Some(plan_nodes::THashJoinNode {
@@ -170,8 +194,8 @@ pub(super) fn build_hash_join_node(
 
 pub(super) fn build_nestloop_join_node(
     node_id: i32,
-    left_tuple_id: i32,
-    right_tuple_id: i32,
+    left_tuple_ids: &[i32],
+    right_tuple_ids: &[i32],
     join_op: plan_nodes::TJoinOp,
     join_conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
@@ -180,8 +204,26 @@ pub(super) fn build_nestloop_join_node(
     node.node_type = plan_nodes::TPlanNodeType::NESTLOOP_JOIN_NODE;
     node.num_children = 2;
     node.limit = -1;
-    node.row_tuples = vec![left_tuple_id, right_tuple_id];
-    node.nullable_tuples = vec![false, false];
+    let mut row_tuples = Vec::with_capacity(left_tuple_ids.len() + right_tuple_ids.len());
+    row_tuples.extend_from_slice(left_tuple_ids);
+    row_tuples.extend_from_slice(right_tuple_ids);
+    let mut nullable_tuples = Vec::with_capacity(row_tuples.len());
+    let (left_nullable, right_nullable) = match join_op {
+        plan_nodes::TJoinOp::LEFT_OUTER_JOIN | plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (false, true),
+        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
+            (true, false)
+        }
+        plan_nodes::TJoinOp::FULL_OUTER_JOIN => (true, true),
+        _ => (false, false),
+    };
+    for _ in left_tuple_ids {
+        nullable_tuples.push(left_nullable);
+    }
+    for _ in right_tuple_ids {
+        nullable_tuples.push(right_nullable);
+    }
+    node.row_tuples = row_tuples;
+    node.nullable_tuples = nullable_tuples;
     node.compact_data = true;
 
     node.nestloop_join_node = Some(plan_nodes::TNestLoopJoinNode::new(

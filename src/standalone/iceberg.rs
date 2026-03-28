@@ -817,7 +817,11 @@ fn iceberg_type_for_sql_type(data_type: &SqlType, next_field_id: &mut i32) -> Re
     Ok(match data_type {
         SqlType::TinyInt | SqlType::SmallInt | SqlType::Int => Type::Primitive(PrimitiveType::Int),
         SqlType::Float => Type::Primitive(PrimitiveType::Float),
-        SqlType::Double | SqlType::Decimal { .. } => Type::Primitive(PrimitiveType::Double),
+        SqlType::Double => Type::Primitive(PrimitiveType::Double),
+        SqlType::Decimal { precision, scale } => Type::Primitive(PrimitiveType::Decimal {
+            precision: *precision as u32,
+            scale: *scale as u32,
+        }),
         SqlType::BigInt => Type::Primitive(PrimitiveType::Long),
         SqlType::LargeInt => Type::Primitive(PrimitiveType::Decimal {
             precision: 38,

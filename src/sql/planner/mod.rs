@@ -182,7 +182,7 @@ fn plan_body(body: QueryBody) -> Result<LogicalPlan, String> {
 // ---------------------------------------------------------------------------
 
 /// Produces:  Project( [Aggregate(] [Filter(] from_plan [)] [)] )
-fn plan_select(select: ResolvedSelect) -> Result<LogicalPlan, String> {
+fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
     // 1. FROM clause → base plan
     let mut current = match select.from {
         Some(relation) => plan_relation(relation)?,
@@ -205,8 +205,23 @@ fn plan_select(select: ResolvedSelect) -> Result<LogicalPlan, String> {
 
     // 3. GROUP BY / aggregation → Aggregate
     if select.has_aggregation || !select.group_by.is_empty() {
-        let (project_items, agg_calls, output_columns) =
-            split_projection_for_aggregate(&select.projection, &select.group_by);
+        // Collect non-aggregate column refs from HAVING that aren't already in
+        // GROUP BY. These come from scalar subquery CROSS JOINs and must pass
+        // through as extra group-by keys so they're available in the
+        // post-aggregate HAVING filter.
+        if let Some(ref having_expr) = select.having {
+            let mut extra_gb = Vec::new();
+            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
+            for col in extra_gb {
+                select.group_by.push(col);
+            }
+        }
+
+        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
+            &select.projection,
+            &select.group_by,
+            select.having.as_ref(),
+        );
         current = LogicalPlan::Aggregate(AggregateNode {
             input: Box::new(current),
             group_by: select.group_by,
@@ -336,6 +351,7 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
 fn split_projection_for_aggregate(
     projection: &[ProjectItem],
     _group_by: &[TypedExpr],
+    having: Option<&TypedExpr>,
 ) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
     let mut agg_calls = Vec::new();
     let mut output_columns = Vec::new();
@@ -348,6 +364,12 @@ fn split_projection_for_aggregate(
             data_type: item.expr.data_type.clone(),
             nullable: item.expr.nullable,
         });
+    }
+
+    // Also collect aggregate calls from HAVING clause so the aggregate node
+    // computes them even when they don't appear in SELECT.
+    if let Some(having_expr) = having {
+        collect_aggregates(having_expr, &mut agg_calls);
     }
 
     // The projection items remain as-is; the thrift emitter will handle
@@ -435,6 +457,84 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
         ExprKind::ColumnRef { .. } | ExprKind::Literal(_) => {}
         // Window calls are handled separately, not as aggregates
         ExprKind::WindowCall { .. } => {}
+        // SubqueryPlaceholder should be rewritten before reaching the planner
+        ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+/// Collect ColumnRef expressions from HAVING that appear outside of aggregate calls.
+/// These are typically scalar subquery results (from CROSS JOINs) that need to pass
+/// through the aggregate node as group-by keys.
+fn collect_non_agg_column_refs(expr: &TypedExpr, group_by: &[TypedExpr], out: &mut Vec<TypedExpr>) {
+    collect_non_agg_column_refs_inner(expr, group_by, out, false);
+}
+
+fn collect_non_agg_column_refs_inner(
+    expr: &TypedExpr,
+    group_by: &[TypedExpr],
+    out: &mut Vec<TypedExpr>,
+    inside_agg: bool,
+) {
+    match &expr.kind {
+        ExprKind::AggregateCall { .. } => {
+            // Don't recurse into aggregate calls — columns inside aggregates
+            // are handled by the aggregate function itself, not as pass-through keys.
+        }
+        ExprKind::ColumnRef { qualifier, column } => {
+            if !inside_agg {
+                // Check if this column is already in group_by
+                let already_grouped = group_by.iter().any(|gb| {
+                    matches!(&gb.kind, ExprKind::ColumnRef { qualifier: gq, column: gc }
+                        if gc == column && gq == qualifier)
+                });
+                // Check if already collected
+                let already_collected = out.iter().any(|o| {
+                    matches!(&o.kind, ExprKind::ColumnRef { qualifier: oq, column: oc }
+                        if oc == column && oq == qualifier)
+                });
+                if !already_grouped && !already_collected {
+                    out.push(expr.clone());
+                }
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_non_agg_column_refs_inner(left, group_by, out, inside_agg);
+            collect_non_agg_column_refs_inner(right, group_by, out, inside_agg);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_non_agg_column_refs_inner(arg, group_by, out, inside_agg);
+            }
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::Nested(inner) => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_non_agg_column_refs_inner(op, group_by, out, inside_agg);
+            }
+            for (w, t) in when_then {
+                collect_non_agg_column_refs_inner(w, group_by, out, inside_agg);
+                collect_non_agg_column_refs_inner(t, group_by, out, inside_agg);
+            }
+            if let Some(e) = else_expr {
+                collect_non_agg_column_refs_inner(e, group_by, out, inside_agg);
+            }
+        }
+        _ => {}
     }
 }
 

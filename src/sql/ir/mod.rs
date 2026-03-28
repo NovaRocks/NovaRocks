@@ -245,6 +245,38 @@ pub(crate) enum ExprKind {
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,
     },
+    /// Placeholder for a subquery that will be rewritten into a JOIN.
+    /// This is an intermediate representation created during expression analysis
+    /// and consumed by the subquery rewriting pass before planning.
+    SubqueryPlaceholder {
+        id: usize,
+        kind: SubqueryKind,
+        data_type: DataType,
+    },
+}
+
+/// The kind of subquery encountered in an expression.
+#[derive(Clone, Debug)]
+pub(crate) enum SubqueryKind {
+    /// Scalar subquery: `col op (SELECT agg(...) FROM ...)`
+    /// Stores the subquery AST, comparison operator, and the LHS expression.
+    Scalar,
+    /// EXISTS (SELECT ...) or NOT EXISTS (SELECT ...)
+    Exists { negated: bool },
+    /// col [NOT] IN (SELECT ...)
+    InSubquery { negated: bool },
+}
+
+/// A collected subquery from expression analysis, ready for rewriting.
+#[derive(Clone, Debug)]
+pub(crate) struct SubqueryInfo {
+    pub id: usize,
+    pub kind: SubqueryKind,
+    pub subquery: Box<sqlparser::ast::Query>,
+    /// The resolved data type of the subquery result (scalar).
+    pub data_type: DataType,
+    /// For IN subquery: the left-hand expression from the outer query.
+    pub in_expr: Option<Box<sqlparser::ast::Expr>>,
 }
 
 /// Window frame specification for analytic functions.

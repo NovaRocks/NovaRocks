@@ -129,6 +129,8 @@ impl<'a> super::AnalyzerContext<'a> {
                             catalog: self.catalog,
                             current_database: self.current_database,
                             ctes: child_ctes,
+                            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+                            collected_subqueries: std::cell::RefCell::new(Vec::new()),
                         };
                         let mut resolved_cte = child_ctx.analyze_query(cte_query)?;
                         // Apply CTE column aliases if present: WITH t(a, b) AS (...)
