@@ -1,16 +1,22 @@
 use std::collections::HashSet;
 
-use crate::sql::ir::{ExprKind, TypedExpr};
+use crate::sql::ir::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::plan::*;
 
-use super::expr_utils::{collect_column_refs, combine_and, split_and, wrap_remaining_filter};
+use super::expr_utils::{
+    collect_column_refs, collect_output_columns, combine_and, split_and, wrap_remaining_filter,
+};
 use super::map_children;
 
 /// Push Filter predicates as close to Scan nodes as possible.
 ///
-/// For a Filter → Scan chain the filter conjuncts that reference only the
-/// scan's columns are moved into `ScanNode.predicates`.  Conjuncts that
-/// cannot be pushed remain in a residual Filter node.
+/// Handles:
+/// - Filter → Scan: push conjuncts into `ScanNode.predicates`
+/// - Filter → Project: push through pass-through column projections
+/// - Filter → Join: classify conjuncts by which side they reference and push
+///   left-only / right-only predicates below the join
+/// - Filter → Aggregate: push predicates that reference only GROUP BY columns
+///   below the aggregate
 pub(super) fn push_down_predicates(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter(node) => {
@@ -96,10 +102,182 @@ fn push_filter_into(predicate: TypedExpr, input: LogicalPlan) -> LogicalPlan {
             wrap_remaining_filter(proj, remaining)
         }
 
-        // Cannot push through other operators for now — keep the filter.
+        // Filter → Join: classify each conjunct by which side of the join it
+        // references and push single-side predicates below the join.
+        LogicalPlan::Join(join) => push_predicates_through_join(predicate, join),
+
+        // Filter → Aggregate: push predicates that reference only GROUP BY
+        // columns (not aggregates) below the aggregate node.
+        LogicalPlan::Aggregate(agg) => push_predicates_through_aggregate(predicate, agg),
+
+        // Cannot push through other operators — keep the filter.
         other => LogicalPlan::Filter(FilterNode {
             input: Box::new(other),
             predicate,
         }),
     }
+}
+
+/// Push filter predicates through a Join node.
+///
+/// Conjuncts are classified into:
+/// - **left-only**: references only left-side columns → pushed below left child
+/// - **right-only**: references only right-side columns → pushed below right child
+///   (only for INNER/CROSS joins; for outer/semi/anti joins these stay above)
+/// - **both-sides**: references columns from both sides → merged into join condition
+/// - **constant**: references no columns from either side → pushed to left child
+fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> LogicalPlan {
+    let conjuncts = split_and(predicate);
+    let left_cols = collect_output_columns(&join.left);
+    let right_cols = collect_output_columns(&join.right);
+
+    let mut left_preds = Vec::new();
+    let mut right_preds = Vec::new();
+    let mut join_preds = Vec::new();
+    let mut remaining = Vec::new();
+
+    for conj in conjuncts {
+        let refs = collect_column_refs(&conj);
+        let in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
+        let in_right = refs
+            .iter()
+            .any(|c| right_cols.contains(&c.to_lowercase()));
+
+        match (in_left, in_right) {
+            (true, false) => left_preds.push(conj),
+            (false, true) => {
+                // For LEFT OUTER / LEFT SEMI / LEFT ANTI / FULL OUTER joins,
+                // right-side predicates affect NULL preservation semantics and
+                // must NOT be pushed below the join.
+                // For RIGHT OUTER, left-side predicates have the same issue
+                // (handled below), but right-side predicates are safe to push.
+                match join.join_type {
+                    JoinKind::Inner | JoinKind::Cross | JoinKind::RightOuter
+                    | JoinKind::RightSemi | JoinKind::RightAnti => {
+                        right_preds.push(conj);
+                    }
+                    _ => remaining.push(conj),
+                }
+            }
+            (true, true) => join_preds.push(conj),
+            (false, false) => {
+                // Constant predicates — push to left side
+                left_preds.push(conj);
+            }
+        }
+    }
+
+    // For RIGHT OUTER joins, left-side predicates cannot be pushed below
+    // (left side is the nullable side). Move them to remaining.
+    if matches!(
+        join.join_type,
+        JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti
+    ) {
+        remaining.extend(left_preds.drain(..));
+    }
+
+    // For FULL OUTER joins, neither side can receive pushed predicates.
+    if matches!(join.join_type, JoinKind::FullOuter) {
+        remaining.extend(left_preds.drain(..));
+        remaining.extend(right_preds.drain(..));
+    }
+
+    // Build the new left child, applying pushed predicates then recursing.
+    let new_left = if left_preds.is_empty() {
+        *join.left
+    } else {
+        let pushed = combine_and(left_preds);
+        // Recursively push the new filter further down (through nested joins, etc.)
+        push_filter_into(pushed, *join.left)
+    };
+
+    // Build the new right child.
+    let new_right = if right_preds.is_empty() {
+        *join.right
+    } else {
+        let pushed = combine_and(right_preds);
+        push_filter_into(pushed, *join.right)
+    };
+
+    // Merge new join predicates with the existing join condition.
+    let new_condition = merge_join_conditions(join.condition, join_preds);
+
+    let new_join = LogicalPlan::Join(JoinNode {
+        left: Box::new(new_left),
+        right: Box::new(new_right),
+        join_type: join.join_type,
+        condition: new_condition,
+    });
+
+    wrap_remaining_filter(new_join, remaining)
+}
+
+/// Merge new predicates into an existing (optional) join condition.
+fn merge_join_conditions(
+    existing: Option<TypedExpr>,
+    new_preds: Vec<TypedExpr>,
+) -> Option<TypedExpr> {
+    let mut all = Vec::new();
+    if let Some(cond) = existing {
+        all.push(cond);
+    }
+    all.extend(new_preds);
+    if all.is_empty() {
+        None
+    } else {
+        Some(combine_and(all))
+    }
+}
+
+/// Push filter predicates through an Aggregate node.
+///
+/// A predicate can be pushed below the aggregate if every column it references
+/// is a GROUP BY column (i.e. a direct column reference in `group_by`).
+/// Predicates that reference aggregate output names must remain above.
+fn push_predicates_through_aggregate(predicate: TypedExpr, agg: AggregateNode) -> LogicalPlan {
+    let conjuncts = split_and(predicate);
+
+    // Collect the set of column names that come from GROUP BY expressions
+    // and thus exist in the aggregate's input.
+    let group_by_columns: HashSet<String> = agg
+        .group_by
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+            _ => None,
+        })
+        .collect();
+
+    let mut pushable = Vec::new();
+    let mut remaining = Vec::new();
+
+    for conj in conjuncts {
+        let refs = collect_column_refs(&conj);
+        if !refs.is_empty()
+            && refs
+                .iter()
+                .all(|r| group_by_columns.contains(&r.to_lowercase()))
+        {
+            pushable.push(conj);
+        } else {
+            remaining.push(conj);
+        }
+    }
+
+    let new_input = if pushable.is_empty() {
+        *agg.input
+    } else {
+        let pushed = combine_and(pushable);
+        // Recursively push the new filter further down.
+        push_filter_into(pushed, *agg.input)
+    };
+
+    let agg_plan = LogicalPlan::Aggregate(AggregateNode {
+        input: Box::new(new_input),
+        group_by: agg.group_by,
+        aggregates: agg.aggregates,
+        output_columns: agg.output_columns,
+    });
+
+    wrap_remaining_filter(agg_plan, remaining)
 }
