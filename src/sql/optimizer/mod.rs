@@ -1,14 +1,18 @@
 //! Logical plan optimizer.
 //!
-//! Currently supports two rule-based optimizations:
+//! Currently supports three rule-based optimizations (applied in order):
 //!   1. **Predicate pushdown** — moves Filter predicates closer to Scan nodes.
-//!   2. **Column pruning** — removes unreferenced columns from Scan nodes.
+//!   2. **Join reorder** — swaps build/probe sides so the smaller relation is
+//!      built into the hash table (right/build) and the larger relation probes
+//!      (left/probe).
+//!   3. **Column pruning** — removes unreferenced columns from Scan nodes.
 //!
 //! The optimizer operates on the [`LogicalPlan`] tree before it is handed to
 //! the Thrift emitter.
 
 mod column_pruning;
 pub(crate) mod expr_utils;
+mod join_reorder;
 mod predicate_pushdown;
 
 use crate::sql::plan::*;
@@ -16,6 +20,7 @@ use crate::sql::plan::*;
 /// Apply all optimization rules to the logical plan.
 pub(crate) fn optimize(plan: LogicalPlan) -> LogicalPlan {
     let plan = predicate_pushdown::push_down_predicates(plan);
+    let plan = join_reorder::reorder_joins(plan);
     let plan = column_pruning::prune_columns(plan);
     plan
 }
