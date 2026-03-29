@@ -126,6 +126,12 @@ fn push_filter_into(predicate: TypedExpr, input: LogicalPlan) -> LogicalPlan {
 ///   (only for INNER/CROSS joins; for outer/semi/anti joins these stay above)
 /// - **both-sides**: references columns from both sides → merged into join condition
 /// - **constant**: references no columns from either side → pushed to left child
+///
+/// Special handling for LEFT OUTER / LEFT SEMI / LEFT ANTI joins: when a
+/// predicate's column names appear in both sides (due to subquery output
+/// sharing names with the left child), but ALL columns are satisfiable by
+/// the left side alone, the predicate is treated as left-only and pushed
+/// to the left child instead of being merged into the join condition.
 fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> LogicalPlan {
     let conjuncts = split_and(predicate);
     let left_cols = collect_output_columns(&join.left);
@@ -136,12 +142,19 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
     let mut join_preds = Vec::new();
     let mut remaining = Vec::new();
 
+    // For LEFT joins (OUTER/SEMI/ANTI), subquery rewrites can produce a right
+    // child whose output columns share names with the left child. A predicate
+    // that references only left-child columns may look like "both-sides" due to
+    // this name overlap. Detect this and treat such predicates as left-only.
+    let is_left_join_variant = matches!(
+        join.join_type,
+        JoinKind::LeftOuter | JoinKind::LeftSemi | JoinKind::LeftAnti
+    );
+
     for conj in conjuncts {
         let refs = collect_column_refs(&conj);
         let in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
-        let in_right = refs
-            .iter()
-            .any(|c| right_cols.contains(&c.to_lowercase()));
+        let in_right = refs.iter().any(|c| right_cols.contains(&c.to_lowercase()));
 
         match (in_left, in_right) {
             (true, false) => left_preds.push(conj),
@@ -152,14 +165,38 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                 // For RIGHT OUTER, left-side predicates have the same issue
                 // (handled below), but right-side predicates are safe to push.
                 match join.join_type {
-                    JoinKind::Inner | JoinKind::Cross | JoinKind::RightOuter
-                    | JoinKind::RightSemi | JoinKind::RightAnti => {
+                    JoinKind::Inner
+                    | JoinKind::Cross
+                    | JoinKind::RightOuter
+                    | JoinKind::RightSemi
+                    | JoinKind::RightAnti => {
                         right_preds.push(conj);
                     }
                     _ => remaining.push(conj),
                 }
             }
-            (true, true) => join_preds.push(conj),
+            (true, true) => {
+                // When columns exist in both sides, check if this is actually
+                // a left-only predicate for LEFT join variants. This happens
+                // after subquery rewrite when the right (subquery) output has
+                // columns with the same name as the left side.
+                if is_left_join_variant
+                    && refs.iter().all(|c| left_cols.contains(&c.to_lowercase()))
+                {
+                    left_preds.push(conj);
+                } else if is_left_join_variant {
+                    // For LEFT OUTER / SEMI / ANTI joins, "both-sides"
+                    // predicates that genuinely reference the right side must
+                    // NOT be merged into the join ON condition. Doing so
+                    // changes semantics: a LEFT OUTER JOIN preserves left
+                    // rows when the ON condition fails (producing NULLs on
+                    // the right), but a post-join filter would eliminate them.
+                    // Keep these predicates above the join.
+                    remaining.push(conj);
+                } else {
+                    join_preds.push(conj);
+                }
+            }
             (false, false) => {
                 // Constant predicates — push to left side
                 left_preds.push(conj);
