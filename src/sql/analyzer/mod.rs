@@ -420,10 +420,35 @@ impl<'a> AnalyzerContext<'a> {
             sqlast::GroupByExpr::Expressions(exprs, _) => exprs,
             _ => return None,
         };
-        // Look for a single Rollup expression in the GROUP BY list
+        // Look for a single Rollup expression in the GROUP BY list.
+        // sqlparser produces Expr::Rollup when the dialect has
+        // supports_group_by_expr() = true.  As a fallback, also detect
+        // Expr::Function with name "rollup" (case-insensitive), which is
+        // what the parser produces when the dialect flag is off.
         for expr in exprs {
             if let sqlast::Expr::Rollup(groups) = expr {
                 return Some(groups.clone());
+            }
+            // Fallback: Expr::Function { name: "rollup", args: [a, b, ...] }
+            if let sqlast::Expr::Function(func) = expr {
+                let func_name = func.name.to_string().to_lowercase();
+                if func_name == "rollup" {
+                    if let sqlast::FunctionArguments::List(ref arg_list) = func.args {
+                        let groups: Vec<Vec<sqlast::Expr>> = arg_list
+                            .args
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                    Some(vec![e.clone()])
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if !groups.is_empty() {
+                            return Some(groups);
+                        }
+                    }
+                }
             }
         }
         None
