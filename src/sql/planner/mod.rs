@@ -236,53 +236,54 @@ fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
             });
         }
 
-        // The projection after aggregation
-        if !project_items.is_empty() {
-            current = LogicalPlan::Project(ProjectNode {
-                input: Box::new(current),
-                items: project_items,
-            });
-        }
+        // The projection after aggregation — may contain window functions
+        current = build_window_and_project(current, project_items, &select.projection)?;
     } else {
         // 4. No aggregation → check for window functions, then Project
-        let has_window = select
-            .projection
-            .iter()
-            .any(|item| has_window_call(&item.expr));
-        if has_window {
-            // Extract window function calls → WindowNode, rewrite Project
-            let (window_exprs, rewritten_items) = extract_window_calls(&select.projection);
-            let mut output_columns = Vec::new();
-            // All input columns pass through
-            // (we'll let the emitter figure out the exact scope)
-            for item in &select.projection {
-                output_columns.push(OutputColumn {
-                    name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
-                });
-            }
-            current = LogicalPlan::Window(WindowNode {
-                input: Box::new(current),
-                window_exprs,
-                output_columns,
-            });
-            current = LogicalPlan::Project(ProjectNode {
-                input: Box::new(current),
-                items: rewritten_items,
-            });
-        } else {
-            current = LogicalPlan::Project(ProjectNode {
-                input: Box::new(current),
-                items: select.projection,
-            });
-        }
+        current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
     }
 
     Ok(current)
 }
 
 /// Check if an expression contains any WindowCall.
+/// Build Window + Project nodes if the projection contains window functions,
+/// otherwise just a Project node.
+fn build_window_and_project(
+    input: LogicalPlan,
+    project_items: Vec<ProjectItem>,
+    original_projection: &[ProjectItem],
+) -> Result<LogicalPlan, String> {
+    let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
+    if has_window {
+        let (window_exprs, rewritten_items) = extract_window_calls(&project_items);
+        let mut output_columns = Vec::new();
+        for item in original_projection {
+            output_columns.push(OutputColumn {
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+            });
+        }
+        let windowed = LogicalPlan::Window(WindowNode {
+            input: Box::new(input),
+            window_exprs,
+            output_columns,
+        });
+        Ok(LogicalPlan::Project(ProjectNode {
+            input: Box::new(windowed),
+            items: rewritten_items,
+        }))
+    } else if !project_items.is_empty() {
+        Ok(LogicalPlan::Project(ProjectNode {
+            input: Box::new(input),
+            items: project_items,
+        }))
+    } else {
+        Ok(input)
+    }
+}
+
 fn has_window_call(expr: &TypedExpr) -> bool {
     match &expr.kind {
         ExprKind::WindowCall { .. } => true,
@@ -297,41 +298,22 @@ fn has_window_call(expr: &TypedExpr) -> bool {
 /// Extract window function calls from the projection items.
 /// Returns (window_exprs, rewritten_projection_items).
 /// Each window call is replaced with a ColumnRef to its output name.
+/// Window calls may be nested inside expressions (e.g., `sum(x) * 100 / sum(sum(x)) OVER (...)`).
 fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
     let mut window_exprs = Vec::new();
     let mut rewritten = Vec::new();
+    let mut counter = 0usize;
 
     for item in items {
-        if let ExprKind::WindowCall {
-            ref name,
-            ref args,
-            distinct,
-            ref partition_by,
-            ref order_by,
-            ref window_frame,
-        } = item.expr.kind
-        {
-            let win_output_name = item.output_name.clone();
-            window_exprs.push(WindowExpr {
-                name: name.clone(),
-                args: args.clone(),
-                distinct,
-                partition_by: partition_by.clone(),
-                order_by: order_by.clone(),
-                window_frame: window_frame.clone(),
-                result_type: item.expr.data_type.clone(),
-                output_name: win_output_name.clone(),
-            });
-            // Replace with a column ref to the window output
+        if has_window_call(&item.expr) {
+            let new_expr = rewrite_window_calls(
+                &item.expr,
+                &item.output_name,
+                &mut window_exprs,
+                &mut counter,
+            );
             rewritten.push(ProjectItem {
-                expr: TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        qualifier: None,
-                        column: win_output_name.clone(),
-                    },
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
-                },
+                expr: new_expr,
                 output_name: item.output_name.clone(),
             });
         } else {
@@ -340,6 +322,106 @@ fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectI
     }
 
     (window_exprs, rewritten)
+}
+
+/// Recursively rewrite an expression tree, replacing each WindowCall node
+/// with a ColumnRef that points to the window function's output column.
+fn rewrite_window_calls(
+    expr: &TypedExpr,
+    base_name: &str,
+    window_exprs: &mut Vec<WindowExpr>,
+    counter: &mut usize,
+) -> TypedExpr {
+    match &expr.kind {
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+        } => {
+            let win_output_name = if *counter == 0 {
+                base_name.to_string()
+            } else {
+                format!("{}__win{}", base_name, counter)
+            };
+            *counter += 1;
+            window_exprs.push(WindowExpr {
+                name: name.clone(),
+                args: args.clone(),
+                distinct: *distinct,
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                window_frame: window_frame.clone(),
+                result_type: expr.data_type.clone(),
+                output_name: win_output_name.clone(),
+            });
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    qualifier: None,
+                    column: win_output_name,
+                },
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
+            }
+        }
+        ExprKind::BinaryOp { left, right, op } => TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(rewrite_window_calls(left, base_name, window_exprs, counter)),
+                op: *op,
+                right: Box::new(rewrite_window_calls(
+                    right,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+            kind: ExprKind::UnaryOp {
+                op: *op,
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                target: target.clone(),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Nested(inner) => TypedExpr {
+            kind: ExprKind::Nested(Box::new(rewrite_window_calls(
+                inner,
+                base_name,
+                window_exprs,
+                counter,
+            ))),
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        // For any other node types, return as-is (no window calls inside)
+        _ => expr.clone(),
+    }
 }
 
 /// Split the SELECT list into post-aggregate projection items and aggregate calls.
@@ -455,8 +537,14 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
         ExprKind::IsTruthValue { expr: inner, .. } => collect_aggregates(inner, out),
         // Leaves
         ExprKind::ColumnRef { .. } | ExprKind::Literal(_) => {}
-        // Window calls are handled separately, not as aggregates
-        ExprKind::WindowCall { .. } => {}
+        // Window calls themselves are not aggregates, but their args may
+        // contain aggregate calls that must be collected so the aggregate node
+        // computes them (e.g. sum(sum(x)) OVER (...)).
+        ExprKind::WindowCall { args, .. } => {
+            for arg in args {
+                collect_aggregates(arg, out);
+            }
+        }
         // SubqueryPlaceholder should be rewritten before reaching the planner
         ExprKind::SubqueryPlaceholder { .. } => {}
     }

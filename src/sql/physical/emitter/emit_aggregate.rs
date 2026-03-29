@@ -33,16 +33,23 @@ impl<'a> super::ThriftEmitter<'a> {
                 nullable,
                 idx as i32,
             );
-            agg_scope.add_column(
-                None,
-                name,
-                ColumnBinding {
-                    tuple_id: agg_tuple_id,
-                    slot_id,
-                    data_type,
-                    nullable,
-                },
-            );
+            let binding = ColumnBinding {
+                tuple_id: agg_tuple_id,
+                slot_id,
+                data_type: data_type.clone(),
+                nullable,
+            };
+            agg_scope.add_column(None, name, binding.clone());
+            // Also register with qualifier so that post-aggregate
+            // projections can resolve qualified column references
+            // like `dt.d_year` after GROUP BY dt.d_year.
+            if let crate::sql::ir::ExprKind::ColumnRef {
+                qualifier: Some(ref q),
+                ref column,
+            } = gb_expr.kind
+            {
+                agg_scope.add_column(Some(q.clone()), column.clone(), binding);
+            }
             grouping_exprs.push(texpr);
         }
 
