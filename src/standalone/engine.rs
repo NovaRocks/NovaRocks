@@ -3407,7 +3407,7 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
     let handle = ResultSinkHandle::new();
     // Use available CPU cores for pipeline parallelism (capped at 8)
     let pipeline_dop = std::thread::available_parallelism()
-        .map(|p| p.get().min(8))
+        .map(|p| p.get().min(4))
         .unwrap_or(4);
     execute_plan_with_pipeline(
         exec_plan,

@@ -202,10 +202,18 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
     // Merge new join predicates with the existing join condition.
     let new_condition = merge_join_conditions(join.condition, join_preds);
 
+    // When a CROSS JOIN gets join predicates extracted from the filter above,
+    // upgrade it to INNER JOIN so the physical emitter can use hash join.
+    let new_join_type = if join.join_type == JoinKind::Cross && new_condition.is_some() {
+        JoinKind::Inner
+    } else {
+        join.join_type
+    };
+
     let new_join = LogicalPlan::Join(JoinNode {
         left: Box::new(new_left),
         right: Box::new(new_right),
-        join_type: join.join_type,
+        join_type: new_join_type,
         condition: new_condition,
     });
 
