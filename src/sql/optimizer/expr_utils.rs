@@ -179,16 +179,17 @@ pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
                 HashSet::new()
             }
         }
-        LogicalPlan::Values(v) => v
-            .columns
-            .iter()
-            .map(|c| c.name.to_lowercase())
-            .collect(),
+        LogicalPlan::Values(v) => v.columns.iter().map(|c| c.name.to_lowercase()).collect(),
         LogicalPlan::GenerateSeries(g) => {
             let mut cols = HashSet::new();
             cols.insert(g.column_name.to_lowercase());
             cols
         }
+        LogicalPlan::SubqueryAlias(s) => s
+            .output_columns
+            .iter()
+            .map(|c| c.name.to_lowercase())
+            .collect(),
     }
 }
 
@@ -381,6 +382,14 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
         }
         LogicalPlan::GenerateSeries(g) => {
             out.insert((None, g.column_name.to_lowercase()));
+        }
+        LogicalPlan::SubqueryAlias(s) => {
+            let alias_lower = s.alias.to_lowercase();
+            for c in &s.output_columns {
+                let col = c.name.to_lowercase();
+                out.insert((Some(alias_lower.clone()), col.clone()));
+                out.insert((None, col));
+            }
         }
     }
 }

@@ -127,6 +127,11 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
         match set_expr {
             sqlast::SetExpr::Select(s) => {
+                // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
+                // If so, expand into a UNION ALL of GROUP BY variants.
+                if let Some(rollup_exprs) = self.extract_rollup_from_group_by(s) {
+                    return self.expand_rollup(s, &rollup_exprs);
+                }
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
             }
@@ -403,6 +408,133 @@ impl<'a> AnalyzerContext<'a> {
             // For other node types, return as-is
             _ => expr,
         }
+    }
+
+    /// Check if a SELECT's GROUP BY clause contains a ROLLUP expression.
+    /// Returns the flattened rollup column expressions if found, None otherwise.
+    fn extract_rollup_from_group_by(
+        &self,
+        select: &sqlast::Select,
+    ) -> Option<Vec<Vec<sqlast::Expr>>> {
+        let exprs = match &select.group_by {
+            sqlast::GroupByExpr::Expressions(exprs, _) => exprs,
+            _ => return None,
+        };
+        // Look for a single Rollup expression in the GROUP BY list
+        for expr in exprs {
+            if let sqlast::Expr::Rollup(groups) = expr {
+                return Some(groups.clone());
+            }
+        }
+        None
+    }
+
+    /// Expand `GROUP BY ROLLUP(a, b, ...)` into a UNION ALL of GROUP BY variants.
+    ///
+    /// `ROLLUP(a, b)` expands to:
+    ///   SELECT a, b, agg(...) ... GROUP BY a, b
+    ///   UNION ALL
+    ///   SELECT a, NULL, agg(...) ... GROUP BY a
+    ///   UNION ALL
+    ///   SELECT NULL, NULL, agg(...) ... (no GROUP BY, full aggregation)
+    fn expand_rollup(
+        &self,
+        select: &sqlast::Select,
+        rollup_groups: &[Vec<sqlast::Expr>],
+    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+        // Flatten the rollup groups: each inner Vec is a "composite key"
+        // (usually single element). For ROLLUP(a, b), groups = [[a], [b]].
+        let n = rollup_groups.len();
+
+        // Build n+1 levels: level i has the first (n-i) groups.
+        // Level 0: all groups (a, b)  →  GROUP BY a, b
+        // Level 1: first (n-1) groups (a) → GROUP BY a, select b as NULL
+        // Level n: no groups → select a as NULL, b as NULL
+        let mut bodies: Vec<(QueryBody, Vec<OutputColumn>)> = Vec::new();
+
+        for level in 0..=n {
+            let active_count = n - level; // number of active rollup groups
+
+            // Build a modified GROUP BY expressions list:
+            // - Keep first `active_count` groups as real GROUP BY keys
+            // - The remaining groups are NULLed out in the projection
+            let mut modified_gb_exprs: Vec<sqlast::Expr> = Vec::new();
+            for group in rollup_groups.iter().take(active_count) {
+                for expr in group {
+                    modified_gb_exprs.push(expr.clone());
+                }
+            }
+
+            // Build the set of NULLed column names (from inactive rollup groups)
+            let mut nulled_exprs: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for group in rollup_groups.iter().skip(active_count) {
+                for expr in group {
+                    nulled_exprs.insert(format!("{expr}").to_lowercase());
+                }
+            }
+
+            // Build modified SELECT with the adjusted GROUP BY
+            // We need to reconstruct the AST Select with modified group_by and projection
+            let mut modified_select = select.clone();
+
+            // Replace GROUP BY with the active keys only
+            modified_select.group_by = sqlast::GroupByExpr::Expressions(modified_gb_exprs, vec![]);
+
+            // Modify projection: replace NULLed columns with NULL literals
+            let mut modified_projection = Vec::new();
+            for item in &select.projection {
+                let (expr_part, alias_part) = match item {
+                    sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                        (expr, Some(alias.clone()))
+                    }
+                    sqlast::SelectItem::UnnamedExpr(expr) => (expr, None),
+                    other => {
+                        modified_projection.push(other.clone());
+                        continue;
+                    }
+                };
+
+                // Check if this projection item is one of the rollup keys
+                // that should be NULLed at this level
+                let expr_str = format!("{expr_part}").to_lowercase();
+                if nulled_exprs.contains(&expr_str) {
+                    let null_expr = sqlast::Expr::Value(sqlast::Value::Null.into());
+                    if let Some(alias) = alias_part {
+                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                            expr: null_expr,
+                            alias,
+                        });
+                    } else {
+                        // Preserve the original name by adding an alias
+                        let name = expr_display_name(expr_part);
+                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                            expr: null_expr,
+                            alias: sqlast::Ident::new(name),
+                        });
+                    }
+                } else {
+                    modified_projection.push(item.clone());
+                }
+            }
+            modified_select.projection = modified_projection;
+
+            let (sel, cols) = self.analyze_select(&modified_select)?;
+            bodies.push((QueryBody::Select(sel), cols));
+        }
+
+        // Build UNION ALL chain from right to left
+        let (mut result_body, result_cols) = bodies.remove(0);
+        for (body, _cols) in bodies {
+            result_body = QueryBody::SetOperation(ResolvedSetOp {
+                kind: SetOpKind::Union,
+                all: true,
+                left: Box::new(result_body),
+                right: Box::new(body),
+            });
+        }
+
+        Ok((result_body, result_cols))
     }
 
     /// Analyze the SELECT projection list.
@@ -1105,5 +1237,161 @@ mod tests {
             ExprKind::Nested(inner) => expr_has_placeholder(inner),
             _ => false,
         }
+    }
+
+    /// Deep check for SubqueryPlaceholder in any expression node.
+    fn expr_has_placeholder_deep(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            ExprKind::SubqueryPlaceholder { .. } => true,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_placeholder_deep(left) || expr_has_placeholder_deep(right)
+            }
+            ExprKind::UnaryOp { expr, .. } => expr_has_placeholder_deep(expr),
+            ExprKind::Nested(inner) => expr_has_placeholder_deep(inner),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                args.iter().any(expr_has_placeholder_deep)
+            }
+            ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
+                expr_has_placeholder_deep(expr)
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .map_or(false, |o| expr_has_placeholder_deep(o))
+                    || when_then
+                        .iter()
+                        .any(|(w, t)| expr_has_placeholder_deep(w) || expr_has_placeholder_deep(t))
+                    || else_expr
+                        .as_ref()
+                        .map_or(false, |e| expr_has_placeholder_deep(e))
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                expr_has_placeholder_deep(expr)
+                    || expr_has_placeholder_deep(low)
+                    || expr_has_placeholder_deep(high)
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr_has_placeholder_deep(expr) || expr_has_placeholder_deep(pattern)
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_has_placeholder_deep(expr) || list.iter().any(expr_has_placeholder_deep)
+            }
+            ExprKind::IsTruthValue { expr, .. } => expr_has_placeholder_deep(expr),
+            ExprKind::WindowCall { args, .. } => args.iter().any(expr_has_placeholder_deep),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn test_table_alias_qualified_reference() {
+        // Simplified q3 pattern: table alias with qualified reference
+        let sql = "SELECT o.o_orderkey FROM orders o WHERE o.o_custkey > 100";
+        let resolved = parse_and_analyze(sql).expect("table alias qualified ref should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_cte_with_alias() {
+        // Simplified q1 pattern: CTE with alias
+        let sql = "WITH order_totals AS (SELECT o_orderkey as ok, o_totalprice as total FROM orders) \
+                   SELECT t1.ok FROM order_totals t1 WHERE t1.total > 100";
+        let resolved = parse_and_analyze(sql).expect("CTE with alias should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_cte_with_comma_join_and_correlated_subquery() {
+        // Closer to q1 pattern: CTE with comma-join and correlated subquery
+        let sql = "WITH order_totals AS (\
+                     SELECT o_orderkey as ok, o_custkey as ck, o_totalprice as total FROM orders\
+                   ) \
+                   SELECT t1.ok FROM order_totals t1, customer \
+                   WHERE t1.total > (\
+                     SELECT avg(t2.total) FROM order_totals t2 WHERE t1.ck = t2.ck\
+                   ) AND t1.ck = c_custkey";
+        let resolved = parse_and_analyze(sql)
+            .expect("CTE with comma-join and correlated subquery should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_comma_join_multiple_aliases() {
+        // Simplified q3 pattern: comma-join with multiple table aliases
+        let sql = "SELECT o.o_orderkey, l.l_partkey \
+                   FROM orders o, lineitem l \
+                   WHERE o.o_orderkey = l.l_orderkey \
+                   GROUP BY o.o_orderkey, l.l_partkey";
+        let resolved =
+            parse_and_analyze(sql).expect("comma-join with multiple aliases should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_scalar_subquery_in_projection() {
+        // q9 pattern: scalar subqueries in projection (SELECT list), not in WHERE
+        let sql = "SELECT (SELECT count(*) FROM orders) as total_orders FROM lineitem \
+                   WHERE l_orderkey = 1";
+        let resolved = parse_and_analyze(sql).expect("scalar subquery in projection should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_case_with_scalar_subqueries_in_projection() {
+        // q9 pattern: CASE WHEN with scalar subqueries in projection
+        let sql = "SELECT CASE WHEN (SELECT count(*) FROM orders) > 100 \
+                          THEN (SELECT avg(o_totalprice) FROM orders) \
+                          ELSE (SELECT avg(o_totalprice) FROM orders WHERE o_totalprice > 0) \
+                   END as bucket1 \
+                   FROM lineitem WHERE l_orderkey = 1";
+        let resolved =
+            parse_and_analyze(sql).expect("CASE with scalar subqueries in projection should work");
+        assert!(!resolved.output_columns.is_empty());
+        // Verify that no SubqueryPlaceholder remains in the projection
+        if let QueryBody::Select(sel) = &resolved.body {
+            for item in &sel.projection {
+                assert!(
+                    !expr_has_placeholder_deep(&item.expr),
+                    "projection should not contain SubqueryPlaceholder after rewriting: {:?}",
+                    item.expr
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_group_by_rollup() {
+        // q5 pattern: GROUP BY ROLLUP(a, b)
+        let sql = "SELECT o_orderstatus, o_orderpriority, count(*) as cnt \
+                   FROM orders \
+                   GROUP BY ROLLUP(o_orderstatus, o_orderpriority)";
+        let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP should work");
+        assert!(!resolved.output_columns.is_empty());
+        // ROLLUP(a, b) should produce a UNION ALL of 3 levels:
+        // Level 0: GROUP BY a, b
+        // Level 1: GROUP BY a (b is NULLed)
+        // Level 2: no GROUP BY (both NULLed)
+        assert!(
+            matches!(resolved.body, QueryBody::SetOperation(_)),
+            "ROLLUP should be expanded into a UNION ALL set operation, got: {:?}",
+            std::mem::discriminant(&resolved.body)
+        );
+    }
+
+    #[test]
+    fn test_group_by_rollup_output_columns() {
+        // Verify ROLLUP preserves output column structure
+        let sql = "SELECT o_orderstatus as status, count(*) as cnt \
+                   FROM orders \
+                   GROUP BY ROLLUP(o_orderstatus)";
+        let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP should work");
+        assert_eq!(resolved.output_columns.len(), 2);
+        assert_eq!(resolved.output_columns[0].name, "status");
+        assert_eq!(resolved.output_columns[1].name, "cnt");
     }
 }

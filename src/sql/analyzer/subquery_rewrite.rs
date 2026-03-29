@@ -275,6 +275,11 @@ impl<'a> AnalyzerContext<'a> {
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
+            Self::replace_placeholder_in_projection(
+                &mut select.projection,
+                sq_info.id,
+                &replacement,
+            );
         } else {
             let scalar_col = resolved_sub.output_columns[0].clone();
             let sub_rel = Relation::Subquery {
@@ -312,6 +317,11 @@ impl<'a> AnalyzerContext<'a> {
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
+            Self::replace_placeholder_in_projection(
+                &mut select.projection,
+                sq_info.id,
+                &replacement,
+            );
         }
 
         Ok(())
@@ -685,6 +695,19 @@ impl<'a> AnalyzerContext<'a> {
         if let Some(expr) = filter.as_ref() {
             let new_expr = replace_placeholder_in_expr(expr, placeholder_id, replacement);
             *filter = Some(new_expr);
+        }
+    }
+
+    /// Replace subquery placeholders in projection items (SELECT list).
+    /// This handles scalar subqueries that appear in the SELECT list
+    /// (e.g., TPC-DS q9: CASE WHEN (SELECT ...) > N THEN (SELECT ...) ELSE (SELECT ...) END).
+    fn replace_placeholder_in_projection(
+        projection: &mut [ProjectItem],
+        placeholder_id: usize,
+        replacement: &TypedExpr,
+    ) {
+        for item in projection.iter_mut() {
+            item.expr = replace_placeholder_in_expr(&item.expr, placeholder_id, replacement);
         }
     }
 }
@@ -1066,6 +1089,31 @@ fn replace_placeholder_in_expr(
                 )),
                 value: *value,
                 negated: *negated,
+            },
+        },
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+        } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::WindowCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
+                    .collect(),
+                distinct: *distinct,
+                partition_by: partition_by
+                    .iter()
+                    .map(|p| replace_placeholder_in_expr(p, placeholder_id, replacement))
+                    .collect(),
+                order_by: order_by.clone(),
+                window_frame: window_frame.clone(),
             },
         },
         _ => expr.clone(),

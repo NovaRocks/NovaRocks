@@ -22,7 +22,9 @@ use crate::sql::plan::*;
 fn count_conjuncts(expr: &TypedExpr) -> usize {
     match &expr.kind {
         ExprKind::BinaryOp {
-            left, op: BinOp::And, right,
+            left,
+            op: BinOp::And,
+            right,
         } => count_conjuncts(left) + count_conjuncts(right),
         _ => 1,
     }
@@ -41,9 +43,9 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
                     let total: u64 = files.iter().map(|f| f.size.max(0) as u64).sum();
                     total.max(1)
                 }
-                TableStorage::LocalParquetFile { path } => {
-                    std::fs::metadata(path).map(|m| m.len()).unwrap_or(1_000_000)
-                }
+                TableStorage::LocalParquetFile { path } => std::fs::metadata(path)
+                    .map(|m| m.len())
+                    .unwrap_or(1_000_000),
             };
             // Apply selectivity for pushed-down predicates on the scan
             let num_predicates = s.predicates.len();
@@ -184,6 +186,10 @@ pub(crate) fn reorder_joins(plan: LogicalPlan) -> LogicalPlan {
             e.inputs = e.inputs.into_iter().map(reorder_joins).collect();
             LogicalPlan::Except(e)
         }
+        LogicalPlan::SubqueryAlias(mut s) => {
+            s.input = Box::new(reorder_joins(*s.input));
+            LogicalPlan::SubqueryAlias(s)
+        }
         // Leaf nodes: Scan, Values, GenerateSeries — nothing to reorder.
         other => other,
     }
@@ -311,7 +317,10 @@ mod tests {
                     LogicalPlan::Scan(s) => s.table.name.clone(),
                     other => panic!("expected Scan, got {:?}", std::mem::discriminant(other)),
                 };
-                assert_eq!(left_name, "large", "probe side should remain the large table");
+                assert_eq!(
+                    left_name, "large",
+                    "probe side should remain the large table"
+                );
             }
             other => panic!("expected Join, got {:?}", std::mem::discriminant(&other)),
         }
@@ -431,9 +440,15 @@ mod tests {
                 // Outer left should be lineitem (the large fact table).
                 match outer.left.as_ref() {
                     LogicalPlan::Scan(s) => {
-                        assert_eq!(s.table.name, "lineitem", "lineitem should be probe of outer join");
+                        assert_eq!(
+                            s.table.name, "lineitem",
+                            "lineitem should be probe of outer join"
+                        );
                     }
-                    other => panic!("expected Scan(lineitem) as outer left, got {:?}", std::mem::discriminant(other)),
+                    other => panic!(
+                        "expected Scan(lineitem) as outer left, got {:?}",
+                        std::mem::discriminant(other)
+                    ),
                 }
 
                 // Outer right should be the inner join.
@@ -442,16 +457,26 @@ mod tests {
                         // Inner join: left=orders, right=customer
                         let inner_left = match inner.left.as_ref() {
                             LogicalPlan::Scan(s) => s.table.name.clone(),
-                            other => panic!("expected Scan, got {:?}", std::mem::discriminant(other)),
+                            other => {
+                                panic!("expected Scan, got {:?}", std::mem::discriminant(other))
+                            }
                         };
                         let inner_right = match inner.right.as_ref() {
                             LogicalPlan::Scan(s) => s.table.name.clone(),
-                            other => panic!("expected Scan, got {:?}", std::mem::discriminant(other)),
+                            other => {
+                                panic!("expected Scan, got {:?}", std::mem::discriminant(other))
+                            }
                         };
                         assert_eq!(inner_left, "orders", "orders should be probe of inner join");
-                        assert_eq!(inner_right, "customer", "customer should be build of inner join");
+                        assert_eq!(
+                            inner_right, "customer",
+                            "customer should be build of inner join"
+                        );
                     }
-                    other => panic!("expected Join as outer right, got {:?}", std::mem::discriminant(other)),
+                    other => panic!(
+                        "expected Join as outer right, got {:?}",
+                        std::mem::discriminant(other)
+                    ),
                 }
             }
             other => panic!("expected Join, got {:?}", std::mem::discriminant(&other)),

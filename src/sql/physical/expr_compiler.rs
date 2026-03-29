@@ -825,10 +825,7 @@ impl<'a> ExprCompiler<'a> {
                     node_type: exprs::TExprNodeType::DECIMAL_LITERAL,
                     type_: type_desc,
                     num_children: 0,
-                    decimal_literal: Some(exprs::TDecimalLiteral::new(
-                        s.clone(),
-                        None::<Vec<u8>>,
-                    )),
+                    decimal_literal: Some(exprs::TDecimalLiteral::new(s.clone(), None::<Vec<u8>>)),
                     ..default_expr_node()
                 });
                 self.last_type = decimal_type.clone();

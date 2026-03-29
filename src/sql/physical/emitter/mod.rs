@@ -152,7 +152,32 @@ impl<'a> ThriftEmitter<'a> {
             LogicalPlan::Except(node) => self.emit_except(node),
             LogicalPlan::GenerateSeries(node) => self.emit_generate_series(node),
             LogicalPlan::Window(node) => self.emit_window(node),
+            LogicalPlan::SubqueryAlias(node) => self.emit_subquery_alias(node),
         }
+    }
+
+    fn emit_subquery_alias(
+        &mut self,
+        node: crate::sql::plan::SubqueryAliasNode,
+    ) -> Result<EmitResult, String> {
+        let mut child = self.emit_node(*node.input)?;
+
+        // Register all output columns with the alias as qualifier, so that
+        // downstream references like `ctr1.ctr_customer_sk` can resolve.
+        // The child plan's scope already has unqualified entries; we add
+        // qualified entries on top.
+        for col in &node.output_columns {
+            let col_name_lower = col.name.to_lowercase();
+            // Find the binding for this column in the child scope (unqualified)
+            if let Ok(binding) = child.scope.resolve_column(None, &col_name_lower) {
+                let binding = binding.clone();
+                child
+                    .scope
+                    .add_column(Some(node.alias.clone()), col.name.clone(), binding);
+            }
+        }
+
+        Ok(child)
     }
 
     // -----------------------------------------------------------------------

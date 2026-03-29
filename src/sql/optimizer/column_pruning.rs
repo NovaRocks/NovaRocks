@@ -184,5 +184,14 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 ..node
             })
         }
+
+        LogicalPlan::SubqueryAlias(node) => {
+            let input = prune_inner(*node.input, needed);
+            LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                input: Box::new(input),
+                alias: node.alias,
+                output_columns: node.output_columns,
+            })
+        }
     }
 }
