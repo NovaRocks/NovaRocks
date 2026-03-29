@@ -472,7 +472,7 @@ fn build_hdfs_scan_range_params(
         Some(0_i64),
         Some(file_len),
         None::<i64>,
-        Some(file_len),
+        None::<i64>,  // file_length: let scan connector determine actual size
         Some(descriptors::THdfsFileFormat::PARQUET),
         None::<descriptors::TTextFileDesc>,
         Some(full_path.to_string()),
