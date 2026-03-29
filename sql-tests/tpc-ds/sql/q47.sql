@@ -1,4 +1,3 @@
--- query 47
 with v1 as(
  select i_category, i_brand,
         s_store_name, s_company_name,

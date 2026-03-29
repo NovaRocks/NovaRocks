@@ -1,4 +1,3 @@
--- query 18
 select  i_item_id,
         ca_country,
         ca_state, 

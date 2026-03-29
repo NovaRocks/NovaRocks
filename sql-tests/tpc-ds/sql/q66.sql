@@ -1,4 +1,3 @@
--- query 66
 select   
          w_warehouse_name
  	,w_warehouse_sq_ft

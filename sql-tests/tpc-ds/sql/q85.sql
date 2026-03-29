@@ -1,4 +1,3 @@
--- query 85
 select  substr(r_reason_desc,1,20)
        ,avg(ws_quantity)
        ,avg(wr_refunded_cash)

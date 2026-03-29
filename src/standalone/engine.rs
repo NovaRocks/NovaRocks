@@ -3204,6 +3204,12 @@ fn record_batch_to_chunk(batch: RecordBatch) -> Result<Chunk, String> {
 /// Extract simple table names from a query AST (for Iceberg table materialization).
 fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> {
     let mut names = Vec::new();
+    // Extract table names from CTEs (WITH clause)
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            extract_table_names_from_subquery(&cte.query, &mut names);
+        }
+    }
     extract_table_names_from_set_expr(query.body.as_ref(), &mut names);
     names.sort();
     names.dedup();

@@ -1,4 +1,3 @@
--- query 33
 with ss as (
  select
           i_manufact_id,sum(ss_ext_sales_price) total_sales

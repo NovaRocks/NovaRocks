@@ -1,4 +1,3 @@
--- query 70
 select  
     sum(ss_net_profit) as total_sum
    ,s_state

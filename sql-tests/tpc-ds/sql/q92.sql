@@ -1,4 +1,3 @@
--- query 92
 select  
    sum(ws_ext_discount_amt)  as "Excess Discount Amount" 
 from 

@@ -1,4 +1,3 @@
--- query 42
 select  dt.d_year
  	,item.i_category_id
  	,item.i_category

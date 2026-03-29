@@ -1,4 +1,3 @@
--- query 99
 select  
    substr(w_warehouse_name,1,20)
   ,sm_type
