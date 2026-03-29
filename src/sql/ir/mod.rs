@@ -312,6 +312,9 @@ pub(crate) enum LiteralValue {
     Bool(bool),
     Int(i64),
     Float(f64),
+    /// Decimal literal with its original string representation (e.g. "100.00").
+    /// Precision and scale are inferred from the text: `100.00` → precision=5, scale=2.
+    Decimal(String),
     String(String),
 }
 

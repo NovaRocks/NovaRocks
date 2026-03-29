@@ -212,3 +212,175 @@ pub(super) fn wrap_remaining_filter(plan: LogicalPlan, remaining: Vec<TypedExpr>
         })
     }
 }
+
+/// Qualified column reference: (qualifier, column), both lowercase.
+pub(super) type QualifiedRef = (Option<String>, String);
+
+/// Collect all column references in an expression, preserving qualifiers.
+///
+/// Unlike [`collect_column_refs`] which returns bare column names, this
+/// function returns `(qualifier, column)` pairs so that self-join predicates
+/// (where both sides have the same column names) can be properly classified.
+pub(super) fn collect_qualified_column_refs(expr: &TypedExpr) -> Vec<QualifiedRef> {
+    let mut out = Vec::new();
+    collect_qualified_column_refs_inner(expr, &mut out);
+    out
+}
+
+fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<QualifiedRef>) {
+    match &expr.kind {
+        ExprKind::ColumnRef { qualifier, column } => {
+            out.push((
+                qualifier.as_ref().map(|q| q.to_lowercase()),
+                column.to_lowercase(),
+            ));
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_qualified_column_refs_inner(left, out);
+            collect_qualified_column_refs_inner(right, out);
+        }
+        ExprKind::UnaryOp { expr, .. } => collect_qualified_column_refs_inner(expr, out),
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_qualified_column_refs_inner(arg, out);
+            }
+        }
+        ExprKind::AggregateCall { args, .. } => {
+            for arg in args {
+                collect_qualified_column_refs_inner(arg, out);
+            }
+        }
+        ExprKind::Cast { expr, .. } => collect_qualified_column_refs_inner(expr, out),
+        ExprKind::IsNull { expr, .. } => collect_qualified_column_refs_inner(expr, out),
+        ExprKind::InList { expr, list, .. } => {
+            collect_qualified_column_refs_inner(expr, out);
+            for item in list {
+                collect_qualified_column_refs_inner(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_qualified_column_refs_inner(expr, out);
+            collect_qualified_column_refs_inner(low, out);
+            collect_qualified_column_refs_inner(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_qualified_column_refs_inner(expr, out);
+            collect_qualified_column_refs_inner(pattern, out);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(operand) = operand {
+                collect_qualified_column_refs_inner(operand, out);
+            }
+            for (when, then) in when_then {
+                collect_qualified_column_refs_inner(when, out);
+                collect_qualified_column_refs_inner(then, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_qualified_column_refs_inner(else_expr, out);
+            }
+        }
+        ExprKind::IsTruthValue { expr, .. } => collect_qualified_column_refs_inner(expr, out),
+        ExprKind::Nested(inner) => collect_qualified_column_refs_inner(inner, out),
+        ExprKind::Literal(_) => {}
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_qualified_column_refs_inner(arg, out);
+            }
+            for pb in partition_by {
+                collect_qualified_column_refs_inner(pb, out);
+            }
+            for ob in order_by {
+                collect_qualified_column_refs_inner(&ob.expr, out);
+            }
+        }
+        ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+/// Collect qualified output columns from a plan subtree.
+///
+/// Returns `(qualifier, column_name)` pairs where `qualifier` is the table
+/// alias (for Scan nodes with an alias) or `None`.  Each column also yields a
+/// bare `(None, column_name)` entry so that unqualified references still match.
+pub(super) fn collect_qualified_output_columns(plan: &LogicalPlan) -> HashSet<QualifiedRef> {
+    let mut out = HashSet::new();
+    collect_qualified_output_columns_inner(plan, &mut out);
+    out
+}
+
+fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<QualifiedRef>) {
+    match plan {
+        LogicalPlan::Scan(s) => {
+            let alias = s
+                .alias
+                .as_ref()
+                .map(|a| a.to_lowercase())
+                .or_else(|| Some(s.table.name.to_lowercase()));
+            for c in &s.columns {
+                let col = c.name.to_lowercase();
+                // Qualified entry: (alias, column)
+                if let Some(ref q) = alias {
+                    out.insert((Some(q.clone()), col.clone()));
+                }
+                // Bare entry: (None, column)
+                out.insert((None, col));
+            }
+        }
+        LogicalPlan::Filter(f) => collect_qualified_output_columns_inner(&f.input, out),
+        LogicalPlan::Project(p) => {
+            for item in &p.items {
+                out.insert((None, item.output_name.to_lowercase()));
+            }
+        }
+        LogicalPlan::Join(j) => {
+            collect_qualified_output_columns_inner(&j.left, out);
+            collect_qualified_output_columns_inner(&j.right, out);
+        }
+        LogicalPlan::Aggregate(a) => {
+            for c in &a.output_columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        LogicalPlan::Sort(s) => collect_qualified_output_columns_inner(&s.input, out),
+        LogicalPlan::Limit(l) => collect_qualified_output_columns_inner(&l.input, out),
+        LogicalPlan::Window(w) => {
+            for c in &w.output_columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        LogicalPlan::Union(u) => {
+            if let Some(first) = u.inputs.first() {
+                collect_qualified_output_columns_inner(first, out);
+            }
+        }
+        LogicalPlan::Intersect(i) => {
+            if let Some(first) = i.inputs.first() {
+                collect_qualified_output_columns_inner(first, out);
+            }
+        }
+        LogicalPlan::Except(e) => {
+            if let Some(first) = e.inputs.first() {
+                collect_qualified_output_columns_inner(first, out);
+            }
+        }
+        LogicalPlan::Values(v) => {
+            for c in &v.columns {
+                out.insert((None, c.name.to_lowercase()));
+            }
+        }
+        LogicalPlan::GenerateSeries(g) => {
+            out.insert((None, g.column_name.to_lowercase()));
+        }
+    }
+}
