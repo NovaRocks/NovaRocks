@@ -11,10 +11,19 @@ pub(crate) fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op:
             (p as u8, s)
         }
         "div" | "/" => {
-            // divide: scale = max(s1+p2+1, 6), precision = p1+s2+scale
-            let s = (s1 + p2 as i8 + 1).max(6);
-            let p = (p1 as i8 + s2 + s).min(38);
-            (p as u8, s)
+            // StarRocks divide rule:
+            // if lhsScale <= 6:  returnScale = lhsScale + 6
+            // if lhsScale <= 12: returnScale = 12
+            // else:              returnScale = lhsScale
+            // precision = 38 (always max)
+            let s = if s1 <= 6 {
+                s1 + 6
+            } else if s1 <= 12 {
+                12
+            } else {
+                s1
+            };
+            (38_u8, s)
         }
         _ => {
             // add/sub/mod: scale = max(s1,s2), precision = max(p1-s1, p2-s2)+scale+1
@@ -51,9 +60,12 @@ pub(crate) fn arithmetic_result_type_with_op(
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
             DataType::Decimal128(p, s),
         ) => decimal_arithmetic_result_type(*p, *s as i8, 19, 0, op),
-        // Decimal + Float -> Float64 (StarRocks behavior)
-        (DataType::Decimal128(_, _), DataType::Float64 | DataType::Float32)
-        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,
+        // Decimal + Float -> Decimal (treat float literal as decimal)
+        (DataType::Decimal128(p, s), DataType::Float64 | DataType::Float32)
+        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(p, s)) => {
+            // Treat float as Decimal(38, 9) and compute result
+            decimal_arithmetic_result_type(*p, *s as i8, 38, 9, op)
+        }
         // Existing rules
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
