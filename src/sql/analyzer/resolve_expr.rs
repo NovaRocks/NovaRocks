@@ -513,10 +513,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         data_type: DataType::Int64,
                         nullable: false,
                     })
-                } else if n.contains('.')
-                    && !n.contains('e')
-                    && !n.contains('E')
-                {
+                } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
                     // Number with decimal point (no scientific notation) → Decimal
                     // with precision/scale inferred from the literal text (e.g.
                     // "100.00" → Decimal(5,2), "7.0" → Decimal(2,1)).
@@ -1050,7 +1047,11 @@ fn infer_decimal_precision_scale(s: &str) -> (u8, i8) {
         None => (s, ""),
     };
     let int_part = int_part.trim_start_matches('0');
-    let int_digits = if int_part.is_empty() { 1 } else { int_part.len() };
+    let int_digits = if int_part.is_empty() {
+        1
+    } else {
+        int_part.len()
+    };
     let scale = frac_part.len();
     let precision = int_digits + scale;
     // Clamp to Decimal128 limits

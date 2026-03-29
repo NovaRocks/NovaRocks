@@ -28,6 +28,19 @@ pub(crate) enum LogicalPlan {
     Values(ValuesNode),
     GenerateSeries(GenerateSeriesNode),
     Window(WindowNode),
+    /// Wraps a subquery plan with an alias, so that the physical emitter
+    /// can register qualified columns (e.g., `ctr1.ctr_customer_sk` for
+    /// a CTE referenced as `FROM customer_total_return ctr1`).
+    SubqueryAlias(SubqueryAliasNode),
+}
+
+/// Subquery alias node: wraps an inlined subquery (CTE or derived table)
+/// with the alias name and output column metadata.
+#[derive(Clone, Debug)]
+pub(crate) struct SubqueryAliasNode {
+    pub input: Box<LogicalPlan>,
+    pub alias: String,
+    pub output_columns: Vec<OutputColumn>,
 }
 
 /// Analytic/window function evaluation node.

@@ -564,9 +564,16 @@ fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
                 required_columns: None,
             }))
         }
-        Relation::Subquery { query, alias: _ } => {
-            // Recursively plan the subquery
-            plan(*query)
+        Relation::Subquery { query, alias } => {
+            // Recursively plan the subquery, wrapping with alias metadata
+            // so the physical emitter can register qualified columns.
+            let output_columns = query.output_columns.clone();
+            let inner_plan = plan(*query)?;
+            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                input: Box::new(inner_plan),
+                alias,
+                output_columns,
+            }))
         }
         Relation::Join(join_rel) => {
             let left = plan_relation(join_rel.left)?;

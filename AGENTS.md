@@ -273,7 +273,12 @@ StarRocks FE
 - User communication and design docs: Chinese
 - Code comments/logs/errors/commit messages: English
 
-### 8.2 Code Quality
+### 8.2 Build Mode
+
+- **Debug build (`cargo build`)**: Use for functional testing and fast iteration. Default choice.
+- **Release build (`cargo build --release`)**: Use ONLY when testing performance (query latency, throughput). Release compilation is very slow and not suitable for rapid iteration.
+
+### 8.3 Code Quality
 
 - `cargo fmt`
 - `cargo clippy`

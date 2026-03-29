@@ -221,9 +221,9 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                     let is_self_join_overlap = {
                         let bare_refs: Vec<String> =
                             refs.iter().map(|c| c.to_lowercase()).collect();
-                        bare_refs.iter().all(|c| {
-                            left_cols.contains(c) && right_cols.contains(c)
-                        })
+                        bare_refs
+                            .iter()
+                            .all(|c| left_cols.contains(c) && right_cols.contains(c))
                     };
                     if is_self_join_overlap {
                         remaining.push(conj);

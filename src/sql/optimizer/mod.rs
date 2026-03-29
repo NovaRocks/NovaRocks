@@ -70,6 +70,11 @@ pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan)
         LogicalPlan::Except(n) => LogicalPlan::Except(ExceptNode {
             inputs: n.inputs.into_iter().map(f).collect(),
         }),
+        LogicalPlan::SubqueryAlias(n) => LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+            input: Box::new(f(*n.input)),
+            alias: n.alias,
+            output_columns: n.output_columns,
+        }),
     }
 }
 
