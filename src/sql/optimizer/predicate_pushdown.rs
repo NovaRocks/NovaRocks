@@ -4,7 +4,8 @@ use crate::sql::ir::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::plan::*;
 
 use super::expr_utils::{
-    collect_column_refs, collect_output_columns, combine_and, split_and, wrap_remaining_filter,
+    collect_column_refs, collect_output_columns, collect_qualified_column_refs,
+    collect_qualified_output_columns, combine_and, split_and, wrap_remaining_filter,
 };
 use super::map_children;
 
@@ -137,6 +138,10 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
     let left_cols = collect_output_columns(&join.left);
     let right_cols = collect_output_columns(&join.right);
 
+    // Qualified output columns for precise self-join disambiguation.
+    let left_qcols = collect_qualified_output_columns(&join.left);
+    let right_qcols = collect_qualified_output_columns(&join.right);
+
     let mut left_preds = Vec::new();
     let mut right_preds = Vec::new();
     let mut join_preds = Vec::new();
@@ -176,25 +181,66 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                 }
             }
             (true, true) => {
-                // When columns exist in both sides, check if this is actually
-                // a left-only predicate for LEFT join variants. This happens
-                // after subquery rewrite when the right (subquery) output has
-                // columns with the same name as the left side.
-                if is_left_join_variant
-                    && refs.iter().all(|c| left_cols.contains(&c.to_lowercase()))
-                {
+                // Bare-name matching says "both sides". Re-check with qualified
+                // column references to handle self-joins (e.g. nation n1, nation n2)
+                // where both sides share the same bare column names.
+                let qrefs = collect_qualified_column_refs(&conj);
+                let q_in_left = qrefs.iter().any(|r| left_qcols.contains(r));
+                let q_in_right = qrefs.iter().any(|r| right_qcols.contains(r));
+
+                // If ALL qualified refs are present in left (and not exclusively
+                // right), treat as left-only. Vice versa for right-only.
+                // Only if qualified refs genuinely span both sides treat as
+                // "both-sides".
+                let all_in_left = qrefs.iter().all(|r| left_qcols.contains(r));
+                let all_in_right = qrefs.iter().all(|r| right_qcols.contains(r));
+
+                if all_in_left && !all_in_right {
+                    // Qualified analysis shows left-only
                     left_preds.push(conj);
-                } else if is_left_join_variant {
-                    // For LEFT OUTER / SEMI / ANTI joins, "both-sides"
-                    // predicates that genuinely reference the right side must
-                    // NOT be merged into the join ON condition. Doing so
-                    // changes semantics: a LEFT OUTER JOIN preserves left
-                    // rows when the ON condition fails (producing NULLs on
-                    // the right), but a post-join filter would eliminate them.
-                    // Keep these predicates above the join.
-                    remaining.push(conj);
+                } else if all_in_right && !all_in_left {
+                    // Qualified analysis shows right-only
+                    match join.join_type {
+                        JoinKind::Inner
+                        | JoinKind::Cross
+                        | JoinKind::RightOuter
+                        | JoinKind::RightSemi
+                        | JoinKind::RightAnti => {
+                            right_preds.push(conj);
+                        }
+                        _ => remaining.push(conj),
+                    }
+                } else if q_in_left && q_in_right {
+                    // Genuinely references both sides.
+                    //
+                    // For self-joins (left and right share the same bare column
+                    // names), keep the predicate as a remaining filter above the
+                    // join.  Merging it into the join condition can cause the
+                    // execution layer to mis-resolve ambiguous column references
+                    // when both sides originate from the same table.
+                    let is_self_join_overlap = {
+                        let bare_refs: Vec<String> =
+                            refs.iter().map(|c| c.to_lowercase()).collect();
+                        bare_refs.iter().all(|c| {
+                            left_cols.contains(c) && right_cols.contains(c)
+                        })
+                    };
+                    if is_self_join_overlap {
+                        remaining.push(conj);
+                    } else if is_left_join_variant
+                        && refs.iter().all(|c| left_cols.contains(&c.to_lowercase()))
+                    {
+                        left_preds.push(conj);
+                    } else if is_left_join_variant {
+                        remaining.push(conj);
+                    } else {
+                        join_preds.push(conj);
+                    }
                 } else {
-                    join_preds.push(conj);
+                    // Fallback: keep above the join as remaining filter.
+                    // This handles cases where qualified matching cannot
+                    // disambiguate (e.g. mixed qualified/unqualified refs).
+                    remaining.push(conj);
                 }
             }
             (false, false) => {

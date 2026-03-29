@@ -818,6 +818,23 @@ impl<'a> ExprCompiler<'a> {
                 self.last_nullable = false;
                 Ok(DataType::Float64)
             }
+            LiteralValue::Decimal(s) => {
+                let decimal_type = expr_type.clone();
+                let type_desc = arrow_type_to_type_desc(&decimal_type)?;
+                self.nodes.push(exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::DECIMAL_LITERAL,
+                    type_: type_desc,
+                    num_children: 0,
+                    decimal_literal: Some(exprs::TDecimalLiteral::new(
+                        s.clone(),
+                        None::<Vec<u8>>,
+                    )),
+                    ..default_expr_node()
+                });
+                self.last_type = decimal_type.clone();
+                self.last_nullable = false;
+                Ok(decimal_type)
+            }
             LiteralValue::String(s) => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::VARCHAR);
                 self.nodes.push(exprs::TExprNode {
