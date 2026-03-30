@@ -18,7 +18,14 @@ mod predicate_pushdown;
 use crate::sql::plan::*;
 
 /// Apply all optimization rules to the logical plan.
-pub(crate) fn optimize(plan: LogicalPlan) -> LogicalPlan {
+///
+/// `table_stats` provides per-table statistics from Iceberg metadata.
+/// Currently passed through for future use by DP-based join reorder;
+/// the existing heuristic-based reorder does not use it yet.
+pub(crate) fn optimize(
+    plan: LogicalPlan,
+    _table_stats: &std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
+) -> LogicalPlan {
     let plan = predicate_pushdown::push_down_predicates(plan);
     let plan = join_reorder::reorder_joins(plan);
     let plan = column_pruning::prune_columns(plan);
@@ -175,7 +182,7 @@ mod tests {
             predicate: pred.clone(),
         });
 
-        let optimized = optimize(plan);
+        let optimized = optimize(plan, &std::collections::HashMap::new());
 
         // Filter should be eliminated; predicate should be on the scan
         match &optimized {
@@ -198,7 +205,7 @@ mod tests {
             }],
         });
 
-        let optimized = optimize(proj);
+        let optimized = optimize(proj, &std::collections::HashMap::new());
 
         match &optimized {
             LogicalPlan::Project(proj) => match proj.input.as_ref() {
@@ -239,7 +246,7 @@ mod tests {
             }],
         });
 
-        let optimized = optimize(proj);
+        let optimized = optimize(proj, &std::collections::HashMap::new());
 
         // Project → Scan (with predicate on b and required_columns = [a, b])
         match &optimized {

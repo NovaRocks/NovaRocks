@@ -77,6 +77,84 @@ pub struct TableStatistics {
     pub column_stats: HashMap<String, ColumnStatistic>,
 }
 
+/// Build table-level statistics from `S3FileInfo` entries.
+///
+/// Aggregates row counts and per-column Iceberg statistics across all files.
+/// Returns `None` if no file has a row count (e.g., non-Iceberg sources).
+pub fn build_table_statistics(
+    files: &[crate::sql::catalog::S3FileInfo],
+) -> Option<TableStatistics> {
+    // Need at least one file with a row count to produce meaningful stats.
+    let all_have_row_count = !files.is_empty() && files.iter().all(|f| f.row_count.is_some());
+    if !all_have_row_count {
+        return None;
+    }
+
+    let total_rows: u64 = files
+        .iter()
+        .map(|f| f.row_count.unwrap().max(0) as u64)
+        .sum();
+
+    // Aggregate per-column stats across files.
+    let mut col_null_total: HashMap<String, i64> = HashMap::new();
+    let mut col_size_total: HashMap<String, i64> = HashMap::new();
+    let mut col_count: HashMap<String, u64> = HashMap::new();
+
+    for file in files {
+        if let Some(ref cs) = file.column_stats {
+            for (col_name, stats) in cs {
+                *col_count.entry(col_name.clone()).or_default() += 1;
+                if let Some(nc) = stats.null_count {
+                    *col_null_total.entry(col_name.clone()).or_default() += nc;
+                }
+                if let Some(sz) = stats.column_size {
+                    *col_size_total.entry(col_name.clone()).or_default() += sz;
+                }
+            }
+        }
+    }
+
+    let num_files = files.len() as u64;
+    let mut column_stats = HashMap::new();
+    for (col_name, count) in &col_count {
+        // Only include columns that appear in all files for consistency.
+        if *count < num_files {
+            continue;
+        }
+        let nulls = col_null_total.get(col_name).copied().unwrap_or(0);
+        let nulls_fraction = if total_rows > 0 {
+            nulls as f64 / total_rows as f64
+        } else {
+            0.0
+        };
+        let avg_row_size = if total_rows > 0 {
+            let total_size = col_size_total.get(col_name).copied().unwrap_or(0);
+            total_size as f64 / total_rows as f64
+        } else {
+            8.0
+        };
+        column_stats.insert(
+            col_name.clone(),
+            ColumnStatistic {
+                min_value: f64::NEG_INFINITY,
+                max_value: f64::INFINITY,
+                nulls_fraction,
+                average_row_size: if avg_row_size > 0.0 {
+                    avg_row_size
+                } else {
+                    8.0
+                },
+                distinct_values_count: 1.0,
+            },
+        );
+    }
+
+    Some(TableStatistics {
+        row_count: total_rows,
+        column_stats,
+    })
+}
+
 /// Selectivity constants aligned with StarRocks StatisticsEstimateCoefficient.
 pub const PREDICATE_UNKNOWN_FILTER: f64 = 0.25;
 pub const IS_NULL_FILTER: f64 = 0.1;

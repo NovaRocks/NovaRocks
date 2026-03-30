@@ -569,6 +569,132 @@ pub(crate) fn extract_data_files(
     .map_err(|e| format!("extract data files runtime: {e}"))?
 }
 
+/// Result of extracting data files with column-level statistics from Iceberg manifests.
+pub(crate) struct DataFileWithStats {
+    pub path: String,
+    pub size: i64,
+    pub record_count: Option<i64>,
+    pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
+}
+
+/// Extract data file paths, sizes, row counts, and per-column statistics from
+/// Iceberg manifest entries.
+///
+/// This reads the manifest list from the current snapshot, loads each data
+/// manifest, and collects per-column stats (null counts, column sizes,
+/// lower/upper bounds) mapped to column names via the table schema.
+///
+/// If no snapshot exists the result is an empty vec.
+pub(crate) fn extract_data_files_with_stats(
+    table: &iceberg::table::Table,
+) -> Result<Vec<DataFileWithStats>, String> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    let metadata = table.metadata();
+    let snapshot = match metadata.current_snapshot() {
+        Some(s) => s,
+        None => return Ok(vec![]),
+    };
+
+    // Build a field-id -> column-name map from the current schema.
+    let schema = metadata.current_schema();
+    let field_id_to_name: HashMap<i32, String> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| (f.id, f.name.clone()))
+        .collect();
+
+    let file_io = table.file_io();
+
+    block_on_iceberg(async {
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, metadata)
+            .await
+            .map_err(|e| format!("load manifest list: {e}"))?;
+
+        let mut results = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            // Only process data manifests, skip delete manifests.
+            if manifest_file.content != ManifestContentType::Data {
+                continue;
+            }
+
+            let manifest = manifest_file
+                .load_manifest(file_io)
+                .await
+                .map_err(|e| format!("load manifest: {e}"))?;
+
+            for entry in manifest.entries() {
+                // Skip deleted entries.
+                if entry.status == ManifestStatus::Deleted {
+                    continue;
+                }
+
+                let df = entry.data_file();
+
+                // Only process data files (not delete files).
+                if df.content_type() != DataContentType::Data {
+                    continue;
+                }
+
+                let path = df.file_path().to_string();
+                let size = i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX);
+                let record_count = Some(df.record_count() as i64);
+
+                // Build per-column stats.
+                let null_counts = df.null_value_counts();
+                let col_sizes = df.column_sizes();
+                let lower = df.lower_bounds();
+                let upper = df.upper_bounds();
+
+                let has_any_stats =
+                    !null_counts.is_empty() || !col_sizes.is_empty() || !lower.is_empty() || !upper.is_empty();
+
+                let column_stats = if has_any_stats {
+                    // Collect all field IDs that appear in any stats map.
+                    let mut all_ids = std::collections::HashSet::new();
+                    all_ids.extend(null_counts.keys());
+                    all_ids.extend(col_sizes.keys());
+                    all_ids.extend(lower.keys());
+                    all_ids.extend(upper.keys());
+
+                    let mut stats_map = HashMap::new();
+                    for &fid in &all_ids {
+                        if let Some(col_name) = field_id_to_name.get(&fid) {
+                            let lb = lower.get(&fid).and_then(|d| d.to_bytes().ok()).map(|b| b.to_vec());
+                            let ub = upper.get(&fid).and_then(|d| d.to_bytes().ok()).map(|b| b.to_vec());
+                            stats_map.insert(
+                                col_name.clone(),
+                                crate::sql::catalog::IcebergColumnStats {
+                                    null_count: null_counts.get(&fid).map(|&v| v as i64),
+                                    column_size: col_sizes.get(&fid).map(|&v| v as i64),
+                                    lower_bound: lb,
+                                    upper_bound: ub,
+                                },
+                            );
+                        }
+                    }
+                    Some(stats_map)
+                } else {
+                    None
+                };
+
+                results.push(DataFileWithStats {
+                    path,
+                    size,
+                    record_count,
+                    column_stats,
+                });
+            }
+        }
+
+        Ok(results)
+    })
+    .map_err(|e| format!("extract data files with stats runtime: {e}"))?
+}
+
 /// Register an existing Iceberg table in the catalog entry by loading it.
 /// This is used by metadata restore to ensure tables are accessible.
 pub(crate) fn register_existing_table(
