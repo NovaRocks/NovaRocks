@@ -547,7 +547,13 @@ fn parse_set_catalog_query(query: &str) -> Option<&str> {
 }
 
 fn is_supported_embedded_statement(query: &str) -> bool {
-    let mut parts = query.split_whitespace();
+    // Skip leading SQL line comments (-- ...)
+    let trimmed = query
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .unwrap_or("");
+    let mut parts = trimmed.split_whitespace();
     let Some(head) = parts.next() else {
         return false;
     };
@@ -594,6 +600,10 @@ async fn execute_statement_text(
 ) -> Result<StatementResult, (ErrorKind, String)> {
     let trimmed = trim_query(statement);
     if trimmed.is_empty() {
+        return Ok(StatementResult::Ok);
+    }
+    // Treat SQL line comments (-- ...) as no-ops
+    if trimmed.starts_with("--") {
         return Ok(StatementResult::Ok);
     }
 

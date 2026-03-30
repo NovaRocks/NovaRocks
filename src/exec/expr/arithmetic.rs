@@ -839,6 +839,9 @@ pub fn eval_div(
 ) -> Result<ArrayRef, String> {
     let lhs = arena.eval(a, chunk)?;
     let rhs = arena.eval(b, chunk)?;
+    // Replace zeros in the divisor with NULLs so that division by zero
+    // returns NULL instead of an error (matches StarRocks behavior).
+    let rhs = nullify_zeros(&rhs);
     let output_type = arena.data_type(expr).cloned().unwrap_or(DataType::Null);
     if let Some(arr) = eval_largeint_binop(&lhs, &rhs, &output_type, LargeIntOp::Div)? {
         return Ok(arr);
@@ -865,6 +868,43 @@ pub fn eval_div(
         },
     )?;
     cast_numeric_output(result, &output_type)
+}
+
+/// Replace zero values in a numeric array with NULLs for safe division.
+fn nullify_zeros(arr: &ArrayRef) -> ArrayRef {
+    use arrow::array::BooleanArray;
+    let len = arr.len();
+    let mut is_zero_buf = vec![false; len];
+    match arr.data_type() {
+        DataType::Int8 => {
+            if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int8Array>() {
+                for i in 0..len { if !a.is_null(i) && a.value(i) == 0 { is_zero_buf[i] = true; } }
+            }
+        }
+        DataType::Int16 => {
+            if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int16Array>() {
+                for i in 0..len { if !a.is_null(i) && a.value(i) == 0 { is_zero_buf[i] = true; } }
+            }
+        }
+        DataType::Int32 => {
+            if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
+                for i in 0..len { if !a.is_null(i) && a.value(i) == 0 { is_zero_buf[i] = true; } }
+            }
+        }
+        DataType::Int64 => {
+            if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+                for i in 0..len { if !a.is_null(i) && a.value(i) == 0 { is_zero_buf[i] = true; } }
+            }
+        }
+        DataType::Float64 => {
+            if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
+                for i in 0..len { if !a.is_null(i) && a.value(i) == 0.0 { is_zero_buf[i] = true; } }
+            }
+        }
+        _ => return arr.clone(),
+    }
+    let mask = BooleanArray::from(is_zero_buf);
+    arrow::compute::nullif(arr, &mask).unwrap_or_else(|_| arr.clone())
 }
 
 pub fn eval_mod(
