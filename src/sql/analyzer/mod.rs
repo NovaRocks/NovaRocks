@@ -506,7 +506,8 @@ impl<'a> AnalyzerContext<'a> {
             // Replace GROUP BY with the active keys only
             modified_select.group_by = sqlast::GroupByExpr::Expressions(modified_gb_exprs, vec![]);
 
-            // Modify projection: replace NULLed columns with NULL literals
+            // Modify projection: replace NULLed columns with NULL literals,
+            // and replace GROUPING(col) calls with literal 0 or 1.
             let mut modified_projection = Vec::new();
             for item in &select.projection {
                 let (expr_part, alias_part) = match item {
@@ -539,7 +540,16 @@ impl<'a> AnalyzerContext<'a> {
                         });
                     }
                 } else {
-                    modified_projection.push(item.clone());
+                    // Replace GROUPING(col) calls with 0 or 1
+                    let rewritten = replace_grouping_calls(expr_part, &nulled_exprs);
+                    if let Some(alias) = alias_part {
+                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                            expr: rewritten,
+                            alias,
+                        });
+                    } else {
+                        modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
+                    }
                 }
             }
             modified_select.projection = modified_projection;
@@ -811,6 +821,111 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok(sort_items)
+    }
+}
+
+/// Replace GROUPING(col) function calls in a sqlparser AST expression with
+/// integer literal 0 (column is active) or 1 (column is NULLed) based on the
+/// current ROLLUP expansion level.
+fn replace_grouping_calls(
+    expr: &sqlast::Expr,
+    nulled_exprs: &std::collections::HashSet<String>,
+) -> sqlast::Expr {
+    match expr {
+        sqlast::Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "grouping" {
+                // Extract the argument column name
+                if let sqlast::FunctionArguments::List(ref list) = func.args {
+                    if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                        arg_expr,
+                    ))) = list.args.first()
+                    {
+                        let arg_str = format!("{arg_expr}").to_lowercase();
+                        let value = if nulled_exprs.contains(&arg_str) {
+                            1i64
+                        } else {
+                            0i64
+                        };
+                        return sqlast::Expr::Value(
+                            sqlast::Value::Number(value.to_string(), false).into(),
+                        );
+                    }
+                }
+            }
+            // Not a GROUPING() call — recurse into arguments
+            let new_args = match &func.args {
+                sqlast::FunctionArguments::List(list) => {
+                    let new_list_args: Vec<_> = list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                                    replace_grouping_calls(e, nulled_exprs),
+                                ))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect();
+                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                        args: new_list_args,
+                        ..list.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            let mut new_func = func.clone();
+            new_func.args = new_args;
+            // Recurse into OVER clause for window functions
+            if let Some(ref window) = func.over {
+                new_func.over = Some(replace_grouping_in_window(window, nulled_exprs));
+            }
+            sqlast::Expr::Function(new_func)
+        }
+        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
+            left: Box::new(replace_grouping_calls(left, nulled_exprs)),
+            op: op.clone(),
+            right: Box::new(replace_grouping_calls(right, nulled_exprs)),
+        },
+        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_grouping_calls(inner, nulled_exprs)),
+        },
+        sqlast::Expr::Nested(inner) => {
+            sqlast::Expr::Nested(Box::new(replace_grouping_calls(inner, nulled_exprs)))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Recurse into window specifications to replace GROUPING() calls in PARTITION BY / ORDER BY.
+fn replace_grouping_in_window(
+    window: &sqlast::WindowType,
+    nulled_exprs: &std::collections::HashSet<String>,
+) -> sqlast::WindowType {
+    match window {
+        sqlast::WindowType::WindowSpec(spec) => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| replace_grouping_calls(e, nulled_exprs))
+                .collect();
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|ob| sqlast::OrderByExpr {
+                    expr: replace_grouping_calls(&ob.expr, nulled_exprs),
+                    ..ob.clone()
+                })
+                .collect();
+            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
+                partition_by,
+                order_by,
+                ..spec.clone()
+            })
+        }
+        other => other.clone(),
     }
 }
 
