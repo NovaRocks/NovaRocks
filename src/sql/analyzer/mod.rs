@@ -831,6 +831,12 @@ fn replace_grouping_calls(
     expr: &sqlast::Expr,
     nulled_exprs: &std::collections::HashSet<String>,
 ) -> sqlast::Expr {
+    // Replace references to NULLed columns with NULL (needed for window
+    // PARTITION BY / ORDER BY expressions that reference rollup keys).
+    let expr_str = format!("{expr}").to_lowercase();
+    if nulled_exprs.contains(&expr_str) {
+        return sqlast::Expr::Value(sqlast::Value::Null.into());
+    }
     match expr {
         sqlast::Expr::Function(func) => {
             let name = func.name.to_string().to_lowercase();
@@ -895,6 +901,29 @@ fn replace_grouping_calls(
         sqlast::Expr::Nested(inner) => {
             sqlast::Expr::Nested(Box::new(replace_grouping_calls(inner, nulled_exprs)))
         }
+        sqlast::Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => sqlast::Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(replace_grouping_calls(o, nulled_exprs))),
+            conditions: conditions
+                .iter()
+                .map(|cw| sqlast::CaseWhen {
+                    condition: replace_grouping_calls(&cw.condition, nulled_exprs),
+                    result: replace_grouping_calls(&cw.result, nulled_exprs),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(replace_grouping_calls(e, nulled_exprs))),
+        },
         other => other.clone(),
     }
 }
