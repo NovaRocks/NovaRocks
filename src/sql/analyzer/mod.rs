@@ -832,8 +832,7 @@ impl<'a> AnalyzerContext<'a> {
                             Err(proj_err) => {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
-                                        let (_, from_scope) =
-                                            self.rebuild_from_scope(from_rel)?;
+                                        let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
                                         match self.analyze_expr(&ob.expr, &from_scope) {
                                             Ok(typed) => typed,
                                             Err(_) => return Err(proj_err),

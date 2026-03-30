@@ -1,16 +1,19 @@
 //! Logical plan optimizer.
 //!
-//! Currently supports three rule-based optimizations (applied in order):
+//! Applies three optimization passes in order:
 //!   1. **Predicate pushdown** — moves Filter predicates closer to Scan nodes.
-//!   2. **Join reorder** — swaps build/probe sides so the smaller relation is
-//!      built into the hash table (right/build) and the larger relation probes
-//!      (left/probe).
+//!   2. **CBO join reorder** — uses cardinality estimation, a cost model, and
+//!      DP join enumeration to find the cheapest join order for chains of INNER
+//!      JOINs.  Falls back to a heuristic swap for non-INNER joins or when the
+//!      join graph is too large.
 //!   3. **Column pruning** — removes unreferenced columns from Scan nodes.
 //!
 //! The optimizer operates on the [`LogicalPlan`] tree before it is handed to
 //! the Thrift emitter.
 
+pub(crate) mod cardinality;
 mod column_pruning;
+pub(crate) mod cost;
 pub(crate) mod expr_utils;
 mod join_reorder;
 mod predicate_pushdown;
@@ -24,10 +27,10 @@ use crate::sql::plan::*;
 /// the existing heuristic-based reorder does not use it yet.
 pub(crate) fn optimize(
     plan: LogicalPlan,
-    _table_stats: &std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
+    table_stats: &std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
 ) -> LogicalPlan {
     let plan = predicate_pushdown::push_down_predicates(plan);
-    let plan = join_reorder::reorder_joins(plan);
+    let plan = join_reorder::reorder_joins_cbo(plan, table_stats);
     let plan = column_pruning::prune_columns(plan);
     plan
 }

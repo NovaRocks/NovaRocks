@@ -879,9 +879,7 @@ fn is_placeholder(expr: &TypedExpr, id: usize) -> bool {
 
 fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> TypedExpr {
     match &expr.kind {
-        ExprKind::BinaryOp { left, op, right }
-            if matches!(op, BinOp::And | BinOp::Or) =>
-        {
+        ExprKind::BinaryOp { left, op, right } if matches!(op, BinOp::And | BinOp::Or) => {
             let identity = matches!(op, BinOp::And); // AND identity = true, OR identity = false
             let left_is = is_placeholder(left, placeholder_id);
             let right_is = is_placeholder(right, placeholder_id);

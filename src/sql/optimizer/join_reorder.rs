@@ -1,22 +1,27 @@
 //! Join reorder optimization pass.
 //!
-//! For hash joins the left child is the **probe** side and the right child is
-//! the **build** side.  Building a hash table on a huge relation is
-//! catastrophically expensive, so we want the *smaller* side on the right
-//! (build) and the *larger* side on the left (probe).
+//! Two strategies are available:
 //!
-//! This pass estimates the byte-size of each subtree and, for join types whose
-//! semantics are commutative (INNER, CROSS), swaps the children when the right
-//! (build) side is significantly larger than the left (probe) side.
+//! 1. **CBO (cost-based)** — `reorder_joins_cbo`: Uses dynamic programming to
+//!    enumerate join orderings for chains of INNER JOINs, picking the cheapest
+//!    plan according to the cardinality estimator and cost model.
 //!
-//! Left-preserving joins (LEFT OUTER, LEFT SEMI, LEFT ANTI) and
-//! right-preserving joins (RIGHT OUTER, RIGHT SEMI, RIGHT ANTI) as well as
-//! FULL OUTER are never swapped because their semantics depend on which side is
-//! left vs. right.
+//! 2. **Heuristic** — `reorder_joins_heuristic` (fallback): For hash joins the
+//!    left child is the **probe** side and the right child is the **build**
+//!    side.  Swaps children when the right (build) side is significantly larger
+//!    than the left (probe) side.
+//!
+//! The CBO path falls back to the heuristic when there are >10 relations in a
+//! join graph, or when join graph extraction fails.
+
+use std::collections::HashMap;
 
 use crate::sql::catalog::TableStorage;
 use crate::sql::ir::{BinOp, ExprKind, JoinKind, TypedExpr};
+use crate::sql::optimizer::cardinality;
+use crate::sql::optimizer::cost;
 use crate::sql::plan::*;
+use crate::sql::statistics::*;
 
 /// Count the number of AND-conjuncts in a predicate expression.
 fn count_conjuncts(expr: &TypedExpr) -> usize {
@@ -116,12 +121,12 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
 ///
 /// The pass is applied bottom-up: children are reordered first so that size
 /// estimates of intermediate joins are based on already-reordered subtrees.
-pub(crate) fn reorder_joins(plan: LogicalPlan) -> LogicalPlan {
+pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Join(mut j) => {
             // Recurse into children first (bottom-up).
-            j.left = Box::new(reorder_joins(*j.left));
-            j.right = Box::new(reorder_joins(*j.right));
+            j.left = Box::new(reorder_joins_heuristic(*j.left));
+            j.right = Box::new(reorder_joins_heuristic(*j.right));
 
             match j.join_type {
                 // INNER and CROSS are commutative — safe to swap.
@@ -163,43 +168,43 @@ pub(crate) fn reorder_joins(plan: LogicalPlan) -> LogicalPlan {
         }
         // --- Recurse through all other node types --------------------------------
         LogicalPlan::Filter(mut f) => {
-            f.input = Box::new(reorder_joins(*f.input));
+            f.input = Box::new(reorder_joins_heuristic(*f.input));
             LogicalPlan::Filter(f)
         }
         LogicalPlan::Project(mut p) => {
-            p.input = Box::new(reorder_joins(*p.input));
+            p.input = Box::new(reorder_joins_heuristic(*p.input));
             LogicalPlan::Project(p)
         }
         LogicalPlan::Aggregate(mut a) => {
-            a.input = Box::new(reorder_joins(*a.input));
+            a.input = Box::new(reorder_joins_heuristic(*a.input));
             LogicalPlan::Aggregate(a)
         }
         LogicalPlan::Sort(mut s) => {
-            s.input = Box::new(reorder_joins(*s.input));
+            s.input = Box::new(reorder_joins_heuristic(*s.input));
             LogicalPlan::Sort(s)
         }
         LogicalPlan::Limit(mut l) => {
-            l.input = Box::new(reorder_joins(*l.input));
+            l.input = Box::new(reorder_joins_heuristic(*l.input));
             LogicalPlan::Limit(l)
         }
         LogicalPlan::Window(mut w) => {
-            w.input = Box::new(reorder_joins(*w.input));
+            w.input = Box::new(reorder_joins_heuristic(*w.input));
             LogicalPlan::Window(w)
         }
         LogicalPlan::Union(mut u) => {
-            u.inputs = u.inputs.into_iter().map(reorder_joins).collect();
+            u.inputs = u.inputs.into_iter().map(reorder_joins_heuristic).collect();
             LogicalPlan::Union(u)
         }
         LogicalPlan::Intersect(mut i) => {
-            i.inputs = i.inputs.into_iter().map(reorder_joins).collect();
+            i.inputs = i.inputs.into_iter().map(reorder_joins_heuristic).collect();
             LogicalPlan::Intersect(i)
         }
         LogicalPlan::Except(mut e) => {
-            e.inputs = e.inputs.into_iter().map(reorder_joins).collect();
+            e.inputs = e.inputs.into_iter().map(reorder_joins_heuristic).collect();
             LogicalPlan::Except(e)
         }
         LogicalPlan::SubqueryAlias(mut s) => {
-            s.input = Box::new(reorder_joins(*s.input));
+            s.input = Box::new(reorder_joins_heuristic(*s.input));
             LogicalPlan::SubqueryAlias(s)
         }
         // Leaf nodes: Scan, Values, GenerateSeries — nothing to reorder.
@@ -207,11 +212,451 @@ pub(crate) fn reorder_joins(plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
+// ===========================================================================
+// CBO: DP-based join reorder
+// ===========================================================================
+
+use crate::sql::optimizer::expr_utils::{
+    QualifiedRef, collect_qualified_output_columns, combine_and, split_and,
+};
+
+/// Entry for the DP memo table.
+struct DpEntry {
+    plan: LogicalPlan,
+    stats: Statistics,
+    cumulative_cost: f64,
+}
+
+/// The join graph: a set of base relations and predicates that connect them.
+struct JoinGraph {
+    /// Leaf plans (the base relations of the join graph).
+    relations: Vec<LogicalPlan>,
+    /// Each predicate: (condition expr, bitmask of relations it references).
+    predicates: Vec<(TypedExpr, u16)>,
+}
+
+/// CBO join reorder: walks the plan tree and applies DP join enumeration to
+/// chains of INNER JOINs.  Non-INNER joins are left in place but their
+/// children are recursively optimized.
+pub(crate) fn reorder_joins_cbo(
+    plan: LogicalPlan,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Join(j) if j.join_type == JoinKind::Inner => {
+            // Try to extract a join graph from this chain of INNER JOINs.
+            let full_plan = LogicalPlan::Join(j);
+            match extract_join_graph(&full_plan) {
+                Some(graph) if graph.relations.len() >= 2 && graph.relations.len() <= 10 => {
+                    // Recursively optimize each leaf relation first.
+                    let optimized_relations: Vec<LogicalPlan> = graph
+                        .relations
+                        .into_iter()
+                        .map(|r| reorder_joins_cbo(r, table_stats))
+                        .collect();
+
+                    let optimized_graph = JoinGraph {
+                        relations: optimized_relations,
+                        predicates: graph.predicates,
+                    };
+
+                    match dp_join_reorder(optimized_graph, table_stats) {
+                        Some(plan) => plan,
+                        None => {
+                            // DP failed, fall back to heuristic.
+                            reorder_joins_heuristic(full_plan)
+                        }
+                    }
+                }
+                _ => {
+                    // Could not extract graph or too many relations, use heuristic.
+                    reorder_joins_heuristic(full_plan)
+                }
+            }
+        }
+        LogicalPlan::Join(mut j) => {
+            // Non-INNER join: recurse into children but do not reorder.
+            j.left = Box::new(reorder_joins_cbo(*j.left, table_stats));
+            j.right = Box::new(reorder_joins_cbo(*j.right, table_stats));
+            LogicalPlan::Join(j)
+        }
+        LogicalPlan::Filter(mut f) => {
+            f.input = Box::new(reorder_joins_cbo(*f.input, table_stats));
+            LogicalPlan::Filter(f)
+        }
+        LogicalPlan::Project(mut p) => {
+            p.input = Box::new(reorder_joins_cbo(*p.input, table_stats));
+            LogicalPlan::Project(p)
+        }
+        LogicalPlan::Aggregate(mut a) => {
+            a.input = Box::new(reorder_joins_cbo(*a.input, table_stats));
+            LogicalPlan::Aggregate(a)
+        }
+        LogicalPlan::Sort(mut s) => {
+            s.input = Box::new(reorder_joins_cbo(*s.input, table_stats));
+            LogicalPlan::Sort(s)
+        }
+        LogicalPlan::Limit(mut l) => {
+            l.input = Box::new(reorder_joins_cbo(*l.input, table_stats));
+            LogicalPlan::Limit(l)
+        }
+        LogicalPlan::Window(mut w) => {
+            w.input = Box::new(reorder_joins_cbo(*w.input, table_stats));
+            LogicalPlan::Window(w)
+        }
+        LogicalPlan::Union(mut u) => {
+            u.inputs = u
+                .inputs
+                .into_iter()
+                .map(|p| reorder_joins_cbo(p, table_stats))
+                .collect();
+            LogicalPlan::Union(u)
+        }
+        LogicalPlan::Intersect(mut i) => {
+            i.inputs = i
+                .inputs
+                .into_iter()
+                .map(|p| reorder_joins_cbo(p, table_stats))
+                .collect();
+            LogicalPlan::Intersect(i)
+        }
+        LogicalPlan::Except(mut e) => {
+            e.inputs = e
+                .inputs
+                .into_iter()
+                .map(|p| reorder_joins_cbo(p, table_stats))
+                .collect();
+            LogicalPlan::Except(e)
+        }
+        LogicalPlan::SubqueryAlias(mut s) => {
+            s.input = Box::new(reorder_joins_cbo(*s.input, table_stats));
+            LogicalPlan::SubqueryAlias(s)
+        }
+        other => other,
+    }
+}
+
+/// Flatten a tree of INNER JOINs into a join graph of base relations and
+/// predicates.  Returns `None` if the tree contains non-INNER joins at the
+/// top level.
+fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
+    let mut relations: Vec<LogicalPlan> = Vec::new();
+    let mut raw_predicates: Vec<TypedExpr> = Vec::new();
+
+    flatten_inner_joins(plan, &mut relations, &mut raw_predicates);
+
+    if relations.len() < 2 {
+        return None;
+    }
+
+    // Build the output column sets for each relation so we can map predicates
+    // to the relations they reference.
+    let relation_columns: Vec<std::collections::HashSet<QualifiedRef>> = relations
+        .iter()
+        .map(|r| collect_qualified_output_columns(r))
+        .collect();
+
+    // Classify each predicate by which relations it touches.
+    let mut predicates = Vec::new();
+    for pred in raw_predicates {
+        let refs = crate::sql::optimizer::expr_utils::collect_qualified_column_refs(&pred);
+        let mut mask: u16 = 0;
+        for qref in &refs {
+            for (i, rel_cols) in relation_columns.iter().enumerate() {
+                if rel_cols.contains(qref) {
+                    mask |= 1u16 << i;
+                }
+            }
+        }
+        predicates.push((pred, mask));
+    }
+
+    Some(JoinGraph {
+        relations,
+        predicates,
+    })
+}
+
+/// Recursively flatten a tree of INNER JOINs into leaf relations and
+/// predicate conjuncts.
+fn flatten_inner_joins(
+    plan: &LogicalPlan,
+    relations: &mut Vec<LogicalPlan>,
+    predicates: &mut Vec<TypedExpr>,
+) {
+    match plan {
+        LogicalPlan::Join(j) if j.join_type == JoinKind::Inner => {
+            flatten_inner_joins(&j.left, relations, predicates);
+            flatten_inner_joins(&j.right, relations, predicates);
+            if let Some(ref cond) = j.condition {
+                let conjuncts = split_and(cond.clone());
+                predicates.extend(conjuncts);
+            }
+        }
+        _ => {
+            relations.push(plan.clone());
+        }
+    }
+}
+
+/// DP join reorder: enumerate all subsets of relations and find the cheapest
+/// join order.  Uses a u16 bitmask (supports up to 16 relations).
+fn dp_join_reorder(
+    graph: JoinGraph,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Option<LogicalPlan> {
+    let n = graph.relations.len();
+    if n > 16 {
+        return None;
+    }
+
+    let mut memo: HashMap<u16, DpEntry> = HashMap::new();
+
+    // Phase 1: Initialize single-relation entries.
+    for (i, rel) in graph.relations.iter().enumerate() {
+        let mask = 1u16 << i;
+        let stats = cardinality::estimate_statistics(rel, table_stats);
+        let self_cost = cost::estimate_operator_cost(rel, &stats, &[]);
+        memo.insert(
+            mask,
+            DpEntry {
+                plan: rel.clone(),
+                stats,
+                cumulative_cost: self_cost.total_cost(),
+            },
+        );
+    }
+
+    // Phase 2: Enumerate subsets of increasing size.
+    let full_mask = (1u16 << n) - 1;
+    for size in 2..=n {
+        for subset in SubsetIter::new(full_mask, size as u32) {
+            // Try all bipartitions of `subset` into (left, right).
+            let mut best: Option<DpEntry> = None;
+
+            // Enumerate non-empty proper subsets as the "left" side.
+            let mut left = (subset - 1) & subset;
+            while left > 0 {
+                let right = subset & !left;
+                if right == 0 || left > right {
+                    // Skip: either right is empty, or we've already
+                    // considered this pair (we try both orientations below).
+                    left = (left - 1) & subset;
+                    continue;
+                }
+
+                // Check that there is at least one predicate connecting left and right.
+                let connecting_preds = find_connecting_predicates(&graph.predicates, left, right);
+
+                if connecting_preds.is_empty() {
+                    // No predicates connect these subsets: skip to avoid
+                    // creating an unintended cross join.
+                    left = (left - 1) & subset;
+                    continue;
+                }
+
+                let condition = combine_and(connecting_preds);
+
+                // We only need left and right entries, which should exist
+                // from previous iterations.
+                if let (Some(left_entry), Some(right_entry)) = (memo.get(&left), memo.get(&right)) {
+                    // Try left-right orientation: left probes, right builds.
+                    try_join_orientation(
+                        &left_entry.plan,
+                        &left_entry.stats,
+                        left_entry.cumulative_cost,
+                        &right_entry.plan,
+                        &right_entry.stats,
+                        right_entry.cumulative_cost,
+                        &condition,
+                        table_stats,
+                        &mut best,
+                    );
+
+                    // Try right-left orientation: right probes, left builds.
+                    try_join_orientation(
+                        &right_entry.plan,
+                        &right_entry.stats,
+                        right_entry.cumulative_cost,
+                        &left_entry.plan,
+                        &left_entry.stats,
+                        left_entry.cumulative_cost,
+                        &condition,
+                        table_stats,
+                        &mut best,
+                    );
+                }
+
+                left = (left - 1) & subset;
+            }
+
+            if let Some(entry) = best {
+                memo.insert(subset, entry);
+            }
+        }
+    }
+
+    memo.remove(&full_mask).map(|e| e.plan)
+}
+
+/// Try a specific left-right join orientation and update `best` if cheaper.
+#[allow(clippy::too_many_arguments)]
+fn try_join_orientation(
+    left_plan: &LogicalPlan,
+    left_stats: &Statistics,
+    left_cumulative: f64,
+    right_plan: &LogicalPlan,
+    right_stats: &Statistics,
+    right_cumulative: f64,
+    condition: &TypedExpr,
+    table_stats: &HashMap<String, TableStatistics>,
+    best: &mut Option<DpEntry>,
+) {
+    let join_plan = LogicalPlan::Join(JoinNode {
+        left: Box::new(left_plan.clone()),
+        right: Box::new(right_plan.clone()),
+        join_type: JoinKind::Inner,
+        condition: Some(condition.clone()),
+    });
+
+    let join_stats = cardinality::estimate_statistics(&join_plan, table_stats);
+    let join_self_cost =
+        cost::estimate_operator_cost(&join_plan, &join_stats, &[left_stats, right_stats]);
+
+    let total_cost = left_cumulative + right_cumulative + join_self_cost.total_cost();
+
+    let dominated = best
+        .as_ref()
+        .map_or(false, |b| b.cumulative_cost <= total_cost);
+    if !dominated {
+        *best = Some(DpEntry {
+            plan: join_plan,
+            stats: join_stats,
+            cumulative_cost: total_cost,
+        });
+    }
+}
+
+/// Find all predicates that connect two subsets (reference columns from both).
+fn find_connecting_predicates(
+    predicates: &[(TypedExpr, u16)],
+    left_mask: u16,
+    right_mask: u16,
+) -> Vec<TypedExpr> {
+    let combined = left_mask | right_mask;
+    predicates
+        .iter()
+        .filter(|(_, mask)| {
+            // Predicate must reference at least one relation from each side,
+            // and all referenced relations must be within the combined subset.
+            let touches_left = (*mask & left_mask) != 0;
+            let touches_right = (*mask & right_mask) != 0;
+            let within_scope = (*mask & !combined) == 0;
+            touches_left && touches_right && within_scope
+        })
+        .map(|(pred, _)| pred.clone())
+        .collect()
+}
+
+/// Iterator over all subsets of `universe` with exactly `k` bits set.
+struct SubsetIter {
+    universe: u16,
+    k: u32,
+    current: Option<u16>,
+}
+
+impl SubsetIter {
+    fn new(universe: u16, k: u32) -> Self {
+        if k == 0 || k > universe.count_ones() {
+            return Self {
+                universe,
+                k,
+                current: None,
+            };
+        }
+        // Find the smallest subset of `universe` with exactly k bits.
+        let first = smallest_k_subset(universe, k);
+        Self {
+            universe,
+            k,
+            current: first,
+        }
+    }
+}
+
+impl Iterator for SubsetIter {
+    type Item = u16;
+
+    fn next(&mut self) -> Option<u16> {
+        let val = self.current?;
+        // Find next subset of universe with k bits.
+        self.current = next_k_subset(val, self.universe);
+        Some(val)
+    }
+}
+
+/// Find the smallest subset of `universe` with exactly `k` bits set.
+fn smallest_k_subset(universe: u16, k: u32) -> Option<u16> {
+    if k == 0 {
+        return Some(0);
+    }
+    let bits: Vec<u16> = (0..16).filter(|&i| (universe >> i) & 1 == 1).collect();
+    if (k as usize) > bits.len() {
+        return None;
+    }
+    let mut result = 0u16;
+    for &bit in bits.iter().take(k as usize) {
+        result |= 1 << bit;
+    }
+    Some(result)
+}
+
+/// Given a k-subset `current` of `universe`, find the lexicographically next
+/// k-subset, or None if `current` is the last.
+fn next_k_subset(current: u16, universe: u16) -> Option<u16> {
+    // Gosper's hack adapted for a constrained universe.
+    let bits: Vec<u16> = (0..16).filter(|&i| (universe >> i) & 1 == 1).collect();
+    let k = current.count_ones() as usize;
+
+    // Map current to indices within `bits`.
+    let mut indices: Vec<usize> = Vec::with_capacity(k);
+    for (idx, &bit) in bits.iter().enumerate() {
+        if (current >> bit) & 1 == 1 {
+            indices.push(idx);
+        }
+    }
+
+    // Find rightmost index that can be incremented.
+    let n = bits.len();
+    let mut i = k;
+    loop {
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+        indices[i] += 1;
+        if indices[i] <= n - (k - i) {
+            break;
+        }
+    }
+
+    // Reset all indices after position i.
+    for j in (i + 1)..k {
+        indices[j] = indices[j - 1] + 1;
+    }
+
+    let mut result = 0u16;
+    for &idx in &indices {
+        result |= 1 << bits[idx];
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
-    use crate::sql::ir::{BinOp, ExprKind, JoinKind, OutputColumn, TypedExpr};
+    use crate::sql::ir::{BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, TypedExpr};
     use arrow::datatypes::DataType;
 
     /// Helper: build a `TableDef` backed by S3 parquet files with the given
@@ -290,7 +735,7 @@ mod tests {
             condition: eq_condition(),
         });
 
-        let reordered = reorder_joins(plan);
+        let reordered = reorder_joins_heuristic(plan);
 
         match reordered {
             LogicalPlan::Join(j) => {
@@ -323,7 +768,7 @@ mod tests {
             condition: eq_condition(),
         });
 
-        let reordered = reorder_joins(plan);
+        let reordered = reorder_joins_heuristic(plan);
 
         match reordered {
             LogicalPlan::Join(j) => {
@@ -353,7 +798,7 @@ mod tests {
             condition: eq_condition(),
         });
 
-        let reordered = reorder_joins(plan);
+        let reordered = reorder_joins_heuristic(plan);
 
         match reordered {
             LogicalPlan::Join(j) => {
@@ -379,7 +824,7 @@ mod tests {
             condition: eq_condition(),
         });
 
-        let reordered = reorder_joins(plan);
+        let reordered = reorder_joins_heuristic(plan);
 
         match reordered {
             LogicalPlan::Join(j) => {
@@ -405,7 +850,7 @@ mod tests {
             condition: None,
         });
 
-        let reordered = reorder_joins(plan);
+        let reordered = reorder_joins_heuristic(plan);
 
         match reordered {
             LogicalPlan::Join(j) => {
@@ -442,7 +887,7 @@ mod tests {
             condition: eq_condition(),
         });
 
-        let reordered = reorder_joins(outer_join);
+        let reordered = reorder_joins_heuristic(outer_join);
 
         // After reorder:
         //   The inner join: customer(3K) vs orders(70K)
@@ -534,7 +979,7 @@ mod tests {
             condition: eq_condition(),
         });
 
-        let reordered = reorder_joins(plan);
+        let reordered = reorder_joins_heuristic(plan);
 
         match reordered {
             LogicalPlan::Join(j) => {
@@ -551,5 +996,251 @@ mod tests {
             }
             other => panic!("expected Join, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CBO DP join reorder tests
+    // -----------------------------------------------------------------------
+
+    fn make_table_stats(name: &str, row_count: u64, ndv: f64) -> (String, TableStatistics) {
+        let mut col_stats = HashMap::new();
+        col_stats.insert(
+            "id".to_string(),
+            ColumnStatistic {
+                min_value: 0.0,
+                max_value: row_count as f64,
+                nulls_fraction: 0.0,
+                average_row_size: 8.0,
+                distinct_values_count: ndv,
+            },
+        );
+        (
+            name.to_string(),
+            TableStatistics {
+                row_count,
+                column_stats: col_stats,
+            },
+        )
+    }
+
+    /// Build a scan with a specific alias for CBO tests.
+    fn scan_with_alias(table: &TableDef, alias: &str) -> LogicalPlan {
+        LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: table.clone(),
+            alias: Some(alias.to_string()),
+            columns: vec![OutputColumn {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+            predicates: vec![],
+            required_columns: None,
+        })
+    }
+
+    fn qualified_eq(left_q: &str, right_q: &str) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(left_q.to_string()),
+                        column: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+                op: BinOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: Some(right_q.to_string()),
+                        column: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                    nullable: false,
+                }),
+            },
+            data_type: DataType::Boolean,
+            nullable: false,
+        }
+    }
+
+    /// Extract all table names from a plan tree in join order (left-to-right DFS).
+    fn collect_table_names(plan: &LogicalPlan) -> Vec<String> {
+        match plan {
+            LogicalPlan::Scan(s) => {
+                vec![s.alias.clone().unwrap_or_else(|| s.table.name.clone())]
+            }
+            LogicalPlan::Join(j) => {
+                let mut names = collect_table_names(&j.left);
+                names.extend(collect_table_names(&j.right));
+                names
+            }
+            LogicalPlan::Filter(f) => collect_table_names(&f.input),
+            LogicalPlan::Project(p) => collect_table_names(&p.input),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn cbo_two_table_join_small_on_build_side() {
+        // Large fact table joined with small dim table.
+        // CBO should place small on the right (build side).
+        let fact = s3_table_with_rows("fact", 1_000_000, 6_000_000);
+        let dim = s3_table_with_rows("dim", 100_000, 25_000);
+
+        let (fn_, ft) = make_table_stats("fact", 6_000_000, 6_000_000.0);
+        let (dn, dt) = make_table_stats("dim", 25_000, 25_000.0);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(fn_, ft);
+        table_stats.insert(dn, dt);
+
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_with_alias(&dim, "dim")),
+            right: Box::new(scan_with_alias(&fact, "fact")),
+            join_type: JoinKind::Inner,
+            condition: Some(qualified_eq("dim", "fact")),
+        });
+
+        let reordered = reorder_joins_cbo(plan, &table_stats);
+
+        match &reordered {
+            LogicalPlan::Join(j) => {
+                let names = collect_table_names(&reordered);
+                // The larger table (fact) should be on the left (probe),
+                // the smaller (dim) on the right (build).
+                assert_eq!(
+                    names.last().unwrap(),
+                    "dim",
+                    "dim should be on build side (right), got order: {:?}",
+                    names
+                );
+            }
+            other => panic!("expected Join, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn cbo_three_table_join_optimal_order() {
+        // TPC-H style: lineitem(6M) JOIN orders(1.5M) JOIN customer(150K)
+        let lineitem = s3_table_with_rows("lineitem", 10_000_000, 6_000_000);
+        let orders = s3_table_with_rows("orders", 5_000_000, 1_500_000);
+        let customer = s3_table_with_rows("customer", 500_000, 150_000);
+
+        let (ln, lt) = make_table_stats("lineitem", 6_000_000, 1_500_000.0);
+        let (on, ot) = make_table_stats("orders", 1_500_000, 1_500_000.0);
+        let (cn, ct) = make_table_stats("customer", 150_000, 150_000.0);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(ln, lt);
+        table_stats.insert(on, ot);
+        table_stats.insert(cn, ct);
+
+        // lineitem JOIN orders ON lineitem.id = orders.id
+        //   JOIN customer ON orders.id = customer.id
+        let inner1 = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_with_alias(&lineitem, "lineitem")),
+            right: Box::new(scan_with_alias(&orders, "orders")),
+            join_type: JoinKind::Inner,
+            condition: Some(qualified_eq("lineitem", "orders")),
+        });
+
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(inner1),
+            right: Box::new(scan_with_alias(&customer, "customer")),
+            join_type: JoinKind::Inner,
+            condition: Some(qualified_eq("orders", "customer")),
+        });
+
+        let reordered = reorder_joins_cbo(plan, &table_stats);
+        let names = collect_table_names(&reordered);
+
+        // The smallest table (customer) should appear as a build side (rightmost
+        // at some level of the tree). The exact order depends on cost, but the
+        // key invariant is that the plan is a valid join tree with all 3 tables.
+        assert_eq!(names.len(), 3, "should have 3 tables, got {:?}", names);
+        assert!(
+            names.contains(&"lineitem".to_string()),
+            "missing lineitem in {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"orders".to_string()),
+            "missing orders in {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"customer".to_string()),
+            "missing customer in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn cbo_left_outer_join_not_reordered() {
+        // LEFT OUTER joins should never be fed into the DP optimizer.
+        let small = s3_table_with_rows("small", 1_000, 100);
+        let large = s3_table_with_rows("large", 10_000_000, 1_000_000);
+
+        let (sn, st) = make_table_stats("small", 100, 100.0);
+        let (ln, lt) = make_table_stats("large", 1_000_000, 1_000_000.0);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(sn, st);
+        table_stats.insert(ln, lt);
+
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_with_alias(&small, "small")),
+            right: Box::new(scan_with_alias(&large, "large")),
+            join_type: JoinKind::LeftOuter,
+            condition: Some(qualified_eq("small", "large")),
+        });
+
+        let reordered = reorder_joins_cbo(plan, &table_stats);
+
+        match &reordered {
+            LogicalPlan::Join(j) => {
+                let left_name = match j.left.as_ref() {
+                    LogicalPlan::Scan(s) => s.alias.clone().unwrap_or_default(),
+                    other => panic!("expected Scan, got {:?}", std::mem::discriminant(other)),
+                };
+                assert_eq!(
+                    left_name, "small",
+                    "LEFT OUTER must preserve original left side"
+                );
+            }
+            other => panic!("expected Join, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn cbo_subset_iter_enumerates_correctly() {
+        // Test that SubsetIter produces all C(4,2) = 6 subsets.
+        let universe = 0b1111u16; // 4 bits
+        let subsets: Vec<u16> = SubsetIter::new(universe, 2).collect();
+        assert_eq!(subsets.len(), 6, "C(4,2) should be 6, got {:?}", subsets);
+        for s in &subsets {
+            assert_eq!(s.count_ones(), 2);
+            assert_eq!(*s & !universe, 0);
+        }
+    }
+
+    #[test]
+    fn cbo_subset_iter_size_3() {
+        let universe = 0b1111u16;
+        let subsets: Vec<u16> = SubsetIter::new(universe, 3).collect();
+        assert_eq!(subsets.len(), 4, "C(4,3) should be 4, got {:?}", subsets);
+    }
+
+    #[test]
+    fn cbo_find_connecting_predicates() {
+        // Predicate referencing relation 0 and 1 should connect masks 0b01 and 0b10.
+        let pred = qualified_eq("a", "b");
+        let predicates = vec![(pred.clone(), 0b11u16)];
+
+        let result = find_connecting_predicates(&predicates, 0b01, 0b10);
+        assert_eq!(result.len(), 1);
+
+        // But not connect 0b01 and 0b100 (different relation set).
+        let result2 = find_connecting_predicates(&predicates, 0b01, 0b100);
+        assert_eq!(result2.len(), 0);
     }
 }

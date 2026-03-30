@@ -1670,10 +1670,7 @@ pub(crate) fn build_slot_ref_texpr(
 }
 
 /// Wrap a TExpr in a CAST node to the given target type.
-pub(crate) fn build_cast_texpr(
-    child: exprs::TExpr,
-    target_type: types::TTypeDesc,
-) -> exprs::TExpr {
+pub(crate) fn build_cast_texpr(child: exprs::TExpr, target_type: types::TTypeDesc) -> exprs::TExpr {
     let mut cast_node = exprs::TExprNode {
         node_type: exprs::TExprNodeType::CAST_EXPR,
         type_: target_type,

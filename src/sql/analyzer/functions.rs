@@ -111,9 +111,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         },
 
         // Math functions that return Float64
-        "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2"
-        | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians"
-        | "degrees" | "pi" | "e" | "sign" | "rand" | "random" => DataType::Float64,
+        "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2" | "log10" | "sin"
+        | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians" | "degrees" | "pi"
+        | "e" | "sign" | "rand" | "random" => DataType::Float64,
 
         // String length/position -> Int32
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
