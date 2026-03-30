@@ -60,12 +60,9 @@ pub(crate) fn arithmetic_result_type_with_op(
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
             DataType::Decimal128(p, s),
         ) => decimal_arithmetic_result_type(*p, *s as i8, 19, 0, op),
-        // Decimal + Float -> Decimal (treat float literal as decimal)
-        (DataType::Decimal128(p, s), DataType::Float64 | DataType::Float32)
-        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(p, s)) => {
-            // Treat float as Decimal(38, 9) and compute result
-            decimal_arithmetic_result_type(*p, *s as i8, 38, 9, op)
-        }
+        // Decimal + Float -> Float64 (StarRocks FE: both sides promote to Double)
+        (DataType::Decimal128(_, _), DataType::Float64 | DataType::Float32)
+        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,
         // Existing rules
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
@@ -106,15 +103,9 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
             };
             DataType::Decimal128(p, s)
         }
-        // Decimal + Float -> Decimal (for comparisons, cast float to decimal)
+        // Decimal + Float -> Float64 (StarRocks FE: promote to Double)
         (DataType::Decimal128(_, _), DataType::Float64 | DataType::Float32)
-        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => {
-            let (p, s) = match (a, b) {
-                (DataType::Decimal128(p, s), _) | (_, DataType::Decimal128(p, s)) => (*p, *s),
-                _ => unreachable!(),
-            };
-            DataType::Decimal128(p, s)
-        }
+        | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,
         // Decimal + other -> Decimal
         (DataType::Decimal128(_, _), _) | (_, DataType::Decimal128(_, _)) => {
             let (p, s) = match (a, b) {
@@ -130,5 +121,73 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Utf8, _) | (_, DataType::Utf8) => DataType::Utf8,
         (DataType::LargeUtf8, _) | (_, DataType::LargeUtf8) => DataType::Utf8,
         _ => a.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::DataType;
+
+    #[test]
+    fn decimal_times_float_returns_float64() {
+        let result = arithmetic_result_type_with_op(
+            &DataType::Decimal128(7, 2),
+            &DataType::Float64,
+            "mul",
+        );
+        assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn float_plus_decimal_returns_float64() {
+        let result = arithmetic_result_type_with_op(
+            &DataType::Float64,
+            &DataType::Decimal128(18, 6),
+            "add",
+        );
+        assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn decimal_div_float32_returns_float64() {
+        let result = arithmetic_result_type_with_op(
+            &DataType::Decimal128(10, 4),
+            &DataType::Float32,
+            "div",
+        );
+        assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn wider_type_decimal_vs_float64_returns_float64() {
+        let result = wider_type(&DataType::Decimal128(7, 2), &DataType::Float64);
+        assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn wider_type_float32_vs_decimal_returns_float64() {
+        let result = wider_type(&DataType::Float32, &DataType::Decimal128(18, 6));
+        assert_eq!(result, DataType::Float64);
+    }
+
+    #[test]
+    fn decimal_times_decimal_unchanged() {
+        let result = arithmetic_result_type_with_op(
+            &DataType::Decimal128(7, 2),
+            &DataType::Decimal128(10, 4),
+            "mul",
+        );
+        assert_eq!(result, DataType::Decimal128(17, 6));
+    }
+
+    #[test]
+    fn decimal_plus_int_unchanged() {
+        let result = arithmetic_result_type_with_op(
+            &DataType::Decimal128(7, 2),
+            &DataType::Int32,
+            "add",
+        );
+        assert_eq!(result, DataType::Decimal128(22, 2));
     }
 }
