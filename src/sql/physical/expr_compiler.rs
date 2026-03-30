@@ -1877,9 +1877,12 @@ fn infer_scalar_function_return_type(
         // Numeric functions
         "abs" | "negative" => Ok(arg_types.first().cloned().unwrap_or(DataType::Float64)),
         "ceil" | "ceiling" | "floor" => Ok(DataType::Int64),
-        "round"
-        | "truncate"
-        | "mod"
+        // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
+        "round" | "truncate" => Ok(match arg_types.first() {
+            Some(DataType::Decimal128(_, s)) => DataType::Decimal128(38, *s),
+            _ => DataType::Float64,
+        }),
+        "mod"
         | "fmod"
         | "pow"
         | "power"
