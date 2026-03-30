@@ -40,8 +40,20 @@ fn estimate_size(plan: &LogicalPlan) -> u64 {
         LogicalPlan::Scan(s) => {
             let raw_size = match &s.table.storage {
                 TableStorage::S3ParquetFiles { files, .. } => {
-                    let total: u64 = files.iter().map(|f| f.size.max(0) as u64).sum();
-                    total.max(1)
+                    // Prefer row_count when available (from Iceberg metadata).
+                    // Fall back to file size in bytes if any file lacks row_count.
+                    let all_have_row_count =
+                        !files.is_empty() && files.iter().all(|f| f.row_count.is_some());
+                    if all_have_row_count {
+                        let total: u64 = files
+                            .iter()
+                            .map(|f| f.row_count.unwrap().max(0) as u64)
+                            .sum();
+                        total.max(1)
+                    } else {
+                        let total: u64 = files.iter().map(|f| f.size.max(0) as u64).sum();
+                        total.max(1)
+                    }
                 }
                 TableStorage::LocalParquetFile { path } => std::fs::metadata(path)
                     .map(|m| m.len())
@@ -479,6 +491,61 @@ mod tests {
                         std::mem::discriminant(other)
                     ),
                 }
+            }
+            other => panic!("expected Join, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// Helper: build a TableDef with S3 files that have row counts.
+    fn s3_table_with_rows(name: &str, total_bytes: i64, row_count: i64) -> TableDef {
+        TableDef {
+            name: name.to_string(),
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+            storage: TableStorage::S3ParquetFiles {
+                files: vec![S3FileInfo {
+                    path: format!("s3://bucket/{}.parquet", name),
+                    size: total_bytes,
+                    row_count: Some(row_count),
+                }],
+                cloud_properties: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn row_count_overrides_file_size_for_join_reorder() {
+        // dim_table: large file (10 MB) but few rows (1000)
+        // fact_table: smaller file (5 MB) but many rows (1_000_000)
+        // Without row_count: dim(10MB) > fact(5MB), so dim probes, fact builds — WRONG
+        // With row_count: fact(1M) > dim(1K), so fact probes, dim builds — CORRECT
+        let dim = s3_table_with_rows("dim", 10_000_000, 1_000);
+        let fact = s3_table_with_rows("fact", 5_000_000, 1_000_000);
+
+        let plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(scan_for(&dim)),
+            right: Box::new(scan_for(&fact)),
+            join_type: JoinKind::Inner,
+            condition: eq_condition(),
+        });
+
+        let reordered = reorder_joins(plan);
+
+        match reordered {
+            LogicalPlan::Join(j) => {
+                let left_name = match j.left.as_ref() {
+                    LogicalPlan::Scan(s) => s.table.name.clone(),
+                    other => panic!("expected Scan, got {:?}", std::mem::discriminant(other)),
+                };
+                let right_name = match j.right.as_ref() {
+                    LogicalPlan::Scan(s) => s.table.name.clone(),
+                    other => panic!("expected Scan, got {:?}", std::mem::discriminant(other)),
+                };
+                assert_eq!(left_name, "fact", "fact (more rows) should be probe side");
+                assert_eq!(right_name, "dim", "dim (fewer rows) should be build side");
             }
             other => panic!("expected Join, got {:?}", std::mem::discriminant(&other)),
         }
