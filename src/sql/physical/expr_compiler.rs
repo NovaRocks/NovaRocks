@@ -1669,6 +1669,23 @@ pub(crate) fn build_slot_ref_texpr(
     exprs::TExpr::new(vec![slot_ref_node(slot_id, tuple_id, type_desc)])
 }
 
+/// Wrap a TExpr in a CAST node to the given target type.
+pub(crate) fn build_cast_texpr(
+    child: exprs::TExpr,
+    target_type: types::TTypeDesc,
+) -> exprs::TExpr {
+    let mut cast_node = exprs::TExprNode {
+        node_type: exprs::TExprNodeType::CAST_EXPR,
+        type_: target_type,
+        num_children: 1,
+        ..default_expr_node()
+    };
+    cast_node.opcode = Some(crate::opcodes::TExprOpcode::CAST);
+    let mut nodes = vec![cast_node];
+    nodes.extend(child.nodes);
+    exprs::TExpr::new(nodes)
+}
+
 fn slot_ref_node(slot_id: i32, tuple_id: i32, type_desc: types::TTypeDesc) -> exprs::TExprNode {
     exprs::TExprNode {
         node_type: exprs::TExprNodeType::SLOT_REF,
