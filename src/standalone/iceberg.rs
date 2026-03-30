@@ -539,10 +539,10 @@ pub(crate) fn insert_rows(
     Ok(())
 }
 
-/// Extract data file paths and sizes from an Iceberg table via scan planning.
+/// Extract data file paths, sizes, and row counts from an Iceberg table via scan planning.
 pub(crate) fn extract_data_files(
     table: &iceberg::table::Table,
-) -> Result<Vec<(String, i64)>, String> {
+) -> Result<Vec<(String, i64, Option<i64>)>, String> {
     block_on_iceberg(async {
         let scan = table
             .scan()
@@ -561,6 +561,7 @@ pub(crate) fn extract_data_files(
                 (
                     t.data_file_path.clone(),
                     i64::try_from(t.file_size_in_bytes).unwrap_or(i64::MAX),
+                    t.record_count.map(|c| c as i64),
                 )
             })
             .collect())
