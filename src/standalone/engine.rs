@@ -365,6 +365,7 @@ impl StandaloneSession {
                             path,
                             size,
                             row_count,
+                            column_stats: None,
                         })
                         .collect(),
                     cloud_properties,

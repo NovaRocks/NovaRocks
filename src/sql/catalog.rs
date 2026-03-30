@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use arrow::datatypes::DataType;
@@ -10,12 +11,22 @@ pub struct ColumnDef {
     pub nullable: bool,
 }
 
+/// Raw per-column statistics from Iceberg manifest DataFile entries.
+#[derive(Clone, Debug)]
+pub struct IcebergColumnStats {
+    pub null_count: Option<i64>,
+    pub column_size: Option<i64>,
+    pub lower_bound: Option<Vec<u8>>,
+    pub upper_bound: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct S3FileInfo {
     pub path: String,
     pub size: i64,
     /// Row count from Iceberg file metadata. None for non-Iceberg sources.
     pub row_count: Option<i64>,
+    pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
 }
 
 #[derive(Clone, Debug)]
