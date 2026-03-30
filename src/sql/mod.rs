@@ -6,6 +6,8 @@ pub(crate) mod parser;
 pub(crate) mod plan;
 pub(crate) mod types;
 
+pub(crate) mod statistics;
+
 pub(crate) mod analyzer;
 pub(crate) mod optimizer;
 pub(crate) mod physical;
