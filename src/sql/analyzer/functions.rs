@@ -103,8 +103,15 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         // Math functions that return Int64
         "ceil" | "ceiling" | "floor" => DataType::Int64,
 
+        // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
+        // (StarRocks FE: getFunctionOfRound preserves Decimal type)
+        "round" | "truncate" => match arg_types.first() {
+            Some(DataType::Decimal128(_, s)) => DataType::Decimal128(38, *s),
+            _ => DataType::Float64,
+        },
+
         // Math functions that return Float64
-        "round" | "truncate" | "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2"
+        "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2"
         | "log10" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians"
         | "degrees" | "pi" | "e" | "sign" | "rand" | "random" => DataType::Float64,
 
