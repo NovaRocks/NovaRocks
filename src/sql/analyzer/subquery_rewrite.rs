@@ -73,7 +73,8 @@ impl<'a> AnalyzerContext<'a> {
         sq_info: SubqueryInfo,
         negated: bool,
     ) -> Result<(), String> {
-        let resolved = self.analyze_query_in_scope(&sq_info.subquery, scope)?;
+        let (resolved, inner_scope) =
+            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         let join_type = if negated {
             JoinKind::LeftAnti
@@ -81,14 +82,71 @@ impl<'a> AnalyzerContext<'a> {
             JoinKind::LeftSemi
         };
 
-        // For EXISTS, the entire subquery WHERE becomes the join ON condition,
-        // and the subquery FROM becomes the right side of the join.
+        // For EXISTS, the subquery FROM becomes the right side of the join.
+        // The subquery WHERE is split into:
+        //   - correlation predicates → join ON condition
+        //   - remaining inner predicates → kept in the subquery WHERE
         let (sub_from, sub_filter) = match resolved.body {
             QueryBody::Select(sel) => (sel.from, sel.filter),
             _ => return Err("EXISTS subquery must be a SELECT".into()),
         };
 
         let sub_rel = sub_from.ok_or("EXISTS subquery must have a FROM clause")?;
+
+        // Extract correlation predicates from the subquery WHERE
+        let join_condition = if let Some(ref filter) = sub_filter {
+            let corr_preds = extract_correlation_predicates(filter, &inner_scope, scope);
+            if corr_preds.is_empty() {
+                // No correlation — use full filter as join condition
+                sub_filter
+            } else {
+                // Build join condition from correlation predicates
+                let mut cond = TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(corr_preds[0].outer_col.clone()),
+                        op: corr_preds[0].op,
+                        right: Box::new(corr_preds[0].inner_col.clone()),
+                    },
+                };
+                for pred in &corr_preds[1..] {
+                    cond = TypedExpr {
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(cond),
+                            op: BinOp::And,
+                            right: Box::new(TypedExpr {
+                                data_type: DataType::Boolean,
+                                nullable: false,
+                                kind: ExprKind::BinaryOp {
+                                    left: Box::new(pred.outer_col.clone()),
+                                    op: pred.op,
+                                    right: Box::new(pred.inner_col.clone()),
+                                },
+                            }),
+                        },
+                    };
+                }
+                // Also include non-correlation predicates from the filter
+                let remaining = remove_correlation_preds_from_expr(filter, &corr_preds);
+                if let Some(remaining) = remaining {
+                    cond = TypedExpr {
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(cond),
+                            op: BinOp::And,
+                            right: Box::new(remaining),
+                        },
+                    };
+                }
+                Some(cond)
+            }
+        } else {
+            None
+        };
 
         let current_from = select
             .from
@@ -99,7 +157,7 @@ impl<'a> AnalyzerContext<'a> {
             left: current_from,
             right: sub_rel,
             join_type,
-            condition: sub_filter,
+            condition: join_condition,
         })));
 
         Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
@@ -751,7 +809,7 @@ fn extract_corr_preds_inner(
 ) {
     match &expr.kind {
         ExprKind::BinaryOp { left, op, right } => match op {
-            BinOp::And => {
+            BinOp::And | BinOp::Or => {
                 extract_corr_preds_inner(left, inner_scope, outer_scope, out);
                 extract_corr_preds_inner(right, inner_scope, outer_scope, out);
             }
@@ -786,6 +844,9 @@ fn extract_corr_preds_inner(
             }
             _ => {}
         },
+        ExprKind::Nested(inner) => {
+            extract_corr_preds_inner(inner, inner_scope, outer_scope, out);
+        }
         _ => {}
     }
 }
@@ -818,16 +879,15 @@ fn is_placeholder(expr: &TypedExpr, id: usize) -> bool {
 
 fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> TypedExpr {
     match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
+        ExprKind::BinaryOp { left, op, right }
+            if matches!(op, BinOp::And | BinOp::Or) =>
+        {
+            let identity = matches!(op, BinOp::And); // AND identity = true, OR identity = false
             let left_is = is_placeholder(left, placeholder_id);
             let right_is = is_placeholder(right, placeholder_id);
             if left_is && right_is {
                 TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Bool(true)),
+                    kind: ExprKind::Literal(LiteralValue::Bool(identity)),
                     data_type: DataType::Boolean,
                     nullable: false,
                 }
@@ -843,7 +903,7 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                     nullable: false,
                     kind: ExprKind::BinaryOp {
                         left: Box::new(new_left),
-                        op: BinOp::And,
+                        op: *op,
                         right: Box::new(new_right),
                     },
                 }
