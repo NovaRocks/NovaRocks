@@ -131,31 +131,22 @@ mod tests {
 
     #[test]
     fn decimal_times_float_returns_float64() {
-        let result = arithmetic_result_type_with_op(
-            &DataType::Decimal128(7, 2),
-            &DataType::Float64,
-            "mul",
-        );
+        let result =
+            arithmetic_result_type_with_op(&DataType::Decimal128(7, 2), &DataType::Float64, "mul");
         assert_eq!(result, DataType::Float64);
     }
 
     #[test]
     fn float_plus_decimal_returns_float64() {
-        let result = arithmetic_result_type_with_op(
-            &DataType::Float64,
-            &DataType::Decimal128(18, 6),
-            "add",
-        );
+        let result =
+            arithmetic_result_type_with_op(&DataType::Float64, &DataType::Decimal128(18, 6), "add");
         assert_eq!(result, DataType::Float64);
     }
 
     #[test]
     fn decimal_div_float32_returns_float64() {
-        let result = arithmetic_result_type_with_op(
-            &DataType::Decimal128(10, 4),
-            &DataType::Float32,
-            "div",
-        );
+        let result =
+            arithmetic_result_type_with_op(&DataType::Decimal128(10, 4), &DataType::Float32, "div");
         assert_eq!(result, DataType::Float64);
     }
 
@@ -183,11 +174,8 @@ mod tests {
 
     #[test]
     fn decimal_plus_int_unchanged() {
-        let result = arithmetic_result_type_with_op(
-            &DataType::Decimal128(7, 2),
-            &DataType::Int32,
-            "add",
-        );
+        let result =
+            arithmetic_result_type_with_op(&DataType::Decimal128(7, 2), &DataType::Int32, "add");
         assert_eq!(result, DataType::Decimal128(22, 2));
     }
 }

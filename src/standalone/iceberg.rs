@@ -649,8 +649,10 @@ pub(crate) fn extract_data_files_with_stats(
                 let lower = df.lower_bounds();
                 let upper = df.upper_bounds();
 
-                let has_any_stats =
-                    !null_counts.is_empty() || !col_sizes.is_empty() || !lower.is_empty() || !upper.is_empty();
+                let has_any_stats = !null_counts.is_empty()
+                    || !col_sizes.is_empty()
+                    || !lower.is_empty()
+                    || !upper.is_empty();
 
                 let column_stats = if has_any_stats {
                     // Collect all field IDs that appear in any stats map.
@@ -663,8 +665,14 @@ pub(crate) fn extract_data_files_with_stats(
                     let mut stats_map = HashMap::new();
                     for &fid in &all_ids {
                         if let Some(col_name) = field_id_to_name.get(&fid) {
-                            let lb = lower.get(&fid).and_then(|d| d.to_bytes().ok()).map(|b| b.to_vec());
-                            let ub = upper.get(&fid).and_then(|d| d.to_bytes().ok()).map(|b| b.to_vec());
+                            let lb = lower
+                                .get(&fid)
+                                .and_then(|d| d.to_bytes().ok())
+                                .map(|b| b.to_vec());
+                            let ub = upper
+                                .get(&fid)
+                                .and_then(|d| d.to_bytes().ok())
+                                .map(|b| b.to_vec());
                             stats_map.insert(
                                 col_name.clone(),
                                 crate::sql::catalog::IcebergColumnStats {

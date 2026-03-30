@@ -3395,7 +3395,8 @@ fn collect_scan_stats(
 
     match plan {
         LogicalPlan::Scan(s) => {
-            if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } = &s.table.storage
+            if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } =
+                &s.table.storage
             {
                 if let Some(ts) = crate::sql::statistics::build_table_statistics(files) {
                     out.insert(s.table.name.clone(), ts);
