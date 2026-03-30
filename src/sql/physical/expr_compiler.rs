@@ -2105,7 +2105,7 @@ fn infer_agg_function_types(
             Ok((first_arg, Some(DataType::Binary)))
         }
         "covar_pop" | "covar_samp" | "corr" | "var_pop" | "var_samp" | "variance" | "stddev"
-        | "stddev_pop" | "stddev_samp" => Ok((DataType::Float64, None)),
+        | "stddev_pop" | "stddev_samp" => Ok((DataType::Float64, Some(DataType::Binary))),
         "percentile_cont"
         | "percentile_disc"
         | "percentile_disc_lc"
