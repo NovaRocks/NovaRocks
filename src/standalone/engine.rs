@@ -3371,8 +3371,65 @@ fn build_query_plan(
     let resolved = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let output_columns = resolved.output_columns.clone();
     let logical = crate::sql::planner::plan(resolved)?;
-    let optimized = crate::sql::optimizer::optimize(logical);
+    let table_stats = build_table_stats_from_plan(&logical);
+    let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
     crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)
+}
+
+/// Walk the logical plan tree and collect table-level statistics for all scan
+/// nodes that reference S3ParquetFiles storage.
+fn build_table_stats_from_plan(
+    plan: &crate::sql::plan::LogicalPlan,
+) -> std::collections::HashMap<String, crate::sql::statistics::TableStatistics> {
+    let mut stats = std::collections::HashMap::new();
+    collect_scan_stats(plan, &mut stats);
+    stats
+}
+
+/// Recursively visit plan nodes and collect statistics from Scan leaves.
+fn collect_scan_stats(
+    plan: &crate::sql::plan::LogicalPlan,
+    out: &mut std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
+) {
+    use crate::sql::plan::LogicalPlan;
+
+    match plan {
+        LogicalPlan::Scan(s) => {
+            if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } = &s.table.storage
+            {
+                if let Some(ts) = crate::sql::statistics::build_table_statistics(files) {
+                    out.insert(s.table.name.clone(), ts);
+                }
+            }
+        }
+        LogicalPlan::Filter(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Project(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Aggregate(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Sort(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Limit(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Window(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::SubqueryAlias(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::Join(n) => {
+            collect_scan_stats(&n.left, out);
+            collect_scan_stats(&n.right, out);
+        }
+        LogicalPlan::Union(n) => {
+            for input in &n.inputs {
+                collect_scan_stats(input, out);
+            }
+        }
+        LogicalPlan::Intersect(n) => {
+            for input in &n.inputs {
+                collect_scan_stats(input, out);
+            }
+        }
+        LogicalPlan::Except(n) => {
+            for input in &n.inputs {
+                collect_scan_stats(input, out);
+            }
+        }
+        LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) => {}
+    }
 }
 
 fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
