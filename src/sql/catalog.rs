@@ -14,6 +14,8 @@ pub struct ColumnDef {
 pub struct S3FileInfo {
     pub path: String,
     pub size: i64,
+    /// Row count from Iceberg file metadata. None for non-Iceberg sources.
+    pub row_count: Option<i64>,
 }
 
 #[derive(Clone, Debug)]

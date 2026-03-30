@@ -216,6 +216,7 @@ mod tests {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
                     size: total_bytes,
+                    row_count: None,
                 }],
                 cloud_properties: Default::default(),
             },

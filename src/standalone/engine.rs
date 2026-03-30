@@ -361,7 +361,11 @@ impl StandaloneSession {
                 crate::sql::catalog::TableStorage::S3ParquetFiles {
                     files: data_files
                         .into_iter()
-                        .map(|(path, size)| crate::sql::catalog::S3FileInfo { path, size })
+                        .map(|(path, size, row_count)| crate::sql::catalog::S3FileInfo {
+                            path,
+                            size,
+                            row_count,
+                        })
                         .collect(),
                     cloud_properties,
                 }
@@ -369,7 +373,7 @@ impl StandaloneSession {
                 // Local Iceberg: extract data files and use LocalParquetFile
                 // For local, there should be exactly one data directory to scan
                 let data_files = super::iceberg::extract_data_files(&loaded.table)?;
-                if let Some((first_path, _)) = data_files.first() {
+                if let Some((first_path, _, _)) = data_files.first() {
                     let local_path = first_path.strip_prefix("file://").unwrap_or(first_path);
                     crate::sql::catalog::TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from(local_path),
