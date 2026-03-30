@@ -786,24 +786,64 @@ impl<'a> AnalyzerContext<'a> {
                     }
                 }
                 _ => {
-                    // Try projection scope first, then fall back to FROM scope
-                    match self.analyze_expr(&ob.expr, &projection_scope) {
-                        Ok(typed) => typed,
-                        Err(proj_err) => {
-                            // Try resolving against the FROM scope (for ORDER BY
-                            // on columns not in the SELECT list).
-                            if let QueryBody::Select(sel) = body {
-                                if let Some(ref from_rel) = sel.from {
-                                    let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
-                                    match self.analyze_expr(&ob.expr, &from_scope) {
-                                        Ok(typed) => typed,
-                                        Err(_) => return Err(proj_err),
+                    // First: check if the ORDER BY expression textually matches
+                    // a SELECT list expression. If so, resolve as a reference to
+                    // the output alias. This handles ORDER BY count(x) matching
+                    // SELECT count(x) as alias.
+                    let ob_text = format!("{}", ob.expr).to_lowercase();
+                    let mut matched_alias = None;
+                    // Match ORDER BY expression text against SELECT item
+                    // expressions (not aliases). This handles ORDER BY
+                    // count(distinct x) matching SELECT count(distinct x) as y.
+                    if let QueryBody::Select(sel) = body {
+                        if let sqlast::SetExpr::Select(ast_sel) = query.body.as_ref() {
+                            for (ast_item, ir_item) in
+                                ast_sel.projection.iter().zip(sel.projection.iter())
+                            {
+                                let ast_expr_text = match ast_item {
+                                    sqlast::SelectItem::ExprWithAlias { expr, .. }
+                                    | sqlast::SelectItem::UnnamedExpr(expr) => {
+                                        format!("{expr}").to_lowercase()
+                                    }
+                                    _ => continue,
+                                };
+                                if ast_expr_text == ob_text
+                                    || ir_item.output_name.to_lowercase() == ob_text
+                                {
+                                    matched_alias = Some(TypedExpr {
+                                        kind: ExprKind::ColumnRef {
+                                            qualifier: None,
+                                            column: ir_item.output_name.clone(),
+                                        },
+                                        data_type: ir_item.expr.data_type.clone(),
+                                        nullable: ir_item.expr.nullable,
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(alias_ref) = matched_alias {
+                        alias_ref
+                    } else {
+                        // Try projection scope first, then fall back to FROM scope
+                        match self.analyze_expr(&ob.expr, &projection_scope) {
+                            Ok(typed) => typed,
+                            Err(proj_err) => {
+                                if let QueryBody::Select(sel) = body {
+                                    if let Some(ref from_rel) = sel.from {
+                                        let (_, from_scope) =
+                                            self.rebuild_from_scope(from_rel)?;
+                                        match self.analyze_expr(&ob.expr, &from_scope) {
+                                            Ok(typed) => typed,
+                                            Err(_) => return Err(proj_err),
+                                        }
+                                    } else {
+                                        return Err(proj_err);
                                     }
                                 } else {
                                     return Err(proj_err);
                                 }
-                            } else {
-                                return Err(proj_err);
                             }
                         }
                     }
