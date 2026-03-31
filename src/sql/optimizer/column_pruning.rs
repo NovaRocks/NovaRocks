@@ -186,7 +186,11 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
         }
 
         LogicalPlan::SubqueryAlias(node) => {
-            let input = prune_inner(*node.input, needed);
+            // Don't propagate outer `needed` into subquery — the inner plan
+            // has its own column namespace (aliases differ from base columns).
+            // Passing `needed` through would incorrectly prune columns that
+            // the inner SELECT references but the outer query doesn't.
+            let input = prune_inner(*node.input, None);
             LogicalPlan::SubqueryAlias(SubqueryAliasNode {
                 input: Box::new(input),
                 alias: node.alias,
