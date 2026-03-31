@@ -4,12 +4,46 @@
 //! from the analyzed query IR.  A future optimizer would rewrite this tree
 //! before it reaches the Thrift emitter.
 
+use crate::sql::cte::CTERegistry;
 use crate::sql::ir::*;
 use crate::sql::plan::*;
 
 // ---------------------------------------------------------------------------
 // Public entry
 // ---------------------------------------------------------------------------
+
+/// Plan a resolved query with shared CTE subtrees into a [`QueryPlan`].
+///
+/// Each CTE entry in the registry is planned independently into a
+/// [`CTEProducePlan`], and references in the main plan appear as
+/// [`LogicalPlan::CTEConsume`] leaf nodes.
+pub(crate) fn plan_query(
+    resolved: ResolvedQuery,
+    cte_registry: CTERegistry,
+) -> Result<QueryPlan, String> {
+    let output_columns = resolved.output_columns.clone();
+    let main_plan = plan(resolved)?;
+
+    // Plan each shared CTE subtree independently.
+    let cte_plans = cte_registry
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let cte_plan = plan(entry.resolved_query)?;
+            Ok(CTEProducePlan {
+                cte_id: entry.id,
+                plan: cte_plan,
+                output_columns: entry.output_columns,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(QueryPlan {
+        cte_plans,
+        main_plan,
+        output_columns,
+    })
+}
 
 /// Convert a fully-analyzed query into a logical plan tree.
 pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
