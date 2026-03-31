@@ -22,18 +22,15 @@ impl<'a> super::ThriftEmitter<'a> {
         // == number of slots in output_tuple_id.
         let virtual_tuple_id = self.alloc_tuple();
 
-        // Collect child columns and their slot IDs for scope building
+        // Collect child columns for rollup slot mapping
         let child_cols: Vec<(String, ColumnBinding)> = child
             .scope
             .iter_columns()
             .map(|(n, b)| (n.clone(), b.clone()))
             .collect();
 
-        // Build merged output scope: child columns (unchanged) + virtual columns
-        let mut output_scope = ExprScope::new();
-        for (name, binding) in &child_cols {
-            output_scope.add_column(None, name.clone(), binding.clone());
-        }
+        // Start with the child's full scope (preserves qualified entries like cd1.col)
+        let mut output_scope = child.scope;
 
         // Add virtual slots to the virtual-only tuple
         let num_virtual = 1 + node.grouping_fn_args.len();
