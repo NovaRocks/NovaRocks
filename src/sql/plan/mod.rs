@@ -32,6 +32,20 @@ pub(crate) enum LogicalPlan {
     /// can register qualified columns (e.g., `ctr1.ctr_customer_sk` for
     /// a CTE referenced as `FROM customer_total_return ctr1`).
     SubqueryAlias(SubqueryAliasNode),
+    /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
+    /// Replicates each input row N times with different null patterns.
+    Repeat(RepeatPlanNode),
+}
+
+/// Repeat node for ROLLUP/CUBE/GROUPING SETS.
+/// Replicates each input row N times with different null patterns.
+#[derive(Clone, Debug)]
+pub(crate) struct RepeatPlanNode {
+    pub input: Box<LogicalPlan>,
+    pub repeat_column_ref_list: Vec<Vec<String>>,
+    pub grouping_ids: Vec<u64>,
+    pub all_rollup_columns: Vec<String>,
+    pub grouping_fn_args: Vec<(String, Vec<String>)>,
 }
 
 /// Subquery alias node: wraps an inlined subquery (CTE or derived table)

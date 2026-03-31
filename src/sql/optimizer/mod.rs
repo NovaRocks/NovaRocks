@@ -85,6 +85,13 @@ pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan)
             alias: n.alias,
             output_columns: n.output_columns,
         }),
+        LogicalPlan::Repeat(n) => LogicalPlan::Repeat(RepeatPlanNode {
+            input: Box::new(f(*n.input)),
+            repeat_column_ref_list: n.repeat_column_ref_list,
+            grouping_ids: n.grouping_ids,
+            all_rollup_columns: n.all_rollup_columns,
+            grouping_fn_args: n.grouping_fn_args,
+        }),
     }
 }
 

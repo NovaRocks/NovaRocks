@@ -33,6 +33,14 @@ pub(crate) fn estimate_statistics(
         LogicalPlan::Intersect(i) => estimate_intersect(i, table_stats),
         LogicalPlan::Except(e) => estimate_except(e, table_stats),
         LogicalPlan::SubqueryAlias(s) => estimate_statistics(&s.input, table_stats),
+        LogicalPlan::Repeat(r) => {
+            let input = estimate_statistics(&r.input, table_stats);
+            let repeat_times = r.repeat_column_ref_list.len() as f64;
+            Statistics {
+                output_row_count: input.output_row_count * repeat_times,
+                column_statistics: input.column_statistics,
+            }
+        }
         LogicalPlan::Values(v) => Statistics {
             output_row_count: v.rows.len() as f64,
             column_statistics: HashMap::new(),

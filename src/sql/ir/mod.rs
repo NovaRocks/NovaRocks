@@ -61,6 +61,21 @@ pub(crate) struct ResolvedSelect {
     pub has_aggregation: bool,
     /// Whether SELECT DISTINCT is used.
     pub distinct: bool,
+    /// Repeat metadata for ROLLUP/CUBE/GROUPING SETS expansion.
+    pub repeat: Option<RepeatInfo>,
+}
+
+/// Metadata for ROLLUP/CUBE/GROUPING SETS repeat execution.
+#[derive(Clone, Debug)]
+pub(crate) struct RepeatInfo {
+    /// For each repeat level, the column names that are NON-null.
+    pub repeat_column_ref_list: Vec<Vec<String>>,
+    /// Grouping ID bitmap for each level. Bit=1 means column is NULLed.
+    pub grouping_ids: Vec<u64>,
+    /// All rollup column names.
+    pub all_rollup_columns: Vec<String>,
+    /// GROUPING() function calls: (output_name, arg_column_names).
+    pub grouping_fn_args: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug)]

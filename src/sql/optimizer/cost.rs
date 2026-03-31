@@ -53,6 +53,11 @@ pub(crate) fn estimate_operator_cost(
             let right = child_stats.get(1).copied().unwrap_or(own_stats);
             estimate_join_cost(j, left, right, own_stats)
         }
+        LogicalPlan::Repeat(_) => CostEstimate {
+            cpu_cost: own_stats.compute_size(),
+            memory_cost: 0.0,
+            network_cost: 0.0,
+        },
         _ => CostEstimate::default(),
     }
 }
