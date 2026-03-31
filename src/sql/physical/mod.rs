@@ -13,11 +13,14 @@ pub(crate) mod type_infer;
 
 use arrow::datatypes::DataType;
 
+use crate::data_sinks;
 use crate::descriptors as thrift_descriptors;
 use crate::internal_service;
 use crate::plan_nodes;
 
 use super::catalog::CatalogProvider;
+use super::cte::CteId;
+use super::fragment::{FragmentId, FragmentPlan};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -36,6 +39,28 @@ pub(crate) struct OutputColumn {
     pub nullable: bool,
 }
 
+/// Result of emitting a multi-fragment plan.
+pub(crate) struct MultiFragmentBuildResult {
+    /// Per-fragment build results.
+    pub fragment_results: Vec<FragmentBuildResult>,
+    /// Which fragment is the root (result sink).
+    pub root_fragment_id: FragmentId,
+}
+
+/// Physical emission result for a single fragment.
+pub(crate) struct FragmentBuildResult {
+    pub fragment_id: FragmentId,
+    pub plan: plan_nodes::TPlan,
+    pub desc_tbl: thrift_descriptors::TDescriptorTable,
+    pub exec_params: internal_service::TPlanFragmentExecParams,
+    pub output_sink: data_sinks::TDataSink,
+    pub output_columns: Vec<OutputColumn>,
+    /// CTE ID if this is a multicast fragment.
+    pub cte_id: Option<CteId>,
+    /// Exchange node IDs that consume from CTE fragments: (cte_id, exchange_node_id).
+    pub cte_exchange_nodes: Vec<(CteId, i32)>,
+}
+
 // ---------------------------------------------------------------------------
 // Public entry
 // ---------------------------------------------------------------------------
@@ -48,6 +73,15 @@ pub(crate) fn emit(
     current_database: &str,
 ) -> Result<PlanBuildResult, String> {
     emitter::emit(plan, output_columns, catalog, current_database)
+}
+
+/// Emit a multi-fragment physical plan from a FragmentPlan.
+pub(crate) fn emit_multi_fragment(
+    fragment_plan: FragmentPlan,
+    catalog: &dyn CatalogProvider,
+    current_database: &str,
+) -> Result<MultiFragmentBuildResult, String> {
+    emitter::emit_multi_fragment(fragment_plan, catalog, current_database)
 }
 
 // ---------------------------------------------------------------------------
