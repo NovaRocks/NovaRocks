@@ -117,7 +117,37 @@ impl<'a> super::AnalyzerContext<'a> {
                 let db_lower = db.to_lowercase();
                 let tbl_lower = tbl.to_lowercase();
 
-                // Check if this table name refers to a CTE first.
+                // Check if this table name refers to a shared CTE (ref_count >= 2).
+                if parts.len() == 1 {
+                    if let Some(&cte_id) = self.shared_cte_ids.get(&tbl_lower) {
+                        let registry = self.cte_registry.borrow();
+                        let entry = registry.get(cte_id).ok_or_else(|| {
+                            format!("internal error: shared CTE id {cte_id} not found in registry")
+                        })?;
+                        let alias_name = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| tbl.clone());
+                        let output_columns = entry.output_columns.clone();
+                        let mut scope = AnalyzerScope::new();
+                        for col in &output_columns {
+                            scope.add_column(
+                                Some(&alias_name),
+                                &col.name,
+                                col.data_type.clone(),
+                                col.nullable,
+                            );
+                        }
+                        let relation = Relation::CTEConsume {
+                            cte_id,
+                            alias: alias_name,
+                            output_columns,
+                        };
+                        return Ok((relation, scope));
+                    }
+                }
+
+                // Check if this table name refers to a CTE (single-ref, inline).
                 if parts.len() == 1 {
                     if let Some((cte_query, cte_col_aliases)) = self.ctes.get(&tbl_lower) {
                         // Inline-expand the CTE as a subquery.
@@ -131,6 +161,10 @@ impl<'a> super::AnalyzerContext<'a> {
                             ctes: child_ctes,
                             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
                             collected_subqueries: std::cell::RefCell::new(Vec::new()),
+                            shared_cte_ids: self.shared_cte_ids.clone(),
+                            cte_registry: std::cell::RefCell::new(
+                                self.cte_registry.borrow().clone(),
+                            ),
                         };
                         let mut resolved_cte = child_ctx.analyze_query(cte_query)?;
                         // Apply CTE column aliases if present: WITH t(a, b) AS (...)

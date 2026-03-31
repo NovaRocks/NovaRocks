@@ -29,20 +29,25 @@ use scope::AnalyzerScope;
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Analyze a parsed SQL query and produce a fully resolved query IR.
+/// Analyze a parsed SQL query and produce a fully resolved query IR,
+/// along with a registry of shared CTEs (those referenced two or more times).
 pub(crate) fn analyze(
     query: &sqlast::Query,
     catalog: &impl CatalogProvider,
     current_database: &str,
-) -> Result<ResolvedQuery, String> {
+) -> Result<(ResolvedQuery, crate::sql::cte::CTERegistry), String> {
     let ctx = AnalyzerContext {
         catalog,
         current_database,
         ctes: std::collections::HashMap::new(),
         next_subquery_id: std::cell::Cell::new(0),
         collected_subqueries: std::cell::RefCell::new(Vec::new()),
+        shared_cte_ids: std::collections::HashMap::new(),
+        cte_registry: std::cell::RefCell::new(crate::sql::cte::CTERegistry::new()),
     };
-    ctx.analyze_query(query)
+    let resolved = ctx.analyze_query(query)?;
+    let registry = ctx.cte_registry.into_inner();
+    Ok((resolved, registry))
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +65,10 @@ pub(super) struct AnalyzerContext<'a> {
     /// Subqueries collected during expression analysis.
     /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
     pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
+    /// Maps shared CTE name -> CteId. Populated during two-pass analysis for CTEs with ref_count >= 2.
+    pub(super) shared_cte_ids: std::collections::HashMap<String, crate::sql::cte::CteId>,
+    /// Accumulated shared CTE registry, built during analysis.
+    pub(super) cte_registry: std::cell::RefCell<crate::sql::cte::CTERegistry>,
 }
 
 impl<'a> AnalyzerContext<'a> {
@@ -73,9 +82,10 @@ impl<'a> AnalyzerContext<'a> {
     /// Top-level query analysis.
     fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
         // Register CTEs from WITH clause (if any) into a child context.
-        let child_ctx;
+        let maybe_child_ctx;
         let ctx = if let Some(ref with_clause) = query.with {
             let mut ctes = self.ctes.clone();
+            let mut cte_defs: Vec<(String, Vec<String>)> = Vec::new();
             for cte in &with_clause.cte_tables {
                 let name = cte.alias.name.value.to_lowercase();
                 let col_aliases: Vec<String> = cte
@@ -84,17 +94,86 @@ impl<'a> AnalyzerContext<'a> {
                     .iter()
                     .map(|c| c.name.value.to_lowercase())
                     .collect();
+                cte_defs.push((name.clone(), col_aliases.clone()));
                 ctes.insert(name, (*cte.query.clone(), col_aliases));
             }
-            child_ctx = AnalyzerContext {
+
+            // --- Two-pass CTE analysis ---
+            // Pass 1: Count how many times each CTE name is referenced in the
+            // query body (and ORDER BY).  This is a heuristic count on the raw
+            // AST — it does not resolve names, so a same-named table would also
+            // be counted, but that is acceptable for the purpose of deciding
+            // whether to share.
+            let cte_names: std::collections::HashSet<String> =
+                cte_defs.iter().map(|(n, _)| n.clone()).collect();
+            let ref_counts = count_cte_references(&cte_names, query);
+
+            // Pass 2: For CTEs referenced >= 2 times, analyze once, register in
+            // the shared CTE registry, and store the CteId.  Single-ref CTEs
+            // stay in the `ctes` map for inline expansion (existing behavior).
+            let mut shared_cte_ids = self.shared_cte_ids.clone();
+            for (name, col_aliases) in &cte_defs {
+                let count = ref_counts.get(name).copied().unwrap_or(0);
+                if count >= 2 {
+                    // Analyze the CTE query once with a child context that has
+                    // the *other* CTEs available (to allow CTE-to-CTE refs).
+                    let mut inner_ctes = ctes.clone();
+                    inner_ctes.remove(name);
+                    let inner_ctx = AnalyzerContext {
+                        catalog: self.catalog,
+                        current_database: self.current_database,
+                        ctes: inner_ctes,
+                        next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+                        collected_subqueries: std::cell::RefCell::new(Vec::new()),
+                        shared_cte_ids: shared_cte_ids.clone(),
+                        cte_registry: std::cell::RefCell::new(
+                            crate::sql::cte::CTERegistry::new(),
+                        ),
+                    };
+                    let mut resolved_cte =
+                        inner_ctx.analyze_query(&ctes.get(name).unwrap().0)?;
+                    // Apply column aliases: WITH t(a, b) AS (...)
+                    if !col_aliases.is_empty() {
+                        for (i, alias_name) in col_aliases.iter().enumerate() {
+                            if let Some(col) = resolved_cte.output_columns.get_mut(i) {
+                                col.name = alias_name.clone();
+                            }
+                        }
+                    }
+                    // Merge any inner CTE registry entries into ours
+                    let inner_registry = inner_ctx.cte_registry.into_inner();
+                    {
+                        let mut our_reg = self.cte_registry.borrow_mut();
+                        for entry in inner_registry.entries {
+                            our_reg.entries.push(entry);
+                        }
+                    }
+                    let output_columns = resolved_cte.output_columns.clone();
+                    let cte_id = self
+                        .cte_registry
+                        .borrow_mut()
+                        .register(name.clone(), resolved_cte, output_columns);
+                    shared_cte_ids.insert(name.clone(), cte_id);
+                    // Remove from inline ctes map so it won't be inlined
+                    ctes.remove(name);
+                }
+            }
+
+            // Clone the parent's registry so the child can look up shared CTEs
+            // that were registered above.
+            let registry_snapshot = self.cte_registry.borrow().clone();
+            maybe_child_ctx = Some(AnalyzerContext {
                 catalog: self.catalog,
                 current_database: self.current_database,
                 ctes,
                 next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
                 collected_subqueries: std::cell::RefCell::new(Vec::new()),
-            };
-            &child_ctx
+                shared_cte_ids,
+                cte_registry: std::cell::RefCell::new(registry_snapshot),
+            });
+            maybe_child_ctx.as_ref().unwrap()
         } else {
+            maybe_child_ctx = None;
             self
         };
 
@@ -107,6 +186,19 @@ impl<'a> AnalyzerContext<'a> {
         // Extract LIMIT / OFFSET
         let limit = extract_limit(query)?;
         let offset = extract_offset(query)?;
+
+        // If we used a child context for CTE processing, merge its CTE
+        // registry entries back into the parent (self).
+        if let Some(child_ctx) = maybe_child_ctx {
+            let child_entries =
+                std::mem::take(&mut *child_ctx.cte_registry.borrow_mut()).entries;
+            if !child_entries.is_empty() {
+                let mut parent_reg = self.cte_registry.borrow_mut();
+                for entry in child_entries {
+                    parent_reg.entries.push(entry);
+                }
+            }
+        }
 
         // Build output columns from the body
         let output_columns = body_output;
@@ -1029,6 +1121,234 @@ impl<'a> AnalyzerContext<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// CTE reference counting (heuristic walk over raw AST)
+// ---------------------------------------------------------------------------
+
+/// Walk the sqlparser AST of a query and count how many times each CTE name
+/// appears as a table reference.  The walk is recursive through subqueries,
+/// set operations, JOINs, and scalar subqueries in WHERE/HAVING.
+///
+/// This is a *heuristic* count on the raw AST — it does not perform name
+/// resolution, so a base table that happens to share a name with a CTE will
+/// also be counted.  For our purposes (deciding inline-vs-share) this is
+/// acceptable.
+fn count_cte_references(
+    cte_names: &std::collections::HashSet<String>,
+    query: &sqlast::Query,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    walk_query(cte_names, query, &mut counts);
+    counts
+}
+
+fn walk_query(
+    cte_names: &std::collections::HashSet<String>,
+    query: &sqlast::Query,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    walk_set_expr(cte_names, query.body.as_ref(), counts);
+    // Walk ORDER BY expressions for subqueries
+    if let Some(sqlast::OrderBy {
+        kind: sqlast::OrderByKind::Expressions(exprs),
+        ..
+    }) = &query.order_by
+    {
+        for ob in exprs {
+            walk_expr(cte_names, &ob.expr, counts);
+        }
+    }
+}
+
+fn walk_set_expr(
+    cte_names: &std::collections::HashSet<String>,
+    set_expr: &sqlast::SetExpr,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match set_expr {
+        sqlast::SetExpr::Select(select) => walk_select(cte_names, select, counts),
+        sqlast::SetExpr::SetOperation { left, right, .. } => {
+            walk_set_expr(cte_names, left, counts);
+            walk_set_expr(cte_names, right, counts);
+        }
+        sqlast::SetExpr::Query(q) => walk_query(cte_names, q, counts),
+        sqlast::SetExpr::Values(_) => {}
+        _ => {}
+    }
+}
+
+fn walk_select(
+    cte_names: &std::collections::HashSet<String>,
+    select: &sqlast::Select,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    // FROM clause: tables and joins
+    for twj in &select.from {
+        walk_table_factor(cte_names, &twj.relation, counts);
+        for join in &twj.joins {
+            walk_table_factor(cte_names, &join.relation, counts);
+            // Extract join constraint, then walk ON expression if present.
+            let constraint = match &join.join_operator {
+                sqlast::JoinOperator::Join(c)
+                | sqlast::JoinOperator::Inner(c)
+                | sqlast::JoinOperator::Left(c)
+                | sqlast::JoinOperator::LeftOuter(c)
+                | sqlast::JoinOperator::Right(c)
+                | sqlast::JoinOperator::RightOuter(c)
+                | sqlast::JoinOperator::FullOuter(c)
+                | sqlast::JoinOperator::LeftSemi(c)
+                | sqlast::JoinOperator::LeftAnti(c)
+                | sqlast::JoinOperator::RightSemi(c)
+                | sqlast::JoinOperator::RightAnti(c) => Some(c),
+                _ => None,
+            };
+            if let Some(sqlast::JoinConstraint::On(expr)) = constraint {
+                walk_expr(cte_names, expr, counts);
+            }
+        }
+    }
+    // WHERE
+    if let Some(ref expr) = select.selection {
+        walk_expr(cte_names, expr, counts);
+    }
+    // SELECT list (may contain scalar subqueries)
+    for item in &select.projection {
+        match item {
+            sqlast::SelectItem::UnnamedExpr(e)
+            | sqlast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                walk_expr(cte_names, e, counts);
+            }
+            _ => {}
+        }
+    }
+    // HAVING
+    if let Some(ref expr) = select.having {
+        walk_expr(cte_names, expr, counts);
+    }
+}
+
+fn walk_table_factor(
+    cte_names: &std::collections::HashSet<String>,
+    factor: &sqlast::TableFactor,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match factor {
+        sqlast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|p| match p {
+                    sqlast::ObjectNamePart::Identifier(ident) => Some(ident.value.to_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            // Only single-part names can match CTE names
+            if parts.len() == 1 {
+                if let Some(tbl) = parts.first() {
+                    if cte_names.contains(tbl) {
+                        *counts.entry(tbl.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        sqlast::TableFactor::Derived { subquery, .. } => {
+            walk_query(cte_names, subquery, counts);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a scalar expression looking for subqueries that may reference CTEs.
+fn walk_expr(
+    cte_names: &std::collections::HashSet<String>,
+    expr: &sqlast::Expr,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match expr {
+        sqlast::Expr::Subquery(q) => walk_query(cte_names, q, counts),
+        sqlast::Expr::InSubquery { subquery, expr, .. } => {
+            walk_query(cte_names, subquery, counts);
+            walk_expr(cte_names, expr, counts);
+        }
+        sqlast::Expr::Exists { subquery, .. } => {
+            walk_query(cte_names, subquery, counts);
+        }
+        sqlast::Expr::BinaryOp { left, right, .. } => {
+            walk_expr(cte_names, left, counts);
+            walk_expr(cte_names, right, counts);
+        }
+        sqlast::Expr::UnaryOp { expr: inner, .. } => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Nested(inner) => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Function(func) => {
+            if let sqlast::FunctionArguments::List(ref arg_list) = func.args {
+                for arg in &arg_list.args {
+                    match arg {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e))
+                        | sqlast::FunctionArg::Named { arg: sqlast::FunctionArgExpr::Expr(e), .. } => {
+                            walk_expr(cte_names, e, counts);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        sqlast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                walk_expr(cte_names, op, counts);
+            }
+            for cw in conditions {
+                walk_expr(cte_names, &cw.condition, counts);
+                walk_expr(cte_names, &cw.result, counts);
+            }
+            if let Some(e) = else_result {
+                walk_expr(cte_names, e, counts);
+            }
+        }
+        sqlast::Expr::Cast { expr: inner, .. } => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            walk_expr(cte_names, inner, counts);
+            walk_expr(cte_names, low, counts);
+            walk_expr(cte_names, high, counts);
+        }
+        sqlast::Expr::InList { expr: inner, list, .. } => {
+            walk_expr(cte_names, inner, counts);
+            for e in list {
+                walk_expr(cte_names, e, counts);
+            }
+        }
+        sqlast::Expr::IsNull(inner)
+        | sqlast::Expr::IsNotNull(inner)
+        | sqlast::Expr::IsTrue(inner)
+        | sqlast::Expr::IsFalse(inner)
+        | sqlast::Expr::IsNotTrue(inner)
+        | sqlast::Expr::IsNotFalse(inner) => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Like { expr, pattern, .. } | sqlast::Expr::ILike { expr, pattern, .. } => {
+            walk_expr(cte_names, expr, counts);
+            walk_expr(cte_names, pattern, counts);
+        }
+        // Leaf nodes (literals, column refs, etc.) — nothing to walk.
+        _ => {}
+    }
+}
+
 /// Replace GROUPING(col) function calls in a sqlparser AST expression with
 /// integer literal 0 (column is active) or 1 (column is NULLed) based on the
 /// current ROLLUP expansion level.
@@ -1731,7 +2051,8 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected a query".into()),
         };
-        analyze(&query, &TestCatalog, "default")
+        let (resolved, _registry) = analyze(&query, &TestCatalog, "default")?;
+        Ok(resolved)
     }
 
     /// Helper to check that a Relation tree contains a JOIN of a given kind.
