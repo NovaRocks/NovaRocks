@@ -38,7 +38,10 @@ pub(crate) fn optimize(
 /// Apply a function to all direct children of a LogicalPlan node.
 pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Scan(_) | LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) => plan,
+        LogicalPlan::Scan(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::GenerateSeries(_)
+        | LogicalPlan::CTEConsume(_) => plan,
         LogicalPlan::Window(n) => LogicalPlan::Window(WindowNode {
             input: Box::new(f(*n.input)),
             ..n

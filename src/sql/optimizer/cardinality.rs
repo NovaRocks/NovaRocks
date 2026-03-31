@@ -56,6 +56,10 @@ pub(crate) fn estimate_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        LogicalPlan::CTEConsume(_) => Statistics {
+            output_row_count: 1000.0,
+            column_statistics: HashMap::new(),
+        }
     }
 }
 

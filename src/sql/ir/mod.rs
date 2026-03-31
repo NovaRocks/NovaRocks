@@ -101,6 +101,12 @@ pub(crate) enum Relation {
     Join(Box<JoinRelation>),
     /// `TABLE(generate_series(start, end[, step]))`.
     GenerateSeries(GenerateSeriesRelation),
+    /// Reference to a shared CTE (multi-referenced, not inlined).
+    CTEConsume {
+        cte_id: crate::sql::cte::CteId,
+        alias: String,
+        output_columns: Vec<OutputColumn>,
+    },
 }
 
 #[derive(Clone, Debug)]
