@@ -144,7 +144,13 @@ pub fn build_table_statistics(
                 } else {
                     8.0
                 },
-                distinct_values_count: 1.0,
+                // NDV heuristic: sqrt(non_null_rows) * 10, capped at row count.
+                // This is rough but much better than 1.0 (which causes cross-join
+                // cardinality estimates) or row_count (which is too optimistic).
+                distinct_values_count: {
+                    let non_null = (total_rows as f64 * (1.0 - nulls_fraction)).max(1.0);
+                    (non_null.sqrt() * 10.0).min(non_null).max(1.0)
+                },
             },
         );
     }
