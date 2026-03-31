@@ -153,6 +153,7 @@ impl<'a> ThriftEmitter<'a> {
             LogicalPlan::GenerateSeries(node) => self.emit_generate_series(node),
             LogicalPlan::Window(node) => self.emit_window(node),
             LogicalPlan::SubqueryAlias(node) => self.emit_subquery_alias(node),
+            LogicalPlan::Repeat(_) => Err("Repeat node emission not yet implemented".to_string()),
         }
     }
 

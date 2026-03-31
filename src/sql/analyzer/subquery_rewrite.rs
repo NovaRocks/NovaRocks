@@ -603,6 +603,7 @@ impl<'a> AnalyzerContext<'a> {
             projection,
             has_aggregation,
             distinct,
+            repeat: None,
         };
 
         // Rewrite nested subqueries within this SELECT if any were collected

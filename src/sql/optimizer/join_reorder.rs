@@ -207,6 +207,10 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
             s.input = Box::new(reorder_joins_heuristic(*s.input));
             LogicalPlan::SubqueryAlias(s)
         }
+        LogicalPlan::Repeat(mut r) => {
+            r.input = Box::new(reorder_joins_heuristic(*r.input));
+            LogicalPlan::Repeat(r)
+        }
         // Leaf nodes: Scan, Values, GenerateSeries — nothing to reorder.
         other => other,
     }
@@ -331,6 +335,10 @@ pub(crate) fn reorder_joins_cbo(
         LogicalPlan::SubqueryAlias(mut s) => {
             s.input = Box::new(reorder_joins_cbo(*s.input, table_stats));
             LogicalPlan::SubqueryAlias(s)
+        }
+        LogicalPlan::Repeat(mut r) => {
+            r.input = Box::new(reorder_joins_cbo(*r.input, table_stats));
+            LogicalPlan::Repeat(r)
         }
         other => other,
     }

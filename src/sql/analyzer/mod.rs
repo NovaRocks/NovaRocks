@@ -351,6 +351,7 @@ impl<'a> AnalyzerContext<'a> {
             projection,
             has_aggregation,
             distinct,
+            repeat: None,
         };
 
         // --- Subquery rewriting ---

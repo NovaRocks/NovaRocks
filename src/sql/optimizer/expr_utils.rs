@@ -190,6 +190,7 @@ pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .iter()
             .map(|c| c.name.to_lowercase())
             .collect(),
+        LogicalPlan::Repeat(r) => collect_output_columns(&r.input),
     }
 }
 
@@ -391,5 +392,6 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
                 out.insert((None, col));
             }
         }
+        LogicalPlan::Repeat(r) => collect_qualified_output_columns_inner(&r.input, out),
     }
 }

@@ -3429,6 +3429,7 @@ fn collect_scan_stats(
                 collect_scan_stats(input, out);
             }
         }
+        LogicalPlan::Repeat(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Values(_) | LogicalPlan::GenerateSeries(_) => {}
     }
 }

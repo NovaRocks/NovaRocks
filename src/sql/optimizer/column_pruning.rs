@@ -193,5 +193,17 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
                 output_columns: node.output_columns,
             })
         }
+
+        LogicalPlan::Repeat(node) => {
+            // Repeat needs all columns from input (rollup columns + others).
+            let input = prune_inner(*node.input, None);
+            LogicalPlan::Repeat(RepeatPlanNode {
+                input: Box::new(input),
+                repeat_column_ref_list: node.repeat_column_ref_list,
+                grouping_ids: node.grouping_ids,
+                all_rollup_columns: node.all_rollup_columns,
+                grouping_fn_args: node.grouping_fn_args,
+            })
+        }
     }
 }
