@@ -15,61 +15,44 @@ impl<'a> super::ThriftEmitter<'a> {
         let child = self.emit_node(*node.input)?;
 
         let repeat_node_id = self.alloc_node();
-        let output_tuple_id = self.alloc_tuple();
 
-        // 1. Pass through all child columns to the output tuple.
-        //    Rollup columns become nullable (they get NULLed per level).
+        // The output_tuple_id for TRepeatNode contains ONLY virtual slots
+        // (grouping_id, GROUPING() calls). Pass-through columns stay in
+        // the child's tuples. The lowering code expects grouping_list.len()
+        // == number of slots in output_tuple_id.
+        let virtual_tuple_id = self.alloc_tuple();
+
+        // Collect child columns and their slot IDs for scope building
         let child_cols: Vec<(String, ColumnBinding)> = child
             .scope
             .iter_columns()
             .map(|(n, b)| (n.clone(), b.clone()))
             .collect();
 
+        // Build merged output scope: child columns (unchanged) + virtual columns
         let mut output_scope = ExprScope::new();
-        let mut child_slot_ids: Vec<i32> = Vec::new();
-
-        for (idx, (name, binding)) in child_cols.iter().enumerate() {
-            let slot_id = self.alloc_slot();
-            self.desc_builder.add_slot(
-                slot_id,
-                output_tuple_id,
-                name,
-                &binding.data_type,
-                true, // all columns become nullable in repeat output
-                idx as i32,
-            );
-            output_scope.add_column(
-                None,
-                name.clone(),
-                ColumnBinding {
-                    tuple_id: output_tuple_id,
-                    slot_id,
-                    data_type: binding.data_type.clone(),
-                    nullable: true,
-                },
-            );
-            child_slot_ids.push(slot_id);
+        for (name, binding) in &child_cols {
+            output_scope.add_column(None, name.clone(), binding.clone());
         }
 
-        // 2. Add virtual slots: __grouping_id and each GROUPING() function call.
+        // Add virtual slots to the virtual-only tuple
         let num_virtual = 1 + node.grouping_fn_args.len();
         let mut virtual_slot_ids = Vec::with_capacity(num_virtual);
 
         let grouping_id_slot = self.alloc_slot();
-        let grouping_id_col_pos = child_cols.len() as i32;
         self.desc_builder.add_slot(
             grouping_id_slot,
-            output_tuple_id,
+            virtual_tuple_id,
             "__grouping_id",
             &DataType::Int64,
             false,
-            grouping_id_col_pos,
+            0,
         );
         output_scope.add_column(
             None,
             "__grouping_id".to_string(),
             ColumnBinding {
-                tuple_id: output_tuple_id,
+                tuple_id: virtual_tuple_id,
                 slot_id: grouping_id_slot,
                 data_type: DataType::Int64,
                 nullable: false,
@@ -81,17 +64,17 @@ impl<'a> super::ThriftEmitter<'a> {
             let slot = self.alloc_slot();
             self.desc_builder.add_slot(
                 slot,
-                output_tuple_id,
+                virtual_tuple_id,
                 fn_name,
                 &DataType::Int64,
                 false,
-                grouping_id_col_pos + 1 + fn_idx as i32,
+                1 + fn_idx as i32,
             );
             output_scope.add_column(
                 None,
                 fn_name.clone(),
                 ColumnBinding {
-                    tuple_id: output_tuple_id,
+                    tuple_id: virtual_tuple_id,
                     slot_id: slot,
                     data_type: DataType::Int64,
                     nullable: false,
@@ -100,58 +83,51 @@ impl<'a> super::ThriftEmitter<'a> {
             virtual_slot_ids.push(slot);
         }
 
-        self.desc_builder.add_tuple(output_tuple_id);
+        self.desc_builder.add_tuple(virtual_tuple_id);
 
-        // 3. Build slot_id_set_list: for each repeat level, which rollup
-        //    column slots are NON-null. The lowering code computes the
-        //    complement (null slots) from this.
+        // Build slot_id_set_list: for each repeat level, which rollup
+        // column slots (from the CHILD tuples) are NON-null.
+        // Map rollup column names to their slot IDs in the child scope.
         let all_rollup_slot_ids: BTreeSet<i32> = node
             .all_rollup_columns
             .iter()
             .filter_map(|col| {
-                child_cols
-                    .iter()
-                    .zip(child_slot_ids.iter())
-                    .find_map(|((name, _), sid)| {
-                        if name.to_lowercase() == col.to_lowercase() {
-                            Some(*sid)
-                        } else {
-                            None
-                        }
-                    })
+                child_cols.iter().find_map(|(name, binding)| {
+                    if name.to_lowercase() == col.to_lowercase() {
+                        Some(binding.slot_id)
+                    } else {
+                        None
+                    }
+                })
             })
             .collect();
 
-        let slot_id_set_list: Vec<BTreeSet<i32>> =
-            node.repeat_column_ref_list
-                .iter()
-                .map(|non_null_cols| {
-                    non_null_cols
-                        .iter()
-                        .filter_map(|col| {
-                            child_cols.iter().zip(child_slot_ids.iter()).find_map(
-                                |((name, _), sid)| {
-                                    if name.to_lowercase() == col.to_lowercase() {
-                                        Some(*sid)
-                                    } else {
-                                        None
-                                    }
-                                },
-                            )
+        let slot_id_set_list: Vec<BTreeSet<i32>> = node
+            .repeat_column_ref_list
+            .iter()
+            .map(|non_null_cols| {
+                non_null_cols
+                    .iter()
+                    .filter_map(|col| {
+                        child_cols.iter().find_map(|(name, binding)| {
+                            if name.to_lowercase() == col.to_lowercase() {
+                                Some(binding.slot_id)
+                            } else {
+                                None
+                            }
                         })
-                        .collect()
-                })
-                .collect();
+                    })
+                    .collect()
+            })
+            .collect();
 
-        // 4. Build grouping_list: first row = grouping_id values,
-        //    additional rows = per-GROUPING() function values.
+        // Build grouping_list: one row per virtual slot.
+        // First row = grouping_id bitmaps, additional rows = GROUPING() values.
         let repeat_times = node.grouping_ids.len();
         let mut grouping_list: Vec<Vec<i64>> = Vec::with_capacity(num_virtual);
 
-        // First row: grouping_id bitmap for each level
         grouping_list.push(node.grouping_ids.iter().map(|g| *g as i64).collect());
 
-        // Additional rows: one per GROUPING() function call
         for (_fn_name, fn_args) in &node.grouping_fn_args {
             let mut values = Vec::with_capacity(repeat_times);
             for non_null_cols in &node.repeat_column_ref_list {
@@ -171,17 +147,21 @@ impl<'a> super::ThriftEmitter<'a> {
 
         let repeat_id_list: Vec<i64> = node.grouping_ids.iter().map(|g| *g as i64).collect();
 
-        // 5. Build TPlanNode with TRepeatNode payload
+        // Build TPlanNode with TRepeatNode payload.
+        // row_tuples = child tuples + virtual tuple (for layout resolution).
+        let mut row_tuples = child.tuple_ids.clone();
+        row_tuples.push(virtual_tuple_id);
+
         let mut plan_node = nodes::default_plan_node();
         plan_node.node_id = repeat_node_id;
         plan_node.node_type = plan_nodes::TPlanNodeType::REPEAT_NODE;
         plan_node.num_children = 1;
         plan_node.limit = -1;
-        plan_node.row_tuples = vec![output_tuple_id];
+        plan_node.row_tuples = row_tuples;
         plan_node.nullable_tuples = vec![];
         plan_node.compact_data = true;
         plan_node.repeat_node = Some(plan_nodes::TRepeatNode {
-            output_tuple_id,
+            output_tuple_id: virtual_tuple_id,
             slot_id_set_list,
             repeat_id_list,
             grouping_list,
@@ -192,10 +172,14 @@ impl<'a> super::ThriftEmitter<'a> {
         let mut plan_nodes = vec![plan_node];
         plan_nodes.extend(child.plan_nodes);
 
+        // Output tuple_ids = child tuple_ids + virtual tuple
+        let mut output_tuple_ids = child.tuple_ids;
+        output_tuple_ids.push(virtual_tuple_id);
+
         Ok(EmitResult {
             plan_nodes,
             scope: output_scope,
-            tuple_ids: vec![output_tuple_id],
+            tuple_ids: output_tuple_ids,
         })
     }
 }
