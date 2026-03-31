@@ -282,6 +282,25 @@ async fn serve_forever(
     mysql_port: u16,
     user: String,
 ) -> Result<(), String> {
+    // Start gRPC exchange server for multi-fragment CTE execution.
+    // Uses the configured http_port (default 8040).
+    let grpc_port = crate::common::config::http_port();
+    match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
+        Ok(()) => {
+            info!(
+                "standalone grpc exchange server started on 127.0.0.1:{}",
+                grpc_port
+            );
+        }
+        Err(e) => {
+            warn!(
+                "failed to start standalone grpc exchange server on port {}: {} \
+                 (multi-fragment CTE queries will not work)",
+                grpc_port, e
+            );
+        }
+    }
+
     let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port));
     let listener = TcpListener::bind(bind_addr)
         .await

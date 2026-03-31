@@ -291,9 +291,9 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = build_query_plan(query, &catalog, current_database)?;
+                let result = execute_query(query, &catalog, current_database)?;
                 drop(catalog);
-                execute_plan(result).map(StatementResult::Query)
+                Ok(StatementResult::Query(result))
             }
             sqlast::Statement::Insert(ref insert) => {
                 self.handle_sqlparser_insert(insert, current_catalog, current_database)
@@ -590,9 +590,8 @@ impl StandaloneSession {
             .catalog
             .read()
             .expect("standalone catalog read lock");
-        let plan_result = build_query_plan(source_query, &catalog, current_database)?;
+        let query_result = execute_query(source_query, &catalog, current_database)?;
         drop(catalog);
-        let query_result = execute_plan(plan_result)?;
 
         // Resolve target table
         let raw_name = match &insert.table {
@@ -3363,7 +3362,8 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 
 use crate::sql::physical::PlanBuildResult;
 
-fn build_query_plan(
+/// Build a single-fragment query plan (no shared CTEs).
+fn build_query_plan_single(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,
@@ -3375,6 +3375,72 @@ fn build_query_plan(
     let table_stats = build_table_stats_from_plan(&logical);
     let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
     crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)
+}
+
+/// Execute a query, automatically choosing single-fragment or multi-fragment path.
+///
+/// Queries without shared CTEs (the vast majority) take the existing
+/// single-fragment fast path.  Queries with multi-referenced CTEs are
+/// split into a fragment DAG and executed via the multi-fragment coordinator.
+fn execute_query(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+) -> Result<QueryResult, String> {
+    let (resolved, cte_registry) =
+        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+
+    if cte_registry.entries.is_empty() {
+        // Single-fragment fast path (no shared CTEs)
+        let output_columns = resolved.output_columns.clone();
+        let logical = crate::sql::planner::plan(resolved)?;
+        let table_stats = build_table_stats_from_plan(&logical);
+        let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
+        let plan_result =
+            crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)?;
+        return execute_plan(plan_result);
+    }
+
+    // Multi-fragment CTE path
+    execute_query_multi_fragment(resolved, cte_registry, catalog, current_database)
+}
+
+/// Execute a query with shared CTEs via multi-fragment coordination.
+fn execute_query_multi_fragment(
+    resolved: crate::sql::ir::ResolvedQuery,
+    cte_registry: crate::sql::cte::CTERegistry,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+) -> Result<QueryResult, String> {
+    // 1. Plan with CTE subtrees
+    let query_plan = crate::sql::planner::plan_query(resolved, cte_registry)?;
+
+    // 2. Collect table stats from ALL plans (CTE + main)
+    let mut all_stats = std::collections::HashMap::new();
+    for cte in &query_plan.cte_plans {
+        let s = build_table_stats_from_plan(&cte.plan);
+        all_stats.extend(s);
+    }
+    all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
+
+    // 3. Optimize
+    let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
+
+    // 4. Split into fragments
+    let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
+
+    // 5. Emit per-fragment Thrift
+    let build_result =
+        crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)?;
+
+    // 6. Coordinate execution
+    let exchange_port = crate::common::config::http_port();
+    let coordinator = super::coordinator::ExecutionCoordinator::new(
+        build_result,
+        "127.0.0.1".to_string(),
+        exchange_port,
+    );
+    coordinator.execute()
 }
 
 /// Walk the logical plan tree and collect table-level statistics for all scan
