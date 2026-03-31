@@ -130,7 +130,7 @@ impl<'a> AnalyzerContext<'a> {
                 // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
                 // If so, expand into a UNION ALL of GROUP BY variants.
                 if let Some(rollup_exprs) = self.extract_rollup_from_group_by(s) {
-                    return self.expand_rollup(s, &rollup_exprs);
+                    return self.resolve_rollup(s, &rollup_exprs);
                 }
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
@@ -463,6 +463,11 @@ impl<'a> AnalyzerContext<'a> {
     ///   SELECT a, NULL, agg(...) ... GROUP BY a
     ///   UNION ALL
     ///   SELECT NULL, NULL, agg(...) ... (no GROUP BY, full aggregation)
+    ///
+    /// NOTE: This method is superseded by `resolve_rollup` which produces a
+    /// single-pass RepeatInfo instead. Kept temporarily for reference and will
+    /// be removed in a later cleanup pass.
+    #[allow(dead_code)]
     fn expand_rollup(
         &self,
         select: &sqlast::Select,
@@ -571,6 +576,130 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         Ok((result_body, result_cols))
+    }
+
+    /// Resolve `GROUP BY ROLLUP(a, b, ...)` into a single SELECT with RepeatInfo
+    /// instead of expanding into N+1 UNION ALL branches.
+    ///
+    /// The SELECT is analyzed once with all rollup keys in the GROUP BY.
+    /// RepeatInfo records the per-level null patterns and grouping_id bitmaps
+    /// so the Repeat operator can replay the aggregated result at execution time.
+    fn resolve_rollup(
+        &self,
+        select: &sqlast::Select,
+        rollup_groups: &[Vec<sqlast::Expr>],
+    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+        use crate::sql::ir::RepeatInfo;
+
+        let n = rollup_groups.len();
+
+        // Flatten all rollup column names (lowercased) in order.
+        let all_rollup_columns: Vec<String> = rollup_groups
+            .iter()
+            .flat_map(|group| group.iter().map(|e| format!("{e}").to_lowercase()))
+            .collect();
+
+        // Compute per-level non-null columns and grouping_id bitmaps.
+        // ROLLUP(a, b, c) produces N+1 levels:
+        //   Level 0: all active (a, b, c)  — grouping_id = 0b000
+        //   Level 1: (a, b) active         — grouping_id = 0b100 (c NULLed)
+        //   Level 2: (a) active            — grouping_id = 0b110 (b, c NULLed)
+        //   Level 3: none active           — grouping_id = 0b111 (all NULLed)
+        let mut repeat_column_ref_list: Vec<Vec<String>> = Vec::with_capacity(n + 1);
+        let mut grouping_ids: Vec<u64> = Vec::with_capacity(n + 1);
+
+        for level in 0..=n {
+            let active_count = n - level;
+
+            // Non-null columns: flatten first `active_count` groups
+            let non_null_cols: Vec<String> = rollup_groups
+                .iter()
+                .take(active_count)
+                .flat_map(|group| group.iter().map(|e| format!("{e}").to_lowercase()))
+                .collect();
+            repeat_column_ref_list.push(non_null_cols);
+
+            // Grouping ID bitmap: bit i = 1 if column i is NULLed
+            let mut bitmap: u64 = 0;
+            for group in rollup_groups.iter().skip(active_count) {
+                for expr in group {
+                    let col_name = format!("{expr}").to_lowercase();
+                    if let Some(bit_pos) = all_rollup_columns.iter().position(|c| *c == col_name) {
+                        bitmap |= 1u64 << bit_pos;
+                    }
+                }
+            }
+            grouping_ids.push(bitmap);
+        }
+
+        // Scan projection for GROUPING() function calls and collect their metadata.
+        // Also build a modified projection where GROUPING(col) is replaced with
+        // a literal 0 placeholder (Int64) so the analyzer can process it.
+        let mut grouping_fn_args: Vec<(String, Vec<String>)> = Vec::new();
+        let mut modified_projection = Vec::new();
+        for item in &select.projection {
+            let (expr_part, alias_part) = match item {
+                sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                    (expr, Some(alias.clone()))
+                }
+                sqlast::SelectItem::UnnamedExpr(expr) => (expr, None),
+                other => {
+                    modified_projection.push(other.clone());
+                    continue;
+                }
+            };
+
+            if let Some((output_name, arg_cols, replacement)) =
+                extract_grouping_call(expr_part, &alias_part)
+            {
+                // Record GROUPING() metadata for RepeatInfo
+                grouping_fn_args.push((output_name.clone(), arg_cols));
+                // Replace with literal 0 placeholder, preserving alias
+                modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                    expr: replacement,
+                    alias: sqlast::Ident::new(output_name),
+                });
+            } else {
+                // Not a GROUPING() call — recursively replace any nested
+                // GROUPING() calls with literal 0 placeholders.
+                let rewritten = replace_grouping_with_zero(expr_part);
+                if let Some(alias) = alias_part {
+                    modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                        expr: rewritten,
+                        alias,
+                    });
+                } else {
+                    modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
+                }
+            }
+        }
+
+        // Build modified SELECT with all rollup keys in GROUP BY (level 0).
+        let mut modified_select = select.clone();
+        let all_gb_exprs: Vec<sqlast::Expr> = rollup_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        modified_select.group_by = sqlast::GroupByExpr::Expressions(all_gb_exprs, vec![]);
+        modified_select.projection = modified_projection;
+
+        // Also replace GROUPING() in HAVING with literal 0 placeholder.
+        if let Some(ref having_expr) = modified_select.having {
+            modified_select.having = Some(replace_grouping_with_zero(having_expr));
+        }
+
+        // Analyze the SELECT once with all GROUP BY keys active.
+        let (mut sel, cols) = self.analyze_select(&modified_select)?;
+
+        // Attach RepeatInfo to the resolved SELECT.
+        sel.repeat = Some(RepeatInfo {
+            repeat_column_ref_list,
+            grouping_ids,
+            all_rollup_columns,
+            grouping_fn_args,
+        });
+
+        Ok((QueryBody::Select(sel), cols))
     }
 
     /// Analyze the SELECT projection list.
@@ -985,6 +1114,152 @@ fn replace_grouping_in_window(
                 .iter()
                 .map(|ob| sqlast::OrderByExpr {
                     expr: replace_grouping_calls(&ob.expr, nulled_exprs),
+                    ..ob.clone()
+                })
+                .collect();
+            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
+                partition_by,
+                order_by,
+                ..spec.clone()
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// Check if an expression is a top-level `GROUPING(col)` call.
+/// Returns `(output_name, arg_column_names, replacement_expr)` if it is.
+/// The replacement is a literal `0` (Int64) placeholder — the Repeat operator
+/// will fill in the real value at execution time.
+fn extract_grouping_call(
+    expr: &sqlast::Expr,
+    alias: &Option<sqlast::Ident>,
+) -> Option<(String, Vec<String>, sqlast::Expr)> {
+    if let sqlast::Expr::Function(func) = expr {
+        let func_name = func.name.to_string().to_lowercase();
+        if func_name == "grouping" {
+            if let sqlast::FunctionArguments::List(ref list) = func.args {
+                let arg_cols: Vec<String> = list
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                            Some(format!("{e}").to_lowercase())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !arg_cols.is_empty() {
+                    let output_name = if let Some(a) = alias {
+                        a.value.clone()
+                    } else {
+                        format!("{expr}").to_lowercase()
+                    };
+                    let replacement =
+                        sqlast::Expr::Value(sqlast::Value::Number("0".to_string(), false).into());
+                    return Some((output_name, arg_cols, replacement));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Replace all GROUPING() calls in an expression tree with a literal 0 (Int64)
+/// placeholder. Used by `resolve_rollup` so the analyzer doesn't encounter the
+/// unknown GROUPING() function during expression resolution.
+fn replace_grouping_with_zero(expr: &sqlast::Expr) -> sqlast::Expr {
+    match expr {
+        sqlast::Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "grouping" {
+                return sqlast::Expr::Value(
+                    sqlast::Value::Number("0".to_string(), false).into(),
+                );
+            }
+            // Not a GROUPING() call — recurse into arguments
+            let new_args = match &func.args {
+                sqlast::FunctionArguments::List(list) => {
+                    let new_list_args: Vec<_> = list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                                    replace_grouping_with_zero(e),
+                                ))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect();
+                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                        args: new_list_args,
+                        ..list.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            let mut new_func = func.clone();
+            new_func.args = new_args;
+            // Recurse into OVER clause for window functions
+            if let Some(ref window) = func.over {
+                new_func.over = Some(replace_grouping_with_zero_in_window(window));
+            }
+            sqlast::Expr::Function(new_func)
+        }
+        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
+            left: Box::new(replace_grouping_with_zero(left)),
+            op: op.clone(),
+            right: Box::new(replace_grouping_with_zero(right)),
+        },
+        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_grouping_with_zero(inner)),
+        },
+        sqlast::Expr::Nested(inner) => {
+            sqlast::Expr::Nested(Box::new(replace_grouping_with_zero(inner)))
+        }
+        sqlast::Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => sqlast::Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(replace_grouping_with_zero(o))),
+            conditions: conditions
+                .iter()
+                .map(|cw| sqlast::CaseWhen {
+                    condition: replace_grouping_with_zero(&cw.condition),
+                    result: replace_grouping_with_zero(&cw.result),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(replace_grouping_with_zero(e))),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Recurse into window specifications to replace GROUPING() calls with literal 0.
+fn replace_grouping_with_zero_in_window(window: &sqlast::WindowType) -> sqlast::WindowType {
+    match window {
+        sqlast::WindowType::WindowSpec(spec) => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| replace_grouping_with_zero(e))
+                .collect();
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|ob| sqlast::OrderByExpr {
+                    expr: replace_grouping_with_zero(&ob.expr),
                     ..ob.clone()
                 })
                 .collect();
@@ -1581,15 +1856,39 @@ mod tests {
                    GROUP BY ROLLUP(o_orderstatus, o_orderpriority)";
         let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP should work");
         assert!(!resolved.output_columns.is_empty());
-        // ROLLUP(a, b) should produce a UNION ALL of 3 levels:
-        // Level 0: GROUP BY a, b
-        // Level 1: GROUP BY a (b is NULLed)
-        // Level 2: no GROUP BY (both NULLed)
-        assert!(
-            matches!(resolved.body, QueryBody::SetOperation(_)),
-            "ROLLUP should be expanded into a UNION ALL set operation, got: {:?}",
-            std::mem::discriminant(&resolved.body)
-        );
+        // ROLLUP(a, b) should produce a single Select with RepeatInfo containing
+        // 3 levels: (a,b), (a), ()
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo");
+            // 3 levels for 2 rollup dimensions
+            assert_eq!(
+                repeat.repeat_column_ref_list.len(),
+                3,
+                "ROLLUP(a,b) should have 3 levels"
+            );
+            // Level 0: both active
+            assert_eq!(repeat.repeat_column_ref_list[0].len(), 2);
+            // Level 1: only first active
+            assert_eq!(repeat.repeat_column_ref_list[1].len(), 1);
+            // Level 2: none active
+            assert_eq!(repeat.repeat_column_ref_list[2].len(), 0);
+
+            // Grouping IDs
+            assert_eq!(repeat.grouping_ids[0], 0b00); // both active
+            assert_eq!(repeat.grouping_ids[1], 0b10); // b NULLed (bit 1)
+            assert_eq!(repeat.grouping_ids[2], 0b11); // both NULLed
+
+            // All rollup columns
+            assert_eq!(repeat.all_rollup_columns.len(), 2);
+        } else {
+            panic!(
+                "ROLLUP should produce a Select with RepeatInfo, got: {:?}",
+                std::mem::discriminant(&resolved.body)
+            );
+        }
     }
 
     #[test]
@@ -1602,5 +1901,43 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 2);
         assert_eq!(resolved.output_columns[0].name, "status");
         assert_eq!(resolved.output_columns[1].name, "cnt");
+        // Also verify RepeatInfo is present
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo");
+            assert_eq!(
+                repeat.repeat_column_ref_list.len(),
+                2,
+                "ROLLUP(a) should have 2 levels"
+            );
+            assert_eq!(repeat.grouping_ids[0], 0b0); // active
+            assert_eq!(repeat.grouping_ids[1], 0b1); // NULLed
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
+    }
+
+    #[test]
+    fn test_group_by_rollup_with_grouping() {
+        // Verify GROUPING() function calls are captured in RepeatInfo
+        let sql = "SELECT o_orderstatus, grouping(o_orderstatus) as g_status, count(*) as cnt \
+                   FROM orders \
+                   GROUP BY ROLLUP(o_orderstatus)";
+        let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP with GROUPING should work");
+        assert_eq!(resolved.output_columns.len(), 3);
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo");
+            // GROUPING(o_orderstatus) should be recorded
+            assert_eq!(repeat.grouping_fn_args.len(), 1);
+            assert_eq!(repeat.grouping_fn_args[0].0, "g_status");
+            assert_eq!(repeat.grouping_fn_args[0].1, vec!["o_orderstatus"]);
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
     }
 }
