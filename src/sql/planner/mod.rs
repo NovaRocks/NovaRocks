@@ -203,6 +203,17 @@ fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
         });
     }
 
+    // 2.5: ROLLUP → Insert Repeat node between filter and aggregate
+    if let Some(repeat_info) = select.repeat.take() {
+        current = LogicalPlan::Repeat(RepeatPlanNode {
+            input: Box::new(current),
+            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+            grouping_ids: repeat_info.grouping_ids,
+            all_rollup_columns: repeat_info.all_rollup_columns,
+            grouping_fn_args: repeat_info.grouping_fn_args,
+        });
+    }
+
     // 3. GROUP BY / aggregation → Aggregate
     if select.has_aggregation || !select.group_by.is_empty() {
         // Collect non-aggregate column refs from HAVING that aren't already in
