@@ -412,6 +412,8 @@ impl<'a> AnalyzerContext<'a> {
             ctes: self.ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
+            shared_cte_ids: self.shared_cte_ids.clone(),
+            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
 
         let result = child_ctx.analyze_query_with_outer_scope_inner(query, outer_scope)?;
@@ -457,6 +459,8 @@ impl<'a> AnalyzerContext<'a> {
                 ctes,
                 next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
                 collected_subqueries: std::cell::RefCell::new(Vec::new()),
+                shared_cte_ids: self.shared_cte_ids.clone(),
+                cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
             };
             &child_ctx
         } else {

@@ -3368,7 +3368,8 @@ fn build_query_plan(
     catalog: &InMemoryCatalog,
     current_database: &str,
 ) -> Result<PlanBuildResult, String> {
-    let resolved = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, _cte_registry) =
+        crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let output_columns = resolved.output_columns.clone();
     let logical = crate::sql::planner::plan(resolved)?;
     let table_stats = build_table_stats_from_plan(&logical);
