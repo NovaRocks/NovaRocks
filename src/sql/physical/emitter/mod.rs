@@ -7,6 +7,7 @@
 mod emit_aggregate;
 mod emit_join;
 mod emit_project;
+mod emit_repeat;
 mod emit_scan;
 mod emit_set_op;
 mod emit_sort;
@@ -153,7 +154,7 @@ impl<'a> ThriftEmitter<'a> {
             LogicalPlan::GenerateSeries(node) => self.emit_generate_series(node),
             LogicalPlan::Window(node) => self.emit_window(node),
             LogicalPlan::SubqueryAlias(node) => self.emit_subquery_alias(node),
-            LogicalPlan::Repeat(_) => Err("Repeat node emission not yet implemented".to_string()),
+            LogicalPlan::Repeat(node) => self.emit_repeat(node),
         }
     }
 
