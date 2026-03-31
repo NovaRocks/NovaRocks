@@ -524,6 +524,33 @@ fn build_hdfs_scan_range_params(
 }
 
 // ---------------------------------------------------------------------------
+// Exchange node (used for CTE consume)
+// ---------------------------------------------------------------------------
+
+pub(super) fn build_exchange_node(
+    node_id: i32,
+    input_row_tuples: Vec<i32>,
+) -> plan_nodes::TPlanNode {
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::EXCHANGE_NODE;
+    node.num_children = 0;
+    node.limit = -1;
+    node.row_tuples = input_row_tuples.clone();
+    node.nullable_tuples = vec![];
+    node.compact_data = true;
+    node.exchange_node = Some(plan_nodes::TExchangeNode::new(
+        input_row_tuples,
+        None::<plan_nodes::TSortInfo>,
+        None::<i64>,
+        Some(partitions::TPartitionType::UNPARTITIONED),
+        None::<bool>,
+        None::<plan_nodes::TLateMaterializeMode>,
+    ));
+    node
+}
+
+// ---------------------------------------------------------------------------
 // Default plan node
 // ---------------------------------------------------------------------------
 

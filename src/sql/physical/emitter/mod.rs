@@ -28,6 +28,8 @@ use super::resolve::{ExprScope, ResolvedTable};
 use crate::sql::ir::{self as query_ir, TypedExpr};
 use crate::sql::plan::*;
 
+use crate::sql::cte::CteId;
+
 use super::{OutputColumn, PlanBuildResult};
 
 // Re-export for expr_compiler.rs which references super::emitter::agg_call_display_name_from_parts
@@ -47,6 +49,120 @@ pub(crate) fn emit(
     emitter.emit_plan(plan, output_columns)
 }
 
+pub(crate) fn emit_multi_fragment(
+    fragment_plan: crate::sql::fragment::FragmentPlan,
+    catalog: &dyn CatalogProvider,
+    current_database: &str,
+) -> Result<super::MultiFragmentBuildResult, String> {
+    let mut emitter = ThriftEmitter::new(catalog, current_database);
+    let mut fragment_results = Vec::new();
+
+    for fragment in &fragment_plan.fragments {
+        // Save and reset per-fragment mutable state
+        let prev_scan_tables = std::mem::take(&mut emitter.scan_tables);
+        let prev_cte_exchange_nodes = std::mem::take(&mut emitter.cte_exchange_nodes);
+
+        // Emit this fragment's plan tree
+        let result = emitter.emit_node(fragment.plan.clone())?;
+
+        // Extract per-fragment state
+        let scan_tables = std::mem::replace(&mut emitter.scan_tables, prev_scan_tables);
+        let cte_exchange_nodes =
+            std::mem::replace(&mut emitter.cte_exchange_nodes, prev_cte_exchange_nodes);
+
+        // Build per-fragment exec_params
+        let exec_params = nodes::build_exec_params_multi(
+            &scan_tables
+                .iter()
+                .map(|(id, rt)| (*id, rt.clone()))
+                .collect::<Vec<_>>(),
+        )?;
+
+        // Build output sink
+        let output_sink = match &fragment.sink {
+            crate::sql::fragment::FragmentSink::Result => {
+                // Build a RESULT_SINK
+                crate::data_sinks::TDataSink::new(
+                    crate::data_sinks::TDataSinkType::RESULT_SINK,
+                    None::<crate::data_sinks::TDataStreamSink>,
+                    Some(crate::data_sinks::TResultSink::default()),
+                    None::<crate::data_sinks::TMysqlTableSink>,
+                    None::<crate::data_sinks::TExportSink>,
+                    None::<crate::data_sinks::TOlapTableSink>,
+                    None::<crate::data_sinks::TMemoryScratchSink>,
+                    None::<crate::data_sinks::TMultiCastDataStreamSink>,
+                    None::<crate::data_sinks::TSchemaTableSink>,
+                    None::<crate::data_sinks::TIcebergTableSink>,
+                    None::<crate::data_sinks::THiveTableSink>,
+                    None::<crate::data_sinks::TTableFunctionTableSink>,
+                    None::<crate::data_sinks::TDictionaryCacheSink>,
+                    None::<Vec<Box<crate::data_sinks::TDataSink>>>,
+                    None::<i64>,
+                    None::<crate::data_sinks::TSplitDataStreamSink>,
+                )
+            }
+            crate::sql::fragment::FragmentSink::MultiCast { .. } => {
+                // Placeholder — actual multicast sink built by coordinator
+                // after all fragments emitted
+                crate::data_sinks::TDataSink::new(
+                    crate::data_sinks::TDataSinkType::NOOP_SINK,
+                    None::<crate::data_sinks::TDataStreamSink>,
+                    None::<crate::data_sinks::TResultSink>,
+                    None::<crate::data_sinks::TMysqlTableSink>,
+                    None::<crate::data_sinks::TExportSink>,
+                    None::<crate::data_sinks::TOlapTableSink>,
+                    None::<crate::data_sinks::TMemoryScratchSink>,
+                    None::<crate::data_sinks::TMultiCastDataStreamSink>,
+                    None::<crate::data_sinks::TSchemaTableSink>,
+                    None::<crate::data_sinks::TIcebergTableSink>,
+                    None::<crate::data_sinks::THiveTableSink>,
+                    None::<crate::data_sinks::TTableFunctionTableSink>,
+                    None::<crate::data_sinks::TDictionaryCacheSink>,
+                    None::<Vec<Box<crate::data_sinks::TDataSink>>>,
+                    None::<i64>,
+                    None::<crate::data_sinks::TSplitDataStreamSink>,
+                )
+            }
+        };
+
+        let cte_id = match &fragment.sink {
+            crate::sql::fragment::FragmentSink::MultiCast { cte_id, .. } => Some(*cte_id),
+            _ => None,
+        };
+
+        fragment_results.push(super::FragmentBuildResult {
+            fragment_id: fragment.id,
+            plan: crate::plan_nodes::TPlan::new(result.plan_nodes),
+            desc_tbl: DescBuilder::new().build(), // placeholder, replaced below
+            exec_params,
+            output_sink,
+            output_columns: fragment
+                .output_columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect(),
+            cte_id,
+            cte_exchange_nodes,
+        });
+    }
+
+    // Build shared descriptor table and assign to all fragments
+    let desc_tbl =
+        std::mem::replace(&mut emitter.desc_builder, super::descriptors::DescriptorTableBuilder::new()).build();
+    for fr in &mut fragment_results {
+        fr.desc_tbl = desc_tbl.clone();
+    }
+
+    Ok(super::MultiFragmentBuildResult {
+        fragment_results,
+        root_fragment_id: fragment_plan.root_fragment_id,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Emitter state
 // ---------------------------------------------------------------------------
@@ -58,6 +174,8 @@ pub(super) struct ThriftEmitter<'a> {
     desc_builder: DescBuilder,
     /// (node_id, ResolvedTable) for each scan node, used to build exec_params.
     scan_tables: Vec<(i32, ResolvedTable)>,
+    /// (cte_id, exchange_node_id) for each CTE consume node emitted in the current fragment.
+    cte_exchange_nodes: Vec<(CteId, i32)>,
     catalog: &'a dyn CatalogProvider,
     current_database: &'a str,
 }
@@ -80,6 +198,7 @@ impl<'a> ThriftEmitter<'a> {
             next_node_id: 1,
             desc_builder: DescBuilder::new(),
             scan_tables: Vec::new(),
+            cte_exchange_nodes: Vec::new(),
             catalog,
             current_database,
         }
@@ -155,9 +274,7 @@ impl<'a> ThriftEmitter<'a> {
             LogicalPlan::Window(node) => self.emit_window(node),
             LogicalPlan::SubqueryAlias(node) => self.emit_subquery_alias(node),
             LogicalPlan::Repeat(node) => self.emit_repeat(node),
-            LogicalPlan::CTEConsume(_node) => {
-                Err("CTEConsume should be handled by multi-fragment emission".to_string())
-            }
+            LogicalPlan::CTEConsume(node) => self.emit_cte_consume(node),
         }
     }
 
@@ -183,6 +300,55 @@ impl<'a> ThriftEmitter<'a> {
         }
 
         Ok(child)
+    }
+
+    // -----------------------------------------------------------------------
+    // CTE consume emission (exchange node for multi-fragment plans)
+    // -----------------------------------------------------------------------
+
+    fn emit_cte_consume(
+        &mut self,
+        node: crate::sql::plan::CTEConsumeNode,
+    ) -> Result<EmitResult, String> {
+        use super::resolve::ColumnBinding;
+
+        let tuple_id = self.alloc_tuple();
+        let node_id = self.alloc_node();
+
+        let mut scope = ExprScope::new();
+
+        for (idx, col) in node.output_columns.iter().enumerate() {
+            let slot_id = self.alloc_slot();
+            self.desc_builder.add_slot(
+                slot_id,
+                tuple_id,
+                &col.name,
+                &col.data_type,
+                col.nullable,
+                idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                nullable: col.nullable,
+            };
+            scope.add_column(Some(node.alias.clone()), col.name.clone(), binding.clone());
+            // Also register unqualified
+            scope.add_column(None, col.name.clone(), binding);
+        }
+        self.desc_builder.add_tuple(tuple_id);
+
+        let exchange_plan_node = nodes::build_exchange_node(node_id, vec![tuple_id]);
+
+        // Record this CTE consume for the coordinator to wire up multicast destinations
+        self.cte_exchange_nodes.push((node.cte_id, node_id));
+
+        Ok(EmitResult {
+            plan_nodes: vec![exchange_plan_node],
+            scope,
+            tuple_ids: vec![tuple_id],
+        })
     }
 
     // -----------------------------------------------------------------------
