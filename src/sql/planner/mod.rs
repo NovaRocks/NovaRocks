@@ -551,9 +551,20 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
         // Window calls themselves are not aggregates, but their args may
         // contain aggregate calls that must be collected so the aggregate node
         // computes them (e.g. sum(sum(x)) OVER (...)).
-        ExprKind::WindowCall { args, .. } => {
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for arg in args {
                 collect_aggregates(arg, out);
+            }
+            for expr in partition_by {
+                collect_aggregates(expr, out);
+            }
+            for sort_item in order_by {
+                collect_aggregates(&sort_item.expr, out);
             }
         }
         // SubqueryPlaceholder should be rewritten before reaching the planner
