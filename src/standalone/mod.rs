@@ -1,4 +1,5 @@
 pub(crate) mod catalog;
+pub(crate) mod coordinator;
 mod engine;
 pub(crate) mod iceberg;
 pub(crate) mod iceberg_add_files;

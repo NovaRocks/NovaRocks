@@ -1,0 +1,349 @@
+//! Execution coordinator for multi-fragment CTE query execution.
+//!
+//! Coordinates the execution of a multi-fragment plan where:
+//! - CTE produce fragments run in background threads, sending data via exchange
+//! - The root fragment runs in the foreground and collects results
+//!
+//! Each CTE fragment has exactly 1 instance. The root fragment has exactly 1
+//! instance. All fragments run in the same process.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::data_sinks;
+use crate::exec::expr::ExprArena;
+use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
+use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
+use crate::exec::pipeline::executor::execute_plan_with_pipeline;
+use crate::lower::fragment::execute_fragment;
+use crate::lower::layout::{build_tuple_slot_order, reorder_tuple_slots};
+use crate::lower::thrift::lower_plan;
+use crate::partitions;
+use crate::planner;
+use crate::runtime::runtime_state::RuntimeState;
+use crate::sql::cte::CteId;
+use crate::sql::fragment::FragmentId;
+use crate::sql::physical::{FragmentBuildResult, MultiFragmentBuildResult};
+use crate::types;
+
+use super::engine::{QueryResult, QueryResultColumn};
+
+/// Coordinates multi-fragment CTE query execution.
+///
+/// Assigns fragment instance IDs, wires up multicast sinks for CTE produce
+/// fragments, spawns CTE fragments in background threads, and executes the
+/// root fragment in the foreground to collect results.
+pub(crate) struct ExecutionCoordinator {
+    build_result: MultiFragmentBuildResult,
+    exchange_host: String,
+    exchange_port: u16,
+}
+
+impl ExecutionCoordinator {
+    pub(crate) fn new(
+        build_result: MultiFragmentBuildResult,
+        exchange_host: String,
+        exchange_port: u16,
+    ) -> Self {
+        Self {
+            build_result,
+            exchange_host,
+            exchange_port,
+        }
+    }
+
+    pub(crate) fn execute(self) -> Result<QueryResult, String> {
+        let root_fragment_id = self.build_result.root_fragment_id;
+        let fragment_results = self.build_result.fragment_results;
+        let exchange_host = self.exchange_host;
+        let exchange_port = self.exchange_port;
+
+        // ---------------------------------------------------------------
+        // 1. Assign fragment instance IDs
+        // ---------------------------------------------------------------
+        // Use (100, fragment_id + 1) as unique (hi, lo) pairs.
+        // query_id is shared across all fragments.
+        let query_id_hi: i64 = 100;
+        let query_id_lo: i64 = 1;
+
+        // Build a lookup: fragment_id -> (hi, lo) instance ID.
+        // Use (100, fragment_id + 1) as unique (hi, lo) pairs.
+        let instance_map: BTreeMap<FragmentId, (i64, i64)> = fragment_results
+            .iter()
+            .map(|fr| (fr.fragment_id, (100_i64, fr.fragment_id as i64 + 1)))
+            .collect();
+
+        // Find the root fragment instance ID
+        let root_instance_id = *instance_map
+            .get(&root_fragment_id)
+            .ok_or_else(|| "root fragment not found in instance map".to_string())?;
+
+        // Separate root and CTE fragments
+        let mut root_fragment: Option<FragmentBuildResult> = None;
+        let mut cte_fragments: Vec<FragmentBuildResult> = Vec::new();
+        for fr in fragment_results {
+            if fr.fragment_id == root_fragment_id {
+                root_fragment = Some(fr);
+            } else {
+                cte_fragments.push(fr);
+            }
+        }
+        let root_fragment =
+            root_fragment.ok_or_else(|| "root fragment not found in build results".to_string())?;
+
+        // ---------------------------------------------------------------
+        // 2. Wire multicast sinks for CTE fragments
+        // ---------------------------------------------------------------
+        // For each CTE produce fragment, build TMultiCastDataStreamSink with
+        // one TDataStreamSink per consumer exchange node in the root fragment.
+        let brpc_addr = types::TNetworkAddress::new(exchange_host, exchange_port as i32);
+
+        // Build a map: cte_id -> Vec<exchange_node_id> from the root fragment's metadata
+        let mut cte_consumers: BTreeMap<CteId, Vec<i32>> = BTreeMap::new();
+        for (cte_id, exchange_node_id) in &root_fragment.cte_exchange_nodes {
+            cte_consumers
+                .entry(*cte_id)
+                .or_default()
+                .push(*exchange_node_id);
+        }
+
+        let mut cte_thrift_fragments: Vec<(FragmentBuildResult, planner::TPlanFragment, crate::internal_service::TPlanFragmentExecParams)> = Vec::new();
+
+        for cte_fr in cte_fragments {
+            let cte_id = cte_fr
+                .cte_id
+                .ok_or_else(|| "CTE fragment missing cte_id".to_string())?;
+
+            let consumer_exchange_nodes = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+
+            if consumer_exchange_nodes.is_empty() {
+                return Err(format!(
+                    "CTE fragment (cte_id={cte_id}) has no consumers in root fragment"
+                ));
+            }
+
+            // Build one TDataStreamSink + destinations per consumer
+            let unpartitioned = partitions::TDataPartition::new(
+                partitions::TPartitionType::UNPARTITIONED,
+                None::<Vec<crate::exprs::TExpr>>,
+                None::<Vec<partitions::TRangePartition>>,
+                None::<Vec<partitions::TBucketProperty>>,
+            );
+
+            let mut sinks = Vec::new();
+            let mut destinations = Vec::new();
+            for &exchange_node_id in &consumer_exchange_nodes {
+                let stream_sink = data_sinks::TDataStreamSink::new(
+                    exchange_node_id,
+                    unpartitioned.clone(),
+                    None::<bool>,  // ignore_not_found
+                    None::<bool>,  // is_merge
+                    None::<i32>,   // dest_dop
+                    None::<Vec<i32>>, // output_columns
+                    None::<i64>,   // limit
+                );
+                sinks.push(stream_sink);
+
+                // Each sink has one destination: the root fragment instance
+                let dest = data_sinks::TPlanFragmentDestination::new(
+                    types::TUniqueId::new(root_instance_id.0, root_instance_id.1),
+                    None::<types::TNetworkAddress>, // deprecated_server
+                    Some(brpc_addr.clone()),         // brpc_server
+                    None::<i32>,                     // pipeline_driver_sequence
+                );
+                destinations.push(vec![dest]);
+            }
+
+            let multi_cast_sink =
+                data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
+
+            let output_sink = data_sinks::TDataSink::new(
+                data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
+                None::<data_sinks::TDataStreamSink>,
+                None::<data_sinks::TResultSink>,
+                None::<data_sinks::TMysqlTableSink>,
+                None::<data_sinks::TExportSink>,
+                None::<data_sinks::TOlapTableSink>,
+                None::<data_sinks::TMemoryScratchSink>,
+                Some(multi_cast_sink),
+                None::<data_sinks::TSchemaTableSink>,
+                None::<data_sinks::TIcebergTableSink>,
+                None::<data_sinks::THiveTableSink>,
+                None::<data_sinks::TTableFunctionTableSink>,
+                None::<data_sinks::TDictionaryCacheSink>,
+                None::<Vec<Box<data_sinks::TDataSink>>>,
+                None::<i64>,
+                None::<data_sinks::TSplitDataStreamSink>,
+            );
+
+            let cte_instance_id = *instance_map
+                .get(&cte_fr.fragment_id)
+                .ok_or_else(|| "CTE fragment instance ID not found".to_string())?;
+
+            // Build TPlanFragment for the CTE fragment
+            let thrift_fragment = planner::TPlanFragment::new(
+                Some(cte_fr.plan.clone()),
+                None::<Vec<crate::exprs::TExpr>>, // output_exprs
+                Some(output_sink),
+                partitions::TDataPartition::new(
+                    partitions::TPartitionType::UNPARTITIONED,
+                    None::<Vec<crate::exprs::TExpr>>,
+                    None::<Vec<partitions::TRangePartition>>,
+                    None::<Vec<partitions::TBucketProperty>>,
+                ),
+                None::<i64>, // min_reservation_bytes
+                None::<i64>, // initial_reservation_total_claims
+                None::<Vec<crate::data::TGlobalDict>>,
+                None::<Vec<crate::data::TGlobalDict>>,
+                None::<planner::TCacheParam>,
+                None::<BTreeMap<i32, crate::exprs::TExpr>>,
+                None::<planner::TGroupExecutionParam>,
+            );
+
+            // Build exec_params for the CTE fragment
+            let mut cte_exec_params = cte_fr.exec_params.clone();
+            cte_exec_params.query_id = types::TUniqueId::new(query_id_hi, query_id_lo);
+            cte_exec_params.fragment_instance_id =
+                types::TUniqueId::new(cte_instance_id.0, cte_instance_id.1);
+
+            cte_thrift_fragments.push((cte_fr, thrift_fragment, cte_exec_params));
+        }
+
+        // ---------------------------------------------------------------
+        // 3. Compute per_exch_num_senders for the root fragment
+        // ---------------------------------------------------------------
+        // Each exchange node in the root fragment receives from 1 sender
+        // (the corresponding CTE fragment has exactly 1 instance).
+        let mut per_exch_num_senders: BTreeMap<i32, i32> = BTreeMap::new();
+        for (_cte_id, exchange_node_id) in &root_fragment.cte_exchange_nodes {
+            per_exch_num_senders.insert(*exchange_node_id, 1);
+        }
+
+        // ---------------------------------------------------------------
+        // 4. Spawn CTE fragments in background threads
+        // ---------------------------------------------------------------
+        let pipeline_dop = std::thread::available_parallelism()
+            .map(|p| p.get().min(4))
+            .unwrap_or(4) as i32;
+
+        let mut cte_handles: Vec<std::thread::JoinHandle<Result<(), String>>> = Vec::new();
+
+        for (cte_fr, thrift_fragment, cte_exec_params) in cte_thrift_fragments {
+            let desc_tbl = cte_fr.desc_tbl.clone();
+            let dop = pipeline_dop;
+
+            let handle = std::thread::spawn(move || {
+                let result = execute_fragment(
+                    &thrift_fragment,
+                    Some(&desc_tbl),
+                    Some(&cte_exec_params),
+                    None, // query_opts
+                    None, // session_time_zone
+                    dop,
+                    None, // group_execution_scan_dop
+                    None, // db_name
+                    None, // profiler
+                    None, // last_query_id
+                    None, // fe_addr
+                    None, // backend_num
+                    None, // mem_tracker
+                );
+                result.map(|_| ())
+            });
+            cte_handles.push(handle);
+        }
+
+        // ---------------------------------------------------------------
+        // 5. Execute root fragment in foreground (Option B: ResultSinkHandle)
+        // ---------------------------------------------------------------
+        let desc_tbl = root_fragment.desc_tbl.clone();
+        let plan = root_fragment.plan.clone();
+        let mut root_exec_params = root_fragment.exec_params.clone();
+        root_exec_params.query_id = types::TUniqueId::new(query_id_hi, query_id_lo);
+        root_exec_params.fragment_instance_id =
+            types::TUniqueId::new(root_instance_id.0, root_instance_id.1);
+        root_exec_params.per_exch_num_senders = per_exch_num_senders;
+
+        let mut tuple_slots = build_tuple_slot_order(Some(&desc_tbl));
+        reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
+        let layout_hints = tuple_slots.clone();
+
+        let mut arena = ExprArena::default();
+        let connectors = crate::connector::ConnectorRegistry::default();
+        let lowered = lower_plan(
+            &plan,
+            &mut arena,
+            &tuple_slots,
+            Some(&desc_tbl),
+            None, // query_global_dicts
+            None, // query_global_dict_exprs
+            Some(&root_exec_params),
+            None, // query_opts
+            None, // db_name
+            &connectors,
+            &layout_hints,
+            None, // last_query_id
+            None, // fe_addr
+        )?;
+
+        let mut exec_plan = ExecPlan {
+            arena,
+            root: lowered.node,
+        };
+        push_down_local_runtime_filters(&mut exec_plan.root, &exec_plan.arena);
+
+        let handle = ResultSinkHandle::new();
+        let exchange_finst_id = Some((root_instance_id.0, root_instance_id.1));
+
+        execute_plan_with_pipeline(
+            exec_plan,
+            false,
+            std::time::Duration::from_millis(10),
+            Box::new(ResultSinkFactory::new(handle.clone())),
+            exchange_finst_id,
+            None, // profiler
+            pipeline_dop,
+            Arc::new(RuntimeState::default()),
+            None, // query_id
+            None, // fe_addr
+            None, // backend_num
+        )?;
+
+        // ---------------------------------------------------------------
+        // 6. Wait for CTE fragment threads to complete
+        // ---------------------------------------------------------------
+        for jh in cte_handles {
+            match jh.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(format!("CTE fragment execution failed: {e}")),
+                Err(panic_payload) => {
+                    let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    return Err(format!("CTE fragment thread panicked: {msg}"));
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // 7. Collect results
+        // ---------------------------------------------------------------
+        Ok(QueryResult {
+            columns: root_fragment
+                .output_columns
+                .iter()
+                .map(|c| QueryResultColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    logical_type: None,
+                })
+                .collect(),
+            chunks: handle.take_chunks(),
+        })
+    }
+}
