@@ -861,6 +861,21 @@ impl<'a> AnalyzerContext<'a> {
                 scope.add_column(Some(qualifier), &gs.column_name, DataType::Int64, false);
                 Ok(())
             }
+            Relation::CTEConsume {
+                alias,
+                output_columns,
+                ..
+            } => {
+                for col in output_columns {
+                    scope.add_column(
+                        Some(alias.as_str()),
+                        &col.name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    );
+                }
+                Ok(())
+            }
         }
     }
 

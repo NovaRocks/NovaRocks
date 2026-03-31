@@ -174,6 +174,7 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),
         LogicalPlan::GenerateSeries(node) => LogicalPlan::GenerateSeries(node),
+        LogicalPlan::CTEConsume(node) => LogicalPlan::CTEConsume(node),
 
         LogicalPlan::Window(node) => {
             // Prune columns in the child, but don't restrict since the window

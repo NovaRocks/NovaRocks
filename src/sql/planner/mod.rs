@@ -702,6 +702,15 @@ fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
             column_name: gs.column_name,
             alias: gs.alias,
         })),
+        Relation::CTEConsume {
+            cte_id,
+            alias,
+            output_columns,
+        } => Ok(LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id,
+            alias,
+            output_columns,
+        })),
     }
 }
 

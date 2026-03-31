@@ -35,6 +35,8 @@ pub(crate) enum LogicalPlan {
     /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
     /// Replicates each input row N times with different null patterns.
     Repeat(RepeatPlanNode),
+    /// Reference to a shared CTE. Leaf node — execution receives data via exchange.
+    CTEConsume(CTEConsumeNode),
 }
 
 /// Repeat node for ROLLUP/CUBE/GROUPING SETS.
@@ -55,6 +57,28 @@ pub(crate) struct SubqueryAliasNode {
     pub input: Box<LogicalPlan>,
     pub alias: String,
     pub output_columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CTEConsumeNode {
+    pub cte_id: crate::sql::cte::CteId,
+    pub alias: String,
+    pub output_columns: Vec<crate::sql::ir::OutputColumn>,
+}
+
+/// A query plan with optional shared CTE subtrees.
+#[derive(Clone, Debug)]
+pub(crate) struct QueryPlan {
+    pub cte_plans: Vec<CTEProducePlan>,
+    pub main_plan: LogicalPlan,
+    pub output_columns: Vec<crate::sql::ir::OutputColumn>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CTEProducePlan {
+    pub cte_id: crate::sql::cte::CteId,
+    pub plan: LogicalPlan,
+    pub output_columns: Vec<crate::sql::ir::OutputColumn>,
 }
 
 /// Analytic/window function evaluation node.

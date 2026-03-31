@@ -155,6 +155,9 @@ impl<'a> ThriftEmitter<'a> {
             LogicalPlan::Window(node) => self.emit_window(node),
             LogicalPlan::SubqueryAlias(node) => self.emit_subquery_alias(node),
             LogicalPlan::Repeat(node) => self.emit_repeat(node),
+            LogicalPlan::CTEConsume(_node) => {
+                Err("CTEConsume should be handled by multi-fragment emission".to_string())
+            }
         }
     }
 

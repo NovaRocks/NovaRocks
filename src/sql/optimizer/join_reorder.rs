@@ -211,7 +211,7 @@ pub(crate) fn reorder_joins_heuristic(plan: LogicalPlan) -> LogicalPlan {
             r.input = Box::new(reorder_joins_heuristic(*r.input));
             LogicalPlan::Repeat(r)
         }
-        // Leaf nodes: Scan, Values, GenerateSeries — nothing to reorder.
+        // Leaf nodes: Scan, Values, GenerateSeries, CTEConsume — nothing to reorder.
         other => other,
     }
 }

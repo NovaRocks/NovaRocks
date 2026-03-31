@@ -191,6 +191,11 @@ pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .map(|c| c.name.to_lowercase())
             .collect(),
         LogicalPlan::Repeat(r) => collect_output_columns(&r.input),
+        LogicalPlan::CTEConsume(c) => c
+            .output_columns
+            .iter()
+            .map(|col| col.name.to_lowercase())
+            .collect(),
     }
 }
 
@@ -393,5 +398,13 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
             }
         }
         LogicalPlan::Repeat(r) => collect_qualified_output_columns_inner(&r.input, out),
+        LogicalPlan::CTEConsume(c) => {
+            let alias_lower = c.alias.to_lowercase();
+            for col in &c.output_columns {
+                let col_name = col.name.to_lowercase();
+                out.insert((Some(alias_lower.clone()), col_name.clone()));
+                out.insert((None, col_name));
+            }
+        }
     }
 }
