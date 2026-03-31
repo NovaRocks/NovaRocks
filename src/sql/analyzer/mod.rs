@@ -632,45 +632,42 @@ impl<'a> AnalyzerContext<'a> {
             grouping_ids.push(bitmap);
         }
 
-        // Scan projection for GROUPING() function calls and collect their metadata.
-        // Also build a modified projection where GROUPING(col) is replaced with
-        // a literal 0 placeholder (Int64) so the analyzer can process it.
+        // Scan ALL GROUPING() calls (top-level and nested) in projection,
+        // assign each a unique marker value, and record metadata for RepeatInfo.
+        // Use negative marker values (-9000, -9001, ...) so they're distinguishable
+        // from real literals after analysis.
         let mut grouping_fn_args: Vec<(String, Vec<String>)> = Vec::new();
+        let mut next_marker: i64 = -9000;
+
+        let replace_grouping_with_marker =
+            |expr: &sqlast::Expr,
+             args: &mut Vec<(String, Vec<String>)>,
+             marker: &mut i64|
+             -> sqlast::Expr { replace_grouping_calls_with_markers(expr, args, marker) };
+
         let mut modified_projection = Vec::new();
         for item in &select.projection {
-            let (expr_part, alias_part) = match item {
+            match item {
                 sqlast::SelectItem::ExprWithAlias { expr, alias } => {
-                    (expr, Some(alias.clone()))
-                }
-                sqlast::SelectItem::UnnamedExpr(expr) => (expr, None),
-                other => {
-                    modified_projection.push(other.clone());
-                    continue;
-                }
-            };
-
-            if let Some((output_name, arg_cols, replacement)) =
-                extract_grouping_call(expr_part, &alias_part)
-            {
-                // Record GROUPING() metadata for RepeatInfo
-                grouping_fn_args.push((output_name.clone(), arg_cols));
-                // Replace with literal 0 placeholder, preserving alias
-                modified_projection.push(sqlast::SelectItem::ExprWithAlias {
-                    expr: replacement,
-                    alias: sqlast::Ident::new(output_name),
-                });
-            } else {
-                // Not a GROUPING() call — recursively replace any nested
-                // GROUPING() calls with literal 0 placeholders.
-                let rewritten = replace_grouping_with_zero(expr_part);
-                if let Some(alias) = alias_part {
+                    let rewritten = replace_grouping_with_marker(
+                        expr,
+                        &mut grouping_fn_args,
+                        &mut next_marker,
+                    );
                     modified_projection.push(sqlast::SelectItem::ExprWithAlias {
                         expr: rewritten,
-                        alias,
+                        alias: alias.clone(),
                     });
-                } else {
+                }
+                sqlast::SelectItem::UnnamedExpr(expr) => {
+                    let rewritten = replace_grouping_with_marker(
+                        expr,
+                        &mut grouping_fn_args,
+                        &mut next_marker,
+                    );
                     modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
                 }
+                other => modified_projection.push(other.clone()),
             }
         }
 
@@ -683,13 +680,37 @@ impl<'a> AnalyzerContext<'a> {
         modified_select.group_by = sqlast::GroupByExpr::Expressions(all_gb_exprs, vec![]);
         modified_select.projection = modified_projection;
 
-        // Also replace GROUPING() in HAVING with literal 0 placeholder.
+        // Replace GROUPING() in HAVING too.
         if let Some(ref having_expr) = modified_select.having {
-            modified_select.having = Some(replace_grouping_with_zero(having_expr));
+            modified_select.having = Some(replace_grouping_calls_with_markers(
+                having_expr,
+                &mut grouping_fn_args,
+                &mut next_marker,
+            ));
         }
 
         // Analyze the SELECT once with all GROUP BY keys active.
         let (mut sel, cols) = self.analyze_select(&modified_select)?;
+
+        // Post-analysis fixup: replace GROUPING() marker literals in the
+        // resolved projection with ColumnRef to the virtual slot names.
+        // Markers are Literal(Int(-9000)), Literal(Int(-9001)), etc.
+        // Each maps to grouping_fn_args[marker - (-9000)].
+        for item in &mut sel.projection {
+            item.expr = replace_grouping_markers_in_typed_expr(&item.expr, &grouping_fn_args);
+        }
+        // Also add each GROUPING() virtual column as a GROUP BY key so it
+        // passes through the Aggregate operator.
+        for (fn_name, _) in &grouping_fn_args {
+            sel.group_by.push(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    qualifier: None,
+                    column: fn_name.clone(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            });
+        }
 
         // Attach RepeatInfo to the resolved SELECT.
         sel.repeat = Some(RepeatInfo {
@@ -1270,6 +1291,198 @@ fn replace_grouping_with_zero_in_window(window: &sqlast::WindowType) -> sqlast::
             })
         }
         other => other.clone(),
+    }
+}
+
+/// Replace GROUPING(col) calls in an AST expression with unique marker
+/// literals (-9000, -9001, ...). Each call is recorded in `args` as
+/// (virtual_name, [column_args]) for the RepeatInfo.
+fn replace_grouping_calls_with_markers(
+    expr: &sqlast::Expr,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::Expr {
+    match expr {
+        sqlast::Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "grouping" {
+                if let sqlast::FunctionArguments::List(ref list) = func.args {
+                    let arg_cols: Vec<String> = list
+                        .args
+                        .iter()
+                        .filter_map(|a| match a {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                Some(format!("{e}").to_lowercase())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let idx = args.len();
+                    let virtual_name = format!("__grouping_fn_{idx}");
+                    args.push((virtual_name, arg_cols));
+                    let marker = *next_marker;
+                    *next_marker -= 1;
+                    return sqlast::Expr::Value(
+                        sqlast::Value::Number(marker.to_string(), false).into(),
+                    );
+                }
+            }
+            // Not GROUPING — recurse into args and OVER clause
+            let new_args = match &func.args {
+                sqlast::FunctionArguments::List(list) => {
+                    let new_list_args: Vec<_> = list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                                    replace_grouping_calls_with_markers(e, args, next_marker),
+                                ))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect();
+                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                        args: new_list_args,
+                        ..list.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            let mut new_func = func.clone();
+            new_func.args = new_args;
+            if let Some(ref window) = func.over {
+                new_func.over = Some(replace_grouping_markers_in_window(window, args, next_marker));
+            }
+            sqlast::Expr::Function(new_func)
+        }
+        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
+            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
+            op: op.clone(),
+            right: Box::new(replace_grouping_calls_with_markers(right, args, next_marker)),
+        },
+        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_grouping_calls_with_markers(inner, args, next_marker)),
+        },
+        sqlast::Expr::Nested(inner) => sqlast::Expr::Nested(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => sqlast::Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(replace_grouping_calls_with_markers(o, args, next_marker))),
+            conditions: conditions
+                .iter()
+                .map(|cw| sqlast::CaseWhen {
+                    condition: replace_grouping_calls_with_markers(&cw.condition, args, next_marker),
+                    result: replace_grouping_calls_with_markers(&cw.result, args, next_marker),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(replace_grouping_calls_with_markers(e, args, next_marker))),
+        },
+        other => other.clone(),
+    }
+}
+
+fn replace_grouping_markers_in_window(
+    window: &sqlast::WindowType,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::WindowType {
+    match window {
+        sqlast::WindowType::WindowSpec(spec) => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| replace_grouping_calls_with_markers(e, args, next_marker))
+                .collect();
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|ob| sqlast::OrderByExpr {
+                    expr: replace_grouping_calls_with_markers(&ob.expr, args, next_marker),
+                    ..ob.clone()
+                })
+                .collect();
+            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
+                partition_by,
+                order_by,
+                ..spec.clone()
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// Walk a resolved TypedExpr tree and replace marker literals (Int(-9000), Int(-9001), ...)
+/// with ColumnRef to the corresponding GROUPING() virtual slot name.
+fn replace_grouping_markers_in_typed_expr(
+    expr: &TypedExpr,
+    grouping_fn_args: &[(String, Vec<String>)],
+) -> TypedExpr {
+    match &expr.kind {
+        ExprKind::Literal(crate::sql::ir::LiteralValue::Int(v)) if *v <= -9000 => {
+            let idx = ((-9000i64) - v) as usize;
+            if let Some((fn_name, _)) = grouping_fn_args.get(idx) {
+                return TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: fn_name.clone(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                };
+            }
+            expr.clone()
+        }
+        ExprKind::BinaryOp { left, op, right } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(replace_grouping_markers_in_typed_expr(left, grouping_fn_args)),
+                op: *op,
+                right: Box::new(replace_grouping_markers_in_typed_expr(
+                    right,
+                    grouping_fn_args,
+                )),
+            },
+        },
+        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::UnaryOp {
+                op: *op,
+                expr: Box::new(replace_grouping_markers_in_typed_expr(inner, grouping_fn_args)),
+            },
+        },
+        ExprKind::Cast { expr: inner, target } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Cast {
+                expr: Box::new(replace_grouping_markers_in_typed_expr(inner, grouping_fn_args)),
+                target: target.clone(),
+            },
+        },
+        ExprKind::Nested(inner) => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Nested(Box::new(replace_grouping_markers_in_typed_expr(
+                inner,
+                grouping_fn_args,
+            ))),
+        },
+        _ => expr.clone(),
     }
 }
 
