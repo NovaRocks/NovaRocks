@@ -20,6 +20,24 @@ mod predicate_pushdown;
 
 use crate::sql::plan::*;
 
+/// Optimize a QueryPlan: optimize each CTE subtree and the main plan independently.
+///
+/// CTE subtrees are optimized first so that `CTEConsume` nodes in the main plan
+/// (and in other CTE subtrees) remain opaque leaf nodes — the optimizer never
+/// looks "through" a CTE boundary.
+pub(crate) fn optimize_query_plan(
+    mut query_plan: QueryPlan,
+    table_stats: &std::collections::HashMap<String, crate::sql::statistics::TableStatistics>,
+) -> QueryPlan {
+    // Optimize each CTE plan independently.
+    for cte in &mut query_plan.cte_plans {
+        cte.plan = optimize(cte.plan.clone(), table_stats);
+    }
+    // Optimize the main plan.
+    query_plan.main_plan = optimize(query_plan.main_plan, table_stats);
+    query_plan
+}
+
 /// Apply all optimization rules to the logical plan.
 ///
 /// `table_stats` provides per-table statistics from Iceberg metadata.
