@@ -20,6 +20,11 @@ impl<'a> super::ThriftEmitter<'a> {
         // (grouping_id, GROUPING() calls). Pass-through columns stay in
         // the child's tuples. The lowering code expects grouping_list.len()
         // == number of slots in output_tuple_id.
+        //
+        // When there are no GROUPING() calls, we still need the virtual tuple
+        // for the Repeat executor (it requires grouping_list), but we use a
+        // minimal 1-slot tuple (__grouping_id only) that stays internal.
+        let has_grouping_fns = !node.grouping_fn_args.is_empty();
         let virtual_tuple_id = self.alloc_tuple();
 
         // Collect child columns for rollup slot mapping
@@ -45,16 +50,21 @@ impl<'a> super::ThriftEmitter<'a> {
             false,
             0,
         );
-        output_scope.add_column(
-            None,
-            "__grouping_id".to_string(),
-            ColumnBinding {
-                tuple_id: virtual_tuple_id,
-                slot_id: grouping_id_slot,
-                data_type: DataType::Int64,
-                nullable: false,
-            },
-        );
+        // Only expose __grouping_id in the SQL scope when GROUPING() functions
+        // need it. Otherwise it leaks into the Aggregate output and causes
+        // slot count mismatches in downstream Project operators.
+        if !node.grouping_fn_args.is_empty() {
+            output_scope.add_column(
+                None,
+                "__grouping_id".to_string(),
+                ColumnBinding {
+                    tuple_id: virtual_tuple_id,
+                    slot_id: grouping_id_slot,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                },
+            );
+        }
         virtual_slot_ids.push(grouping_id_slot);
 
         for (fn_idx, (fn_name, _)) in node.grouping_fn_args.iter().enumerate() {
@@ -145,9 +155,14 @@ impl<'a> super::ThriftEmitter<'a> {
         let repeat_id_list: Vec<i64> = node.grouping_ids.iter().map(|g| *g as i64).collect();
 
         // Build TPlanNode with TRepeatNode payload.
-        // row_tuples = child tuples + virtual tuple (for layout resolution).
+        // row_tuples includes the virtual tuple only when GROUPING() functions
+        // are present (so layout resolution exposes the virtual columns to
+        // downstream operators). Without GROUPING(), the virtual tuple stays
+        // internal to the Repeat executor.
         let mut row_tuples = child.tuple_ids.clone();
-        row_tuples.push(virtual_tuple_id);
+        if has_grouping_fns {
+            row_tuples.push(virtual_tuple_id);
+        }
 
         let mut plan_node = nodes::default_plan_node();
         plan_node.node_id = repeat_node_id;
@@ -169,9 +184,11 @@ impl<'a> super::ThriftEmitter<'a> {
         let mut plan_nodes = vec![plan_node];
         plan_nodes.extend(child.plan_nodes);
 
-        // Output tuple_ids = child tuple_ids + virtual tuple
+        // Output tuple_ids = child tuple_ids + virtual tuple (only when GROUPING() present)
         let mut output_tuple_ids = child.tuple_ids;
-        output_tuple_ids.push(virtual_tuple_id);
+        if has_grouping_fns {
+            output_tuple_ids.push(virtual_tuple_id);
+        }
 
         Ok(EmitResult {
             plan_nodes,
