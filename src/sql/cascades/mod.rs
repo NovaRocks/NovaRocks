@@ -1,5 +1,6 @@
 //! Cascades optimizer framework.
 
+pub(crate) mod convert;
 pub(crate) mod memo;
 pub(crate) mod operator;
 pub(crate) mod property;
