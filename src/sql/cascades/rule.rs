@@ -32,5 +32,8 @@ pub(crate) trait Rule: Send + Sync {
     /// Returns true if this rule can apply to the given operator.
     fn matches(&self, op: &Operator) -> bool;
     /// Produce alternative expressions for the given MExpr.
-    fn apply(&self, expr: &MExpr, memo: &Memo) -> Vec<NewExpr>;
+    ///
+    /// Takes `&mut Memo` so that rules creating intermediate groups (e.g. two-phase
+    /// aggregation) can allocate new groups for their internal structure.
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr>;
 }

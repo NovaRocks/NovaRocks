@@ -102,7 +102,7 @@ impl Rule for ScanToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalScan(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalScan(op) = &expr.op else {
             return vec![];
         };
@@ -136,7 +136,7 @@ impl Rule for FilterToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalFilter(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalFilter(op) = &expr.op else {
             return vec![];
         };
@@ -165,7 +165,7 @@ impl Rule for ProjectToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalProject(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalProject(op) = &expr.op else {
             return vec![];
         };
@@ -194,7 +194,7 @@ impl Rule for JoinToHashJoin {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalJoin(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
@@ -242,7 +242,7 @@ impl Rule for JoinToNestLoop {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalJoin(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
@@ -278,11 +278,13 @@ impl Rule for AggToHashAgg {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalAggregate(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalAggregate(op) = &expr.op else {
             return vec![];
         };
-        vec![NewExpr {
+
+        // Alternative 1: Single-phase aggregation (always applicable).
+        let single = NewExpr {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: op.group_by.clone(),
@@ -290,7 +292,41 @@ impl Rule for AggToHashAgg {
                 output_columns: op.output_columns.clone(),
             }),
             children: expr.children.clone(),
-        }]
+        };
+
+        // Alternative 2: Two-phase Local+Global aggregation.
+        // Only applicable when there are GROUP BY columns; scalar aggregation
+        // (empty group_by) does not benefit from a two-phase split.
+        if op.group_by.is_empty() {
+            return vec![single];
+        }
+
+        // Create a new group containing the Local aggregate whose child is the
+        // original child group of the LogicalAggregate.
+        let local_expr = MExpr {
+            id: memo.next_expr_id(),
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Local,
+                group_by: op.group_by.clone(),
+                aggregates: op.aggregates.clone(),
+                output_columns: op.output_columns.clone(),
+            }),
+            children: expr.children.clone(),
+        };
+        let local_group = memo.new_group(local_expr);
+
+        // Global aggregate: its child is the Local group.
+        let global = NewExpr {
+            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
+                mode: AggMode::Global,
+                group_by: op.group_by.clone(),
+                aggregates: op.aggregates.clone(),
+                output_columns: op.output_columns.clone(),
+            }),
+            children: vec![local_group],
+        };
+
+        vec![single, global]
     }
 }
 
@@ -310,7 +346,7 @@ impl Rule for SortToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalSort(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalSort(op) = &expr.op else {
             return vec![];
         };
@@ -339,7 +375,7 @@ impl Rule for LimitToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalLimit(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalLimit(op) = &expr.op else {
             return vec![];
         };
@@ -369,7 +405,7 @@ impl Rule for WindowToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalWindow(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalWindow(op) = &expr.op else {
             return vec![];
         };
@@ -399,7 +435,7 @@ impl Rule for CTEProduceToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalCTEProduce(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalCTEProduce(op) = &expr.op else {
             return vec![];
         };
@@ -429,7 +465,7 @@ impl Rule for CTEConsumeToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalCTEConsume(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalCTEConsume(op) = &expr.op else {
             return vec![];
         };
@@ -460,7 +496,7 @@ impl Rule for RepeatToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalRepeat(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalRepeat(op) = &expr.op else {
             return vec![];
         };
@@ -492,7 +528,7 @@ impl Rule for UnionToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalUnion(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalUnion(op) = &expr.op else {
             return vec![];
         };
@@ -519,7 +555,7 @@ impl Rule for IntersectToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalIntersect(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         vec![NewExpr {
             op: Operator::PhysicalIntersect(PhysicalIntersectOp),
             children: expr.children.clone(),
@@ -543,7 +579,7 @@ impl Rule for ExceptToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalExcept(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         vec![NewExpr {
             op: Operator::PhysicalExcept(PhysicalExceptOp),
             children: expr.children.clone(),
@@ -567,7 +603,7 @@ impl Rule for ValuesToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalValues(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalValues(op) = &expr.op else {
             return vec![];
         };
@@ -597,7 +633,7 @@ impl Rule for GenerateSeriesToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalGenerateSeries(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalGenerateSeries(op) = &expr.op else {
             return vec![];
         };
@@ -630,7 +666,7 @@ impl Rule for SubqueryAliasToPhysical {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalSubqueryAlias(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalSubqueryAlias(op) = &expr.op else {
             return vec![];
         };

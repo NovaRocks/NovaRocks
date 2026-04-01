@@ -1,6 +1,8 @@
 //! Rule registration for the Cascades optimizer.
 
 pub(crate) mod implement;
+pub(crate) mod join_associativity;
+pub(crate) mod join_commutativity;
 
 use super::rule::Rule;
 
@@ -29,7 +31,9 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
 }
 
 /// Returns all transformation rules (logical -> logical).
-/// Currently empty; transformation rules will be added in later tasks.
 pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
-    vec![]
+    vec![
+        Box::new(join_commutativity::JoinCommutativity),
+        Box::new(join_associativity::JoinAssociativity),
+    ]
 }
