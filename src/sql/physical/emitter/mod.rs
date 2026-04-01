@@ -13,7 +13,7 @@ mod emit_set_op;
 mod emit_sort;
 mod emit_values;
 mod emit_window;
-pub(super) mod helpers;
+pub(crate) mod helpers;
 
 use crate::exprs;
 use crate::internal_service;

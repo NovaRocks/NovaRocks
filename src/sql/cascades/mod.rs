@@ -3,6 +3,7 @@
 pub(crate) mod convert;
 pub(crate) mod cost;
 pub(crate) mod extract;
+pub(crate) mod fragment_builder;
 pub(crate) mod memo;
 pub(crate) mod operator;
 pub(crate) mod physical_plan;

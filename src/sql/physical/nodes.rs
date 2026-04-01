@@ -18,7 +18,7 @@ use crate::sql::catalog::{TableDef, TableStorage};
 // Scan node
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_scan_node(
+pub(crate) fn build_scan_node(
     node_id: i32,
     scan_tuple_id: i32,
     resolved: &ResolvedTable,
@@ -92,7 +92,7 @@ pub(super) fn build_scan_node(
 // Project node
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_project_node(
+pub(crate) fn build_project_node(
     node_id: i32,
     tuple_id: i32,
     slot_map: BTreeMap<types::TSlotId, exprs::TExpr>,
@@ -118,7 +118,7 @@ pub(super) fn build_project_node(
 // Hash join node
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_hash_join_node(
+pub(crate) fn build_hash_join_node(
     node_id: i32,
     left_tuple_ids: &[i32],
     right_tuple_ids: &[i32],
@@ -192,7 +192,7 @@ pub(super) fn build_hash_join_node(
 // Nested loop join node (for CROSS JOIN and non-equi joins)
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_nestloop_join_node(
+pub(crate) fn build_nestloop_join_node(
     node_id: i32,
     left_tuple_ids: &[i32],
     right_tuple_ids: &[i32],
@@ -246,7 +246,7 @@ pub(super) fn build_nestloop_join_node(
 // Aggregation node
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_aggregation_node(
+pub(crate) fn build_aggregation_node(
     node_id: i32,
     output_tuple_id: i32,
     intermediate_tuple_id: i32,
@@ -412,7 +412,7 @@ pub(super) fn build_exec_params(
 }
 
 /// Build exec params for multiple scan nodes (used in JOIN queries).
-pub(super) fn build_exec_params_multi(
+pub(crate) fn build_exec_params_multi(
     scan_tables: &[(i32, ResolvedTable)],
 ) -> Result<internal_service::TPlanFragmentExecParams, String> {
     let mut per_node_scan_ranges = BTreeMap::new();
@@ -554,7 +554,7 @@ pub(super) fn build_exchange_node(
 // Default plan node
 // ---------------------------------------------------------------------------
 
-pub(super) fn default_plan_node() -> plan_nodes::TPlanNode {
+pub(crate) fn default_plan_node() -> plan_nodes::TPlanNode {
     plan_nodes::TPlanNode {
         node_id: 0,
         node_type: plan_nodes::TPlanNodeType::HDFS_SCAN_NODE,
