@@ -348,6 +348,7 @@ mod tests {
     use crate::runtime::exchange;
     use crate::runtime::query_context::{QueryId, query_context_manager};
     use crate::service::grpc_proto as proto;
+    #[cfg(feature = "compat")]
     use crate::service::internal_rpc_client;
     use crate::types;
 
@@ -516,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "compat")]
     fn test_handle_transmit_runtime_filter_partial_merge_broadcasts_on_completion() {
         let _hook_guard = internal_rpc_client::test_hook_lock();
         internal_rpc_client::clear_test_hooks();

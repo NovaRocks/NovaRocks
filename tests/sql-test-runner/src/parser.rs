@@ -240,17 +240,25 @@ pub fn load_sql_case_from_file(
         .enumerate()
         .filter_map(|(idx, line)| extract_query_number(line, marker_re).map(|num| (idx, num)))
         .collect();
-    for (expected_idx, (_, query_number)) in markers.iter().enumerate() {
-        let expected_query_number = expected_idx + 1;
-        if *query_number != expected_query_number {
-            bail!(
-                "{}: expected marker '-- query {}', found '-- query {}'",
-                sql_path.display(),
-                expected_query_number,
-                query_number
-            );
+    // A single marker (e.g. "-- query 14") is a decorative label, not a
+    // multi-step split boundary.  Only split when there are 2+ markers with
+    // consecutive numbering starting from 1.
+    let markers = if markers.len() <= 1 {
+        Vec::new()
+    } else {
+        for (expected_idx, (_, query_number)) in markers.iter().enumerate() {
+            let expected_query_number = expected_idx + 1;
+            if *query_number != expected_query_number {
+                bail!(
+                    "{}: expected marker '-- query {}', found '-- query {}'",
+                    sql_path.display(),
+                    expected_query_number,
+                    query_number
+                );
+            }
         }
-    }
+        markers
+    };
 
     let file_meta_lines = if let Some((first_marker_idx, _)) = markers.first() {
         lines[..*first_marker_idx].to_vec()

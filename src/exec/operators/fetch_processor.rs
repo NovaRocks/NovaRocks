@@ -41,7 +41,7 @@ use crate::exec::row_position::RowPositionDescriptor;
 use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
-use crate::service::internal_rpc_client;
+use crate::service::grpc_proto as internal_proto;
 
 /// Factory for fetch processors that resolve deferred row/slot materialization.
 pub struct FetchProcessorFactory {
@@ -266,8 +266,8 @@ impl FetchProcessor {
             .as_ref()
             .and_then(|info| find_node(info, backend_id))
             .ok_or_else(|| format!("node info not found for backend_id {}", backend_id))?;
-        let mut req = internal_rpc_client::proto::starrocks::PLookUpRequest::default();
-        req.query_id = Some(internal_rpc_client::proto::starrocks::PUniqueId {
+        let mut req = internal_proto::starrocks::PLookUpRequest::default();
+        req.query_id = Some(internal_proto::starrocks::PUniqueId {
             hi: query_id.hi,
             lo: query_id.lo,
         });
@@ -276,17 +276,26 @@ impl FetchProcessor {
         for (slot_id, array) in request_columns {
             let data = encode_column_ipc(array)?;
             req.request_columns
-                .push(internal_rpc_client::proto::starrocks::PColumn {
+                .push(internal_proto::starrocks::PColumn {
                     slot_id: Some(slot_id.as_u32() as i32),
                     data_size: Some(data.len() as i64),
                     data: Some(data),
                 });
         }
-        let resp = internal_rpc_client::lookup(
+        #[cfg(not(feature = "compat"))]
+        {
+            return Err("lookup requires compat feature (brpc)".to_string());
+        }
+
+        #[cfg(feature = "compat")]
+        let resp = crate::service::internal_rpc_client::lookup(
             &node_info.host,
             node_info.async_internal_port as u16,
             req,
         )?;
+
+        #[cfg(not(feature = "compat"))]
+        let resp: internal_proto::starrocks::PLookUpResponse = unreachable!();
         if let Some(status) = resp.status.as_ref() {
             if status.status_code != 0 {
                 return Err(format!("lookup failed: {:?}", status.error_msgs));
@@ -309,7 +318,7 @@ impl FetchProcessor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compat"))]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -328,8 +337,8 @@ mod tests {
         let captured_hook = std::sync::Arc::clone(&captured);
         internal_rpc_client::set_lookup_hook(move |host, port, _req| {
             *captured_hook.lock().expect("captured lock") = Some((host.to_string(), port));
-            Ok(internal_rpc_client::proto::starrocks::PLookUpResponse {
-                status: Some(internal_rpc_client::proto::starrocks::StatusPb {
+            Ok(internal_proto::starrocks::PLookUpResponse {
+                status: Some(internal_proto::starrocks::StatusPb {
                     status_code: 0,
                     error_msgs: Vec::new(),
                 }),

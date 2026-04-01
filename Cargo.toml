@@ -81,6 +81,7 @@ tempfile = "3"
 
 [features]
 ssb = []
+compat = []
 embedded-jvm = ["dep:jni"]
 
 [build-dependencies]

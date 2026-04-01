@@ -242,6 +242,10 @@ fn embedded_jvm_feature_enabled() -> bool {
     env::var_os("CARGO_FEATURE_EMBEDDED_JVM").is_some()
 }
 
+fn compat_feature_enabled() -> bool {
+    env::var_os("CARGO_FEATURE_COMPAT").is_some()
+}
+
 fn emit_git_version() {
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
@@ -308,6 +312,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=STARROCKS_THIRDPARTY");
     println!("cargo:rerun-if-env-changed=STARROCKS_GCC_HOME");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EMBEDDED_JVM");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_COMPAT");
 
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let thrift_out = out_dir.join("thrift");
@@ -322,23 +327,34 @@ fn main() {
             panic!("embedded iceberg bridge setup failed");
         }
     }
-    let project_thirdparty_root = resolve_thirdparty_root(&manifest_dir).unwrap_or_else(|e| {
-        eprintln!("Error: {e}");
+    let compat = compat_feature_enabled();
+
+    // Resolve thirdparty root.  For compat builds this is mandatory (C++ shim
+    // compilation and native library linkage require it).  For non-compat builds
+    // it is best-effort — we still use it to locate the `thrift` tool for Rust
+    // codegen, but fall back to PATH if thirdparty is absent.
+    let tp_resolved = resolve_thirdparty_root(&manifest_dir)
+        .ok()
+        .and_then(|root| resolve_thirdparty_install_root(&root).ok());
+
+    if compat && tp_resolved.is_none() {
+        eprintln!("Error: thirdparty artifacts not found");
         eprintln!("  To build default thirdparty, run: ./thirdparty/build-thirdparty.sh");
-        panic!("thirdparty root not found");
-    });
-    let project_thirdparty = resolve_thirdparty_install_root(&project_thirdparty_root)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
-            eprintln!("  To build default thirdparty, run: ./thirdparty/build-thirdparty.sh");
-            panic!("thirdparty artifacts not found");
-        });
-    let (tp_bin, tp_include, tp_lib, tp_lib64) = (
-        project_thirdparty.join("bin"),
-        project_thirdparty.join("include"),
-        project_thirdparty.join("lib"),
-        project_thirdparty.join("lib64"),
-    );
+        panic!("compat feature requires STARROCKS_THIRDPARTY");
+    }
+
+    let (tp_bin, tp_include, tp_lib, tp_lib64) = match &tp_resolved {
+        Some(tp) => (
+            tp.join("bin"),
+            tp.join("include"),
+            tp.join("lib"),
+            tp.join("lib64"),
+        ),
+        None => {
+            let dummy = std::path::PathBuf::from("/nonexistent");
+            (dummy.clone(), dummy.clone(), dummy.clone(), dummy)
+        }
+    };
     // Check target platform for platform-specific configurations.
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_macos = target.contains("apple") || target.contains("darwin");
@@ -348,30 +364,35 @@ fn main() {
     std::fs::create_dir_all(&proto_out).expect("create proto out dir");
     std::fs::create_dir_all(&thrift_rs_out).expect("create thrift_rs out dir");
 
-    // Try to find thrift in PATH first, fallback to thirdparty
-    let thrift_cmd = find_tool("thrift", &tp_bin);
-    for thrift_file in [
-        "idl/thrift/HeartbeatService.thrift",
-        "idl/thrift/InternalService.thrift",
-    ] {
-        let thrift_status = std::process::Command::new(&thrift_cmd)
-            .args(["-r", "-I", "idl/thrift", "--gen", "cpp", "-out"])
-            .arg(&thrift_out)
-            .arg(thrift_file)
-            .status()
-            .expect("run thrift");
-        if !thrift_status.success() {
-            panic!("thrift codegen failed for {thrift_file} with status={thrift_status}");
+    // C++ thrift codegen — only needed for compat builds.
+    if compat {
+        let thrift_cmd = find_tool("thrift", &tp_bin);
+        for thrift_file in [
+            "idl/thrift/HeartbeatService.thrift",
+            "idl/thrift/InternalService.thrift",
+        ] {
+            let thrift_status = std::process::Command::new(&thrift_cmd)
+                .args(["-r", "-I", "idl/thrift", "--gen", "cpp", "-out"])
+                .arg(&thrift_out)
+                .arg(thrift_file)
+                .status()
+                .expect("run thrift");
+            if !thrift_status.success() {
+                panic!("thrift codegen failed for {thrift_file} with status={thrift_status}");
+            }
         }
     }
 
+    // Rust thrift codegen — always needed (shared types for both modes).
+    // Uses thirdparty thrift if available, otherwise falls back to PATH.
+    let thrift_rs_cmd = find_tool("thrift", &tp_bin);
     for thrift_file in [
         "idl/thrift/InternalService.thrift",
         "idl/thrift/FrontendService.thrift",
         "idl/thrift/HeartbeatService.thrift",
         "idl/thrift/BackendService.thrift",
     ] {
-        let thrift_rs_status = std::process::Command::new(&thrift_cmd)
+        let thrift_rs_status = std::process::Command::new(&thrift_rs_cmd)
             .args(["-r", "-I", "idl/thrift", "--gen", "rs", "-out"])
             .arg(&thrift_rs_out)
             .arg(thrift_file)
@@ -407,6 +428,10 @@ fn main() {
     }
     fs::write(out_dir.join("thrift_root_mod.rs"), wrapper).expect("write thrift_root_mod.rs");
 
+    // C++ protobuf codegen, C++ shim compilation, and native library linkage
+    // — only needed for compat builds.
+    if compat {
+
     let proto_files = [
         "idl/proto/status.proto",
         "idl/proto/types.proto",
@@ -421,8 +446,6 @@ fn main() {
         "idl/proto/internal_service.proto",
     ];
 
-    // Try to find protoc in PATH first, fallback to thirdparty
-    // Note: For Rust proto generation, we use protoc-bin-vendored (see below)
     let protoc_cmd = find_tool("protoc", &tp_bin);
     let mut protoc = std::process::Command::new(&protoc_cmd);
     protoc.arg("-I").arg("idl/proto");
@@ -565,6 +588,8 @@ static C++ runtime is required.",
     }
 
     println!("cargo:rustc-link-lib=pthread");
+
+    } // end if compat
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc path");
     unsafe {

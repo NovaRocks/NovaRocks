@@ -143,18 +143,18 @@ fn ctx() -> &'static ResultCtx {
     })
 }
 
-#[cfg(not(test))]
+#[cfg(all(feature = "compat", not(test)))]
 unsafe extern "C" {
     fn novarocks_compat_notify_fetch_ready(finst_id_hi: i64, finst_id_lo: i64);
 }
 
 fn notify_fetch_ready(finst_id: UniqueId) {
-    #[cfg(not(test))]
+    #[cfg(all(feature = "compat", not(test)))]
     unsafe {
         novarocks_compat_notify_fetch_ready(finst_id.hi, finst_id.lo);
     }
 
-    #[cfg(test)]
+    #[cfg(not(all(feature = "compat", not(test))))]
     let _ = finst_id;
 }
 
