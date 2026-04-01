@@ -12,11 +12,11 @@
 //! the Thrift emitter.
 
 pub(crate) mod cardinality;
-mod column_pruning;
+pub(crate) mod column_pruning;
 pub(crate) mod cost;
 pub(crate) mod expr_utils;
 mod join_reorder;
-mod predicate_pushdown;
+pub(crate) mod predicate_pushdown;
 
 use crate::sql::plan::*;
 

@@ -331,7 +331,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
 // ---------------------------------------------------------------------------
 
 /// Determine the required physical properties for each child of a physical operator.
-fn required_input_properties(
+pub(super) fn required_input_properties(
     op: &Operator,
     parent_required: &PhysicalPropertySet,
 ) -> Vec<PhysicalPropertySet> {
