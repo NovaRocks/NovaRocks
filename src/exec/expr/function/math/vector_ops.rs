@@ -246,4 +246,3 @@ pub fn eval_l2_distance(
         arena.data_type(expr),
     )
 }
-

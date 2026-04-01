@@ -1,4 +1,3 @@
--- query 67
 select  *
 from (select i_category
             ,i_class

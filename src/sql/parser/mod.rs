@@ -1,13 +1,9 @@
-use crate::sql::ast::Statement;
+#![allow(dead_code)]
 
-mod manual;
+mod raw;
 
-use manual::ManualParser;
-
-pub(crate) trait SqlParserBackend {
-    fn parse(&self, sql: &str) -> Result<Statement, String>;
-}
-
-pub(crate) fn parse_sql(sql: &str) -> Result<Statement, String> {
-    ManualParser.parse(sql)
+/// Parse SQL into a raw sqlparser AST (no custom AST conversion).
+/// Used by the standalone ThriftPlanBuilder.
+pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
+    raw::parse_sql_raw(sql)
 }

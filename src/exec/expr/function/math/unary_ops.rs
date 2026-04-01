@@ -226,4 +226,3 @@ pub fn eval_tan(
 ) -> Result<ArrayRef, String> {
     eval_unary_f64(arena, expr, args, chunk, |v| v.tan())
 }
-

@@ -36,7 +36,11 @@ pub(crate) fn parse_date_literal(value: &str) -> Result<i32, String> {
 }
 
 /// Parse decimal literal string to i128 value.
-pub(crate) fn parse_decimal_literal(value: &str, _precision: u8, scale: i8) -> Result<i128, String> {
+pub(crate) fn parse_decimal_literal(
+    value: &str,
+    _precision: u8,
+    scale: i8,
+) -> Result<i128, String> {
     if scale < 0 {
         return Err(format!("invalid decimal scale: {}", scale));
     }

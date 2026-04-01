@@ -51,4 +51,3 @@ pub fn eval_pi(
 ) -> Result<ArrayRef, String> {
     eval_const_f64(chunk.len(), std::f64::consts::PI, arena.data_type(expr))
 }
-

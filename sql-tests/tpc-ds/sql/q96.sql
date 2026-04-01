@@ -1,4 +1,3 @@
--- query 96
 select  count(*) 
 from store_sales
     ,household_demographics 

@@ -27,7 +27,6 @@ use crate::runtime::io::io_executor;
 use crate::runtime::mem_tracker::TrackedBytes;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::runtime::runtime_state::RuntimeErrorState;
-use crate::service::internal_rpc_client;
 
 pub struct ExchangeSendTracker {
     inflight_tasks: AtomicUsize,
@@ -80,12 +79,22 @@ pub struct ExchangeSendTask {
     pub tracker: Arc<ExchangeSendTracker>,
 }
 
+#[cfg(feature = "compat")]
 pub fn send_runtime_filter(
     dest_host: &str,
     dest_port: u16,
-    params: internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+    params: crate::service::internal_rpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
 ) -> Result<(), String> {
-    internal_rpc_client::transmit_runtime_filter(dest_host, dest_port, params)
+    crate::service::internal_rpc_client::transmit_runtime_filter(dest_host, dest_port, params)
+}
+
+#[cfg(not(feature = "compat"))]
+pub fn send_runtime_filter(
+    dest_host: &str,
+    dest_port: u16,
+    params: crate::service::grpc_client::proto::starrocks::PTransmitRuntimeFilterParams,
+) -> Result<(), String> {
+    crate::service::grpc_client::transmit_runtime_filter(dest_host, dest_port, params)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -265,7 +274,22 @@ impl ExchangeSendQueue {
 
 fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_bytes: usize) {
     let send_start = Instant::now();
-    let result = internal_rpc_client::send_chunks(
+
+    #[cfg(feature = "compat")]
+    let result = crate::service::internal_rpc_client::send_chunks(
+        &task.dest_host,
+        task.dest_port,
+        task.finst_id,
+        task.node_id,
+        task.sender_id,
+        task.be_number,
+        task.eos,
+        task.sequence,
+        task.payload,
+    );
+
+    #[cfg(not(feature = "compat"))]
+    let result = crate::service::grpc_client::send_chunks(
         &task.dest_host,
         task.dest_port,
         task.finst_id,

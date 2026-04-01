@@ -17,10 +17,10 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::exec::expr::function::math::eval_math_function;
-use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use arrow::array::{Array, ArrayRef, FixedSizeBinaryArray, Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field};
+use novarocks::exec::expr::function::math::eval_math_function;
+use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -398,8 +398,7 @@ fn test_vector_math_empty_array_rejected() {
     let list_type = DataType::List(Arc::new(Field::new("item", DataType::Float32, true)));
     let empty = arena.push_typed(ExprNode::ArrayExpr { elements: vec![] }, list_type.clone());
 
-    let err =
-        eval_math_function("l2_distance", &arena, expr, &[empty, empty], &chunk).unwrap_err();
+    let err = eval_math_function("l2_distance", &arena, expr, &[empty, empty], &chunk).unwrap_err();
     assert!(err.contains("requires non-empty arrays"));
 }
 
@@ -457,9 +456,13 @@ fn test_equiwidth_bucket_basic() {
     let max = common::literal_i64(&mut arena, 10);
     let buckets = common::literal_i64(&mut arena, 20);
 
-    let out =
-        eval_equiwidth_bucket(&arena, expr, &[value, min, max, buckets], &common::chunk_len_1())
-            .unwrap();
+    let out = eval_equiwidth_bucket(
+        &arena,
+        expr,
+        &[value, min, max, buckets],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(out.value(0), 10);
 }
@@ -472,9 +475,13 @@ fn test_equiwidth_bucket_invalid_range() {
     let min = common::literal_i64(&mut arena, 2);
     let max = common::literal_i64(&mut arena, 2);
     let buckets = common::literal_i64(&mut arena, 1);
-    let err =
-        eval_equiwidth_bucket(&arena, expr, &[value, min, max, buckets], &common::chunk_len_1())
-            .unwrap_err();
+    let err = eval_equiwidth_bucket(
+        &arena,
+        expr,
+        &[value, min, max, buckets],
+        &common::chunk_len_1(),
+    )
+    .unwrap_err();
     assert!(err.contains("min < max"));
 }
 
@@ -486,9 +493,13 @@ fn test_equiwidth_bucket_out_of_bounds() {
     let min = common::literal_i64(&mut arena, 0);
     let max = common::literal_i64(&mut arena, 10);
     let buckets = common::literal_i64(&mut arena, 20);
-    let err =
-        eval_equiwidth_bucket(&arena, expr, &[value, min, max, buckets], &common::chunk_len_1())
-            .unwrap_err();
+    let err = eval_equiwidth_bucket(
+        &arena,
+        expr,
+        &[value, min, max, buckets],
+        &common::chunk_len_1(),
+    )
+    .unwrap_err();
     assert!(err.contains("size <= max"));
 }
 
@@ -542,8 +553,8 @@ fn test_cbrt_specific_values() {
 // Tests from abs.rs
 // ---------------------------------------------------------------------------
 
-use novarocks::exec::expr::function::FunctionKind;
 use novarocks::common::largeint;
+use novarocks::exec::expr::function::FunctionKind;
 
 fn create_test_chunk_int(values: Vec<i64>) -> novarocks::exec::chunk::Chunk {
     use arrow::array::{ArrayRef, Int64Array};
@@ -554,13 +565,15 @@ fn create_test_chunk_int(values: Vec<i64>) -> novarocks::exec::chunk::Chunk {
     use std::sync::Arc;
 
     let array = Arc::new(Int64Array::from(values)) as ArrayRef;
-    let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Int64, false)]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "col0",
+        DataType::Int64,
+        false,
+    )]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -579,11 +592,9 @@ fn create_test_chunk_float(values: Vec<f64>) -> novarocks::exec::chunk::Chunk {
         false,
     )]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -797,16 +808,10 @@ fn test_trig_and_log() {
     assert!((math_eval_f64("sin", &arena, expr_f64, &[zero], &chunk) - 0.0).abs() < 1e-12);
     assert!((math_eval_f64("tan", &arena, expr_f64, &[zero], &chunk) - 0.0).abs() < 1e-12);
     let pi_quarter = common::literal_f64(&mut arena, pi / 4.0);
-    assert!(
-        (math_eval_f64("cot", &arena, expr_f64, &[pi_quarter], &chunk) - 1.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("cot", &arena, expr_f64, &[pi_quarter], &chunk) - 1.0).abs() < 1e-12);
     let deg180 = common::literal_f64(&mut arena, 180.0);
-    assert!(
-        (math_eval_f64("radians", &arena, expr_f64, &[deg180], &chunk) - pi).abs() < 1e-9
-    );
-    assert!(
-        (math_eval_f64("degress", &arena, expr_f64, &[pi_lit], &chunk) - 180.0).abs() < 1e-9
-    );
+    assert!((math_eval_f64("radians", &arena, expr_f64, &[deg180], &chunk) - pi).abs() < 1e-9);
+    assert!((math_eval_f64("degress", &arena, expr_f64, &[pi_lit], &chunk) - 180.0).abs() < 1e-9);
 
     let e_val = common::literal_f64(&mut arena, std::f64::consts::E);
     let log10_val = common::literal_f64(&mut arena, 100.0);
@@ -814,18 +819,11 @@ fn test_trig_and_log() {
     let log_base = common::literal_f64(&mut arena, 2.0);
     let log_val = common::literal_f64(&mut arena, 8.0);
     assert!((math_eval_f64("ln", &arena, expr_f64, &[e_val], &chunk) - 1.0).abs() < 1e-12);
+    assert!((math_eval_f64("log10", &arena, expr_f64, &[log10_val], &chunk) - 2.0).abs() < 1e-12);
+    assert!((math_eval_f64("dlog10", &arena, expr_f64, &[log10_val], &chunk) - 2.0).abs() < 1e-12);
+    assert!((math_eval_f64("log2", &arena, expr_f64, &[log2_val], &chunk) - 3.0).abs() < 1e-12);
     assert!(
-        (math_eval_f64("log10", &arena, expr_f64, &[log10_val], &chunk) - 2.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("dlog10", &arena, expr_f64, &[log10_val], &chunk) - 2.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("log2", &arena, expr_f64, &[log2_val], &chunk) - 3.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("log", &arena, expr_f64, &[log_base, log_val], &chunk) - 3.0).abs()
-            < 1e-12
+        (math_eval_f64("log", &arena, expr_f64, &[log_base, log_val], &chunk) - 3.0).abs() < 1e-12
     );
     assert!((math_eval_f64("dlog1", &arena, expr_f64, &[zero], &chunk) - 0.0).abs() < 1e-12);
 }
@@ -850,24 +848,14 @@ fn test_pow_and_roots() {
         (math_eval_f64("dexp", &arena, expr_f64, &[one], &chunk) - std::f64::consts::E).abs()
             < 1e-12
     );
-    assert!(
-        (math_eval_f64("square", &arena, expr_f64, &[three], &chunk) - 9.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("square", &arena, expr_f64, &[three], &chunk) - 9.0).abs() < 1e-12);
 
     let base = common::literal_f64(&mut arena, 2.0);
     let exp = common::literal_f64(&mut arena, 3.0);
-    assert!(
-        (math_eval_f64("pow", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("power", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("dpow", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("fpow", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("pow", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12);
+    assert!((math_eval_f64("power", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12);
+    assert!((math_eval_f64("dpow", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12);
+    assert!((math_eval_f64("fpow", &arena, expr_f64, &[base, exp], &chunk) - 8.0).abs() < 1e-12);
 }
 
 #[test]
@@ -901,34 +889,21 @@ fn test_rounding_and_floor() {
     let expr_f64 = common::typed_null(&mut arena, DataType::Float64);
 
     let val = common::literal_f64(&mut arena, 1.2);
-    assert!(
-        (math_eval_f64("ceil", &arena, expr_f64, &[val], &chunk) - 2.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("ceiling", &arena, expr_f64, &[val], &chunk) - 2.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("dceil", &arena, expr_f64, &[val], &chunk) - 2.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("ceil", &arena, expr_f64, &[val], &chunk) - 2.0).abs() < 1e-12);
+    assert!((math_eval_f64("ceiling", &arena, expr_f64, &[val], &chunk) - 2.0).abs() < 1e-12);
+    assert!((math_eval_f64("dceil", &arena, expr_f64, &[val], &chunk) - 2.0).abs() < 1e-12);
 
     let val2 = common::literal_f64(&mut arena, 1.8);
-    assert!(
-        (math_eval_f64("floor", &arena, expr_f64, &[val2], &chunk) - 1.0).abs() < 1e-12
-    );
-    assert!(
-        (math_eval_f64("dfloor", &arena, expr_f64, &[val2], &chunk) - 1.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("floor", &arena, expr_f64, &[val2], &chunk) - 1.0).abs() < 1e-12);
+    assert!((math_eval_f64("dfloor", &arena, expr_f64, &[val2], &chunk) - 1.0).abs() < 1e-12);
 
     let val3 = common::literal_f64(&mut arena, 12.345);
     let scale = common::literal_i64(&mut arena, 2);
     assert!(
-        (math_eval_f64("truncate", &arena, expr_f64, &[val3, scale], &chunk) - 12.34).abs()
-            < 1e-12
+        (math_eval_f64("truncate", &arena, expr_f64, &[val3, scale], &chunk) - 12.34).abs() < 1e-12
     );
     let round_val = common::literal_f64(&mut arena, 1.6);
-    assert!(
-        (math_eval_f64("dround", &arena, expr_f64, &[round_val], &chunk) - 2.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("dround", &arena, expr_f64, &[round_val], &chunk) - 2.0).abs() < 1e-12);
 }
 
 #[test]
@@ -945,9 +920,7 @@ fn test_mod_sign_greatest_least() {
 
     let fa = common::literal_f64(&mut arena, 5.5);
     let fb = common::literal_f64(&mut arena, 2.0);
-    assert!(
-        (math_eval_f64("fmod", &arena, expr_f64, &[fa, fb], &chunk) - 1.5).abs() < 1e-12
-    );
+    assert!((math_eval_f64("fmod", &arena, expr_f64, &[fa, fb], &chunk) - 1.5).abs() < 1e-12);
 
     let neg = common::literal_f64(&mut arena, -3.0);
     assert_eq!(math_eval_i64("sign", &arena, expr_i64, &[neg], &chunk), -1);
@@ -958,9 +931,7 @@ fn test_mod_sign_greatest_least() {
     assert!(
         (math_eval_f64("greatest", &arena, expr_f64, &[g1, g2, g3], &chunk) - 3.0).abs() < 1e-12
     );
-    assert!(
-        (math_eval_f64("least", &arena, expr_f64, &[g1, g2, g3], &chunk) - 1.0).abs() < 1e-12
-    );
+    assert!((math_eval_f64("least", &arena, expr_f64, &[g1, g2, g3], &chunk) - 1.0).abs() < 1e-12);
 }
 
 #[test]

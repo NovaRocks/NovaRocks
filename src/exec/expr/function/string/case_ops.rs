@@ -54,4 +54,3 @@ pub fn eval_lcase(
 ) -> Result<ArrayRef, String> {
     eval_lower_impl(arena, args, chunk)
 }
-

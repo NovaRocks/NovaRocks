@@ -1,4 +1,3 @@
--- query 49
 select  channel, item, return_ratio, return_rank, currency_rank from
  (select
  'web' as channel

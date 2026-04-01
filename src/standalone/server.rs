@@ -1,24 +1,25 @@
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use async_trait::async_trait;
-use chrono::{Datelike, Duration, NaiveDate, Timelike, Utc};
+use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use mysql_common::scramble::scramble_native;
 use mysql_common::value::Value as MySqlValue;
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, Column, ColumnFlags, ColumnType, ErrorKind, InitWriter,
-    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter,
+    OkResponse, ParamParser, QueryResultWriter, StatementMetaWriter, ToMysqlValue,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
@@ -34,12 +35,83 @@ use crate::version;
 use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{
     QueryResult, QueryResultColumn, StandaloneNovaRocks, StandaloneOptions, StatementResult,
+    build_string_query_result,
 };
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
 const DEFAULT_CATALOG: &str = "default_catalog";
 const ROOT_USER: &str = "root";
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
+
+#[derive(Clone, Debug, PartialEq)]
+enum StandaloneMysqlValue {
+    Null,
+    Bytes(Vec<u8>),
+    Int(i64),
+    UInt(u64),
+    Float(f32),
+    Double(f64),
+    Date(NaiveDate),
+    DateTime(NaiveDateTime),
+    Time {
+        negative: bool,
+        days: u32,
+        hours: u8,
+        minutes: u8,
+        seconds: u8,
+        micros: u32,
+    },
+}
+
+impl ToMysqlValue for StandaloneMysqlValue {
+    fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        match self {
+            Self::Null => None::<u8>.to_mysql_text(w),
+            Self::Bytes(bytes) => bytes.to_mysql_text(w),
+            Self::Int(value) => value.to_mysql_text(w),
+            Self::UInt(value) => value.to_mysql_text(w),
+            Self::Float(value) => value.to_mysql_text(w),
+            Self::Double(value) => value.to_mysql_text(w),
+            Self::Date(value) => value.to_mysql_text(w),
+            Self::DateTime(value) => value.to_mysql_text(w),
+            Self::Time {
+                negative,
+                days,
+                hours,
+                minutes,
+                seconds,
+                micros,
+            } => MySqlValue::Time(*negative, *days, *hours, *minutes, *seconds, *micros)
+                .to_mysql_text(w),
+        }
+    }
+
+    fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
+        match self {
+            Self::Null => unreachable!("NULL payloads are handled by the row null bitmap"),
+            Self::Bytes(bytes) => bytes.to_mysql_bin(w, c),
+            Self::Int(value) => value.to_mysql_bin(w, c),
+            Self::UInt(value) => value.to_mysql_bin(w, c),
+            Self::Float(value) => value.to_mysql_bin(w, c),
+            Self::Double(value) => value.to_mysql_bin(w, c),
+            Self::Date(value) => value.to_mysql_bin(w, c),
+            Self::DateTime(value) => value.to_mysql_bin(w, c),
+            Self::Time {
+                negative,
+                days,
+                hours,
+                minutes,
+                seconds,
+                micros,
+            } => MySqlValue::Time(*negative, *days, *hours, *minutes, *seconds, *micros)
+                .to_mysql_bin(w, c),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandaloneTableConfig {
@@ -197,6 +269,25 @@ async fn serve_forever(
     mysql_port: u16,
     user: String,
 ) -> Result<(), String> {
+    // Start gRPC exchange server for multi-fragment CTE execution.
+    // Uses the configured http_port (default 8040).
+    let grpc_port = crate::common::config::http_port();
+    match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", grpc_port) {
+        Ok(()) => {
+            info!(
+                "standalone grpc exchange server started on 127.0.0.1:{}",
+                grpc_port
+            );
+        }
+        Err(e) => {
+            warn!(
+                "failed to start standalone grpc exchange server on port {}: {} \
+                 (multi-fragment CTE queries will not work)",
+                grpc_port, e
+            );
+        }
+    }
+
     let bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port));
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -369,7 +460,14 @@ fn trim_query(query: &str) -> &str {
 
 fn is_session_noop(query: &str) -> bool {
     let lower = query.to_ascii_lowercase();
+    // Note: "alter " is NOT a noop — it's handled by engine.rs (ADD FILES)
     lower.starts_with("set ")
+        || lower.starts_with("show ")
+        || lower.starts_with("update ")
+        || lower.starts_with("delete ")
+        || lower.starts_with("admin ")
+        || lower.starts_with("submit ")
+        || lower.starts_with("analyze ")
 }
 
 fn split_sql_statements(query: &str) -> Result<Vec<String>, String> {
@@ -455,14 +553,24 @@ fn parse_set_catalog_query(query: &str) -> Option<&str> {
 }
 
 fn is_supported_embedded_statement(query: &str) -> bool {
-    let mut parts = query.split_whitespace();
+    // Skip leading SQL line comments (-- ...)
+    let trimmed = query
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with("--"))
+        .unwrap_or("");
+    let mut parts = trimmed.split_whitespace();
     let Some(head) = parts.next() else {
         return false;
     };
     head.eq_ignore_ascii_case("select")
+        || head.eq_ignore_ascii_case("with")
         || head.eq_ignore_ascii_case("create")
         || head.eq_ignore_ascii_case("drop")
         || head.eq_ignore_ascii_case("insert")
+        || head.eq_ignore_ascii_case("explain")
+        || head.eq_ignore_ascii_case("truncate")
+        || head.eq_ignore_ascii_case("alter")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -498,6 +606,10 @@ async fn execute_statement_text(
 ) -> Result<StatementResult, (ErrorKind, String)> {
     let trimmed = trim_query(statement);
     if trimmed.is_empty() {
+        return Ok(StatementResult::Ok);
+    }
+    // Treat SQL line comments (-- ...) as no-ops
+    if trimmed.starts_with("--") {
         return Ok(StatementResult::Ok);
     }
 
@@ -637,17 +749,26 @@ fn resolve_database_context(
 }
 
 fn parse_object_name(raw: &str) -> Result<Vec<&str>, String> {
-    raw.split('.')
-        .map(str::trim)
-        .map(strip_identifier_quotes)
-        .map(|part| {
-            if part.is_empty() {
-                Err(format!("unsupported identifier `{raw}`"))
-            } else {
-                Ok(part)
-            }
-        })
-        .collect()
+    // MySQL COM_INIT_DB strips the outermost backtick pair, producing strings
+    // like: catalog`.`db  (original was `catalog`.`db`).
+    // Split on the "`.`" pattern first, then fall back to plain '.'.
+    let parts: Vec<&str> = if raw.contains("`.`") {
+        raw.split("`.`")
+            .map(|s| s.trim().trim_matches('`'))
+            .collect()
+    } else {
+        raw.split('.')
+            .map(str::trim)
+            .map(strip_identifier_quotes)
+            .collect()
+    };
+
+    for part in &parts {
+        if part.is_empty() {
+            return Err(format!("unsupported identifier `{raw}`"));
+        }
+    }
+    Ok(parts)
 }
 
 fn strip_identifier_quotes(raw: &str) -> &str {
@@ -716,7 +837,8 @@ async fn write_query_result<W: AsyncWrite + Unpin>(
     let mut writer = results.start(columns.as_slice()).await?;
     for chunk in &result.chunks {
         for row_idx in 0..chunk.len() {
-            let row = build_mysql_row(chunk, row_idx).map_err(invalid_data_error)?;
+            let row =
+                build_mysql_row(chunk, &result.columns, row_idx).map_err(invalid_data_error)?;
             writer.write_row(row).await?;
         }
     }
@@ -727,6 +849,17 @@ fn query_result_column_to_mysql_column(column: &QueryResultColumn) -> Result<Col
     let mut colflags = ColumnFlags::empty();
     if !column.nullable {
         colflags.insert(ColumnFlags::NOT_NULL_FLAG);
+    }
+    if matches!(
+        column.logical_type,
+        Some(crate::sql::SqlType::Decimal { .. })
+    ) {
+        return Ok(Column {
+            table: String::new(),
+            column: column.name.clone(),
+            coltype: ColumnType::MYSQL_TYPE_NEWDECIMAL,
+            colflags,
+        });
     }
     let coltype = match column.data_type {
         DataType::Boolean => ColumnType::MYSQL_TYPE_TINY,
@@ -741,6 +874,7 @@ fn query_result_column_to_mysql_column(column: &QueryResultColumn) -> Result<Col
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
             ColumnType::MYSQL_TYPE_VAR_STRING
         }
+        DataType::Decimal128(_, _) => ColumnType::MYSQL_TYPE_NEWDECIMAL,
         DataType::Date32 => ColumnType::MYSQL_TYPE_DATE,
         DataType::Time32(_) | DataType::Time64(_) => ColumnType::MYSQL_TYPE_TIME,
         DataType::Timestamp(_, _) => ColumnType::MYSQL_TYPE_DATETIME,
@@ -761,62 +895,173 @@ fn query_result_column_to_mysql_column(column: &QueryResultColumn) -> Result<Col
     })
 }
 
-fn build_mysql_row(chunk: &Chunk, row_idx: usize) -> Result<Vec<MySqlValue>, String> {
+fn build_mysql_row(
+    chunk: &Chunk,
+    columns: &[QueryResultColumn],
+    row_idx: usize,
+) -> Result<Vec<StandaloneMysqlValue>, String> {
+    if chunk.columns().len() != columns.len() {
+        return Err(format!(
+            "query result column count mismatch: metadata has {}, chunk has {}",
+            columns.len(),
+            chunk.columns().len()
+        ));
+    }
     chunk
         .columns()
         .iter()
-        .map(|column| array_value_to_mysql_value(column, row_idx))
+        .zip(columns.iter())
+        .map(|(column, declared)| array_value_to_mysql_value(column, declared, row_idx))
         .collect()
 }
 
-fn array_value_to_mysql_value(column: &ArrayRef, row_idx: usize) -> Result<MySqlValue, String> {
+fn array_value_to_mysql_value(
+    column: &ArrayRef,
+    declared: &QueryResultColumn,
+    row_idx: usize,
+) -> Result<StandaloneMysqlValue, String> {
     if column.is_null(row_idx) {
-        return Ok(MySqlValue::NULL);
+        return Ok(StandaloneMysqlValue::Null);
+    }
+
+    if let Some(crate::sql::SqlType::Decimal { scale, .. }) = declared.logical_type.as_ref() {
+        return decimal_to_mysql_value(column, row_idx, *scale);
+    }
+
+    if matches!(declared.data_type, DataType::Date32)
+        && matches!(column.data_type(), DataType::Timestamp(_, _))
+    {
+        return timestamp_to_date_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
     }
 
     match column.data_type() {
         DataType::Boolean => downcast_array::<BooleanArray>(column, "BooleanArray")
-            .map(|arr| MySqlValue::Int(if arr.value(row_idx) { 1 } else { 0 })),
+            .map(|arr| StandaloneMysqlValue::Int(if arr.value(row_idx) { 1 } else { 0 })),
         DataType::Int8 => downcast_array::<Int8Array>(column, "Int8Array")
-            .map(|arr| MySqlValue::Int(i64::from(arr.value(row_idx)))),
+            .map(|arr| StandaloneMysqlValue::Int(i64::from(arr.value(row_idx)))),
         DataType::Int16 => downcast_array::<Int16Array>(column, "Int16Array")
-            .map(|arr| MySqlValue::Int(i64::from(arr.value(row_idx)))),
+            .map(|arr| StandaloneMysqlValue::Int(i64::from(arr.value(row_idx)))),
         DataType::Int32 => downcast_array::<Int32Array>(column, "Int32Array")
-            .map(|arr| MySqlValue::Int(i64::from(arr.value(row_idx)))),
+            .map(|arr| StandaloneMysqlValue::Int(i64::from(arr.value(row_idx)))),
         DataType::Int64 => downcast_array::<Int64Array>(column, "Int64Array")
-            .map(|arr| MySqlValue::Int(arr.value(row_idx))),
+            .map(|arr| StandaloneMysqlValue::Int(arr.value(row_idx))),
         DataType::UInt8 => downcast_array::<UInt8Array>(column, "UInt8Array")
-            .map(|arr| MySqlValue::UInt(u64::from(arr.value(row_idx)))),
+            .map(|arr| StandaloneMysqlValue::UInt(u64::from(arr.value(row_idx)))),
         DataType::UInt16 => downcast_array::<UInt16Array>(column, "UInt16Array")
-            .map(|arr| MySqlValue::UInt(u64::from(arr.value(row_idx)))),
+            .map(|arr| StandaloneMysqlValue::UInt(u64::from(arr.value(row_idx)))),
         DataType::UInt32 => downcast_array::<UInt32Array>(column, "UInt32Array")
-            .map(|arr| MySqlValue::UInt(u64::from(arr.value(row_idx)))),
+            .map(|arr| StandaloneMysqlValue::UInt(u64::from(arr.value(row_idx)))),
         DataType::UInt64 => downcast_array::<UInt64Array>(column, "UInt64Array")
-            .map(|arr| MySqlValue::UInt(arr.value(row_idx))),
+            .map(|arr| StandaloneMysqlValue::UInt(arr.value(row_idx))),
         DataType::Float32 => downcast_array::<Float32Array>(column, "Float32Array")
-            .map(|arr| MySqlValue::Float(arr.value(row_idx))),
+            .map(|arr| StandaloneMysqlValue::Float(arr.value(row_idx))),
         DataType::Float64 => downcast_array::<Float64Array>(column, "Float64Array")
-            .map(|arr| MySqlValue::Double(arr.value(row_idx))),
+            .map(|arr| StandaloneMysqlValue::Double(arr.value(row_idx))),
         DataType::Utf8 => downcast_array::<StringArray>(column, "StringArray")
-            .map(|arr| MySqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
+            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
         DataType::LargeUtf8 => downcast_array::<LargeStringArray>(column, "LargeStringArray")
-            .map(|arr| MySqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
+            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
         DataType::Binary => downcast_array::<BinaryArray>(column, "BinaryArray")
-            .map(|arr| MySqlValue::Bytes(arr.value(row_idx).to_vec())),
+            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).to_vec())),
         DataType::LargeBinary => downcast_array::<LargeBinaryArray>(column, "LargeBinaryArray")
-            .map(|arr| MySqlValue::Bytes(arr.value(row_idx).to_vec())),
+            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).to_vec())),
         DataType::Date32 => {
             let arr = downcast_array::<Date32Array>(column, "Date32Array")?;
             date32_to_mysql_value(arr.value(row_idx))
         }
+        DataType::Decimal128(_, scale) => decimal128_to_mysql_value(column, row_idx, *scale),
         DataType::Time32(unit) => time_to_mysql_value(column, *unit, row_idx),
         DataType::Time64(unit) => time_to_mysql_value(column, *unit, row_idx),
         DataType::Timestamp(unit, _) => timestamp_to_mysql_value(column, *unit, row_idx),
-        DataType::Null => Ok(MySqlValue::NULL),
+        DataType::Null => Ok(StandaloneMysqlValue::Null),
         other => Err(format!(
             "standalone mysql server does not support output column type {:?}",
             other
         )),
+    }
+}
+
+fn decimal128_to_mysql_value(
+    column: &ArrayRef,
+    row_idx: usize,
+    scale: i8,
+) -> Result<StandaloneMysqlValue, String> {
+    let arr = downcast_array::<Decimal128Array>(column, "Decimal128Array")?;
+    Ok(StandaloneMysqlValue::Bytes(
+        format_decimal128_string(arr.value(row_idx), scale)?.into_bytes(),
+    ))
+}
+
+fn format_decimal128_string(value: i128, scale: i8) -> Result<String, String> {
+    if scale < 0 {
+        return Err(format!("unsupported decimal scale: {scale}"));
+    }
+    let scale = u32::try_from(scale).map_err(|_| format!("unsupported decimal scale: {scale}"))?;
+    if scale == 0 {
+        return Ok(value.to_string());
+    }
+    let factor = 10_u128
+        .checked_pow(scale)
+        .ok_or_else(|| format!("unsupported decimal scale: {scale}"))?;
+    let negative = value.is_negative();
+    let abs = value.unsigned_abs();
+    let whole = abs / factor;
+    let fraction = abs % factor;
+    Ok(format!(
+        "{}{}.{:0width$}",
+        if negative { "-" } else { "" },
+        whole,
+        fraction,
+        width = scale as usize
+    ))
+}
+
+fn decimal_to_mysql_value(
+    column: &ArrayRef,
+    row_idx: usize,
+    scale: i8,
+) -> Result<StandaloneMysqlValue, String> {
+    let scale =
+        usize::try_from(scale).map_err(|_| format!("unsupported decimal scale: {scale}"))?;
+    let formatted = match column.data_type() {
+        DataType::Int8 => downcast_array::<Int8Array>(column, "Int8Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::Int16 => downcast_array::<Int16Array>(column, "Int16Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::Int32 => downcast_array::<Int32Array>(column, "Int32Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::Int64 => downcast_array::<Int64Array>(column, "Int64Array")
+            .map(|arr| format!("{:.*}", scale, arr.value(row_idx) as f64))?,
+        DataType::UInt8 => downcast_array::<UInt8Array>(column, "UInt8Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::UInt16 => downcast_array::<UInt16Array>(column, "UInt16Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::UInt32 => downcast_array::<UInt32Array>(column, "UInt32Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::UInt64 => downcast_array::<UInt64Array>(column, "UInt64Array")
+            .map(|arr| format!("{:.*}", scale, arr.value(row_idx) as f64))?,
+        DataType::Float32 => downcast_array::<Float32Array>(column, "Float32Array")
+            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
+        DataType::Float64 => downcast_array::<Float64Array>(column, "Float64Array")
+            .map(|arr| format!("{:.*}", scale, arr.value(row_idx)))?,
+        DataType::Utf8 => downcast_array::<StringArray>(column, "StringArray")
+            .map(|arr| arr.value(row_idx).to_string())?,
+        DataType::LargeUtf8 => downcast_array::<LargeStringArray>(column, "LargeStringArray")
+            .map(|arr| arr.value(row_idx).to_string())?,
+        other => {
+            return Err(format!(
+                "standalone mysql server does not support decimal output column type {:?}",
+                other
+            ));
+        }
+    };
+    Ok(StandaloneMysqlValue::Bytes(formatted.into_bytes()))
+}
+
+fn timestamp_unit(data_type: &DataType) -> Result<TimeUnit, String> {
+    match data_type {
+        DataType::Timestamp(unit, _) => Ok(*unit),
+        other => Err(format!("expected timestamp data type, got {:?}", other)),
     }
 }
 
@@ -827,27 +1072,19 @@ fn downcast_array<'a, T: 'static>(column: &'a ArrayRef, expected: &str) -> Resul
         .ok_or_else(|| format!("failed to downcast output column to {}", expected))
 }
 
-fn date32_to_mysql_value(days: i32) -> Result<MySqlValue, String> {
+fn date32_to_mysql_value(days: i32) -> Result<StandaloneMysqlValue, String> {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
     let date = epoch
         .checked_add_signed(Duration::days(i64::from(days)))
         .ok_or_else(|| format!("date32 value out of range: {days}"))?;
-    Ok(MySqlValue::Date(
-        date.year() as u16,
-        date.month() as u8,
-        date.day() as u8,
-        0,
-        0,
-        0,
-        0,
-    ))
+    Ok(StandaloneMysqlValue::Date(date))
 }
 
-fn timestamp_to_mysql_value(
+fn timestamp_to_naive_datetime(
     column: &ArrayRef,
     unit: TimeUnit,
     row_idx: usize,
-) -> Result<MySqlValue, String> {
+) -> Result<NaiveDateTime, String> {
     let raw = match unit {
         TimeUnit::Second => {
             i128::from(
@@ -879,15 +1116,26 @@ fn timestamp_to_mysql_value(
         u32::try_from(micros).map_err(|_| format!("timestamp micros out of range: {raw}"))?;
     let dt = chrono::DateTime::<Utc>::from_timestamp(secs, micros * 1_000)
         .ok_or_else(|| format!("timestamp value out of range: {raw}"))?;
-    let naive = dt.naive_utc();
-    Ok(MySqlValue::Date(
-        naive.year() as u16,
-        naive.month() as u8,
-        naive.day() as u8,
-        naive.hour() as u8,
-        naive.minute() as u8,
-        naive.second() as u8,
-        naive.and_utc().timestamp_subsec_micros(),
+    Ok(dt.naive_utc())
+}
+
+fn timestamp_to_mysql_value(
+    column: &ArrayRef,
+    unit: TimeUnit,
+    row_idx: usize,
+) -> Result<StandaloneMysqlValue, String> {
+    Ok(StandaloneMysqlValue::DateTime(timestamp_to_naive_datetime(
+        column, unit, row_idx,
+    )?))
+}
+
+fn timestamp_to_date_mysql_value(
+    column: &ArrayRef,
+    unit: TimeUnit,
+    row_idx: usize,
+) -> Result<StandaloneMysqlValue, String> {
+    Ok(StandaloneMysqlValue::Date(
+        timestamp_to_naive_datetime(column, unit, row_idx)?.date(),
     ))
 }
 
@@ -895,7 +1143,7 @@ fn time_to_mysql_value(
     column: &ArrayRef,
     unit: TimeUnit,
     row_idx: usize,
-) -> Result<MySqlValue, String> {
+) -> Result<StandaloneMysqlValue, String> {
     let micros = match unit {
         TimeUnit::Second => {
             i128::from(
@@ -928,20 +1176,59 @@ fn time_to_mysql_value(
     let days = hours.div_euclid(24);
     let hour_of_day = hours.rem_euclid(24);
 
-    Ok(MySqlValue::Time(
-        micros.is_negative(),
-        u32::try_from(days.unsigned_abs())
+    Ok(StandaloneMysqlValue::Time {
+        negative: micros.is_negative(),
+        days: u32::try_from(days.unsigned_abs())
             .map_err(|_| format!("time value out of range: {micros}"))?,
-        u8::try_from(hour_of_day.unsigned_abs())
+        hours: u8::try_from(hour_of_day.unsigned_abs())
             .map_err(|_| format!("time value out of range: {micros}"))?,
-        u8::try_from(minutes.unsigned_abs())
+        minutes: u8::try_from(minutes.unsigned_abs())
             .map_err(|_| format!("time value out of range: {micros}"))?,
-        u8::try_from(seconds.unsigned_abs())
+        seconds: u8::try_from(seconds.unsigned_abs())
             .map_err(|_| format!("time value out of range: {micros}"))?,
-        microseconds,
-    ))
+        micros: microseconds,
+    })
 }
 
 fn invalid_data_error(err: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::TimestampMicrosecondArray;
+
+    use super::*;
+
+    #[test]
+    fn declared_date_timestamp_value_serializes_without_time_component() {
+        let declared = QueryResultColumn {
+            name: "d".to_string(),
+            data_type: DataType::Date32,
+            nullable: false,
+            logical_type: None,
+        };
+        let value = array_value_to_mysql_value(
+            &(Arc::new(TimestampMicrosecondArray::from(vec![
+                1_580_601_600_000_000i64,
+            ])) as ArrayRef),
+            &declared,
+            0,
+        )
+        .expect("convert timestamp to DATE");
+
+        assert_eq!(
+            value,
+            StandaloneMysqlValue::Date(NaiveDate::from_ymd_opt(2020, 2, 2).expect("valid date"))
+        );
+
+        let mut encoded = Vec::new();
+        value
+            .to_mysql_text(&mut encoded)
+            .expect("encode DATE text payload");
+        assert_eq!(encoded[0], 10);
+        assert_eq!(&encoded[1..], b"2020-02-02");
+    }
 }

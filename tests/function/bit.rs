@@ -20,8 +20,8 @@ use arrow::array::{Array, FixedSizeBinaryArray, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks::common::largeint;
 use novarocks::exec::expr::function::bit::{
-    eval_bit_shift_left, eval_bit_shift_right, eval_bit_shift_right_logical,
-    eval_bitand, eval_bitnot, eval_bitor, eval_bitxor, eval_xx_hash3_128,
+    eval_bit_shift_left, eval_bit_shift_right, eval_bit_shift_right_logical, eval_bitand,
+    eval_bitnot, eval_bitor, eval_bitxor, eval_xx_hash3_128,
 };
 use novarocks::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
 
@@ -73,8 +73,7 @@ fn test_bit_shift_right_logical_basic() {
     let a = common::literal_i64(&mut arena, -1);
     let b = common::literal_i64(&mut arena, 1);
 
-    let out =
-        eval_bit_shift_right_logical(&arena, expr, &[a, b], &common::chunk_len_1()).unwrap();
+    let out = eval_bit_shift_right_logical(&arena, expr, &[a, b], &common::chunk_len_1()).unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(out.value(0), 0x7fff_ffff_ffff_ffff_u64 as i64);
 }
@@ -171,8 +170,7 @@ fn test_xx_hash3_128_known_vectors() {
     assert_eq!(high, -5338522934378283393);
     assert_eq!(low, 14373748016363485208u64);
 
-    let out =
-        eval_xx_hash3_128(&arena, expr, &[hello, starrocks], &common::chunk_len_1()).unwrap();
+    let out = eval_xx_hash3_128(&arena, expr, &[hello, starrocks], &common::chunk_len_1()).unwrap();
     let out = out.as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
     let value = largeint::value_at(out, 0).unwrap();
     let (high, low) = split_high_low(value);
@@ -197,8 +195,8 @@ fn test_xx_hash3_128_null_propagation() {
 
 #[test]
 fn test_register_bit_functions() {
-    use novarocks::exec::expr::function::bit::register;
     use novarocks::exec::expr::function::FunctionKind;
+    use novarocks::exec::expr::function::bit::register;
     use std::collections::HashMap;
 
     let mut m = HashMap::new();

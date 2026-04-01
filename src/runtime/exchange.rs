@@ -1035,13 +1035,39 @@ fn chunk_schema_for_wire_meta(
     };
     let mut slots = Vec::with_capacity(batch.num_columns());
     let batch_schema = batch.schema();
+
+    // Check whether wire slot IDs match the expected schema. If not (e.g. CTE
+    // produce/consume have independent slot namespaces), fall back to
+    // position-based mapping using the expected schema's own slot ordering.
+    let wire_ids_match = wire_meta
+        .slot_ids_by_index
+        .iter()
+        .all(|id| expected_chunk_schema.slot(*id).is_some());
+    let expected_slots_by_index = if wire_ids_match {
+        &[] as &[_]
+    } else {
+        expected_chunk_schema.slots()
+    };
+
     for (idx, slot_id) in wire_meta.slot_ids_by_index.iter().enumerate() {
-        let expected_slot = expected_chunk_schema.slot(*slot_id).ok_or_else(|| {
-            format!(
-                "exchange wire slot id {} not found in expected chunk schema at index {}",
-                slot_id, idx
-            )
-        })?;
+        let expected_slot = if wire_ids_match {
+            expected_chunk_schema.slot(*slot_id).ok_or_else(|| {
+                format!(
+                    "exchange wire slot id {} not found in expected chunk schema at index {}",
+                    slot_id, idx
+                )
+            })?
+        } else {
+            // Position-based fallback: use the expected schema's slot at the
+            // same column index.
+            expected_slots_by_index.get(idx).ok_or_else(|| {
+                format!(
+                    "exchange column index {} out of range for expected chunk schema (len={})",
+                    idx,
+                    expected_slots_by_index.len()
+                )
+            })?
+        };
         let field = batch_schema.field(idx);
         if let Some(type_desc) = expected_slot.type_desc() {
             if let Some(expected_arrow_type) = arrow_type_from_desc(type_desc) {
@@ -1077,7 +1103,14 @@ fn chunk_schema_for_wire_meta(
                 }
             }
         }
-        slots.push(expected_slot.with_field_and_slot_id(*slot_id, field.as_ref().clone())?);
+        // Use the expected schema's slot ID (not the wire ID) so the decoded
+        // chunk has the receiver's own slot namespace.
+        let output_slot_id = if wire_ids_match {
+            *slot_id
+        } else {
+            expected_slot.slot_id()
+        };
+        slots.push(expected_slot.with_field_and_slot_id(output_slot_id, field.as_ref().clone())?);
     }
     Ok(Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?))
 }

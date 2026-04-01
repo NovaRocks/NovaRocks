@@ -718,26 +718,29 @@ fn main() {
             novarocks::service::backend_service::start_backend_service(backend_cfg)
                 .expect("start backend service");
 
-            // Start C++ brpc service (for query execution)
-            let compat_cfg = novarocks::service::compat::CompatConfig {
-                host: server.host.as_str(),
-                heartbeat_port: server.heartbeat_port,
-                brpc_port: server.brpc_port,
-                internal_service_query_rpc_thread_num:
-                    novarocks::common::config::internal_service_query_rpc_thread_num()
-                        .min(u32::MAX as usize) as u32,
-                debug_exec_batch_plan_json: cfg.debug.exec_batch_plan_json,
-                log_level: log_level_num,
-            };
-            novarocks::service::compat::start(&compat_cfg).expect("start compat");
+            // Start C++ brpc service (for query execution) — only with compat feature.
+            #[cfg(feature = "compat")]
+            {
+                let compat_cfg = novarocks::service::compat::CompatConfig {
+                    host: server.host.as_str(),
+                    heartbeat_port: server.heartbeat_port,
+                    brpc_port: server.brpc_port,
+                    internal_service_query_rpc_thread_num:
+                        novarocks::common::config::internal_service_query_rpc_thread_num()
+                            .min(u32::MAX as usize) as u32,
+                    debug_exec_batch_plan_json: cfg.debug.exec_batch_plan_json,
+                    log_level: log_level_num,
+                };
+                novarocks::service::compat::start(&compat_cfg).expect("start compat");
+            }
 
             println!(
                 "novarocksd started (bind_host={}, advertise_host={}, heartbeat_port={}, be_port={}, brpc_port={}, http_port={}, starlet_port={})",
-                compat_cfg.host,
+                server.host,
                 advertise_host,
-                compat_cfg.heartbeat_port,
+                server.heartbeat_port,
                 server.be_port,
-                compat_cfg.brpc_port,
+                server.brpc_port,
                 server.http_port,
                 server.starlet_port
             );
@@ -748,6 +751,7 @@ fn main() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
 
+            #[cfg(feature = "compat")]
             novarocks::service::compat::stop();
             novarocks::service::backend_service::stop_backend_service();
             novarocks::service::heartbeat_service::stop_heartbeat_server();

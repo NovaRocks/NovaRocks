@@ -1,4 +1,3 @@
--- query 35
 select   
   ca_state,
   cd_gender,

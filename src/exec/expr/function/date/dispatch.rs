@@ -708,4 +708,3 @@ static DATE_METADATA: &[FunctionMeta] = &[
         max_args: 1,
     },
 ];
-

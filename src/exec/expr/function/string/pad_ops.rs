@@ -110,4 +110,3 @@ pub fn eval_rpad(
 ) -> Result<ArrayRef, String> {
     eval_pad_impl(arena, args, chunk, false)
 }
-

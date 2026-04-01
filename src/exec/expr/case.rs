@@ -86,6 +86,13 @@ pub fn eval_case(
 
         let condition_bool = if let Some(ref case_arr) = case_array {
             let condition_array = arena.eval(condition_expr, chunk)?;
+            // Cast condition value to match case expression type for comparison
+            let condition_array = if condition_array.data_type() != case_arr.data_type() {
+                cast(condition_array.as_ref(), case_arr.data_type())
+                    .map_err(|e| format!("CASE WHEN type cast: {e}"))?
+            } else {
+                condition_array
+            };
             eq(
                 &case_arr.as_ref() as &dyn arrow::array::Datum,
                 &condition_array.as_ref() as &dyn arrow::array::Datum,

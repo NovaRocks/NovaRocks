@@ -177,4 +177,3 @@ pub fn eval_least(
 ) -> Result<ArrayRef, String> {
     eval_greatest_least(arena, expr, args, chunk, false)
 }
-

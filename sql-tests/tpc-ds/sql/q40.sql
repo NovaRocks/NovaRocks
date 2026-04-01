@@ -1,4 +1,3 @@
--- query 40
 select  
    w_state
   ,i_item_id

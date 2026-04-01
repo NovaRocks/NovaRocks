@@ -1,4 +1,3 @@
--- query 63
 select  * 
 from (select i_manager_id
              ,sum(ss_sales_price) sum_sales

@@ -1,4 +1,3 @@
--- query 12
 select  i_item_id
       ,i_item_desc 
       ,i_category 

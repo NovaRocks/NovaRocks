@@ -1,430 +1,2496 @@
-use std::collections::HashMap;
+//! Semantic analyzer: converts `sqlparser::ast::Query` into `ResolvedQuery`.
+//!
+//! This module performs name resolution, type inference, and scope management
+//! without producing any physical plan concepts (tuple_id, slot_id, etc.).
+
+mod functions;
+mod helpers;
+mod resolve_expr;
+mod resolve_from;
+mod scope;
+mod subquery_rewrite;
 
 use arrow::datatypes::DataType;
+use sqlparser::ast as sqlast;
 
-use crate::sql::ast::{
-    ColumnRef, CompareOp, Expr, Literal, ObjectName, OrderByExpr, ProjectionItem, QueryStmt,
-    Statement,
+use crate::sql::catalog::CatalogProvider;
+
+use crate::sql::ir::{
+    ExprKind, JoinKind, JoinRelation, OutputColumn, ProjectItem, QueryBody, Relation,
+    ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
+    SubqueryInfo, TypedExpr,
 };
-use crate::standalone::catalog::{ColumnDef, InMemoryCatalog, TableDef, normalize_identifier};
-use crate::standalone::iceberg::{
-    IcebergCatalogRegistry, IcebergLoadedTable, load_table as load_iceberg_table,
-};
+use crate::sql::types::wider_type;
 
-#[derive(Clone, Debug)]
-pub(crate) struct AnalyzerContext<'a> {
-    pub(crate) current_catalog: Option<&'a str>,
-    pub(crate) current_database: &'a str,
-}
+use helpers::{expr_display_name, extract_limit, extract_offset};
+use scope::AnalyzerScope;
 
-#[derive(Clone, Debug)]
-pub(crate) enum AnalyzedStatement {
-    Query(AnalyzedQuery),
-    Passthrough(Statement),
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
-pub(crate) struct AnalyzedQuery {
-    pub(crate) source: QuerySource,
-    pub(crate) bound: BoundQuery,
-    pub(crate) order_by: Vec<OrderByExpr>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum QuerySource {
-    Local {
-        resolved: ResolvedLocalTableName,
-        table: TableDef,
-    },
-    Iceberg {
-        #[allow(dead_code)]
-        resolved: ResolvedIcebergTableName,
-        loaded: IcebergLoadedTable,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedLocalTableName {
-    pub(crate) database: String,
-    pub(crate) table: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedIcebergTableName {
-    pub(crate) catalog: String,
-    pub(crate) namespace: String,
-    pub(crate) table: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundScanColumn {
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
-    pub(crate) scan_slot_id: i32,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundOutputColumn {
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
-    pub(crate) scan_column_index: usize,
-    pub(crate) output_slot_id: Option<i32>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundPredicate {
-    pub(crate) scan_column_index: usize,
-    pub(crate) op: CompareOp,
-    pub(crate) literal: Literal,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BoundQuery {
-    pub(crate) scan_columns: Vec<BoundScanColumn>,
-    pub(crate) output_columns: Vec<BoundOutputColumn>,
-    pub(crate) predicate: Option<BoundPredicate>,
-    pub(crate) needs_project: bool,
-}
-
-pub(crate) fn analyze_statement(
-    stmt: Statement,
-    ctx: AnalyzerContext<'_>,
-    local_catalog: &InMemoryCatalog,
-    iceberg_catalogs: &IcebergCatalogRegistry,
-) -> Result<AnalyzedStatement, String> {
-    match stmt {
-        Statement::Query(query) => {
-            analyze_query(query, ctx, local_catalog, iceberg_catalogs).map(AnalyzedStatement::Query)
-        }
-        other => Ok(AnalyzedStatement::Passthrough(other)),
-    }
-}
-
-fn analyze_query(
-    query: QueryStmt,
-    ctx: AnalyzerContext<'_>,
-    local_catalog: &InMemoryCatalog,
-    iceberg_catalogs: &IcebergCatalogRegistry,
-) -> Result<AnalyzedQuery, String> {
-    let source = if ctx.current_catalog.is_none() {
-        match query.from.name.parts.len() {
-            1 | 2 => {
-                let resolved = resolve_local_table_name(&query.from.name, ctx.current_database)?;
-                let table = local_catalog.get(&resolved.database, &resolved.table)?;
-                QuerySource::Local { resolved, table }
-            }
-            3 => {
-                let resolved = resolve_iceberg_table_name_explicit(&query.from.name)?;
-                let entry = iceberg_catalogs.get(&resolved.catalog)?;
-                let loaded = load_iceberg_table(&entry, &resolved.namespace, &resolved.table)?;
-                QuerySource::Iceberg { resolved, loaded }
-            }
-            _ => {
-                return Err(format!(
-                    "unsupported table name `{}`; expected `<table>`, `<database>.<table>`, or `<catalog>.<database>.<table>`",
-                    query.from.name.parts.join(".")
-                ));
-            }
-        }
-    } else {
-        let resolved = resolve_iceberg_table_name(
-            query.from.name.clone(),
-            ctx.current_catalog,
-            ctx.current_database,
-        )?;
-        let entry = iceberg_catalogs.get(&resolved.catalog)?;
-        let loaded = load_iceberg_table(&entry, &resolved.namespace, &resolved.table)?;
-        QuerySource::Iceberg { resolved, loaded }
-    };
-
-    let columns = match &source {
-        QuerySource::Local { table, .. } => &table.columns,
-        QuerySource::Iceberg { loaded, .. } => &loaded.columns,
-    };
-    let bound = bind_query(&query, columns)?;
-    Ok(AnalyzedQuery {
-        source,
-        bound,
-        order_by: query.order_by,
-    })
-}
-
-pub(crate) fn resolve_local_table_name(
-    name: &ObjectName,
+/// Analyze a parsed SQL query and produce a fully resolved query IR,
+/// along with a registry of shared CTEs (those referenced two or more times).
+pub(crate) fn analyze(
+    query: &sqlast::Query,
+    catalog: &impl CatalogProvider,
     current_database: &str,
-) -> Result<ResolvedLocalTableName, String> {
-    match name.parts.as_slice() {
-        [table] => Ok(ResolvedLocalTableName {
-            database: normalize_identifier(current_database)?,
-            table: normalize_identifier(table)?,
-        }),
-        [database, table] => Ok(ResolvedLocalTableName {
-            database: normalize_identifier(database)?,
-            table: normalize_identifier(table)?,
-        }),
-        _ => Err(format!(
-            "local table name must be `<table>` or `<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-pub(crate) fn resolve_iceberg_table_name(
-    name: ObjectName,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<ResolvedIcebergTableName, String> {
-    match (
-        normalize_optional_identifier(current_catalog)?,
-        name.parts.as_slice(),
-    ) {
-        (Some(catalog), [table]) => Ok(ResolvedIcebergTableName {
-            catalog,
-            namespace: normalize_identifier(current_database)?,
-            table: normalize_identifier(table)?,
-        }),
-        (Some(catalog), [namespace, table]) => Ok(ResolvedIcebergTableName {
-            catalog,
-            namespace: normalize_identifier(namespace)?,
-            table: normalize_identifier(table)?,
-        }),
-        (_, [catalog, namespace, table]) => Ok(ResolvedIcebergTableName {
-            catalog: normalize_identifier(catalog)?,
-            namespace: normalize_identifier(namespace)?,
-            table: normalize_identifier(table)?,
-        }),
-        _ => Err(format!(
-            "iceberg table name must be `<table>`/`<database>.<table>` with current catalog or `<catalog>.<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn resolve_iceberg_namespace_name(
-    name: ObjectName,
-    current_catalog: Option<&str>,
-) -> Result<(String, String), String> {
-    match (
-        normalize_optional_identifier(current_catalog)?,
-        name.parts.as_slice(),
-    ) {
-        (Some(catalog), [namespace]) => Ok((catalog, normalize_identifier(namespace)?)),
-        (_, [catalog, namespace]) => Ok((
-            normalize_identifier(catalog)?,
-            normalize_identifier(namespace)?,
-        )),
-        _ => Err(format!(
-            "iceberg database name must be `<database>` with current catalog or `<catalog>.<database>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-pub(crate) fn resolve_iceberg_table_name_explicit(
-    name: &ObjectName,
-) -> Result<ResolvedIcebergTableName, String> {
-    let [catalog, namespace, table] = name.parts.as_slice() else {
-        return Err(format!(
-            "iceberg table name must be `<catalog>.<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        ));
+) -> Result<(ResolvedQuery, crate::sql::cte::CTERegistry), String> {
+    let ctx = AnalyzerContext {
+        catalog,
+        current_database,
+        ctes: std::collections::HashMap::new(),
+        next_subquery_id: std::cell::Cell::new(0),
+        collected_subqueries: std::cell::RefCell::new(Vec::new()),
+        shared_cte_ids: std::collections::HashMap::new(),
+        cte_registry: std::cell::RefCell::new(crate::sql::cte::CTERegistry::new()),
     };
-    Ok(ResolvedIcebergTableName {
-        catalog: normalize_identifier(catalog)?,
-        namespace: normalize_identifier(namespace)?,
-        table: normalize_identifier(table)?,
-    })
+    let resolved = ctx.analyze_query(query)?;
+    let registry = ctx.cte_registry.into_inner();
+    Ok((resolved, registry))
 }
 
-pub(crate) fn normalize_optional_identifier(raw: Option<&str>) -> Result<Option<String>, String> {
-    raw.map(normalize_identifier).transpose()
+// ---------------------------------------------------------------------------
+// Analyzer context
+// ---------------------------------------------------------------------------
+
+pub(super) struct AnalyzerContext<'a> {
+    pub(super) catalog: &'a dyn CatalogProvider,
+    pub(super) current_database: &'a str,
+    /// CTE definitions from WITH clause, keyed by lowercase name.
+    /// Value is (query, optional column aliases).
+    pub(super) ctes: std::collections::HashMap<String, (sqlast::Query, Vec<String>)>,
+    /// Counter for generating unique subquery placeholder IDs.
+    pub(super) next_subquery_id: std::cell::Cell<usize>,
+    /// Subqueries collected during expression analysis.
+    /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
+    pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
+    /// Maps shared CTE name -> CteId. Populated during two-pass analysis for CTEs with ref_count >= 2.
+    pub(super) shared_cte_ids: std::collections::HashMap<String, crate::sql::cte::CteId>,
+    /// Accumulated shared CTE registry, built during analysis.
+    pub(super) cte_registry: std::cell::RefCell<crate::sql::cte::CTERegistry>,
 }
 
-fn bind_query(query: &QueryStmt, columns: &[ColumnDef]) -> Result<BoundQuery, String> {
-    let mut column_by_name = HashMap::with_capacity(columns.len());
-    for (idx, column) in columns.iter().enumerate() {
-        column_by_name.insert(normalize_identifier(&column.name)?, idx);
+impl<'a> AnalyzerContext<'a> {
+    /// Allocate a unique subquery placeholder ID.
+    pub(super) fn alloc_subquery_id(&self) -> usize {
+        let id = self.next_subquery_id.get();
+        self.next_subquery_id.set(id + 1);
+        id
     }
 
-    let projection_indices = expand_projection(&query.projection, columns, &column_by_name)?;
-    let mut scan_columns = Vec::new();
-    let mut scan_index_by_source = HashMap::new();
-    let mut output_columns = Vec::with_capacity(projection_indices.len());
+    /// Top-level query analysis.
+    fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
+        // Register CTEs from WITH clause (if any) into a child context.
+        let maybe_child_ctx;
+        let ctx = if let Some(ref with_clause) = query.with {
+            let mut ctes = self.ctes.clone();
+            let mut cte_defs: Vec<(String, Vec<String>)> = Vec::new();
+            for cte in &with_clause.cte_tables {
+                let name = cte.alias.name.value.to_lowercase();
+                let col_aliases: Vec<String> = cte
+                    .alias
+                    .columns
+                    .iter()
+                    .map(|c| c.name.value.to_lowercase())
+                    .collect();
+                cte_defs.push((name.clone(), col_aliases.clone()));
+                ctes.insert(name, (*cte.query.clone(), col_aliases));
+            }
 
-    for &source_idx in &projection_indices {
-        let scan_column_index = ensure_scan_column(
-            &mut scan_columns,
-            &mut scan_index_by_source,
-            &columns[source_idx],
-            source_idx,
-        )?;
-        let column = &columns[source_idx];
-        output_columns.push(BoundOutputColumn {
-            name: column.name.clone(),
-            data_type: column.data_type.clone(),
-            nullable: column.nullable,
-            scan_column_index,
-            output_slot_id: None,
-        });
+            // --- Two-pass CTE analysis ---
+            // Pass 1: Count how many times each CTE name is referenced in the
+            // query body (and ORDER BY).  This is a heuristic count on the raw
+            // AST — it does not resolve names, so a same-named table would also
+            // be counted, but that is acceptable for the purpose of deciding
+            // whether to share.
+            let cte_names: std::collections::HashSet<String> =
+                cte_defs.iter().map(|(n, _)| n.clone()).collect();
+            let ref_counts = count_cte_references(&cte_names, query);
+
+            // Pass 2: For CTEs referenced >= 2 times, analyze once, register in
+            // the shared CTE registry, and store the CteId.  Single-ref CTEs
+            // stay in the `ctes` map for inline expansion (existing behavior).
+            let mut shared_cte_ids = self.shared_cte_ids.clone();
+            for (name, col_aliases) in &cte_defs {
+                let count = ref_counts.get(name).copied().unwrap_or(0);
+                if count >= 2 {
+                    // Analyze the CTE query once with a child context that has
+                    // the *other* CTEs available (to allow CTE-to-CTE refs).
+                    let mut inner_ctes = ctes.clone();
+                    inner_ctes.remove(name);
+                    let inner_ctx = AnalyzerContext {
+                        catalog: self.catalog,
+                        current_database: self.current_database,
+                        ctes: inner_ctes,
+                        next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+                        collected_subqueries: std::cell::RefCell::new(Vec::new()),
+                        shared_cte_ids: shared_cte_ids.clone(),
+                        cte_registry: std::cell::RefCell::new(
+                            crate::sql::cte::CTERegistry::new(),
+                        ),
+                    };
+                    let mut resolved_cte =
+                        inner_ctx.analyze_query(&ctes.get(name).unwrap().0)?;
+                    // Apply column aliases: WITH t(a, b) AS (...)
+                    if !col_aliases.is_empty() {
+                        for (i, alias_name) in col_aliases.iter().enumerate() {
+                            if let Some(col) = resolved_cte.output_columns.get_mut(i) {
+                                col.name = alias_name.clone();
+                            }
+                        }
+                    }
+                    // Merge any inner CTE registry entries into ours
+                    let inner_registry = inner_ctx.cte_registry.into_inner();
+                    {
+                        let mut our_reg = self.cte_registry.borrow_mut();
+                        for entry in inner_registry.entries {
+                            our_reg.entries.push(entry);
+                        }
+                    }
+                    let output_columns = resolved_cte.output_columns.clone();
+                    let cte_id = self
+                        .cte_registry
+                        .borrow_mut()
+                        .register(name.clone(), resolved_cte, output_columns);
+                    shared_cte_ids.insert(name.clone(), cte_id);
+                    // Remove from inline ctes map so it won't be inlined
+                    ctes.remove(name);
+                }
+            }
+
+            // Clone the parent's registry so the child can look up shared CTEs
+            // that were registered above.
+            let registry_snapshot = self.cte_registry.borrow().clone();
+            maybe_child_ctx = Some(AnalyzerContext {
+                catalog: self.catalog,
+                current_database: self.current_database,
+                ctes,
+                next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+                collected_subqueries: std::cell::RefCell::new(Vec::new()),
+                shared_cte_ids,
+                cte_registry: std::cell::RefCell::new(registry_snapshot),
+            });
+            maybe_child_ctx.as_ref().unwrap()
+        } else {
+            maybe_child_ctx = None;
+            self
+        };
+
+        // Analyze body (SELECT / SetOperation / VALUES)
+        let (body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
+
+        // Analyze ORDER BY
+        let order_by = ctx.analyze_order_by(query, &body_output, &body)?;
+
+        // Extract LIMIT / OFFSET
+        let limit = extract_limit(query)?;
+        let offset = extract_offset(query)?;
+
+        // If we used a child context for CTE processing, merge its CTE
+        // registry entries back into the parent (self).
+        if let Some(child_ctx) = maybe_child_ctx {
+            let child_entries =
+                std::mem::take(&mut *child_ctx.cte_registry.borrow_mut()).entries;
+            if !child_entries.is_empty() {
+                let mut parent_reg = self.cte_registry.borrow_mut();
+                // Only merge entries that don't already exist in the parent
+                // (the child started with a snapshot of parent's entries).
+                for entry in child_entries {
+                    if !parent_reg.entries.iter().any(|e| e.id == entry.id) {
+                        parent_reg.entries.push(entry);
+                    }
+                }
+            }
+        }
+
+        // Build output columns from the body
+        let output_columns = body_output;
+
+        Ok(ResolvedQuery {
+            body,
+            order_by,
+            limit,
+            offset,
+            output_columns,
+        })
     }
 
-    let predicate = match query.selection.as_ref() {
-        Some(expr) => Some(bind_predicate(
-            expr,
-            &mut scan_columns,
-            &mut scan_index_by_source,
-            columns,
-            &column_by_name,
-        )?),
-        None => None,
-    };
+    /// Analyze a SetExpr and return (QueryBody, output_columns).
+    fn analyze_set_expr(
+        &self,
+        set_expr: &sqlast::SetExpr,
+    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+        match set_expr {
+            sqlast::SetExpr::Select(s) => {
+                // Check if GROUP BY contains ROLLUP/CUBE/GROUPING SETS.
+                // If so, expand into a UNION ALL of GROUP BY variants.
+                if let Some(rollup_exprs) = self.extract_rollup_from_group_by(s) {
+                    return self.resolve_rollup(s, &rollup_exprs);
+                }
+                let (sel, cols) = self.analyze_select(s)?;
+                Ok((QueryBody::Select(sel), cols))
+            }
+            sqlast::SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                let (left_body, left_cols) = self.analyze_set_expr(left)?;
+                let (right_body, right_cols) = self.analyze_set_expr(right)?;
 
-    for (idx, column) in scan_columns.iter_mut().enumerate() {
-        column.scan_slot_id =
-            i32::try_from(idx + 1).map_err(|_| "too many scan columns".to_string())?;
+                // Validate column count
+                if left_cols.len() != right_cols.len() {
+                    return Err(format!(
+                        "set operation column count mismatch: left has {}, right has {}",
+                        left_cols.len(),
+                        right_cols.len()
+                    ));
+                }
+
+                // Widen types
+                let mut output_cols = Vec::with_capacity(left_cols.len());
+                for (lc, rc) in left_cols.iter().zip(right_cols.iter()) {
+                    let dt = wider_type(&lc.data_type, &rc.data_type);
+                    output_cols.push(OutputColumn {
+                        name: lc.name.clone(),
+                        data_type: dt,
+                        nullable: lc.nullable || rc.nullable,
+                    });
+                }
+
+                let kind = match op {
+                    sqlast::SetOperator::Union => SetOpKind::Union,
+                    sqlast::SetOperator::Intersect => SetOpKind::Intersect,
+                    sqlast::SetOperator::Except | sqlast::SetOperator::Minus => SetOpKind::Except,
+                };
+                let all = matches!(
+                    set_quantifier,
+                    sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName
+                );
+
+                Ok((
+                    QueryBody::SetOperation(ResolvedSetOp {
+                        kind,
+                        all,
+                        left: Box::new(left_body),
+                        right: Box::new(right_body),
+                    }),
+                    output_cols,
+                ))
+            }
+            sqlast::SetExpr::Values(values) => {
+                let (resolved_values, cols) = self.analyze_values(values)?;
+                Ok((QueryBody::Values(resolved_values), cols))
+            }
+            sqlast::SetExpr::Query(q) => {
+                let resolved = self.analyze_query(q)?;
+                let cols = resolved.output_columns.clone();
+                Ok((resolved.body, cols))
+            }
+            other => Err(format!("unsupported set expression: {other}")),
+        }
     }
 
-    let needs_project = output_columns.len() != scan_columns.len()
-        || output_columns
+    /// Analyze a VALUES clause.
+    fn analyze_values(
+        &self,
+        values: &sqlast::Values,
+    ) -> Result<(ResolvedValues, Vec<OutputColumn>), String> {
+        let scope = AnalyzerScope::new(); // VALUES has no table scope
+        let mut resolved_rows = Vec::with_capacity(values.rows.len());
+        let mut column_types: Vec<DataType> = Vec::new();
+
+        for row in &values.rows {
+            let mut resolved_row = Vec::with_capacity(row.len());
+            for (col_idx, expr) in row.iter().enumerate() {
+                let typed = self.analyze_expr(expr, &scope)?;
+                if col_idx < column_types.len() {
+                    column_types[col_idx] = wider_type(&column_types[col_idx], &typed.data_type);
+                } else {
+                    column_types.push(typed.data_type.clone());
+                }
+                resolved_row.push(typed);
+            }
+            resolved_rows.push(resolved_row);
+        }
+
+        let output_cols: Vec<OutputColumn> = column_types
             .iter()
             .enumerate()
-            .any(|(output_idx, column)| column.scan_column_index != output_idx);
+            .map(|(i, dt)| OutputColumn {
+                name: format!("column{}", i),
+                data_type: dt.clone(),
+                nullable: true,
+            })
+            .collect();
 
-    if needs_project {
-        for (idx, column) in output_columns.iter_mut().enumerate() {
-            column.output_slot_id = Some(
-                i32::try_from(scan_columns.len() + idx + 1)
-                    .map_err(|_| "too many output columns".to_string())?,
+        Ok((
+            ResolvedValues {
+                rows: resolved_rows,
+                column_types,
+            },
+            output_cols,
+        ))
+    }
+
+    /// Analyze a SELECT statement.
+    fn analyze_select(
+        &self,
+        select: &sqlast::Select,
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), String> {
+        // --- FROM clause ---
+        let (from, scope) = if select.from.is_empty() {
+            // SELECT without FROM (dual)
+            (None, AnalyzerScope::new())
+        } else if select.from.len() == 1 {
+            let (rel, scope) = self.analyze_from(&select.from[0])?;
+            (Some(rel), scope)
+        } else {
+            // Multiple comma-separated FROM items → implicit CROSS JOIN
+            let mut iter = select.from.iter();
+            let first = iter.next().unwrap();
+            let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
+            for twj in iter {
+                let (right_rel, right_scope) = self.analyze_from(twj)?;
+                current_scope.merge(&right_scope);
+                current_rel = Relation::Join(Box::new(JoinRelation {
+                    left: current_rel,
+                    right: right_rel,
+                    join_type: JoinKind::Cross,
+                    condition: None,
+                }));
+            }
+            (Some(current_rel), current_scope)
+        };
+
+        // --- WHERE clause ---
+        let filter = match &select.selection {
+            Some(expr) => Some(self.analyze_expr(expr, &scope)?),
+            None => None,
+        };
+
+        // --- SELECT list (before GROUP BY so aliases are available) ---
+        let (projection, output_columns) = self.analyze_projection(&select.projection, &scope)?;
+
+        // --- GROUP BY (with SELECT alias fallback) ---
+        let group_by_exprs = match &select.group_by {
+            sqlast::GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+            sqlast::GroupByExpr::All(_) => {
+                return Err("GROUP BY ALL is not supported".into());
+            }
+        };
+        let mut group_by = Vec::with_capacity(group_by_exprs.len());
+        for gb_expr in &group_by_exprs {
+            match self.analyze_expr(gb_expr, &scope) {
+                Ok(typed) => group_by.push(typed),
+                Err(_) => {
+                    // Try SELECT aliases: GROUP BY alias_name
+                    let mut alias_scope = scope.clone();
+                    for item in &projection {
+                        alias_scope.add_column(
+                            None,
+                            &item.output_name,
+                            item.expr.data_type.clone(),
+                            item.expr.nullable,
+                        );
+                    }
+                    let typed = self.analyze_expr(gb_expr, &alias_scope)?;
+                    // Substitute alias ref with original expression
+                    group_by.push(self.substitute_select_aliases(typed, &projection));
+                }
+            }
+        }
+
+        // --- Detect aggregation ---
+        let has_agg_in_select = self.select_has_aggregate_functions(&select.projection);
+        let has_aggregation = !group_by.is_empty() || has_agg_in_select;
+
+        // --- HAVING ---
+        // Resolve against the FROM scope. If a HAVING reference matches a SELECT
+        // alias, substitute with the aliased expression so the emitter sees the
+        // real aggregate call (e.g. `total` → `sum(v)`).
+        let having = match &select.having {
+            Some(expr) => {
+                let analyzed = self.analyze_expr(expr, &scope);
+                match analyzed {
+                    Ok(h) => Some(h),
+                    Err(_) => {
+                        // Maybe references a SELECT alias — build alias scope
+                        let mut alias_scope = scope.clone();
+                        for item in &projection {
+                            alias_scope.add_column(
+                                None,
+                                &item.output_name,
+                                item.expr.data_type.clone(),
+                                item.expr.nullable,
+                            );
+                        }
+                        let h = self.analyze_expr(expr, &alias_scope)?;
+                        // Substitute alias refs with real expressions
+                        Some(self.substitute_select_aliases(h, &projection))
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // --- DISTINCT ---
+        let distinct = matches!(select.distinct, Some(sqlast::Distinct::Distinct));
+
+        let mut resolved_select = ResolvedSelect {
+            from,
+            filter,
+            group_by,
+            having,
+            projection,
+            has_aggregation,
+            distinct,
+            repeat: None,
+        };
+
+        // --- Subquery rewriting ---
+        // If the WHERE or HAVING clause contained subqueries (recorded as
+        // SubqueryPlaceholder nodes), rewrite them into JOINs now.
+        let has_subqueries = !self.collected_subqueries.borrow().is_empty();
+        if has_subqueries {
+            let mut mutable_scope = scope;
+            self.rewrite_subqueries(&mut resolved_select, &mut mutable_scope)?;
+        }
+
+        Ok((resolved_select, output_columns))
+    }
+
+    /// Replace ColumnRef nodes that match SELECT aliases with the aliased expression.
+    fn substitute_select_aliases(&self, expr: TypedExpr, projection: &[ProjectItem]) -> TypedExpr {
+        match expr.kind {
+            ExprKind::ColumnRef {
+                ref qualifier,
+                ref column,
+            } if qualifier.is_none() => {
+                // Check if this column name matches a SELECT alias
+                let col_lower = column.to_lowercase();
+                for item in projection {
+                    if item.output_name.to_lowercase() == col_lower {
+                        return item.expr.clone();
+                    }
+                }
+                expr
+            }
+            ExprKind::BinaryOp { left, op, right } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(self.substitute_select_aliases(*left, projection)),
+                    op,
+                    right: Box::new(self.substitute_select_aliases(*right, projection)),
+                },
+            },
+            ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::UnaryOp {
+                    op,
+                    expr: Box::new(self.substitute_select_aliases(*inner, projection)),
+                },
+            },
+            ExprKind::Nested(inner) => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::Nested(Box::new(
+                    self.substitute_select_aliases(*inner, projection),
+                )),
+            },
+            // For other node types, return as-is
+            _ => expr,
+        }
+    }
+
+    /// Check if a SELECT's GROUP BY clause contains a ROLLUP expression.
+    /// Returns the flattened rollup column expressions if found, None otherwise.
+    fn extract_rollup_from_group_by(
+        &self,
+        select: &sqlast::Select,
+    ) -> Option<Vec<Vec<sqlast::Expr>>> {
+        let exprs = match &select.group_by {
+            sqlast::GroupByExpr::Expressions(exprs, _) => exprs,
+            _ => return None,
+        };
+        // Look for a single Rollup expression in the GROUP BY list.
+        // sqlparser produces Expr::Rollup when the dialect has
+        // supports_group_by_expr() = true.  As a fallback, also detect
+        // Expr::Function with name "rollup" (case-insensitive), which is
+        // what the parser produces when the dialect flag is off.
+        for expr in exprs {
+            if let sqlast::Expr::Rollup(groups) = expr {
+                return Some(groups.clone());
+            }
+            // Fallback: Expr::Function { name: "rollup", args: [a, b, ...] }
+            if let sqlast::Expr::Function(func) = expr {
+                let func_name = func.name.to_string().to_lowercase();
+                if func_name == "rollup" {
+                    if let sqlast::FunctionArguments::List(ref arg_list) = func.args {
+                        let groups: Vec<Vec<sqlast::Expr>> = arg_list
+                            .args
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                    Some(vec![e.clone()])
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        if !groups.is_empty() {
+                            return Some(groups);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Expand `GROUP BY ROLLUP(a, b, ...)` into a UNION ALL of GROUP BY variants.
+    ///
+    /// `ROLLUP(a, b)` expands to:
+    ///   SELECT a, b, agg(...) ... GROUP BY a, b
+    ///   UNION ALL
+    ///   SELECT a, NULL, agg(...) ... GROUP BY a
+    ///   UNION ALL
+    ///   SELECT NULL, NULL, agg(...) ... (no GROUP BY, full aggregation)
+    ///
+    /// NOTE: This method is superseded by `resolve_rollup` which produces a
+    /// single-pass RepeatInfo instead. Kept temporarily for reference and will
+    /// be removed in a later cleanup pass.
+    #[allow(dead_code)]
+    fn expand_rollup(
+        &self,
+        select: &sqlast::Select,
+        rollup_groups: &[Vec<sqlast::Expr>],
+    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+        // Flatten the rollup groups: each inner Vec is a "composite key"
+        // (usually single element). For ROLLUP(a, b), groups = [[a], [b]].
+        let n = rollup_groups.len();
+
+        // Build n+1 levels: level i has the first (n-i) groups.
+        // Level 0: all groups (a, b)  →  GROUP BY a, b
+        // Level 1: first (n-1) groups (a) → GROUP BY a, select b as NULL
+        // Level n: no groups → select a as NULL, b as NULL
+        let mut bodies: Vec<(QueryBody, Vec<OutputColumn>)> = Vec::new();
+
+        for level in 0..=n {
+            let active_count = n - level; // number of active rollup groups
+
+            // Build a modified GROUP BY expressions list:
+            // - Keep first `active_count` groups as real GROUP BY keys
+            // - The remaining groups are NULLed out in the projection
+            let mut modified_gb_exprs: Vec<sqlast::Expr> = Vec::new();
+            for group in rollup_groups.iter().take(active_count) {
+                for expr in group {
+                    modified_gb_exprs.push(expr.clone());
+                }
+            }
+
+            // Build the set of NULLed column names (from inactive rollup groups)
+            let mut nulled_exprs: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for group in rollup_groups.iter().skip(active_count) {
+                for expr in group {
+                    nulled_exprs.insert(format!("{expr}").to_lowercase());
+                }
+            }
+
+            // Build modified SELECT with the adjusted GROUP BY
+            // We need to reconstruct the AST Select with modified group_by and projection
+            let mut modified_select = select.clone();
+
+            // Replace GROUP BY with the active keys only
+            modified_select.group_by = sqlast::GroupByExpr::Expressions(modified_gb_exprs, vec![]);
+
+            // Modify projection: replace NULLed columns with NULL literals,
+            // and replace GROUPING(col) calls with literal 0 or 1.
+            let mut modified_projection = Vec::new();
+            for item in &select.projection {
+                let (expr_part, alias_part) = match item {
+                    sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                        (expr, Some(alias.clone()))
+                    }
+                    sqlast::SelectItem::UnnamedExpr(expr) => (expr, None),
+                    other => {
+                        modified_projection.push(other.clone());
+                        continue;
+                    }
+                };
+
+                // Check if this projection item is one of the rollup keys
+                // that should be NULLed at this level
+                let expr_str = format!("{expr_part}").to_lowercase();
+                if nulled_exprs.contains(&expr_str) {
+                    let null_expr = sqlast::Expr::Value(sqlast::Value::Null.into());
+                    if let Some(alias) = alias_part {
+                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                            expr: null_expr,
+                            alias,
+                        });
+                    } else {
+                        // Preserve the original name by adding an alias
+                        let name = expr_display_name(expr_part);
+                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                            expr: null_expr,
+                            alias: sqlast::Ident::new(name),
+                        });
+                    }
+                } else {
+                    // Replace GROUPING(col) calls with 0 or 1
+                    let rewritten = replace_grouping_calls(expr_part, &nulled_exprs);
+                    if let Some(alias) = alias_part {
+                        modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                            expr: rewritten,
+                            alias,
+                        });
+                    } else {
+                        modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
+                    }
+                }
+            }
+            modified_select.projection = modified_projection;
+
+            let (sel, cols) = self.analyze_select(&modified_select)?;
+            bodies.push((QueryBody::Select(sel), cols));
+        }
+
+        // Build UNION ALL chain from right to left
+        let (mut result_body, result_cols) = bodies.remove(0);
+        for (body, _cols) in bodies {
+            result_body = QueryBody::SetOperation(ResolvedSetOp {
+                kind: SetOpKind::Union,
+                all: true,
+                left: Box::new(result_body),
+                right: Box::new(body),
+            });
+        }
+
+        Ok((result_body, result_cols))
+    }
+
+    /// Resolve `GROUP BY ROLLUP(a, b, ...)` into a single SELECT with RepeatInfo
+    /// instead of expanding into N+1 UNION ALL branches.
+    ///
+    /// The SELECT is analyzed once with all rollup keys in the GROUP BY.
+    /// RepeatInfo records the per-level null patterns and grouping_id bitmaps
+    /// so the Repeat operator can replay the aggregated result at execution time.
+    fn resolve_rollup(
+        &self,
+        select: &sqlast::Select,
+        rollup_groups: &[Vec<sqlast::Expr>],
+    ) -> Result<(QueryBody, Vec<OutputColumn>), String> {
+        use crate::sql::ir::RepeatInfo;
+
+        let n = rollup_groups.len();
+
+        // Flatten all rollup column names (lowercased) in order.
+        let all_rollup_columns: Vec<String> = rollup_groups
+            .iter()
+            .flat_map(|group| group.iter().map(|e| format!("{e}").to_lowercase()))
+            .collect();
+
+        // Compute per-level non-null columns and grouping_id bitmaps.
+        // ROLLUP(a, b, c) produces N+1 levels:
+        //   Level 0: all active (a, b, c)  — grouping_id = 0b000
+        //   Level 1: (a, b) active         — grouping_id = 0b100 (c NULLed)
+        //   Level 2: (a) active            — grouping_id = 0b110 (b, c NULLed)
+        //   Level 3: none active           — grouping_id = 0b111 (all NULLed)
+        let mut repeat_column_ref_list: Vec<Vec<String>> = Vec::with_capacity(n + 1);
+        let mut grouping_ids: Vec<u64> = Vec::with_capacity(n + 1);
+
+        for level in 0..=n {
+            let active_count = n - level;
+
+            // Non-null columns: flatten first `active_count` groups
+            let non_null_cols: Vec<String> = rollup_groups
+                .iter()
+                .take(active_count)
+                .flat_map(|group| group.iter().map(|e| format!("{e}").to_lowercase()))
+                .collect();
+            repeat_column_ref_list.push(non_null_cols);
+
+            // Grouping ID bitmap: bit i = 1 if column i is NULLed
+            let mut bitmap: u64 = 0;
+            for group in rollup_groups.iter().skip(active_count) {
+                for expr in group {
+                    let col_name = format!("{expr}").to_lowercase();
+                    if let Some(bit_pos) = all_rollup_columns.iter().position(|c| *c == col_name) {
+                        bitmap |= 1u64 << bit_pos;
+                    }
+                }
+            }
+            grouping_ids.push(bitmap);
+        }
+
+        // Scan ALL GROUPING() calls (top-level and nested) in projection,
+        // assign each a unique marker value, and record metadata for RepeatInfo.
+        // Use negative marker values (-9000, -9001, ...) so they're distinguishable
+        // from real literals after analysis.
+        let mut grouping_fn_args: Vec<(String, Vec<String>)> = Vec::new();
+        let mut next_marker: i64 = -9000;
+
+        let replace_grouping_with_marker =
+            |expr: &sqlast::Expr,
+             args: &mut Vec<(String, Vec<String>)>,
+             marker: &mut i64|
+             -> sqlast::Expr { replace_grouping_calls_with_markers(expr, args, marker) };
+
+        let mut modified_projection = Vec::new();
+        for item in &select.projection {
+            match item {
+                sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                    let rewritten = replace_grouping_with_marker(
+                        expr,
+                        &mut grouping_fn_args,
+                        &mut next_marker,
+                    );
+                    modified_projection.push(sqlast::SelectItem::ExprWithAlias {
+                        expr: rewritten,
+                        alias: alias.clone(),
+                    });
+                }
+                sqlast::SelectItem::UnnamedExpr(expr) => {
+                    let rewritten = replace_grouping_with_marker(
+                        expr,
+                        &mut grouping_fn_args,
+                        &mut next_marker,
+                    );
+                    modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
+                }
+                other => modified_projection.push(other.clone()),
+            }
+        }
+
+        // Build modified SELECT with all rollup keys in GROUP BY (level 0).
+        let mut modified_select = select.clone();
+        let all_gb_exprs: Vec<sqlast::Expr> = rollup_groups
+            .iter()
+            .flat_map(|group| group.iter().cloned())
+            .collect();
+        modified_select.group_by = sqlast::GroupByExpr::Expressions(all_gb_exprs, vec![]);
+        modified_select.projection = modified_projection;
+
+        // Replace GROUPING() in HAVING too.
+        if let Some(ref having_expr) = modified_select.having {
+            modified_select.having = Some(replace_grouping_calls_with_markers(
+                having_expr,
+                &mut grouping_fn_args,
+                &mut next_marker,
+            ));
+        }
+
+        // Analyze the SELECT once with all GROUP BY keys active.
+        let (mut sel, cols) = self.analyze_select(&modified_select)?;
+
+        // Post-analysis fixup: replace GROUPING() marker literals in the
+        // resolved projection with ColumnRef to the virtual slot names.
+        // Markers are Literal(Int(-9000)), Literal(Int(-9001)), etc.
+        // Each maps to grouping_fn_args[marker - (-9000)].
+        for item in &mut sel.projection {
+            item.expr = replace_grouping_markers_in_typed_expr(&item.expr, &grouping_fn_args);
+        }
+        // Also add each GROUPING() virtual column as a GROUP BY key so it
+        // passes through the Aggregate operator.
+        for (fn_name, _) in &grouping_fn_args {
+            sel.group_by.push(TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    qualifier: None,
+                    column: fn_name.clone(),
+                },
+                data_type: DataType::Int64,
+                nullable: false,
+            });
+        }
+
+        // Attach RepeatInfo to the resolved SELECT.
+        sel.repeat = Some(RepeatInfo {
+            repeat_column_ref_list,
+            grouping_ids,
+            all_rollup_columns,
+            grouping_fn_args,
+        });
+
+        Ok((QueryBody::Select(sel), cols))
+    }
+
+    /// Analyze the SELECT projection list.
+    fn analyze_projection(
+        &self,
+        items: &[sqlast::SelectItem],
+        scope: &AnalyzerScope,
+    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
+        let mut projection = Vec::new();
+        let mut output_columns = Vec::new();
+
+        for item in items {
+            match item {
+                sqlast::SelectItem::UnnamedExpr(expr) => {
+                    let typed = self.analyze_expr(expr, scope)?;
+                    let name = expr_display_name(expr);
+                    output_columns.push(OutputColumn {
+                        name: name.clone(),
+                        data_type: typed.data_type.clone(),
+                        nullable: typed.nullable,
+                    });
+                    projection.push(ProjectItem {
+                        expr: typed,
+                        output_name: name,
+                    });
+                }
+                sqlast::SelectItem::ExprWithAlias { expr, alias } => {
+                    let typed = self.analyze_expr(expr, scope)?;
+                    let name = alias.value.clone();
+                    output_columns.push(OutputColumn {
+                        name: name.clone(),
+                        data_type: typed.data_type.clone(),
+                        nullable: typed.nullable,
+                    });
+                    projection.push(ProjectItem {
+                        expr: typed,
+                        output_name: name,
+                    });
+                }
+                sqlast::SelectItem::Wildcard(_) => {
+                    for (qualifier, col_name, data_type, nullable) in scope.iter_columns() {
+                        let typed = TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: qualifier.clone(),
+                                column: col_name.clone(),
+                            },
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        };
+                        output_columns.push(OutputColumn {
+                            name: col_name.clone(),
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        });
+                        projection.push(ProjectItem {
+                            expr: typed,
+                            output_name: col_name.clone(),
+                        });
+                    }
+                }
+                sqlast::SelectItem::QualifiedWildcard(kind, _) => {
+                    let qualifier_str = match kind {
+                        sqlast::SelectItemQualifiedWildcardKind::ObjectName(obj_name) => {
+                            obj_name.to_string()
+                        }
+                        _ => return Err("unsupported qualified wildcard expression".into()),
+                    };
+                    let mut found = false;
+                    for (qualifier, col_name, data_type, nullable) in
+                        scope.iter_qualified_columns(&qualifier_str)
+                    {
+                        found = true;
+                        let typed = TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: qualifier.clone(),
+                                column: col_name.clone(),
+                            },
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        };
+                        output_columns.push(OutputColumn {
+                            name: col_name.clone(),
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        });
+                        projection.push(ProjectItem {
+                            expr: typed,
+                            output_name: col_name.clone(),
+                        });
+                    }
+                    if !found {
+                        return Err(format!("no columns found for qualifier `{qualifier_str}`"));
+                    }
+                }
+            }
+        }
+
+        Ok((projection, output_columns))
+    }
+
+    /// Rebuild the FROM scope from an already-resolved Relation tree.
+    /// Used by ORDER BY fallback when the expression doesn't match projection columns.
+    fn rebuild_from_scope(&self, relation: &Relation) -> Result<((), AnalyzerScope), String> {
+        let mut scope = AnalyzerScope::new();
+        self.collect_relation_scope(relation, &mut scope)?;
+        Ok(((), scope))
+    }
+
+    fn collect_relation_scope(
+        &self,
+        relation: &Relation,
+        scope: &mut AnalyzerScope,
+    ) -> Result<(), String> {
+        match relation {
+            Relation::Scan(scan) => {
+                let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
+                scope.add_table(Some(qualifier), &scan.table.columns);
+                Ok(())
+            }
+            Relation::Subquery { query, alias } => {
+                for col in &query.output_columns {
+                    scope.add_column(
+                        Some(alias.as_str()),
+                        &col.name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    );
+                }
+                Ok(())
+            }
+            Relation::Join(join_rel) => {
+                self.collect_relation_scope(&join_rel.left, scope)?;
+                self.collect_relation_scope(&join_rel.right, scope)?;
+                Ok(())
+            }
+            Relation::GenerateSeries(gs) => {
+                let qualifier = gs.alias.as_deref().unwrap_or("generate_series");
+                scope.add_column(Some(qualifier), &gs.column_name, DataType::Int64, false);
+                Ok(())
+            }
+            Relation::CTEConsume {
+                alias,
+                output_columns,
+                ..
+            } => {
+                for col in output_columns {
+                    scope.add_column(
+                        Some(alias.as_str()),
+                        &col.name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Analyze ORDER BY clause.
+    fn analyze_order_by(
+        &self,
+        query: &sqlast::Query,
+        body_output: &[OutputColumn],
+        body: &QueryBody,
+    ) -> Result<Vec<SortItem>, String> {
+        let order_by_exprs = match &query.order_by {
+            Some(sqlast::OrderBy {
+                kind: sqlast::OrderByKind::Expressions(exprs),
+                ..
+            }) => exprs,
+            Some(sqlast::OrderBy {
+                kind: sqlast::OrderByKind::All(_),
+                ..
+            }) => return Err("ORDER BY ALL is not supported".into()),
+            None => return Ok(vec![]),
+        };
+
+        // Build a projection scope from body output columns for ORDER BY resolution.
+        let mut projection_scope = AnalyzerScope::new();
+        for col in body_output {
+            projection_scope.add_column(None, &col.name, col.data_type.clone(), col.nullable);
+        }
+        // Also register qualified column refs from projection items
+        // so ORDER BY a.id works when SELECT has a.id
+        if let QueryBody::Select(sel) = body {
+            for item in &sel.projection {
+                if let ExprKind::ColumnRef {
+                    qualifier: Some(ref q),
+                    ref column,
+                } = item.expr.kind
+                {
+                    projection_scope.add_column(
+                        Some(q),
+                        column,
+                        item.expr.data_type.clone(),
+                        item.expr.nullable,
+                    );
+                }
+            }
+        }
+
+        let mut sort_items = Vec::with_capacity(order_by_exprs.len());
+        for ob in order_by_exprs {
+            // Try resolving against the projection scope first, then fall back
+            // to a numeric literal reference (ORDER BY 1, 2, ...)
+            let typed = match &ob.expr {
+                sqlast::Expr::Value(sqlast::ValueWithSpan {
+                    value: sqlast::Value::Number(n, _),
+                    ..
+                }) => {
+                    // Positional reference: ORDER BY 1
+                    let pos: usize = n
+                        .parse::<usize>()
+                        .map_err(|e| format!("invalid ORDER BY position: {e}"))?;
+                    if pos == 0 || pos > body_output.len() {
+                        return Err(format!(
+                            "ORDER BY position {pos} is out of range (1..{})",
+                            body_output.len()
+                        ));
+                    }
+                    let col = &body_output[pos - 1];
+                    TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: None,
+                            column: col.name.clone(),
+                        },
+                        data_type: col.data_type.clone(),
+                        nullable: col.nullable,
+                    }
+                }
+                _ => {
+                    // First: check if the ORDER BY expression textually matches
+                    // a SELECT list expression. If so, resolve as a reference to
+                    // the output alias. This handles ORDER BY count(x) matching
+                    // SELECT count(x) as alias.
+                    let ob_text = format!("{}", ob.expr).to_lowercase();
+                    let mut matched_alias = None;
+                    // Match ORDER BY expression text against SELECT item
+                    // expressions (not aliases). This handles ORDER BY
+                    // count(distinct x) matching SELECT count(distinct x) as y.
+                    if let QueryBody::Select(sel) = body {
+                        if let sqlast::SetExpr::Select(ast_sel) = query.body.as_ref() {
+                            for (ast_item, ir_item) in
+                                ast_sel.projection.iter().zip(sel.projection.iter())
+                            {
+                                let ast_expr_text = match ast_item {
+                                    sqlast::SelectItem::ExprWithAlias { expr, .. }
+                                    | sqlast::SelectItem::UnnamedExpr(expr) => {
+                                        format!("{expr}").to_lowercase()
+                                    }
+                                    _ => continue,
+                                };
+                                if ast_expr_text == ob_text
+                                    || ir_item.output_name.to_lowercase() == ob_text
+                                {
+                                    matched_alias = Some(TypedExpr {
+                                        kind: ExprKind::ColumnRef {
+                                            qualifier: None,
+                                            column: ir_item.output_name.clone(),
+                                        },
+                                        data_type: ir_item.expr.data_type.clone(),
+                                        nullable: ir_item.expr.nullable,
+                                    });
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(alias_ref) = matched_alias {
+                        alias_ref
+                    } else {
+                        // Try projection scope first, then fall back to FROM scope
+                        match self.analyze_expr(&ob.expr, &projection_scope) {
+                            Ok(typed) => typed,
+                            Err(proj_err) => {
+                                if let QueryBody::Select(sel) = body {
+                                    if let Some(ref from_rel) = sel.from {
+                                        let (_, from_scope) = self.rebuild_from_scope(from_rel)?;
+                                        match self.analyze_expr(&ob.expr, &from_scope) {
+                                            Ok(typed) => typed,
+                                            Err(_) => return Err(proj_err),
+                                        }
+                                    } else {
+                                        return Err(proj_err);
+                                    }
+                                } else {
+                                    return Err(proj_err);
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            let asc = ob.options.asc.unwrap_or(true);
+            let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+
+            sort_items.push(SortItem {
+                expr: typed,
+                asc,
+                nulls_first,
+            });
+        }
+
+        Ok(sort_items)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CTE reference counting (heuristic walk over raw AST)
+// ---------------------------------------------------------------------------
+
+/// Walk the sqlparser AST of a query and count how many times each CTE name
+/// appears as a table reference.  The walk is recursive through subqueries,
+/// set operations, JOINs, and scalar subqueries in WHERE/HAVING.
+///
+/// This is a *heuristic* count on the raw AST — it does not perform name
+/// resolution, so a base table that happens to share a name with a CTE will
+/// also be counted.  For our purposes (deciding inline-vs-share) this is
+/// acceptable.
+fn count_cte_references(
+    cte_names: &std::collections::HashSet<String>,
+    query: &sqlast::Query,
+) -> std::collections::HashMap<String, usize> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    walk_query(cte_names, query, &mut counts);
+    counts
+}
+
+fn walk_query(
+    cte_names: &std::collections::HashSet<String>,
+    query: &sqlast::Query,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    walk_set_expr(cte_names, query.body.as_ref(), counts);
+    // Walk ORDER BY expressions for subqueries
+    if let Some(sqlast::OrderBy {
+        kind: sqlast::OrderByKind::Expressions(exprs),
+        ..
+    }) = &query.order_by
+    {
+        for ob in exprs {
+            walk_expr(cte_names, &ob.expr, counts);
+        }
+    }
+}
+
+fn walk_set_expr(
+    cte_names: &std::collections::HashSet<String>,
+    set_expr: &sqlast::SetExpr,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match set_expr {
+        sqlast::SetExpr::Select(select) => walk_select(cte_names, select, counts),
+        sqlast::SetExpr::SetOperation { left, right, .. } => {
+            walk_set_expr(cte_names, left, counts);
+            walk_set_expr(cte_names, right, counts);
+        }
+        sqlast::SetExpr::Query(q) => walk_query(cte_names, q, counts),
+        sqlast::SetExpr::Values(_) => {}
+        _ => {}
+    }
+}
+
+fn walk_select(
+    cte_names: &std::collections::HashSet<String>,
+    select: &sqlast::Select,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    // FROM clause: tables and joins
+    for twj in &select.from {
+        walk_table_factor(cte_names, &twj.relation, counts);
+        for join in &twj.joins {
+            walk_table_factor(cte_names, &join.relation, counts);
+            // Extract join constraint, then walk ON expression if present.
+            let constraint = match &join.join_operator {
+                sqlast::JoinOperator::Join(c)
+                | sqlast::JoinOperator::Inner(c)
+                | sqlast::JoinOperator::Left(c)
+                | sqlast::JoinOperator::LeftOuter(c)
+                | sqlast::JoinOperator::Right(c)
+                | sqlast::JoinOperator::RightOuter(c)
+                | sqlast::JoinOperator::FullOuter(c)
+                | sqlast::JoinOperator::LeftSemi(c)
+                | sqlast::JoinOperator::LeftAnti(c)
+                | sqlast::JoinOperator::RightSemi(c)
+                | sqlast::JoinOperator::RightAnti(c) => Some(c),
+                _ => None,
+            };
+            if let Some(sqlast::JoinConstraint::On(expr)) = constraint {
+                walk_expr(cte_names, expr, counts);
+            }
+        }
+    }
+    // WHERE
+    if let Some(ref expr) = select.selection {
+        walk_expr(cte_names, expr, counts);
+    }
+    // SELECT list (may contain scalar subqueries)
+    for item in &select.projection {
+        match item {
+            sqlast::SelectItem::UnnamedExpr(e)
+            | sqlast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                walk_expr(cte_names, e, counts);
+            }
+            _ => {}
+        }
+    }
+    // HAVING
+    if let Some(ref expr) = select.having {
+        walk_expr(cte_names, expr, counts);
+    }
+}
+
+fn walk_table_factor(
+    cte_names: &std::collections::HashSet<String>,
+    factor: &sqlast::TableFactor,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match factor {
+        sqlast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|p| match p {
+                    sqlast::ObjectNamePart::Identifier(ident) => Some(ident.value.to_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            // Only single-part names can match CTE names
+            if parts.len() == 1 {
+                if let Some(tbl) = parts.first() {
+                    if cte_names.contains(tbl) {
+                        *counts.entry(tbl.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        sqlast::TableFactor::Derived { subquery, .. } => {
+            walk_query(cte_names, subquery, counts);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a scalar expression looking for subqueries that may reference CTEs.
+fn walk_expr(
+    cte_names: &std::collections::HashSet<String>,
+    expr: &sqlast::Expr,
+    counts: &mut std::collections::HashMap<String, usize>,
+) {
+    match expr {
+        sqlast::Expr::Subquery(q) => walk_query(cte_names, q, counts),
+        sqlast::Expr::InSubquery { subquery, expr, .. } => {
+            walk_query(cte_names, subquery, counts);
+            walk_expr(cte_names, expr, counts);
+        }
+        sqlast::Expr::Exists { subquery, .. } => {
+            walk_query(cte_names, subquery, counts);
+        }
+        sqlast::Expr::BinaryOp { left, right, .. } => {
+            walk_expr(cte_names, left, counts);
+            walk_expr(cte_names, right, counts);
+        }
+        sqlast::Expr::UnaryOp { expr: inner, .. } => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Nested(inner) => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Function(func) => {
+            if let sqlast::FunctionArguments::List(ref arg_list) = func.args {
+                for arg in &arg_list.args {
+                    match arg {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e))
+                        | sqlast::FunctionArg::Named { arg: sqlast::FunctionArgExpr::Expr(e), .. } => {
+                            walk_expr(cte_names, e, counts);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        sqlast::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(op) = operand {
+                walk_expr(cte_names, op, counts);
+            }
+            for cw in conditions {
+                walk_expr(cte_names, &cw.condition, counts);
+                walk_expr(cte_names, &cw.result, counts);
+            }
+            if let Some(e) = else_result {
+                walk_expr(cte_names, e, counts);
+            }
+        }
+        sqlast::Expr::Cast { expr: inner, .. } => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            walk_expr(cte_names, inner, counts);
+            walk_expr(cte_names, low, counts);
+            walk_expr(cte_names, high, counts);
+        }
+        sqlast::Expr::InList { expr: inner, list, .. } => {
+            walk_expr(cte_names, inner, counts);
+            for e in list {
+                walk_expr(cte_names, e, counts);
+            }
+        }
+        sqlast::Expr::IsNull(inner)
+        | sqlast::Expr::IsNotNull(inner)
+        | sqlast::Expr::IsTrue(inner)
+        | sqlast::Expr::IsFalse(inner)
+        | sqlast::Expr::IsNotTrue(inner)
+        | sqlast::Expr::IsNotFalse(inner) => {
+            walk_expr(cte_names, inner, counts);
+        }
+        sqlast::Expr::Like { expr, pattern, .. } | sqlast::Expr::ILike { expr, pattern, .. } => {
+            walk_expr(cte_names, expr, counts);
+            walk_expr(cte_names, pattern, counts);
+        }
+        // Leaf nodes (literals, column refs, etc.) — nothing to walk.
+        _ => {}
+    }
+}
+
+/// Replace GROUPING(col) function calls in a sqlparser AST expression with
+/// integer literal 0 (column is active) or 1 (column is NULLed) based on the
+/// current ROLLUP expansion level.
+fn replace_grouping_calls(
+    expr: &sqlast::Expr,
+    nulled_exprs: &std::collections::HashSet<String>,
+) -> sqlast::Expr {
+    // Replace references to NULLed columns with NULL (needed for window
+    // PARTITION BY / ORDER BY expressions that reference rollup keys).
+    let expr_str = format!("{expr}").to_lowercase();
+    if nulled_exprs.contains(&expr_str) {
+        return sqlast::Expr::Value(sqlast::Value::Null.into());
+    }
+    match expr {
+        sqlast::Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "grouping" {
+                // Extract the argument column name
+                if let sqlast::FunctionArguments::List(ref list) = func.args {
+                    if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                        arg_expr,
+                    ))) = list.args.first()
+                    {
+                        let arg_str = format!("{arg_expr}").to_lowercase();
+                        let value = if nulled_exprs.contains(&arg_str) {
+                            1i64
+                        } else {
+                            0i64
+                        };
+                        return sqlast::Expr::Value(
+                            sqlast::Value::Number(value.to_string(), false).into(),
+                        );
+                    }
+                }
+            }
+            // Not a GROUPING() call — recurse into arguments
+            let new_args = match &func.args {
+                sqlast::FunctionArguments::List(list) => {
+                    let new_list_args: Vec<_> = list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                                    replace_grouping_calls(e, nulled_exprs),
+                                ))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect();
+                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                        args: new_list_args,
+                        ..list.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            let mut new_func = func.clone();
+            new_func.args = new_args;
+            // Recurse into OVER clause for window functions
+            if let Some(ref window) = func.over {
+                new_func.over = Some(replace_grouping_in_window(window, nulled_exprs));
+            }
+            sqlast::Expr::Function(new_func)
+        }
+        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
+            left: Box::new(replace_grouping_calls(left, nulled_exprs)),
+            op: op.clone(),
+            right: Box::new(replace_grouping_calls(right, nulled_exprs)),
+        },
+        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_grouping_calls(inner, nulled_exprs)),
+        },
+        sqlast::Expr::Nested(inner) => {
+            sqlast::Expr::Nested(Box::new(replace_grouping_calls(inner, nulled_exprs)))
+        }
+        sqlast::Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => sqlast::Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(replace_grouping_calls(o, nulled_exprs))),
+            conditions: conditions
+                .iter()
+                .map(|cw| sqlast::CaseWhen {
+                    condition: replace_grouping_calls(&cw.condition, nulled_exprs),
+                    result: replace_grouping_calls(&cw.result, nulled_exprs),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(replace_grouping_calls(e, nulled_exprs))),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Recurse into window specifications to replace GROUPING() calls in PARTITION BY / ORDER BY.
+fn replace_grouping_in_window(
+    window: &sqlast::WindowType,
+    nulled_exprs: &std::collections::HashSet<String>,
+) -> sqlast::WindowType {
+    match window {
+        sqlast::WindowType::WindowSpec(spec) => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| replace_grouping_calls(e, nulled_exprs))
+                .collect();
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|ob| sqlast::OrderByExpr {
+                    expr: replace_grouping_calls(&ob.expr, nulled_exprs),
+                    ..ob.clone()
+                })
+                .collect();
+            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
+                partition_by,
+                order_by,
+                ..spec.clone()
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// Check if an expression is a top-level `GROUPING(col)` call.
+/// Returns `(output_name, arg_column_names, replacement_expr)` if it is.
+/// The replacement is a literal `0` (Int64) placeholder — the Repeat operator
+/// will fill in the real value at execution time.
+fn extract_grouping_call(
+    expr: &sqlast::Expr,
+    alias: &Option<sqlast::Ident>,
+) -> Option<(String, Vec<String>, sqlast::Expr)> {
+    if let sqlast::Expr::Function(func) = expr {
+        let func_name = func.name.to_string().to_lowercase();
+        if func_name == "grouping" {
+            if let sqlast::FunctionArguments::List(ref list) = func.args {
+                let arg_cols: Vec<String> = list
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                            Some(format!("{e}").to_lowercase())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !arg_cols.is_empty() {
+                    let output_name = if let Some(a) = alias {
+                        a.value.clone()
+                    } else {
+                        format!("{expr}").to_lowercase()
+                    };
+                    let replacement =
+                        sqlast::Expr::Value(sqlast::Value::Number("0".to_string(), false).into());
+                    return Some((output_name, arg_cols, replacement));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Replace all GROUPING() calls in an expression tree with a literal 0 (Int64)
+/// placeholder. Used by `resolve_rollup` so the analyzer doesn't encounter the
+/// unknown GROUPING() function during expression resolution.
+fn replace_grouping_with_zero(expr: &sqlast::Expr) -> sqlast::Expr {
+    match expr {
+        sqlast::Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "grouping" {
+                return sqlast::Expr::Value(
+                    sqlast::Value::Number("0".to_string(), false).into(),
+                );
+            }
+            // Not a GROUPING() call — recurse into arguments
+            let new_args = match &func.args {
+                sqlast::FunctionArguments::List(list) => {
+                    let new_list_args: Vec<_> = list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                                    replace_grouping_with_zero(e),
+                                ))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect();
+                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                        args: new_list_args,
+                        ..list.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            let mut new_func = func.clone();
+            new_func.args = new_args;
+            // Recurse into OVER clause for window functions
+            if let Some(ref window) = func.over {
+                new_func.over = Some(replace_grouping_with_zero_in_window(window));
+            }
+            sqlast::Expr::Function(new_func)
+        }
+        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
+            left: Box::new(replace_grouping_with_zero(left)),
+            op: op.clone(),
+            right: Box::new(replace_grouping_with_zero(right)),
+        },
+        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_grouping_with_zero(inner)),
+        },
+        sqlast::Expr::Nested(inner) => {
+            sqlast::Expr::Nested(Box::new(replace_grouping_with_zero(inner)))
+        }
+        sqlast::Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => sqlast::Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(replace_grouping_with_zero(o))),
+            conditions: conditions
+                .iter()
+                .map(|cw| sqlast::CaseWhen {
+                    condition: replace_grouping_with_zero(&cw.condition),
+                    result: replace_grouping_with_zero(&cw.result),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(replace_grouping_with_zero(e))),
+        },
+        other => other.clone(),
+    }
+}
+
+/// Recurse into window specifications to replace GROUPING() calls with literal 0.
+fn replace_grouping_with_zero_in_window(window: &sqlast::WindowType) -> sqlast::WindowType {
+    match window {
+        sqlast::WindowType::WindowSpec(spec) => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| replace_grouping_with_zero(e))
+                .collect();
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|ob| sqlast::OrderByExpr {
+                    expr: replace_grouping_with_zero(&ob.expr),
+                    ..ob.clone()
+                })
+                .collect();
+            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
+                partition_by,
+                order_by,
+                ..spec.clone()
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// Replace GROUPING(col) calls in an AST expression with unique marker
+/// literals (-9000, -9001, ...). Each call is recorded in `args` as
+/// (virtual_name, [column_args]) for the RepeatInfo.
+fn replace_grouping_calls_with_markers(
+    expr: &sqlast::Expr,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::Expr {
+    match expr {
+        sqlast::Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name == "grouping" {
+                if let sqlast::FunctionArguments::List(ref list) = func.args {
+                    let arg_cols: Vec<String> = list
+                        .args
+                        .iter()
+                        .filter_map(|a| match a {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                Some(format!("{e}").to_lowercase())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    let idx = args.len();
+                    let virtual_name = format!("__grouping_fn_{idx}");
+                    args.push((virtual_name, arg_cols));
+                    let marker = *next_marker;
+                    *next_marker -= 1;
+                    return sqlast::Expr::Value(
+                        sqlast::Value::Number(marker.to_string(), false).into(),
+                    );
+                }
+            }
+            // Not GROUPING — recurse into args and OVER clause
+            let new_args = match &func.args {
+                sqlast::FunctionArguments::List(list) => {
+                    let new_list_args: Vec<_> = list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                                    replace_grouping_calls_with_markers(e, args, next_marker),
+                                ))
+                            }
+                            other => other.clone(),
+                        })
+                        .collect();
+                    sqlast::FunctionArguments::List(sqlast::FunctionArgumentList {
+                        args: new_list_args,
+                        ..list.clone()
+                    })
+                }
+                other => other.clone(),
+            };
+            let mut new_func = func.clone();
+            new_func.args = new_args;
+            if let Some(ref window) = func.over {
+                new_func.over = Some(replace_grouping_markers_in_window(window, args, next_marker));
+            }
+            sqlast::Expr::Function(new_func)
+        }
+        sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
+            left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
+            op: op.clone(),
+            right: Box::new(replace_grouping_calls_with_markers(right, args, next_marker)),
+        },
+        sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(replace_grouping_calls_with_markers(inner, args, next_marker)),
+        },
+        sqlast::Expr::Nested(inner) => sqlast::Expr::Nested(Box::new(
+            replace_grouping_calls_with_markers(inner, args, next_marker),
+        )),
+        sqlast::Expr::Case {
+            case_token,
+            end_token,
+            operand,
+            conditions,
+            else_result,
+        } => sqlast::Expr::Case {
+            case_token: case_token.clone(),
+            end_token: end_token.clone(),
+            operand: operand
+                .as_ref()
+                .map(|o| Box::new(replace_grouping_calls_with_markers(o, args, next_marker))),
+            conditions: conditions
+                .iter()
+                .map(|cw| sqlast::CaseWhen {
+                    condition: replace_grouping_calls_with_markers(&cw.condition, args, next_marker),
+                    result: replace_grouping_calls_with_markers(&cw.result, args, next_marker),
+                })
+                .collect(),
+            else_result: else_result
+                .as_ref()
+                .map(|e| Box::new(replace_grouping_calls_with_markers(e, args, next_marker))),
+        },
+        other => other.clone(),
+    }
+}
+
+fn replace_grouping_markers_in_window(
+    window: &sqlast::WindowType,
+    args: &mut Vec<(String, Vec<String>)>,
+    next_marker: &mut i64,
+) -> sqlast::WindowType {
+    match window {
+        sqlast::WindowType::WindowSpec(spec) => {
+            let partition_by = spec
+                .partition_by
+                .iter()
+                .map(|e| replace_grouping_calls_with_markers(e, args, next_marker))
+                .collect();
+            let order_by = spec
+                .order_by
+                .iter()
+                .map(|ob| sqlast::OrderByExpr {
+                    expr: replace_grouping_calls_with_markers(&ob.expr, args, next_marker),
+                    ..ob.clone()
+                })
+                .collect();
+            sqlast::WindowType::WindowSpec(sqlast::WindowSpec {
+                partition_by,
+                order_by,
+                ..spec.clone()
+            })
+        }
+        other => other.clone(),
+    }
+}
+
+/// Walk a resolved TypedExpr tree and replace marker literals (Int(-9000), Int(-9001), ...)
+/// with ColumnRef to the corresponding GROUPING() virtual slot name.
+fn replace_grouping_markers_in_typed_expr(
+    expr: &TypedExpr,
+    grouping_fn_args: &[(String, Vec<String>)],
+) -> TypedExpr {
+    match &expr.kind {
+        ExprKind::Literal(crate::sql::ir::LiteralValue::Int(v)) if *v <= -9000 => {
+            let idx = ((-9000i64) - v) as usize;
+            if let Some((fn_name, _)) = grouping_fn_args.get(idx) {
+                return TypedExpr {
+                    kind: ExprKind::ColumnRef {
+                        qualifier: None,
+                        column: fn_name.clone(),
+                    },
+                    data_type: DataType::Int64,
+                    nullable: false,
+                };
+            }
+            expr.clone()
+        }
+        ExprKind::BinaryOp { left, op, right } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(replace_grouping_markers_in_typed_expr(left, grouping_fn_args)),
+                op: *op,
+                right: Box::new(replace_grouping_markers_in_typed_expr(
+                    right,
+                    grouping_fn_args,
+                )),
+            },
+        },
+        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::UnaryOp {
+                op: *op,
+                expr: Box::new(replace_grouping_markers_in_typed_expr(inner, grouping_fn_args)),
+            },
+        },
+        ExprKind::Cast { expr: inner, target } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Cast {
+                expr: Box::new(replace_grouping_markers_in_typed_expr(inner, grouping_fn_args)),
+                target: target.clone(),
+            },
+        },
+        ExprKind::Nested(inner) => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Nested(Box::new(replace_grouping_markers_in_typed_expr(
+                inner,
+                grouping_fn_args,
+            ))),
+        },
+        _ => expr.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};
+    use crate::sql::ir::{ExprKind, JoinKind, Relation};
+
+    struct TestCatalog;
+    impl crate::sql::catalog::CatalogProvider for TestCatalog {
+        fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+            match table {
+                "orders" => Ok(TableDef {
+                    name: "orders".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "o_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "o_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "o_orderstatus".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "o_totalprice".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "o_orderdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "o_orderpriority".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/orders.parquet"),
+                    },
+                }),
+                "lineitem" => Ok(TableDef {
+                    name: "lineitem".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "l_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "l_partkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "l_suppkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "l_quantity".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_extendedprice".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_discount".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_commitdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_receiptdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "l_shipdate".to_string(),
+                            data_type: arrow::datatypes::DataType::Date32,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/lineitem.parquet"),
+                    },
+                }),
+                "supplier" => Ok(TableDef {
+                    name: "supplier".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "s_suppkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "s_name".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "s_comment".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/supplier.parquet"),
+                    },
+                }),
+                "part" => Ok(TableDef {
+                    name: "part".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "p_partkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "p_name".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "p_brand".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/part.parquet"),
+                    },
+                }),
+                "partsupp" => Ok(TableDef {
+                    name: "partsupp".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "ps_partkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "ps_suppkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "ps_supplycost".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "ps_availqty".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/partsupp.parquet"),
+                    },
+                }),
+                "customer" => Ok(TableDef {
+                    name: "customer".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "c_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "c_acctbal".to_string(),
+                            data_type: arrow::datatypes::DataType::Float64,
+                            nullable: true,
+                        },
+                        ColumnDef {
+                            name: "c_phone".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/customer.parquet"),
+                    },
+                }),
+                "nation" => Ok(TableDef {
+                    name: "nation".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "n_nationkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "n_name".to_string(),
+                            data_type: arrow::datatypes::DataType::Utf8,
+                            nullable: true,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/nation.parquet"),
+                    },
+                }),
+                _ => Err(format!("table not found: {table}")),
+            }
+        }
+    }
+
+    fn parse_and_analyze(sql: &str) -> Result<ResolvedQuery, String> {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        let stmts = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .map_err(|e| format!("parse error: {e}"))?;
+        let stmt = stmts.into_iter().next().ok_or("empty SQL")?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => return Err("expected a query".into()),
+        };
+        let (resolved, _registry) = analyze(&query, &TestCatalog, "default")?;
+        Ok(resolved)
+    }
+
+    /// Helper to check that a Relation tree contains a JOIN of a given kind.
+    fn has_join_kind(rel: &Relation, kind: JoinKind) -> bool {
+        match rel {
+            Relation::Join(jr) => {
+                jr.join_type == kind
+                    || has_join_kind(&jr.left, kind)
+                    || has_join_kind(&jr.right, kind)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn exists_subquery_rewrites_to_left_semi_join() {
+        let sql = "SELECT o_orderpriority, count(*) FROM orders \
+                    WHERE exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey) \
+                    GROUP BY o_orderpriority";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "EXISTS should be rewritten to LEFT SEMI JOIN, got: {from:?}"
+            );
+            // The placeholder should be removed from the filter
+            assert!(
+                sel.filter.is_none() || !filter_has_placeholder(&sel.filter),
+                "filter should not contain SubqueryPlaceholder"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn not_exists_subquery_rewrites_to_left_anti_join() {
+        let sql = "SELECT o_orderpriority FROM orders \
+                    WHERE not exists (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftAnti),
+                "NOT EXISTS should be rewritten to LEFT ANTI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn in_subquery_rewrites_to_left_semi_join() {
+        let sql = "SELECT o_orderkey FROM orders \
+                    WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "IN should be rewritten to LEFT SEMI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn not_in_subquery_rewrites_to_left_anti_join() {
+        let sql = "SELECT s_suppkey FROM supplier \
+                    WHERE s_suppkey NOT IN (SELECT ps_suppkey FROM partsupp)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftAnti),
+                "NOT IN should be rewritten to LEFT ANTI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn uncorrelated_scalar_subquery_rewrites_to_cross_join() {
+        let sql = "SELECT c_custkey FROM customer \
+                    WHERE c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::Cross),
+                "uncorrelated scalar subquery should be rewritten to CROSS JOIN, got: {from:?}"
+            );
+            // The filter should still exist (the comparison) but no placeholder
+            assert!(
+                sel.filter.is_some(),
+                "filter should still contain the comparison"
+            );
+            assert!(
+                !filter_has_placeholder(&sel.filter),
+                "filter should not contain SubqueryPlaceholder"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn correlated_scalar_subquery_rewrites_to_left_join() {
+        let sql = "SELECT l_orderkey FROM lineitem, part \
+                    WHERE p_partkey = l_partkey \
+                    AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftOuter),
+                "correlated scalar subquery should be rewritten to LEFT OUTER JOIN, got: {from:?}"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn scalar_subquery_in_having_rewrites_to_cross_join() {
+        let sql = "SELECT ps_partkey, sum(ps_supplycost) as value FROM partsupp \
+                    GROUP BY ps_partkey \
+                    HAVING sum(ps_supplycost) > (SELECT sum(ps_supplycost) * 0.0001 FROM partsupp)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::Cross),
+                "scalar subquery in HAVING should be rewritten to CROSS JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn multiple_subqueries_exists_and_not_exists() {
+        // q21 pattern: EXISTS + NOT EXISTS in the same WHERE
+        let sql = "SELECT s_name FROM supplier, lineitem l1, orders, nation \
+                    WHERE s_suppkey = l1.l_suppkey \
+                    AND o_orderkey = l1.l_orderkey \
+                    AND exists (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey) \
+                    AND not exists (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "EXISTS should produce LEFT SEMI JOIN"
+            );
+            assert!(
+                has_join_kind(from, JoinKind::LeftAnti),
+                "NOT EXISTS should produce LEFT ANTI JOIN"
+            );
+            assert!(
+                !filter_has_placeholder(&sel.filter),
+                "filter should not contain SubqueryPlaceholder"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn subquery_in_from_derived_table() {
+        // q22 pattern: subquery inside a derived table in FROM
+        let sql = "SELECT cntrycode FROM \
+                    (SELECT substring(c_phone, 1, 2) as cntrycode, c_acctbal FROM customer \
+                     WHERE c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00)) as custsale";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        // The subquery in the derived table should be rewritten to a CROSS JOIN
+        // within the derived table's ResolvedQuery
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn in_subquery_with_group_by_having() {
+        // q18 pattern: IN subquery with GROUP BY and HAVING
+        let sql = "SELECT o_orderkey FROM orders \
+                    WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 315)";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "IN subquery should be rewritten to LEFT SEMI JOIN"
+            );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    fn filter_has_placeholder(filter: &Option<TypedExpr>) -> bool {
+        match filter {
+            Some(expr) => expr_has_placeholder(expr),
+            None => false,
+        }
+    }
+
+    fn expr_has_placeholder(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            ExprKind::SubqueryPlaceholder { .. } => true,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_placeholder(left) || expr_has_placeholder(right)
+            }
+            ExprKind::UnaryOp { expr, .. } => expr_has_placeholder(expr),
+            ExprKind::Nested(inner) => expr_has_placeholder(inner),
+            _ => false,
+        }
+    }
+
+    /// Deep check for SubqueryPlaceholder in any expression node.
+    fn expr_has_placeholder_deep(expr: &TypedExpr) -> bool {
+        match &expr.kind {
+            ExprKind::SubqueryPlaceholder { .. } => true,
+            ExprKind::BinaryOp { left, right, .. } => {
+                expr_has_placeholder_deep(left) || expr_has_placeholder_deep(right)
+            }
+            ExprKind::UnaryOp { expr, .. } => expr_has_placeholder_deep(expr),
+            ExprKind::Nested(inner) => expr_has_placeholder_deep(inner),
+            ExprKind::FunctionCall { args, .. } | ExprKind::AggregateCall { args, .. } => {
+                args.iter().any(expr_has_placeholder_deep)
+            }
+            ExprKind::Cast { expr, .. } | ExprKind::IsNull { expr, .. } => {
+                expr_has_placeholder_deep(expr)
+            }
+            ExprKind::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                operand
+                    .as_ref()
+                    .map_or(false, |o| expr_has_placeholder_deep(o))
+                    || when_then
+                        .iter()
+                        .any(|(w, t)| expr_has_placeholder_deep(w) || expr_has_placeholder_deep(t))
+                    || else_expr
+                        .as_ref()
+                        .map_or(false, |e| expr_has_placeholder_deep(e))
+            }
+            ExprKind::Between {
+                expr, low, high, ..
+            } => {
+                expr_has_placeholder_deep(expr)
+                    || expr_has_placeholder_deep(low)
+                    || expr_has_placeholder_deep(high)
+            }
+            ExprKind::Like { expr, pattern, .. } => {
+                expr_has_placeholder_deep(expr) || expr_has_placeholder_deep(pattern)
+            }
+            ExprKind::InList { expr, list, .. } => {
+                expr_has_placeholder_deep(expr) || list.iter().any(expr_has_placeholder_deep)
+            }
+            ExprKind::IsTruthValue { expr, .. } => expr_has_placeholder_deep(expr),
+            ExprKind::WindowCall { args, .. } => args.iter().any(expr_has_placeholder_deep),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn test_table_alias_qualified_reference() {
+        // Simplified q3 pattern: table alias with qualified reference
+        let sql = "SELECT o.o_orderkey FROM orders o WHERE o.o_custkey > 100";
+        let resolved = parse_and_analyze(sql).expect("table alias qualified ref should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_cte_with_alias() {
+        // Simplified q1 pattern: CTE with alias
+        let sql = "WITH order_totals AS (SELECT o_orderkey as ok, o_totalprice as total FROM orders) \
+                   SELECT t1.ok FROM order_totals t1 WHERE t1.total > 100";
+        let resolved = parse_and_analyze(sql).expect("CTE with alias should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_cte_with_comma_join_and_correlated_subquery() {
+        // Closer to q1 pattern: CTE with comma-join and correlated subquery
+        let sql = "WITH order_totals AS (\
+                     SELECT o_orderkey as ok, o_custkey as ck, o_totalprice as total FROM orders\
+                   ) \
+                   SELECT t1.ok FROM order_totals t1, customer \
+                   WHERE t1.total > (\
+                     SELECT avg(t2.total) FROM order_totals t2 WHERE t1.ck = t2.ck\
+                   ) AND t1.ck = c_custkey";
+        let resolved = parse_and_analyze(sql)
+            .expect("CTE with comma-join and correlated subquery should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_comma_join_multiple_aliases() {
+        // Simplified q3 pattern: comma-join with multiple table aliases
+        let sql = "SELECT o.o_orderkey, l.l_partkey \
+                   FROM orders o, lineitem l \
+                   WHERE o.o_orderkey = l.l_orderkey \
+                   GROUP BY o.o_orderkey, l.l_partkey";
+        let resolved =
+            parse_and_analyze(sql).expect("comma-join with multiple aliases should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_scalar_subquery_in_projection() {
+        // q9 pattern: scalar subqueries in projection (SELECT list), not in WHERE
+        let sql = "SELECT (SELECT count(*) FROM orders) as total_orders FROM lineitem \
+                   WHERE l_orderkey = 1";
+        let resolved = parse_and_analyze(sql).expect("scalar subquery in projection should work");
+        assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_case_with_scalar_subqueries_in_projection() {
+        // q9 pattern: CASE WHEN with scalar subqueries in projection
+        let sql = "SELECT CASE WHEN (SELECT count(*) FROM orders) > 100 \
+                          THEN (SELECT avg(o_totalprice) FROM orders) \
+                          ELSE (SELECT avg(o_totalprice) FROM orders WHERE o_totalprice > 0) \
+                   END as bucket1 \
+                   FROM lineitem WHERE l_orderkey = 1";
+        let resolved =
+            parse_and_analyze(sql).expect("CASE with scalar subqueries in projection should work");
+        assert!(!resolved.output_columns.is_empty());
+        // Verify that no SubqueryPlaceholder remains in the projection
+        if let QueryBody::Select(sel) = &resolved.body {
+            for item in &sel.projection {
+                assert!(
+                    !expr_has_placeholder_deep(&item.expr),
+                    "projection should not contain SubqueryPlaceholder after rewriting: {:?}",
+                    item.expr
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_group_by_rollup() {
+        // q5 pattern: GROUP BY ROLLUP(a, b)
+        let sql = "SELECT o_orderstatus, o_orderpriority, count(*) as cnt \
+                   FROM orders \
+                   GROUP BY ROLLUP(o_orderstatus, o_orderpriority)";
+        let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP should work");
+        assert!(!resolved.output_columns.is_empty());
+        // ROLLUP(a, b) should produce a single Select with RepeatInfo containing
+        // 3 levels: (a,b), (a), ()
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo");
+            // 3 levels for 2 rollup dimensions
+            assert_eq!(
+                repeat.repeat_column_ref_list.len(),
+                3,
+                "ROLLUP(a,b) should have 3 levels"
+            );
+            // Level 0: both active
+            assert_eq!(repeat.repeat_column_ref_list[0].len(), 2);
+            // Level 1: only first active
+            assert_eq!(repeat.repeat_column_ref_list[1].len(), 1);
+            // Level 2: none active
+            assert_eq!(repeat.repeat_column_ref_list[2].len(), 0);
+
+            // Grouping IDs
+            assert_eq!(repeat.grouping_ids[0], 0b00); // both active
+            assert_eq!(repeat.grouping_ids[1], 0b10); // b NULLed (bit 1)
+            assert_eq!(repeat.grouping_ids[2], 0b11); // both NULLed
+
+            // All rollup columns
+            assert_eq!(repeat.all_rollup_columns.len(), 2);
+        } else {
+            panic!(
+                "ROLLUP should produce a Select with RepeatInfo, got: {:?}",
+                std::mem::discriminant(&resolved.body)
             );
         }
     }
 
-    Ok(BoundQuery {
-        scan_columns,
-        output_columns,
-        predicate,
-        needs_project,
-    })
-}
-
-fn expand_projection(
-    projection: &[ProjectionItem],
-    columns: &[ColumnDef],
-    column_by_name: &HashMap<String, usize>,
-) -> Result<Vec<usize>, String> {
-    match projection {
-        [ProjectionItem::Wildcard] => Ok((0..columns.len()).collect()),
-        _ => projection
-            .iter()
-            .map(|item| match item {
-                ProjectionItem::Wildcard => {
-                    Err("wildcard projection cannot be combined with explicit columns".to_string())
-                }
-                ProjectionItem::Column(column) => resolve_column_index(column, column_by_name),
-            })
-            .collect(),
+    #[test]
+    fn test_group_by_rollup_output_columns() {
+        // Verify ROLLUP preserves output column structure
+        let sql = "SELECT o_orderstatus as status, count(*) as cnt \
+                   FROM orders \
+                   GROUP BY ROLLUP(o_orderstatus)";
+        let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP should work");
+        assert_eq!(resolved.output_columns.len(), 2);
+        assert_eq!(resolved.output_columns[0].name, "status");
+        assert_eq!(resolved.output_columns[1].name, "cnt");
+        // Also verify RepeatInfo is present
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo");
+            assert_eq!(
+                repeat.repeat_column_ref_list.len(),
+                2,
+                "ROLLUP(a) should have 2 levels"
+            );
+            assert_eq!(repeat.grouping_ids[0], 0b0); // active
+            assert_eq!(repeat.grouping_ids[1], 0b1); // NULLed
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
     }
-}
 
-fn resolve_column_index(
-    column: &ColumnRef,
-    column_by_name: &HashMap<String, usize>,
-) -> Result<usize, String> {
-    let name = normalize_identifier(&column.name)?;
-    column_by_name
-        .get(&name)
-        .copied()
-        .ok_or_else(|| format!("unknown column: {}", column.name))
-}
-
-fn ensure_scan_column(
-    scan_columns: &mut Vec<BoundScanColumn>,
-    scan_index_by_source: &mut HashMap<usize, usize>,
-    column: &ColumnDef,
-    source_idx: usize,
-) -> Result<usize, String> {
-    if let Some(&scan_idx) = scan_index_by_source.get(&source_idx) {
-        return Ok(scan_idx);
-    }
-    let scan_idx = scan_columns.len();
-    scan_columns.push(BoundScanColumn {
-        name: column.name.clone(),
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
-        scan_slot_id: 0,
-    });
-    scan_index_by_source.insert(source_idx, scan_idx);
-    Ok(scan_idx)
-}
-
-fn bind_predicate(
-    expr: &Expr,
-    scan_columns: &mut Vec<BoundScanColumn>,
-    scan_index_by_source: &mut HashMap<usize, usize>,
-    columns: &[ColumnDef],
-    column_by_name: &HashMap<String, usize>,
-) -> Result<BoundPredicate, String> {
-    let Expr::Comparison { left, op, right } = expr;
-    let source_idx = resolve_column_index(left, column_by_name)?;
-    let column = &columns[source_idx];
-    validate_literal_for_column(right, &column.data_type)?;
-    let scan_column_index =
-        ensure_scan_column(scan_columns, scan_index_by_source, column, source_idx)?;
-    Ok(BoundPredicate {
-        scan_column_index,
-        op: *op,
-        literal: right.clone(),
-    })
-}
-
-fn validate_literal_for_column(literal: &Literal, column_type: &DataType) -> Result<(), String> {
-    match literal {
-        Literal::Null => Ok(()),
-        Literal::Bool(_) if matches!(column_type, DataType::Boolean) => Ok(()),
-        Literal::Int(_) => match column_type {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::Float32
-            | DataType::Float64 => Ok(()),
-            other => Err(format!(
-                "integer literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::Float(_) => match column_type {
-            DataType::Float32 | DataType::Float64 => Ok(()),
-            other => Err(format!(
-                "float literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::String(_) => match column_type {
-            DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Binary
-            | DataType::LargeBinary
-            | DataType::Date32
-            | DataType::Timestamp(_, _) => Ok(()),
-            other => Err(format!(
-                "string literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::Date(_) => match column_type {
-            DataType::Date32 | DataType::Timestamp(_, _) => Ok(()),
-            other => Err(format!(
-                "date literal is not supported for column type {:?}",
-                other
-            )),
-        },
-        Literal::Bool(_) => Err(format!(
-            "boolean literal is not supported for column type {:?}",
-            column_type
-        )),
+    #[test]
+    fn test_group_by_rollup_with_grouping() {
+        // Verify GROUPING() function calls are captured in RepeatInfo
+        let sql = "SELECT o_orderstatus, grouping(o_orderstatus) as g_status, count(*) as cnt \
+                   FROM orders \
+                   GROUP BY ROLLUP(o_orderstatus)";
+        let resolved = parse_and_analyze(sql).expect("GROUP BY ROLLUP with GROUPING should work");
+        assert_eq!(resolved.output_columns.len(), 3);
+        if let QueryBody::Select(ref sel) = resolved.body {
+            let repeat = sel
+                .repeat
+                .as_ref()
+                .expect("ROLLUP should produce RepeatInfo");
+            // GROUPING(o_orderstatus) should be recorded
+            assert_eq!(repeat.grouping_fn_args.len(), 1);
+            assert_eq!(repeat.grouping_fn_args[0].0, "g_status");
+            assert_eq!(repeat.grouping_fn_args[0].1, vec!["o_orderstatus"]);
+        } else {
+            panic!("expected Select body with RepeatInfo");
+        }
     }
 }

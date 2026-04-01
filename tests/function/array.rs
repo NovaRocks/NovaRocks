@@ -76,8 +76,7 @@ fn test_all_match_false_and_null() {
         },
         list_type.clone(),
     );
-    let out_false =
-        eval_array_function("all_match", &arena, expr, &[arr_false], &chunk).unwrap();
+    let out_false = eval_array_function("all_match", &arena, expr, &[arr_false], &chunk).unwrap();
     let out_false = out_false.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(!out_false.value(0));
 
@@ -88,8 +87,7 @@ fn test_all_match_false_and_null() {
         },
         list_type,
     );
-    let out_null =
-        eval_array_function("all_match", &arena, expr2, &[arr_null], &chunk).unwrap();
+    let out_null = eval_array_function("all_match", &arena, expr2, &[arr_null], &chunk).unwrap();
     let out_null = out_null.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out_null.is_null(0));
 }
@@ -144,8 +142,7 @@ fn test_any_match_false_and_null() {
         },
         list_type.clone(),
     );
-    let out_false =
-        eval_array_function("any_match", &arena, expr, &[arr_false], &chunk).unwrap();
+    let out_false = eval_array_function("any_match", &arena, expr, &[arr_false], &chunk).unwrap();
     let out_false = out_false.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(!out_false.value(0));
 
@@ -156,8 +153,7 @@ fn test_any_match_false_and_null() {
         },
         list_type,
     );
-    let out_null =
-        eval_array_function("any_match", &arena, expr2, &[arr_null], &chunk).unwrap();
+    let out_null = eval_array_function("any_match", &arena, expr2, &[arr_null], &chunk).unwrap();
     let out_null = out_null.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out_null.is_null(0));
 }
@@ -184,8 +180,7 @@ fn test_array_append_basic() {
     );
     let target = common::literal_i64(&mut arena, 3);
 
-    let out =
-        eval_array_function("array_append", &arena, expr, &[arr, target], &chunk).unwrap();
+    let out = eval_array_function("array_append", &arena, expr, &[arr, target], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.values(), &[1, 2, 3]);
@@ -210,8 +205,8 @@ fn test_array_append_null_array_and_null_element() {
     let v1 = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64);
     let arr = arena.push_typed(ExprNode::ArrayExpr { elements: vec![v1] }, list_type);
     let target_null = common::typed_null(&mut arena, DataType::Int64);
-    let out = eval_array_function("array_append", &arena, expr2, &[arr, target_null], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_append", &arena, expr2, &[arr, target_null], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.len(), 2);
@@ -387,8 +382,7 @@ fn test_array_contains_true_false() {
     );
     let target = common::literal_i64(&mut arena, 2);
 
-    let out =
-        eval_array_function("array_contains", &arena, expr, &[arr, target], &chunk).unwrap();
+    let out = eval_array_function("array_contains", &arena, expr, &[arr, target], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 }
@@ -438,8 +432,8 @@ fn test_array_contains_all_basic() {
         list_type,
     );
 
-    let out = eval_array_function("array_contains_all", &arena, expr, &[left, right], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_contains_all", &arena, expr, &[left, right], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 }
@@ -466,8 +460,8 @@ fn test_array_contains_all_with_null_element() {
         list_type,
     );
 
-    let out = eval_array_function("array_contains_all", &arena, expr, &[left, right], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_contains_all", &arena, expr, &[left, right], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 }
@@ -500,8 +494,8 @@ fn test_array_contains_seq_basic() {
         list_type,
     );
 
-    let out = eval_array_function("array_contains_seq", &arena, expr, &[left, right], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_contains_seq", &arena, expr, &[left, right], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 }
@@ -527,8 +521,8 @@ fn test_array_contains_seq_with_nulls() {
         },
         list_type.clone(),
     );
-    let out = eval_array_function("array_contains_seq", &arena, expr, &[left, right], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_contains_seq", &arena, expr, &[left, right], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 
@@ -761,8 +755,7 @@ fn test_array_filter_basic() {
         filter_type,
     );
 
-    let out =
-        eval_array_function("array_filter", &arena, expr, &[src, filter], &chunk).unwrap();
+    let out = eval_array_function("array_filter", &arena, expr, &[src, filter], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.values(), &[1, 3]);
@@ -780,8 +773,7 @@ fn test_array_filter_filter_null_row_returns_empty() {
     let src = arena.push_typed(ExprNode::ArrayExpr { elements: vec![v1] }, src_type);
     let filter = common::typed_null(&mut arena, filter_type);
 
-    let out =
-        eval_array_function("array_filter", &arena, expr, &[src, filter], &chunk).unwrap();
+    let out = eval_array_function("array_filter", &arena, expr, &[src, filter], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<ListArray>().unwrap();
     assert_eq!(out.value_length(0), 0);
     assert!(!out.is_null(0));
@@ -888,8 +880,7 @@ fn test_array_generate_two_args_desc() {
     let start = common::literal_i64(&mut arena, 3);
     let stop = common::literal_i64(&mut arena, 1);
 
-    let out =
-        eval_array_function("array_generate", &arena, expr, &[start, stop], &chunk).unwrap();
+    let out = eval_array_function("array_generate", &arena, expr, &[start, stop], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.values(), &[3, 2, 1]);
@@ -905,8 +896,8 @@ fn test_array_generate_three_args_and_empty() {
     let stop = common::literal_i64(&mut arena, 5);
     let step = common::literal_i64(&mut arena, 2);
 
-    let out = eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_generate", &arena, expr, &[start, stop, step], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.values(), &[1, 3, 5]);
@@ -939,22 +930,16 @@ fn test_array_generate_date_with_unit_arg() {
     )));
     let expr = common::typed_null(&mut arena, list_type);
     let start = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Utf8(
-            "2025-10-01".to_string(),
-        )),
+        ExprNode::Literal(LiteralValue::Utf8("2025-10-01".to_string())),
         DataType::Utf8,
     );
     let stop = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Utf8(
-            "2025-10-05".to_string(),
-        )),
+        ExprNode::Literal(LiteralValue::Utf8("2025-10-05".to_string())),
         DataType::Utf8,
     );
     let step = common::literal_i64(&mut arena, 1);
     let unit = arena.push_typed(
-        ExprNode::Literal(LiteralValue::Utf8(
-            "day".to_string(),
-        )),
+        ExprNode::Literal(LiteralValue::Utf8("day".to_string())),
         DataType::Utf8,
     );
     let out = eval_array_function(
@@ -999,8 +984,7 @@ fn test_array_intersect_basic() {
         list_type,
     );
 
-    let out =
-        eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+    let out = eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.len(), 1);
@@ -1032,8 +1016,7 @@ fn test_array_intersect_keeps_shared_null_once() {
         list_type,
     );
 
-    let out =
-        eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+    let out = eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.len(), 2);
@@ -1068,8 +1051,7 @@ fn test_array_intersect_preserves_starrocks_hash_order() {
         list_type,
     );
 
-    let out =
-        eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+    let out = eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int16Array>().unwrap();
     assert_eq!(values.values(), &[300, 100]);
@@ -1145,8 +1127,7 @@ fn test_array_intersect_preserves_decimalv2_hash_order() {
         list_type,
     );
 
-    let out =
-        eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+    let out = eval_array_function("array_intersect", &arena, expr, &[arr1, arr2], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list
         .values()
@@ -1207,8 +1188,8 @@ fn test_array_join_replace_null() {
     let sep = arena.push(ExprNode::Literal(LiteralValue::Utf8("-".to_string())));
     let null_repl = arena.push(ExprNode::Literal(LiteralValue::Utf8("X".to_string())));
 
-    let out = eval_array_function("array_join", &arena, expr, &[arr, sep, null_repl], &chunk)
-        .unwrap();
+    let out =
+        eval_array_function("array_join", &arena, expr, &[arr, sep, null_repl], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "1-X-3");
 }
@@ -1222,8 +1203,7 @@ fn test_array_length_basic() {
     let mut arena = ExprArena::default();
     let chunk = common::chunk_len_1();
     let expr = common::typed_null(&mut arena, DataType::Int32);
-    let values =
-        vec![arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64)];
+    let values = vec![arena.push_typed(ExprNode::Literal(LiteralValue::Int64(1)), DataType::Int64)];
     let arr = arena.push_typed(
         ExprNode::ArrayExpr { elements: values },
         DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
@@ -1502,8 +1482,7 @@ fn test_array_position_found() {
     );
     let target = common::literal_i64(&mut arena, 2);
 
-    let out =
-        eval_array_function("array_position", &arena, expr, &[arr, target], &chunk).unwrap();
+    let out = eval_array_function("array_position", &arena, expr, &[arr, target], &chunk).unwrap();
     let out = out
         .as_any()
         .downcast_ref::<arrow::array::Int32Array>()
@@ -1552,8 +1531,7 @@ fn test_array_remove_basic() {
     );
     let target = common::literal_i64(&mut arena, 2);
 
-    let out =
-        eval_array_function("array_remove", &arena, expr, &[arr, target], &chunk).unwrap();
+    let out = eval_array_function("array_remove", &arena, expr, &[arr, target], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.len(), 2);
@@ -1579,8 +1557,7 @@ fn test_array_remove_null_target_removes_null_elements() {
     );
     let target = common::typed_null(&mut arena, DataType::Int64);
 
-    let out =
-        eval_array_function("array_remove", &arena, expr, &[arr, target], &chunk).unwrap();
+    let out = eval_array_function("array_remove", &arena, expr, &[arr, target], &chunk).unwrap();
     let list = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = list.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.len(), 1);
@@ -1637,9 +1614,8 @@ fn test_array_repeat_null_behaviour() {
     let expr2 = common::typed_null(&mut arena, list_type);
     let source = common::literal_i64(&mut arena, 2);
     let count_null = common::typed_null(&mut arena, DataType::Int64);
-    let out2 =
-        eval_array_function("array_repeat", &arena, expr2, &[source, count_null], &chunk)
-            .expect("array_repeat should succeed");
+    let out2 = eval_array_function("array_repeat", &arena, expr2, &[source, count_null], &chunk)
+        .expect("array_repeat should succeed");
     let out2 = out2.as_any().downcast_ref::<ListArray>().unwrap();
     assert!(out2.is_null(0));
 }
@@ -1914,8 +1890,7 @@ fn test_array_sortby_key_null_keeps_source() {
     );
     let key_null = common::typed_null(&mut arena, key_type);
 
-    let out =
-        eval_array_function("array_sortby", &arena, expr, &[src, key_null], &chunk).unwrap();
+    let out = eval_array_function("array_sortby", &arena, expr, &[src, key_null], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<ListArray>().unwrap();
     let values = out.values().as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.values(), &[2, 1]);
@@ -1971,8 +1946,7 @@ fn test_array_sum_skip_null_and_all_null() {
         },
         list_type,
     );
-    let out2 =
-        eval_array_function("array_sum", &arena, expr2, &[arr_all_null], &chunk).unwrap();
+    let out2 = eval_array_function("array_sum", &arena, expr2, &[arr_all_null], &chunk).unwrap();
     let out2 = out2.as_any().downcast_ref::<Int64Array>().unwrap();
     assert!(out2.is_null(0));
 }
@@ -2031,8 +2005,7 @@ fn test_arrays_overlap() {
         list_type,
     );
 
-    let out =
-        eval_array_function("arrays_overlap", &arena, expr, &[arr1, arr2], &chunk).unwrap();
+    let out = eval_array_function("arrays_overlap", &arena, expr, &[arr1, arr2], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 }

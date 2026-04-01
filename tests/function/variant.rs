@@ -17,18 +17,18 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::exec::expr::function::variant::{eval_variant_function, eval_variant_query};
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use novarocks::exec::expr::ExprId;
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::chunk::ChunkSchema;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks::common::ids::SlotId;
+use novarocks::exec::chunk::Chunk;
+use novarocks::exec::chunk::ChunkSchema;
+use novarocks::exec::expr::ExprId;
+use novarocks::exec::expr::function::FunctionKind;
+use novarocks::exec::expr::function::variant::{eval_variant_function, eval_variant_query};
+use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -52,10 +52,12 @@ fn variant_primitive_serialized(type_id: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 fn make_variant_chunk(variant_bytes: Vec<u8>) -> (Chunk, ExprId, ExprArena) {
-    let variant_arr = Arc::new(LargeBinaryArray::from(vec![Some(variant_bytes.as_slice())])) as ArrayRef;
+    let variant_arr =
+        Arc::new(LargeBinaryArray::from(vec![Some(variant_bytes.as_slice())])) as ArrayRef;
     let variant_type = DataType::LargeBinary;
     let field = Field::new("v", variant_type.clone(), true);
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
+    let batch =
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![variant_arr]).unwrap();
     let chunk = {
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
@@ -117,7 +119,8 @@ fn test_get_variant_bool() {
     let (chunk, arg0, mut arena) = make_variant_chunk(variant);
     let arg1 = arena.push(ExprNode::Literal(LiteralValue::Utf8("$".to_string())));
     let expr = common::typed_null(&mut arena, DataType::Boolean);
-    let out = eval_variant_function("get_variant_bool", &arena, expr, &[arg0, arg1], &chunk).unwrap();
+    let out =
+        eval_variant_function("get_variant_bool", &arena, expr, &[arg0, arg1], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
     assert!(out.value(0));
 }
@@ -128,7 +131,8 @@ fn test_get_variant_int() {
     let (chunk, arg0, mut arena) = make_variant_chunk(variant);
     let arg1 = arena.push(ExprNode::Literal(LiteralValue::Utf8("$".to_string())));
     let expr = common::typed_null(&mut arena, DataType::Int64);
-    let out = eval_variant_function("get_variant_int", &arena, expr, &[arg0, arg1], &chunk).unwrap();
+    let out =
+        eval_variant_function("get_variant_int", &arena, expr, &[arg0, arg1], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(out.value(0), 123);
 }
@@ -140,7 +144,8 @@ fn test_get_variant_double() {
     let (chunk, arg0, mut arena) = make_variant_chunk(variant);
     let arg1 = arena.push(ExprNode::Literal(LiteralValue::Utf8("$".to_string())));
     let expr = common::typed_null(&mut arena, DataType::Float64);
-    let out = eval_variant_function("get_variant_double", &arena, expr, &[arg0, arg1], &chunk).unwrap();
+    let out =
+        eval_variant_function("get_variant_double", &arena, expr, &[arg0, arg1], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
     assert!((out.value(0) - 3.5).abs() < 1e-12);
 }
@@ -151,7 +156,8 @@ fn test_get_variant_string() {
     let (chunk, arg0, mut arena) = make_variant_chunk(variant);
     let arg1 = arena.push(ExprNode::Literal(LiteralValue::Utf8("$".to_string())));
     let expr = common::typed_null(&mut arena, DataType::Utf8);
-    let out = eval_variant_function("get_variant_string", &arena, expr, &[arg0, arg1], &chunk).unwrap();
+    let out =
+        eval_variant_function("get_variant_string", &arena, expr, &[arg0, arg1], &chunk).unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "123");
 }
@@ -163,8 +169,7 @@ fn test_json_query_quotes_string_and_null_for_missing() {
         Some("{\"age\":23}"),
     ])) as ArrayRef;
     let field = Field::new("j", DataType::Utf8, true);
-    let batch =
-        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![json_arr]).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![json_arr]).unwrap();
     let chunk = {
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),

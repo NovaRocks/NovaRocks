@@ -95,8 +95,8 @@ fn encode_scalar_value(value: &AggScalarValue, buf: &mut Vec<u8>) -> Result<(), 
         }
         AggScalarValue::Struct(items) => {
             buf.push(8);
-            let len =
-                u32::try_from(items.len()).map_err(|_| "max_by/min_by struct too large".to_string())?;
+            let len = u32::try_from(items.len())
+                .map_err(|_| "max_by/min_by struct too large".to_string())?;
             buf.extend_from_slice(&len.to_le_bytes());
             for item in items {
                 encode_scalar(item, buf)?;
@@ -104,8 +104,8 @@ fn encode_scalar_value(value: &AggScalarValue, buf: &mut Vec<u8>) -> Result<(), 
         }
         AggScalarValue::Map(items) => {
             buf.push(9);
-            let len =
-                u32::try_from(items.len()).map_err(|_| "max_by/min_by map too large".to_string())?;
+            let len = u32::try_from(items.len())
+                .map_err(|_| "max_by/min_by map too large".to_string())?;
             buf.extend_from_slice(&len.to_le_bytes());
             for (key, value) in items {
                 encode_scalar(key, buf)?;
@@ -114,8 +114,8 @@ fn encode_scalar_value(value: &AggScalarValue, buf: &mut Vec<u8>) -> Result<(), 
         }
         AggScalarValue::List(items) => {
             buf.push(10);
-            let len =
-                u32::try_from(items.len()).map_err(|_| "max_by/min_by list too large".to_string())?;
+            let len = u32::try_from(items.len())
+                .map_err(|_| "max_by/min_by list too large".to_string())?;
             buf.extend_from_slice(&len.to_le_bytes());
             for item in items {
                 encode_scalar(item, buf)?;

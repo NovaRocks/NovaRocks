@@ -150,4 +150,3 @@ pub fn eval_translate(
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
-

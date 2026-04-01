@@ -1,4 +1,3 @@
--- query 86
 select   
     sum(ws_net_paid) as total_sum
    ,i_category

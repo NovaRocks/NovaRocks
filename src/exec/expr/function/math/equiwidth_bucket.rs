@@ -119,4 +119,3 @@ pub fn eval_equiwidth_bucket(
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
     super::common::cast_output(out, arena.data_type(expr))
 }
-

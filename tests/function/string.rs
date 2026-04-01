@@ -17,15 +17,15 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::exec::expr::function::string::{eval_split, eval_string_function};
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use std::sync::Arc;
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray,
     MapArray, StringArray, StructArray,
 };
 use arrow::datatypes::DataType;
+use novarocks::exec::expr::function::FunctionKind;
+use novarocks::exec::expr::function::string::{eval_split, eval_string_function};
+use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Helpers copied from string/test_utils.rs (updated to use novarocks:: prefix)
@@ -474,13 +474,13 @@ fn test_concat_ws_logic() {
 
 #[test]
 fn crc32_utf8_values_match_zlib() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::chunk::ChunkSchema;
     use std::sync::Arc;
-    use arrow::array::Int64Array;
-    use arrow::datatypes::{Field, Schema};
-    use arrow::record_batch::RecordBatch;
 
     let mut arena = ExprArena::default();
     let arg = arena.push_typed(ExprNode::SlotId(SlotId(1)), DataType::Utf8);
@@ -490,11 +490,9 @@ fn crc32_utf8_values_match_zlib() {
     let schema = Arc::new(Schema::new(vec![field]));
     let batch = RecordBatch::try_new(schema, vec![input]).expect("record batch");
     let chunk = {
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId(1)],
-        )
-        .expect("chunk schema");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId(1)])
+                .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     };
 
@@ -524,7 +522,14 @@ fn test_field_null_first_argument_with_null_type_returns_zero() {
     let first = arena.push_typed(ExprNode::Literal(LiteralValue::Null), DataType::Null);
     let a = common::literal_string(&mut arena, "a");
     let b = common::literal_string(&mut arena, "b");
-    let out = eval_string_function("field", &arena, expr, &[first, a, b], &common::chunk_len_1()).unwrap();
+    let out = eval_string_function(
+        "field",
+        &arena,
+        expr,
+        &[first, a, b],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
     assert_eq!(out.value(0), 0);
 }
@@ -651,7 +656,14 @@ fn test_strpos_impl_logic() {
     let haystack = common::literal_string(&mut arena, "abcabc");
     let needle = common::literal_string(&mut arena, "abc");
     let instance = common::literal_i64(&mut arena, 2);
-    let out = eval_string_function("strpos", &arena, expr_i64, &[haystack, needle, instance], &chunk).unwrap();
+    let out = eval_string_function(
+        "strpos",
+        &arena,
+        expr_i64,
+        &[haystack, needle, instance],
+        &chunk,
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
     assert_eq!(out.value(0), 4);
 }
@@ -671,12 +683,12 @@ fn test_money_format_logic() {
 
 #[test]
 fn murmur_hash3_32_known_vectors() {
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::chunk::ChunkSchema;
     use std::sync::Arc;
-    use arrow::datatypes::{Field, Schema};
-    use arrow::record_batch::RecordBatch;
 
     let mut arena = ExprArena::default();
     let arg0 = arena.push_typed(ExprNode::SlotId(SlotId(1)), DataType::Utf8);
@@ -698,7 +710,8 @@ fn murmur_hash3_32_known_vectors() {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     };
 
-    let out_single = eval_string_function("murmur_hash3_32", &arena, arg0, &[arg0], &chunk).expect("eval single");
+    let out_single = eval_string_function("murmur_hash3_32", &arena, arg0, &[arg0], &chunk)
+        .expect("eval single");
     let out_single = out_single
         .as_any()
         .downcast_ref::<Int32Array>()
@@ -706,7 +719,8 @@ fn murmur_hash3_32_known_vectors() {
     assert_eq!(out_single.value(0), -1_948_194_659);
     assert_eq!(out_single.value(1), 1_321_743_225);
 
-    let out_multi = eval_string_function("murmur_hash3_32", &arena, arg0, &[arg0, arg1], &chunk).expect("eval multi");
+    let out_multi = eval_string_function("murmur_hash3_32", &arena, arg0, &[arg0, arg1], &chunk)
+        .expect("eval multi");
     let out_multi = out_multi
         .as_any()
         .downcast_ref::<Int32Array>()
@@ -717,12 +731,12 @@ fn murmur_hash3_32_known_vectors() {
 
 #[test]
 fn murmur_hash3_32_null_propagation() {
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::Chunk;
     use novarocks::exec::chunk::ChunkSchema;
     use std::sync::Arc;
-    use arrow::datatypes::{Field, Schema};
-    use arrow::record_batch::RecordBatch;
 
     let mut arena = ExprArena::default();
     let arg0 = arena.push_typed(ExprNode::SlotId(SlotId(1)), DataType::Utf8);
@@ -744,7 +758,8 @@ fn murmur_hash3_32_null_propagation() {
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     };
 
-    let out = eval_string_function("murmur_hash3_32", &arena, arg0, &[arg0, arg1], &chunk).expect("eval");
+    let out =
+        eval_string_function("murmur_hash3_32", &arena, arg0, &[arg0, arg1], &chunk).expect("eval");
     let out = out
         .as_any()
         .downcast_ref::<Int32Array>()
@@ -765,7 +780,14 @@ fn test_ngram_search_basic() {
     let haystack = common::literal_string(&mut arena, "chinese");
     let needle = common::literal_string(&mut arena, "china");
     let gram_num = common::literal_i64(&mut arena, 4);
-    let out = eval_string_function("ngram_search", &arena, expr, &[haystack, needle, gram_num], &chunk).unwrap();
+    let out = eval_string_function(
+        "ngram_search",
+        &arena,
+        expr,
+        &[haystack, needle, gram_num],
+        &chunk,
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
     assert_eq!(out.value(0), 0.5);
 }
@@ -852,7 +874,14 @@ fn test_regexp_count_special_pattern_returns_zero() {
     let input = common::literal_string(&mut arena, "test string");
     let pat = common::literal_string(&mut arena, "a{,}");
 
-    let out = eval_string_function("regexp_count", &arena, expr, &[input, pat], &common::chunk_len_1()).unwrap();
+    let out = eval_string_function(
+        "regexp_count",
+        &arena,
+        expr,
+        &[input, pat],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(out.value(0), 0);
 }
@@ -874,7 +903,14 @@ fn test_regexp_extract_no_match_returns_empty_string() {
     let pat = common::literal_string(&mut arena, "bar=([0-9]+)");
     let idx = common::literal_i64(&mut arena, 1);
 
-    let out = eval_string_function("regexp_extract", &arena, expr, &[input, pat, idx], &common::chunk_len_1()).unwrap();
+    let out = eval_string_function(
+        "regexp_extract",
+        &arena,
+        expr,
+        &[input, pat, idx],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert!(!out.is_null(0));
     assert_eq!(out.value(0), "");
@@ -897,7 +933,14 @@ fn test_regexp_extract_all_out_of_range_group_returns_empty_json_array() {
     let pat = common::literal_string(&mut arena, "([[:lower:]]+)C([[:lower:]]+)");
     let idx = common::literal_i64(&mut arena, 3);
 
-    let out = eval_string_function("regexp_extract_all", &arena, expr, &[input, pat, idx], &common::chunk_len_1()).unwrap();
+    let out = eval_string_function(
+        "regexp_extract_all",
+        &arena,
+        expr,
+        &[input, pat, idx],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<StringArray>().unwrap();
     assert_eq!(out.value(0), "[]");
 }
@@ -920,7 +963,14 @@ fn test_regexp_position_unicode_and_occurrence() {
     let start = common::literal_i64(&mut arena, 10);
     let occ = common::literal_i64(&mut arena, 2);
 
-    let out = eval_string_function("regexp_position", &arena, expr, &[input, pat, start, occ], &common::chunk_len_1()).unwrap();
+    let out = eval_string_function(
+        "regexp_position",
+        &arena,
+        expr,
+        &[input, pat, start, occ],
+        &common::chunk_len_1(),
+    )
+    .unwrap();
     let out = out.as_any().downcast_ref::<Int32Array>().unwrap();
     assert_eq!(out.value(0), -1);
 }
@@ -1068,12 +1118,14 @@ fn test_unhex_invalid_input_returns_empty_string() {
     let bad = common::literal_string(&mut arena, "ZZ");
     let odd = common::literal_string(&mut arena, "F");
 
-    let out_bad = eval_string_function("unhex", &arena, expr, &[bad], &common::chunk_len_1()).unwrap();
+    let out_bad =
+        eval_string_function("unhex", &arena, expr, &[bad], &common::chunk_len_1()).unwrap();
     let out_bad = out_bad.as_any().downcast_ref::<BinaryArray>().unwrap();
     assert!(!out_bad.is_null(0));
     assert_eq!(out_bad.value(0), b"");
 
-    let out_odd = eval_string_function("unhex", &arena, expr, &[odd], &common::chunk_len_1()).unwrap();
+    let out_odd =
+        eval_string_function("unhex", &arena, expr, &[odd], &common::chunk_len_1()).unwrap();
     let out_odd = out_odd.as_any().downcast_ref::<BinaryArray>().unwrap();
     assert!(!out_odd.is_null(0));
     assert_eq!(out_odd.value(0), b"");
@@ -1084,20 +1136,18 @@ fn test_unhex_invalid_input_returns_empty_string() {
 // ---------------------------------------------------------------------------
 
 fn create_test_chunk_string(values: Vec<String>) -> novarocks::exec::chunk::Chunk {
+    use arrow::datatypes::{Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use novarocks::common::ids::SlotId;
     use novarocks::exec::chunk::ChunkSchema;
     use std::sync::Arc;
-    use arrow::datatypes::{Field, Schema};
-    use arrow::record_batch::RecordBatch;
 
     let array = Arc::new(StringArray::from(values)) as ArrayRef;
     let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Utf8, false)]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     novarocks::exec::chunk::Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -1252,7 +1302,8 @@ fn test_url_encode_decode_logic() {
     );
 
     let encoded_expr = common::literal_string(&mut arena, &encoded);
-    let decoded_arr = eval_string_function("url_decode", &arena, expr_str, &[encoded_expr], &chunk).unwrap();
+    let decoded_arr =
+        eval_string_function("url_decode", &arena, expr_str, &[encoded_expr], &chunk).unwrap();
     let decoded = decoded_arr
         .as_any()
         .downcast_ref::<StringArray>()
@@ -1296,13 +1347,13 @@ fn test_initcap_non_space_delimiters() {
 
     let cases: &[(&str, &str)] = &[
         ("one,two.three;four", "One,Two.Three;Four"),
-        ("alpha-beta_gamma",   "Alpha-Beta_Gamma"),
-        ("1st place",          "1st Place"),
-        ("word1 word2",        "Word1 Word2"),
-        ("123abc456",          "123abc456"),
-        ("macDonald",          "Macdonald"),
-        ("hello world",        "Hello World"),
-        ("HELLO WORLD",        "Hello World"),
+        ("alpha-beta_gamma", "Alpha-Beta_Gamma"),
+        ("1st place", "1st Place"),
+        ("word1 word2", "Word1 Word2"),
+        ("123abc456", "123abc456"),
+        ("macDonald", "Macdonald"),
+        ("hello world", "Hello World"),
+        ("HELLO WORLD", "Hello World"),
     ];
     for (input, expected) in cases {
         let s = common::literal_string(&mut arena, input);
@@ -1340,14 +1391,14 @@ fn test_raise_error_null_returns_null() {
     let out = eval_string_function("raise_error", &arena, expr_str, &[null_val], &chunk).unwrap();
     assert!(out.is_null(0));
 }
+use arrow::datatypes::{Field, Schema};
+use arrow::record_batch::RecordBatch;
 /// Integration tests for SUBSTRING/SUBSTR function.
 ///
 /// Tests verify that SUBSTRING properly extracts substrings from strings
 /// and aligns with StarRocks BE's substring behavior.
 use novarocks::common::ids::SlotId;
 use novarocks::exec::chunk::Chunk;
-use arrow::datatypes::{Field, Schema};
-use arrow::record_batch::RecordBatch;
 
 /// Helper function to create a test chunk with a dummy column
 fn create_test_chunk() -> Chunk {
@@ -1708,7 +1759,11 @@ fn test_split_unicode_and_empty_delimiter() {
 
     // empty delimiter splits into UTF-8 characters
     split_eq!("测隔试隔试", "", ["测", "隔", "试", "隔", "试"]);
-    split_eq!("测abc隔试隔试", "", ["测", "a", "b", "c", "隔", "试", "隔", "试"]);
+    split_eq!(
+        "测abc隔试隔试",
+        "",
+        ["测", "a", "b", "c", "隔", "试", "隔", "试"]
+    );
     split_eq!("a|b|c|d", "", ["a", "|", "b", "|", "c", "|", "d"]);
 
     // Chinese delimiter

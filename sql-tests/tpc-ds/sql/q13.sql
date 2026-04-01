@@ -1,4 +1,3 @@
--- query 13
 select avg(ss_quantity)
        ,avg(ss_ext_sales_price)
        ,avg(ss_ext_wholesale_cost)

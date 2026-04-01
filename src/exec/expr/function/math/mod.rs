@@ -37,8 +37,8 @@ mod unary_ops;
 mod vector_ops;
 
 pub use abs::eval_abs;
-pub use binary_ops::{eval_atan2, eval_fmod, eval_pow};
 pub use bin::eval_bin;
+pub use binary_ops::{eval_atan2, eval_fmod, eval_pow};
 pub use const_ops::{eval_e, eval_pi};
 pub use conv::eval_conv;
 pub use dispatch::{eval_math_function, metadata, register};
@@ -52,7 +52,7 @@ pub use sign::eval_sign;
 pub use truncate_ops::{eval_dround, eval_truncate};
 pub use unary_ops::{
     eval_acos, eval_asin, eval_atan, eval_cbrt, eval_ceil, eval_cos, eval_cot, eval_degress,
-    eval_dlog1, eval_exp, eval_floor, eval_ln, eval_log10, eval_log2, eval_positive, eval_radians,
+    eval_dlog1, eval_exp, eval_floor, eval_ln, eval_log2, eval_log10, eval_positive, eval_radians,
     eval_sin, eval_sqrt, eval_square, eval_tan,
 };
 pub use vector_ops::{eval_cosine_similarity, eval_cosine_similarity_norm, eval_l2_distance};

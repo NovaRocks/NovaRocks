@@ -1,4 +1,3 @@
--- query 89
 select  *
 from(
 select i_category, i_class, i_brand,

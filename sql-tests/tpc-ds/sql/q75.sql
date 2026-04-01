@@ -1,4 +1,3 @@
--- query 75
 WITH all_sales AS (
  SELECT d_year
        ,i_brand_id

@@ -17,21 +17,21 @@
 #![allow(unused_imports)]
 
 use crate::common;
-use novarocks::exec::expr::function::conditional::{
-    eval_assert_true, eval_coalesce, eval_if, eval_ifnull, eval_is_not_null, eval_is_null,
-    eval_nullif,
-};
-use novarocks::exec::expr::function::FunctionKind;
-use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use novarocks::exec::expr::ExprId;
-use novarocks::common::ids::SlotId;
-use novarocks::exec::chunk::Chunk;
-use novarocks::exec::chunk::ChunkSchema;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Int8Array, Int64Array, StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use novarocks::common::ids::SlotId;
+use novarocks::exec::chunk::Chunk;
+use novarocks::exec::chunk::ChunkSchema;
+use novarocks::exec::expr::ExprId;
+use novarocks::exec::expr::function::FunctionKind;
+use novarocks::exec::expr::function::conditional::{
+    eval_assert_true, eval_coalesce, eval_if, eval_ifnull, eval_is_not_null, eval_is_null,
+    eval_nullif,
+};
+use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -41,13 +41,10 @@ use std::sync::Arc;
 fn bool_chunk(values: Vec<Option<bool>>) -> Chunk {
     let field = Field::new("cond", DataType::Boolean, true);
     let schema = Arc::new(Schema::new(vec![field]));
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(values))]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(BooleanArray::from(values))]).unwrap();
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -55,11 +52,9 @@ fn create_test_chunk_int(values: Vec<Option<i64>>) -> Chunk {
     let array = Arc::new(Int64Array::from(values)) as ArrayRef;
     let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Int64, true)]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -67,11 +62,9 @@ fn create_test_chunk_string(values: Vec<Option<String>>) -> Chunk {
     let array = Arc::new(StringArray::from(values)) as ArrayRef;
     let schema = Arc::new(Schema::new(vec![Field::new("col0", DataType::Utf8, true)]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -269,11 +262,9 @@ fn chunk_int64_nullable(values: Vec<Option<i64>>) -> Chunk {
     let array = Arc::new(Int64Array::from(values)) as ArrayRef;
     let schema = Arc::new(Schema::new(vec![Field::new("c0", DataType::Int64, true)]));
     let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId::new(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -332,11 +323,9 @@ fn if_does_not_eagerly_eval_then_branch() {
     let options = RecordBatchOptions::new().with_row_count(Some(1));
     let batch = RecordBatch::try_new_with_options(schema, vec![], &options).unwrap();
     let chunk = {
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[],
-        )
-        .expect("chunk schema");
+        let chunk_schema =
+            ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[])
+                .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)
     };
 
@@ -380,9 +369,6 @@ fn if_does_not_eagerly_eval_then_branch() {
     );
 
     let result = arena.eval(if_expr, &chunk).unwrap();
-    let arr = result
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .unwrap();
+    let arr = result.as_any().downcast_ref::<Decimal128Array>().unwrap();
     assert_eq!(arr.value(0), 100);
 }

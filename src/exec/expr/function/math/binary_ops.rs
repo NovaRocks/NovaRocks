@@ -78,4 +78,3 @@ pub fn eval_pow(
 ) -> Result<ArrayRef, String> {
     eval_binary_f64(arena, expr, args, chunk, |a, b| a.powf(b))
 }
-

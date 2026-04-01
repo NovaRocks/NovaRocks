@@ -17,16 +17,18 @@
 #![allow(unused_imports)]
 
 use crate::common;
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, StringArray,
+};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use novarocks::common::ids::SlotId;
+use novarocks::exec::chunk::{Chunk, ChunkSchema};
+use novarocks::exec::expr::function::FunctionKind;
 use novarocks::exec::expr::function::object::{
     eval_hll_hash, eval_object_function, eval_percentile_hash, eval_to_bitmap, register,
 };
-use novarocks::exec::expr::function::FunctionKind;
 use novarocks::exec::expr::{ExprArena, ExprNode, LiteralValue};
-use novarocks::exec::chunk::{Chunk, ChunkSchema};
-use novarocks::common::ids::SlotId;
-use arrow::array::{Array, ArrayRef, BinaryArray, BooleanArray, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -38,11 +40,9 @@ fn one_col_chunk(data_type: DataType, array: ArrayRef) -> Chunk {
     let field = Field::new("c1", data_type.clone(), true);
     let schema = Arc::new(Schema::new(vec![field]));
     let batch = RecordBatch::try_new(schema, vec![array]).expect("record batch");
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(),
-        &[SlotId(1)],
-    )
-    .expect("chunk schema");
+    let chunk_schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId(1)])
+            .expect("chunk schema");
     Chunk::new_with_chunk_schema(batch, chunk_schema)
 }
 

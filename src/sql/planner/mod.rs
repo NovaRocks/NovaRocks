@@ -1,984 +1,792 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+//! Logical Planner — converts [`ResolvedQuery`] into [`LogicalPlan`].
+//!
+//! This is a structural transformation that builds a relational algebra tree
+//! from the analyzed query IR.  A future optimizer would rewrite this tree
+//! before it reaches the Thrift emitter.
 
-use arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
-};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use crate::sql::cte::CTERegistry;
+use crate::sql::ir::*;
+use crate::sql::plan::*;
 
-use crate::common::types::UniqueId;
-use crate::descriptors;
-use crate::internal_service;
-use crate::opcodes;
-use crate::partitions;
-use crate::plan_nodes;
-use crate::runtime::result_buffer::{self, TryFetchResult};
-use crate::sql::analyzer::{BoundQuery, QuerySource};
-use crate::sql::optimizer::RelQueryPlan;
-use crate::sql::{CompareOp, Literal};
-use crate::types;
+// ---------------------------------------------------------------------------
+// Public entry
+// ---------------------------------------------------------------------------
 
-const STANDALONE_SCAN_TUPLE_ID: types::TTupleId = 1;
-const STANDALONE_PROJECT_TUPLE_ID: types::TTupleId = 2;
-const STANDALONE_PROJECT_NODE_ID: types::TPlanNodeId = 1;
-const STANDALONE_SCAN_NODE_ID: types::TPlanNodeId = 2;
+/// Plan a resolved query with shared CTE subtrees into a [`QueryPlan`].
+///
+/// Each CTE entry in the registry is planned independently into a
+/// [`CTEProducePlan`], and references in the main plan appear as
+/// [`LogicalPlan::CTEConsume`] leaf nodes.
+pub(crate) fn plan_query(
+    resolved: ResolvedQuery,
+    cte_registry: CTERegistry,
+) -> Result<QueryPlan, String> {
+    let output_columns = resolved.output_columns.clone();
+    let main_plan = plan(resolved)?;
 
-static NEXT_REQUEST_ID: AtomicI64 = AtomicI64::new(10_000);
-
-#[derive(Clone, Debug)]
-pub(crate) struct PlannedQueryColumn {
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PlannedQuery {
-    pub(crate) request: internal_service::TExecPlanFragmentParams,
-    pub(crate) columns: Vec<PlannedQueryColumn>,
-    pub(crate) order_by: Vec<crate::sql::ast::OrderByExpr>,
-}
-
-pub(crate) fn build_local_query_plan_fragment(plan: &RelQueryPlan) -> Result<PlannedQuery, String> {
-    let QuerySource::Local { table, resolved } = &plan.source else {
-        return Err("only local standalone queries can be lowered to thrift fragment".to_string());
-    };
-
-    let desc_tbl = build_descriptor_table(&plan.bound)?;
-    let fragment = build_fragment(table, &plan.bound)?;
-    let params = build_exec_params(table, STANDALONE_SCAN_NODE_ID)?;
-    let request = internal_service::TExecPlanFragmentParams::new(
-        internal_service::InternalServiceVersion::V1,
-        Some(fragment),
-        Some(desc_tbl),
-        Some(params),
-        None::<types::TNetworkAddress>,
-        None::<i32>,
-        None::<internal_service::TQueryGlobals>,
-        None::<internal_service::TQueryOptions>,
-        Some(false),
-        None::<types::TResourceInfo>,
-        None::<String>,
-        Some(resolved.database.clone()),
-        None::<i64>,
-        None::<internal_service::TLoadErrorHubInfo>,
-        Some(true),
-        Some(1),
-        None::<BTreeMap<types::TPlanNodeId, i32>>,
-        None::<crate::work_group::TWorkGroup>,
-        None::<bool>,
-        None::<i32>,
-        None::<bool>,
-        None::<bool>,
-        None::<internal_service::TAdaptiveDopParam>,
-        None::<i32>,
-        None::<internal_service::TPredicateTreeParams>,
-        None::<Vec<i32>>,
-    );
-    Ok(PlannedQuery {
-        request,
-        columns: plan
-            .bound
-            .output_columns
-            .iter()
-            .map(|column| PlannedQueryColumn {
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
+    // Plan each shared CTE subtree independently.
+    let cte_plans = cte_registry
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let cte_plan = plan(entry.resolved_query)?;
+            Ok(CTEProducePlan {
+                cte_id: entry.id,
+                plan: cte_plan,
+                output_columns: entry.output_columns,
             })
-            .collect(),
-        order_by: plan.order_by.clone(),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(QueryPlan {
+        cte_plans,
+        main_plan,
+        output_columns,
     })
 }
 
-pub(crate) fn collect_query_result(
-    finst_id: UniqueId,
-    columns: &[PlannedQueryColumn],
-) -> Result<RecordBatch, String> {
-    let mut rows = Vec::new();
-    loop {
-        match result_buffer::try_fetch(finst_id) {
-            TryFetchResult::Ready(fetch) if fetch.eos => break,
-            TryFetchResult::Ready(fetch) => rows.extend(fetch.result_batch.rows),
-            TryFetchResult::NotReady => std::thread::yield_now(),
-            TryFetchResult::Error(err) => return Err(err.message),
-        }
-    }
-    decode_mysql_text_rows(columns, &rows)
-}
+/// Convert a fully-analyzed query into a logical plan tree.
+pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
+    let mut body_plan = plan_body(resolved.body)?;
 
-fn decode_mysql_text_rows(
-    columns: &[PlannedQueryColumn],
-    rows: &[Vec<u8>],
-) -> Result<RecordBatch, String> {
-    let mut decoded_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        decoded_rows.push(parse_lenenc_row(row, columns.len())?);
-    }
+    // Wrap with Sort if ORDER BY is present.
+    if !resolved.order_by.is_empty() {
+        // If ORDER BY references columns not in the projection, we need to
+        // extend the project to include them (hidden columns) so the sort can
+        // reference them.  After sort, a top-level project strips them.
+        let needs_hidden =
+            has_non_projected_sort_columns(&resolved.order_by, &resolved.output_columns);
+        if needs_hidden {
+            // Collect extra columns needed by ORDER BY
+            let mut extra_items = Vec::new();
+            for sort_item in &resolved.order_by {
+                collect_extra_columns(&sort_item.expr, &resolved.output_columns, &mut extra_items);
+            }
 
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>(),
-    ));
+            // Extend the project node at the top of body_plan
+            if let LogicalPlan::Project(ref mut proj) = body_plan {
+                for extra in &extra_items {
+                    proj.items.push(extra.clone());
+                }
+            }
 
-    let arrays = columns
-        .iter()
-        .enumerate()
-        .map(|(idx, column)| decode_column_array(column, &decoded_rows, idx))
-        .collect::<Result<Vec<_>, _>>()?;
-    RecordBatch::try_new(schema, arrays)
-        .map_err(|e| format!("build standalone result batch failed: {e}"))
-}
+            // Sort with extended scope
+            body_plan = LogicalPlan::Sort(SortNode {
+                input: Box::new(body_plan),
+                items: resolved.order_by,
+            });
 
-fn decode_column_array(
-    column: &PlannedQueryColumn,
-    rows: &[Vec<Option<Vec<u8>>>],
-    column_idx: usize,
-) -> Result<ArrayRef, String> {
-    match &column.data_type {
-        DataType::Boolean => Ok(std::sync::Arc::new(BooleanArray::from(
-            rows.iter()
-                .map(|row| {
-                    row[column_idx]
-                        .as_ref()
-                        .map(|bytes| bytes.as_slice() == b"1")
-                })
-                .collect::<Vec<_>>(),
-        ))),
-        DataType::Int8 => Ok(std::sync::Arc::new(Int8Array::from(parse_numeric_column(
-            rows, column_idx, "TINYINT",
-        )?))),
-        DataType::Int16 => Ok(std::sync::Arc::new(Int16Array::from(parse_numeric_column(
-            rows, column_idx, "SMALLINT",
-        )?))),
-        DataType::Int32 => Ok(std::sync::Arc::new(Int32Array::from(parse_numeric_column(
-            rows, column_idx, "INT",
-        )?))),
-        DataType::Int64 => Ok(std::sync::Arc::new(Int64Array::from(parse_numeric_column(
-            rows, column_idx, "BIGINT",
-        )?))),
-        DataType::Float32 => Ok(std::sync::Arc::new(Float32Array::from(
-            parse_numeric_column(rows, column_idx, "FLOAT")?,
-        ))),
-        DataType::Float64 => Ok(std::sync::Arc::new(Float64Array::from(
-            parse_numeric_column(rows, column_idx, "DOUBLE")?,
-        ))),
-        DataType::Utf8 => Ok(std::sync::Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| {
-                    row[column_idx]
-                        .as_ref()
-                        .map(|bytes| String::from_utf8(bytes.clone()))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("decode UTF8 result failed: {e}"))?,
-        ))),
-        DataType::LargeUtf8 => Ok(std::sync::Arc::new(LargeStringArray::from(
-            rows.iter()
-                .map(|row| {
-                    row[column_idx]
-                        .as_ref()
-                        .map(|bytes| String::from_utf8(bytes.clone()))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("decode UTF8 result failed: {e}"))?,
-        ))),
-        DataType::Binary => Ok(std::sync::Arc::new(BinaryArray::from(
-            rows.iter()
-                .map(|row| row[column_idx].as_deref())
-                .collect::<Vec<_>>(),
-        ))),
-        DataType::Date32 => Ok(std::sync::Arc::new(Date32Array::from(
-            rows.iter()
-                .map(|row| {
-                    row[column_idx]
-                        .as_ref()
-                        .map(|bytes| parse_date32(bytes))
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ))),
-        DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => Ok(std::sync::Arc::new(TimestampSecondArray::from(
-                parse_timestamp_column(rows, column_idx, TimeUnit::Second)?,
-            ))),
-            TimeUnit::Millisecond => Ok(std::sync::Arc::new(TimestampMillisecondArray::from(
-                parse_timestamp_column(rows, column_idx, TimeUnit::Millisecond)?,
-            ))),
-            TimeUnit::Microsecond => Ok(std::sync::Arc::new(TimestampMicrosecondArray::from(
-                parse_timestamp_column(rows, column_idx, TimeUnit::Microsecond)?,
-            ))),
-            TimeUnit::Nanosecond => Ok(std::sync::Arc::new(TimestampNanosecondArray::from(
-                parse_timestamp_column(rows, column_idx, TimeUnit::Nanosecond)?,
-            ))),
-        },
-        other => Err(format!(
-            "standalone thrift result decoder does not support {:?}",
-            other
-        )),
-    }
-}
-
-fn parse_numeric_column<T>(
-    rows: &[Vec<Option<Vec<u8>>>],
-    column_idx: usize,
-    type_name: &str,
-) -> Result<Vec<Option<T>>, String>
-where
-    T: std::str::FromStr,
-    <T as std::str::FromStr>::Err: std::fmt::Display,
-{
-    rows.iter()
-        .map(|row| {
-            row[column_idx]
-                .as_ref()
-                .map(|bytes| {
-                    std::str::from_utf8(bytes)
-                        .map_err(|e| format!("decode {type_name} text failed: {e}"))?
-                        .parse::<T>()
-                        .map_err(|e| format!("parse {type_name} value failed: {e}"))
-                })
-                .transpose()
-        })
-        .collect()
-}
-
-fn parse_date32(bytes: &[u8]) -> Result<i32, String> {
-    let text = std::str::from_utf8(bytes).map_err(|e| format!("decode DATE text failed: {e}"))?;
-    let date = NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .map_err(|e| format!("parse DATE value failed: {e}"))?;
-    Ok(date.num_days_from_ce() - 719_163)
-}
-
-fn parse_timestamp_column(
-    rows: &[Vec<Option<Vec<u8>>>],
-    column_idx: usize,
-    unit: TimeUnit,
-) -> Result<Vec<Option<i64>>, String> {
-    rows.iter()
-        .map(|row| {
-            row[column_idx]
-                .as_ref()
-                .map(|bytes| parse_timestamp(bytes, unit))
-                .transpose()
-        })
-        .collect()
-}
-
-fn parse_timestamp(bytes: &[u8], unit: TimeUnit) -> Result<i64, String> {
-    let text =
-        std::str::from_utf8(bytes).map_err(|e| format!("decode DATETIME text failed: {e}"))?;
-    let value = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
-        .map_err(|e| format!("parse DATETIME value failed: {e}"))?;
-    let utc = value.and_utc();
-    let nanos = utc
-        .timestamp_nanos_opt()
-        .ok_or_else(|| "timestamp overflows i64".to_string())?;
-    Ok(match unit {
-        TimeUnit::Second => utc.timestamp(),
-        TimeUnit::Millisecond => utc.timestamp_millis(),
-        TimeUnit::Microsecond => utc.timestamp_micros(),
-        TimeUnit::Nanosecond => nanos,
-    })
-}
-
-fn parse_lenenc_row(row: &[u8], expected_fields: usize) -> Result<Vec<Option<Vec<u8>>>, String> {
-    let mut fields = Vec::with_capacity(expected_fields);
-    let mut idx = 0usize;
-    while idx < row.len() && fields.len() < expected_fields {
-        if row[idx] == 0xFB {
-            fields.push(None);
-            idx += 1;
-            continue;
-        }
-        let len = parse_lenenc_int(row, &mut idx)?;
-        let end = idx
-            .checked_add(len)
-            .ok_or_else(|| "lenenc row length overflow".to_string())?;
-        if end > row.len() {
-            return Err("lenenc row is truncated".to_string());
-        }
-        fields.push(Some(row[idx..end].to_vec()));
-        idx = end;
-    }
-    if fields.len() != expected_fields {
-        return Err(format!(
-            "lenenc row field count mismatch: expected {}, got {}",
-            expected_fields,
-            fields.len()
-        ));
-    }
-    Ok(fields)
-}
-
-fn parse_lenenc_int(row: &[u8], idx: &mut usize) -> Result<usize, String> {
-    let Some(&first) = row.get(*idx) else {
-        return Err("lenenc row is truncated".to_string());
-    };
-    *idx += 1;
-    let value = match first {
-        0x00..=0xFA => u64::from(first),
-        0xFC => read_fixed_int(row, idx, 2)?,
-        0xFD => read_fixed_int(row, idx, 3)?,
-        0xFE => read_fixed_int(row, idx, 8)?,
-        0xFB => return Err("unexpected NULL marker while parsing lenenc integer".to_string()),
-        0xFF => return Err("invalid lenenc integer prefix".to_string()),
-    };
-    usize::try_from(value).map_err(|_| "lenenc integer overflows usize".to_string())
-}
-
-fn read_fixed_int(row: &[u8], idx: &mut usize, width: usize) -> Result<u64, String> {
-    let end = idx
-        .checked_add(width)
-        .ok_or_else(|| "lenenc integer overflow".to_string())?;
-    let bytes = row
-        .get(*idx..end)
-        .ok_or_else(|| "lenenc integer is truncated".to_string())?;
-    *idx = end;
-    Ok(bytes.iter().enumerate().fold(0u64, |acc, (shift, byte)| {
-        acc | (u64::from(*byte) << (shift * 8))
-    }))
-}
-
-fn build_fragment(
-    table: &crate::standalone::catalog::TableDef,
-    bound: &BoundQuery,
-) -> Result<crate::planner::TPlanFragment, String> {
-    let plan = build_plan(table, bound)?;
-    let result_sink = crate::data_sinks::TResultSink::new(
-        Some(crate::data_sinks::TResultSinkType::MYSQL_PROTOCAL),
-        None::<crate::data_sinks::TResultFileSinkOptions>,
-        None::<crate::data_sinks::TResultSinkFormatType>,
-        Some(false),
-        Some(
-            bound
+            // Strip extra columns with a final project
+            let final_items: Vec<ProjectItem> = resolved
                 .output_columns
                 .iter()
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>(),
-        ),
-    );
-    let output_sink = crate::data_sinks::TDataSink::new(
-        crate::data_sinks::TDataSinkType::RESULT_SINK,
-        None::<crate::data_sinks::TDataStreamSink>,
-        Some(result_sink),
-        None::<crate::data_sinks::TMysqlTableSink>,
-        None::<crate::data_sinks::TExportSink>,
-        None::<crate::data_sinks::TOlapTableSink>,
-        None::<crate::data_sinks::TMemoryScratchSink>,
-        None::<crate::data_sinks::TMultiCastDataStreamSink>,
-        None::<crate::data_sinks::TSchemaTableSink>,
-        None::<crate::data_sinks::TIcebergTableSink>,
-        None::<crate::data_sinks::THiveTableSink>,
-        None::<crate::data_sinks::TTableFunctionTableSink>,
-        None::<crate::data_sinks::TDictionaryCacheSink>,
-        None::<Vec<Box<crate::data_sinks::TDataSink>>>,
-        None::<i64>,
-        None::<crate::data_sinks::TSplitDataStreamSink>,
-    );
-    Ok(crate::planner::TPlanFragment::new(
-        Some(plan),
-        None::<Vec<crate::exprs::TExpr>>,
-        Some(output_sink),
-        partitions::TDataPartition::new(
-            partitions::TPartitionType::UNPARTITIONED,
-            None::<Vec<crate::exprs::TExpr>>,
-            None::<Vec<partitions::TRangePartition>>,
-            None::<Vec<partitions::TBucketProperty>>,
-        ),
-        None::<i64>,
-        None::<i64>,
-        None::<Vec<crate::data::TGlobalDict>>,
-        None::<Vec<crate::data::TGlobalDict>>,
-        None::<crate::planner::TCacheParam>,
-        None::<BTreeMap<i32, crate::exprs::TExpr>>,
-        None::<crate::planner::TGroupExecutionParam>,
-    ))
-}
-
-fn build_plan(
-    table: &crate::standalone::catalog::TableDef,
-    bound: &BoundQuery,
-) -> Result<plan_nodes::TPlan, String> {
-    let scan_node = build_scan_node(table, bound)?;
-    if !bound.needs_project {
-        return Ok(plan_nodes::TPlan::new(vec![scan_node]));
+                .map(|col| ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: None,
+                            column: col.name.clone(),
+                        },
+                        data_type: col.data_type.clone(),
+                        nullable: col.nullable,
+                    },
+                    output_name: col.name.clone(),
+                })
+                .collect();
+            body_plan = LogicalPlan::Project(ProjectNode {
+                input: Box::new(body_plan),
+                items: final_items,
+            });
+        } else {
+            body_plan = LogicalPlan::Sort(SortNode {
+                input: Box::new(body_plan),
+                items: resolved.order_by,
+            });
+        }
     }
-    let project_node = build_project_node(bound)?;
-    Ok(plan_nodes::TPlan::new(vec![project_node, scan_node]))
-}
 
-fn build_scan_node(
-    table: &crate::standalone::catalog::TableDef,
-    bound: &BoundQuery,
-) -> Result<plan_nodes::TPlanNode, String> {
-    Ok(plan_nodes::TPlanNode {
-        node_id: STANDALONE_SCAN_NODE_ID,
-        node_type: plan_nodes::TPlanNodeType::HDFS_SCAN_NODE,
-        num_children: 0,
-        limit: -1,
-        row_tuples: vec![STANDALONE_SCAN_TUPLE_ID],
-        nullable_tuples: vec![],
-        conjuncts: build_scan_conjuncts(bound)?,
-        compact_data: true,
-        common: None,
-        hash_join_node: None,
-        agg_node: None,
-        sort_node: None,
-        merge_node: None,
-        exchange_node: None,
-        mysql_scan_node: None,
-        olap_scan_node: None,
-        file_scan_node: None,
-        schema_scan_node: None,
-        meta_scan_node: None,
-        analytic_node: None,
-        union_node: None,
-        resource_profile: None,
-        es_scan_node: None,
-        repeat_node: None,
-        assert_num_rows_node: None,
-        intersect_node: None,
-        except_node: None,
-        merge_join_node: None,
-        raw_values_node: None,
-        use_vectorized: None,
-        hdfs_scan_node: Some(plan_nodes::THdfsScanNode::new(
-            Some(STANDALONE_SCAN_TUPLE_ID),
-            None::<BTreeMap<types::TTupleId, Vec<crate::exprs::TExpr>>>,
-            None::<Vec<crate::exprs::TExpr>>,
-            None::<types::TTupleId>,
-            None::<BTreeMap<types::TSlotId, Vec<i32>>>,
-            None::<Vec<crate::exprs::TExpr>>,
-            Some(
-                table
-                    .columns
-                    .iter()
-                    .map(|c| c.name.clone())
-                    .collect::<Vec<_>>(),
-            ),
-            Some(table.name.clone()),
-            None::<String>,
-            None::<String>,
-            None::<String>,
-            Some(true),
-            None::<crate::cloud_configuration::TCloudConfiguration>,
-            None::<bool>,
-            None::<bool>,
-            None::<bool>,
-            None::<types::TTupleId>,
-            None::<String>,
-            None::<String>,
-            None::<bool>,
-            None::<String>,
-            None::<crate::data_cache::TDataCacheOptions>,
-            None::<Vec<types::TSlotId>>,
-            None::<bool>,
-            None::<Vec<partitions::TBucketProperty>>,
-        )),
-        project_node: None,
-        table_function_node: None,
-        probe_runtime_filters: None,
-        decode_node: None,
-        local_rf_waiting_set: None,
-        filter_null_value_columns: None,
-        need_create_tuple_columns: None,
-        jdbc_scan_node: None,
-        connector_scan_node: None,
-        cross_join_node: None,
-        lake_scan_node: None,
-        nestloop_join_node: None,
-        starrocks_scan_node: None,
-        stream_scan_node: None,
-        stream_join_node: None,
-        stream_agg_node: None,
-        select_node: None,
-        fetch_node: None,
-        look_up_node: None,
-        benchmark_scan_node: None,
-    })
-}
-
-fn build_project_node(bound: &BoundQuery) -> Result<plan_nodes::TPlanNode, String> {
-    let mut slot_map = BTreeMap::new();
-    for output in &bound.output_columns {
-        let output_slot_id = output
-            .output_slot_id
-            .ok_or_else(|| "project node requires output slot ids".to_string())?;
-        let scan_column = &bound.scan_columns[output.scan_column_index];
-        slot_map.insert(
-            output_slot_id,
-            build_slot_ref_expr(
-                scan_column.scan_slot_id,
-                STANDALONE_SCAN_TUPLE_ID,
-                arrow_type_to_type_desc(&scan_column.data_type)?,
-            ),
-        );
+    // Wrap with Limit if LIMIT/OFFSET is present.
+    if resolved.limit.is_some() || resolved.offset.is_some() {
+        body_plan = LogicalPlan::Limit(LimitNode {
+            input: Box::new(body_plan),
+            limit: resolved.limit,
+            offset: resolved.offset,
+        });
     }
-    Ok(plan_nodes::TPlanNode {
-        node_id: STANDALONE_PROJECT_NODE_ID,
-        node_type: plan_nodes::TPlanNodeType::PROJECT_NODE,
-        num_children: 1,
-        limit: -1,
-        row_tuples: vec![STANDALONE_PROJECT_TUPLE_ID],
-        nullable_tuples: vec![],
-        conjuncts: None,
-        compact_data: true,
-        common: None,
-        hash_join_node: None,
-        agg_node: None,
-        sort_node: None,
-        merge_node: None,
-        exchange_node: None,
-        mysql_scan_node: None,
-        olap_scan_node: None,
-        file_scan_node: None,
-        schema_scan_node: None,
-        meta_scan_node: None,
-        analytic_node: None,
-        union_node: None,
-        resource_profile: None,
-        es_scan_node: None,
-        repeat_node: None,
-        assert_num_rows_node: None,
-        intersect_node: None,
-        except_node: None,
-        merge_join_node: None,
-        raw_values_node: None,
-        use_vectorized: None,
-        hdfs_scan_node: None,
-        project_node: Some(plan_nodes::TProjectNode::new(
-            Some(slot_map),
-            None::<BTreeMap<types::TSlotId, crate::exprs::TExpr>>,
-        )),
-        table_function_node: None,
-        probe_runtime_filters: None,
-        decode_node: None,
-        local_rf_waiting_set: None,
-        filter_null_value_columns: None,
-        need_create_tuple_columns: None,
-        jdbc_scan_node: None,
-        connector_scan_node: None,
-        cross_join_node: None,
-        lake_scan_node: None,
-        nestloop_join_node: None,
-        starrocks_scan_node: None,
-        stream_scan_node: None,
-        stream_join_node: None,
-        stream_agg_node: None,
-        select_node: None,
-        fetch_node: None,
-        look_up_node: None,
-        benchmark_scan_node: None,
-    })
+
+    Ok(body_plan)
 }
 
-fn build_scan_conjuncts(bound: &BoundQuery) -> Result<Option<Vec<crate::exprs::TExpr>>, String> {
-    let Some(predicate) = bound.predicate.as_ref() else {
-        return Ok(None);
-    };
-    let scan_column = &bound.scan_columns[predicate.scan_column_index];
-    let compare_type = arrow_type_to_type_desc(&scan_column.data_type)?;
-    let root = crate::exprs::TExprNode {
-        node_type: crate::exprs::TExprNodeType::BINARY_PRED,
-        type_: crate::lower::thrift::type_lowering::scalar_type_desc(
-            types::TPrimitiveType::BOOLEAN,
-        ),
-        opcode: Some(compare_op_to_opcode(predicate.op)),
-        num_children: 2,
-        child_type_desc: Some(compare_type.clone()),
-        ..default_expr_node()
-    };
-    let left = slot_ref_expr_node(
-        scan_column.scan_slot_id,
-        STANDALONE_SCAN_TUPLE_ID,
-        compare_type.clone(),
-    );
-    let right = literal_expr_node(&predicate.literal, &scan_column.data_type)?;
-    Ok(Some(vec![crate::exprs::TExpr::new(vec![
-        root, left, right,
-    ])]))
+/// Check if any ORDER BY expression references columns not in the output.
+fn has_non_projected_sort_columns(order_by: &[SortItem], output: &[OutputColumn]) -> bool {
+    let output_names: std::collections::HashSet<String> =
+        output.iter().map(|c| c.name.to_lowercase()).collect();
+    for item in order_by {
+        if has_non_projected_ref(&item.expr, &output_names) {
+            return true;
+        }
+    }
+    false
 }
 
-fn compare_op_to_opcode(op: CompareOp) -> opcodes::TExprOpcode {
-    match op {
-        CompareOp::Eq => opcodes::TExprOpcode::EQ,
-        CompareOp::Ne => opcodes::TExprOpcode::NE,
-        CompareOp::Lt => opcodes::TExprOpcode::LT,
-        CompareOp::Le => opcodes::TExprOpcode::LE,
-        CompareOp::Gt => opcodes::TExprOpcode::GT,
-        CompareOp::Ge => opcodes::TExprOpcode::GE,
+fn has_non_projected_ref(
+    expr: &TypedExpr,
+    output_names: &std::collections::HashSet<String>,
+) -> bool {
+    match &expr.kind {
+        ExprKind::ColumnRef { column, .. } => !output_names.contains(&column.to_lowercase()),
+        ExprKind::BinaryOp { left, right, .. } => {
+            has_non_projected_ref(left, output_names) || has_non_projected_ref(right, output_names)
+        }
+        ExprKind::UnaryOp { expr, .. } => has_non_projected_ref(expr, output_names),
+        ExprKind::FunctionCall { args, .. } => {
+            args.iter().any(|a| has_non_projected_ref(a, output_names))
+        }
+        ExprKind::Cast { expr, .. } => has_non_projected_ref(expr, output_names),
+        ExprKind::Nested(inner) => has_non_projected_ref(inner, output_names),
+        ExprKind::IsNull { expr, .. } => has_non_projected_ref(expr, output_names),
+        _ => false,
     }
 }
 
-fn build_slot_ref_expr(
-    slot_id: types::TSlotId,
-    tuple_id: types::TTupleId,
-    type_desc: types::TTypeDesc,
-) -> crate::exprs::TExpr {
-    crate::exprs::TExpr::new(vec![slot_ref_expr_node(slot_id, tuple_id, type_desc)])
+/// Collect ColumnRef items from ORDER BY that aren't in the output,
+/// and build extra ProjectItems for them.
+fn collect_extra_columns(expr: &TypedExpr, output: &[OutputColumn], extra: &mut Vec<ProjectItem>) {
+    let output_names: std::collections::HashSet<String> =
+        output.iter().map(|c| c.name.to_lowercase()).collect();
+    let already_added: std::collections::HashSet<String> =
+        extra.iter().map(|e| e.output_name.to_lowercase()).collect();
+    collect_extra_inner(expr, &output_names, &already_added, extra);
 }
 
-fn slot_ref_expr_node(
-    slot_id: types::TSlotId,
-    tuple_id: types::TTupleId,
-    type_desc: types::TTypeDesc,
-) -> crate::exprs::TExprNode {
-    crate::exprs::TExprNode {
-        node_type: crate::exprs::TExprNodeType::SLOT_REF,
-        type_: type_desc,
-        num_children: 0,
-        slot_ref: Some(crate::exprs::TSlotRef { slot_id, tuple_id }),
-        ..default_expr_node()
-    }
-}
-
-fn literal_expr_node(
-    literal: &Literal,
-    target_type: &DataType,
-) -> Result<crate::exprs::TExprNode, String> {
-    let node = match literal {
-        Literal::Null => crate::exprs::TExprNode {
-            node_type: crate::exprs::TExprNodeType::NULL_LITERAL,
-            type_: arrow_type_to_type_desc(target_type)?,
-            num_children: 0,
-            ..default_expr_node()
-        },
-        Literal::Bool(value) => crate::exprs::TExprNode {
-            node_type: crate::exprs::TExprNodeType::BOOL_LITERAL,
-            type_: crate::lower::thrift::type_lowering::scalar_type_desc(
-                types::TPrimitiveType::BOOLEAN,
-            ),
-            num_children: 0,
-            bool_literal: Some(crate::exprs::TBoolLiteral { value: *value }),
-            ..default_expr_node()
-        },
-        Literal::Int(value) => crate::exprs::TExprNode {
-            node_type: crate::exprs::TExprNodeType::INT_LITERAL,
-            type_: int_literal_type_desc(target_type),
-            num_children: 0,
-            int_literal: Some(crate::exprs::TIntLiteral { value: *value }),
-            ..default_expr_node()
-        },
-        Literal::Float(value) => crate::exprs::TExprNode {
-            node_type: crate::exprs::TExprNodeType::FLOAT_LITERAL,
-            type_: float_literal_type_desc(target_type),
-            num_children: 0,
-            float_literal: Some(crate::exprs::TFloatLiteral {
-                value: thrift::OrderedFloat::from(*value),
-            }),
-            ..default_expr_node()
-        },
-        Literal::String(value) => crate::exprs::TExprNode {
-            node_type: crate::exprs::TExprNodeType::STRING_LITERAL,
-            type_: string_literal_type_desc(target_type),
-            num_children: 0,
-            string_literal: Some(crate::exprs::TStringLiteral {
-                value: value.clone(),
-            }),
-            ..default_expr_node()
-        },
-        Literal::Date(value) => match target_type {
-            DataType::Date32 => crate::exprs::TExprNode {
-                node_type: crate::exprs::TExprNodeType::DATE_LITERAL,
-                type_: crate::lower::thrift::type_lowering::scalar_type_desc(
-                    types::TPrimitiveType::DATE,
-                ),
-                num_children: 0,
-                date_literal: Some(crate::exprs::TDateLiteral {
-                    value: value.clone(),
-                }),
-                ..default_expr_node()
-            },
-            DataType::Timestamp(_, _) => crate::exprs::TExprNode {
-                node_type: crate::exprs::TExprNodeType::STRING_LITERAL,
-                type_: crate::lower::thrift::type_lowering::scalar_type_desc(
-                    types::TPrimitiveType::VARCHAR,
-                ),
-                num_children: 0,
-                string_literal: Some(crate::exprs::TStringLiteral {
-                    value: value.clone(),
-                }),
-                ..default_expr_node()
-            },
-            other => {
-                return Err(format!(
-                    "date literal is not supported for column type {:?}",
-                    other
-                ));
+fn collect_extra_inner(
+    expr: &TypedExpr,
+    output_names: &std::collections::HashSet<String>,
+    already_added: &std::collections::HashSet<String>,
+    extra: &mut Vec<ProjectItem>,
+) {
+    match &expr.kind {
+        ExprKind::ColumnRef { column, .. } => {
+            let col_lower = column.to_lowercase();
+            if !output_names.contains(&col_lower) && !already_added.contains(&col_lower) {
+                extra.push(ProjectItem {
+                    expr: expr.clone(),
+                    output_name: column.clone(),
+                });
             }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_extra_inner(left, output_names, already_added, extra);
+            collect_extra_inner(right, output_names, already_added, extra);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            collect_extra_inner(inner, output_names, already_added, extra);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for a in args {
+                collect_extra_inner(a, output_names, already_added, extra);
+            }
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_extra_inner(inner, output_names, already_added, extra);
+        }
+        ExprKind::Nested(inner) => {
+            collect_extra_inner(inner, output_names, already_added, extra);
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            collect_extra_inner(inner, output_names, already_added, extra);
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Body planning
+// ---------------------------------------------------------------------------
+
+fn plan_body(body: QueryBody) -> Result<LogicalPlan, String> {
+    match body {
+        QueryBody::Select(select) => plan_select(select),
+        QueryBody::SetOperation(set_op) => plan_set_operation(set_op),
+        QueryBody::Values(values) => plan_values(values),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SELECT planning
+// ---------------------------------------------------------------------------
+
+/// Produces:  Project( [Aggregate(] [Filter(] from_plan [)] [)] )
+fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
+    // 1. FROM clause → base plan
+    let mut current = match select.from {
+        Some(relation) => plan_relation(relation)?,
+        None => {
+            // SELECT without FROM — single-row values node
+            LogicalPlan::Values(ValuesNode {
+                rows: vec![vec![]],
+                columns: vec![],
+            })
+        }
+    };
+
+    // 2. WHERE → Filter
+    if let Some(predicate) = select.filter {
+        current = LogicalPlan::Filter(FilterNode {
+            input: Box::new(current),
+            predicate,
+        });
+    }
+
+    // 2.5: ROLLUP → Insert Repeat node between filter and aggregate
+    if let Some(repeat_info) = select.repeat.take() {
+        current = LogicalPlan::Repeat(RepeatPlanNode {
+            input: Box::new(current),
+            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+            grouping_ids: repeat_info.grouping_ids,
+            all_rollup_columns: repeat_info.all_rollup_columns,
+            grouping_fn_args: repeat_info.grouping_fn_args,
+        });
+    }
+
+    // 3. GROUP BY / aggregation → Aggregate
+    if select.has_aggregation || !select.group_by.is_empty() {
+        // Collect non-aggregate column refs from HAVING that aren't already in
+        // GROUP BY. These come from scalar subquery CROSS JOINs and must pass
+        // through as extra group-by keys so they're available in the
+        // post-aggregate HAVING filter.
+        if let Some(ref having_expr) = select.having {
+            let mut extra_gb = Vec::new();
+            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
+            for col in extra_gb {
+                select.group_by.push(col);
+            }
+        }
+
+        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
+            &select.projection,
+            &select.group_by,
+            select.having.as_ref(),
+        );
+        current = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(current),
+            group_by: select.group_by,
+            aggregates: agg_calls,
+            output_columns,
+        });
+        // HAVING → Filter between Aggregate and Project
+        if let Some(having) = select.having {
+            current = LogicalPlan::Filter(FilterNode {
+                input: Box::new(current),
+                predicate: having,
+            });
+        }
+
+        // The projection after aggregation — may contain window functions
+        current = build_window_and_project(current, project_items, &select.projection)?;
+    } else {
+        // 4. No aggregation → check for window functions, then Project
+        current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
+    }
+
+    Ok(current)
+}
+
+/// Check if an expression contains any WindowCall.
+/// Build Window + Project nodes if the projection contains window functions,
+/// otherwise just a Project node.
+fn build_window_and_project(
+    input: LogicalPlan,
+    project_items: Vec<ProjectItem>,
+    original_projection: &[ProjectItem],
+) -> Result<LogicalPlan, String> {
+    let has_window = project_items.iter().any(|item| has_window_call(&item.expr));
+    if has_window {
+        let (window_exprs, rewritten_items) = extract_window_calls(&project_items);
+        let mut output_columns = Vec::new();
+        for item in original_projection {
+            output_columns.push(OutputColumn {
+                name: item.output_name.clone(),
+                data_type: item.expr.data_type.clone(),
+                nullable: item.expr.nullable,
+            });
+        }
+        let windowed = LogicalPlan::Window(WindowNode {
+            input: Box::new(input),
+            window_exprs,
+            output_columns,
+        });
+        Ok(LogicalPlan::Project(ProjectNode {
+            input: Box::new(windowed),
+            items: rewritten_items,
+        }))
+    } else if !project_items.is_empty() {
+        Ok(LogicalPlan::Project(ProjectNode {
+            input: Box::new(input),
+            items: project_items,
+        }))
+    } else {
+        Ok(input)
+    }
+}
+
+fn has_window_call(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::WindowCall { .. } => true,
+        ExprKind::BinaryOp { left, right, .. } => has_window_call(left) || has_window_call(right),
+        ExprKind::UnaryOp { expr, .. } => has_window_call(expr),
+        ExprKind::Cast { expr, .. } => has_window_call(expr),
+        ExprKind::Nested(inner) => has_window_call(inner),
+        _ => false,
+    }
+}
+
+/// Extract window function calls from the projection items.
+/// Returns (window_exprs, rewritten_projection_items).
+/// Each window call is replaced with a ColumnRef to its output name.
+/// Window calls may be nested inside expressions (e.g., `sum(x) * 100 / sum(sum(x)) OVER (...)`).
+fn extract_window_calls(items: &[ProjectItem]) -> (Vec<WindowExpr>, Vec<ProjectItem>) {
+    let mut window_exprs = Vec::new();
+    let mut rewritten = Vec::new();
+    let mut counter = 0usize;
+
+    for item in items {
+        if has_window_call(&item.expr) {
+            let new_expr = rewrite_window_calls(
+                &item.expr,
+                &item.output_name,
+                &mut window_exprs,
+                &mut counter,
+            );
+            rewritten.push(ProjectItem {
+                expr: new_expr,
+                output_name: item.output_name.clone(),
+            });
+        } else {
+            rewritten.push(item.clone());
+        }
+    }
+
+    (window_exprs, rewritten)
+}
+
+/// Recursively rewrite an expression tree, replacing each WindowCall node
+/// with a ColumnRef that points to the window function's output column.
+fn rewrite_window_calls(
+    expr: &TypedExpr,
+    base_name: &str,
+    window_exprs: &mut Vec<WindowExpr>,
+    counter: &mut usize,
+) -> TypedExpr {
+    match &expr.kind {
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+        } => {
+            let win_output_name = if *counter == 0 {
+                base_name.to_string()
+            } else {
+                format!("{}__win{}", base_name, counter)
+            };
+            *counter += 1;
+            window_exprs.push(WindowExpr {
+                name: name.clone(),
+                args: args.clone(),
+                distinct: *distinct,
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                window_frame: window_frame.clone(),
+                result_type: expr.data_type.clone(),
+                output_name: win_output_name.clone(),
+            });
+            TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    qualifier: None,
+                    column: win_output_name,
+                },
+                data_type: expr.data_type.clone(),
+                nullable: expr.nullable,
+            }
+        }
+        ExprKind::BinaryOp { left, right, op } => TypedExpr {
+            kind: ExprKind::BinaryOp {
+                left: Box::new(rewrite_window_calls(left, base_name, window_exprs, counter)),
+                op: *op,
+                right: Box::new(rewrite_window_calls(
+                    right,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
         },
-    };
-    Ok(node)
-}
-
-fn int_literal_type_desc(target_type: &DataType) -> types::TTypeDesc {
-    match target_type {
-        DataType::Int8 => {
-            crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::TINYINT)
-        }
-        DataType::Int16 => {
-            crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::SMALLINT)
-        }
-        DataType::Int32 => {
-            crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::INT)
-        }
-        DataType::Int64 => {
-            crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT)
-        }
-        _ => crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+        ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+            kind: ExprKind::UnaryOp {
+                op: *op,
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(rewrite_window_calls(
+                    inner,
+                    base_name,
+                    window_exprs,
+                    counter,
+                )),
+                target: target.clone(),
+            },
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        ExprKind::Nested(inner) => TypedExpr {
+            kind: ExprKind::Nested(Box::new(rewrite_window_calls(
+                inner,
+                base_name,
+                window_exprs,
+                counter,
+            ))),
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+        },
+        // For any other node types, return as-is (no window calls inside)
+        _ => expr.clone(),
     }
 }
 
-fn float_literal_type_desc(target_type: &DataType) -> types::TTypeDesc {
-    match target_type {
-        DataType::Float32 => {
-            crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::FLOAT)
+/// Split the SELECT list into post-aggregate projection items and aggregate calls.
+///
+/// For a query like `SELECT a, count(*), sum(b) + 1 FROM t GROUP BY a`:
+/// - group_by exprs: [a]
+/// - aggregate calls: [count(*), sum(b)]
+/// - project items: the full SELECT list (may reference group-by columns and agg results)
+fn split_projection_for_aggregate(
+    projection: &[ProjectItem],
+    _group_by: &[TypedExpr],
+    having: Option<&TypedExpr>,
+) -> (Vec<ProjectItem>, Vec<AggregateCall>, Vec<OutputColumn>) {
+    let mut agg_calls = Vec::new();
+    let mut output_columns = Vec::new();
+
+    // Collect aggregate calls from projection
+    for item in projection {
+        collect_aggregates(&item.expr, &mut agg_calls);
+        output_columns.push(OutputColumn {
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+        });
+    }
+
+    // Also collect aggregate calls from HAVING clause so the aggregate node
+    // computes them even when they don't appear in SELECT.
+    if let Some(having_expr) = having {
+        collect_aggregates(having_expr, &mut agg_calls);
+    }
+
+    // The projection items remain as-is; the thrift emitter will handle
+    // mapping them to the aggregate output.
+    (projection.to_vec(), agg_calls, output_columns)
+}
+
+/// Recursively collect AggregateCall from a TypedExpr tree.
+fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
+    match &expr.kind {
+        ExprKind::AggregateCall {
+            name,
+            args,
+            distinct,
+            order_by,
+        } => {
+            // Avoid duplicates — compare name, distinct, and actual arg content
+            let already = out.iter().any(|a| {
+                a.name == *name
+                    && a.distinct == *distinct
+                    && a.args.len() == args.len()
+                    && a.args
+                        .iter()
+                        .zip(args.iter())
+                        .all(|(a, b)| format!("{:?}", a.kind) == format!("{:?}", b.kind))
+            });
+            if !already {
+                out.push(AggregateCall {
+                    name: name.clone(),
+                    args: args.clone(),
+                    distinct: *distinct,
+                    result_type: expr.data_type.clone(),
+                    order_by: order_by.clone(),
+                });
+            }
         }
-        _ => crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::DOUBLE),
-    }
-}
-
-fn string_literal_type_desc(target_type: &DataType) -> types::TTypeDesc {
-    match target_type {
-        DataType::Binary => {
-            crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::VARBINARY)
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_aggregates(left, out);
+            collect_aggregates(right, out);
         }
-        _ => crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::VARCHAR),
-    }
-}
-
-fn default_expr_node() -> crate::exprs::TExprNode {
-    crate::exprs::TExprNode {
-        node_type: crate::exprs::TExprNodeType::INT_LITERAL,
-        type_: crate::lower::thrift::type_lowering::scalar_type_desc(types::TPrimitiveType::INT),
-        opcode: None,
-        num_children: 0,
-        agg_expr: None,
-        bool_literal: None,
-        case_expr: None,
-        date_literal: None,
-        float_literal: None,
-        int_literal: None,
-        in_predicate: None,
-        is_null_pred: None,
-        like_pred: None,
-        literal_pred: None,
-        slot_ref: None,
-        string_literal: None,
-        tuple_is_null_pred: None,
-        info_func: None,
-        decimal_literal: None,
-        output_scale: 0,
-        fn_call_expr: None,
-        large_int_literal: None,
-        output_column: None,
-        output_type: None,
-        vector_opcode: None,
-        fn_: None,
-        vararg_start_idx: None,
-        child_type: None,
-        vslot_ref: None,
-        used_subfield_names: None,
-        binary_literal: None,
-        copy_flag: None,
-        check_is_out_of_bounds: None,
-        use_vectorized: None,
-        has_nullable_child: None,
-        is_nullable: None,
-        child_type_desc: None,
-        is_monotonic: None,
-        dict_query_expr: None,
-        dictionary_get_expr: None,
-        is_index_only_filter: None,
-        is_nondeterministic: None,
-    }
-}
-
-fn build_exec_params(
-    table: &crate::standalone::catalog::TableDef,
-    scan_node_id: types::TPlanNodeId,
-) -> Result<internal_service::TPlanFragmentExecParams, String> {
-    let crate::standalone::catalog::TableStorage::LocalParquetFile { path } = &table.storage;
-    let metadata = std::fs::metadata(path).map_err(|e| format!("stat parquet file failed: {e}"))?;
-    let file_len =
-        i64::try_from(metadata.len()).map_err(|_| "parquet file is too large".to_string())?;
-    let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
-        None::<String>,
-        Some(0_i64),
-        Some(file_len),
-        None::<i64>,
-        Some(file_len),
-        Some(descriptors::THdfsFileFormat::PARQUET),
-        None::<descriptors::TTextFileDesc>,
-        Some(path.display().to_string()),
-        None::<Vec<String>>,
-        None::<bool>,
-        None::<Vec<plan_nodes::TIcebergDeleteFile>>,
-        None::<i64>,
-        None::<bool>,
-        None::<String>,
-        None::<String>,
-        None::<i64>,
-        None::<crate::data_cache::TDataCacheOptions>,
-        None::<Vec<types::TSlotId>>,
-        None::<bool>,
-        None::<BTreeMap<String, String>>,
-        None::<Vec<types::TSlotId>>,
-        None::<bool>,
-        None::<String>,
-        None::<bool>,
-        None::<String>,
-        None::<String>,
-        None::<plan_nodes::TPaimonDeletionFile>,
-        None::<BTreeMap<types::TSlotId, crate::exprs::TExpr>>,
-        None::<descriptors::THdfsPartition>,
-        None::<types::TTableId>,
-        None::<plan_nodes::TDeletionVectorDescriptor>,
-        None::<String>,
-        None::<i64>,
-        None::<bool>,
-        None::<BTreeMap<i32, crate::exprs::TExprMinMaxValue>>,
-        None::<i32>,
-        None::<i64>,
-    );
-    let scan_range = internal_service::TScanRangeParams::new(
-        plan_nodes::TScanRange::new(
-            None::<plan_nodes::TInternalScanRange>,
-            None::<Vec<u8>>,
-            None::<plan_nodes::TBrokerScanRange>,
-            None::<plan_nodes::TEsScanRange>,
-            Some(hdfs_scan_range),
-            None::<plan_nodes::TBinlogScanRange>,
-            None::<plan_nodes::TBenchmarkScanRange>,
-        ),
-        None::<i32>,
-        Some(false),
-        Some(false),
-    );
-    let seed = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    Ok(internal_service::TPlanFragmentExecParams::new(
-        types::TUniqueId::new(1, seed),
-        types::TUniqueId::new(2, seed),
-        BTreeMap::from([(scan_node_id, vec![scan_range])]),
-        BTreeMap::new(),
-        None::<Vec<crate::data_sinks::TPlanFragmentDestination>>,
-        None::<i32>,
-        None::<i32>,
-        None::<bool>,
-        None::<bool>,
-        None::<crate::runtime_filter::TRuntimeFilterParams>,
-        None::<i32>,
-        None::<bool>,
-        None::<BTreeMap<types::TPlanNodeId, BTreeMap<i32, Vec<internal_service::TScanRangeParams>>>>,
-        None::<bool>,
-        None::<i32>,
-        None::<bool>,
-        None::<Vec<internal_service::TExecDebugOption>>,
-    ))
-}
-
-fn build_descriptor_table(bound: &BoundQuery) -> Result<descriptors::TDescriptorTable, String> {
-    let mut slot_descs = Vec::with_capacity(bound.scan_columns.len() + bound.output_columns.len());
-    for (idx, column) in bound.scan_columns.iter().enumerate() {
-        let slot_type = arrow_type_to_type_desc(&column.data_type)?;
-        slot_descs.push(descriptors::TSlotDescriptor::new(
-            Some(column.scan_slot_id),
-            Some(STANDALONE_SCAN_TUPLE_ID),
-            Some(slot_type),
-            Some(i32::try_from(idx).map_err(|_| "too many columns".to_string())?),
-            Some(0),
-            Some(0),
-            Some(0),
-            Some(column.name.clone()),
-            Some(i32::try_from(idx).map_err(|_| "too many columns".to_string())?),
-            Some(true),
-            Some(true),
-            Some(column.nullable),
-            None::<i32>,
-            None::<String>,
-        ));
-    }
-
-    for (idx, column) in bound.output_columns.iter().enumerate() {
-        let Some(output_slot_id) = column.output_slot_id else {
-            continue;
-        };
-        let slot_type = arrow_type_to_type_desc(&column.data_type)?;
-        let output_idx = i32::try_from(idx).map_err(|_| "too many output columns".to_string())?;
-        slot_descs.push(descriptors::TSlotDescriptor::new(
-            Some(output_slot_id),
-            Some(STANDALONE_PROJECT_TUPLE_ID),
-            Some(slot_type),
-            Some(output_idx),
-            Some(0),
-            Some(0),
-            Some(0),
-            Some(column.name.clone()),
-            Some(output_idx),
-            Some(true),
-            Some(true),
-            Some(column.nullable),
-            None::<i32>,
-            None::<String>,
-        ));
-    }
-
-    let mut tuple_descs = vec![descriptors::TTupleDescriptor::new(
-        Some(STANDALONE_SCAN_TUPLE_ID),
-        Some(0),
-        Some(0),
-        None::<types::TTableId>,
-        Some(0),
-    )];
-    if bound.needs_project {
-        tuple_descs.push(descriptors::TTupleDescriptor::new(
-            Some(STANDALONE_PROJECT_TUPLE_ID),
-            Some(0),
-            Some(0),
-            None::<types::TTableId>,
-            Some(0),
-        ));
-    }
-    Ok(descriptors::TDescriptorTable::new(
-        Some(slot_descs),
-        tuple_descs,
-        None::<Vec<descriptors::TTableDescriptor>>,
-        None::<bool>,
-    ))
-}
-
-fn arrow_type_to_type_desc(data_type: &DataType) -> Result<types::TTypeDesc, String> {
-    let primitive = match data_type {
-        DataType::Boolean => types::TPrimitiveType::BOOLEAN,
-        DataType::Int8 => types::TPrimitiveType::TINYINT,
-        DataType::Int16 => types::TPrimitiveType::SMALLINT,
-        DataType::Int32 => types::TPrimitiveType::INT,
-        DataType::Int64 => types::TPrimitiveType::BIGINT,
-        DataType::Float32 => types::TPrimitiveType::FLOAT,
-        DataType::Float64 => types::TPrimitiveType::DOUBLE,
-        DataType::Utf8 | DataType::LargeUtf8 => types::TPrimitiveType::VARCHAR,
-        DataType::Binary | DataType::LargeBinary => types::TPrimitiveType::VARBINARY,
-        DataType::Date32 => types::TPrimitiveType::DATE,
-        DataType::Timestamp(_, _) => types::TPrimitiveType::DATETIME,
-        other => {
-            return Err(format!(
-                "standalone MVP does not support Parquet column type {:?}",
-                other
-            ));
+        ExprKind::UnaryOp { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_aggregates(arg, out);
+            }
         }
-    };
-    Ok(crate::lower::thrift::type_lowering::scalar_type_desc(
-        primitive,
-    ))
+        ExprKind::Cast { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_aggregates(op, out);
+            }
+            for (w, t) in when_then {
+                collect_aggregates(w, out);
+                collect_aggregates(t, out);
+            }
+            if let Some(e) = else_expr {
+                collect_aggregates(e, out);
+            }
+        }
+        ExprKind::IsNull { expr: inner, .. } => collect_aggregates(inner, out),
+        ExprKind::Nested(inner) => collect_aggregates(inner, out),
+        ExprKind::InList { expr, list, .. } => {
+            collect_aggregates(expr, out);
+            for item in list {
+                collect_aggregates(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_aggregates(expr, out);
+            collect_aggregates(low, out);
+            collect_aggregates(high, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_aggregates(expr, out);
+            collect_aggregates(pattern, out);
+        }
+        ExprKind::IsTruthValue { expr: inner, .. } => collect_aggregates(inner, out),
+        // Leaves
+        ExprKind::ColumnRef { .. } | ExprKind::Literal(_) => {}
+        // Window calls themselves are not aggregates, but their args may
+        // contain aggregate calls that must be collected so the aggregate node
+        // computes them (e.g. sum(sum(x)) OVER (...)).
+        ExprKind::WindowCall {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_aggregates(arg, out);
+            }
+            for expr in partition_by {
+                collect_aggregates(expr, out);
+            }
+            for sort_item in order_by {
+                collect_aggregates(&sort_item.expr, out);
+            }
+        }
+        // SubqueryPlaceholder should be rewritten before reaching the planner
+        ExprKind::SubqueryPlaceholder { .. } => {}
+    }
+}
+
+/// Collect ColumnRef expressions from HAVING that appear outside of aggregate calls.
+/// These are typically scalar subquery results (from CROSS JOINs) that need to pass
+/// through the aggregate node as group-by keys.
+fn collect_non_agg_column_refs(expr: &TypedExpr, group_by: &[TypedExpr], out: &mut Vec<TypedExpr>) {
+    collect_non_agg_column_refs_inner(expr, group_by, out, false);
+}
+
+fn collect_non_agg_column_refs_inner(
+    expr: &TypedExpr,
+    group_by: &[TypedExpr],
+    out: &mut Vec<TypedExpr>,
+    inside_agg: bool,
+) {
+    match &expr.kind {
+        ExprKind::AggregateCall { .. } => {
+            // Don't recurse into aggregate calls — columns inside aggregates
+            // are handled by the aggregate function itself, not as pass-through keys.
+        }
+        ExprKind::ColumnRef { qualifier, column } => {
+            if !inside_agg {
+                // Check if this column is already in group_by
+                let already_grouped = group_by.iter().any(|gb| {
+                    matches!(&gb.kind, ExprKind::ColumnRef { qualifier: gq, column: gc }
+                        if gc == column && gq == qualifier)
+                });
+                // Check if already collected
+                let already_collected = out.iter().any(|o| {
+                    matches!(&o.kind, ExprKind::ColumnRef { qualifier: oq, column: oc }
+                        if oc == column && oq == qualifier)
+                });
+                if !already_grouped && !already_collected {
+                    out.push(expr.clone());
+                }
+            }
+        }
+        ExprKind::BinaryOp { left, right, .. } => {
+            collect_non_agg_column_refs_inner(left, group_by, out, inside_agg);
+            collect_non_agg_column_refs_inner(right, group_by, out, inside_agg);
+        }
+        ExprKind::UnaryOp { expr: inner, .. } => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_non_agg_column_refs_inner(arg, group_by, out, inside_agg);
+            }
+        }
+        ExprKind::Cast { expr: inner, .. } => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::Nested(inner) => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::IsNull { expr: inner, .. } => {
+            collect_non_agg_column_refs_inner(inner, group_by, out, inside_agg);
+        }
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            if let Some(op) = operand {
+                collect_non_agg_column_refs_inner(op, group_by, out, inside_agg);
+            }
+            for (w, t) in when_then {
+                collect_non_agg_column_refs_inner(w, group_by, out, inside_agg);
+                collect_non_agg_column_refs_inner(t, group_by, out, inside_agg);
+            }
+            if let Some(e) = else_expr {
+                collect_non_agg_column_refs_inner(e, group_by, out, inside_agg);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FROM clause planning
+// ---------------------------------------------------------------------------
+
+fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
+    match relation {
+        Relation::Scan(scan) => {
+            let columns = scan
+                .table
+                .columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect();
+            Ok(LogicalPlan::Scan(ScanNode {
+                database: scan.database,
+                table: scan.table,
+                alias: scan.alias,
+                columns,
+                predicates: vec![],
+                required_columns: None,
+            }))
+        }
+        Relation::Subquery { query, alias } => {
+            // Recursively plan the subquery, wrapping with alias metadata
+            // so the physical emitter can register qualified columns.
+            let output_columns = query.output_columns.clone();
+            let inner_plan = plan(*query)?;
+            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                input: Box::new(inner_plan),
+                alias,
+                output_columns,
+            }))
+        }
+        Relation::Join(join_rel) => {
+            let left = plan_relation(join_rel.left)?;
+            let right = plan_relation(join_rel.right)?;
+            Ok(LogicalPlan::Join(JoinNode {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: join_rel.join_type,
+                condition: join_rel.condition,
+            }))
+        }
+        Relation::GenerateSeries(gs) => Ok(LogicalPlan::GenerateSeries(GenerateSeriesNode {
+            start: gs.start,
+            end: gs.end,
+            step: gs.step,
+            column_name: gs.column_name,
+            alias: gs.alias,
+        })),
+        Relation::CTEConsume {
+            cte_id,
+            alias,
+            output_columns,
+        } => Ok(LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id,
+            alias,
+            output_columns,
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Set operation planning
+// ---------------------------------------------------------------------------
+
+fn plan_set_operation(set_op: ResolvedSetOp) -> Result<LogicalPlan, String> {
+    let left = plan_body(*set_op.left)?;
+    let right = plan_body(*set_op.right)?;
+
+    match set_op.kind {
+        SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
+            inputs: vec![left, right],
+            all: set_op.all,
+        })),
+        SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
+            inputs: vec![left, right],
+        })),
+        SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
+            inputs: vec![left, right],
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VALUES planning
+// ---------------------------------------------------------------------------
+
+fn plan_values(values: ResolvedValues) -> Result<LogicalPlan, String> {
+    let columns = values
+        .column_types
+        .iter()
+        .enumerate()
+        .map(|(i, dt)| OutputColumn {
+            name: format!("column_{}", i),
+            data_type: dt.clone(),
+            nullable: true,
+        })
+        .collect();
+    Ok(LogicalPlan::Values(ValuesNode {
+        rows: values.rows,
+        columns,
+    }))
 }

@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod backend_service;
+#[cfg(feature = "compat")]
 pub mod compat;
 pub mod disk_report;
+#[cfg(feature = "compat")]
 pub mod engine_ffi;
 pub mod exchange_sender;
 pub(crate) mod exec_state_reporter;
@@ -27,6 +29,7 @@ pub mod grpc_proto;
 pub mod grpc_server;
 pub mod heartbeat_service;
 pub(crate) mod internal_rpc;
+#[cfg(feature = "compat")]
 pub(crate) mod internal_rpc_client;
 pub mod internal_service;
 pub mod load_tracking_http;

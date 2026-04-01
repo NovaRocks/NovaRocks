@@ -18,7 +18,6 @@
 
 use crate::common::TestConfig;
 
-
 fn assert_type_accessible<T: 'static>() {
     let type_name = std::any::type_name::<T>();
     assert!(

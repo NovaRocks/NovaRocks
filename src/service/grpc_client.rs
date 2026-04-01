@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Channel;
 use tracing::debug;
 
@@ -37,51 +36,6 @@ static CHANNELS: OnceLock<ChannelCache> = OnceLock::new();
 
 fn channels() -> &'static ChannelCache {
     CHANNELS.get_or_init(|| ChannelCache {
-        mu: Mutex::new(HashMap::new()),
-    })
-}
-
-#[derive(Clone)]
-struct StreamConn {
-    tx: tokio::sync::mpsc::Sender<proto::novarocks::ExchangeRequest>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-struct ExchangeStreamKey {
-    dest_host: String,
-    dest_port: u16,
-    finst_id: UniqueId,
-    node_id: i32,
-    sender_id: i32,
-}
-
-impl ExchangeStreamKey {
-    fn new(
-        dest_host: &str,
-        dest_port: u16,
-        finst_id: UniqueId,
-        node_id: i32,
-        sender_id: i32,
-    ) -> Self {
-        Self {
-            dest_host: dest_host.to_string(),
-            dest_port,
-            finst_id,
-            node_id,
-            sender_id,
-        }
-    }
-}
-
-#[derive(Default)]
-struct StreamCache {
-    mu: Mutex<HashMap<ExchangeStreamKey, StreamConn>>,
-}
-
-static STREAMS: OnceLock<StreamCache> = OnceLock::new();
-
-fn streams() -> &'static StreamCache {
-    STREAMS.get_or_init(|| StreamCache {
         mu: Mutex::new(HashMap::new()),
     })
 }
@@ -125,106 +79,12 @@ async fn get_channel(host: &str, port: u16) -> Result<Channel, String> {
     Ok(ch)
 }
 
-fn get_or_create_exchange_stream(
-    dest_host: &str,
-    port: u16,
-    finst_id: UniqueId,
-    node_id: i32,
-    sender_id: i32,
-) -> Result<StreamConn, String> {
-    let key = ExchangeStreamKey::new(dest_host, port, finst_id, node_id, sender_id);
-    if let Some(conn) = streams()
-        .mu
-        .lock()
-        .expect("stream cache lock")
-        .get(&key)
-        .cloned()
-    {
-        return Ok(conn);
-    }
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<proto::novarocks::ExchangeRequest>(4096);
-    let dest_host = dest_host.to_string();
-    let port = port;
-    let key_for_task = key.clone();
-    let runtime_handle = data_runtime_handle()?;
-    runtime_handle.spawn(async move {
-        let ch = match get_channel(&dest_host, port).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "exchange stream connect failed: dest={}:{} error={}",
-                    dest_host, port, e
-                );
-                streams()
-                    .mu
-                    .lock()
-                    .expect("stream cache lock")
-                    .remove(&key_for_task);
-                return;
-            }
-        };
-        let mut cli = proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
-            .max_encoding_message_size(64 * 1024 * 1024)
-            .max_decoding_message_size(64 * 1024 * 1024);
-
-        let req_stream = ReceiverStream::new(rx);
-        let resp = match cli.exchange(req_stream).await {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "exchange stream open failed: dest={}:{} error={}",
-                    dest_host, port, e
-                );
-                streams()
-                    .mu
-                    .lock()
-                    .expect("stream cache lock")
-                    .remove(&key_for_task);
-                return;
-            }
-        };
-
-        let mut inbound = resp.into_inner();
-        let mut ack_count = 0u64;
-        loop {
-            match inbound.message().await {
-                Ok(Some(_ack)) => {
-                    // Drain acks to avoid backpressure on the server response stream.
-                    ack_count = ack_count.saturating_add(1);
-                    if ack_count % 1024 == 1 {
-                        debug!(
-                            "exchange ack RECV: dest={}:{} count={}",
-                            dest_host, port, ack_count
-                        );
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    error!(
-                        "exchange stream recv failed: dest={}:{} error={}",
-                        dest_host, port, e
-                    );
-                    break;
-                }
-            }
-        }
-        streams()
-            .mu
-            .lock()
-            .expect("stream cache lock")
-            .remove(&key_for_task);
-    });
-
-    let conn = StreamConn { tx };
-    streams()
-        .mu
-        .lock()
-        .expect("stream cache lock")
-        .insert(key, conn.clone());
-    Ok(conn)
-}
-
+/// Synchronous exchange send — blocks until the server acknowledges receipt.
+///
+/// Each call opens a single-message gRPC stream, sends the request, and waits
+/// for the server ack before returning.  This matches the delivery guarantee of
+/// the brpc path and ensures `ExchangeSendTracker::on_complete` fires only
+/// after the data has actually been received by the exchange registry.
 pub fn send_chunks(
     dest_host: &str,
     dest_port: u16,
@@ -236,12 +96,7 @@ pub fn send_chunks(
     sequence: i64,
     payload: Vec<u8>,
 ) -> Result<(), String> {
-    use crate::novarocks_logging::debug;
-    let payload_size = payload.len();
-    debug!(
-        "send_chunks START: dest={} finst={} node_id={} sender_id={} be_number={} eos={} seq={} payload_bytes={}",
-        dest_host, finst_id, node_id, sender_id, be_number, eos, sequence, payload_size
-    );
+    let host = dest_host.to_string();
     let port = dest_port;
     let req = proto::novarocks::ExchangeRequest {
         finst_id_hi: finst_id.hi,
@@ -254,32 +109,25 @@ pub fn send_chunks(
         payload,
     };
 
-    let conn = get_or_create_exchange_stream(dest_host, port, finst_id, node_id, sender_id)?;
-    match conn.tx.blocking_send(req) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let key = ExchangeStreamKey::new(dest_host, port, finst_id, node_id, sender_id);
-            streams().mu.lock().expect("stream cache lock").remove(&key);
-            Err(format!("exchange stream send failed: {e}"))
+    data_block_on(async move {
+        let ch = get_channel(&host, port).await?;
+        let mut cli =
+            proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
+                .max_encoding_message_size(64 * 1024 * 1024)
+                .max_decoding_message_size(64 * 1024 * 1024);
+
+        let stream = tokio_stream::once(req);
+        let resp = cli
+            .exchange(stream)
+            .await
+            .map_err(|e| format!("exchange rpc failed: {e}"))?;
+        let mut inbound = resp.into_inner();
+        // Wait for the server ack to confirm delivery.
+        match inbound.message().await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("exchange ack recv failed: {e}")),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exchange_stream_key_is_sender_scoped() {
-        let finst = UniqueId { hi: 1, lo: 2 };
-        let base = ExchangeStreamKey::new("127.0.0.1", 8060, finst, 3, 7);
-        assert_eq!(base, ExchangeStreamKey::new("127.0.0.1", 8060, finst, 3, 7));
-        assert_ne!(base, ExchangeStreamKey::new("127.0.0.1", 8060, finst, 3, 8));
-        assert_ne!(
-            base,
-            ExchangeStreamKey::new("127.0.0.1", 8060, UniqueId { hi: 1, lo: 3 }, 3, 7)
-        );
-    }
+    })?
 }
 
 pub fn transmit_runtime_filter(

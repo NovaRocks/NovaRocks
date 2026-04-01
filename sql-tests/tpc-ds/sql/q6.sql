@@ -1,4 +1,3 @@
--- query 6
 select  a.ca_state state, count(*) cnt
  from customer_address a
      ,customer c

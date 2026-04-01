@@ -1,4 +1,3 @@
--- query 65
 select 
 	s_store_name,
 	i_item_desc,

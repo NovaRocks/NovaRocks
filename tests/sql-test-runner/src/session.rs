@@ -126,6 +126,12 @@ impl MysqlSession {
     ) -> (bool, Option<QueryExecution>, String) {
         const MAX_TRANSIENT_ATTEMPTS: usize = 2;
         const TRANSIENT_RETRY_DELAY_MS: u64 = 300;
+        let statements = match split_sql_statements(sql) {
+            Ok(statements) => statements,
+            Err(err) => {
+                return (false, None, format!("ERROR (0.00s): {}", err));
+            }
+        };
 
         for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
             let started = Instant::now();
@@ -154,85 +160,95 @@ impl MysqlSession {
                 );
             }
 
-            match self.conn.query_iter(sql) {
-                Ok(mut query_result) => {
-                    let mut last_header: Vec<String> = Vec::new();
-                    let mut last_rows: Vec<Vec<String>> = Vec::new();
-                    let mut saw_tabular_result = false;
+            let mut last_header: Vec<String> = Vec::new();
+            let mut last_rows: Vec<Vec<String>> = Vec::new();
+            let mut saw_tabular_result = false;
+            let mut failed = None;
 
-                    while let Some(mut result_set) = query_result.iter() {
-                        let header: Vec<String> = result_set
-                            .columns()
-                            .as_ref()
-                            .iter()
-                            .map(|column| column.name_str().to_string())
-                            .collect();
-                        let mut rows: Vec<Vec<String>> = Vec::new();
+            for statement in &statements {
+                match self.conn.query_iter(statement) {
+                    Ok(mut query_result) => {
+                        while let Some(mut result_set) = query_result.iter() {
+                            let header: Vec<String> = result_set
+                                .columns()
+                                .as_ref()
+                                .iter()
+                                .map(|column| column.name_str().to_string())
+                                .collect();
+                            let mut rows: Vec<Vec<String>> = Vec::new();
 
-                        for row_result in result_set.by_ref() {
-                            match row_result {
-                                Ok(row) => rows.push(mysql_row_to_strings(row)),
-                                Err(exc) => {
-                                    let elapsed = started.elapsed();
-                                    let message = exc.to_string();
-                                    let clipped = if message.len() > 500 {
-                                        message[..500].to_string()
-                                    } else {
-                                        message
-                                    };
-                                    return (
-                                        false,
-                                        None,
-                                        format!(
-                                            "FAIL ({:.2}s): {}",
-                                            elapsed.as_secs_f64(),
-                                            clipped
-                                        ),
-                                    );
+                            for row_result in result_set.by_ref() {
+                                match row_result {
+                                    Ok(row) => rows.push(mysql_row_to_strings(row)),
+                                    Err(exc) => {
+                                        failed = Some(exc.to_string());
+                                        break;
+                                    }
                                 }
                             }
-                        }
+                            if failed.is_some() {
+                                break;
+                            }
 
-                        if !header.is_empty() {
-                            saw_tabular_result = true;
-                            last_header = header;
-                            last_rows = rows;
-                        } else if !saw_tabular_result {
-                            last_header = header;
-                            last_rows = rows;
+                            if !header.is_empty() {
+                                if !saw_tabular_result {
+                                    // First tabular result — use its header
+                                    // (matches `mysql --batch` behavior where
+                                    // the first header line wins).
+                                    saw_tabular_result = true;
+                                    last_header = header;
+                                    last_rows = rows;
+                                } else {
+                                    // Subsequent result sets: the header row
+                                    // becomes a data row in `mysql --batch`
+                                    // output, so append it plus the data rows.
+                                    last_rows.push(header);
+                                    last_rows.extend(rows);
+                                }
+                            } else if !saw_tabular_result {
+                                last_header = header;
+                                last_rows = rows;
+                            }
                         }
                     }
-
-                    let elapsed = started.elapsed();
-                    let execution = QueryExecution {
-                        text_output: render_output(&last_header, &last_rows),
-                        header: last_header,
-                        rows: last_rows,
-                        elapsed,
-                    };
-                    return (true, Some(execution), String::new());
+                    Err(exc) => {
+                        failed = Some(exc.to_string());
+                    }
                 }
-                Err(exc) => {
-                    let elapsed = started.elapsed();
-                    let message = exc.to_string();
-                    if attempt + 1 < MAX_TRANSIENT_ATTEMPTS
-                        && is_transient_iceberg_commit_error(&message)
-                    {
-                        std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
-                        continue;
-                    }
-                    let clipped = if message.len() > 500 {
-                        message[..500].to_string()
-                    } else {
-                        message
-                    };
-                    return (
-                        false,
-                        None,
-                        format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
-                    );
+
+                if failed.is_some() {
+                    break;
                 }
             }
+
+            if let Some(message) = failed {
+                let elapsed = started.elapsed();
+                if attempt + 1 < MAX_TRANSIENT_ATTEMPTS
+                    && is_transient_iceberg_commit_error(&message)
+                {
+                    std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
+                    continue;
+                }
+                let clipped = if message.len() > 500 {
+                    message[..500].to_string()
+                } else {
+                    message
+                };
+                return (
+                    false,
+                    None,
+                    format!("FAIL ({:.2}s): {}", elapsed.as_secs_f64(), clipped),
+                );
+            }
+
+            let elapsed = started.elapsed();
+            let execution = QueryExecution {
+                text_output: render_output(&last_header, &last_rows),
+                header: last_header,
+                rows: last_rows,
+                elapsed,
+            };
+            return (true, Some(execution), String::new());
         }
 
         (
@@ -240,6 +256,71 @@ impl MysqlSession {
             None,
             "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
         )
+    }
+}
+
+fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum QuoteState {
+        Single,
+        Double,
+        Backtick,
+    }
+
+    let mut statements = Vec::new();
+    let mut start = 0usize;
+    let mut quote_state = None;
+
+    for (idx, ch) in sql.char_indices() {
+        match quote_state {
+            Some(QuoteState::Single) if ch == '\'' => quote_state = None,
+            Some(QuoteState::Double) if ch == '"' => quote_state = None,
+            Some(QuoteState::Backtick) if ch == '`' => quote_state = None,
+            Some(_) => {}
+            None => match ch {
+                '\'' => quote_state = Some(QuoteState::Single),
+                '"' => quote_state = Some(QuoteState::Double),
+                '`' => quote_state = Some(QuoteState::Backtick),
+                ';' => {
+                    if let Some(statement) = normalize_statement_fragment(&sql[start..idx]) {
+                        statements.push(statement);
+                    }
+                    start = idx + ch.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    if quote_state.is_some() {
+        bail!("unterminated quoted string in SQL batch");
+    }
+
+    if let Some(trailing) = normalize_statement_fragment(&sql[start..]) {
+        statements.push(trailing);
+    }
+    Ok(statements)
+}
+
+fn normalize_statement_fragment(fragment: &str) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut started = false;
+    for line in fragment.lines() {
+        let trimmed = line.trim();
+        if !started && (trimmed.is_empty() || trimmed.starts_with("--") || trimmed.starts_with('#'))
+        {
+            continue;
+        }
+        if !trimmed.is_empty() {
+            started = true;
+        }
+        lines.push(line.trim_end());
+    }
+    let normalized = lines.join("\n").trim().to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
     }
 }
 

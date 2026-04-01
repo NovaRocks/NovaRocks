@@ -513,6 +513,83 @@ fn ensure_bindable(host: &str, port: u16, role: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Start a lightweight gRPC exchange server on a specific port.
+///
+/// Unlike [`start_grpc_server`] this does not require global config to be
+/// initialised — the caller supplies the bind address directly.  Only the
+/// exchange service is started (no starlet, no HTTP routes), which is
+/// sufficient for standalone multi-fragment CTE execution.
+pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
+    {
+        let state = grpc_server_state()
+            .lock()
+            .map_err(|_| "lock grpc server state failed".to_string())?;
+        if state.started {
+            return Ok(());
+        }
+    }
+
+    let host = host.to_string();
+    ensure_bindable(&host, port, "standalone grpc/exchange")?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let join_handle = std::thread::spawn(move || {
+        info!(
+            target: "novarocks::grpc",
+            host = %host,
+            port = port,
+            "starting standalone grpc exchange server"
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(4)
+            .build()
+            .expect("build standalone grpc server runtime");
+
+        rt.block_on(async move {
+            let addr: SocketAddr = format!("{host}:{port}")
+                .parse()
+                .expect("parse standalone grpc bind addr");
+            let mut shutdown = shutdown_rx.clone();
+
+            let svc = GrpcService::default();
+            let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
+                .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+
+            let server = Server::builder()
+                .add_service(svc)
+                .serve_with_shutdown(addr, async move {
+                    while !*shutdown.borrow() {
+                        if shutdown.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+            if let Err(e) = server.await {
+                error!(
+                    target: "novarocks::grpc",
+                    error = %e,
+                    port = port,
+                    "standalone grpc exchange server stopped"
+                );
+            }
+        });
+    });
+
+    let mut state = grpc_server_state()
+        .lock()
+        .map_err(|_| "lock grpc server state failed".to_string())?;
+    if state.started {
+        return Ok(());
+    }
+    state.started = true;
+    state.shutdown_tx = Some(shutdown_tx);
+    state.join_handle = Some(join_handle);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ensure_bindable, validate_grpc_ports};

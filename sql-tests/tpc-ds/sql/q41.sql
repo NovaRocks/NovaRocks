@@ -1,4 +1,3 @@
--- query 41
 select  distinct(i_product_name)
  from item i1
  where i_manufact_id between 738 and 738+40 
