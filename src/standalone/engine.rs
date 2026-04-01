@@ -280,6 +280,32 @@ impl StandaloneSession {
             .parse_statement()
             .map_err(|e| format!("sql parser error: {e}"))?;
         match stmt {
+            sqlast::Statement::Explain {
+                statement,
+                verbose,
+                analyze: false,
+                ..
+            } => {
+                let sqlast::Statement::Query(ref query) = *statement else {
+                    return Err("EXPLAIN only supports SELECT queries".to_string());
+                };
+                if let Some(cat_name) = current_catalog {
+                    self.register_iceberg_tables_for_query(cat_name, current_database, query)?;
+                }
+                let level = if verbose {
+                    crate::sql::explain::ExplainLevel::Verbose
+                } else {
+                    crate::sql::explain::ExplainLevel::Normal
+                };
+                let catalog = self
+                    .inner
+                    .catalog
+                    .read()
+                    .expect("standalone catalog read lock");
+                let result = explain_query(query, &catalog, current_database, level)?;
+                drop(catalog);
+                Ok(StatementResult::Query(result))
+            }
             sqlast::Statement::Query(ref query) => {
                 // When current_catalog is an Iceberg catalog, materialize
                 // referenced Iceberg tables into the local catalog first.
@@ -3382,6 +3408,59 @@ fn build_query_plan_single(
 /// Queries without shared CTEs (the vast majority) take the existing
 /// single-fragment fast path.  Queries with multi-referenced CTEs are
 /// split into a fragment DAG and executed via the multi-fragment coordinator.
+/// Produce EXPLAIN output for a query without executing it.
+fn explain_query(
+    query: &sqlparser::ast::Query,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+    level: crate::sql::explain::ExplainLevel,
+) -> Result<QueryResult, String> {
+    use crate::sql::explain::{ExplainLevel, explain_plan, explain_query_plan};
+
+    let (resolved, cte_registry) =
+        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+
+    let mut lines = Vec::new();
+
+    if cte_registry.entries.is_empty() {
+        let logical = crate::sql::planner::plan(resolved)?;
+        let table_stats = build_table_stats_from_plan(&logical);
+        let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
+
+        if matches!(level, ExplainLevel::Costs) {
+            for (table, stats) in &table_stats {
+                lines.push(format!(
+                    "  Statistics: {table} row_count={}",
+                    stats.row_count
+                ));
+            }
+        }
+        lines.extend(explain_plan(&optimized, level));
+    } else {
+        let query_plan =
+            crate::sql::planner::plan_query(resolved, cte_registry)?;
+        let mut all_stats = std::collections::HashMap::new();
+        for cte in &query_plan.cte_plans {
+            all_stats.extend(build_table_stats_from_plan(&cte.plan));
+        }
+        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
+        let optimized =
+            crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
+
+        if matches!(level, ExplainLevel::Costs) {
+            for (table, stats) in &all_stats {
+                lines.push(format!(
+                    "  Statistics: {table} row_count={}",
+                    stats.row_count
+                ));
+            }
+        }
+        lines.extend(explain_query_plan(&optimized, level));
+    }
+
+    build_string_query_result("Explain String", lines)
+}
+
 fn execute_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
