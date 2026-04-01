@@ -1,4 +1,5 @@
 -- @float_epsilon=1e-12
+-- query 39
 with inv as
 (select w_warehouse_name,w_warehouse_sk,i_item_sk,d_moy
        ,stdev,mean, case mean when 0 then null else stdev/mean end cov

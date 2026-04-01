@@ -194,8 +194,12 @@ impl<'a> AnalyzerContext<'a> {
                 std::mem::take(&mut *child_ctx.cte_registry.borrow_mut()).entries;
             if !child_entries.is_empty() {
                 let mut parent_reg = self.cte_registry.borrow_mut();
+                // Only merge entries that don't already exist in the parent
+                // (the child started with a snapshot of parent's entries).
                 for entry in child_entries {
-                    parent_reg.entries.push(entry);
+                    if !parent_reg.entries.iter().any(|e| e.id == entry.id) {
+                        parent_reg.entries.push(entry);
+                    }
                 }
             }
         }

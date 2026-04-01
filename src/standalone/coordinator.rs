@@ -61,16 +61,19 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 1. Assign fragment instance IDs
         // ---------------------------------------------------------------
-        // Use (100, fragment_id + 1) as unique (hi, lo) pairs.
-        // query_id is shared across all fragments.
-        let query_id_hi: i64 = 100;
+        // Use a monotonically increasing base to ensure exchange keys are
+        // unique across queries within the same process.
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static NEXT_QUERY_BASE: AtomicI64 = AtomicI64::new(100);
+        let query_base = NEXT_QUERY_BASE.fetch_add(1000, Ordering::Relaxed);
+
+        let query_id_hi: i64 = query_base;
         let query_id_lo: i64 = 1;
 
         // Build a lookup: fragment_id -> (hi, lo) instance ID.
-        // Use (100, fragment_id + 1) as unique (hi, lo) pairs.
         let instance_map: BTreeMap<FragmentId, (i64, i64)> = fragment_results
             .iter()
-            .map(|fr| (fr.fragment_id, (100_i64, fr.fragment_id as i64 + 1)))
+            .map(|fr| (fr.fragment_id, (query_base, fr.fragment_id as i64 + 1)))
             .collect();
 
         // Find the root fragment instance ID
@@ -231,7 +234,6 @@ impl ExecutionCoordinator {
         for (cte_fr, thrift_fragment, cte_exec_params) in cte_thrift_fragments {
             let desc_tbl = cte_fr.desc_tbl.clone();
             let dop = pipeline_dop;
-
             let handle = std::thread::spawn(move || {
                 let result = execute_fragment(
                     &thrift_fragment,
