@@ -43,19 +43,6 @@ const DEFAULT_CATALOG: &str = "default_catalog";
 const ROOT_USER: &str = "root";
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExplainMode {
-    Standard,
-    Verbose,
-    Costs,
-}
-
-#[derive(Clone, Debug)]
-struct ExplainRequest<'a> {
-    mode: ExplainMode,
-    query: &'a str,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 enum StandaloneMysqlValue {
     Null,
@@ -659,14 +646,6 @@ async fn execute_statement_text(
         return Ok(StatementResult::Ok);
     }
 
-    if let Some(explain) = parse_explain_request(trimmed) {
-        let result = build_explain_result(explain).map_err(|err| {
-            let kind = classify_query_error(&err);
-            (kind, err)
-        })?;
-        return Ok(StatementResult::Query(result));
-    }
-
     if !is_supported_embedded_statement(trimmed) {
         return Err((
             ErrorKind::ER_NOT_SUPPORTED_YET,
@@ -693,108 +672,6 @@ async fn execute_statement_text(
             format!("standalone query worker failed: {err}"),
         )),
     }
-}
-
-fn parse_explain_request(query: &str) -> Option<ExplainRequest<'_>> {
-    let rest = strip_ascii_prefix(query.trim_start(), "explain")?.trim_start();
-    if rest.is_empty() {
-        return None;
-    }
-    if let Some(verbose) = strip_ascii_prefix(rest, "verbose") {
-        let query = verbose.trim_start();
-        if query.is_empty() {
-            return None;
-        }
-        return Some(ExplainRequest {
-            mode: ExplainMode::Verbose,
-            query,
-        });
-    }
-    if let Some(costs) = strip_ascii_prefix(rest, "costs") {
-        let query = costs.trim_start();
-        if query.is_empty() {
-            return None;
-        }
-        return Some(ExplainRequest {
-            mode: ExplainMode::Costs,
-            query,
-        });
-    }
-    Some(ExplainRequest {
-        mode: ExplainMode::Standard,
-        query: rest,
-    })
-}
-
-fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = value.get(..prefix.len())?;
-    if head.eq_ignore_ascii_case(prefix) {
-        Some(&value[prefix.len()..])
-    } else {
-        None
-    }
-}
-
-fn build_explain_result(request: ExplainRequest<'_>) -> Result<QueryResult, String> {
-    let query = request.query.trim();
-    let query_lower = query.to_ascii_lowercase();
-    let mut lines = vec![
-        "PLAN FRAGMENT 0".to_string(),
-        format!("EXPLAIN MODE: {:?}", request.mode).to_ascii_uppercase(),
-    ];
-
-    if matches!(request.mode, ExplainMode::Costs) {
-        lines.push("  Decode".to_string());
-        lines.push("  cardinality: 1".to_string());
-    }
-    if matches!(request.mode, ExplainMode::Verbose) {
-        lines.push("  min-max stats".to_string());
-    }
-    if query_lower.contains(" distinct ") || query_lower.starts_with("select distinct") {
-        lines.push("  AGGREGATE".to_string());
-    }
-    if query_lower.contains(" group by ") {
-        lines.push("  GROUP BY".to_string());
-    }
-    if query_lower.contains(" join ") {
-        lines.push("  JOIN".to_string());
-    }
-    for table in extract_explain_tables(query) {
-        lines.push(format!("  TABLE: {table}"));
-    }
-    lines.push(format!("  SQL: {query}"));
-    build_string_query_result("Explain String", lines)
-}
-
-fn extract_explain_tables(query: &str) -> Vec<String> {
-    let normalized = query
-        .replace(',', " ")
-        .replace(';', " ")
-        .replace('(', " ")
-        .replace(')', " ");
-    let tokens = normalized
-        .split_whitespace()
-        .map(|token| token.trim_matches('`'))
-        .collect::<Vec<_>>();
-    let mut tables = Vec::new();
-    let mut idx = 0usize;
-    while idx + 1 < tokens.len() {
-        let token = tokens[idx];
-        if token.eq_ignore_ascii_case("from") || token.eq_ignore_ascii_case("join") {
-            let candidate = tokens[idx + 1];
-            if !candidate.eq_ignore_ascii_case("select")
-                && !candidate.eq_ignore_ascii_case("table")
-                && !candidate.eq_ignore_ascii_case("with")
-            {
-                let table = candidate.to_string();
-                if !tables.contains(&table) {
-                    tables.push(table);
-                }
-            }
-        }
-        idx += 1;
-    }
-    tables
 }
 
 fn resolve_catalog_name(
