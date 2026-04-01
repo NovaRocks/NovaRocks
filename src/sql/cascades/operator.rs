@@ -199,11 +199,10 @@ pub(crate) struct PhysicalWindowOp {
     pub output_columns: Vec<OutputColumn>,
 }
 
-/// Distribution enforcer node. The `spec` field will be replaced with
-/// `DistributionSpec` once `property.rs` is created in Task 2.
+/// Distribution enforcer node.
 #[derive(Clone, Debug)]
 pub(crate) struct PhysicalDistributionOp {
-    pub spec: String,
+    pub spec: super::property::DistributionSpec,
 }
 
 #[derive(Clone, Debug)]
