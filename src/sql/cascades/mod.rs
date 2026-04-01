@@ -6,6 +6,7 @@ pub(crate) mod operator;
 pub(crate) mod property;
 pub(crate) mod rule;
 pub(crate) mod rules;
+pub(crate) mod stats;
 
 pub(crate) use memo::{GroupId, MExprId, Memo};
 pub(crate) use operator::Operator;
