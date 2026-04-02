@@ -3388,34 +3388,17 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 
 use crate::sql::physical::PlanBuildResult;
 
-/// Build a single-fragment query plan (no shared CTEs).
-fn build_query_plan_single(
-    query: &sqlparser::ast::Query,
-    catalog: &InMemoryCatalog,
-    current_database: &str,
-) -> Result<PlanBuildResult, String> {
-    let (resolved, _cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
-    let output_columns = resolved.output_columns.clone();
-    let logical = crate::sql::planner::plan(resolved)?;
-    let table_stats = build_table_stats_from_plan(&logical);
-    let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
-    crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)
-}
-
-/// Execute a query, automatically choosing single-fragment or multi-fragment path.
-///
-/// Queries without shared CTEs (the vast majority) take the existing
-/// single-fragment fast path.  Queries with multi-referenced CTEs are
-/// split into a fragment DAG and executed via the multi-fragment coordinator.
 /// Produce EXPLAIN output for a query without executing it.
+///
+/// Non-CTE queries go through the Cascades optimizer and produce a physical
+/// plan.  CTE queries use the old LogicalPlan explain path for now.
 fn explain_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
 ) -> Result<QueryResult, String> {
-    use crate::sql::explain::{ExplainLevel, explain_plan, explain_query_plan};
+    use crate::sql::explain::{ExplainLevel, explain_physical_plan, explain_query_plan};
 
     let (resolved, cte_registry) =
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
@@ -3423,9 +3406,10 @@ fn explain_query(
     let mut lines = Vec::new();
 
     if cte_registry.entries.is_empty() {
+        // Cascades path for non-CTE queries
         let logical = crate::sql::planner::plan(resolved)?;
         let table_stats = build_table_stats_from_plan(&logical);
-        let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
+        let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
 
         if matches!(level, ExplainLevel::Costs) {
             for (table, stats) in &table_stats {
@@ -3435,8 +3419,9 @@ fn explain_query(
                 ));
             }
         }
-        lines.extend(explain_plan(&optimized, level));
+        lines.extend(explain_physical_plan(&physical, level));
     } else {
+        // CTE queries: use old LogicalPlan explain for now
         let query_plan =
             crate::sql::planner::plan_query(resolved, cte_registry)?;
         let mut all_stats = std::collections::HashMap::new();
@@ -3469,57 +3454,61 @@ fn execute_query(
     let (resolved, cte_registry) =
         crate::sql::analyzer::analyze(query, catalog, current_database)?;
 
-    if cte_registry.entries.is_empty() {
-        // Single-fragment fast path (no shared CTEs)
-        let output_columns = resolved.output_columns.clone();
-        let logical = crate::sql::planner::plan(resolved)?;
-        let table_stats = build_table_stats_from_plan(&logical);
-        let optimized = crate::sql::optimizer::optimize(logical, &table_stats);
-        let plan_result =
-            crate::sql::physical::emit(optimized, &output_columns, catalog, current_database)?;
-        return execute_plan(plan_result);
+    // Build logical plan (with CTE if multi-referenced)
+    let logical = if cte_registry.entries.is_empty() {
+        crate::sql::planner::plan(resolved)?
+    } else {
+        // For CTE queries, use the old optimizer + emitter path.
+        // TODO: full CTE support in Cascades (produce/consume should appear in plan)
+        let query_plan = crate::sql::planner::plan_query(resolved, cte_registry)?;
+        let mut all_stats = std::collections::HashMap::new();
+        for cte in &query_plan.cte_plans {
+            all_stats.extend(build_table_stats_from_plan(&cte.plan));
+        }
+        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
+        let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
+        let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
+        let build_result = crate::sql::physical::emit_multi_fragment(
+            fragment_plan, catalog, current_database,
+        )?;
+        let exchange_port = crate::common::config::http_port();
+        return super::coordinator::ExecutionCoordinator::new(
+            build_result,
+            "127.0.0.1".to_string(),
+            exchange_port,
+        )
+        .execute();
+    };
+
+    // Cascades path for non-CTE queries
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
+    let build_result = crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
+        &physical, catalog, current_database,
+    )?;
+
+    if build_result.fragments.len() == 1 {
+        let frag = build_result.fragments.into_iter().next().unwrap();
+        execute_plan(PlanBuildResult {
+            plan: frag.plan,
+            desc_tbl: frag.desc_tbl,
+            exec_params: frag.exec_params,
+            output_columns: frag.output_columns,
+        })
+    } else {
+        // Multi-fragment from distribution enforcement
+        let multi = crate::sql::physical::MultiFragmentBuildResult {
+            fragment_results: build_result.fragments,
+            root_fragment_id: build_result.root_fragment_id,
+        };
+        let exchange_port = crate::common::config::http_port();
+        super::coordinator::ExecutionCoordinator::new(
+            multi,
+            "127.0.0.1".to_string(),
+            exchange_port,
+        )
+        .execute()
     }
-
-    // Multi-fragment CTE path
-    execute_query_multi_fragment(resolved, cte_registry, catalog, current_database)
-}
-
-/// Execute a query with shared CTEs via multi-fragment coordination.
-fn execute_query_multi_fragment(
-    resolved: crate::sql::ir::ResolvedQuery,
-    cte_registry: crate::sql::cte::CTERegistry,
-    catalog: &InMemoryCatalog,
-    current_database: &str,
-) -> Result<QueryResult, String> {
-    // 1. Plan with CTE subtrees
-    let query_plan = crate::sql::planner::plan_query(resolved, cte_registry)?;
-
-    // 2. Collect table stats from ALL plans (CTE + main)
-    let mut all_stats = std::collections::HashMap::new();
-    for cte in &query_plan.cte_plans {
-        let s = build_table_stats_from_plan(&cte.plan);
-        all_stats.extend(s);
-    }
-    all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-
-    // 3. Optimize
-    let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
-
-    // 4. Split into fragments
-    let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
-
-    // 5. Emit per-fragment Thrift
-    let build_result =
-        crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)?;
-
-    // 6. Coordinate execution
-    let exchange_port = crate::common::config::http_port();
-    let coordinator = super::coordinator::ExecutionCoordinator::new(
-        build_result,
-        "127.0.0.1".to_string(),
-        exchange_port,
-    );
-    coordinator.execute()
 }
 
 /// Walk the logical plan tree and collect table-level statistics for all scan
