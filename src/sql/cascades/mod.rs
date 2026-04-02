@@ -36,8 +36,8 @@ pub(crate) fn optimize(
     plan: LogicalPlan,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Result<PhysicalPlanNode, String> {
-    // 1. RBO rewrite (predicate pushdown + column pruning).
-    let rewritten = rewriter::rewrite(plan);
+    // 1. RBO rewrite (predicate pushdown + join reorder + column pruning).
+    let rewritten = rewriter::rewrite(plan, table_stats);
 
     // 2. Convert to Memo.
     let mut memo = Memo::new();

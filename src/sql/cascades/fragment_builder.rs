@@ -35,7 +35,7 @@ use crate::sql::physical::nodes;
 use crate::sql::physical::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::physical::{FragmentBuildResult, OutputColumn};
 
-use crate::sql::ir::{ExprKind, TypedExpr};
+use crate::sql::ir::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::plan::AggregateCall;
 
 // ---------------------------------------------------------------------------
@@ -504,6 +504,30 @@ impl<'a> PlanFragmentBuilder<'a> {
             other_join_conjuncts,
         );
 
+        // Widen nullable for outer/anti join nullable side tuples so that
+        // the Arrow schema allows NULL values from unmatched rows.
+        match op.join_type {
+            JoinKind::LeftOuter | JoinKind::LeftAnti => {
+                for &tid in &right.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightAnti => {
+                for &tid in &left.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in &left.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+                for &tid in &right.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            _ => {}
+        }
+
         let mut merged_scope = left.scope;
         merged_scope.merge(&right.scope);
 
@@ -559,6 +583,29 @@ impl<'a> PlanFragmentBuilder<'a> {
             join_op,
             join_conjuncts,
         );
+
+        // Widen nullable for outer/anti join nullable side tuples.
+        match op.join_type {
+            JoinKind::LeftOuter | JoinKind::LeftAnti => {
+                for &tid in &right.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::RightOuter | JoinKind::RightAnti => {
+                for &tid in &left.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            JoinKind::FullOuter => {
+                for &tid in &left.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+                for &tid in &right.tuple_ids {
+                    self.desc_builder.widen_tuple_nullable(tid);
+                }
+            }
+            _ => {}
+        }
 
         let mut merged_scope = left.scope;
         merged_scope.merge(&right.scope);
