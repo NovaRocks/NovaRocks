@@ -344,12 +344,27 @@ impl HashJoinProbeCore {
     pub(crate) fn build_full_outer_unmatched_build(
         &mut self,
     ) -> Result<Option<RecordBatch>, String> {
+        let flags = match self.build_matched.as_ref() {
+            Some(f) => f.clone(),
+            None => return Ok(None),
+        };
+        self.build_full_outer_unmatched_build_inner(&flags)
+    }
+
+    pub(crate) fn build_full_outer_unmatched_build_with_flags(
+        &mut self,
+        flags: &[Vec<bool>],
+    ) -> Result<Option<RecordBatch>, String> {
+        self.build_full_outer_unmatched_build_inner(flags)
+    }
+
+    fn build_full_outer_unmatched_build_inner(
+        &mut self,
+        flags: &[Vec<bool>],
+    ) -> Result<Option<RecordBatch>, String> {
         if self.build_batches.is_empty() {
             return Ok(None);
         }
-        let Some(flags) = self.build_matched.as_ref() else {
-            return Ok(None);
-        };
 
         let output_schema = Arc::clone(&self.join_scope_schema);
 
@@ -431,6 +446,22 @@ impl HashJoinProbeCore {
         Ok(Some(batch))
     }
 
+    /// Take ownership of the local build-matched flags.  Used by broadcast
+    /// join to merge per-driver flags into a shared accumulator.
+    pub(crate) fn take_build_matched(&mut self) -> Option<Vec<Vec<bool>>> {
+        self.build_matched.take()
+    }
+
+    /// Produce output from externally-provided build-matched flags (e.g.
+    /// after merging flags from all broadcast probe drivers).
+    pub(crate) fn build_right_semi_anti_output_with_flags(
+        &mut self,
+        flags: &[Vec<bool>],
+        want_matched: bool,
+    ) -> Result<Option<RecordBatch>, String> {
+        self.build_right_semi_anti_output_inner(flags, want_matched)
+    }
+
     pub(crate) fn build_right_semi_anti_output(
         &mut self,
         want_matched: bool,
@@ -441,6 +472,19 @@ impl HashJoinProbeCore {
         let Some(flags) = self.build_matched.as_ref() else {
             return Ok(None);
         };
+        // Clone to satisfy borrow checker (flags borrows self).
+        let flags = flags.clone();
+        self.build_right_semi_anti_output_inner(&flags, want_matched)
+    }
+
+    fn build_right_semi_anti_output_inner(
+        &mut self,
+        flags: &[Vec<bool>],
+        want_matched: bool,
+    ) -> Result<Option<RecordBatch>, String> {
+        if self.build_batches.is_empty() {
+            return Ok(None);
+        }
 
         let output_schema = self
             .build_batches
@@ -820,23 +864,12 @@ impl HashJoinProbeCore {
 
         if self.probe_is_left && matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti)
         {
-            let want_output = self.join_type == JoinType::RightSemi;
-            let output_indices =
-                self.mark_build_matches_for_semi_anti(probe_chunks, want_output)?;
-            if !want_output {
-                return Ok(None);
-            }
-            let Some(output_indices) = output_indices else {
-                return Ok(None);
-            };
-            let Some(build_batch) = self.build_right_semi_output_from_indices(&output_indices)?
-            else {
-                return Ok(None);
-            };
-            self.output_rows = self
-                .output_rows
-                .saturating_add(build_batch.num_rows() as u64);
-            return Ok(Some(self.extend_with_null_probe_columns(build_batch)?));
+            // For both RIGHT SEMI and RIGHT ANTI: only mark which build
+            // rows matched, do not produce output during probing.  The
+            // actual output is deferred to `finish_one()` where per-driver
+            // flags are merged to avoid duplicates across parallel drivers.
+            self.mark_build_matches_for_semi_anti(probe_chunks, false)?;
+            return Ok(None);
         }
 
         let output_schema = probe_chunks[0].schema();

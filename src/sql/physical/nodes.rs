@@ -142,10 +142,12 @@ pub(crate) fn build_hash_join_node(
     // right side tuples are nullable, etc.
     let mut nullable_tuples = Vec::with_capacity(row_tuples.len());
     let (left_nullable, right_nullable) = match join_op {
-        plan_nodes::TJoinOp::LEFT_OUTER_JOIN | plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (false, true),
-        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
-            (true, false)
-        }
+        plan_nodes::TJoinOp::LEFT_OUTER_JOIN
+        | plan_nodes::TJoinOp::LEFT_ANTI_JOIN
+        | plan_nodes::TJoinOp::LEFT_SEMI_JOIN => (false, true),
+        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN
+        | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN
+        | plan_nodes::TJoinOp::RIGHT_SEMI_JOIN => (true, false),
         plan_nodes::TJoinOp::FULL_OUTER_JOIN => (true, true),
         _ => (false, false),
     };
@@ -209,10 +211,12 @@ pub(crate) fn build_nestloop_join_node(
     row_tuples.extend_from_slice(right_tuple_ids);
     let mut nullable_tuples = Vec::with_capacity(row_tuples.len());
     let (left_nullable, right_nullable) = match join_op {
-        plan_nodes::TJoinOp::LEFT_OUTER_JOIN | plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (false, true),
-        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
-            (true, false)
-        }
+        plan_nodes::TJoinOp::LEFT_OUTER_JOIN
+        | plan_nodes::TJoinOp::LEFT_ANTI_JOIN
+        | plan_nodes::TJoinOp::LEFT_SEMI_JOIN => (false, true),
+        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN
+        | plan_nodes::TJoinOp::RIGHT_ANTI_JOIN
+        | plan_nodes::TJoinOp::RIGHT_SEMI_JOIN => (true, false),
         plan_nodes::TJoinOp::FULL_OUTER_JOIN => (true, true),
         _ => (false, false),
     };

@@ -504,15 +504,19 @@ impl<'a> PlanFragmentBuilder<'a> {
             other_join_conjuncts,
         );
 
-        // Widen nullable for outer/anti join nullable side tuples so that
-        // the Arrow schema allows NULL values from unmatched rows.
+        // Widen nullable for join nullable side tuples so that the Arrow
+        // schema allows NULL values from unmatched rows.  SEMI joins also
+        // need widening: the runtime emits null-padded columns for the
+        // pruned side (see `extend_with_null_build_columns` /
+        // `extend_with_null_probe_columns`), and downstream operators
+        // reference those slots.
         match op.join_type {
-            JoinKind::LeftOuter | JoinKind::LeftAnti => {
+            JoinKind::LeftOuter | JoinKind::LeftAnti | JoinKind::LeftSemi => {
                 for &tid in &right.tuple_ids {
                     self.desc_builder.widen_tuple_nullable(tid);
                 }
             }
-            JoinKind::RightOuter | JoinKind::RightAnti => {
+            JoinKind::RightOuter | JoinKind::RightAnti | JoinKind::RightSemi => {
                 for &tid in &left.tuple_ids {
                     self.desc_builder.widen_tuple_nullable(tid);
                 }

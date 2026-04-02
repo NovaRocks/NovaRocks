@@ -15,6 +15,10 @@ use crate::sql::ir::{BinOp, ExprKind, JoinKind, TypedExpr};
 /// Walk a join condition and split top-level AND-connected `a = b` pairs from
 /// the remaining predicate. Returns `(eq_pairs, remaining_condition)`.
 ///
+/// Also handles OR-connected disjuncts: if the top-level condition (or a
+/// top-level conjunct) is `(A AND eq) OR (B AND eq) OR …`, the equality
+/// pairs that appear in *every* OR branch are extracted as hash join keys.
+///
 /// For cross joins (condition is `None`) or when no equalities are found,
 /// `eq_pairs` will be empty.
 fn extract_eq_conditions(
@@ -28,6 +32,20 @@ fn extract_eq_conditions(
     let mut others = Vec::new();
     collect_conjuncts(cond, &mut eq_pairs, &mut others);
 
+    // If no equalities were found from top-level AND, try to extract common
+    // equalities from OR branches among the "other" predicates.
+    if eq_pairs.is_empty() {
+        let mut new_others = Vec::new();
+        for part in others {
+            let (common, rewritten) = try_extract_common_eq_from_or(&part);
+            eq_pairs.extend(common);
+            if let Some(r) = rewritten {
+                new_others.push(r);
+            }
+        }
+        others = new_others;
+    }
+
     let remaining = combine_conjuncts(others);
     (eq_pairs, remaining)
 }
@@ -40,6 +58,10 @@ fn collect_conjuncts(
     others: &mut Vec<TypedExpr>,
 ) {
     match &expr.kind {
+        // Unwrap parenthesized expressions transparently.
+        ExprKind::Nested(inner) => {
+            collect_conjuncts(inner, eq_pairs, others);
+        }
         ExprKind::BinaryOp {
             left,
             op: BinOp::And,
@@ -59,6 +81,129 @@ fn collect_conjuncts(
             others.push(expr.clone());
         }
     }
+}
+
+/// Split a top-level OR expression into its disjuncts.
+fn split_or(expr: &TypedExpr) -> Vec<TypedExpr> {
+    match &expr.kind {
+        ExprKind::Nested(inner) => split_or(inner),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => {
+            let mut parts = split_or(left);
+            parts.extend(split_or(right));
+            parts
+        }
+        _ => vec![expr.clone()],
+    }
+}
+
+/// Combine a list of disjuncts back into a single OR-connected expression.
+fn combine_disjuncts(mut parts: Vec<TypedExpr>) -> Option<TypedExpr> {
+    if parts.is_empty() {
+        return None;
+    }
+    let mut result = parts.pop().unwrap();
+    while let Some(p) = parts.pop() {
+        result = TypedExpr {
+            data_type: arrow::datatypes::DataType::Boolean,
+            nullable: p.nullable || result.nullable,
+            kind: ExprKind::BinaryOp {
+                left: Box::new(p),
+                op: BinOp::Or,
+                right: Box::new(result),
+            },
+        };
+    }
+    Some(result)
+}
+
+/// Structural equality for TypedExpr using Debug representation.
+fn typed_expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
+    format!("{:?}", a) == format!("{:?}", b)
+}
+
+/// Check if two eq pairs are structurally equal (possibly with swapped sides).
+fn eq_pair_matches(a: &(TypedExpr, TypedExpr), b: &(TypedExpr, TypedExpr)) -> bool {
+    (typed_expr_eq(&a.0, &b.0) && typed_expr_eq(&a.1, &b.1))
+        || (typed_expr_eq(&a.0, &b.1) && typed_expr_eq(&a.1, &b.0))
+}
+
+/// Try to extract common equality conditions from an OR expression.
+///
+/// Given `(A AND x=y AND B) OR (C AND x=y AND D)`, extracts `(x, y)` as
+/// a common eq pair and rewrites the expression to `(A AND B) OR (C AND D)`.
+///
+/// Returns `(common_eq_pairs, rewritten_or_condition)`.
+fn try_extract_common_eq_from_or(
+    expr: &TypedExpr,
+) -> (Vec<(TypedExpr, TypedExpr)>, Option<TypedExpr>) {
+    let branches = split_or(expr);
+    if branches.len() < 2 {
+        return (vec![], Some(expr.clone()));
+    }
+
+    // For each branch, extract eq pairs and residual.
+    let mut branch_eqs: Vec<Vec<(TypedExpr, TypedExpr)>> = Vec::new();
+    let mut branch_others: Vec<Vec<TypedExpr>> = Vec::new();
+    for branch in &branches {
+        let mut eqs = Vec::new();
+        let mut others = Vec::new();
+        collect_conjuncts(branch, &mut eqs, &mut others);
+        branch_eqs.push(eqs);
+        branch_others.push(others);
+    }
+
+    // Find eq pairs that appear in ALL branches.
+    let first_eqs = &branch_eqs[0];
+    let mut common: Vec<(TypedExpr, TypedExpr)> = Vec::new();
+    for eq in first_eqs {
+        if branch_eqs[1..].iter().all(|branch| branch.iter().any(|b| eq_pair_matches(eq, b))) {
+            common.push(eq.clone());
+        }
+    }
+
+    if common.is_empty() {
+        return (vec![], Some(expr.clone()));
+    }
+
+    // Rewrite each branch: remove the common eq pairs, recombine.
+    let mut rewritten_branches = Vec::new();
+    for (eqs, others) in branch_eqs.iter().zip(branch_others.iter()) {
+        let mut remaining_parts: Vec<TypedExpr> = others.clone();
+        for eq in eqs {
+            if !common.iter().any(|c| eq_pair_matches(c, eq)) {
+                // Keep non-common eq pairs as regular conjuncts.
+                remaining_parts.push(TypedExpr {
+                    data_type: arrow::datatypes::DataType::Boolean,
+                    nullable: eq.0.nullable || eq.1.nullable,
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(eq.0.clone()),
+                        op: BinOp::Eq,
+                        right: Box::new(eq.1.clone()),
+                    },
+                });
+            }
+        }
+        if let Some(branch_expr) = combine_conjuncts(remaining_parts) {
+            rewritten_branches.push(branch_expr);
+        }
+        // If a branch becomes empty (only common eqs), skip it — it
+        // effectively becomes TRUE, making the whole OR always true for
+        // matched eq keys.  We represent this by omitting the branch.
+    }
+
+    let rewritten = if rewritten_branches.len() == branches.len() {
+        combine_disjuncts(rewritten_branches)
+    } else {
+        // Some branches were pure eq-only; the entire OR condition is
+        // satisfied whenever the common equalities hold.
+        None
+    };
+
+    (common, rewritten)
 }
 
 /// Combine a list of residual predicates back into a single AND-connected
