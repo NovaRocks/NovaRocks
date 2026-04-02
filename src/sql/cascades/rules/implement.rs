@@ -294,39 +294,11 @@ impl Rule for AggToHashAgg {
             children: expr.children.clone(),
         };
 
-        // Alternative 2: Two-phase Local+Global aggregation.
-        // Only applicable when there are GROUP BY columns; scalar aggregation
-        // (empty group_by) does not benefit from a two-phase split.
-        if op.group_by.is_empty() {
-            return vec![single];
-        }
-
-        // Create a new group containing the Local aggregate whose child is the
-        // original child group of the LogicalAggregate.
-        let local_expr = MExpr {
-            id: memo.next_expr_id(),
-            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
-                mode: AggMode::Local,
-                group_by: op.group_by.clone(),
-                aggregates: op.aggregates.clone(),
-                output_columns: op.output_columns.clone(),
-            }),
-            children: expr.children.clone(),
-        };
-        let local_group = memo.new_group(local_expr);
-
-        // Global aggregate: its child is the Local group.
-        let global = NewExpr {
-            op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
-                mode: AggMode::Global,
-                group_by: op.group_by.clone(),
-                aggregates: op.aggregates.clone(),
-                output_columns: op.output_columns.clone(),
-            }),
-            children: vec![local_group],
-        };
-
-        vec![single, global]
+        // Two-phase Local+Global aggregation is deferred — the Global
+        // aggregate's input expressions must reference the Local output
+        // columns (e.g., `sum(sum(x))`), which requires expression
+        // rewriting not yet implemented.  Single-phase only for now.
+        vec![single]
     }
 }
 
