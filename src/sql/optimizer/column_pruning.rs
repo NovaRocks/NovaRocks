@@ -6,7 +6,7 @@ use super::expr_utils::{collect_column_refs, merge_needed};
 
 /// Walk the plan top-down, collecting which columns are actually needed, and
 /// set `ScanNode.required_columns` accordingly.
-pub(super) fn prune_columns(plan: LogicalPlan) -> LogicalPlan {
+pub(crate) fn prune_columns(plan: LogicalPlan) -> LogicalPlan {
     // Collect all columns required at the root level first, then recurse.
     prune_inner(plan, None)
 }

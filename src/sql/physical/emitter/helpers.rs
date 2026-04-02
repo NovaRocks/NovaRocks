@@ -3,7 +3,7 @@ use crate::sql::ir::{self as query_ir, BinOp, ExprKind, TypedExpr};
 use crate::sql::plan::AggregateCall;
 
 /// Split a TypedExpr on AND into a flat list of conjuncts.
-pub(super) fn split_and_conjuncts_typed(expr: &TypedExpr) -> Vec<&TypedExpr> {
+pub(crate) fn split_and_conjuncts_typed(expr: &TypedExpr) -> Vec<&TypedExpr> {
     let mut result = Vec::new();
     collect_and_conjuncts_typed(expr, &mut result);
     result
@@ -84,7 +84,7 @@ pub(crate) fn agg_call_display_name_from_parts(
     }
 }
 
-pub(super) fn agg_call_display_name(call: &AggregateCall) -> String {
+pub(crate) fn agg_call_display_name(call: &AggregateCall) -> String {
     if call.args.is_empty() {
         format!("{}(*)", call.name)
     } else {
@@ -98,7 +98,7 @@ pub(super) fn agg_call_display_name(call: &AggregateCall) -> String {
 }
 
 /// Map JoinKind to TJoinOp.
-pub(super) fn join_kind_to_op(kind: query_ir::JoinKind) -> plan_nodes::TJoinOp {
+pub(crate) fn join_kind_to_op(kind: query_ir::JoinKind) -> plan_nodes::TJoinOp {
     match kind {
         query_ir::JoinKind::Inner => plan_nodes::TJoinOp::INNER_JOIN,
         query_ir::JoinKind::LeftOuter => plan_nodes::TJoinOp::LEFT_OUTER_JOIN,

@@ -19,6 +19,8 @@
 //! Responsibilities:
 //! - Publishes one build artifact to all probe operators and tracks build completion.
 //! - Coordinates probe visibility and shared error propagation across drivers.
+//! - Merges per-driver build-matched flags for RIGHT SEMI/ANTI and FULL/RIGHT OUTER
+//!   joins so that unmatched build rows are emitted exactly once.
 //!
 //! Key exported interfaces:
 //! - Types: `BroadcastJoinSharedState`.
@@ -33,18 +35,37 @@ use super::build_artifact::JoinBuildArtifact;
 use super::build_state::JoinBuildSinkState;
 use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
 
+/// Accumulator that OR-merges per-driver build-matched flags.
+struct BuildMatchMerge {
+    /// OR-accumulated flags: `merged[batch_idx][row_idx]` is true if ANY
+    /// driver marked that build row as matched.
+    merged: Vec<Vec<bool>>,
+    drivers_merged: usize,
+    total_drivers: usize,
+}
+
 /// Shared state that publishes one broadcast join build artifact and coordinates probe readiness.
 pub(crate) struct BroadcastJoinSharedState {
     dep: DependencyHandle,
     build: Mutex<Option<Arc<JoinBuildArtifact>>>,
+    /// Merge accumulator for per-driver build-matched flags (RIGHT SEMI/ANTI,
+    /// FULL OUTER, RIGHT OUTER).  Initialised lazily on first merge call.
+    build_match_merge: Mutex<Option<BuildMatchMerge>>,
+    total_probe_drivers: usize,
 }
 
 impl BroadcastJoinSharedState {
-    pub(crate) fn new(node_id: i32, dep_manager: DependencyManager) -> Self {
+    pub(crate) fn new(
+        node_id: i32,
+        dep_manager: DependencyManager,
+        total_probe_drivers: usize,
+    ) -> Self {
         let dep = dep_manager.get_or_create(format!("broadcast_join_build:{}", node_id));
         Self {
             dep,
             build: Mutex::new(None),
+            build_match_merge: Mutex::new(None),
+            total_probe_drivers,
         }
     }
 
@@ -74,6 +95,47 @@ impl BroadcastJoinSharedState {
     pub(crate) fn has_build(&self) -> bool {
         let guard = self.build.lock().expect("broadcast join build lock");
         guard.is_some()
+    }
+
+    /// Merge one driver's local `build_matched` flags into the shared
+    /// accumulator.  Returns `Some(merged_flags)` when this is the last
+    /// driver to merge (meaning all probing is done and it is safe to
+    /// compute the unmatched-row output).  All other drivers receive `None`.
+    pub(crate) fn merge_build_matched(
+        &self,
+        local_flags: Vec<Vec<bool>>,
+    ) -> Option<Vec<Vec<bool>>> {
+        let mut guard = self.build_match_merge.lock().expect("build match merge lock");
+        let merge = guard.get_or_insert_with(|| BuildMatchMerge {
+            merged: local_flags
+                .iter()
+                .map(|batch| vec![false; batch.len()])
+                .collect(),
+            drivers_merged: 0,
+            total_drivers: self.total_probe_drivers,
+        });
+
+        // OR-merge local flags into accumulator.
+        for (batch_idx, batch_flags) in local_flags.iter().enumerate() {
+            if let Some(merged_batch) = merge.merged.get_mut(batch_idx) {
+                for (row_idx, &matched) in batch_flags.iter().enumerate() {
+                    if matched {
+                        if let Some(slot) = merged_batch.get_mut(row_idx) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        merge.drivers_merged += 1;
+        if merge.drivers_merged == merge.total_drivers {
+            // Last driver: take the merged flags.
+            let result = std::mem::take(&mut merge.merged);
+            Some(result)
+        } else {
+            None
+        }
     }
 }
 

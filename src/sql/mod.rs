@@ -10,6 +10,8 @@ pub(crate) mod types;
 
 pub(crate) mod statistics;
 
+pub(crate) mod cascades;
+
 pub(crate) mod analyzer;
 pub(crate) mod explain;
 pub(crate) mod optimizer;

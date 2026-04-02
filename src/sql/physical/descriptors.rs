@@ -59,6 +59,16 @@ impl DescriptorTableBuilder {
         ));
     }
 
+    /// Mark all slots belonging to the given tuple as nullable.
+    /// Used for outer/anti join nullable side columns.
+    pub fn widen_tuple_nullable(&mut self, tuple_id: types::TTupleId) {
+        for slot in &mut self.slots {
+            if slot.parent == Some(tuple_id) {
+                slot.is_nullable = Some(true);
+            }
+        }
+    }
+
     pub fn build(self) -> descriptors::TDescriptorTable {
         descriptors::TDescriptorTable::new(
             Some(self.slots),

@@ -324,6 +324,13 @@ impl PartitionedJoinProbeProcessorOperator {
                     .core
                     .merge_join_outputs(None, build_out, &schema, true)?;
             }
+            JoinType::RightSemi if self.core.probe_is_left() => {
+                let schema = Arc::clone(self.core.build_chunk_schema());
+                let build_out = self.core.build_right_semi_anti_output(true)?;
+                out = self
+                    .core
+                    .merge_join_outputs(None, build_out, &schema, true)?;
+            }
             JoinType::FullOuter | JoinType::RightOuter => {
                 let schema = Arc::clone(self.core.join_scope_chunk_schema());
                 let build_unmatched = self.core.build_full_outer_unmatched_build()?;

@@ -271,18 +271,48 @@ impl BroadcastJoinProbeProcessorOperator {
 
         match self.core.join_type() {
             JoinType::RightAnti if self.core.probe_is_left() => {
-                let schema = Arc::clone(self.core.build_chunk_schema());
-                let build_out = self.core.build_right_semi_anti_output(false)?;
-                out = self
-                    .core
-                    .merge_join_outputs(None, build_out, &schema, true)?;
+                // Merge this driver's local build-matched flags into the
+                // shared accumulator.  Only the last driver to merge
+                // receives the merged flags and produces the output.
+                let local_flags = self.core.take_build_matched().unwrap_or_default();
+                if let Some(merged) = self.state.merge_build_matched(local_flags) {
+                    let schema = Arc::clone(self.core.build_chunk_schema());
+                    let build_out =
+                        self.core.build_right_semi_anti_output_with_flags(&merged, false)?;
+                    out = self
+                        .core
+                        .merge_join_outputs(None, build_out, &schema, true)?;
+                } else {
+                    // Not the last driver — no build-side output from this driver.
+                    out = None;
+                }
+            }
+            JoinType::RightSemi if self.core.probe_is_left() => {
+                let local_flags = self.core.take_build_matched().unwrap_or_default();
+                if let Some(merged) = self.state.merge_build_matched(local_flags) {
+                    let schema = Arc::clone(self.core.build_chunk_schema());
+                    let build_out =
+                        self.core.build_right_semi_anti_output_with_flags(&merged, true)?;
+                    out = self
+                        .core
+                        .merge_join_outputs(None, build_out, &schema, true)?;
+                } else {
+                    out = None;
+                }
             }
             JoinType::FullOuter | JoinType::RightOuter => {
-                let schema = Arc::clone(self.core.join_scope_chunk_schema());
-                let build_unmatched = self.core.build_full_outer_unmatched_build()?;
-                out = self
-                    .core
-                    .merge_join_outputs(out, build_unmatched, &schema, false)?;
+                let local_flags = self.core.take_build_matched().unwrap_or_default();
+                if let Some(merged) = self.state.merge_build_matched(local_flags) {
+                    let schema = Arc::clone(self.core.join_scope_chunk_schema());
+                    let build_unmatched = self
+                        .core
+                        .build_full_outer_unmatched_build_with_flags(&merged)?;
+                    out = self
+                        .core
+                        .merge_join_outputs(out, build_unmatched, &schema, false)?;
+                }
+                // Non-last drivers keep their own probe output (if any)
+                // but do not emit unmatched build rows.
             }
             _ => {}
         }
@@ -442,7 +472,7 @@ mod tests {
 
         let dep_manager = DependencyManager::new();
         let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
-        let join_state = Arc::new(BroadcastJoinSharedState::new(1, dep_manager));
+        let join_state = Arc::new(BroadcastJoinSharedState::new(1, dep_manager, 1));
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
         let build_factory = HashJoinBuildSinkFactory::new(
@@ -548,7 +578,7 @@ mod tests {
 
         let dep_manager = DependencyManager::new();
         let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
-        let join_state = Arc::new(BroadcastJoinSharedState::new(1, dep_manager));
+        let join_state = Arc::new(BroadcastJoinSharedState::new(1, dep_manager, 1));
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
         let build_factory = HashJoinBuildSinkFactory::new(
@@ -649,7 +679,7 @@ mod tests {
 
         let dep_manager = DependencyManager::new();
         let runtime_filter_hub = Arc::new(RuntimeFilterHub::new(dep_manager.clone()));
-        let join_state = Arc::new(BroadcastJoinSharedState::new(1, dep_manager));
+        let join_state = Arc::new(BroadcastJoinSharedState::new(1, dep_manager, 1));
 
         let build_state: Arc<dyn JoinBuildSinkState> = join_state.clone();
         let build_factory = HashJoinBuildSinkFactory::new(

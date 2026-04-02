@@ -18,7 +18,7 @@ use super::map_children;
 ///   left-only / right-only predicates below the join
 /// - Filter → Aggregate: push predicates that reference only GROUP BY columns
 ///   below the aggregate
-pub(super) fn push_down_predicates(plan: LogicalPlan) -> LogicalPlan {
+pub(crate) fn push_down_predicates(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter(node) => {
             let input = push_down_predicates(*node.input);

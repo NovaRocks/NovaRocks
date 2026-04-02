@@ -900,9 +900,11 @@ fn build_pipeline_for_node(
                     )))
                 };
 
+                let probe_dop = probe_build.pipeline.dop.max(1) as usize;
                 let join_state = Arc::new(BroadcastJoinSharedState::new(
                     *node_id,
                     ctx.dep_manager.clone(),
+                    probe_dop,
                 ));
 
                 probe_build.pipeline.factories.push(Box::new(

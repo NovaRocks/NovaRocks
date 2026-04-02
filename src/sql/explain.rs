@@ -1,7 +1,10 @@
-//! EXPLAIN plan formatter — produces StarRocks-compatible text from a LogicalPlan.
+//! EXPLAIN plan formatter — produces text from LogicalPlan or PhysicalPlan.
 
 use std::fmt::Write;
 
+use crate::sql::cascades::operator::{AggMode, JoinDistribution, Operator};
+use crate::sql::cascades::physical_plan::PhysicalPlanNode;
+use crate::sql::cascades::property::DistributionSpec;
 use crate::sql::ir::{BinOp, ExprKind, JoinKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::plan::{LogicalPlan, QueryPlan};
 
@@ -224,6 +227,295 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
         }
         LogicalPlan::CTEConsume(node) => {
             out.push(format!("{pad}CTE_CONSUME(cte_id={})", node.cte_id));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Physical plan formatting
+// ---------------------------------------------------------------------------
+
+/// Format a PhysicalPlanNode tree as EXPLAIN text lines.
+pub(crate) fn explain_physical_plan(plan: &PhysicalPlanNode, level: ExplainLevel) -> Vec<String> {
+    let mut out = Vec::new();
+    format_physical_node(plan, level, 0, &mut out);
+    out
+}
+
+fn format_physical_node(
+    node: &PhysicalPlanNode,
+    level: ExplainLevel,
+    indent: usize,
+    out: &mut Vec<String>,
+) {
+    let pad = "  ".repeat(indent);
+    let costs_suffix = if matches!(level, ExplainLevel::Costs) {
+        format!(" (rows={:.0})", node.stats.output_row_count)
+    } else {
+        String::new()
+    };
+
+    match &node.op {
+        Operator::PhysicalScan(op) => {
+            let alias = op
+                .alias
+                .as_deref()
+                .map(|a| format!(" (alias={a})"))
+                .unwrap_or_default();
+            out.push(format!(
+                "{pad}SCAN {}.{}{alias}{costs_suffix}",
+                op.database, op.table.name
+            ));
+            if let Some(ref cols) = op.required_columns {
+                if matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs) {
+                    out.push(format!("{pad}     columns: {}", cols.join(", ")));
+                }
+            }
+            if !op.predicates.is_empty() {
+                let preds: Vec<String> = op.predicates.iter().map(format_expr).collect();
+                out.push(format!("{pad}     predicates: {}", preds.join(" AND ")));
+            }
+        }
+        Operator::PhysicalFilter(op) => {
+            out.push(format!("{pad}FILTER{costs_suffix}"));
+            out.push(format!("{pad}  predicate: {}", format_expr(&op.predicate)));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalProject(op) => {
+            let items: Vec<String> = op
+                .items
+                .iter()
+                .map(|item| {
+                    let expr_str = format_expr(&item.expr);
+                    if item.output_name != expr_str {
+                        format!("{expr_str} AS {}", item.output_name)
+                    } else {
+                        expr_str
+                    }
+                })
+                .collect();
+            out.push(format!("{pad}PROJECT [{}]{costs_suffix}", items.join(", ")));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalHashJoin(op) => {
+            let dist = match op.distribution {
+                JoinDistribution::Shuffle => "SHUFFLE",
+                JoinDistribution::Broadcast => "BROADCAST",
+                JoinDistribution::Colocate => "COLOCATE",
+            };
+            let join_str = match op.join_type {
+                JoinKind::Inner => "INNER",
+                JoinKind::LeftOuter => "LEFT OUTER",
+                JoinKind::RightOuter => "RIGHT OUTER",
+                JoinKind::FullOuter => "FULL OUTER",
+                JoinKind::Cross => "CROSS",
+                JoinKind::LeftSemi => "LEFT SEMI",
+                JoinKind::RightSemi => "RIGHT SEMI",
+                JoinKind::LeftAnti => "LEFT ANTI",
+                JoinKind::RightAnti => "RIGHT ANTI",
+            };
+            let eq: Vec<String> = op
+                .eq_conditions
+                .iter()
+                .map(|(l, r)| format!("{} = {}", format_expr(l), format_expr(r)))
+                .collect();
+            out.push(format!(
+                "{pad}HASH JOIN ({dist}, {join_str}, eq: [{}]){costs_suffix}",
+                eq.join(", ")
+            ));
+            if let Some(ref other) = op.other_condition {
+                out.push(format!("{pad}  other: {}", format_expr(other)));
+            }
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalNestLoopJoin(op) => {
+            let join_str = match op.join_type {
+                JoinKind::Inner => "INNER",
+                JoinKind::LeftOuter => "LEFT OUTER",
+                JoinKind::RightOuter => "RIGHT OUTER",
+                JoinKind::FullOuter => "FULL OUTER",
+                JoinKind::Cross => "CROSS",
+                JoinKind::LeftSemi => "LEFT SEMI",
+                JoinKind::RightSemi => "RIGHT SEMI",
+                JoinKind::LeftAnti => "LEFT ANTI",
+                JoinKind::RightAnti => "RIGHT ANTI",
+            };
+            out.push(format!("{pad}NEST LOOP JOIN ({join_str}){costs_suffix}"));
+            if let Some(ref cond) = op.condition {
+                out.push(format!("{pad}  on: {}", format_expr(cond)));
+            }
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalHashAggregate(op) => {
+            let mode = match op.mode {
+                AggMode::Single => "SINGLE",
+                AggMode::Local => "LOCAL",
+                AggMode::Global => "GLOBAL",
+            };
+            let groups: Vec<String> = op.group_by.iter().map(format_expr).collect();
+            let aggs: Vec<String> = op
+                .aggregates
+                .iter()
+                .map(|a| {
+                    let args: Vec<String> = a.args.iter().map(format_expr).collect();
+                    let distinct = if a.distinct { "DISTINCT " } else { "" };
+                    format!("{}({}{})", a.name, distinct, args.join(", "))
+                })
+                .collect();
+            let mut detail = format!("{pad}HASH AGGREGATE ({mode}");
+            if !groups.is_empty() {
+                let _ = write!(detail, ", group by: [{}]", groups.join(", "));
+            }
+            let _ = write!(detail, "){costs_suffix}");
+            out.push(detail);
+            if !aggs.is_empty() {
+                out.push(format!("{pad}  aggregations: {}", aggs.join(", ")));
+            }
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalSort(op) => {
+            let items: Vec<String> = op
+                .items
+                .iter()
+                .map(|s| {
+                    let dir = if s.asc { "ASC" } else { "DESC" };
+                    let nulls = if s.nulls_first {
+                        " NULLS FIRST"
+                    } else {
+                        " NULLS LAST"
+                    };
+                    format!("{} {dir}{nulls}", format_expr(&s.expr))
+                })
+                .collect();
+            out.push(format!(
+                "{pad}SORT BY [{}]{costs_suffix}",
+                items.join(", ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalLimit(op) => {
+            let mut parts = Vec::new();
+            if let Some(limit) = op.limit {
+                parts.push(format!("limit={limit}"));
+            }
+            if let Some(offset) = op.offset {
+                parts.push(format!("offset={offset}"));
+            }
+            out.push(format!(
+                "{pad}LIMIT [{}]{costs_suffix}",
+                parts.join(", ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalDistribution(op) => {
+            let label = match &op.spec {
+                DistributionSpec::Any => "ANY EXCHANGE".to_string(),
+                DistributionSpec::Gather => "GATHER EXCHANGE".to_string(),
+                DistributionSpec::HashPartitioned(cols) => {
+                    let col_names: Vec<String> = cols
+                        .iter()
+                        .map(|c| match &c.qualifier {
+                            Some(q) => format!("{q}.{}", c.column),
+                            None => c.column.clone(),
+                        })
+                        .collect();
+                    format!("HASH EXCHANGE (hash: [{}])", col_names.join(", "))
+                }
+            };
+            out.push(format!("{pad}{label}{costs_suffix}"));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalWindow(op) => {
+            let fns: Vec<String> = op
+                .window_exprs
+                .iter()
+                .map(|w| {
+                    let args: Vec<String> = w.args.iter().map(format_expr).collect();
+                    format!("{}({})", w.name, args.join(", "))
+                })
+                .collect();
+            out.push(format!(
+                "{pad}WINDOW [{}]{costs_suffix}",
+                fns.join("; ")
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalCTEProduce(op) => {
+            out.push(format!("{pad}CTE PRODUCE (cte_id={}){costs_suffix}", op.cte_id));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalCTEConsume(op) => {
+            out.push(format!(
+                "{pad}CTE CONSUME (cte_id={}){costs_suffix}",
+                op.cte_id
+            ));
+        }
+        Operator::PhysicalRepeat(op) => {
+            out.push(format!(
+                "{pad}REPEAT ({} grouping sets){costs_suffix}",
+                op.grouping_ids.len()
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalUnion(op) => {
+            let kind = if op.all { "UNION ALL" } else { "UNION" };
+            out.push(format!("{pad}{kind}{costs_suffix}"));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalIntersect(_) => {
+            out.push(format!("{pad}INTERSECT{costs_suffix}"));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalExcept(_) => {
+            out.push(format!("{pad}EXCEPT{costs_suffix}"));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalValues(op) => {
+            out.push(format!("{pad}VALUES ({} rows){costs_suffix}", op.rows.len()));
+        }
+        Operator::PhysicalGenerateSeries(op) => {
+            out.push(format!(
+                "{pad}GENERATE_SERIES({}, {}, {}){costs_suffix}",
+                op.start, op.end, op.step
+            ));
+        }
+        Operator::PhysicalSubqueryAlias(op) => {
+            out.push(format!("{pad}SUBQUERY ALIAS [{}]{costs_suffix}", op.alias));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        // Logical operators should not appear in physical plan
+        _ => {
+            out.push(format!("{pad}<logical operator>{costs_suffix}"));
         }
     }
 }
