@@ -1,8 +1,9 @@
 //! PlanFragmentBuilder — converts a PhysicalPlanNode tree into Thrift TPlan
 //! per fragment.
 //!
-//! This first version handles single-fragment plans.  Multi-fragment
-//! splitting at PhysicalDistribution / CTE boundaries is deferred to Task 11.
+//! Fragment boundaries are created at `PhysicalDistribution` nodes.
+//! `PhysicalCTEProduce` / `PhysicalCTEConsume` create multicast fragments
+//! whose sinks are wired by the `ExecutionCoordinator` after building.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1296,38 +1297,10 @@ impl<'a> PlanFragmentBuilder<'a> {
         _op: &PhysicalDistributionOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        // 1. Visit the child subtree to get its plan nodes and scope.
-        let child = self.visit(&node.children[0])?;
-
-        // 2. Finalize the child subtree as a separate fragment.
-        //    The coordinator will wire the real sink (DataStreamSink) later;
-        //    we use a NOOP_SINK placeholder here.
-        let child_fragment_id = self.alloc_fragment_id();
-        let child_fragment = FragmentBuildResult {
-            fragment_id: child_fragment_id,
-            plan: plan_nodes::TPlan::new(child.plan_nodes),
-            // desc_tbl and exec_params are placeholder; build() patches them
-            // with the shared values after visitation completes.
-            desc_tbl: DescriptorTableBuilder::new().build(),
-            exec_params: nodes::build_exec_params_multi(&[])?,
-            output_sink: build_noop_sink(),
-            output_columns: Vec::new(),
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        self.completed_fragments.push(child_fragment);
-
-        // 3. Create an exchange node in the current (parent) fragment that
-        //    will receive data from the child fragment.
-        let exchange_node_id = self.alloc_node();
-        let exchange_node =
-            nodes::build_exchange_node(exchange_node_id, child.tuple_ids.clone());
-
-        Ok(VisitResult {
-            plan_nodes: vec![exchange_node],
-            scope: child.scope,
-            tuple_ids: child.tuple_ids,
-        })
+        // In standalone mode (single node), distribution enforcers are logical
+        // markers for cost model purposes.  Actual execution doesn't need
+        // separate fragments — all data is local.  Pass through to child.
+        self.visit(&node.children[0])
     }
 
     // -------------------------------------------------------------------
