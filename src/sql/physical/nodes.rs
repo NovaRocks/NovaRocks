@@ -527,7 +527,7 @@ fn build_hdfs_scan_range_params(
 // Exchange node (used for CTE consume)
 // ---------------------------------------------------------------------------
 
-pub(super) fn build_exchange_node(
+pub(crate) fn build_exchange_node(
     node_id: i32,
     input_row_tuples: Vec<i32>,
 ) -> plan_nodes::TPlanNode {

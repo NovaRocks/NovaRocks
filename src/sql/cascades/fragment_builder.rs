@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
@@ -16,11 +17,13 @@ use crate::plan_nodes;
 use crate::sql::catalog::CatalogProvider;
 use crate::sql::cascades::operator::Operator;
 use crate::sql::cascades::operator::{
-    PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
-    PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
-    PhysicalSortOp, PhysicalSubqueryAliasOp, PhysicalValuesOp, PhysicalWindowOp,
+    PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDistributionOp, PhysicalFilterOp,
+    PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalLimitOp,
+    PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
+    PhysicalSubqueryAliasOp, PhysicalValuesOp, PhysicalWindowOp,
 };
 use crate::sql::cascades::physical_plan::PhysicalPlanNode;
+use crate::sql::cte::CteId;
 use crate::sql::fragment::FragmentId;
 use crate::sql::physical::descriptors::DescriptorTableBuilder;
 use crate::sql::physical::emitter::helpers::{
@@ -68,6 +71,15 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     next_node_id: i32,
     next_slot_id: i32,
     next_tuple_id: i32,
+    next_fragment_id: FragmentId,
+    /// Fragments finalized during visitation (child fragments from distribution
+    /// boundaries and CTE produce fragments).
+    completed_fragments: Vec<FragmentBuildResult>,
+    /// CTE ID -> index in `completed_fragments`.
+    cte_fragments: HashMap<CteId, usize>,
+    /// Exchange node IDs that consume from CTE fragments, recorded for the root
+    /// fragment: `(cte_id, exchange_node_id)`.
+    cte_exchange_nodes: Vec<(CteId, i32)>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -88,10 +100,17 @@ impl<'a> PlanFragmentBuilder<'a> {
             next_node_id: 1,
             next_slot_id: 1,
             next_tuple_id: 1,
+            next_fragment_id: 0,
+            completed_fragments: Vec::new(),
+            cte_fragments: HashMap::new(),
+            cte_exchange_nodes: Vec::new(),
         };
 
         let result = builder.visit(plan)?;
 
+        // Build the shared descriptor table and exec params.  All fragments
+        // share the same descriptor table and scan ranges since the
+        // coordinator rewires instance IDs and sinks after the fact.
         let desc_tbl = std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new())
             .build();
 
@@ -113,23 +132,33 @@ impl<'a> PlanFragmentBuilder<'a> {
             })
             .collect();
 
-        // Build a result sink for the single fragment.
-        let output_sink = build_result_sink();
-
-        let fragment = FragmentBuildResult {
-            fragment_id: 0,
+        // Build the root fragment with a result sink.
+        let root_fragment_id = builder.alloc_fragment_id();
+        let root_fragment = FragmentBuildResult {
+            fragment_id: root_fragment_id,
             plan: plan_nodes::TPlan::new(result.plan_nodes),
-            desc_tbl,
-            exec_params,
-            output_sink,
+            desc_tbl: desc_tbl.clone(),
+            exec_params: exec_params.clone(),
+            output_sink: build_result_sink(),
             output_columns,
             cte_id: None,
-            cte_exchange_nodes: Vec::new(),
+            cte_exchange_nodes: builder.cte_exchange_nodes,
         };
 
+        // Patch all completed (child) fragments with the shared descriptor
+        // table and exec params.
+        for frag in &mut builder.completed_fragments {
+            frag.desc_tbl = desc_tbl.clone();
+            frag.exec_params = exec_params.clone();
+        }
+
+        // Assemble all fragments: completed child fragments first, then root.
+        let mut fragments = builder.completed_fragments;
+        fragments.push(root_fragment);
+
         Ok(BuildResult {
-            fragments: vec![fragment],
-            root_fragment_id: 0,
+            fragments,
+            root_fragment_id,
         })
     }
 
@@ -155,6 +184,12 @@ impl<'a> PlanFragmentBuilder<'a> {
         id
     }
 
+    fn alloc_fragment_id(&mut self) -> FragmentId {
+        let id = self.next_fragment_id;
+        self.next_fragment_id += 1;
+        id
+    }
+
     // -------------------------------------------------------------------
     // Dispatcher
     // -------------------------------------------------------------------
@@ -174,16 +209,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalGenerateSeries(op) => self.visit_generate_series(op, node),
             Operator::PhysicalSubqueryAlias(op) => self.visit_subquery_alias(op, node),
             Operator::PhysicalRepeat(op) => self.visit_repeat(op, node),
-            // Operators deferred to Task 11 (multi-fragment)
-            Operator::PhysicalDistribution(_) => {
-                Err("PhysicalDistribution not supported in single-fragment builder".to_string())
-            }
-            Operator::PhysicalCTEProduce(_) => {
-                Err("PhysicalCTEProduce not supported in single-fragment builder".to_string())
-            }
-            Operator::PhysicalCTEConsume(_) => {
-                Err("PhysicalCTEConsume not supported in single-fragment builder".to_string())
-            }
+            Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
+            Operator::PhysicalCTEProduce(op) => self.visit_cte_produce(op, node),
+            Operator::PhysicalCTEConsume(op) => self.visit_cte_consume(op),
             // Set operations: union, intersect, except — not yet wired in cascades
             Operator::PhysicalUnion(_)
             | Operator::PhysicalIntersect(_)
@@ -1258,6 +1286,163 @@ impl<'a> PlanFragmentBuilder<'a> {
             tuple_ids: output_tuple_ids,
         })
     }
+
+    // -------------------------------------------------------------------
+    // visit_distribution
+    // -------------------------------------------------------------------
+
+    fn visit_distribution(
+        &mut self,
+        _op: &PhysicalDistributionOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        // 1. Visit the child subtree to get its plan nodes and scope.
+        let child = self.visit(&node.children[0])?;
+
+        // 2. Finalize the child subtree as a separate fragment.
+        //    The coordinator will wire the real sink (DataStreamSink) later;
+        //    we use a NOOP_SINK placeholder here.
+        let child_fragment_id = self.alloc_fragment_id();
+        let child_fragment = FragmentBuildResult {
+            fragment_id: child_fragment_id,
+            plan: plan_nodes::TPlan::new(child.plan_nodes),
+            // desc_tbl and exec_params are placeholder; build() patches them
+            // with the shared values after visitation completes.
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi(&[])?,
+            output_sink: build_noop_sink(),
+            output_columns: Vec::new(),
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        };
+        self.completed_fragments.push(child_fragment);
+
+        // 3. Create an exchange node in the current (parent) fragment that
+        //    will receive data from the child fragment.
+        let exchange_node_id = self.alloc_node();
+        let exchange_node =
+            nodes::build_exchange_node(exchange_node_id, child.tuple_ids.clone());
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // visit_cte_produce
+    // -------------------------------------------------------------------
+
+    fn visit_cte_produce(
+        &mut self,
+        op: &PhysicalCTEProduceOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        // Visit the child subtree that produces the CTE data.
+        let child = self.visit(&node.children[0])?;
+
+        // Finalize the child as a fragment marked with the CTE ID.
+        // The coordinator will replace the NOOP_SINK with a multicast sink
+        // after seeing all consumers.
+        let cte_fragment_id = self.alloc_fragment_id();
+        let cte_fragment = FragmentBuildResult {
+            fragment_id: cte_fragment_id,
+            plan: plan_nodes::TPlan::new(child.plan_nodes),
+            // Placeholder; build() patches these.
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi(&[])?,
+            output_sink: build_noop_sink(),
+            output_columns: Vec::new(),
+            cte_id: Some(op.cte_id),
+            cte_exchange_nodes: Vec::new(),
+        };
+        let idx = self.completed_fragments.len();
+        self.completed_fragments.push(cte_fragment);
+        self.cte_fragments.insert(op.cte_id, idx);
+
+        // CTE produce is transparent — return the child's scope and tuple IDs
+        // so that the parent can continue building on top of the CTE output.
+        // The plan_nodes are empty because they have been moved into the
+        // completed fragment; the parent will reference them via exchange.
+        // However, the *logical* output shape (scope + tuple_ids) propagates
+        // upward so that a subsequent visit_cte_consume can create a matching
+        // exchange node.
+
+        // Build an exchange node for the implicit consume that follows in the
+        // plan tree (the parent of CTE produce is typically the root fragment
+        // or another CTE consumer).
+        let exchange_node_id = self.alloc_node();
+        let exchange_node =
+            nodes::build_exchange_node(exchange_node_id, child.tuple_ids.clone());
+        self.cte_exchange_nodes
+            .push((op.cte_id, exchange_node_id));
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope: child.scope,
+            tuple_ids: child.tuple_ids,
+        })
+    }
+
+    // -------------------------------------------------------------------
+    // visit_cte_consume
+    // -------------------------------------------------------------------
+
+    fn visit_cte_consume(&mut self, op: &PhysicalCTEConsumeOp) -> Result<VisitResult, String> {
+        // Verify the CTE produce fragment was already visited.
+        if !self.cte_fragments.contains_key(&op.cte_id) {
+            return Err(format!(
+                "CTE consume references unknown cte_id={}",
+                op.cte_id
+            ));
+        }
+
+        // Allocate an exchange node that will receive data from the CTE
+        // produce fragment's multicast sink.
+        let exchange_node_id = self.alloc_node();
+
+        // Record this consumer so the root fragment carries the metadata
+        // needed by the coordinator to wire multicast destinations.
+        self.cte_exchange_nodes
+            .push((op.cte_id, exchange_node_id));
+
+        // Build the scope from the CTE consume's declared output columns
+        // so that parent operators can resolve column references.
+        let exchange_tuple_id = self.alloc_tuple();
+        let mut scope = ExprScope::new();
+
+        for (idx, col) in op.output_columns.iter().enumerate() {
+            let slot_id = self.alloc_slot();
+            self.desc_builder.add_slot(
+                slot_id,
+                exchange_tuple_id,
+                &col.name,
+                &col.data_type,
+                col.nullable,
+                idx as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: exchange_tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                nullable: col.nullable,
+            };
+            scope.add_column(None, col.name.clone(), binding.clone());
+            // Also register with the CTE alias as qualifier
+            scope.add_column(Some(op.alias.clone()), col.name.clone(), binding);
+        }
+        self.desc_builder.add_tuple(exchange_tuple_id);
+
+        let exchange_node =
+            nodes::build_exchange_node(exchange_node_id, vec![exchange_tuple_id]);
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope,
+            tuple_ids: vec![exchange_tuple_id],
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1454,30 @@ fn build_result_sink() -> data_sinks::TDataSink {
         data_sinks::TDataSinkType::RESULT_SINK,
         None::<data_sinks::TDataStreamSink>,
         Some(data_sinks::TResultSink::default()),
+        None::<data_sinks::TMysqlTableSink>,
+        None::<data_sinks::TExportSink>,
+        None::<data_sinks::TOlapTableSink>,
+        None::<data_sinks::TMemoryScratchSink>,
+        None::<data_sinks::TMultiCastDataStreamSink>,
+        None::<data_sinks::TSchemaTableSink>,
+        None::<data_sinks::TIcebergTableSink>,
+        None::<data_sinks::THiveTableSink>,
+        None::<data_sinks::TTableFunctionTableSink>,
+        None::<data_sinks::TDictionaryCacheSink>,
+        None::<Vec<Box<data_sinks::TDataSink>>>,
+        None::<i64>,
+        None::<data_sinks::TSplitDataStreamSink>,
+    )
+}
+
+/// Placeholder sink for child / CTE fragments.  The coordinator replaces
+/// this with the real DataStreamSink or MultiCastDataStreamSink after
+/// fragment instance IDs are assigned.
+fn build_noop_sink() -> data_sinks::TDataSink {
+    data_sinks::TDataSink::new(
+        data_sinks::TDataSinkType::NOOP_SINK,
+        None::<data_sinks::TDataStreamSink>,
+        None::<data_sinks::TResultSink>,
         None::<data_sinks::TMysqlTableSink>,
         None::<data_sinks::TExportSink>,
         None::<data_sinks::TOlapTableSink>,
