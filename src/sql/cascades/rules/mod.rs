@@ -34,6 +34,8 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
 pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(join_commutativity::JoinCommutativity),
-        Box::new(join_associativity::JoinAssociativity),
+        // JoinAssociativity disabled: creates exponential groups on large join
+        // graphs.  Needs bounded enumeration (DP or beam search) to be usable.
+        // Box::new(join_associativity::JoinAssociativity),
     ]
 }

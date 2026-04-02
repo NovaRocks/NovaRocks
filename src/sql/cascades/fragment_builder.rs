@@ -459,13 +459,24 @@ impl<'a> PlanFragmentBuilder<'a> {
         let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
 
-        // Compile eq conditions
+        // Compile eq conditions.  The eq_conditions pairs come from the SQL
+        // text order (e.g. `l_orderkey = o_orderkey`), which may not match the
+        // join's left/right child assignment.  Try the natural order first; if
+        // the left expr fails against the left scope, swap sides.
         let mut eq_join_conjuncts = Vec::new();
-        for (left_expr, right_expr) in &op.eq_conditions {
-            let mut left_compiler = ExprCompiler::new(&left.scope);
-            let mut right_compiler = ExprCompiler::new(&right.scope);
-            let left_texpr = left_compiler.compile_typed(left_expr)?;
-            let right_texpr = right_compiler.compile_typed(right_expr)?;
+        for (expr_a, expr_b) in &op.eq_conditions {
+            let (left_texpr, right_texpr) = {
+                let try_left = ExprCompiler::new(&left.scope).compile_typed(expr_a);
+                if let Ok(lt) = try_left {
+                    let rt = ExprCompiler::new(&right.scope).compile_typed(expr_b)?;
+                    (lt, rt)
+                } else {
+                    // Swap: expr_a is from the right child, expr_b from the left.
+                    let lt = ExprCompiler::new(&left.scope).compile_typed(expr_b)?;
+                    let rt = ExprCompiler::new(&right.scope).compile_typed(expr_a)?;
+                    (lt, rt)
+                }
+            };
             eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
                 left: left_texpr,
                 right: right_texpr,

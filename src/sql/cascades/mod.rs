@@ -68,22 +68,31 @@ pub(crate) fn optimize(
 
 /// Apply transformation rules to all groups in a fixed-point loop.
 ///
-/// Iterates until no new expressions are added to any group.
+/// Iterates until no new expressions are added or the iteration limit is
+/// reached.  The limit prevents combinatorial explosion with join
+/// commutativity + associativity on large join graphs.
+const EXPLORE_MAX_ITERATIONS: usize = 8;
+
 fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for group_id in 0..memo.groups.len() {
+    for _round in 0..EXPLORE_MAX_ITERATIONS {
+        let mut changed = false;
+        let num_groups = memo.groups.len();
+        for group_id in 0..num_groups {
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
                     if rule.matches(&expr.op) {
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
+                            // Dedup: compare operator AND children to avoid
+                            // infinite JoinCommutativity A<->B oscillation.
                             let already_exists = memo.groups[group_id]
                                 .logical_exprs
                                 .iter()
-                                .any(|existing| op_equal(&existing.op, &new_expr.op));
+                                .any(|existing| {
+                                    existing.children == new_expr.children
+                                        && op_equal(&existing.op, &new_expr.op)
+                                });
                             if !already_exists {
                                 let mexpr = MExpr {
                                     id: memo.next_expr_id(),
@@ -98,17 +107,21 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
                 }
             }
         }
+        if !changed {
+            break;
+        }
     }
 }
 
-/// Apply implementation rules to all groups in a fixed-point loop.
+/// Apply implementation rules to all groups.
 ///
-/// Iterates logical expressions and adds physical alternatives.
+/// Single pass — each logical expr gets physical alternatives once.
 fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
     let mut changed = true;
     while changed {
         changed = false;
-        for group_id in 0..memo.groups.len() {
+        let num_groups = memo.groups.len();
+        for group_id in 0..num_groups {
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
