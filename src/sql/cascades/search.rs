@@ -236,7 +236,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         Operator::PhysicalCTEConsume(_) => PhysicalPropertySet::any(),
 
         // Filter, Project, Limit, SubqueryAlias, CTE Anchor, CTE Produce, Repeat:
-        // passthrough child properties (approximate as Any).
+        // currently modeled conservatively as Any-only structural operators.
         Operator::PhysicalFilter(_)
         | Operator::PhysicalProject(_)
         | Operator::PhysicalLimit(_)
@@ -343,8 +343,10 @@ pub(super) fn required_input_properties(
         | Operator::PhysicalGenerateSeries(_)
         | Operator::PhysicalCTEConsume(_) => vec![],
 
+        // CTE anchor is structurally wired only for now. Do not imply real
+        // property passthrough until the runtime path models it end-to-end.
         Operator::PhysicalCTEAnchor(_) => {
-            vec![PhysicalPropertySet::any(), parent_required.clone()]
+            vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
         }
 
         // Shuffle join: [Hash(left_eq_keys), Hash(right_eq_keys)]
@@ -844,5 +846,15 @@ mod tests {
         let child_reqs = required_input_properties(&op, &parent_req);
         assert_eq!(child_reqs.len(), 1);
         assert_eq!(child_reqs[0], parent_req);
+    }
+
+    #[test]
+    fn cte_anchor_requires_any_for_both_children() {
+        let op = Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id: 7 });
+        let parent_req = PhysicalPropertySet::gather();
+        let child_reqs = required_input_properties(&op, &parent_req);
+        assert_eq!(child_reqs.len(), 2);
+        assert_eq!(child_reqs[0], PhysicalPropertySet::any());
+        assert_eq!(child_reqs[1], PhysicalPropertySet::any());
     }
 }
