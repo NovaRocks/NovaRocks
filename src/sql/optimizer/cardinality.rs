@@ -41,6 +41,8 @@ pub(crate) fn estimate_statistics(
                 column_statistics: input.column_statistics,
             }
         }
+        LogicalPlan::CTEAnchor(node) => estimate_statistics(&node.consumer, table_stats),
+        LogicalPlan::CTEProduce(node) => estimate_statistics(&node.input, table_stats),
         LogicalPlan::Values(v) => Statistics {
             output_row_count: v.rows.len() as f64,
             column_statistics: HashMap::new(),
@@ -59,7 +61,7 @@ pub(crate) fn estimate_statistics(
         LogicalPlan::CTEConsume(_) => Statistics {
             output_row_count: 1000.0,
             column_statistics: HashMap::new(),
-        }
+        },
     }
 }
 

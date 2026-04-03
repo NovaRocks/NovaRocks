@@ -340,6 +340,7 @@ pub(crate) fn reorder_joins_cbo(
             r.input = Box::new(reorder_joins_cbo(*r.input, table_stats));
             LogicalPlan::Repeat(r)
         }
+        LogicalPlan::CTEAnchor(_) | LogicalPlan::CTEProduce(_) | LogicalPlan::CTEConsume(_) => plan,
         other => other,
     }
 }

@@ -247,8 +247,9 @@ impl StandaloneSession {
 
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
         if looks_like_create_table(&parser) {
-            let result =
-                crate::sql::parser::dialect::create_table::parse_create_table_statement(&mut parser)?;
+            let result = crate::sql::parser::dialect::create_table::parse_create_table_statement(
+                &mut parser,
+            )?;
             return execute_create_table_statement(
                 &self.inner,
                 result,
@@ -258,7 +259,9 @@ impl StandaloneSession {
         }
         if looks_like_create_catalog(&parser) {
             let result =
-                crate::sql::parser::dialect::create_catalog::parse_create_catalog_statement(&mut parser)?;
+                crate::sql::parser::dialect::create_catalog::parse_create_catalog_statement(
+                    &mut parser,
+                )?;
             return self.handle_create_catalog(result);
         }
         if looks_like_create_database(&parser) {
@@ -326,8 +329,9 @@ impl StandaloneSession {
             }
             sqlast::Statement::Truncate(truncate) => {
                 for truncate_table in &truncate.table_names {
-                    let table_name =
-                        crate::sql::parser::dialect::convert_object_name(truncate_table.name.clone())?;
+                    let table_name = crate::sql::parser::dialect::convert_object_name(
+                        truncate_table.name.clone(),
+                    )?;
                     execute_truncate_table_statement(&self.inner, &table_name, current_database)?;
                 }
                 Ok(StatementResult::Ok)
@@ -929,12 +933,14 @@ fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, St
         sqlast::Expr::Identifier(ident) => Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
             name: ident.value.clone(),
         })),
-        sqlast::Expr::CompoundIdentifier(parts) => Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
-            name: parts
-                .last()
-                .map(|p| p.value.clone())
-                .ok_or_else(|| "empty column reference".to_string())?,
-        })),
+        sqlast::Expr::CompoundIdentifier(parts) => {
+            Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
+                name: parts
+                    .last()
+                    .map(|p| p.value.clone())
+                    .ok_or_else(|| "empty column reference".to_string())?,
+            }))
+        }
         sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => {
             let lit = match value {
                 sqlast::Value::Null => Literal::Null,
@@ -3398,10 +3404,9 @@ fn explain_query(
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
 ) -> Result<QueryResult, String> {
-    use crate::sql::explain::{ExplainLevel, explain_physical_plan, explain_query_plan};
+    use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
-    let (resolved, cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
 
     let mut lines = Vec::new();
 
@@ -3421,16 +3426,8 @@ fn explain_query(
         }
         lines.extend(explain_physical_plan(&physical, level));
     } else {
-        // CTE queries: use old LogicalPlan explain for now
-        let query_plan =
-            crate::sql::planner::plan_query(resolved, cte_registry)?;
-        let mut all_stats = std::collections::HashMap::new();
-        for cte in &query_plan.cte_plans {
-            all_stats.extend(build_table_stats_from_plan(&cte.plan));
-        }
-        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-        let optimized =
-            crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+        let all_stats = build_table_stats_from_plan(&logical);
 
         if matches!(level, ExplainLevel::Costs) {
             for (table, stats) in &all_stats {
@@ -3440,7 +3437,7 @@ fn explain_query(
                 ));
             }
         }
-        lines.extend(explain_query_plan(&optimized, level));
+        lines.extend(crate::sql::explain::explain_plan(&logical, level));
     }
 
     build_string_query_result("Explain String", lines)
@@ -3451,8 +3448,7 @@ fn execute_query(
     catalog: &InMemoryCatalog,
     current_database: &str,
 ) -> Result<QueryResult, String> {
-    let (resolved, cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
 
     // Build logical plan (with CTE if multi-referenced)
     let logical = if cte_registry.entries.is_empty() {
@@ -3460,7 +3456,7 @@ fn execute_query(
     } else {
         // For CTE queries, use the old optimizer + emitter path.
         // TODO: full CTE support in Cascades (produce/consume should appear in plan)
-        let query_plan = crate::sql::planner::plan_query(resolved, cte_registry)?;
+        let query_plan = crate::sql::planner::plan_query_legacy(resolved, cte_registry)?;
         let mut all_stats = std::collections::HashMap::new();
         for cte in &query_plan.cte_plans {
             all_stats.extend(build_table_stats_from_plan(&cte.plan));
@@ -3468,9 +3464,8 @@ fn execute_query(
         all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
         let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
         let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
-        let build_result = crate::sql::physical::emit_multi_fragment(
-            fragment_plan, catalog, current_database,
-        )?;
+        let build_result =
+            crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)?;
         let exchange_port = crate::common::config::http_port();
         return super::coordinator::ExecutionCoordinator::new(
             build_result,
@@ -3484,7 +3479,9 @@ fn execute_query(
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
     let build_result = crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
-        &physical, catalog, current_database,
+        &physical,
+        catalog,
+        current_database,
     )?;
 
     if build_result.fragments.len() == 1 {
@@ -3502,12 +3499,8 @@ fn execute_query(
             root_fragment_id: build_result.root_fragment_id,
         };
         let exchange_port = crate::common::config::http_port();
-        super::coordinator::ExecutionCoordinator::new(
-            multi,
-            "127.0.0.1".to_string(),
-            exchange_port,
-        )
-        .execute()
+        super::coordinator::ExecutionCoordinator::new(multi, "127.0.0.1".to_string(), exchange_port)
+            .execute()
     }
 }
 
@@ -3544,6 +3537,11 @@ fn collect_scan_stats(
         LogicalPlan::Sort(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Limit(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Window(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::CTEAnchor(n) => {
+            collect_scan_stats(&n.produce, out);
+            collect_scan_stats(&n.consumer, out);
+        }
+        LogicalPlan::CTEProduce(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::SubqueryAlias(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Join(n) => {
             collect_scan_stats(&n.left, out);

@@ -246,6 +246,10 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             };
             memo.new_group(expr)
         }
+
+        LogicalPlan::CTEAnchor(_) | LogicalPlan::CTEProduce(_) => {
+            panic!("CTE anchor/produce are not supported in Cascades conversion yet")
+        }
     }
 }
 

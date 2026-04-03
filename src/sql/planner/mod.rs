@@ -12,19 +12,38 @@ use crate::sql::plan::*;
 // Public entry
 // ---------------------------------------------------------------------------
 
-/// Plan a resolved query with shared CTE subtrees into a [`QueryPlan`].
-///
-/// Each CTE entry in the registry is planned independently into a
-/// [`CTEProducePlan`], and references in the main plan appear as
-/// [`LogicalPlan::CTEConsume`] leaf nodes.
+/// Plan a resolved query into a single logical tree, wrapping CTE definitions
+/// as nested anchor/produce pairs around the main query subtree.
 pub(crate) fn plan_query(
+    resolved: ResolvedQuery,
+    cte_registry: CTERegistry,
+) -> Result<LogicalPlan, String> {
+    let mut root = plan(resolved)?;
+
+    for entry in cte_registry.entries.into_iter().rev() {
+        let produce_input = plan(entry.resolved_query)?;
+        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
+            cte_id: entry.id,
+            input: Box::new(produce_input),
+            output_columns: entry.output_columns,
+        });
+        root = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: entry.id,
+            produce: Box::new(produce),
+            consumer: Box::new(root),
+        });
+    }
+
+    Ok(root)
+}
+
+pub(crate) fn plan_query_legacy(
     resolved: ResolvedQuery,
     cte_registry: CTERegistry,
 ) -> Result<QueryPlan, String> {
     let output_columns = resolved.output_columns.clone();
     let main_plan = plan(resolved)?;
 
-    // Plan each shared CTE subtree independently.
     let cte_plans = cte_registry
         .entries
         .into_iter()
@@ -789,4 +808,91 @@ fn plan_values(values: ResolvedValues) -> Result<LogicalPlan, String> {
         rows: values.rows,
         columns,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+
+    struct TestCatalog;
+
+    impl CatalogProvider for TestCatalog {
+        fn get_table(&self, _db: &str, table: &str) -> Result<TableDef, String> {
+            match table {
+                "orders" => Ok(TableDef {
+                    name: "orders".to_string(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "o_orderkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "o_custkey".to_string(),
+                            data_type: arrow::datatypes::DataType::Int64,
+                            nullable: false,
+                        },
+                    ],
+                    storage: TableStorage::LocalParquetFile {
+                        path: std::path::PathBuf::from("/tmp/orders.parquet"),
+                    },
+                }),
+                other => Err(format!("unknown test table: {other}")),
+            }
+        }
+    }
+
+    fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlan, String> {
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut ast =
+            sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
+        let stmt = ast
+            .pop()
+            .ok_or_else(|| "expected a statement".to_string())?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => return Err("expected query".into()),
+        };
+        let (resolved, cte_registry) =
+            crate::sql::analyzer::analyze(&query, &TestCatalog, "default")?;
+        plan_query(resolved, cte_registry)
+    }
+
+    #[test]
+    fn test_plan_query_wraps_single_cte_in_anchor() {
+        let plan = parse_analyze_and_plan(
+            "WITH t AS (SELECT o_orderkey AS ok FROM orders) SELECT ok FROM t",
+        )
+        .expect("planner should succeed");
+
+        match plan {
+            LogicalPlan::CTEAnchor(anchor) => {
+                assert_eq!(anchor.cte_id, 0);
+                assert!(matches!(*anchor.produce, LogicalPlan::CTEProduce(_)));
+            }
+            other => panic!("expected CTEAnchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_plan_query_builds_nested_anchor_chain() {
+        let plan = parse_analyze_and_plan(
+            "WITH a AS (SELECT o_orderkey AS ok FROM orders), \
+                  b AS (SELECT ok FROM a) \
+             SELECT ok FROM b",
+        )
+        .expect("planner should succeed");
+
+        match plan {
+            LogicalPlan::CTEAnchor(anchor_a) => match *anchor_a.consumer {
+                LogicalPlan::CTEAnchor(anchor_b) => {
+                    assert_eq!(anchor_a.cte_id, 0);
+                    assert_eq!(anchor_b.cte_id, 1);
+                }
+                other => panic!("expected nested CTEAnchor, got {other:?}"),
+            },
+            other => panic!("expected outer CTEAnchor, got {other:?}"),
+        }
+    }
 }

@@ -185,6 +185,12 @@ pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             cols.insert(g.column_name.to_lowercase());
             cols
         }
+        LogicalPlan::CTEAnchor(a) => collect_output_columns(&a.consumer),
+        LogicalPlan::CTEProduce(p) => p
+            .output_columns
+            .iter()
+            .map(|col| col.name.to_lowercase())
+            .collect(),
         LogicalPlan::SubqueryAlias(s) => s
             .output_columns
             .iter()
@@ -388,6 +394,14 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
         }
         LogicalPlan::GenerateSeries(g) => {
             out.insert((None, g.column_name.to_lowercase()));
+        }
+        LogicalPlan::CTEAnchor(a) => {
+            collect_qualified_output_columns_inner(&a.consumer, out);
+        }
+        LogicalPlan::CTEProduce(p) => {
+            for col in &p.output_columns {
+                out.insert((None, col.name.to_lowercase()));
+            }
         }
         LogicalPlan::SubqueryAlias(s) => {
             let alias_lower = s.alias.to_lowercase();

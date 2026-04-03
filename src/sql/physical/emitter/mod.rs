@@ -151,8 +151,11 @@ pub(crate) fn emit_multi_fragment(
     }
 
     // Build shared descriptor table and assign to all fragments
-    let desc_tbl =
-        std::mem::replace(&mut emitter.desc_builder, super::descriptors::DescriptorTableBuilder::new()).build();
+    let desc_tbl = std::mem::replace(
+        &mut emitter.desc_builder,
+        super::descriptors::DescriptorTableBuilder::new(),
+    )
+    .build();
     for fr in &mut fragment_results {
         fr.desc_tbl = desc_tbl.clone();
     }
@@ -274,6 +277,9 @@ impl<'a> ThriftEmitter<'a> {
             LogicalPlan::Window(node) => self.emit_window(node),
             LogicalPlan::SubqueryAlias(node) => self.emit_subquery_alias(node),
             LogicalPlan::Repeat(node) => self.emit_repeat(node),
+            LogicalPlan::CTEAnchor(_) | LogicalPlan::CTEProduce(_) => {
+                Err("legacy emitter does not handle Cascades CTE structure".to_string())
+            }
             LogicalPlan::CTEConsume(node) => self.emit_cte_consume(node),
         }
     }
