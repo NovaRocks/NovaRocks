@@ -119,7 +119,11 @@ impl<'a> super::AnalyzerContext<'a> {
 
                 if parts.len() == 1 {
                     let registry = self.cte_registry.borrow();
-                    if let Some(entry) = registry.entries.iter().find(|entry| entry.name == tbl_lower)
+                    if let Some(entry) = registry
+                        .entries
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.name == tbl_lower)
                     {
                         let alias_name = alias
                             .as_ref()

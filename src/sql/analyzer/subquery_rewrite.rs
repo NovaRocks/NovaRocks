@@ -448,7 +448,7 @@ impl<'a> AnalyzerContext<'a> {
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
         let body = query.body.as_ref();
-        match body {
+        let result = match body {
             sqlparser::ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
@@ -486,7 +486,15 @@ impl<'a> AnalyzerContext<'a> {
                     AnalyzerScope::new(),
                 ))
             }
+        };
+
+        if let Some(child_ctx) = maybe_child_ctx {
+            self.next_subquery_id
+                .set(child_ctx.next_subquery_id.get());
+            *self.cte_registry.borrow_mut() = child_ctx.cte_registry.borrow().clone();
         }
+
+        result
     }
 
     /// Analyze a SELECT that can reference outer scope columns for correlation.
