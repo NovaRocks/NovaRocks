@@ -200,7 +200,6 @@ impl Operator for MultiCastDataStreamSinkOperator {
     fn is_finished(&self) -> bool {
         self.finished
     }
-
 }
 
 impl ProcessorOperator for MultiCastDataStreamSinkOperator {

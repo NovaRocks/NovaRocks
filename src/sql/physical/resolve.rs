@@ -72,7 +72,6 @@ impl ExprScope {
         self.ordered.iter().map(|(name, binding)| (name, binding))
     }
 
-
     /// Merge another scope into this one. Used for building JOIN output scopes.
     /// Qualified lookups are always added; unqualified lookups are added
     /// only if the column name is not already present (ambiguous columns

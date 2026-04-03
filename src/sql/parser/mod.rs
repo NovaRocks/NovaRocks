@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-mod raw;
-pub(crate) mod dialect;
 pub(crate) mod ast;
+pub(crate) mod dialect;
+mod raw;
 
 /// Parse SQL into a raw sqlparser AST (no custom AST conversion).
 /// Used by the standalone ThriftPlanBuilder.

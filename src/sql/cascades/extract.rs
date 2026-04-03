@@ -9,7 +9,7 @@ use super::memo::{GroupId, Memo};
 use super::operator::{Operator, PhysicalDistributionOp, PhysicalSortOp};
 use super::physical_plan::PhysicalPlanNode;
 use super::property::{OrderingSpec, PhysicalPropertySet};
-use super::search::{required_input_properties, EnforcerKind, Winner};
+use super::search::{EnforcerKind, Winner, required_input_properties};
 use crate::sql::ir::{ExprKind, SortItem, TypedExpr};
 use crate::sql::statistics::Statistics;
 
@@ -27,9 +27,12 @@ pub(crate) fn extract_best(
     winners: &HashMap<(GroupId, PhysicalPropertySet), Winner>,
 ) -> Result<PhysicalPlanNode, String> {
     let cache_key = (root_group, required.clone());
-    let winner = winners
-        .get(&cache_key)
-        .ok_or_else(|| format!("no winner for group {} with props {:?}", root_group, required))?;
+    let winner = winners.get(&cache_key).ok_or_else(|| {
+        format!(
+            "no winner for group {} with props {:?}",
+            root_group, required
+        )
+    })?;
 
     if winner.cost.is_infinite() {
         return Err(format!(
@@ -70,20 +73,17 @@ pub(crate) fn extract_best(
     }
 
     // No enforcer: extract the physical expression directly.
-    let expr = group
-        .physical_exprs
-        .get(winner.expr_index)
-        .ok_or_else(|| {
-            format!(
-                "winner expr_index {} out of bounds for group {} (has {} physical exprs)",
-                winner.expr_index,
-                root_group,
-                group.physical_exprs.len()
-            )
-        })?;
+    let expr = group.physical_exprs.get(winner.expr_index).ok_or_else(|| {
+        format!(
+            "winner expr_index {} out of bounds for group {} (has {} physical exprs)",
+            winner.expr_index,
+            root_group,
+            group.physical_exprs.len()
+        )
+    })?;
 
     // Determine child required properties.
-    let child_reqs = required_input_properties(&expr.op, required);
+    let child_reqs = required_input_properties(&expr.op, required, expr.children.len());
 
     // Recursively extract children.
     let mut children = Vec::with_capacity(expr.children.len());

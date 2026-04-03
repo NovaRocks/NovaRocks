@@ -277,8 +277,9 @@ impl BroadcastJoinProbeProcessorOperator {
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
                 if let Some(merged) = self.state.merge_build_matched(local_flags) {
                     let schema = Arc::clone(self.core.build_chunk_schema());
-                    let build_out =
-                        self.core.build_right_semi_anti_output_with_flags(&merged, false)?;
+                    let build_out = self
+                        .core
+                        .build_right_semi_anti_output_with_flags(&merged, false)?;
                     out = self
                         .core
                         .merge_join_outputs(None, build_out, &schema, true)?;
@@ -291,8 +292,9 @@ impl BroadcastJoinProbeProcessorOperator {
                 let local_flags = self.core.take_build_matched().unwrap_or_default();
                 if let Some(merged) = self.state.merge_build_matched(local_flags) {
                     let schema = Arc::clone(self.core.build_chunk_schema());
-                    let build_out =
-                        self.core.build_right_semi_anti_output_with_flags(&merged, true)?;
+                    let build_out = self
+                        .core
+                        .build_right_semi_anti_output_with_flags(&merged, true)?;
                     out = self
                         .core
                         .merge_join_outputs(None, build_out, &schema, true)?;

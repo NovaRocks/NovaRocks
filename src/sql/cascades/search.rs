@@ -102,12 +102,8 @@ impl SearchContext {
 
             if provided.satisfies(required) {
                 // --- Direct satisfaction path ---
-                let child_reqs = required_input_properties(&expr.op, required);
-
-                // Validate child count matches.
-                if child_reqs.len() != expr.children.len() {
-                    continue;
-                }
+                let child_reqs =
+                    required_input_properties(&expr.op, required, expr.children.len());
 
                 // Compute own cost.
                 let own_stats = derive_statistics(expr, memo, &self.table_stats);
@@ -126,8 +122,7 @@ impl SearchContext {
                 let mut total = own_cost;
                 let mut feasible = true;
                 for (i, &child_group_id) in expr.children.iter().enumerate() {
-                    let child_cost =
-                        self.optimize_group(memo, child_group_id, &child_reqs[i])?;
+                    let child_cost = self.optimize_group(memo, child_group_id, &child_reqs[i])?;
                     if child_cost.is_infinite() {
                         feasible = false;
                         break;
@@ -164,11 +159,7 @@ impl SearchContext {
                 }
 
                 // Compute the group statistics for enforcer cost estimation.
-                let group_stats = stats_for_group(
-                    &memo.groups[group_id],
-                    memo,
-                    &self.table_stats,
-                );
+                let group_stats = stats_for_group(&memo.groups[group_id], memo, &self.table_stats);
 
                 // Sum up enforcer costs.
                 let mut enforcer_cost = 0.0;
@@ -335,6 +326,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
 pub(super) fn required_input_properties(
     op: &Operator,
     parent_required: &PhysicalPropertySet,
+    num_children: usize,
 ) -> Vec<PhysicalPropertySet> {
     match op {
         // Leaf operators: no children.
@@ -418,9 +410,7 @@ pub(super) fn required_input_properties(
         Operator::PhysicalSort(_) => vec![PhysicalPropertySet::gather()],
 
         // Filter, Project, Limit: passthrough parent requirement.
-        Operator::PhysicalFilter(_)
-        | Operator::PhysicalProject(_)
-        | Operator::PhysicalLimit(_) => {
+        Operator::PhysicalFilter(_) | Operator::PhysicalProject(_) | Operator::PhysicalLimit(_) => {
             vec![parent_required.clone()]
         }
 
@@ -460,15 +450,9 @@ pub(super) fn required_input_properties(
         Operator::PhysicalDistribution(_) => vec![PhysicalPropertySet::any()],
 
         // Union/Intersect/Except: each child gets Any.
-        Operator::PhysicalUnion(u) => {
-            // Number of children is not in the op — we'll handle this via
-            // the generic fallback below.  But we know unions typically have
-            // 2+ children, so return a generous vector.
-            // The caller clips to actual children count anyway.
-            vec![PhysicalPropertySet::any(); 8]
-        }
-        Operator::PhysicalIntersect(_) => vec![PhysicalPropertySet::any(); 8],
-        Operator::PhysicalExcept(_) => vec![PhysicalPropertySet::any(); 8],
+        Operator::PhysicalUnion(_)
+        | Operator::PhysicalIntersect(_)
+        | Operator::PhysicalExcept(_) => vec![PhysicalPropertySet::any(); num_children],
 
         // Logical operators should not appear here.
         _ => vec![PhysicalPropertySet::any()],
@@ -793,7 +777,7 @@ mod tests {
             other_condition: None,
             distribution: JoinDistribution::Shuffle,
         });
-        let reqs = required_input_properties(&op, &PhysicalPropertySet::any());
+        let reqs = required_input_properties(&op, &PhysicalPropertySet::any(), 2);
         assert_eq!(reqs.len(), 2);
         match &reqs[0].distribution {
             DistributionSpec::HashPartitioned(cols) => {
@@ -835,15 +819,13 @@ mod tests {
     fn filter_passthrough_parent_required() {
         let op = Operator::PhysicalFilter(PhysicalFilterOp {
             predicate: crate::sql::ir::TypedExpr {
-                kind: crate::sql::ir::ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(
-                    true,
-                )),
+                kind: crate::sql::ir::ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)),
                 data_type: arrow::datatypes::DataType::Boolean,
                 nullable: false,
             },
         });
         let parent_req = PhysicalPropertySet::gather();
-        let child_reqs = required_input_properties(&op, &parent_req);
+        let child_reqs = required_input_properties(&op, &parent_req, 1);
         assert_eq!(child_reqs.len(), 1);
         assert_eq!(child_reqs[0], parent_req);
     }
@@ -852,7 +834,7 @@ mod tests {
     fn cte_anchor_requires_any_for_both_children() {
         let op = Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id: 7 });
         let parent_req = PhysicalPropertySet::gather();
-        let child_reqs = required_input_properties(&op, &parent_req);
+        let child_reqs = required_input_properties(&op, &parent_req, 2);
         assert_eq!(child_reqs.len(), 2);
         assert_eq!(child_reqs[0], PhysicalPropertySet::any());
         assert_eq!(child_reqs[1], PhysicalPropertySet::any());

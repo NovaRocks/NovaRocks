@@ -105,7 +105,10 @@ impl BroadcastJoinSharedState {
         &self,
         local_flags: Vec<Vec<bool>>,
     ) -> Option<Vec<Vec<bool>>> {
-        let mut guard = self.build_match_merge.lock().expect("build match merge lock");
+        let mut guard = self
+            .build_match_merge
+            .lock()
+            .expect("build match merge lock");
         let merge = guard.get_or_insert_with(|| BuildMatchMerge {
             merged: local_flags
                 .iter()

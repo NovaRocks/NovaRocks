@@ -45,7 +45,7 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
                 visit(&node.consumer, ctx);
             }
             LogicalPlan::CTEProduce(node) => {
-                ctx.produces.insert(node.cte_id);
+                // produces.insert is already done in CTEAnchor above.
                 visit(&node.input, ctx);
             }
             LogicalPlan::CTEConsume(node) => {

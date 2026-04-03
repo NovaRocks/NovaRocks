@@ -16,7 +16,7 @@ pub(crate) mod optimizer;
 pub(crate) mod physical;
 pub(crate) mod planner;
 
+pub(crate) use catalog::CatalogProvider;
 pub(crate) use parser::ast::{
     ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
-pub(crate) use catalog::CatalogProvider;

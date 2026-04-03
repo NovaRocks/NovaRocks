@@ -3439,6 +3439,9 @@ fn execute_query(
     current_database: &str,
     exchange_port: u16,
 ) -> Result<QueryResult, String> {
+    // All non-recursive queries, including CTE queries, now flow through
+    // planner -> cascades -> fragment builder. The legacy QueryPlan/FragmentPlan
+    // path remains only for compile-time compatibility and should not be used here.
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
@@ -3681,7 +3684,7 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
 #[cfg(test)]
 mod tests {
     use super::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
@@ -3812,6 +3815,41 @@ mod tests {
     }
 
     #[test]
+    fn embedded_query_explain_for_multi_use_cte_shows_physical_cte_nodes() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let explain = session
+            .query("EXPLAIN WITH t AS (SELECT id FROM tbl) SELECT a.id FROM t a JOIN t b ON a.id = b.id")
+            .expect("execute explain");
+
+        assert!(explain.row_count() > 0);
+        let text = explain
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                let col = chunk.batch.column(0);
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("string array");
+                (0..arr.len())
+                    .map(|idx| arr.value(idx).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("CTE ANCHOR"), "text={text}");
+        assert!(text.contains("CTE PRODUCE"), "text={text}");
+        assert!(text.contains("CTE CONSUME"), "text={text}");
+    }
+
+    #[test]
     fn embedded_query_executes_nested_multi_use_cte_through_multicast_reuse() {
         let parquet = write_parquet_file();
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
@@ -3833,6 +3871,34 @@ mod tests {
         assert_eq!(result.row_count(), 3);
         let chunk = &result.chunks[0];
         assert_eq!(chunk.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn embedded_query_cte_union_with_four_way_self_join() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        // Simulates TPC-DS q11 pattern: CTE with UNION ALL, 4-way self-join
+        let result = session.query(
+            "WITH year_total AS ( \
+                SELECT id, name FROM tbl \
+                UNION ALL \
+                SELECT id, name FROM tbl \
+            ) \
+            SELECT a.id \
+            FROM year_total a, year_total b, year_total c, year_total d \
+            WHERE a.id = b.id AND b.id = c.id AND c.id = d.id \
+            ORDER BY 1 \
+            LIMIT 10",
+        );
+        match &result {
+            Ok(r) => assert!(r.row_count() > 0),
+            Err(e) => panic!("q11 pattern failed: {e}"),
+        }
     }
 
     #[test]

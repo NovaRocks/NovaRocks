@@ -160,7 +160,10 @@ fn try_extract_common_eq_from_or(
     let first_eqs = &branch_eqs[0];
     let mut common: Vec<(TypedExpr, TypedExpr)> = Vec::new();
     for eq in first_eqs {
-        if branch_eqs[1..].iter().all(|branch| branch.iter().any(|b| eq_pair_matches(eq, b))) {
+        if branch_eqs[1..]
+            .iter()
+            .all(|branch| branch.iter().any(|b| eq_pair_matches(eq, b)))
+        {
             common.push(eq.clone());
         }
     }

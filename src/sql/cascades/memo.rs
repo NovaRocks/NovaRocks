@@ -25,9 +25,7 @@ pub(crate) struct Memo {
 
 impl Memo {
     pub(crate) fn new() -> Self {
-        Self {
-            groups: Vec::new(),
-        }
+        Self { groups: Vec::new() }
     }
 
     /// Create a new group containing a single expression. Returns the new GroupId.
