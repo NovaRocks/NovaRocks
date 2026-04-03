@@ -39,6 +39,8 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     // 1. RBO rewrite (predicate pushdown + join reorder + column pruning).
     let rewritten = rewriter::rewrite(plan, table_stats);
+    // This is an intentional pre-Memo structural rewrite for CTE shape cleanup,
+    // not a second full logical optimization pass.
     let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
     let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
 

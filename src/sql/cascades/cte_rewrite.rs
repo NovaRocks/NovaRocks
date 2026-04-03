@@ -164,7 +164,13 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
 
 fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::CTEConsume(node) if node.cte_id == cte_id => replacement.clone(),
+        LogicalPlan::CTEConsume(node) if node.cte_id == cte_id => {
+            LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                input: Box::new(replacement.clone()),
+                alias: node.alias,
+                output_columns: node.output_columns,
+            })
+        }
         LogicalPlan::Scan(_)
         | LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)
@@ -291,6 +297,21 @@ mod tests {
         }]
     }
 
+    fn consume_plan(cte_id: CteId, alias: &str) -> LogicalPlan {
+        LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id,
+            alias: alias.to_string(),
+            output_columns: output_columns(),
+        })
+    }
+
+    fn assert_output_columns_match(columns: &[OutputColumn]) {
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "id");
+        assert_eq!(columns[0].data_type, DataType::Int32);
+        assert!(!columns[0].nullable);
+    }
+
     #[test]
     fn test_collect_cte_counts_counts_consumes() {
         let plan = LogicalPlan::CTEAnchor(CTEAnchorNode {
@@ -321,16 +342,37 @@ mod tests {
                 input: Box::new(scan_plan()),
                 output_columns: output_columns(),
             })),
-            consumer: Box::new(LogicalPlan::CTEConsume(CTEConsumeNode {
-                cte_id: 1,
-                alias: "t".to_string(),
-                output_columns: output_columns(),
-            })),
+            consumer: Box::new(consume_plan(1, "t")),
         });
 
         let ctx = collect_cte_counts(&plan);
         let rewritten = inline_single_use_ctes(plan, &ctx);
-        assert!(matches!(rewritten, LogicalPlan::Scan(_)));
+        assert!(matches!(rewritten, LogicalPlan::SubqueryAlias(_)));
+    }
+
+    #[test]
+    fn test_inline_single_use_cte_preserves_alias_namespace() {
+        let plan = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: 1,
+            produce: Box::new(LogicalPlan::CTEProduce(CTEProduceNode {
+                cte_id: 1,
+                input: Box::new(scan_plan()),
+                output_columns: output_columns(),
+            })),
+            consumer: Box::new(consume_plan(1, "x")),
+        });
+
+        let ctx = collect_cte_counts(&plan);
+        let rewritten = inline_single_use_ctes(plan, &ctx);
+
+        match rewritten {
+            LogicalPlan::SubqueryAlias(node) => {
+                assert_eq!(node.alias, "x");
+                assert_output_columns_match(&node.output_columns);
+                assert!(matches!(*node.input, LogicalPlan::Scan(_)));
+            }
+            other => panic!("expected SubqueryAlias, got {other:?}"),
+        }
     }
 
     #[test]
@@ -343,18 +385,7 @@ mod tests {
                 output_columns: output_columns(),
             })),
             consumer: Box::new(LogicalPlan::Union(UnionNode {
-                inputs: vec![
-                    LogicalPlan::CTEConsume(CTEConsumeNode {
-                        cte_id: 1,
-                        alias: "t1".to_string(),
-                        output_columns: output_columns(),
-                    }),
-                    LogicalPlan::CTEConsume(CTEConsumeNode {
-                        cte_id: 1,
-                        alias: "t2".to_string(),
-                        output_columns: output_columns(),
-                    }),
-                ],
+                inputs: vec![consume_plan(1, "t1"), consume_plan(1, "t2")],
                 all: true,
             })),
         });
@@ -364,5 +395,96 @@ mod tests {
 
         let rewritten = inline_single_use_ctes(plan, &ctx);
         assert!(matches!(rewritten, LogicalPlan::CTEAnchor(_)));
+    }
+
+    #[test]
+    fn test_inline_single_use_cte_inlines_nested_cte_inside_later_produce() {
+        let plan = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: 1,
+            produce: Box::new(LogicalPlan::CTEProduce(CTEProduceNode {
+                cte_id: 1,
+                input: Box::new(scan_plan()),
+                output_columns: output_columns(),
+            })),
+            consumer: Box::new(LogicalPlan::CTEAnchor(CTEAnchorNode {
+                cte_id: 2,
+                produce: Box::new(LogicalPlan::CTEProduce(CTEProduceNode {
+                    cte_id: 2,
+                    input: Box::new(LogicalPlan::CTEAnchor(CTEAnchorNode {
+                        cte_id: 1,
+                        produce: Box::new(LogicalPlan::CTEProduce(CTEProduceNode {
+                            cte_id: 1,
+                            input: Box::new(scan_plan()),
+                            output_columns: output_columns(),
+                        })),
+                        consumer: Box::new(consume_plan(1, "a")),
+                    })),
+                    output_columns: output_columns(),
+                })),
+                consumer: Box::new(LogicalPlan::Union(UnionNode {
+                    inputs: vec![consume_plan(2, "b1"), consume_plan(2, "b2")],
+                    all: true,
+                })),
+            })),
+        });
+
+        let ctx = collect_cte_counts(&plan);
+        assert_eq!(ctx.consume_count.get(&1), Some(&1));
+        assert_eq!(ctx.consume_count.get(&2), Some(&2));
+
+        let rewritten = inline_single_use_ctes(plan, &ctx);
+
+        match rewritten {
+            LogicalPlan::CTEAnchor(anchor) => {
+                assert_eq!(anchor.cte_id, 2);
+                match *anchor.produce {
+                    LogicalPlan::CTEProduce(produce) => match *produce.input {
+                        LogicalPlan::SubqueryAlias(alias) => {
+                            assert_eq!(alias.alias, "a");
+                            assert!(matches!(*alias.input, LogicalPlan::Scan(_)));
+                        }
+                        other => panic!("expected nested alias replacement, got {other:?}"),
+                    },
+                    other => panic!("expected CTEProduce for b, got {other:?}"),
+                }
+                assert!(matches!(*anchor.consumer, LogicalPlan::Union(_)));
+            }
+            other => panic!("expected surviving anchor for b, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replace_cte_consume_only_rewrites_targeted_cte_id() {
+        let plan = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: 2,
+            produce: Box::new(LogicalPlan::CTEProduce(CTEProduceNode {
+                cte_id: 2,
+                input: Box::new(scan_plan()),
+                output_columns: output_columns(),
+            })),
+            consumer: Box::new(LogicalPlan::Union(UnionNode {
+                inputs: vec![consume_plan(1, "target"), consume_plan(2, "shadow")],
+                all: true,
+            })),
+        });
+
+        let rewritten = replace_cte_consume(plan, 1, &scan_plan());
+
+        match rewritten {
+            LogicalPlan::CTEAnchor(anchor) => match *anchor.consumer {
+                LogicalPlan::Union(union) => {
+                    match &union.inputs[0] {
+                        LogicalPlan::SubqueryAlias(alias) => {
+                            assert_eq!(alias.alias, "target");
+                            assert!(matches!(*alias.input.clone(), LogicalPlan::Scan(_)));
+                        }
+                        other => panic!("expected targeted consume to be rewritten, got {other:?}"),
+                    }
+                    assert!(matches!(union.inputs[1], LogicalPlan::CTEConsume(_)));
+                }
+                other => panic!("expected union consumer, got {other:?}"),
+            },
+            other => panic!("expected outer anchor, got {other:?}"),
+        }
     }
 }
