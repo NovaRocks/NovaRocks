@@ -18,6 +18,8 @@ pub(crate) struct ResolvedQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub output_columns: Vec<OutputColumn>,
+    /// CTE ids declared by this query block's WITH clause, in declaration order.
+    pub local_cte_ids: Vec<crate::sql::cte::CteId>,
 }
 
 #[derive(Clone, Debug)]
@@ -101,7 +103,8 @@ pub(crate) enum Relation {
     Join(Box<JoinRelation>),
     /// `TABLE(generate_series(start, end[, step]))`.
     GenerateSeries(GenerateSeriesRelation),
-    /// Reference to a shared CTE (multi-referenced, not inlined).
+    /// Reference to an analyzed non-recursive CTE definition.
+    /// Inline vs reuse is decided later by Cascades.
     CTEConsume {
         cte_id: crate::sql::cte::CteId,
         alias: String,
@@ -155,8 +158,8 @@ pub(crate) enum JoinKind {
 pub(crate) struct ResolvedSetOp {
     pub kind: SetOpKind,
     pub all: bool,
-    pub left: Box<QueryBody>,
-    pub right: Box<QueryBody>,
+    pub left: Box<ResolvedQuery>,
+    pub right: Box<ResolvedQuery>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

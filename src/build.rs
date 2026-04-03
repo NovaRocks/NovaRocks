@@ -431,164 +431,164 @@ fn main() {
     // C++ protobuf codegen, C++ shim compilation, and native library linkage
     // — only needed for compat builds.
     if compat {
+        let proto_files = [
+            "idl/proto/status.proto",
+            "idl/proto/types.proto",
+            "idl/proto/data.proto",
+            "idl/proto/binlog.proto",
+            "idl/proto/olap_common.proto",
+            "idl/proto/tablet_schema.proto",
+            "idl/proto/olap_file.proto",
+            "idl/proto/descriptors.proto",
+            "idl/proto/lake_types.proto",
+            "idl/proto/lake_service.proto",
+            "idl/proto/internal_service.proto",
+        ];
 
-    let proto_files = [
-        "idl/proto/status.proto",
-        "idl/proto/types.proto",
-        "idl/proto/data.proto",
-        "idl/proto/binlog.proto",
-        "idl/proto/olap_common.proto",
-        "idl/proto/tablet_schema.proto",
-        "idl/proto/olap_file.proto",
-        "idl/proto/descriptors.proto",
-        "idl/proto/lake_types.proto",
-        "idl/proto/lake_service.proto",
-        "idl/proto/internal_service.proto",
-    ];
-
-    let protoc_cmd = find_tool("protoc", &tp_bin);
-    let mut protoc = std::process::Command::new(&protoc_cmd);
-    protoc.arg("-I").arg("idl/proto");
-    protoc.arg("--cpp_out").arg(&proto_out);
-    for file in proto_files {
-        protoc.arg(file);
-    }
-    let protoc_status = protoc.status().expect("run protoc");
-    if !protoc_status.success() {
-        panic!("protoc codegen failed with status={protoc_status}");
-    }
-
-    let mut build = cc::Build::new();
-    build
-        .cpp(true)
-        .file("src/shim/compat.cpp")
-        .file("src/shim/brpc_server.cpp");
-
-    for entry in std::fs::read_dir(&thrift_out).expect("read thrift out dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) == Some("cpp") {
-            if path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|name| name.ends_with(".skeleton.cpp"))
-            {
-                continue;
-            }
-            build.file(path);
+        let protoc_cmd = find_tool("protoc", &tp_bin);
+        let mut protoc = std::process::Command::new(&protoc_cmd);
+        protoc.arg("-I").arg("idl/proto");
+        protoc.arg("--cpp_out").arg(&proto_out);
+        for file in proto_files {
+            protoc.arg(file);
         }
-    }
-
-    for entry in std::fs::read_dir(&proto_out).expect("read proto out dir") {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) == Some("cc") {
-            build.file(path);
+        let protoc_status = protoc.status().expect("run protoc");
+        if !protoc_status.success() {
+            panic!("protoc codegen failed with status={protoc_status}");
         }
-    }
 
-    build
-        .flag_if_supported("-std=c++17")
-        .flag_if_supported("-Wno-deprecated-declarations")
-        .flag_if_supported("-Wno-unused-parameter")
-        .flag_if_supported("-Wno-vla-cxx-extension")
-        .flag_if_supported("-w") // Suppress all warnings for C++ code
-        .define("GLOG_USE_GLOG_EXPORT", None) // Required for glog 0.7.1 static linking
-        .define("GLOG_STATIC_DEFINE", None) // Required for glog 0.7.1 static linking
-        .include("src/shim")
-        .include(&thrift_out)
-        .include(&proto_out);
+        let mut build = cc::Build::new();
+        build
+            .cpp(true)
+            .file("src/shim/compat.cpp")
+            .file("src/shim/brpc_server.cpp");
 
-    // On Linux, never let cc crate emit C++ stdlib link directives.
-    // We manage runtime linkage explicitly to align with StarRocks BE behavior.
-    if is_linux {
-        build.cpp_link_stdlib(None);
-        build.cpp_link_stdlib_static(false);
-    }
-
-    // Add thirdparty include
-    build.include(&tp_include);
-
-    // macOS-specific include paths
-    if is_macos {
-        build.include("/opt/homebrew/opt/openssl/include");
-        // Add boost include for thrift (thrift requires boost)
-        build.include("/opt/homebrew/include");
-    }
-    build.compile("novarocks_compat");
-
-    // Add library search paths
-    println!("cargo:rustc-link-search=native={}", tp_lib.display());
-    if tp_lib64.exists() {
-        println!("cargo:rustc-link-search=native={}", tp_lib64.display());
-    }
-
-    if is_linux {
-        // Align with StarRocks default: prefer static C++ runtime by default.
-        if let Some(libstdcpp_static) = find_cxx_runtime("libstdc++.a") {
-            if let Some(parent) = libstdcpp_static.parent() {
-                println!("cargo:rustc-link-search=native={}", parent.display());
+        for entry in std::fs::read_dir(&thrift_out).expect("read thrift out dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|s| s.to_str()) == Some("cpp") {
+                if path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.ends_with(".skeleton.cpp"))
+                {
+                    continue;
+                }
+                build.file(path);
             }
-            eprintln!(
-                "info: using static libstdc++ archive: {}",
-                libstdcpp_static.display()
-            );
-            eprintln!("info: linking C++ runtime statically (-static-libstdc++ -static-libgcc)");
-            println!("cargo:rustc-link-arg=-static-libstdc++");
-            println!("cargo:rustc-link-arg=-static-libgcc");
-            println!("cargo:rustc-link-lib=static=stdc++");
-            if let Some(libsupcxx_static) = find_cxx_runtime("libsupc++.a") {
-                if let Some(parent) = libsupcxx_static.parent() {
+        }
+
+        for entry in std::fs::read_dir(&proto_out).expect("read proto out dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|s| s.to_str()) == Some("cc") {
+                build.file(path);
+            }
+        }
+
+        build
+            .flag_if_supported("-std=c++17")
+            .flag_if_supported("-Wno-deprecated-declarations")
+            .flag_if_supported("-Wno-unused-parameter")
+            .flag_if_supported("-Wno-vla-cxx-extension")
+            .flag_if_supported("-w") // Suppress all warnings for C++ code
+            .define("GLOG_USE_GLOG_EXPORT", None) // Required for glog 0.7.1 static linking
+            .define("GLOG_STATIC_DEFINE", None) // Required for glog 0.7.1 static linking
+            .include("src/shim")
+            .include(&thrift_out)
+            .include(&proto_out);
+
+        // On Linux, never let cc crate emit C++ stdlib link directives.
+        // We manage runtime linkage explicitly to align with StarRocks BE behavior.
+        if is_linux {
+            build.cpp_link_stdlib(None);
+            build.cpp_link_stdlib_static(false);
+        }
+
+        // Add thirdparty include
+        build.include(&tp_include);
+
+        // macOS-specific include paths
+        if is_macos {
+            build.include("/opt/homebrew/opt/openssl/include");
+            // Add boost include for thrift (thrift requires boost)
+            build.include("/opt/homebrew/include");
+        }
+        build.compile("novarocks_compat");
+
+        // Add library search paths
+        println!("cargo:rustc-link-search=native={}", tp_lib.display());
+        if tp_lib64.exists() {
+            println!("cargo:rustc-link-search=native={}", tp_lib64.display());
+        }
+
+        if is_linux {
+            // Align with StarRocks default: prefer static C++ runtime by default.
+            if let Some(libstdcpp_static) = find_cxx_runtime("libstdc++.a") {
+                if let Some(parent) = libstdcpp_static.parent() {
                     println!("cargo:rustc-link-search=native={}", parent.display());
                 }
                 eprintln!(
-                    "info: using static libsupc++ archive: {}",
-                    libsupcxx_static.display()
+                    "info: using static libstdc++ archive: {}",
+                    libstdcpp_static.display()
                 );
-                println!("cargo:rustc-link-lib=static=supc++");
-            }
-        } else {
-            let cxx = std::env::var("CXX").unwrap_or_else(|_| "g++".to_string());
-            panic!(
-                "libstdc++.a not found for compiler '{}'. \
+                eprintln!(
+                    "info: linking C++ runtime statically (-static-libstdc++ -static-libgcc)"
+                );
+                println!("cargo:rustc-link-arg=-static-libstdc++");
+                println!("cargo:rustc-link-arg=-static-libgcc");
+                println!("cargo:rustc-link-lib=static=stdc++");
+                if let Some(libsupcxx_static) = find_cxx_runtime("libsupc++.a") {
+                    if let Some(parent) = libsupcxx_static.parent() {
+                        println!("cargo:rustc-link-search=native={}", parent.display());
+                    }
+                    eprintln!(
+                        "info: using static libsupc++ archive: {}",
+                        libsupcxx_static.display()
+                    );
+                    println!("cargo:rustc-link-lib=static=supc++");
+                }
+            } else {
+                let cxx = std::env::var("CXX").unwrap_or_else(|_| "g++".to_string());
+                panic!(
+                    "libstdc++.a not found for compiler '{}'. \
 Install static libstdc++ package for your toolchain (for example libstdc++-static / gcc-toolset-*-libstdc++-static) \
 static C++ runtime is required.",
-                cxx
-            );
+                    cxx
+                );
+            }
+
+            // Ensure runtime can resolve thirdparty shared libs (for example OpenSSL).
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tp_lib.display());
+            if tp_lib64.exists() {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tp_lib64.display());
+            }
         }
 
-        // Ensure runtime can resolve thirdparty shared libs (for example OpenSSL).
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tp_lib.display());
-        if tp_lib64.exists() {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", tp_lib64.display());
+        // Link OpenSSL dynamically from resolved thirdparty install root.
+        println!("cargo:rustc-link-lib=ssl");
+        println!("cargo:rustc-link-lib=crypto");
+        println!("cargo:rustc-link-lib=static=brpc");
+        println!("cargo:rustc-link-lib=static=protobuf");
+        println!("cargo:rustc-link-lib=static=glog");
+        println!("cargo:rustc-link-lib=static=leveldb"); // Required by brpc
+        println!("cargo:rustc-link-lib=static=gflags"); // Required by glog
+        println!("cargo:rustc-link-lib=static=thrift"); // Use static thrift from thirdparty
+        println!("cargo:rustc-link-lib=z");
+
+        // macOS-specific libraries and paths
+        if is_macos {
+            // Align with brpc's Darwin linkage: profiler/tcmalloc are optional.
+            // We do not enable CPU profiler support in NovaRocks, so these symbols
+            // are allowed to remain unresolved and built-in profiling endpoints
+            // will report "not enabled" at runtime.
+            println!("cargo:rustc-link-arg=-Wl,-U,_MallocExtension_ReleaseFreeMemory");
+            println!("cargo:rustc-link-arg=-Wl,-U,_ProfilerStart");
+            println!("cargo:rustc-link-arg=-Wl,-U,_ProfilerStop");
+            println!("cargo:rustc-link-arg=-Wl,-U,__Z13GetStackTracePPvii");
+            println!("cargo:rustc-link-lib=objc");
+            println!("cargo:rustc-link-lib=framework=Foundation");
         }
-    }
 
-    // Link OpenSSL dynamically from resolved thirdparty install root.
-    println!("cargo:rustc-link-lib=ssl");
-    println!("cargo:rustc-link-lib=crypto");
-    println!("cargo:rustc-link-lib=static=brpc");
-    println!("cargo:rustc-link-lib=static=protobuf");
-    println!("cargo:rustc-link-lib=static=glog");
-    println!("cargo:rustc-link-lib=static=leveldb"); // Required by brpc
-    println!("cargo:rustc-link-lib=static=gflags"); // Required by glog
-    println!("cargo:rustc-link-lib=static=thrift"); // Use static thrift from thirdparty
-    println!("cargo:rustc-link-lib=z");
-
-    // macOS-specific libraries and paths
-    if is_macos {
-        // Align with brpc's Darwin linkage: profiler/tcmalloc are optional.
-        // We do not enable CPU profiler support in NovaRocks, so these symbols
-        // are allowed to remain unresolved and built-in profiling endpoints
-        // will report "not enabled" at runtime.
-        println!("cargo:rustc-link-arg=-Wl,-U,_MallocExtension_ReleaseFreeMemory");
-        println!("cargo:rustc-link-arg=-Wl,-U,_ProfilerStart");
-        println!("cargo:rustc-link-arg=-Wl,-U,_ProfilerStop");
-        println!("cargo:rustc-link-arg=-Wl,-U,__Z13GetStackTracePPvii");
-        println!("cargo:rustc-link-lib=objc");
-        println!("cargo:rustc-link-lib=framework=Foundation");
-    }
-
-    println!("cargo:rustc-link-lib=pthread");
-
+        println!("cargo:rustc-link-lib=pthread");
     } // end if compat
 
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc path");

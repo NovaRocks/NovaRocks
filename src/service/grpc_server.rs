@@ -40,6 +40,7 @@ const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Default)]
 struct GrpcServerState {
     started: bool,
+    bound_port: Option<u16>,
     shutdown_tx: Option<watch::Sender<bool>>,
     join_handle: Option<JoinHandle<()>>,
 }
@@ -468,9 +469,22 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
         return Ok(());
     }
     state.started = true;
+    state.bound_port = Some(grpc_http_port);
     state.shutdown_tx = Some(shutdown_tx);
     state.join_handle = Some(join_handle);
     Ok(())
+}
+
+pub fn grpc_server_bound_port() -> Result<u16, String> {
+    let state = grpc_server_state()
+        .lock()
+        .map_err(|_| "lock grpc server state failed".to_string())?;
+    if !state.started {
+        return Err("grpc server not started".to_string());
+    }
+    state
+        .bound_port
+        .ok_or_else(|| "grpc server bound port unavailable".to_string())
 }
 
 pub fn stop_grpc_server() {
@@ -483,6 +497,7 @@ pub fn stop_grpc_server() {
             return;
         }
         state.started = false;
+        state.bound_port = None;
         (state.shutdown_tx.take(), state.join_handle.take())
     };
 
@@ -585,6 +600,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
         return Ok(());
     }
     state.started = true;
+    state.bound_port = Some(port);
     state.shutdown_tx = Some(shutdown_tx);
     state.join_handle = Some(join_handle);
     Ok(())

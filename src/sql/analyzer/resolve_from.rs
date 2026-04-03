@@ -117,13 +117,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 let db_lower = db.to_lowercase();
                 let tbl_lower = tbl.to_lowercase();
 
-                // Check if this table name refers to a shared CTE (ref_count >= 2).
                 if parts.len() == 1 {
-                    if let Some(&cte_id) = self.shared_cte_ids.get(&tbl_lower) {
+                    if self.pending_ctes.contains(&tbl_lower) {
+                        return Err(format!(
+                            "forward CTE reference is not supported: {tbl_lower}"
+                        ));
+                    }
+
+                    if let Some(&cte_id) = self.ctes.get(&tbl_lower) {
                         let registry = self.cte_registry.borrow();
-                        let entry = registry.get(cte_id).ok_or_else(|| {
-                            format!("internal error: shared CTE id {cte_id} not found in registry")
-                        })?;
+                        let entry = registry
+                            .get(cte_id)
+                            .ok_or_else(|| format!("unknown CTE id: {cte_id}"))?;
                         let alias_name = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
@@ -138,61 +143,14 @@ impl<'a> super::AnalyzerContext<'a> {
                                 col.nullable,
                             );
                         }
-                        let relation = Relation::CTEConsume {
-                            cte_id,
-                            alias: alias_name,
-                            output_columns,
-                        };
-                        return Ok((relation, scope));
-                    }
-                }
-
-                // Check if this table name refers to a CTE (single-ref, inline).
-                if parts.len() == 1 {
-                    if let Some((cte_query, cte_col_aliases)) = self.ctes.get(&tbl_lower) {
-                        // Inline-expand the CTE as a subquery.
-                        // Remove self from CTE map to prevent infinite recursion
-                        // for recursive CTEs (not supported — will error gracefully).
-                        let mut child_ctes = self.ctes.clone();
-                        child_ctes.remove(&tbl_lower);
-                        let child_ctx = super::AnalyzerContext {
-                            catalog: self.catalog,
-                            current_database: self.current_database,
-                            ctes: child_ctes,
-                            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-                            collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                            shared_cte_ids: self.shared_cte_ids.clone(),
-                            cte_registry: std::cell::RefCell::new(
-                                self.cte_registry.borrow().clone(),
-                            ),
-                        };
-                        let mut resolved_cte = child_ctx.analyze_query(cte_query)?;
-                        // Apply CTE column aliases if present: WITH t(a, b) AS (...)
-                        if !cte_col_aliases.is_empty() {
-                            for (i, alias_name) in cte_col_aliases.iter().enumerate() {
-                                if let Some(col) = resolved_cte.output_columns.get_mut(i) {
-                                    col.name = alias_name.clone();
-                                }
-                            }
-                        }
-                        let alias_name = alias
-                            .as_ref()
-                            .map(|a| a.name.value.clone())
-                            .unwrap_or_else(|| tbl.clone());
-                        let mut scope = AnalyzerScope::new();
-                        for col in &resolved_cte.output_columns {
-                            scope.add_column(
-                                Some(&alias_name),
-                                &col.name,
-                                col.data_type.clone(),
-                                col.nullable,
-                            );
-                        }
-                        let relation = Relation::Subquery {
-                            query: Box::new(resolved_cte),
-                            alias: alias_name,
-                        };
-                        return Ok((relation, scope));
+                        return Ok((
+                            Relation::CTEConsume {
+                                cte_id: entry.id,
+                                alias: alias_name,
+                                output_columns,
+                            },
+                            scope,
+                        ));
                     }
                 }
 

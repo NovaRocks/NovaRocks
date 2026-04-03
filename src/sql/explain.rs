@@ -67,7 +67,10 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
         }
         LogicalPlan::Filter(node) => {
             out.push(format!("{pad}FILTER"));
-            out.push(format!("{pad}  predicate: {}", format_expr(&node.predicate)));
+            out.push(format!(
+                "{pad}  predicate: {}",
+                format_expr(&node.predicate)
+            ));
             format_node(&node.input, level, indent + 1, out);
         }
         LogicalPlan::Project(node) => {
@@ -223,6 +226,15 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 "{pad}REPEAT ({} grouping sets)",
                 node.grouping_ids.len()
             ));
+            format_node(&node.input, level, indent + 1, out);
+        }
+        LogicalPlan::CTEAnchor(node) => {
+            out.push(format!("{pad}CTE_ANCHOR(cte_id={})", node.cte_id));
+            format_node(&node.produce, level, indent + 1, out);
+            format_node(&node.consumer, level, indent + 1, out);
+        }
+        LogicalPlan::CTEProduce(node) => {
+            out.push(format!("{pad}CTE_PRODUCE(cte_id={})", node.cte_id));
             format_node(&node.input, level, indent + 1, out);
         }
         LogicalPlan::CTEConsume(node) => {
@@ -397,10 +409,7 @@ fn format_physical_node(
                     format!("{} {dir}{nulls}", format_expr(&s.expr))
                 })
                 .collect();
-            out.push(format!(
-                "{pad}SORT BY [{}]{costs_suffix}",
-                items.join(", ")
-            ));
+            out.push(format!("{pad}SORT BY [{}]{costs_suffix}", items.join(", ")));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -413,10 +422,7 @@ fn format_physical_node(
             if let Some(offset) = op.offset {
                 parts.push(format!("offset={offset}"));
             }
-            out.push(format!(
-                "{pad}LIMIT [{}]{costs_suffix}",
-                parts.join(", ")
-            ));
+            out.push(format!("{pad}LIMIT [{}]{costs_suffix}", parts.join(", ")));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -450,16 +456,25 @@ fn format_physical_node(
                     format!("{}({})", w.name, args.join(", "))
                 })
                 .collect();
+            out.push(format!("{pad}WINDOW [{}]{costs_suffix}", fns.join("; ")));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
+        Operator::PhysicalCTEAnchor(op) => {
             out.push(format!(
-                "{pad}WINDOW [{}]{costs_suffix}",
-                fns.join("; ")
+                "{pad}CTE ANCHOR (cte_id={}){costs_suffix}",
+                op.cte_id
             ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
         }
         Operator::PhysicalCTEProduce(op) => {
-            out.push(format!("{pad}CTE PRODUCE (cte_id={}){costs_suffix}", op.cte_id));
+            out.push(format!(
+                "{pad}CTE PRODUCE (cte_id={}){costs_suffix}",
+                op.cte_id
+            ));
             for child in &node.children {
                 format_physical_node(child, level, indent + 1, out);
             }
@@ -499,7 +514,10 @@ fn format_physical_node(
             }
         }
         Operator::PhysicalValues(op) => {
-            out.push(format!("{pad}VALUES ({} rows){costs_suffix}", op.rows.len()));
+            out.push(format!(
+                "{pad}VALUES ({} rows){costs_suffix}",
+                op.rows.len()
+            ));
         }
         Operator::PhysicalGenerateSeries(op) => {
             out.push(format!(
@@ -566,14 +584,20 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             format!("{op_str} {}", format_expr(expr))
         }
         ExprKind::FunctionCall {
-            name, args, distinct, ..
+            name,
+            args,
+            distinct,
+            ..
         } => {
             let args_str: Vec<String> = args.iter().map(format_expr).collect();
             let distinct_str = if *distinct { "DISTINCT " } else { "" };
             format!("{name}({distinct_str}{})", args_str.join(", "))
         }
         ExprKind::AggregateCall {
-            name, args, distinct, ..
+            name,
+            args,
+            distinct,
+            ..
         } => {
             let args_str: Vec<String> = args.iter().map(format_expr).collect();
             let distinct_str = if *distinct { "DISTINCT " } else { "" };

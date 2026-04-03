@@ -2,10 +2,10 @@
 
 use super::memo::{GroupId, MExpr, Memo};
 use super::operator::{
-    LogicalAggregateOp, LogicalCTEConsumeOp, LogicalExceptOp, LogicalFilterOp,
-    LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp, LogicalLimitOp, LogicalProjectOp,
-    LogicalRepeatOp, LogicalScanOp, LogicalSortOp, LogicalSubqueryAliasOp, LogicalUnionOp,
-    LogicalValuesOp, LogicalWindowOp, Operator,
+    LogicalAggregateOp, LogicalCTEAnchorOp, LogicalCTEConsumeOp, LogicalCTEProduceOp,
+    LogicalExceptOp, LogicalFilterOp, LogicalGenerateSeriesOp, LogicalIntersectOp, LogicalJoinOp,
+    LogicalLimitOp, LogicalProjectOp, LogicalRepeatOp, LogicalScanOp, LogicalSortOp,
+    LogicalSubqueryAliasOp, LogicalUnionOp, LogicalValuesOp, LogicalWindowOp, Operator,
 };
 use crate::sql::plan::LogicalPlan;
 
@@ -246,6 +246,33 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             };
             memo.new_group(expr)
         }
+
+        LogicalPlan::CTEAnchor(node) => {
+            let produce = logical_plan_to_memo(&node.produce, memo);
+            let consumer = logical_plan_to_memo(&node.consumer, memo);
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::LogicalCTEAnchor(LogicalCTEAnchorOp {
+                    cte_id: node.cte_id,
+                }),
+                children: vec![produce, consumer],
+            };
+            memo.new_group(expr)
+        }
+
+        LogicalPlan::CTEProduce(node) => {
+            let child = logical_plan_to_memo(&node.input, memo);
+            let op = Operator::LogicalCTEProduce(LogicalCTEProduceOp {
+                cte_id: node.cte_id,
+                output_columns: node.output_columns.clone(),
+            });
+            let expr = MExpr {
+                id: memo.next_expr_id(),
+                op,
+                children: vec![child],
+            };
+            memo.new_group(expr)
+        }
     }
 }
 
@@ -349,5 +376,45 @@ mod tests {
             Operator::LogicalFilter(_)
         ));
         assert_eq!(memo.groups[1].logical_exprs[0].children, vec![0]);
+    }
+
+    #[test]
+    fn test_cte_anchor_to_memo() {
+        let scan = LogicalPlan::Scan(ScanNode {
+            database: "db".to_string(),
+            table: dummy_table_def(),
+            alias: None,
+            columns: dummy_output_columns(),
+            predicates: vec![],
+            required_columns: None,
+        });
+
+        let produce = LogicalPlan::CTEProduce(crate::sql::plan::CTEProduceNode {
+            cte_id: 7,
+            input: Box::new(scan.clone()),
+            output_columns: dummy_output_columns(),
+        });
+
+        let consume = LogicalPlan::CTEConsume(crate::sql::plan::CTEConsumeNode {
+            cte_id: 7,
+            alias: "t".to_string(),
+            output_columns: dummy_output_columns(),
+        });
+
+        let anchor = LogicalPlan::CTEAnchor(crate::sql::plan::CTEAnchorNode {
+            cte_id: 7,
+            produce: Box::new(produce),
+            consumer: Box::new(consume),
+        });
+
+        let mut memo = Memo::new();
+        let gid = logical_plan_to_memo(&anchor, &mut memo);
+
+        assert_eq!(gid, 3);
+        assert!(matches!(
+            memo.groups[3].logical_exprs[0].op,
+            Operator::LogicalCTEAnchor(_)
+        ));
+        assert_eq!(memo.groups[3].logical_exprs[0].children, vec![1, 2]);
     }
 }

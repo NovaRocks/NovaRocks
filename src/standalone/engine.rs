@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -13,8 +15,8 @@ use tokio::runtime::Handle;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::sql::ast::{ArithmeticOp, GenerateSeriesSelect, SqlType, TableColumnDef};
-use crate::sql::ast::{
+use crate::sql::parser::ast::{ArithmeticOp, GenerateSeriesSelect, SqlType, TableColumnDef};
+use crate::sql::parser::ast::{
     ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName, TableKeyKind,
 };
 
@@ -100,6 +102,7 @@ struct StandaloneState {
     catalog: RwLock<InMemoryCatalog>,
     iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
     metadata_store: Option<SqliteMetadataStore>,
+    exchange_port: u16,
 }
 
 #[derive(Clone)]
@@ -124,12 +127,14 @@ impl StandaloneNovaRocks {
                     .map_err(|e| format!("load config failed: {e}"))?;
             }
         }
+        let exchange_port = ensure_standalone_exchange_server()?;
         let metadata_store = resolve_metadata_store(
             opts.metadata_db_path.as_deref(),
             opts.config_path.as_deref(),
         )?;
         let inner = Arc::new(StandaloneState {
             metadata_store,
+            exchange_port,
             ..Default::default()
         });
         restore_metadata_if_needed(&inner)?;
@@ -233,13 +238,13 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        use crate::sql::dialect::{
+        use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
             looks_like_create_table, looks_like_drop_statement,
         };
         use sqlparser::ast as sqlast;
 
-        let normalized = crate::sql::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -247,8 +252,9 @@ impl StandaloneSession {
 
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
         if looks_like_create_table(&parser) {
-            let result =
-                crate::sql::dialect::create_table::parse_create_table_statement(&mut parser)?;
+            let result = crate::sql::parser::dialect::create_table::parse_create_table_statement(
+                &mut parser,
+            )?;
             return execute_create_table_statement(
                 &self.inner,
                 result,
@@ -258,15 +264,17 @@ impl StandaloneSession {
         }
         if looks_like_create_catalog(&parser) {
             let result =
-                crate::sql::dialect::create_catalog::parse_create_catalog_statement(&mut parser)?;
+                crate::sql::parser::dialect::create_catalog::parse_create_catalog_statement(
+                    &mut parser,
+                )?;
             return self.handle_create_catalog(result);
         }
         if looks_like_create_database(&parser) {
-            let db_name = crate::sql::dialect::parse_create_database_name(&mut parser)?;
+            let db_name = crate::sql::parser::dialect::parse_create_database_name(&mut parser)?;
             return execute_create_database_statement(&self.inner, &db_name, current_catalog);
         }
         if looks_like_drop_statement(&parser) {
-            let drop = crate::sql::dialect::drop::parse_drop_statement(&mut parser)?;
+            let drop = crate::sql::parser::dialect::drop::parse_drop_statement(&mut parser)?;
             return self.handle_drop(drop, current_catalog, current_database);
         }
 
@@ -317,7 +325,8 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = execute_query(query, &catalog, current_database)?;
+                let result =
+                    execute_query(query, &catalog, current_database, self.inner.exchange_port)?;
                 drop(catalog);
                 Ok(StatementResult::Query(result))
             }
@@ -326,8 +335,9 @@ impl StandaloneSession {
             }
             sqlast::Statement::Truncate(truncate) => {
                 for truncate_table in &truncate.table_names {
-                    let table_name =
-                        crate::sql::dialect::convert_object_name(truncate_table.name.clone())?;
+                    let table_name = crate::sql::parser::dialect::convert_object_name(
+                        truncate_table.name.clone(),
+                    )?;
                     execute_truncate_table_statement(&self.inner, &table_name, current_database)?;
                 }
                 Ok(StatementResult::Ok)
@@ -504,7 +514,7 @@ impl StandaloneSession {
     /// Handle CREATE CATALOG result.
     fn handle_create_catalog(
         &self,
-        stmt: crate::sql::ast::CreateCatalogStmt,
+        stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
         let mut guard = self
             .inner
@@ -525,11 +535,11 @@ impl StandaloneSession {
     /// Handle DROP TABLE/DATABASE/CATALOG result.
     fn handle_drop(
         &self,
-        drop: crate::sql::dialect::drop::DropResult,
+        drop: crate::sql::parser::dialect::drop::DropResult,
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        use crate::sql::dialect::drop::DropResult;
+        use crate::sql::parser::dialect::drop::DropResult;
         match drop {
             DropResult::Catalog(stmt) => {
                 execute_drop_catalog_statement(&self.inner, &stmt.name, stmt.if_exists)
@@ -573,7 +583,7 @@ impl StandaloneSession {
                     sqlast::TableObject::TableName(name) => name.clone(),
                     other => return Err(format!("unsupported INSERT target: {other}")),
                 };
-                if let Ok(table_name) = crate::sql::dialect::convert_object_name(raw_name) {
+                if let Ok(table_name) = crate::sql::parser::dialect::convert_object_name(raw_name) {
                     if let Ok(resolved) = resolve_local_table_name(&table_name, current_database) {
                         let guard = self
                             .inner
@@ -616,7 +626,12 @@ impl StandaloneSession {
             .catalog
             .read()
             .expect("standalone catalog read lock");
-        let query_result = execute_query(source_query, &catalog, current_database)?;
+        let query_result = execute_query(
+            source_query,
+            &catalog,
+            current_database,
+            self.inner.exchange_port,
+        )?;
         drop(catalog);
 
         // Resolve target table
@@ -624,7 +639,7 @@ impl StandaloneSession {
             sqlast::TableObject::TableName(name) => name.clone(),
             other => return Err(format!("unsupported INSERT target: {other}")),
         };
-        let table_name = crate::sql::dialect::convert_object_name(raw_name)?;
+        let table_name = crate::sql::parser::dialect::convert_object_name(raw_name)?;
         let resolved = resolve_local_table_name(&table_name, current_database)?;
         let guard = self
             .inner
@@ -782,12 +797,12 @@ impl StandaloneSession {
 /// Used for Iceberg tables which need the custom AST's InsertSource types.
 fn convert_sqlparser_insert_to_custom(
     insert: &sqlparser::ast::Insert,
-) -> Result<crate::sql::ast::InsertStmt, String> {
+) -> Result<crate::sql::parser::ast::InsertStmt, String> {
     use sqlparser::ast as sqlast;
 
     let table = match &insert.table {
         sqlast::TableObject::TableName(name) => {
-            crate::sql::dialect::convert_object_name(name.clone())?
+            crate::sql::parser::dialect::convert_object_name(name.clone())?
         }
         other => return Err(format!("unsupported INSERT target: {other}")),
     };
@@ -866,7 +881,7 @@ fn convert_sqlparser_insert_to_custom(
         }
         _ => return Err("unsupported INSERT source".into()),
     };
-    Ok(crate::sql::ast::InsertStmt {
+    Ok(crate::sql::parser::ast::InsertStmt {
         table,
         columns,
         source,
@@ -926,15 +941,17 @@ fn parse_generate_series_function_expr(
 fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
     use sqlparser::ast as sqlast;
     match expr {
-        sqlast::Expr::Identifier(ident) => Ok(Expr::Column(crate::sql::ast::ColumnRef {
+        sqlast::Expr::Identifier(ident) => Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
             name: ident.value.clone(),
         })),
-        sqlast::Expr::CompoundIdentifier(parts) => Ok(Expr::Column(crate::sql::ast::ColumnRef {
-            name: parts
-                .last()
-                .map(|p| p.value.clone())
-                .ok_or_else(|| "empty column reference".to_string())?,
-        })),
+        sqlast::Expr::CompoundIdentifier(parts) => {
+            Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
+                name: parts
+                    .last()
+                    .map(|p| p.value.clone())
+                    .ok_or_else(|| "empty column reference".to_string())?,
+            }))
+        }
         sqlast::Expr::Value(sqlast::ValueWithSpan { value, .. }) => {
             let lit = match value {
                 sqlast::Value::Null => Literal::Null,
@@ -993,7 +1010,7 @@ fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, St
             ..
         } => {
             let inner_expr = sqlparser_expr_to_custom_expr(inner)?;
-            let sql_type = crate::sql::dialect::convert_sql_type(data_type.clone())?;
+            let sql_type = crate::sql::parser::dialect::convert_sql_type(data_type.clone())?;
             Ok(Expr::Cast {
                 expr: Box::new(inner_expr),
                 data_type: sql_type,
@@ -1140,7 +1157,7 @@ fn execute_create_database_statement(
 
 fn execute_create_table_statement(
     state: &Arc<StandaloneState>,
-    stmt: crate::sql::ast::CreateTableStmt,
+    stmt: crate::sql::parser::ast::CreateTableStmt,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
@@ -3389,59 +3406,29 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 use crate::sql::physical::PlanBuildResult;
 
 /// Produce EXPLAIN output for a query without executing it.
-///
-/// Non-CTE queries go through the Cascades optimizer and produce a physical
-/// plan.  CTE queries use the old LogicalPlan explain path for now.
 fn explain_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,
     level: crate::sql::explain::ExplainLevel,
 ) -> Result<QueryResult, String> {
-    use crate::sql::explain::{ExplainLevel, explain_physical_plan, explain_query_plan};
+    use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
-    let (resolved, cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
 
     let mut lines = Vec::new();
-
-    if cte_registry.entries.is_empty() {
-        // Cascades path for non-CTE queries
-        let logical = crate::sql::planner::plan(resolved)?;
-        let table_stats = build_table_stats_from_plan(&logical);
-        let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
-
-        if matches!(level, ExplainLevel::Costs) {
-            for (table, stats) in &table_stats {
-                lines.push(format!(
-                    "  Statistics: {table} row_count={}",
-                    stats.row_count
-                ));
-            }
+    if matches!(level, ExplainLevel::Costs) {
+        for (table, stats) in &table_stats {
+            lines.push(format!(
+                "  Statistics: {table} row_count={}",
+                stats.row_count
+            ));
         }
-        lines.extend(explain_physical_plan(&physical, level));
-    } else {
-        // CTE queries: use old LogicalPlan explain for now
-        let query_plan =
-            crate::sql::planner::plan_query(resolved, cte_registry)?;
-        let mut all_stats = std::collections::HashMap::new();
-        for cte in &query_plan.cte_plans {
-            all_stats.extend(build_table_stats_from_plan(&cte.plan));
-        }
-        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-        let optimized =
-            crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
-
-        if matches!(level, ExplainLevel::Costs) {
-            for (table, stats) in &all_stats {
-                lines.push(format!(
-                    "  Statistics: {table} row_count={}",
-                    stats.row_count
-                ));
-            }
-        }
-        lines.extend(explain_query_plan(&optimized, level));
     }
+    lines.extend(explain_physical_plan(&physical, level));
 
     build_string_query_result("Explain String", lines)
 }
@@ -3450,41 +3437,19 @@ fn execute_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,
+    exchange_port: u16,
 ) -> Result<QueryResult, String> {
-    let (resolved, cte_registry) =
-        crate::sql::analyzer::analyze(query, catalog, current_database)?;
-
-    // Build logical plan (with CTE if multi-referenced)
-    let logical = if cte_registry.entries.is_empty() {
-        crate::sql::planner::plan(resolved)?
-    } else {
-        // For CTE queries, use the old optimizer + emitter path.
-        // TODO: full CTE support in Cascades (produce/consume should appear in plan)
-        let query_plan = crate::sql::planner::plan_query(resolved, cte_registry)?;
-        let mut all_stats = std::collections::HashMap::new();
-        for cte in &query_plan.cte_plans {
-            all_stats.extend(build_table_stats_from_plan(&cte.plan));
-        }
-        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-        let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
-        let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
-        let build_result = crate::sql::physical::emit_multi_fragment(
-            fragment_plan, catalog, current_database,
-        )?;
-        let exchange_port = crate::common::config::http_port();
-        return super::coordinator::ExecutionCoordinator::new(
-            build_result,
-            "127.0.0.1".to_string(),
-            exchange_port,
-        )
-        .execute();
-    };
-
-    // Cascades path for non-CTE queries
+    // All non-recursive queries, including CTE queries, now flow through
+    // planner -> cascades -> fragment builder. The legacy QueryPlan/FragmentPlan
+    // path remains only for compile-time compatibility and should not be used here.
+    let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
     let build_result = crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
-        &physical, catalog, current_database,
+        &physical,
+        catalog,
+        current_database,
     )?;
 
     if build_result.fragments.len() == 1 {
@@ -3501,13 +3466,77 @@ fn execute_query(
             fragment_results: build_result.fragments,
             root_fragment_id: build_result.root_fragment_id,
         };
-        let exchange_port = crate::common::config::http_port();
-        super::coordinator::ExecutionCoordinator::new(
-            multi,
-            "127.0.0.1".to_string(),
-            exchange_port,
-        )
-        .execute()
+        super::coordinator::ExecutionCoordinator::new(multi, "127.0.0.1".to_string(), exchange_port)
+            .execute()
+    }
+}
+
+fn ensure_standalone_exchange_server() -> Result<u16, String> {
+    static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
+
+    if let Some(port) = STANDALONE_EXCHANGE_PORT.get() {
+        return Ok(*port);
+    }
+
+    let default_port = crate::common::config::http_port();
+    let started_port =
+        match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", default_port) {
+            Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
+                .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
+            Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|bind_err| {
+                    format!("reserve standalone grpc exchange port failed: {bind_err}")
+                })?;
+                let fallback_port = listener
+                    .local_addr()
+                    .map_err(|addr_err| {
+                        format!("read standalone grpc exchange port failed: {addr_err}")
+                    })?
+                    .port();
+                drop(listener);
+                crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", fallback_port)
+                    .map_err(|start_err| {
+                        format!(
+                            "start standalone grpc exchange server failed on fallback port {}: {}",
+                            fallback_port, start_err
+                        )
+                    })?;
+                crate::service::grpc_server::grpc_server_bound_port().map_err(|e| {
+                    format!("read standalone grpc exchange server fallback port failed: {e}")
+                })?
+            }
+            Err(e) => return Err(format!("start standalone grpc exchange server failed: {e}")),
+        };
+
+    wait_for_standalone_exchange_server(started_port)?;
+
+    if STANDALONE_EXCHANGE_PORT.set(started_port).is_err() {
+        return Ok(*STANDALONE_EXCHANGE_PORT
+            .get()
+            .expect("standalone exchange port initialized"));
+    }
+    Ok(started_port)
+}
+
+fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "standalone grpc exchange server on 127.0.0.1:{} did not become ready: {}",
+                    port, err
+                ));
+            }
+        }
     }
 }
 
@@ -3544,6 +3573,11 @@ fn collect_scan_stats(
         LogicalPlan::Sort(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Limit(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Window(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::CTEAnchor(n) => {
+            collect_scan_stats(&n.produce, out);
+            collect_scan_stats(&n.consumer, out);
+        }
+        LogicalPlan::CTEProduce(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::SubqueryAlias(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Join(n) => {
             collect_scan_stats(&n.left, out);
@@ -3650,7 +3684,7 @@ fn execute_plan(result: PlanBuildResult) -> Result<QueryResult, String> {
 #[cfg(test)]
 mod tests {
     use super::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
@@ -3737,6 +3771,134 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string array");
         assert_eq!(names.value(0), "b");
+    }
+
+    #[test]
+    fn embedded_query_executes_single_use_cte_through_cascades() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH t AS (SELECT id, name FROM tbl WHERE id >= 2) SELECT name FROM t ORDER BY 1",
+            )
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 2);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "name");
+    }
+
+    #[test]
+    fn embedded_query_executes_multi_use_cte_through_multicast_reuse() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH t AS (SELECT id FROM tbl) \
+                    SELECT a.id FROM t a JOIN t b ON a.id = b.id ORDER BY 1",
+            )
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 3);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn embedded_query_explain_for_multi_use_cte_shows_physical_cte_nodes() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let explain = session
+            .query("EXPLAIN WITH t AS (SELECT id FROM tbl) SELECT a.id FROM t a JOIN t b ON a.id = b.id")
+            .expect("execute explain");
+
+        assert!(explain.row_count() > 0);
+        let text = explain
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                let col = chunk.batch.column(0);
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("string array");
+                (0..arr.len())
+                    .map(|idx| arr.value(idx).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("CTE ANCHOR"), "text={text}");
+        assert!(text.contains("CTE PRODUCE"), "text={text}");
+        assert!(text.contains("CTE CONSUME"), "text={text}");
+    }
+
+    #[test]
+    fn embedded_query_executes_nested_multi_use_cte_through_multicast_reuse() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH outer_cte AS ( \
+                    WITH inner_cte AS (SELECT id FROM tbl) \
+                    SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \
+                ) \
+                SELECT x.id FROM outer_cte x JOIN outer_cte y ON x.id = y.id ORDER BY 1",
+            )
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 3);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn embedded_query_cte_union_with_four_way_self_join() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        // Simulates TPC-DS q11 pattern: CTE with UNION ALL, 4-way self-join
+        let result = session.query(
+            "WITH year_total AS ( \
+                SELECT id, name FROM tbl \
+                UNION ALL \
+                SELECT id, name FROM tbl \
+            ) \
+            SELECT a.id \
+            FROM year_total a, year_total b, year_total c, year_total d \
+            WHERE a.id = b.id AND b.id = c.id AND c.id = d.id \
+            ORDER BY 1 \
+            LIMIT 10",
+        );
+        match &result {
+            Ok(r) => assert!(r.row_count() > 0),
+            Err(e) => panic!("q11 pattern failed: {e}"),
+        }
     }
 
     #[test]

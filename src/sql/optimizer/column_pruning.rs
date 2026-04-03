@@ -174,6 +174,23 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),
         LogicalPlan::GenerateSeries(node) => LogicalPlan::GenerateSeries(node),
+        LogicalPlan::CTEAnchor(node) => {
+            let produce = prune_inner(*node.produce, None);
+            let consumer = prune_inner(*node.consumer, needed);
+            LogicalPlan::CTEAnchor(CTEAnchorNode {
+                cte_id: node.cte_id,
+                produce: Box::new(produce),
+                consumer: Box::new(consumer),
+            })
+        }
+        LogicalPlan::CTEProduce(node) => {
+            let input = prune_inner(*node.input, None);
+            LogicalPlan::CTEProduce(CTEProduceNode {
+                cte_id: node.cte_id,
+                input: Box::new(input),
+                output_columns: node.output_columns,
+            })
+        }
         LogicalPlan::CTEConsume(node) => LogicalPlan::CTEConsume(node),
 
         LogicalPlan::Window(node) => {

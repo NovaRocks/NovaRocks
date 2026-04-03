@@ -60,6 +60,16 @@ pub(super) fn map_children(plan: LogicalPlan, f: fn(LogicalPlan) -> LogicalPlan)
         | LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)
         | LogicalPlan::CTEConsume(_) => plan,
+        LogicalPlan::CTEAnchor(n) => LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: n.cte_id,
+            produce: Box::new(f(*n.produce)),
+            consumer: Box::new(f(*n.consumer)),
+        }),
+        LogicalPlan::CTEProduce(n) => LogicalPlan::CTEProduce(CTEProduceNode {
+            cte_id: n.cte_id,
+            input: Box::new(f(*n.input)),
+            output_columns: n.output_columns,
+        }),
         LogicalPlan::Window(n) => LogicalPlan::Window(WindowNode {
             input: Box::new(f(*n.input)),
             ..n

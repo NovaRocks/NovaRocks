@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub(crate) mod ast;
+pub(crate) mod dialect;
 mod raw;
 
 /// Parse SQL into a raw sqlparser AST (no custom AST conversion).

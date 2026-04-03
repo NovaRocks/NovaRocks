@@ -160,7 +160,10 @@ fn try_extract_common_eq_from_or(
     let first_eqs = &branch_eqs[0];
     let mut common: Vec<(TypedExpr, TypedExpr)> = Vec::new();
     for eq in first_eqs {
-        if branch_eqs[1..].iter().all(|branch| branch.iter().any(|b| eq_pair_matches(eq, b))) {
+        if branch_eqs[1..]
+            .iter()
+            .all(|branch| branch.iter().any(|b| eq_pair_matches(eq, b)))
+        {
             common.push(eq.clone());
         }
     }
@@ -537,7 +540,34 @@ impl Rule for WindowToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 10. CTEProduceToPhysical
+// 10. CTEAnchorToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct CTEAnchorToPhysical;
+
+impl Rule for CTEAnchorToPhysical {
+    fn name(&self) -> &str {
+        "CTEAnchorToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalCTEAnchor(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalCTEAnchor(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalCTEAnchor(PhysicalCTEAnchorOp { cte_id: op.cte_id }),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 11. CTEProduceToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct CTEProduceToPhysical;
@@ -567,7 +597,7 @@ impl Rule for CTEProduceToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 11. CTEConsumeToPhysical
+// 12. CTEConsumeToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct CTEConsumeToPhysical;
@@ -598,7 +628,7 @@ impl Rule for CTEConsumeToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 12. RepeatToPhysical
+// 13. RepeatToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct RepeatToPhysical;
@@ -630,7 +660,7 @@ impl Rule for RepeatToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 13. UnionToPhysical
+// 14. UnionToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct UnionToPhysical;
@@ -657,7 +687,7 @@ impl Rule for UnionToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 14. IntersectToPhysical
+// 15. IntersectToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct IntersectToPhysical;

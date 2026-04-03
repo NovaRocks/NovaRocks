@@ -46,10 +46,13 @@ pub(crate) fn derive_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        // TODO: derive CTEConsume stats from the corresponding CTEProduce group
+        // once we add a cte_id -> group_id mapping to Memo.
         Operator::LogicalCTEConsume(_) => Statistics {
             output_row_count: 1000.0,
             column_statistics: HashMap::new(),
         },
+        Operator::LogicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
         // -- Unary operators (single child) --
         Operator::LogicalFilter(filter) => {
@@ -441,10 +444,13 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalCTEProduce(_) => child_statistics(memo, &expr.children, 0),
 
+        // TODO: derive from corresponding CTEProduce group (see logical arm above).
         Operator::PhysicalCTEConsume(_) => Statistics {
             output_row_count: 1000.0,
             column_statistics: HashMap::new(),
         },
+
+        Operator::PhysicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
         Operator::PhysicalRepeat(repeat) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
@@ -571,11 +577,7 @@ pub(crate) fn derive_group_statistics(
 ///
 /// Reads `logical_props` from the child group. If not yet derived (should
 /// not happen when groups are processed in order), returns a default.
-fn child_statistics(
-    memo: &Memo,
-    children: &[super::memo::GroupId],
-    index: usize,
-) -> Statistics {
+fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize) -> Statistics {
     let group_id = children[index];
     let group = &memo.groups[group_id];
     if let Some(ref props) = group.logical_props {
@@ -743,15 +745,9 @@ fn derive_join(
 }
 
 /// Derive output columns for a group from its first expression.
-fn derive_output_columns(
-    memo: &Memo,
-    group_idx: usize,
-) -> Vec<crate::sql::ir::OutputColumn> {
+fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::OutputColumn> {
     let group = &memo.groups[group_idx];
-    let expr = group
-        .logical_exprs
-        .first()
-        .or(group.physical_exprs.first());
+    let expr = group.logical_exprs.first().or(group.physical_exprs.first());
 
     let Some(expr) = expr else {
         return vec![];
@@ -772,6 +768,7 @@ fn derive_output_columns(
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
         Operator::LogicalSubqueryAlias(s) => s.output_columns.clone(),
+        Operator::LogicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::LogicalCTEProduce(c) => c.output_columns.clone(),
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
         Operator::LogicalGenerateSeries(g) => {
@@ -837,6 +834,7 @@ fn derive_output_columns(
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
         Operator::PhysicalSubqueryAlias(s) => s.output_columns.clone(),
+        Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::PhysicalCTEProduce(c) => c.output_columns.clone(),
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
         Operator::PhysicalGenerateSeries(g) => {
@@ -915,10 +913,8 @@ fn get_join_key_ndv(
             op: BinOp::Eq | BinOp::EqForNull,
             right,
         } => {
-            let left_ndv =
-                get_expr_ndv(left, left_stats).max(get_expr_ndv(left, right_stats));
-            let right_ndv =
-                get_expr_ndv(right, left_stats).max(get_expr_ndv(right, right_stats));
+            let left_ndv = get_expr_ndv(left, left_stats).max(get_expr_ndv(left, right_stats));
+            let right_ndv = get_expr_ndv(right, left_stats).max(get_expr_ndv(right, right_stats));
             left_ndv.max(right_ndv).max(1.0)
         }
         ExprKind::BinaryOp {
@@ -942,6 +938,18 @@ fn extract_column_name(expr: &TypedExpr) -> Option<&str> {
         ExprKind::Nested(inner) => extract_column_name(inner),
         _ => None,
     }
+}
+
+fn child_output_columns(
+    memo: &Memo,
+    children: &[usize],
+    child_idx: usize,
+) -> Vec<crate::sql::ir::OutputColumn> {
+    children
+        .get(child_idx)
+        .and_then(|&child_id| memo.groups[child_id].logical_props.as_ref())
+        .map(|props| props.output_columns.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,10 +1111,8 @@ mod tests {
 
     #[test]
     fn join_group_stats() {
-        let (ln, lt) =
-            make_table_stats("lineitem", 6_000_000, &[("l_orderkey", 1_500_000.0)]);
-        let (on, ot) =
-            make_table_stats("orders", 1_500_000, &[("o_orderkey", 1_500_000.0)]);
+        let (ln, lt) = make_table_stats("lineitem", 6_000_000, &[("l_orderkey", 1_500_000.0)]);
+        let (on, ot) = make_table_stats("orders", 1_500_000, &[("o_orderkey", 1_500_000.0)]);
         let mut table_stats = HashMap::new();
         table_stats.insert(ln, lt);
         table_stats.insert(on, ot);

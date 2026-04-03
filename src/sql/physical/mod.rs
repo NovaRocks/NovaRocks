@@ -57,7 +57,8 @@ pub(crate) struct FragmentBuildResult {
     pub output_columns: Vec<OutputColumn>,
     /// CTE ID if this is a multicast fragment.
     pub cte_id: Option<CteId>,
-    /// Exchange node IDs that consume from CTE fragments: (cte_id, exchange_node_id).
+    /// Exchange node IDs in this fragment that consume from CTE fragments:
+    /// `(cte_id, exchange_node_id)`.
     pub cte_exchange_nodes: Vec<(CteId, i32)>,
 }
 

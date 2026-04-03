@@ -1,12 +1,16 @@
 //! CTE (Common Table Expression) metadata types.
+//!
+//! The registry stores all non-recursive CTE definitions analyzed for the
+//! current query. Lexical visibility is tracked separately by the analyzer.
 
 use crate::sql::ir::{OutputColumn, ResolvedQuery};
 
 /// Unique identifier for a CTE within a query.
 pub(crate) type CteId = u32;
 
-/// Registry of shared CTEs produced by the analyzer.
-/// Only contains CTEs with ref_count >= 2 (worth sharing).
+/// Accumulated registry of all non-recursive CTEs produced by the analyzer.
+/// The planner turns these definitions into `CTEProduce` / `CTEAnchor`
+/// structure; Cascades decides later whether to inline or reuse them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CTERegistry {
     pub entries: Vec<CTEEntry>,
@@ -18,7 +22,7 @@ impl CTERegistry {
         Self::default()
     }
 
-    /// Register a shared CTE and return its ID.
+    /// Register a CTE and return its ID.
     pub fn register(
         &mut self,
         name: String,
@@ -41,7 +45,7 @@ impl CTERegistry {
     }
 }
 
-/// A single shared CTE definition.
+/// A single analyzed CTE definition in the current query scope.
 #[derive(Clone, Debug)]
 pub(crate) struct CTEEntry {
     pub id: CteId,

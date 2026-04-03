@@ -410,9 +410,9 @@ impl<'a> AnalyzerContext<'a> {
             catalog: self.catalog,
             current_database: self.current_database,
             ctes: self.ctes.clone(),
+            pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
-            shared_cte_ids: self.shared_cte_ids.clone(),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
 
@@ -425,6 +425,10 @@ impl<'a> AnalyzerContext<'a> {
             .borrow_mut()
             .drain(..)
             .collect();
+
+        self.cte_registry
+            .borrow_mut()
+            .clone_from(&child_ctx.cte_registry.borrow());
         if !nested_sqs.is_empty() {
             let resolved = self.rewrite_nested_subqueries(result.0, nested_sqs, outer_scope)?;
             return Ok((resolved, result.1));
@@ -440,35 +444,16 @@ impl<'a> AnalyzerContext<'a> {
         query: &sqlparser::ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
-        let child_ctx;
-        let ctx = if let Some(ref with_clause) = query.with {
-            let mut ctes = self.ctes.clone();
-            for cte in &with_clause.cte_tables {
-                let name = cte.alias.name.value.to_lowercase();
-                let col_aliases: Vec<String> = cte
-                    .alias
-                    .columns
-                    .iter()
-                    .map(|c| c.name.value.to_lowercase())
-                    .collect();
-                ctes.insert(name, (*cte.query.clone(), col_aliases));
-            }
-            child_ctx = AnalyzerContext {
-                catalog: self.catalog,
-                current_database: self.current_database,
-                ctes,
-                next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-                collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                shared_cte_ids: self.shared_cte_ids.clone(),
-                cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
-            };
-            &child_ctx
+        let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
+            let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
+            (Some(child_ctx), local_cte_ids)
         } else {
-            self
+            (None, Vec::new())
         };
+        let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
         let body = query.body.as_ref();
-        match body {
+        let result = match body {
             sqlparser::ast::SetExpr::Select(s) => {
                 let (sel, cols, inner_scope) =
                     ctx.analyze_select_with_outer_scope(s, outer_scope)?;
@@ -485,15 +470,37 @@ impl<'a> AnalyzerContext<'a> {
                         limit,
                         offset,
                         output_columns: cols,
+                        local_cte_ids,
                     },
                     inner_scope,
                 ))
             }
             _ => {
-                let resolved = ctx.analyze_query(query)?;
-                Ok((resolved, AnalyzerScope::new()))
+                let (body, cols) = ctx.analyze_set_expr(body)?;
+                let order_by = ctx.analyze_order_by(query, &cols, &body)?;
+                let limit = super::helpers::extract_limit(query)?;
+                let offset = super::helpers::extract_offset(query)?;
+
+                Ok((
+                    ResolvedQuery {
+                        body,
+                        order_by,
+                        limit,
+                        offset,
+                        output_columns: cols,
+                        local_cte_ids,
+                    },
+                    AnalyzerScope::new(),
+                ))
             }
+        };
+
+        if let Some(child_ctx) = maybe_child_ctx {
+            self.next_subquery_id.set(child_ctx.next_subquery_id.get());
+            *self.cte_registry.borrow_mut() = child_ctx.cte_registry.borrow().clone();
         }
+
+        result
     }
 
     /// Analyze a SELECT that can reference outer scope columns for correlation.

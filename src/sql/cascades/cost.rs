@@ -42,6 +42,7 @@ pub(crate) fn compute_cost(
         | Operator::LogicalGenerateSeries(_)
         | Operator::LogicalSubqueryAlias(_)
         | Operator::LogicalRepeat(_)
+        | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_) => 0.0,
 
@@ -50,26 +51,16 @@ pub(crate) fn compute_cost(
         // ------------------------------------------------------------------
         Operator::PhysicalScan(_) => own_stats.compute_size(),
 
-        Operator::PhysicalFilter(_) => {
-            own_stats.output_row_count * own_stats.avg_row_size() * 0.01
-        }
+        Operator::PhysicalFilter(_) => own_stats.output_row_count * own_stats.avg_row_size() * 0.01,
 
         Operator::PhysicalProject(_) => own_stats.output_row_count * 0.01,
 
         Operator::PhysicalHashJoin(j) => {
-            let probe_size = child_stats
-                .first()
-                .map(|s| s.compute_size())
-                .unwrap_or(0.0);
-            let build_size = child_stats
-                .get(1)
-                .map(|s| s.compute_size())
-                .unwrap_or(0.0);
+            let probe_size = child_stats.first().map(|s| s.compute_size()).unwrap_or(0.0);
+            let build_size = child_stats.get(1).map(|s| s.compute_size()).unwrap_or(0.0);
 
             match j.distribution {
-                JoinDistribution::Shuffle => {
-                    (build_size + probe_size) * NETWORK_COST + probe_size
-                }
+                JoinDistribution::Shuffle => (build_size + probe_size) * NETWORK_COST + probe_size,
                 JoinDistribution::Broadcast => build_size * NETWORK_COST + probe_size,
                 JoinDistribution::Colocate => probe_size,
             }
@@ -89,10 +80,7 @@ pub(crate) fn compute_cost(
         }
 
         Operator::PhysicalHashAggregate(a) => {
-            let input_size = child_stats
-                .first()
-                .map(|s| s.compute_size())
-                .unwrap_or(0.0);
+            let input_size = child_stats.first().map(|s| s.compute_size()).unwrap_or(0.0);
             match a.mode {
                 AggMode::Single => input_size,
                 AggMode::Local => input_size * 0.5,
@@ -108,6 +96,8 @@ pub(crate) fn compute_cost(
         Operator::PhysicalDistribution(_) => own_stats.compute_size() * NETWORK_COST,
 
         Operator::PhysicalLimit(_) => 0.01,
+
+        Operator::PhysicalCTEAnchor(_) => 0.0,
 
         // Window, Repeat, Union, Intersect, Except, Values, GenerateSeries,
         // SubqueryAlias, CTE — lightweight default.

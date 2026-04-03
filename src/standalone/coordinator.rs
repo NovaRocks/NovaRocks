@@ -81,6 +81,24 @@ impl ExecutionCoordinator {
             .get(&root_fragment_id)
             .ok_or_else(|| "root fragment not found in instance map".to_string())?;
 
+        // Aggregate all fragment-local CTE consumer exchange nodes before
+        // moving fragments into root/CTE buckets.
+        let mut cte_consumers: BTreeMap<CteId, Vec<(FragmentId, i32)>> = BTreeMap::new();
+        let mut per_fragment_exch_num_senders: BTreeMap<FragmentId, BTreeMap<i32, i32>> =
+            BTreeMap::new();
+        for fr in &fragment_results {
+            for (cte_id, exchange_node_id) in &fr.cte_exchange_nodes {
+                cte_consumers
+                    .entry(*cte_id)
+                    .or_default()
+                    .push((fr.fragment_id, *exchange_node_id));
+                per_fragment_exch_num_senders
+                    .entry(fr.fragment_id)
+                    .or_default()
+                    .insert(*exchange_node_id, 1);
+            }
+        }
+
         // Separate root and CTE fragments
         let mut root_fragment: Option<FragmentBuildResult> = None;
         let mut cte_fragments: Vec<FragmentBuildResult> = Vec::new();
@@ -98,19 +116,14 @@ impl ExecutionCoordinator {
         // 2. Wire multicast sinks for CTE fragments
         // ---------------------------------------------------------------
         // For each CTE produce fragment, build TMultiCastDataStreamSink with
-        // one TDataStreamSink per consumer exchange node in the root fragment.
+        // one TDataStreamSink per consumer exchange node across all fragments.
         let brpc_addr = types::TNetworkAddress::new(exchange_host, exchange_port as i32);
 
-        // Build a map: cte_id -> Vec<exchange_node_id> from the root fragment's metadata
-        let mut cte_consumers: BTreeMap<CteId, Vec<i32>> = BTreeMap::new();
-        for (cte_id, exchange_node_id) in &root_fragment.cte_exchange_nodes {
-            cte_consumers
-                .entry(*cte_id)
-                .or_default()
-                .push(*exchange_node_id);
-        }
-
-        let mut cte_thrift_fragments: Vec<(FragmentBuildResult, planner::TPlanFragment, crate::internal_service::TPlanFragmentExecParams)> = Vec::new();
+        let mut cte_thrift_fragments: Vec<(
+            FragmentBuildResult,
+            planner::TPlanFragment,
+            crate::internal_service::TPlanFragmentExecParams,
+        )> = Vec::new();
 
         for cte_fr in cte_fragments {
             let cte_id = cte_fr
@@ -120,9 +133,7 @@ impl ExecutionCoordinator {
             let consumer_exchange_nodes = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
 
             if consumer_exchange_nodes.is_empty() {
-                return Err(format!(
-                    "CTE fragment (cte_id={cte_id}) has no consumers in root fragment"
-                ));
+                return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
             }
 
             // Build one TDataStreamSink + destinations per consumer
@@ -135,30 +146,38 @@ impl ExecutionCoordinator {
 
             let mut sinks = Vec::new();
             let mut destinations = Vec::new();
-            for &exchange_node_id in &consumer_exchange_nodes {
+            for (consumer_fragment_id, exchange_node_id) in &consumer_exchange_nodes {
                 let stream_sink = data_sinks::TDataStreamSink::new(
-                    exchange_node_id,
+                    *exchange_node_id,
                     unpartitioned.clone(),
-                    None::<bool>,  // ignore_not_found
-                    None::<bool>,  // is_merge
-                    None::<i32>,   // dest_dop
+                    None::<bool>,     // ignore_not_found
+                    None::<bool>,     // is_merge
+                    None::<i32>,      // dest_dop
                     None::<Vec<i32>>, // output_columns
-                    None::<i64>,   // limit
+                    None::<i64>,      // limit
                 );
                 sinks.push(stream_sink);
 
-                // Each sink has one destination: the root fragment instance
+                let consumer_instance_id = *instance_map
+                    .get(consumer_fragment_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "consumer fragment instance ID not found for fragment_id={consumer_fragment_id}"
+                        )
+                    })?;
+
+                // Each sink has one destination: the owning fragment instance
+                // for the exchange node that consumes this CTE output.
                 let dest = data_sinks::TPlanFragmentDestination::new(
-                    types::TUniqueId::new(root_instance_id.0, root_instance_id.1),
+                    types::TUniqueId::new(consumer_instance_id.0, consumer_instance_id.1),
                     None::<types::TNetworkAddress>, // deprecated_server
-                    Some(brpc_addr.clone()),         // brpc_server
-                    None::<i32>,                     // pipeline_driver_sequence
+                    Some(brpc_addr.clone()),        // brpc_server
+                    None::<i32>,                    // pipeline_driver_sequence
                 );
                 destinations.push(vec![dest]);
             }
 
-            let multi_cast_sink =
-                data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
+            let multi_cast_sink = data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
 
             let output_sink = data_sinks::TDataSink::new(
                 data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
@@ -208,6 +227,10 @@ impl ExecutionCoordinator {
             cte_exec_params.query_id = types::TUniqueId::new(query_id_hi, query_id_lo);
             cte_exec_params.fragment_instance_id =
                 types::TUniqueId::new(cte_instance_id.0, cte_instance_id.1);
+            cte_exec_params.per_exch_num_senders = per_fragment_exch_num_senders
+                .get(&cte_fr.fragment_id)
+                .cloned()
+                .unwrap_or_default();
 
             cte_thrift_fragments.push((cte_fr, thrift_fragment, cte_exec_params));
         }
@@ -215,12 +238,10 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // 3. Compute per_exch_num_senders for the root fragment
         // ---------------------------------------------------------------
-        // Each exchange node in the root fragment receives from 1 sender
-        // (the corresponding CTE fragment has exactly 1 instance).
-        let mut per_exch_num_senders: BTreeMap<i32, i32> = BTreeMap::new();
-        for (_cte_id, exchange_node_id) in &root_fragment.cte_exchange_nodes {
-            per_exch_num_senders.insert(*exchange_node_id, 1);
-        }
+        let per_exch_num_senders = per_fragment_exch_num_senders
+            .get(&root_fragment.fragment_id)
+            .cloned()
+            .unwrap_or_default();
 
         // ---------------------------------------------------------------
         // 4. Spawn CTE fragments in background threads

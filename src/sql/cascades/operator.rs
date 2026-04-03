@@ -124,6 +124,11 @@ pub(crate) struct LogicalRepeatOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct LogicalCTEAnchorOp {
+    pub cte_id: CteId,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LogicalCTEProduceOp {
     pub cte_id: CteId,
     pub output_columns: Vec<OutputColumn>,
@@ -206,6 +211,11 @@ pub(crate) struct PhysicalDistributionOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PhysicalCTEAnchorOp {
+    pub cte_id: CteId,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PhysicalCTEProduceOp {
     pub cte_id: CteId,
     pub output_columns: Vec<OutputColumn>,
@@ -280,6 +290,7 @@ pub(crate) enum Operator {
     LogicalGenerateSeries(LogicalGenerateSeriesOp),
     LogicalSubqueryAlias(LogicalSubqueryAliasOp),
     LogicalRepeat(LogicalRepeatOp),
+    LogicalCTEAnchor(LogicalCTEAnchorOp),
     LogicalCTEProduce(LogicalCTEProduceOp),
     LogicalCTEConsume(LogicalCTEConsumeOp),
 
@@ -294,6 +305,7 @@ pub(crate) enum Operator {
     PhysicalLimit(PhysicalLimitOp),
     PhysicalWindow(PhysicalWindowOp),
     PhysicalDistribution(PhysicalDistributionOp),
+    PhysicalCTEAnchor(PhysicalCTEAnchorOp),
     PhysicalCTEProduce(PhysicalCTEProduceOp),
     PhysicalCTEConsume(PhysicalCTEConsumeOp),
     PhysicalRepeat(PhysicalRepeatOp),
@@ -324,6 +336,7 @@ impl Operator {
                 | Operator::LogicalGenerateSeries(_)
                 | Operator::LogicalSubqueryAlias(_)
                 | Operator::LogicalRepeat(_)
+                | Operator::LogicalCTEAnchor(_)
                 | Operator::LogicalCTEProduce(_)
                 | Operator::LogicalCTEConsume(_)
         )

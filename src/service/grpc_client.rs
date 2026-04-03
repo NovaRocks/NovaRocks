@@ -111,10 +111,9 @@ pub fn send_chunks(
 
     data_block_on(async move {
         let ch = get_channel(&host, port).await?;
-        let mut cli =
-            proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
-                .max_encoding_message_size(64 * 1024 * 1024)
-                .max_decoding_message_size(64 * 1024 * 1024);
+        let mut cli = proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
+            .max_encoding_message_size(64 * 1024 * 1024)
+            .max_decoding_message_size(64 * 1024 * 1024);
 
         let stream = tokio_stream::once(req);
         let resp = cli

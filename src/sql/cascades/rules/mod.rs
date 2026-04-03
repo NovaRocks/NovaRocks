@@ -18,6 +18,7 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::SortToPhysical),
         Box::new(implement::LimitToPhysical),
         Box::new(implement::WindowToPhysical),
+        Box::new(implement::CTEAnchorToPhysical),
         Box::new(implement::CTEProduceToPhysical),
         Box::new(implement::CTEConsumeToPhysical),
         Box::new(implement::RepeatToPhysical),
