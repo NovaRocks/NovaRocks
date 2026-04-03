@@ -18,6 +18,8 @@ pub(crate) struct ResolvedQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub output_columns: Vec<OutputColumn>,
+    /// CTE ids declared by this query block's WITH clause, in declaration order.
+    pub local_cte_ids: Vec<crate::sql::cte::CteId>,
 }
 
 #[derive(Clone, Debug)]

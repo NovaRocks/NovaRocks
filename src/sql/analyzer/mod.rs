@@ -83,7 +83,7 @@ impl<'a> AnalyzerContext<'a> {
     fn build_with_clause_context(
         &self,
         with_clause: &sqlast::With,
-    ) -> Result<AnalyzerContext<'a>, String> {
+    ) -> Result<(AnalyzerContext<'a>, Vec<crate::sql::cte::CteId>), String> {
         let mut pending_ctes = self.pending_ctes.clone();
         pending_ctes.extend(
             with_clause
@@ -101,6 +101,7 @@ impl<'a> AnalyzerContext<'a> {
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
+        let mut local_cte_ids = Vec::with_capacity(with_clause.cte_tables.len());
 
         for cte in &with_clause.cte_tables {
             let name = cte.alias.name.value.to_lowercase();
@@ -124,23 +125,26 @@ impl<'a> AnalyzerContext<'a> {
             }
 
             let output_columns = resolved_cte.output_columns.clone();
-            let cte_id = child_ctx
-                .cte_registry
-                .borrow_mut()
-                .register(name.clone(), resolved_cte, output_columns);
+            let cte_id = child_ctx.cte_registry.borrow_mut().register(
+                name.clone(),
+                resolved_cte,
+                output_columns,
+            );
 
             child_ctx.ctes.insert(name, cte_id);
+            local_cte_ids.push(cte_id);
         }
 
-        Ok(child_ctx)
+        Ok((child_ctx, local_cte_ids))
     }
 
     /// Top-level query analysis.
     fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
-        let maybe_child_ctx = if let Some(ref with_clause) = query.with {
-            Some(self.build_with_clause_context(with_clause)?)
+        let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
+            let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
+            (Some(child_ctx), local_cte_ids)
         } else {
-            None
+            (None, Vec::new())
         };
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
@@ -167,6 +171,7 @@ impl<'a> AnalyzerContext<'a> {
             limit,
             offset,
             output_columns,
+            local_cte_ids,
         })
     }
 
@@ -689,32 +694,27 @@ impl<'a> AnalyzerContext<'a> {
         let mut grouping_fn_args: Vec<(String, Vec<String>)> = Vec::new();
         let mut next_marker: i64 = -9000;
 
-        let replace_grouping_with_marker =
-            |expr: &sqlast::Expr,
-             args: &mut Vec<(String, Vec<String>)>,
-             marker: &mut i64|
-             -> sqlast::Expr { replace_grouping_calls_with_markers(expr, args, marker) };
+        let replace_grouping_with_marker = |expr: &sqlast::Expr,
+                                            args: &mut Vec<(String, Vec<String>)>,
+                                            marker: &mut i64|
+         -> sqlast::Expr {
+            replace_grouping_calls_with_markers(expr, args, marker)
+        };
 
         let mut modified_projection = Vec::new();
         for item in &select.projection {
             match item {
                 sqlast::SelectItem::ExprWithAlias { expr, alias } => {
-                    let rewritten = replace_grouping_with_marker(
-                        expr,
-                        &mut grouping_fn_args,
-                        &mut next_marker,
-                    );
+                    let rewritten =
+                        replace_grouping_with_marker(expr, &mut grouping_fn_args, &mut next_marker);
                     modified_projection.push(sqlast::SelectItem::ExprWithAlias {
                         expr: rewritten,
                         alias: alias.clone(),
                     });
                 }
                 sqlast::SelectItem::UnnamedExpr(expr) => {
-                    let rewritten = replace_grouping_with_marker(
-                        expr,
-                        &mut grouping_fn_args,
-                        &mut next_marker,
-                    );
+                    let rewritten =
+                        replace_grouping_with_marker(expr, &mut grouping_fn_args, &mut next_marker);
                     modified_projection.push(sqlast::SelectItem::UnnamedExpr(rewritten));
                 }
                 other => modified_projection.push(other.clone()),
@@ -1259,9 +1259,7 @@ fn replace_grouping_with_zero(expr: &sqlast::Expr) -> sqlast::Expr {
         sqlast::Expr::Function(func) => {
             let name = func.name.to_string().to_lowercase();
             if name == "grouping" {
-                return sqlast::Expr::Value(
-                    sqlast::Value::Number("0".to_string(), false).into(),
-                );
+                return sqlast::Expr::Value(sqlast::Value::Number("0".to_string(), false).into());
             }
             // Not a GROUPING() call — recurse into arguments
             let new_args = match &func.args {
@@ -1417,18 +1415,30 @@ fn replace_grouping_calls_with_markers(
             let mut new_func = func.clone();
             new_func.args = new_args;
             if let Some(ref window) = func.over {
-                new_func.over = Some(replace_grouping_markers_in_window(window, args, next_marker));
+                new_func.over = Some(replace_grouping_markers_in_window(
+                    window,
+                    args,
+                    next_marker,
+                ));
             }
             sqlast::Expr::Function(new_func)
         }
         sqlast::Expr::BinaryOp { left, op, right } => sqlast::Expr::BinaryOp {
             left: Box::new(replace_grouping_calls_with_markers(left, args, next_marker)),
             op: op.clone(),
-            right: Box::new(replace_grouping_calls_with_markers(right, args, next_marker)),
+            right: Box::new(replace_grouping_calls_with_markers(
+                right,
+                args,
+                next_marker,
+            )),
         },
         sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
             op: op.clone(),
-            expr: Box::new(replace_grouping_calls_with_markers(inner, args, next_marker)),
+            expr: Box::new(replace_grouping_calls_with_markers(
+                inner,
+                args,
+                next_marker,
+            )),
         },
         sqlast::Expr::Nested(inner) => sqlast::Expr::Nested(Box::new(
             replace_grouping_calls_with_markers(inner, args, next_marker),
@@ -1448,7 +1458,11 @@ fn replace_grouping_calls_with_markers(
             conditions: conditions
                 .iter()
                 .map(|cw| sqlast::CaseWhen {
-                    condition: replace_grouping_calls_with_markers(&cw.condition, args, next_marker),
+                    condition: replace_grouping_calls_with_markers(
+                        &cw.condition,
+                        args,
+                        next_marker,
+                    ),
                     result: replace_grouping_calls_with_markers(&cw.result, args, next_marker),
                 })
                 .collect(),
@@ -1515,7 +1529,10 @@ fn replace_grouping_markers_in_typed_expr(
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
             kind: ExprKind::BinaryOp {
-                left: Box::new(replace_grouping_markers_in_typed_expr(left, grouping_fn_args)),
+                left: Box::new(replace_grouping_markers_in_typed_expr(
+                    left,
+                    grouping_fn_args,
+                )),
                 op: *op,
                 right: Box::new(replace_grouping_markers_in_typed_expr(
                     right,
@@ -1528,14 +1545,23 @@ fn replace_grouping_markers_in_typed_expr(
             nullable: expr.nullable,
             kind: ExprKind::UnaryOp {
                 op: *op,
-                expr: Box::new(replace_grouping_markers_in_typed_expr(inner, grouping_fn_args)),
+                expr: Box::new(replace_grouping_markers_in_typed_expr(
+                    inner,
+                    grouping_fn_args,
+                )),
             },
         },
-        ExprKind::Cast { expr: inner, target } => TypedExpr {
+        ExprKind::Cast {
+            expr: inner,
+            target,
+        } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
             kind: ExprKind::Cast {
-                expr: Box::new(replace_grouping_markers_in_typed_expr(inner, grouping_fn_args)),
+                expr: Box::new(replace_grouping_markers_in_typed_expr(
+                    inner,
+                    grouping_fn_args,
+                )),
                 target: target.clone(),
             },
         },
@@ -1789,9 +1815,11 @@ mod tests {
         sql: &str,
     ) -> Result<(ResolvedQuery, crate::sql::cte::CTERegistry), String> {
         let dialect = crate::sql::parser::dialect::StarRocksDialect;
-        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
-            .map_err(|e| e.to_string())?;
-        let stmt = ast.pop().ok_or_else(|| "expected a statement".to_string())?;
+        let mut ast =
+            sqlparser::parser::Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
+        let stmt = ast
+            .pop()
+            .ok_or_else(|| "expected a statement".to_string())?;
         let query = match stmt {
             sqlparser::ast::Statement::Query(q) => q,
             _ => return Err("expected a query".into()),

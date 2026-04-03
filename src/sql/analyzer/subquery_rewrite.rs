@@ -426,7 +426,9 @@ impl<'a> AnalyzerContext<'a> {
             .drain(..)
             .collect();
 
-        self.cte_registry.borrow_mut().clone_from(&child_ctx.cte_registry.borrow());
+        self.cte_registry
+            .borrow_mut()
+            .clone_from(&child_ctx.cte_registry.borrow());
         if !nested_sqs.is_empty() {
             let resolved = self.rewrite_nested_subqueries(result.0, nested_sqs, outer_scope)?;
             return Ok((resolved, result.1));
@@ -442,10 +444,11 @@ impl<'a> AnalyzerContext<'a> {
         query: &sqlparser::ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
-        let maybe_child_ctx = if let Some(ref with_clause) = query.with {
-            Some(self.build_with_clause_context(with_clause)?)
+        let (maybe_child_ctx, local_cte_ids) = if let Some(ref with_clause) = query.with {
+            let (child_ctx, local_cte_ids) = self.build_with_clause_context(with_clause)?;
+            (Some(child_ctx), local_cte_ids)
         } else {
-            None
+            (None, Vec::new())
         };
         let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
@@ -467,6 +470,7 @@ impl<'a> AnalyzerContext<'a> {
                         limit,
                         offset,
                         output_columns: cols,
+                        local_cte_ids,
                     },
                     inner_scope,
                 ))
@@ -484,6 +488,7 @@ impl<'a> AnalyzerContext<'a> {
                         limit,
                         offset,
                         output_columns: cols,
+                        local_cte_ids,
                     },
                     AnalyzerScope::new(),
                 ))
@@ -491,8 +496,7 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         if let Some(child_ctx) = maybe_child_ctx {
-            self.next_subquery_id
-                .set(child_ctx.next_subquery_id.get());
+            self.next_subquery_id.set(child_ctx.next_subquery_id.get());
             *self.cte_registry.borrow_mut() = child_ctx.cte_registry.borrow().clone();
         }
 

@@ -18,23 +18,7 @@ pub(crate) fn plan_query(
     resolved: ResolvedQuery,
     cte_registry: CTERegistry,
 ) -> Result<LogicalPlan, String> {
-    let mut root = plan(resolved)?;
-
-    for entry in cte_registry.entries.into_iter().rev() {
-        let produce_input = plan(entry.resolved_query)?;
-        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
-            cte_id: entry.id,
-            input: Box::new(produce_input),
-            output_columns: entry.output_columns,
-        });
-        root = LogicalPlan::CTEAnchor(CTEAnchorNode {
-            cte_id: entry.id,
-            produce: Box::new(produce),
-            consumer: Box::new(root),
-        });
-    }
-
-    Ok(root)
+    plan_scoped_query(resolved, &cte_registry)
 }
 
 pub(crate) fn plan_query_legacy(
@@ -66,20 +50,82 @@ pub(crate) fn plan_query_legacy(
 
 /// Convert a fully-analyzed query into a logical plan tree.
 pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
-    let mut body_plan = plan_body(resolved.body)?;
+    let ResolvedQuery {
+        body,
+        order_by,
+        limit,
+        offset,
+        output_columns,
+        ..
+    } = resolved;
+    let body_plan = plan_body(body)?;
+    Ok(apply_query_modifiers(
+        body_plan,
+        order_by,
+        output_columns,
+        limit,
+        offset,
+    ))
+}
 
+fn plan_scoped_query(
+    resolved: ResolvedQuery,
+    cte_registry: &CTERegistry,
+) -> Result<LogicalPlan, String> {
+    let ResolvedQuery {
+        body,
+        order_by,
+        limit,
+        offset,
+        output_columns,
+        local_cte_ids,
+    } = resolved;
+    let mut root = apply_query_modifiers(
+        plan_body_scoped(body, cte_registry)?,
+        order_by,
+        output_columns,
+        limit,
+        offset,
+    );
+
+    for cte_id in local_cte_ids.into_iter().rev() {
+        let entry = cte_registry
+            .get(cte_id)
+            .ok_or_else(|| format!("missing CTE entry for id {cte_id}"))?;
+        let produce_input = plan_scoped_query(entry.resolved_query.clone(), cte_registry)?;
+        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
+            cte_id: entry.id,
+            input: Box::new(produce_input),
+            output_columns: entry.output_columns.clone(),
+        });
+        root = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: entry.id,
+            produce: Box::new(produce),
+            consumer: Box::new(root),
+        });
+    }
+
+    Ok(root)
+}
+
+fn apply_query_modifiers(
+    mut body_plan: LogicalPlan,
+    order_by: Vec<SortItem>,
+    output_columns: Vec<OutputColumn>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> LogicalPlan {
     // Wrap with Sort if ORDER BY is present.
-    if !resolved.order_by.is_empty() {
+    if !order_by.is_empty() {
         // If ORDER BY references columns not in the projection, we need to
         // extend the project to include them (hidden columns) so the sort can
         // reference them.  After sort, a top-level project strips them.
-        let needs_hidden =
-            has_non_projected_sort_columns(&resolved.order_by, &resolved.output_columns);
+        let needs_hidden = has_non_projected_sort_columns(&order_by, &output_columns);
         if needs_hidden {
             // Collect extra columns needed by ORDER BY
             let mut extra_items = Vec::new();
-            for sort_item in &resolved.order_by {
-                collect_extra_columns(&sort_item.expr, &resolved.output_columns, &mut extra_items);
+            for sort_item in &order_by {
+                collect_extra_columns(&sort_item.expr, &output_columns, &mut extra_items);
             }
 
             // Extend the project node at the top of body_plan
@@ -92,12 +138,11 @@ pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
             // Sort with extended scope
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
-                items: resolved.order_by,
+                items: order_by,
             });
 
             // Strip extra columns with a final project
-            let final_items: Vec<ProjectItem> = resolved
-                .output_columns
+            let final_items: Vec<ProjectItem> = output_columns
                 .iter()
                 .map(|col| ProjectItem {
                     expr: TypedExpr {
@@ -118,21 +163,21 @@ pub(crate) fn plan(resolved: ResolvedQuery) -> Result<LogicalPlan, String> {
         } else {
             body_plan = LogicalPlan::Sort(SortNode {
                 input: Box::new(body_plan),
-                items: resolved.order_by,
+                items: order_by,
             });
         }
     }
 
     // Wrap with Limit if LIMIT/OFFSET is present.
-    if resolved.limit.is_some() || resolved.offset.is_some() {
+    if limit.is_some() || offset.is_some() {
         body_plan = LogicalPlan::Limit(LimitNode {
             input: Box::new(body_plan),
-            limit: resolved.limit,
-            offset: resolved.offset,
+            limit,
+            offset,
         });
     }
 
-    Ok(body_plan)
+    body_plan
 }
 
 /// Check if any ORDER BY expression references columns not in the output.
@@ -230,6 +275,14 @@ fn plan_body(body: QueryBody) -> Result<LogicalPlan, String> {
     }
 }
 
+fn plan_body_scoped(body: QueryBody, cte_registry: &CTERegistry) -> Result<LogicalPlan, String> {
+    match body {
+        QueryBody::Select(select) => plan_select_scoped(select, cte_registry),
+        QueryBody::SetOperation(set_op) => plan_set_operation_scoped(set_op, cte_registry),
+        QueryBody::Values(values) => plan_values(values),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SELECT planning
 // ---------------------------------------------------------------------------
@@ -304,6 +357,70 @@ fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
         current = build_window_and_project(current, project_items, &select.projection)?;
     } else {
         // 4. No aggregation → check for window functions, then Project
+        current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
+    }
+
+    Ok(current)
+}
+
+fn plan_select_scoped(
+    mut select: ResolvedSelect,
+    cte_registry: &CTERegistry,
+) -> Result<LogicalPlan, String> {
+    let mut current = match select.from {
+        Some(relation) => plan_relation_scoped(relation, cte_registry)?,
+        None => LogicalPlan::Values(ValuesNode {
+            rows: vec![vec![]],
+            columns: vec![],
+        }),
+    };
+
+    if let Some(predicate) = select.filter {
+        current = LogicalPlan::Filter(FilterNode {
+            input: Box::new(current),
+            predicate,
+        });
+    }
+
+    if let Some(repeat_info) = select.repeat.take() {
+        current = LogicalPlan::Repeat(RepeatPlanNode {
+            input: Box::new(current),
+            repeat_column_ref_list: repeat_info.repeat_column_ref_list,
+            grouping_ids: repeat_info.grouping_ids,
+            all_rollup_columns: repeat_info.all_rollup_columns,
+            grouping_fn_args: repeat_info.grouping_fn_args,
+        });
+    }
+
+    if select.has_aggregation || !select.group_by.is_empty() {
+        if let Some(ref having_expr) = select.having {
+            let mut extra_gb = Vec::new();
+            collect_non_agg_column_refs(having_expr, &select.group_by, &mut extra_gb);
+            for col in extra_gb {
+                select.group_by.push(col);
+            }
+        }
+
+        let (project_items, agg_calls, output_columns) = split_projection_for_aggregate(
+            &select.projection,
+            &select.group_by,
+            select.having.as_ref(),
+        );
+        current = LogicalPlan::Aggregate(AggregateNode {
+            input: Box::new(current),
+            group_by: select.group_by,
+            aggregates: agg_calls,
+            output_columns,
+        });
+        if let Some(having) = select.having {
+            current = LogicalPlan::Filter(FilterNode {
+                input: Box::new(current),
+                predicate: having,
+            });
+        }
+
+        current = build_window_and_project(current, project_items, &select.projection)?;
+    } else {
         current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
     }
 
@@ -767,6 +884,69 @@ fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
     }
 }
 
+fn plan_relation_scoped(
+    relation: Relation,
+    cte_registry: &CTERegistry,
+) -> Result<LogicalPlan, String> {
+    match relation {
+        Relation::Scan(scan) => {
+            let columns = scan
+                .table
+                .columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect();
+            Ok(LogicalPlan::Scan(ScanNode {
+                database: scan.database,
+                table: scan.table,
+                alias: scan.alias,
+                columns,
+                predicates: vec![],
+                required_columns: None,
+            }))
+        }
+        Relation::Subquery { query, alias } => {
+            let output_columns = query.output_columns.clone();
+            let inner_plan = plan_scoped_query(*query, cte_registry)?;
+            Ok(LogicalPlan::SubqueryAlias(SubqueryAliasNode {
+                input: Box::new(inner_plan),
+                alias,
+                output_columns,
+            }))
+        }
+        Relation::Join(join_rel) => {
+            let left = plan_relation_scoped(join_rel.left, cte_registry)?;
+            let right = plan_relation_scoped(join_rel.right, cte_registry)?;
+            Ok(LogicalPlan::Join(JoinNode {
+                left: Box::new(left),
+                right: Box::new(right),
+                join_type: join_rel.join_type,
+                condition: join_rel.condition,
+            }))
+        }
+        Relation::GenerateSeries(gs) => Ok(LogicalPlan::GenerateSeries(GenerateSeriesNode {
+            start: gs.start,
+            end: gs.end,
+            step: gs.step,
+            column_name: gs.column_name,
+            alias: gs.alias,
+        })),
+        Relation::CTEConsume {
+            cte_id,
+            alias,
+            output_columns,
+        } => Ok(LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id,
+            alias,
+            output_columns,
+        })),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Set operation planning
 // ---------------------------------------------------------------------------
@@ -774,6 +954,27 @@ fn plan_relation(relation: Relation) -> Result<LogicalPlan, String> {
 fn plan_set_operation(set_op: ResolvedSetOp) -> Result<LogicalPlan, String> {
     let left = plan_body(*set_op.left)?;
     let right = plan_body(*set_op.right)?;
+
+    match set_op.kind {
+        SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
+            inputs: vec![left, right],
+            all: set_op.all,
+        })),
+        SetOpKind::Intersect => Ok(LogicalPlan::Intersect(IntersectNode {
+            inputs: vec![left, right],
+        })),
+        SetOpKind::Except => Ok(LogicalPlan::Except(ExceptNode {
+            inputs: vec![left, right],
+        })),
+    }
+}
+
+fn plan_set_operation_scoped(
+    set_op: ResolvedSetOp,
+    cte_registry: &CTERegistry,
+) -> Result<LogicalPlan, String> {
+    let left = plan_body_scoped(*set_op.left, cte_registry)?;
+    let right = plan_body_scoped(*set_op.right, cte_registry)?;
 
     match set_op.kind {
         SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
@@ -859,6 +1060,16 @@ mod tests {
         plan_query(resolved, cte_registry)
     }
 
+    fn find_subquery_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Project(node) => find_subquery_input(&node.input),
+            LogicalPlan::Sort(node) => find_subquery_input(&node.input),
+            LogicalPlan::Limit(node) => find_subquery_input(&node.input),
+            LogicalPlan::SubqueryAlias(node) => Some(&node.input),
+            _ => None,
+        }
+    }
+
     #[test]
     fn test_plan_query_wraps_single_cte_in_anchor() {
         let plan = parse_analyze_and_plan(
@@ -894,5 +1105,84 @@ mod tests {
             },
             other => panic!("expected outer CTEAnchor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_nested_with_in_derived_table_stays_inside_subquery_scope() {
+        let plan = parse_analyze_and_plan(
+            "WITH outer_t AS (SELECT o_orderkey AS ok FROM orders) \
+             SELECT ok FROM (WITH inner_t AS (SELECT o_custkey AS ok FROM orders) \
+                             SELECT ok FROM inner_t) s",
+        )
+        .expect("planner should succeed");
+
+        match plan {
+            LogicalPlan::CTEAnchor(outer_anchor) => {
+                assert_eq!(outer_anchor.cte_id, 0);
+                let subquery_input = find_subquery_input(&outer_anchor.consumer)
+                    .expect("expected derived subquery under outer consumer");
+                match subquery_input {
+                    LogicalPlan::CTEAnchor(inner_anchor) => {
+                        assert_eq!(inner_anchor.cte_id, 1);
+                    }
+                    other => panic!("expected inner CTEAnchor inside subquery, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer CTEAnchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nested_with_in_cte_definition_stays_inside_produce_subtree() {
+        let plan = parse_analyze_and_plan(
+            "WITH outer_cte AS (WITH inner_cte AS (SELECT o_orderkey AS ok FROM orders) \
+                                SELECT ok FROM inner_cte) \
+             SELECT ok FROM outer_cte",
+        )
+        .expect("planner should succeed");
+
+        match plan {
+            LogicalPlan::CTEAnchor(outer_anchor) => {
+                assert_eq!(outer_anchor.cte_id, 1);
+                match *outer_anchor.produce {
+                    LogicalPlan::CTEProduce(outer_produce) => match *outer_produce.input {
+                        LogicalPlan::CTEAnchor(inner_anchor) => {
+                            assert_eq!(inner_anchor.cte_id, 0);
+                        }
+                        other => {
+                            panic!("expected inner CTEAnchor inside produce input, got {other:?}")
+                        }
+                    },
+                    other => panic!("expected outer CTEProduce, got {other:?}"),
+                }
+            }
+            other => panic!("expected outer CTEAnchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_explain_keeps_nested_cte_anchor_inside_subquery() {
+        let plan = parse_analyze_and_plan(
+            "WITH outer_t AS (SELECT o_orderkey AS ok FROM orders) \
+             SELECT ok FROM (WITH inner_t AS (SELECT o_custkey AS ok FROM orders) \
+                             SELECT ok FROM inner_t) s",
+        )
+        .expect("planner should succeed");
+
+        let lines =
+            crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Normal);
+        let subquery_idx = lines
+            .iter()
+            .position(|line| line.contains("SUBQUERY ALIAS [s]"))
+            .expect("expected subquery alias line");
+        let inner_anchor_idx = lines
+            .iter()
+            .position(|line| line.contains("CTE_ANCHOR(cte_id=1)"))
+            .expect("expected nested inner anchor line");
+
+        assert!(
+            inner_anchor_idx > subquery_idx,
+            "nested inner anchor should appear under subquery: {lines:?}"
+        );
     }
 }
