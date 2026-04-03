@@ -2,6 +2,7 @@
 
 pub(crate) mod convert;
 pub(crate) mod cost;
+pub(crate) mod cte_rewrite;
 pub(crate) mod extract;
 pub(crate) mod fragment_builder;
 pub(crate) mod memo;
@@ -21,10 +22,10 @@ pub(crate) use property::{ColumnRef, DistributionSpec, OrderingSpec, PhysicalPro
 
 use std::collections::HashMap;
 
-use memo::MExpr;
-use rule::Rule;
 use crate::sql::plan::LogicalPlan;
 use crate::sql::statistics::TableStatistics;
+use memo::MExpr;
+use rule::Rule;
 
 /// Main entry point for the Cascades optimizer.
 ///
@@ -38,6 +39,8 @@ pub(crate) fn optimize(
 ) -> Result<PhysicalPlanNode, String> {
     // 1. RBO rewrite (predicate pushdown + join reorder + column pruning).
     let rewritten = rewriter::rewrite(plan, table_stats);
+    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten);
+    let rewritten = cte_rewrite::inline_single_use_ctes(rewritten, &cte_ctx);
 
     // 2. Convert to Memo.
     let mut memo = Memo::new();
@@ -86,10 +89,8 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
                         for new_expr in new_exprs {
                             // Dedup: compare operator AND children to avoid
                             // infinite JoinCommutativity A<->B oscillation.
-                            let already_exists = memo.groups[group_id]
-                                .logical_exprs
-                                .iter()
-                                .any(|existing| {
+                            let already_exists =
+                                memo.groups[group_id].logical_exprs.iter().any(|existing| {
                                     existing.children == new_expr.children
                                         && op_equal(&existing.op, &new_expr.op)
                                 });
