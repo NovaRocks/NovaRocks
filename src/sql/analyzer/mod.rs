@@ -2154,6 +2154,19 @@ mod tests {
     }
 
     #[test]
+    fn test_correlated_subquery_with_inner_with_registers_cte() {
+        let sql = "SELECT o_orderkey FROM orders o \
+                   WHERE EXISTS (\
+                     WITH filtered AS (SELECT l_orderkey FROM lineitem) \
+                     SELECT 1 FROM filtered WHERE filtered.l_orderkey = o.o_orderkey\
+                   )";
+        let (_resolved, registry) =
+            parse_and_analyze_with_registry(sql).expect("analysis should succeed");
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.entries[0].name, "filtered");
+    }
+
+    #[test]
     fn test_comma_join_multiple_aliases() {
         // Simplified q3 pattern: comma-join with multiple table aliases
         let sql = "SELECT o.o_orderkey, l.l_partkey \

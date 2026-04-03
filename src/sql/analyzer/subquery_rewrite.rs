@@ -425,6 +425,8 @@ impl<'a> AnalyzerContext<'a> {
             .borrow_mut()
             .drain(..)
             .collect();
+
+        self.cte_registry.borrow_mut().clone_from(&child_ctx.cte_registry.borrow());
         if !nested_sqs.is_empty() {
             let resolved = self.rewrite_nested_subqueries(result.0, nested_sqs, outer_scope)?;
             return Ok((resolved, result.1));
