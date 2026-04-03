@@ -118,13 +118,17 @@ impl<'a> super::AnalyzerContext<'a> {
                 let tbl_lower = tbl.to_lowercase();
 
                 if parts.len() == 1 {
-                    let registry = self.cte_registry.borrow();
-                    if let Some(entry) = registry
-                        .entries
-                        .iter()
-                        .rev()
-                        .find(|entry| entry.name == tbl_lower)
-                    {
+                    if self.pending_ctes.contains(&tbl_lower) {
+                        return Err(format!(
+                            "forward CTE reference is not supported: {tbl_lower}"
+                        ));
+                    }
+
+                    if let Some(&cte_id) = self.ctes.get(&tbl_lower) {
+                        let registry = self.cte_registry.borrow();
+                        let entry = registry
+                            .get(cte_id)
+                            .ok_or_else(|| format!("unknown CTE id: {cte_id}"))?;
                         let alias_name = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
@@ -146,14 +150,6 @@ impl<'a> super::AnalyzerContext<'a> {
                                 output_columns,
                             },
                             scope,
-                        ));
-                    }
-                }
-
-                if parts.len() == 1 {
-                    if self.pending_ctes.contains(&tbl_lower) {
-                        return Err(format!(
-                            "forward CTE reference is not supported: {tbl_lower}"
                         ));
                     }
                 }

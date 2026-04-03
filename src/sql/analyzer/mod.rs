@@ -57,10 +57,9 @@ pub(crate) fn analyze(
 pub(super) struct AnalyzerContext<'a> {
     pub(super) catalog: &'a dyn CatalogProvider,
     pub(super) current_database: &'a str,
-    /// Already-visible CTE definitions from outer scopes or earlier entries in
-    /// the same WITH clause, keyed by lowercase name.
-    /// Value is (query, optional column aliases).
-    pub(super) ctes: std::collections::HashMap<String, (sqlast::Query, Vec<String>)>,
+    /// Currently visible CTE definitions from outer scopes or earlier entries
+    /// in the same WITH clause, keyed by lowercase name.
+    pub(super) ctes: std::collections::HashMap<String, crate::sql::cte::CteId>,
     /// Names declared by the current WITH clause but not yet visible because
     /// their definitions have not been analyzed.
     pub(super) pending_ctes: std::collections::HashSet<String>,
@@ -123,14 +122,12 @@ impl<'a> AnalyzerContext<'a> {
             }
 
             let output_columns = resolved_cte.output_columns.clone();
-            child_ctx
+            let cte_id = child_ctx
                 .cte_registry
                 .borrow_mut()
                 .register(name.clone(), resolved_cte, output_columns);
 
-            child_ctx
-                .ctes
-                .insert(name, (*cte.query.clone(), col_aliases));
+            child_ctx.ctes.insert(name, cte_id);
         }
 
         Ok(child_ctx)
@@ -2087,16 +2084,33 @@ mod tests {
     fn test_single_use_cte_is_still_registered() {
         let sql = "WITH order_totals AS (SELECT o_orderkey AS ok FROM orders) \
                    SELECT ok FROM order_totals";
-        let (_resolved, registry) =
+        let (resolved, registry) =
             parse_and_analyze_with_registry(sql).expect("analysis should succeed");
         assert_eq!(registry.entries.len(), 1);
         assert_eq!(registry.entries[0].name, "order_totals");
+        match &resolved.body {
+            QueryBody::Select(sel) => match sel.from.as_ref().expect("should have FROM") {
+                Relation::CTEConsume { cte_id, .. } => {
+                    let entry = registry
+                        .entries
+                        .iter()
+                        .find(|entry| entry.id == *cte_id)
+                        .expect("cte id should exist in registry");
+                    assert_eq!(entry.name, "order_totals");
+                }
+                _ => panic!("expected direct CTEConsume for single-use top-level CTE"),
+            },
+            _ => panic!("expected select body"),
+        }
     }
 
     #[test]
     fn test_forward_cte_reference_is_rejected() {
-        let sql = "WITH b AS (SELECT * FROM a), a AS (SELECT o_orderkey FROM orders) \
-                   SELECT * FROM b";
+        let sql = "WITH a AS (SELECT 1 AS x) \
+                   SELECT * FROM (\
+                     WITH b AS (SELECT * FROM a), a AS (SELECT o_orderkey FROM orders) \
+                     SELECT * FROM b\
+                   ) s";
         let err = parse_and_analyze_with_registry(sql).expect_err("forward reference must fail");
         assert!(
             err.contains("forward CTE reference is not supported"),
@@ -2136,6 +2150,37 @@ mod tests {
             _ => None,
         };
         assert_eq!(inner_value, Some(2));
+    }
+
+    #[test]
+    fn test_inner_with_does_not_leak_to_sibling_scope() {
+        let sql = "WITH t AS (SELECT 1 AS x) \
+                   SELECT * FROM (WITH t AS (SELECT 2 AS x) SELECT 1) d, t";
+        let (resolved, registry) =
+            parse_and_analyze_with_registry(sql).expect("analysis should succeed");
+        let sibling_cte_id = match &resolved.body {
+            QueryBody::Select(sel) => match sel.from.as_ref().expect("should have FROM") {
+                Relation::Join(join) => match &join.right {
+                    Relation::CTEConsume { cte_id, .. } => *cte_id,
+                    _ => panic!("expected sibling CTEConsume"),
+                },
+                _ => panic!("expected join from comma-separated FROM items"),
+            },
+            _ => panic!("expected select body"),
+        };
+        let entry = registry
+            .entries
+            .iter()
+            .find(|entry| entry.id == sibling_cte_id)
+            .expect("cte id should exist in registry");
+        let outer_value = match &entry.resolved_query.body {
+            QueryBody::Select(inner_sel) => match &inner_sel.projection[0].expr.kind {
+                ExprKind::Literal(crate::sql::ir::LiteralValue::Int(v)) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        };
+        assert_eq!(outer_value, Some(1));
     }
 
     #[test]
