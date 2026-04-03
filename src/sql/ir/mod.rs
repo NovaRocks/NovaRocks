@@ -158,8 +158,8 @@ pub(crate) enum JoinKind {
 pub(crate) struct ResolvedSetOp {
     pub kind: SetOpKind,
     pub all: bool,
-    pub left: Box<QueryBody>,
-    pub right: Box<QueryBody>,
+    pub left: Box<ResolvedQuery>,
+    pub right: Box<ResolvedQuery>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

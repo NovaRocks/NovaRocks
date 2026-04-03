@@ -196,8 +196,10 @@ impl<'a> AnalyzerContext<'a> {
                 left,
                 right,
             } => {
-                let (left_body, left_cols) = self.analyze_set_expr(left)?;
-                let (right_body, right_cols) = self.analyze_set_expr(right)?;
+                let left_query = self.analyze_set_operand(left)?;
+                let right_query = self.analyze_set_operand(right)?;
+                let left_cols = left_query.output_columns.clone();
+                let right_cols = right_query.output_columns.clone();
 
                 // Validate column count
                 if left_cols.len() != right_cols.len() {
@@ -233,8 +235,8 @@ impl<'a> AnalyzerContext<'a> {
                     QueryBody::SetOperation(ResolvedSetOp {
                         kind,
                         all,
-                        left: Box::new(left_body),
-                        right: Box::new(right_body),
+                        left: Box::new(left_query),
+                        right: Box::new(right_query),
                     }),
                     output_cols,
                 ))
@@ -249,6 +251,23 @@ impl<'a> AnalyzerContext<'a> {
                 Ok((resolved.body, cols))
             }
             other => Err(format!("unsupported set expression: {other}")),
+        }
+    }
+
+    fn analyze_set_operand(&self, set_expr: &sqlast::SetExpr) -> Result<ResolvedQuery, String> {
+        match set_expr {
+            sqlast::SetExpr::Query(q) => self.analyze_query(q),
+            _ => {
+                let (body, output_columns) = self.analyze_set_expr(set_expr)?;
+                Ok(ResolvedQuery {
+                    body,
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    output_columns,
+                    local_cte_ids: vec![],
+                })
+            }
         }
     }
 
@@ -621,12 +640,26 @@ impl<'a> AnalyzerContext<'a> {
 
         // Build UNION ALL chain from right to left
         let (mut result_body, result_cols) = bodies.remove(0);
-        for (body, _cols) in bodies {
+        for (body, cols) in bodies {
             result_body = QueryBody::SetOperation(ResolvedSetOp {
                 kind: SetOpKind::Union,
                 all: true,
-                left: Box::new(result_body),
-                right: Box::new(body),
+                left: Box::new(ResolvedQuery {
+                    body: result_body,
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    output_columns: result_cols.clone(),
+                    local_cte_ids: vec![],
+                }),
+                right: Box::new(ResolvedQuery {
+                    body,
+                    order_by: vec![],
+                    limit: None,
+                    offset: None,
+                    output_columns: cols,
+                    local_cte_ids: vec![],
+                }),
             });
         }
 

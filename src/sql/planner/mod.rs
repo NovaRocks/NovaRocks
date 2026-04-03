@@ -952,8 +952,8 @@ fn plan_relation_scoped(
 // ---------------------------------------------------------------------------
 
 fn plan_set_operation(set_op: ResolvedSetOp) -> Result<LogicalPlan, String> {
-    let left = plan_body(*set_op.left)?;
-    let right = plan_body(*set_op.right)?;
+    let left = plan(*set_op.left)?;
+    let right = plan(*set_op.right)?;
 
     match set_op.kind {
         SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
@@ -973,8 +973,8 @@ fn plan_set_operation_scoped(
     set_op: ResolvedSetOp,
     cte_registry: &CTERegistry,
 ) -> Result<LogicalPlan, String> {
-    let left = plan_body_scoped(*set_op.left, cte_registry)?;
-    let right = plan_body_scoped(*set_op.right, cte_registry)?;
+    let left = plan_scoped_query(*set_op.left, cte_registry)?;
+    let right = plan_scoped_query(*set_op.right, cte_registry)?;
 
     match set_op.kind {
         SetOpKind::Union => Ok(LogicalPlan::Union(UnionNode {
@@ -1183,6 +1183,55 @@ mod tests {
         assert!(
             inner_anchor_idx > subquery_idx,
             "nested inner anchor should appear under subquery: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_parenthesized_set_op_branch_keeps_local_cte_anchor_in_branch() {
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey AS ok FROM orders \
+             UNION ALL \
+             (WITH t AS (SELECT o_custkey AS ok FROM orders) SELECT ok FROM t)",
+        )
+        .expect("planner should succeed");
+
+        match plan {
+            LogicalPlan::Union(node) => {
+                assert_eq!(node.inputs.len(), 2);
+                match &node.inputs[1] {
+                    LogicalPlan::CTEAnchor(anchor) => assert_eq!(anchor.cte_id, 0),
+                    other => {
+                        panic!("expected branch-local CTEAnchor in union input, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("expected UNION plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_explain_keeps_parenthesized_set_op_branch_anchor_in_branch() {
+        let plan = parse_analyze_and_plan(
+            "SELECT o_orderkey AS ok FROM orders \
+             UNION ALL \
+             (WITH t AS (SELECT o_custkey AS ok FROM orders) SELECT ok FROM t)",
+        )
+        .expect("planner should succeed");
+
+        let lines =
+            crate::sql::explain::explain_plan(&plan, crate::sql::explain::ExplainLevel::Normal);
+        let union_idx = lines
+            .iter()
+            .position(|line| line.contains("UNION ALL"))
+            .expect("expected union line");
+        let anchor_idx = lines
+            .iter()
+            .position(|line| line.contains("CTE_ANCHOR(cte_id=0)"))
+            .expect("expected branch-local anchor line");
+
+        assert!(
+            anchor_idx > union_idx,
+            "branch-local anchor should appear under union: {lines:?}"
         );
     }
 }
