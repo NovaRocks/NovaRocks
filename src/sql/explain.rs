@@ -461,6 +461,15 @@ fn format_physical_node(
                 format_physical_node(child, level, indent + 1, out);
             }
         }
+        Operator::PhysicalCTEAnchor(op) => {
+            out.push(format!(
+                "{pad}CTE ANCHOR (cte_id={}){costs_suffix}",
+                op.cte_id
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
+        }
         Operator::PhysicalCTEProduce(op) => {
             out.push(format!(
                 "{pad}CTE PRODUCE (cte_id={}){costs_suffix}",

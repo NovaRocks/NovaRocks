@@ -15,15 +15,15 @@ use crate::data_sinks;
 use crate::exprs;
 use crate::plan_nodes;
 
-use crate::sql::catalog::CatalogProvider;
 use crate::sql::cascades::operator::Operator;
 use crate::sql::cascades::operator::{
-    PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDistributionOp, PhysicalFilterOp,
-    PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalLimitOp,
-    PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-    PhysicalSubqueryAliasOp, PhysicalValuesOp, PhysicalWindowOp,
+    PhysicalCTEAnchorOp, PhysicalCTEConsumeOp, PhysicalCTEProduceOp, PhysicalDistributionOp,
+    PhysicalFilterOp, PhysicalGenerateSeriesOp, PhysicalHashAggregateOp, PhysicalHashJoinOp,
+    PhysicalLimitOp, PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp,
+    PhysicalSortOp, PhysicalSubqueryAliasOp, PhysicalValuesOp, PhysicalWindowOp,
 };
 use crate::sql::cascades::physical_plan::PhysicalPlanNode;
+use crate::sql::catalog::CatalogProvider;
 use crate::sql::cte::CteId;
 use crate::sql::fragment::FragmentId;
 use crate::sql::physical::descriptors::DescriptorTableBuilder;
@@ -112,8 +112,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Build the shared descriptor table and exec params.  All fragments
         // share the same descriptor table and scan ranges since the
         // coordinator rewires instance IDs and sinks after the fact.
-        let desc_tbl = std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new())
-            .build();
+        let desc_tbl =
+            std::mem::replace(&mut builder.desc_builder, DescriptorTableBuilder::new()).build();
 
         let exec_params = nodes::build_exec_params_multi(
             &builder
@@ -211,19 +211,25 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalSubqueryAlias(op) => self.visit_subquery_alias(op, node),
             Operator::PhysicalRepeat(op) => self.visit_repeat(op, node),
             Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
+            Operator::PhysicalCTEAnchor(op) => self.visit_cte_anchor(op, node),
             Operator::PhysicalCTEProduce(op) => self.visit_cte_produce(op, node),
             Operator::PhysicalCTEConsume(op) => self.visit_cte_consume(op),
             // Set operations: union, intersect, except — not yet wired in cascades
             Operator::PhysicalUnion(_)
             | Operator::PhysicalIntersect(_)
-            | Operator::PhysicalExcept(_) => {
-                Err(format!("set operation {:?} not yet supported in cascades fragment builder", node.op))
-            }
+            | Operator::PhysicalExcept(_) => Err(format!(
+                "set operation {:?} not yet supported in cascades fragment builder",
+                node.op
+            )),
             // Logical operators should never appear in an extracted physical plan
-            other if other.is_logical() => {
-                Err(format!("unexpected logical operator in physical plan: {:?}", other))
-            }
-            other => Err(format!("unhandled operator in fragment builder: {:?}", other)),
+            other if other.is_logical() => Err(format!(
+                "unexpected logical operator in physical plan: {:?}",
+                other
+            )),
+            other => Err(format!(
+                "unhandled operator in fragment builder: {:?}",
+                other
+            )),
         }
     }
 
@@ -1118,11 +1124,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Build a TableDef and emit as a scan
         let table_def = crate::sql::catalog::TableDef {
-            name: op
-                .alias
-                .as_deref()
-                .unwrap_or("generate_series")
-                .to_string(),
+            name: op.alias.as_deref().unwrap_or("generate_series").to_string(),
             columns: vec![crate::sql::catalog::ColumnDef {
                 name: col_name.clone(),
                 data_type: ArrowDataType::Int64,
@@ -1366,6 +1368,19 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 
     // -------------------------------------------------------------------
+    // visit_cte_anchor
+    // -------------------------------------------------------------------
+
+    fn visit_cte_anchor(
+        &mut self,
+        _op: &PhysicalCTEAnchorOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        let _ = self.visit(&node.children[0])?;
+        self.visit(&node.children[1])
+    }
+
+    // -------------------------------------------------------------------
     // visit_cte_produce
     // -------------------------------------------------------------------
 
@@ -1384,11 +1399,18 @@ impl<'a> PlanFragmentBuilder<'a> {
         let cte_fragment = FragmentBuildResult {
             fragment_id: cte_fragment_id,
             plan: plan_nodes::TPlan::new(child.plan_nodes),
-            // Placeholder; build() patches these.
             desc_tbl: DescriptorTableBuilder::new().build(),
             exec_params: nodes::build_exec_params_multi(&[])?,
             output_sink: build_noop_sink(),
-            output_columns: Vec::new(),
+            output_columns: op
+                .output_columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect(),
             cte_id: Some(op.cte_id),
             cte_exchange_nodes: Vec::new(),
         };
@@ -1396,25 +1418,8 @@ impl<'a> PlanFragmentBuilder<'a> {
         self.completed_fragments.push(cte_fragment);
         self.cte_fragments.insert(op.cte_id, idx);
 
-        // CTE produce is transparent — return the child's scope and tuple IDs
-        // so that the parent can continue building on top of the CTE output.
-        // The plan_nodes are empty because they have been moved into the
-        // completed fragment; the parent will reference them via exchange.
-        // However, the *logical* output shape (scope + tuple_ids) propagates
-        // upward so that a subsequent visit_cte_consume can create a matching
-        // exchange node.
-
-        // Build an exchange node for the implicit consume that follows in the
-        // plan tree (the parent of CTE produce is typically the root fragment
-        // or another CTE consumer).
-        let exchange_node_id = self.alloc_node();
-        let exchange_node =
-            nodes::build_exchange_node(exchange_node_id, child.tuple_ids.clone());
-        self.cte_exchange_nodes
-            .push((op.cte_id, exchange_node_id));
-
         Ok(VisitResult {
-            plan_nodes: vec![exchange_node],
+            plan_nodes: Vec::new(),
             scope: child.scope,
             tuple_ids: child.tuple_ids,
         })
@@ -1439,8 +1444,7 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Record this consumer so the root fragment carries the metadata
         // needed by the coordinator to wire multicast destinations.
-        self.cte_exchange_nodes
-            .push((op.cte_id, exchange_node_id));
+        self.cte_exchange_nodes.push((op.cte_id, exchange_node_id));
 
         // Build the scope from the CTE consume's declared output columns
         // so that parent operators can resolve column references.
@@ -1469,8 +1473,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         self.desc_builder.add_tuple(exchange_tuple_id);
 
-        let exchange_node =
-            nodes::build_exchange_node(exchange_node_id, vec![exchange_tuple_id]);
+        let exchange_node = nodes::build_exchange_node(exchange_node_id, vec![exchange_tuple_id]);
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],

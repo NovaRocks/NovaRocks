@@ -1,8 +1,10 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -100,6 +102,7 @@ struct StandaloneState {
     catalog: RwLock<InMemoryCatalog>,
     iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
     metadata_store: Option<SqliteMetadataStore>,
+    exchange_port: u16,
 }
 
 #[derive(Clone)]
@@ -124,12 +127,14 @@ impl StandaloneNovaRocks {
                     .map_err(|e| format!("load config failed: {e}"))?;
             }
         }
+        let exchange_port = ensure_standalone_exchange_server()?;
         let metadata_store = resolve_metadata_store(
             opts.metadata_db_path.as_deref(),
             opts.config_path.as_deref(),
         )?;
         let inner = Arc::new(StandaloneState {
             metadata_store,
+            exchange_port,
             ..Default::default()
         });
         restore_metadata_if_needed(&inner)?;
@@ -320,7 +325,8 @@ impl StandaloneSession {
                     .catalog
                     .read()
                     .expect("standalone catalog read lock");
-                let result = execute_query(query, &catalog, current_database)?;
+                let result =
+                    execute_query(query, &catalog, current_database, self.inner.exchange_port)?;
                 drop(catalog);
                 Ok(StatementResult::Query(result))
             }
@@ -620,7 +626,12 @@ impl StandaloneSession {
             .catalog
             .read()
             .expect("standalone catalog read lock");
-        let query_result = execute_query(source_query, &catalog, current_database)?;
+        let query_result = execute_query(
+            source_query,
+            &catalog,
+            current_database,
+            self.inner.exchange_port,
+        )?;
         drop(catalog);
 
         // Resolve target table
@@ -3395,9 +3406,6 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 use crate::sql::physical::PlanBuildResult;
 
 /// Produce EXPLAIN output for a query without executing it.
-///
-/// Non-CTE queries go through the Cascades optimizer and produce a physical
-/// plan.  CTE queries use the old LogicalPlan explain path for now.
 fn explain_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
@@ -3407,38 +3415,20 @@ fn explain_query(
     use crate::sql::explain::{ExplainLevel, explain_physical_plan};
 
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
+    let table_stats = build_table_stats_from_plan(&logical);
+    let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
 
     let mut lines = Vec::new();
-
-    if cte_registry.entries.is_empty() {
-        // Cascades path for non-CTE queries
-        let logical = crate::sql::planner::plan(resolved)?;
-        let table_stats = build_table_stats_from_plan(&logical);
-        let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
-
-        if matches!(level, ExplainLevel::Costs) {
-            for (table, stats) in &table_stats {
-                lines.push(format!(
-                    "  Statistics: {table} row_count={}",
-                    stats.row_count
-                ));
-            }
+    if matches!(level, ExplainLevel::Costs) {
+        for (table, stats) in &table_stats {
+            lines.push(format!(
+                "  Statistics: {table} row_count={}",
+                stats.row_count
+            ));
         }
-        lines.extend(explain_physical_plan(&physical, level));
-    } else {
-        let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
-        let all_stats = build_table_stats_from_plan(&logical);
-
-        if matches!(level, ExplainLevel::Costs) {
-            for (table, stats) in &all_stats {
-                lines.push(format!(
-                    "  Statistics: {table} row_count={}",
-                    stats.row_count
-                ));
-            }
-        }
-        lines.extend(crate::sql::explain::explain_plan(&logical, level));
     }
+    lines.extend(explain_physical_plan(&physical, level));
 
     build_string_query_result("Explain String", lines)
 }
@@ -3447,35 +3437,10 @@ fn execute_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,
+    exchange_port: u16,
 ) -> Result<QueryResult, String> {
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
-
-    // Build logical plan (with CTE if multi-referenced)
-    let logical = if cte_registry.entries.is_empty() {
-        crate::sql::planner::plan(resolved)?
-    } else {
-        // For CTE queries, use the old optimizer + emitter path.
-        // TODO: full CTE support in Cascades (produce/consume should appear in plan)
-        let query_plan = crate::sql::planner::plan_query_legacy(resolved, cte_registry)?;
-        let mut all_stats = std::collections::HashMap::new();
-        for cte in &query_plan.cte_plans {
-            all_stats.extend(build_table_stats_from_plan(&cte.plan));
-        }
-        all_stats.extend(build_table_stats_from_plan(&query_plan.main_plan));
-        let optimized = crate::sql::optimizer::optimize_query_plan(query_plan, &all_stats);
-        let fragment_plan = crate::sql::fragment::plan_fragments(optimized);
-        let build_result =
-            crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)?;
-        let exchange_port = crate::common::config::http_port();
-        return super::coordinator::ExecutionCoordinator::new(
-            build_result,
-            "127.0.0.1".to_string(),
-            exchange_port,
-        )
-        .execute();
-    };
-
-    // Cascades path for non-CTE queries
+    let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
     let build_result = crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
@@ -3498,9 +3463,74 @@ fn execute_query(
             fragment_results: build_result.fragments,
             root_fragment_id: build_result.root_fragment_id,
         };
-        let exchange_port = crate::common::config::http_port();
         super::coordinator::ExecutionCoordinator::new(multi, "127.0.0.1".to_string(), exchange_port)
             .execute()
+    }
+}
+
+fn ensure_standalone_exchange_server() -> Result<u16, String> {
+    static STANDALONE_EXCHANGE_PORT: OnceLock<u16> = OnceLock::new();
+
+    if let Some(port) = STANDALONE_EXCHANGE_PORT.get() {
+        return Ok(*port);
+    }
+
+    let default_port = crate::common::config::http_port();
+    let selected_port =
+        match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", default_port) {
+            Ok(()) => default_port,
+            Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|bind_err| {
+                    format!("reserve standalone grpc exchange port failed: {bind_err}")
+                })?;
+                let fallback_port = listener
+                    .local_addr()
+                    .map_err(|addr_err| {
+                        format!("read standalone grpc exchange port failed: {addr_err}")
+                    })?
+                    .port();
+                drop(listener);
+                crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", fallback_port)
+                    .map_err(|start_err| {
+                        format!(
+                            "start standalone grpc exchange server failed on fallback port {}: {}",
+                            fallback_port, start_err
+                        )
+                    })?;
+                fallback_port
+            }
+            Err(e) => return Err(format!("start standalone grpc exchange server failed: {e}")),
+        };
+
+    wait_for_standalone_exchange_server(selected_port)?;
+
+    if STANDALONE_EXCHANGE_PORT.set(selected_port).is_err() {
+        return Ok(*STANDALONE_EXCHANGE_PORT
+            .get()
+            .expect("standalone exchange port initialized"));
+    }
+    Ok(selected_port)
+}
+
+fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err) if Instant::now() < deadline => {
+                let _ = err;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "standalone grpc exchange server on 127.0.0.1:{} did not become ready: {}",
+                    port, err
+                ));
+            }
+        }
     }
 }
 
@@ -3735,6 +3765,47 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string array");
         assert_eq!(names.value(0), "b");
+    }
+
+    #[test]
+    fn embedded_query_executes_single_use_cte_through_cascades() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH t AS (SELECT id, name FROM tbl WHERE id >= 2) SELECT name FROM t ORDER BY 1",
+            )
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 2);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "name");
+    }
+
+    #[test]
+    fn embedded_query_executes_multi_use_cte_through_multicast_reuse() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH t AS (SELECT id FROM tbl) \
+                    SELECT a.id FROM t a JOIN t b ON a.id = b.id ORDER BY 1",
+            )
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 3);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "id");
     }
 
     #[test]
