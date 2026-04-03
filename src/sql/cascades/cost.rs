@@ -42,6 +42,7 @@ pub(crate) fn compute_cost(
         | Operator::LogicalGenerateSeries(_)
         | Operator::LogicalSubqueryAlias(_)
         | Operator::LogicalRepeat(_)
+        | Operator::LogicalCTEAnchor(_)
         | Operator::LogicalCTEProduce(_)
         | Operator::LogicalCTEConsume(_) => 0.0,
 
@@ -108,6 +109,8 @@ pub(crate) fn compute_cost(
         Operator::PhysicalDistribution(_) => own_stats.compute_size() * NETWORK_COST,
 
         Operator::PhysicalLimit(_) => 0.01,
+
+        Operator::PhysicalCTEAnchor(_) => 0.0,
 
         // Window, Repeat, Union, Intersect, Except, Values, GenerateSeries,
         // SubqueryAlias, CTE — lightweight default.

@@ -50,6 +50,7 @@ pub(crate) fn derive_statistics(
             output_row_count: 1000.0,
             column_statistics: HashMap::new(),
         },
+        Operator::LogicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
         // -- Unary operators (single child) --
         Operator::LogicalFilter(filter) => {
@@ -446,6 +447,8 @@ pub(crate) fn derive_statistics(
             column_statistics: HashMap::new(),
         },
 
+        Operator::PhysicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
+
         Operator::PhysicalRepeat(repeat) => {
             let child_stats = child_statistics(memo, &expr.children, 0);
             let repeat_times = repeat.repeat_column_ref_list.len() as f64;
@@ -772,6 +775,7 @@ fn derive_output_columns(
         Operator::LogicalWindow(w) => w.output_columns.clone(),
         Operator::LogicalValues(v) => v.columns.clone(),
         Operator::LogicalSubqueryAlias(s) => s.output_columns.clone(),
+        Operator::LogicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::LogicalCTEProduce(c) => c.output_columns.clone(),
         Operator::LogicalCTEConsume(c) => c.output_columns.clone(),
         Operator::LogicalGenerateSeries(g) => {
@@ -837,6 +841,7 @@ fn derive_output_columns(
         Operator::PhysicalWindow(w) => w.output_columns.clone(),
         Operator::PhysicalValues(v) => v.columns.clone(),
         Operator::PhysicalSubqueryAlias(s) => s.output_columns.clone(),
+        Operator::PhysicalCTEAnchor(_) => child_output_columns(memo, &expr.children, 1),
         Operator::PhysicalCTEProduce(c) => c.output_columns.clone(),
         Operator::PhysicalCTEConsume(c) => c.output_columns.clone(),
         Operator::PhysicalGenerateSeries(g) => {
@@ -942,6 +947,18 @@ fn extract_column_name(expr: &TypedExpr) -> Option<&str> {
         ExprKind::Nested(inner) => extract_column_name(inner),
         _ => None,
     }
+}
+
+fn child_output_columns(
+    memo: &Memo,
+    children: &[usize],
+    child_idx: usize,
+) -> Vec<crate::sql::ir::OutputColumn> {
+    children
+        .get(child_idx)
+        .and_then(|&child_id| memo.groups[child_id].logical_props.as_ref())
+        .map(|props| props.output_columns.clone())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------

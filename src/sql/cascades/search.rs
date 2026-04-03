@@ -235,12 +235,13 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         // CTE consume: leaf-like, Any.
         Operator::PhysicalCTEConsume(_) => PhysicalPropertySet::any(),
 
-        // Filter, Project, Limit, SubqueryAlias, CTE Produce, Repeat:
+        // Filter, Project, Limit, SubqueryAlias, CTE Anchor, CTE Produce, Repeat:
         // passthrough child properties (approximate as Any).
         Operator::PhysicalFilter(_)
         | Operator::PhysicalProject(_)
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalSubqueryAlias(_)
+        | Operator::PhysicalCTEAnchor(_)
         | Operator::PhysicalCTEProduce(_)
         | Operator::PhysicalRepeat(_) => PhysicalPropertySet::any(),
 
@@ -341,6 +342,10 @@ pub(super) fn required_input_properties(
         | Operator::PhysicalValues(_)
         | Operator::PhysicalGenerateSeries(_)
         | Operator::PhysicalCTEConsume(_) => vec![],
+
+        Operator::PhysicalCTEAnchor(_) => {
+            vec![PhysicalPropertySet::any(), parent_required.clone()]
+        }
 
         // Shuffle join: [Hash(left_eq_keys), Hash(right_eq_keys)]
         Operator::PhysicalHashJoin(j) => match j.distribution {

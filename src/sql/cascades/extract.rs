@@ -96,8 +96,13 @@ pub(crate) fn extract_best(
         children.push(child_node);
     }
 
+    let op = match &expr.op {
+        Operator::PhysicalCTEAnchor(op) => Operator::PhysicalCTEAnchor(op.clone()),
+        other => other.clone(),
+    };
+
     Ok(PhysicalPlanNode {
-        op: expr.op.clone(),
+        op,
         children,
         stats: group_stats,
         output_columns,
