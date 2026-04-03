@@ -30,7 +30,7 @@ use scope::AnalyzerScope;
 // ---------------------------------------------------------------------------
 
 /// Analyze a parsed SQL query and produce a fully resolved query IR,
-/// along with a registry of shared CTEs (those referenced two or more times).
+/// along with a registry of all non-recursive CTE definitions.
 pub(crate) fn analyze(
     query: &sqlast::Query,
     catalog: &impl CatalogProvider,
@@ -40,9 +40,9 @@ pub(crate) fn analyze(
         catalog,
         current_database,
         ctes: std::collections::HashMap::new(),
+        pending_ctes: std::collections::HashSet::new(),
         next_subquery_id: std::cell::Cell::new(0),
         collected_subqueries: std::cell::RefCell::new(Vec::new()),
-        shared_cte_ids: std::collections::HashMap::new(),
         cte_registry: std::cell::RefCell::new(crate::sql::cte::CTERegistry::new()),
     };
     let resolved = ctx.analyze_query(query)?;
@@ -57,17 +57,19 @@ pub(crate) fn analyze(
 pub(super) struct AnalyzerContext<'a> {
     pub(super) catalog: &'a dyn CatalogProvider,
     pub(super) current_database: &'a str,
-    /// CTE definitions from WITH clause, keyed by lowercase name.
+    /// Already-visible CTE definitions from outer scopes or earlier entries in
+    /// the same WITH clause, keyed by lowercase name.
     /// Value is (query, optional column aliases).
     pub(super) ctes: std::collections::HashMap<String, (sqlast::Query, Vec<String>)>,
+    /// Names declared by the current WITH clause but not yet visible because
+    /// their definitions have not been analyzed.
+    pub(super) pending_ctes: std::collections::HashSet<String>,
     /// Counter for generating unique subquery placeholder IDs.
     pub(super) next_subquery_id: std::cell::Cell<usize>,
     /// Subqueries collected during expression analysis.
     /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
     pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
-    /// Maps shared CTE name -> CteId. Populated during two-pass analysis for CTEs with ref_count >= 2.
-    pub(super) shared_cte_ids: std::collections::HashMap<String, crate::sql::cte::CteId>,
-    /// Accumulated shared CTE registry, built during analysis.
+    /// Accumulated CTE registry for the current query scope.
     pub(super) cte_registry: std::cell::RefCell<crate::sql::cte::CTERegistry>,
 }
 
@@ -79,103 +81,69 @@ impl<'a> AnalyzerContext<'a> {
         id
     }
 
-    /// Top-level query analysis.
-    fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
-        // Register CTEs from WITH clause (if any) into a child context.
-        let maybe_child_ctx;
-        let ctx = if let Some(ref with_clause) = query.with {
-            let mut ctes = self.ctes.clone();
-            let mut cte_defs: Vec<(String, Vec<String>)> = Vec::new();
-            for cte in &with_clause.cte_tables {
-                let name = cte.alias.name.value.to_lowercase();
-                let col_aliases: Vec<String> = cte
-                    .alias
-                    .columns
-                    .iter()
-                    .map(|c| c.name.value.to_lowercase())
-                    .collect();
-                cte_defs.push((name.clone(), col_aliases.clone()));
-                ctes.insert(name, (*cte.query.clone(), col_aliases));
-            }
+    fn build_with_clause_context(
+        &self,
+        with_clause: &sqlast::With,
+    ) -> Result<AnalyzerContext<'a>, String> {
+        let mut pending_ctes: std::collections::HashSet<String> = with_clause
+            .cte_tables
+            .iter()
+            .map(|cte| cte.alias.name.value.to_lowercase())
+            .collect();
 
-            // --- Two-pass CTE analysis ---
-            // Pass 1: Count how many times each CTE name is referenced in the
-            // query body (and ORDER BY).  This is a heuristic count on the raw
-            // AST — it does not resolve names, so a same-named table would also
-            // be counted, but that is acceptable for the purpose of deciding
-            // whether to share.
-            let cte_names: std::collections::HashSet<String> =
-                cte_defs.iter().map(|(n, _)| n.clone()).collect();
-            let ref_counts = count_cte_references(&cte_names, query);
+        let mut child_ctx = AnalyzerContext {
+            catalog: self.catalog,
+            current_database: self.current_database,
+            ctes: self.ctes.clone(),
+            pending_ctes: pending_ctes.clone(),
+            next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
+            collected_subqueries: std::cell::RefCell::new(Vec::new()),
+            cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
+        };
 
-            // Pass 2: For CTEs referenced >= 2 times, analyze once, register in
-            // the shared CTE registry, and store the CteId.  Single-ref CTEs
-            // stay in the `ctes` map for inline expansion (existing behavior).
-            let mut shared_cte_ids = self.shared_cte_ids.clone();
-            for (name, col_aliases) in &cte_defs {
-                let count = ref_counts.get(name).copied().unwrap_or(0);
-                if count >= 2 {
-                    // Analyze the CTE query once with a child context that has
-                    // the *other* CTEs available (to allow CTE-to-CTE refs).
-                    let mut inner_ctes = ctes.clone();
-                    inner_ctes.remove(name);
-                    let inner_ctx = AnalyzerContext {
-                        catalog: self.catalog,
-                        current_database: self.current_database,
-                        ctes: inner_ctes,
-                        next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-                        collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                        shared_cte_ids: shared_cte_ids.clone(),
-                        cte_registry: std::cell::RefCell::new(
-                            crate::sql::cte::CTERegistry::new(),
-                        ),
-                    };
-                    let mut resolved_cte =
-                        inner_ctx.analyze_query(&ctes.get(name).unwrap().0)?;
-                    // Apply column aliases: WITH t(a, b) AS (...)
-                    if !col_aliases.is_empty() {
-                        for (i, alias_name) in col_aliases.iter().enumerate() {
-                            if let Some(col) = resolved_cte.output_columns.get_mut(i) {
-                                col.name = alias_name.clone();
-                            }
-                        }
+        for cte in &with_clause.cte_tables {
+            let name = cte.alias.name.value.to_lowercase();
+            pending_ctes.remove(&name);
+            child_ctx.pending_ctes = pending_ctes.clone();
+
+            let col_aliases: Vec<String> = cte
+                .alias
+                .columns
+                .iter()
+                .map(|ident| ident.name.value.clone())
+                .collect();
+
+            let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
+            if !col_aliases.is_empty() {
+                for (idx, alias_name) in col_aliases.iter().enumerate() {
+                    if let Some(col) = resolved_cte.output_columns.get_mut(idx) {
+                        col.name = alias_name.clone();
                     }
-                    // Merge any inner CTE registry entries into ours
-                    let inner_registry = inner_ctx.cte_registry.into_inner();
-                    {
-                        let mut our_reg = self.cte_registry.borrow_mut();
-                        for entry in inner_registry.entries {
-                            our_reg.entries.push(entry);
-                        }
-                    }
-                    let output_columns = resolved_cte.output_columns.clone();
-                    let cte_id = self
-                        .cte_registry
-                        .borrow_mut()
-                        .register(name.clone(), resolved_cte, output_columns);
-                    shared_cte_ids.insert(name.clone(), cte_id);
-                    // Remove from inline ctes map so it won't be inlined
-                    ctes.remove(name);
                 }
             }
 
-            // Clone the parent's registry so the child can look up shared CTEs
-            // that were registered above.
-            let registry_snapshot = self.cte_registry.borrow().clone();
-            maybe_child_ctx = Some(AnalyzerContext {
-                catalog: self.catalog,
-                current_database: self.current_database,
-                ctes,
-                next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-                collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                shared_cte_ids,
-                cte_registry: std::cell::RefCell::new(registry_snapshot),
-            });
-            maybe_child_ctx.as_ref().unwrap()
+            let output_columns = resolved_cte.output_columns.clone();
+            child_ctx
+                .cte_registry
+                .borrow_mut()
+                .register(name.clone(), resolved_cte, output_columns);
+
+            child_ctx
+                .ctes
+                .insert(name, (*cte.query.clone(), col_aliases));
+        }
+
+        Ok(child_ctx)
+    }
+
+    /// Top-level query analysis.
+    fn analyze_query(&self, query: &sqlast::Query) -> Result<ResolvedQuery, String> {
+        let maybe_child_ctx = if let Some(ref with_clause) = query.with {
+            Some(self.build_with_clause_context(with_clause)?)
         } else {
-            maybe_child_ctx = None;
-            self
+            None
         };
+        let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
         // Analyze body (SELECT / SetOperation / VALUES)
         let (body, body_output) = ctx.analyze_set_expr(query.body.as_ref())?;
@@ -187,21 +155,8 @@ impl<'a> AnalyzerContext<'a> {
         let limit = extract_limit(query)?;
         let offset = extract_offset(query)?;
 
-        // If we used a child context for CTE processing, merge its CTE
-        // registry entries back into the parent (self).
         if let Some(child_ctx) = maybe_child_ctx {
-            let child_entries =
-                std::mem::take(&mut *child_ctx.cte_registry.borrow_mut()).entries;
-            if !child_entries.is_empty() {
-                let mut parent_reg = self.cte_registry.borrow_mut();
-                // Only merge entries that don't already exist in the parent
-                // (the child started with a snapshot of parent's entries).
-                for entry in child_entries {
-                    if !parent_reg.entries.iter().any(|e| e.id == entry.id) {
-                        parent_reg.entries.push(entry);
-                    }
-                }
-            }
+            *self.cte_registry.borrow_mut() = child_ctx.cte_registry.borrow().clone();
         }
 
         // Build output columns from the body
@@ -2059,6 +2014,20 @@ mod tests {
         Ok(resolved)
     }
 
+    fn parse_and_analyze_with_registry(
+        sql: &str,
+    ) -> Result<(ResolvedQuery, crate::sql::cte::CTERegistry), String> {
+        let dialect = crate::sql::parser::dialect::StarRocksDialect;
+        let mut ast = sqlparser::parser::Parser::parse_sql(&dialect, sql)
+            .map_err(|e| e.to_string())?;
+        let stmt = ast.pop().ok_or_else(|| "expected a statement".to_string())?;
+        let query = match stmt {
+            sqlparser::ast::Statement::Query(q) => q,
+            _ => return Err("expected a query".into()),
+        };
+        analyze(&query, &TestCatalog, "default")
+    }
+
     /// Helper to check that a Relation tree contains a JOIN of a given kind.
     fn has_join_kind(rel: &Relation, kind: JoinKind) -> bool {
         match rel {
@@ -2340,6 +2309,27 @@ mod tests {
                    SELECT t1.ok FROM order_totals t1 WHERE t1.total > 100";
         let resolved = parse_and_analyze(sql).expect("CTE with alias should work");
         assert!(!resolved.output_columns.is_empty());
+    }
+
+    #[test]
+    fn test_single_use_cte_is_still_registered() {
+        let sql = "WITH order_totals AS (SELECT o_orderkey AS ok FROM orders) \
+                   SELECT ok FROM order_totals";
+        let (_resolved, registry) =
+            parse_and_analyze_with_registry(sql).expect("analysis should succeed");
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.entries[0].name, "order_totals");
+    }
+
+    #[test]
+    fn test_forward_cte_reference_is_rejected() {
+        let sql = "WITH b AS (SELECT * FROM a), a AS (SELECT o_orderkey FROM orders) \
+                   SELECT * FROM b";
+        let err = parse_and_analyze_with_registry(sql).expect_err("forward reference must fail");
+        assert!(
+            err.contains("forward CTE reference is not supported"),
+            "err={err}"
+        );
     }
 
     #[test]

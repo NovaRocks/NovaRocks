@@ -3,7 +3,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, convert_sql_type, peek_word_eq};
-use crate::sql::ast::{
+use crate::sql::parser::ast::{
     CreateTableKind, CreateTableStmt, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
 

@@ -1,7 +1,5 @@
-pub(crate) mod ast;
 pub(crate) mod catalog;
 pub(crate) mod cte;
-pub(crate) mod dialect;
 pub(crate) mod fragment;
 pub(crate) mod ir;
 pub(crate) mod parser;
@@ -18,7 +16,7 @@ pub(crate) mod optimizer;
 pub(crate) mod physical;
 pub(crate) mod planner;
 
-pub(crate) use ast::{
+pub(crate) use parser::ast::{
     ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
-pub(crate) use catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+pub(crate) use catalog::CatalogProvider;

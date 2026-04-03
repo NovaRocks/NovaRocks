@@ -13,8 +13,8 @@ use tokio::runtime::Handle;
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::sql::ast::{ArithmeticOp, GenerateSeriesSelect, SqlType, TableColumnDef};
-use crate::sql::ast::{
+use crate::sql::parser::ast::{ArithmeticOp, GenerateSeriesSelect, SqlType, TableColumnDef};
+use crate::sql::parser::ast::{
     ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName, TableKeyKind,
 };
 
@@ -233,13 +233,13 @@ impl StandaloneSession {
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        use crate::sql::dialect::{
+        use crate::sql::parser::dialect::{
             StarRocksDialect, looks_like_create_catalog, looks_like_create_database,
             looks_like_create_table, looks_like_drop_statement,
         };
         use sqlparser::ast as sqlast;
 
-        let normalized = crate::sql::dialect::normalize_for_raw_parse(sql)?;
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&normalized)
@@ -248,7 +248,7 @@ impl StandaloneSession {
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
         if looks_like_create_table(&parser) {
             let result =
-                crate::sql::dialect::create_table::parse_create_table_statement(&mut parser)?;
+                crate::sql::parser::dialect::create_table::parse_create_table_statement(&mut parser)?;
             return execute_create_table_statement(
                 &self.inner,
                 result,
@@ -258,15 +258,15 @@ impl StandaloneSession {
         }
         if looks_like_create_catalog(&parser) {
             let result =
-                crate::sql::dialect::create_catalog::parse_create_catalog_statement(&mut parser)?;
+                crate::sql::parser::dialect::create_catalog::parse_create_catalog_statement(&mut parser)?;
             return self.handle_create_catalog(result);
         }
         if looks_like_create_database(&parser) {
-            let db_name = crate::sql::dialect::parse_create_database_name(&mut parser)?;
+            let db_name = crate::sql::parser::dialect::parse_create_database_name(&mut parser)?;
             return execute_create_database_statement(&self.inner, &db_name, current_catalog);
         }
         if looks_like_drop_statement(&parser) {
-            let drop = crate::sql::dialect::drop::parse_drop_statement(&mut parser)?;
+            let drop = crate::sql::parser::dialect::drop::parse_drop_statement(&mut parser)?;
             return self.handle_drop(drop, current_catalog, current_database);
         }
 
@@ -327,7 +327,7 @@ impl StandaloneSession {
             sqlast::Statement::Truncate(truncate) => {
                 for truncate_table in &truncate.table_names {
                     let table_name =
-                        crate::sql::dialect::convert_object_name(truncate_table.name.clone())?;
+                        crate::sql::parser::dialect::convert_object_name(truncate_table.name.clone())?;
                     execute_truncate_table_statement(&self.inner, &table_name, current_database)?;
                 }
                 Ok(StatementResult::Ok)
@@ -504,7 +504,7 @@ impl StandaloneSession {
     /// Handle CREATE CATALOG result.
     fn handle_create_catalog(
         &self,
-        stmt: crate::sql::ast::CreateCatalogStmt,
+        stmt: crate::sql::parser::ast::CreateCatalogStmt,
     ) -> Result<StatementResult, String> {
         let mut guard = self
             .inner
@@ -525,11 +525,11 @@ impl StandaloneSession {
     /// Handle DROP TABLE/DATABASE/CATALOG result.
     fn handle_drop(
         &self,
-        drop: crate::sql::dialect::drop::DropResult,
+        drop: crate::sql::parser::dialect::drop::DropResult,
         current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<StatementResult, String> {
-        use crate::sql::dialect::drop::DropResult;
+        use crate::sql::parser::dialect::drop::DropResult;
         match drop {
             DropResult::Catalog(stmt) => {
                 execute_drop_catalog_statement(&self.inner, &stmt.name, stmt.if_exists)
@@ -573,7 +573,7 @@ impl StandaloneSession {
                     sqlast::TableObject::TableName(name) => name.clone(),
                     other => return Err(format!("unsupported INSERT target: {other}")),
                 };
-                if let Ok(table_name) = crate::sql::dialect::convert_object_name(raw_name) {
+                if let Ok(table_name) = crate::sql::parser::dialect::convert_object_name(raw_name) {
                     if let Ok(resolved) = resolve_local_table_name(&table_name, current_database) {
                         let guard = self
                             .inner
@@ -624,7 +624,7 @@ impl StandaloneSession {
             sqlast::TableObject::TableName(name) => name.clone(),
             other => return Err(format!("unsupported INSERT target: {other}")),
         };
-        let table_name = crate::sql::dialect::convert_object_name(raw_name)?;
+        let table_name = crate::sql::parser::dialect::convert_object_name(raw_name)?;
         let resolved = resolve_local_table_name(&table_name, current_database)?;
         let guard = self
             .inner
@@ -782,12 +782,12 @@ impl StandaloneSession {
 /// Used for Iceberg tables which need the custom AST's InsertSource types.
 fn convert_sqlparser_insert_to_custom(
     insert: &sqlparser::ast::Insert,
-) -> Result<crate::sql::ast::InsertStmt, String> {
+) -> Result<crate::sql::parser::ast::InsertStmt, String> {
     use sqlparser::ast as sqlast;
 
     let table = match &insert.table {
         sqlast::TableObject::TableName(name) => {
-            crate::sql::dialect::convert_object_name(name.clone())?
+            crate::sql::parser::dialect::convert_object_name(name.clone())?
         }
         other => return Err(format!("unsupported INSERT target: {other}")),
     };
@@ -866,7 +866,7 @@ fn convert_sqlparser_insert_to_custom(
         }
         _ => return Err("unsupported INSERT source".into()),
     };
-    Ok(crate::sql::ast::InsertStmt {
+    Ok(crate::sql::parser::ast::InsertStmt {
         table,
         columns,
         source,
@@ -926,10 +926,10 @@ fn parse_generate_series_function_expr(
 fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, String> {
     use sqlparser::ast as sqlast;
     match expr {
-        sqlast::Expr::Identifier(ident) => Ok(Expr::Column(crate::sql::ast::ColumnRef {
+        sqlast::Expr::Identifier(ident) => Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
             name: ident.value.clone(),
         })),
-        sqlast::Expr::CompoundIdentifier(parts) => Ok(Expr::Column(crate::sql::ast::ColumnRef {
+        sqlast::Expr::CompoundIdentifier(parts) => Ok(Expr::Column(crate::sql::parser::ast::ColumnRef {
             name: parts
                 .last()
                 .map(|p| p.value.clone())
@@ -993,7 +993,7 @@ fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Result<Expr, St
             ..
         } => {
             let inner_expr = sqlparser_expr_to_custom_expr(inner)?;
-            let sql_type = crate::sql::dialect::convert_sql_type(data_type.clone())?;
+            let sql_type = crate::sql::parser::dialect::convert_sql_type(data_type.clone())?;
             Ok(Expr::Cast {
                 expr: Box::new(inner_expr),
                 data_type: sql_type,
@@ -1140,7 +1140,7 @@ fn execute_create_database_statement(
 
 fn execute_create_table_statement(
     state: &Arc<StandaloneState>,
-    stmt: crate::sql::ast::CreateTableStmt,
+    stmt: crate::sql::parser::ast::CreateTableStmt,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {

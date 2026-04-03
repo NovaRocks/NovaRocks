@@ -3,7 +3,7 @@ use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
 use super::peek_word_eq;
-use crate::sql::ast::CreateCatalogStmt;
+use crate::sql::parser::ast::CreateCatalogStmt;
 
 /// Parse: CREATE [EXTERNAL] CATALOG <name> [COMMENT '...'] PROPERTIES ( "key"="value", ... )
 pub(crate) fn parse_create_catalog_statement(

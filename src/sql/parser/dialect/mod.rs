@@ -7,7 +7,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use crate::sql::ast::{ObjectName, SqlType};
+use crate::sql::parser::ast::{ObjectName, SqlType};
 
 /// Custom StarRocks dialect for sqlparser.
 #[derive(Debug)]

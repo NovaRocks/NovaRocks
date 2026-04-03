@@ -410,9 +410,9 @@ impl<'a> AnalyzerContext<'a> {
             catalog: self.catalog,
             current_database: self.current_database,
             ctes: self.ctes.clone(),
+            pending_ctes: self.pending_ctes.clone(),
             next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
             collected_subqueries: std::cell::RefCell::new(Vec::new()),
-            shared_cte_ids: self.shared_cte_ids.clone(),
             cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
         };
 
@@ -440,32 +440,12 @@ impl<'a> AnalyzerContext<'a> {
         query: &sqlparser::ast::Query,
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), String> {
-        let child_ctx;
-        let ctx = if let Some(ref with_clause) = query.with {
-            let mut ctes = self.ctes.clone();
-            for cte in &with_clause.cte_tables {
-                let name = cte.alias.name.value.to_lowercase();
-                let col_aliases: Vec<String> = cte
-                    .alias
-                    .columns
-                    .iter()
-                    .map(|c| c.name.value.to_lowercase())
-                    .collect();
-                ctes.insert(name, (*cte.query.clone(), col_aliases));
-            }
-            child_ctx = AnalyzerContext {
-                catalog: self.catalog,
-                current_database: self.current_database,
-                ctes,
-                next_subquery_id: std::cell::Cell::new(self.next_subquery_id.get()),
-                collected_subqueries: std::cell::RefCell::new(Vec::new()),
-                shared_cte_ids: self.shared_cte_ids.clone(),
-                cte_registry: std::cell::RefCell::new(self.cte_registry.borrow().clone()),
-            };
-            &child_ctx
+        let maybe_child_ctx = if let Some(ref with_clause) = query.with {
+            Some(self.build_with_clause_context(with_clause)?)
         } else {
-            self
+            None
         };
+        let ctx = maybe_child_ctx.as_ref().unwrap_or(self);
 
         let body = query.body.as_ref();
         match body {
@@ -490,8 +470,21 @@ impl<'a> AnalyzerContext<'a> {
                 ))
             }
             _ => {
-                let resolved = ctx.analyze_query(query)?;
-                Ok((resolved, AnalyzerScope::new()))
+                let (body, cols) = ctx.analyze_set_expr(body)?;
+                let order_by = ctx.analyze_order_by(query, &cols, &body)?;
+                let limit = super::helpers::extract_limit(query)?;
+                let offset = super::helpers::extract_offset(query)?;
+
+                Ok((
+                    ResolvedQuery {
+                        body,
+                        order_by,
+                        limit,
+                        offset,
+                        output_columns: cols,
+                    },
+                    AnalyzerScope::new(),
+                ))
             }
         }
     }

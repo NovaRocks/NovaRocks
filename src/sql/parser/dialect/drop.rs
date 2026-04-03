@@ -2,7 +2,7 @@ use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 
 use super::{convert_object_name, peek_word_eq};
-use crate::sql::ast::{DropCatalogStmt, DropDatabaseStmt, DropTableStmt};
+use crate::sql::parser::ast::{DropCatalogStmt, DropDatabaseStmt, DropTableStmt};
 
 /// Result of parsing a DROP statement.
 pub(crate) enum DropResult {
