@@ -58,6 +58,9 @@ struct VisitResult {
     scope: ExprScope,
     /// Tuple IDs in this subtree's output.
     tuple_ids: Vec<i32>,
+    /// Exchange nodes in this fragment that consume from CTE fragments:
+    /// `(cte_id, exchange_node_id)`.
+    cte_exchange_nodes: Vec<(CteId, i32)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -78,9 +81,6 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     completed_fragments: Vec<FragmentBuildResult>,
     /// CTE ID -> index in `completed_fragments`.
     cte_fragments: HashMap<CteId, usize>,
-    /// Exchange node IDs that consume from CTE fragments, recorded for the root
-    /// fragment: `(cte_id, exchange_node_id)`.
-    cte_exchange_nodes: Vec<(CteId, i32)>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -104,7 +104,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             next_fragment_id: 0,
             completed_fragments: Vec::new(),
             cte_fragments: HashMap::new(),
-            cte_exchange_nodes: Vec::new(),
         };
 
         let result = builder.visit(plan)?;
@@ -143,7 +142,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             output_sink: build_result_sink(),
             output_columns,
             cte_id: None,
-            cte_exchange_nodes: builder.cte_exchange_nodes,
+            cte_exchange_nodes: result.cte_exchange_nodes,
         };
 
         // Patch all completed (child) fragments with the shared descriptor
@@ -335,6 +334,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes: vec![scan_plan_node],
             scope,
             tuple_ids: vec![scan_tuple_id],
+            cte_exchange_nodes: Vec::new(),
         })
     }
 
@@ -447,6 +447,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes,
             scope: project_scope,
             tuple_ids: vec![project_tuple_id],
+            cte_exchange_nodes: child.cte_exchange_nodes,
         })
     }
 
@@ -548,11 +549,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut plan_nodes = vec![join_plan_node];
         plan_nodes.extend(left.plan_nodes);
         plan_nodes.extend(right.plan_nodes);
+        let mut cte_exchange_nodes = left.cte_exchange_nodes;
+        cte_exchange_nodes.extend(right.cte_exchange_nodes);
 
         Ok(VisitResult {
             plan_nodes,
             scope: merged_scope,
             tuple_ids: merged_tuple_ids,
+            cte_exchange_nodes,
         })
     }
 
@@ -626,11 +630,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut plan_nodes = vec![join_plan_node];
         plan_nodes.extend(left.plan_nodes);
         plan_nodes.extend(right.plan_nodes);
+        let mut cte_exchange_nodes = left.cte_exchange_nodes;
+        cte_exchange_nodes.extend(right.cte_exchange_nodes);
 
         Ok(VisitResult {
             plan_nodes,
             scope: merged_scope,
             tuple_ids: merged_tuple_ids,
+            cte_exchange_nodes,
         })
     }
 
@@ -729,6 +736,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes,
             scope: agg_scope,
             tuple_ids: vec![agg_tuple_id],
+            cte_exchange_nodes: child.cte_exchange_nodes,
         })
     }
 
@@ -809,6 +817,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes,
             scope: child.scope,
             tuple_ids: child.tuple_ids,
+            cte_exchange_nodes: child.cte_exchange_nodes,
         })
     }
 
@@ -1020,6 +1029,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes,
             scope: output_scope,
             tuple_ids: child.tuple_ids,
+            cte_exchange_nodes: child.cte_exchange_nodes,
         })
     }
 
@@ -1070,6 +1080,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes: vec![scan_plan_node],
             scope,
             tuple_ids: vec![scan_tuple_id],
+            cte_exchange_nodes: Vec::new(),
         })
     }
 
@@ -1349,6 +1360,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes,
             scope: output_scope,
             tuple_ids: output_tuple_ids,
+            cte_exchange_nodes: child.cte_exchange_nodes,
         })
     }
 
@@ -1412,7 +1424,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 })
                 .collect(),
             cte_id: Some(op.cte_id),
-            cte_exchange_nodes: Vec::new(),
+            cte_exchange_nodes: child.cte_exchange_nodes,
         };
         let idx = self.completed_fragments.len();
         self.completed_fragments.push(cte_fragment);
@@ -1422,6 +1434,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes: Vec::new(),
             scope: child.scope,
             tuple_ids: child.tuple_ids,
+            cte_exchange_nodes: Vec::new(),
         })
     }
 
@@ -1441,10 +1454,6 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Allocate an exchange node that will receive data from the CTE
         // produce fragment's multicast sink.
         let exchange_node_id = self.alloc_node();
-
-        // Record this consumer so the root fragment carries the metadata
-        // needed by the coordinator to wire multicast destinations.
-        self.cte_exchange_nodes.push((op.cte_id, exchange_node_id));
 
         // Build the scope from the CTE consume's declared output columns
         // so that parent operators can resolve column references.
@@ -1479,6 +1488,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             plan_nodes: vec![exchange_node],
             scope,
             tuple_ids: vec![exchange_tuple_id],
+            cte_exchange_nodes: vec![(op.cte_id, exchange_node_id)],
         })
     }
 }

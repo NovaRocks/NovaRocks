@@ -3476,9 +3476,10 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
     }
 
     let default_port = crate::common::config::http_port();
-    let selected_port =
+    let started_port =
         match crate::service::grpc_server::start_grpc_exchange_server("127.0.0.1", default_port) {
-            Ok(()) => default_port,
+            Ok(()) => crate::service::grpc_server::grpc_server_bound_port()
+                .map_err(|e| format!("read standalone grpc exchange server port failed: {e}"))?,
             Err(e) if e.contains("Address already in use") || e.contains("os error 48") => {
                 let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|bind_err| {
                     format!("reserve standalone grpc exchange port failed: {bind_err}")
@@ -3497,19 +3498,21 @@ fn ensure_standalone_exchange_server() -> Result<u16, String> {
                             fallback_port, start_err
                         )
                     })?;
-                fallback_port
+                crate::service::grpc_server::grpc_server_bound_port().map_err(|e| {
+                    format!("read standalone grpc exchange server fallback port failed: {e}")
+                })?
             }
             Err(e) => return Err(format!("start standalone grpc exchange server failed: {e}")),
         };
 
-    wait_for_standalone_exchange_server(selected_port)?;
+    wait_for_standalone_exchange_server(started_port)?;
 
-    if STANDALONE_EXCHANGE_PORT.set(selected_port).is_err() {
+    if STANDALONE_EXCHANGE_PORT.set(started_port).is_err() {
         return Ok(*STANDALONE_EXCHANGE_PORT
             .get()
             .expect("standalone exchange port initialized"));
     }
-    Ok(selected_port)
+    Ok(started_port)
 }
 
 fn wait_for_standalone_exchange_server(port: u16) -> Result<(), String> {
@@ -3800,6 +3803,30 @@ mod tests {
             .query(
                 "WITH t AS (SELECT id FROM tbl) \
                     SELECT a.id FROM t a JOIN t b ON a.id = b.id ORDER BY 1",
+            )
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 3);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn embedded_query_executes_nested_multi_use_cte_through_multicast_reuse() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH outer_cte AS ( \
+                    WITH inner_cte AS (SELECT id FROM tbl) \
+                    SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \
+                ) \
+                SELECT x.id FROM outer_cte x JOIN outer_cte y ON x.id = y.id ORDER BY 1",
             )
             .expect("execute query");
 
