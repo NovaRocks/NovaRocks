@@ -1,14 +1,14 @@
 //! CTE (Common Table Expression) metadata types.
 //!
-//! The registry stores all non-recursive CTE definitions visible to the
-//! current query scope. Inline vs reuse is decided later by Cascades.
+//! The registry stores all non-recursive CTE definitions analyzed for the
+//! current query. Lexical visibility is tracked separately by the analyzer.
 
 use crate::sql::ir::{OutputColumn, ResolvedQuery};
 
 /// Unique identifier for a CTE within a query.
 pub(crate) type CteId = u32;
 
-/// Registry of all non-recursive CTEs produced by the analyzer.
+/// Accumulated registry of all non-recursive CTEs produced by the analyzer.
 /// The planner turns these definitions into `CTEProduce` / `CTEAnchor`
 /// structure; Cascades decides later whether to inline or reuse them.
 #[derive(Clone, Debug, Default)]

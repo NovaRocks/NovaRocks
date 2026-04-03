@@ -68,7 +68,7 @@ pub(super) struct AnalyzerContext<'a> {
     /// Subqueries collected during expression analysis.
     /// Populated by `resolve_expr.rs`, consumed by `subquery_rewrite.rs`.
     pub(super) collected_subqueries: std::cell::RefCell<Vec<SubqueryInfo>>,
-    /// Accumulated CTE registry for the current query scope.
+    /// Accumulated CTE registry for the current query analysis.
     pub(super) cte_registry: std::cell::RefCell<crate::sql::cte::CTERegistry>,
 }
 
@@ -84,11 +84,13 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         with_clause: &sqlast::With,
     ) -> Result<AnalyzerContext<'a>, String> {
-        let mut pending_ctes: std::collections::HashSet<String> = with_clause
-            .cte_tables
-            .iter()
-            .map(|cte| cte.alias.name.value.to_lowercase())
-            .collect();
+        let mut pending_ctes = self.pending_ctes.clone();
+        pending_ctes.extend(
+            with_clause
+                .cte_tables
+                .iter()
+                .map(|cte| cte.alias.name.value.to_lowercase()),
+        );
 
         let mut child_ctx = AnalyzerContext {
             catalog: self.catalog,
@@ -2114,6 +2116,20 @@ mod tests {
         let err = parse_and_analyze_with_registry(sql).expect_err("forward reference must fail");
         assert!(
             err.contains("forward CTE reference is not supported"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn test_nested_with_inherits_enclosing_pending_ctes() {
+        let sql = "WITH early AS (\
+                     WITH nested AS (SELECT * FROM orders) \
+                     SELECT * FROM nested\
+                   ), orders AS (SELECT 1 AS x) \
+                   SELECT * FROM early";
+        let err = parse_and_analyze_with_registry(sql).expect_err("forward reference must fail");
+        assert!(
+            err.contains("forward CTE reference is not supported: orders"),
             "err={err}"
         );
     }
