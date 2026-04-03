@@ -30,6 +30,7 @@ use crate::exec::node::scan::ScanNode;
 use crate::exec::operators::scan::dispatch::ScanDispatchState;
 use crate::exec::pipeline::dependency::DependencyManager;
 use crate::exec::pipeline::global_driver_executor::FragmentCompletion;
+use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::row_position::RowPositionDescriptor;
 use crate::fs::scan_context::FileScanRange;
 use crate::internal_service;
@@ -74,6 +75,7 @@ pub(crate) struct QueryContext {
     pub(crate) pending_runtime_filters: Vec<PendingRuntimeFilter>,
     pub(crate) row_pos_descs: HashMap<i32, RowPositionDescriptor>,
     pub(crate) glm_contexts: HashMap<SlotId, GlobalLateMaterializationContext>,
+    pub(crate) lake_glm_contexts: HashMap<SlotId, LakeGlmScanInfo>,
     pub(crate) lake_tablet_paths: HashMap<String, HashMap<i64, String>>,
     pub(crate) mem_tracker: Arc<MemTracker>,
 }
@@ -114,6 +116,7 @@ impl QueryContext {
             pending_runtime_filters: Vec::new(),
             row_pos_descs: HashMap::new(),
             glm_contexts: HashMap::new(),
+            lake_glm_contexts: HashMap::new(),
             lake_tablet_paths: HashMap::new(),
             mem_tracker,
         }
@@ -240,6 +243,14 @@ impl QueryContext {
         self.glm_contexts
             .get(&row_source_slot)
             .map(|ctx| ctx.scan_config.clone())
+    }
+
+    pub(crate) fn register_lake_glm(&mut self, row_source_slot: SlotId, info: LakeGlmScanInfo) {
+        self.lake_glm_contexts.insert(row_source_slot, info);
+    }
+
+    pub(crate) fn lake_glm_info(&self, row_source_slot: SlotId) -> Option<&LakeGlmScanInfo> {
+        self.lake_glm_contexts.get(&row_source_slot)
     }
 
     pub(crate) fn push_pending_runtime_filter(
@@ -557,6 +568,32 @@ impl QueryContextManager {
             .get(&query_id)
             .or_else(|| guard.second_chance.get(&query_id))
             .and_then(|ctx| ctx.glm_scan_config(row_source_slot))
+    }
+
+    pub(crate) fn register_lake_glm(
+        &self,
+        query_id: QueryId,
+        row_source_slot: SlotId,
+        info: LakeGlmScanInfo,
+    ) -> Result<(), String> {
+        self.with_context_mut(query_id, |ctx| {
+            ctx.register_lake_glm(row_source_slot, info);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn lake_glm_info(
+        &self,
+        query_id: QueryId,
+        row_source_slot: SlotId,
+    ) -> Option<LakeGlmScanInfo> {
+        let guard = self.inner.lock().expect("query_ctx_manager lock");
+        guard
+            .active
+            .get(&query_id)
+            .or_else(|| guard.second_chance.get(&query_id))
+            .and_then(|ctx| ctx.lake_glm_info(row_source_slot))
+            .cloned()
     }
 
     pub(crate) fn exchange_sender_count(&self, query_id: QueryId, node_id: i32) -> Option<usize> {

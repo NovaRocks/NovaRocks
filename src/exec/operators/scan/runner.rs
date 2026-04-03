@@ -38,6 +38,8 @@ use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::exec::row_position::RowPositionSpec;
+use crate::exec::node::scan::LakeGlmScanInfo;
+use crate::exec::row_position::LakeRowPositionSpec;
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
     filter_chunk_by_membership_filters_with_exprs,
@@ -160,12 +162,20 @@ pub(super) struct ScanAsyncRunner {
     current_morsel: Option<ScanMorsel>,
     driver_id: i32,
     row_position_state: Option<RowPositionState>,
+    lake_row_position_state: Option<LakeRowPositionState>,
 }
 
 struct RowPositionState {
     spec: RowPositionSpec,
     scan_range_id: i32,
     first_row_id: i64,
+    next_row_offset: i64,
+}
+
+struct LakeRowPositionState {
+    spec: LakeRowPositionSpec,
+    tablet_id: i64,
+    range_idx: i32,
     next_row_offset: i64,
 }
 
@@ -203,6 +213,7 @@ impl ScanAsyncRunner {
             current_morsel: None,
             driver_id,
             row_position_state: None,
+            lake_row_position_state: None,
         }
     }
 
@@ -309,11 +320,13 @@ impl ScanAsyncRunner {
                     self.finished = true;
                     self.current_morsel = None;
                     self.row_position_state = None;
+                    self.lake_row_position_state = None;
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
+                self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
                 let start = Instant::now();
                 self.morsel_iter = Some(
                     self.scan
@@ -385,6 +398,7 @@ impl ScanAsyncRunner {
                     self.morsel_iter = None;
                     self.current_morsel = None;
                     self.row_position_state = None;
+                    self.lake_row_position_state = None;
                     self.last_progress = Instant::now();
                     continue;
                 }
@@ -441,7 +455,27 @@ impl ScanAsyncRunner {
         }))
     }
 
+    fn build_lake_row_position_state(&self, morsel: &ScanMorsel) -> Option<LakeRowPositionState> {
+        let spec = self.scan.lake_row_position()?;
+        let ScanMorsel::StarRocksRange { tablet_id, index } = morsel else {
+            return None;
+        };
+        Some(LakeRowPositionState {
+            spec: spec.clone(),
+            tablet_id: *tablet_id,
+            range_idx: i32::try_from(*index).unwrap_or(i32::MAX),
+            next_row_offset: 0,
+        })
+    }
+
     fn append_row_position_columns(&mut self, chunk: Chunk) -> Result<Chunk, String> {
+        // Check lake GLM first (mutually exclusive with iceberg GLM)
+        if self.row_position_state.is_none() {
+            if let Some(state) = self.lake_row_position_state.as_mut() {
+                return Self::append_lake_row_position_cols(state, chunk);
+            }
+            return Ok(chunk);
+        }
         let Some(state) = self.row_position_state.as_mut() else {
             return Ok(chunk);
         };
@@ -526,6 +560,108 @@ impl ScanAsyncRunner {
 
         let _ = fields;
         Chunk::try_new_with_columns(Arc::new(ChunkSchema::try_new(slot_schemas)?), columns)
+    }
+
+    fn append_lake_row_position_cols(
+        state: &mut LakeRowPositionState,
+        chunk: Chunk,
+    ) -> Result<Chunk, String> {
+        let row_count = chunk.len();
+        if row_count == 0 {
+            return Ok(chunk);
+        }
+        let backend_id = crate::runtime::backend_id::backend_id()
+            .ok_or_else(|| "backend_id is not initialized for lake row position".to_string())?;
+        let source_id = i32::try_from(backend_id)
+            .map_err(|_| format!("backend_id {} does not fit in int32", backend_id))?;
+
+        let source_id_array =
+            Arc::new(Int32Array::from(vec![source_id; row_count])) as ArrayRef;
+        let tablet_id_array =
+            Arc::new(Int64Array::from(vec![state.tablet_id; row_count])) as ArrayRef;
+        let rss_id_array =
+            Arc::new(Int32Array::from(vec![state.range_idx; row_count])) as ArrayRef;
+
+        let start_offset = state.next_row_offset;
+        let row_id_values: Vec<i64> = (0..row_count as i64)
+            .map(|i| start_offset + i)
+            .collect();
+        state.next_row_offset += row_count as i64;
+        let row_id_array = Arc::new(Int64Array::from(row_id_values)) as ArrayRef;
+
+        let mut field_map = HashMap::new();
+        let chunk_schema = chunk.schema();
+        for (idx, slot_schema) in chunk.chunk_schema().slots().iter().enumerate() {
+            let field = chunk_schema.field(idx);
+            field_map.insert(slot_schema.slot_id(), (field, slot_schema.clone()));
+        }
+
+        let output_chunk_schema = chunk.chunk_schema().clone();
+        // We need to use the scan's output schema, but we only have the chunk here.
+        // Build output by scanning the output_chunk_schema of the ScanNode, but since we
+        // don't have scan here, we reconstruct by appending virtual cols to existing cols.
+        let existing_slots: Vec<_> = chunk.chunk_schema().slots().to_vec();
+
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        let mut slot_schemas_out = Vec::new();
+
+        // First output all existing storage columns
+        for (idx, slot_schema) in existing_slots.iter().enumerate() {
+            let field = chunk_schema.field(idx);
+            fields.push(field.clone());
+            columns.push(chunk.columns()[idx].clone());
+            slot_schemas_out.push(slot_schema.clone());
+        }
+
+        // Then append the four lake virtual columns
+        let spec = &state.spec;
+
+        fields.push(spec.source_id_field.clone());
+        columns.push(source_id_array);
+        slot_schemas_out.push(ChunkSlotSchema::new(
+            spec.source_id_slot,
+            spec.source_id_field.name().clone(),
+            spec.source_id_field.is_nullable(),
+            Some(scalar_type_desc(types::TPrimitiveType::INT)),
+            None,
+        ));
+
+        fields.push(spec.tablet_id_field.clone());
+        columns.push(tablet_id_array);
+        slot_schemas_out.push(ChunkSlotSchema::new(
+            spec.tablet_id_slot,
+            spec.tablet_id_field.name().clone(),
+            spec.tablet_id_field.is_nullable(),
+            Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+            None,
+        ));
+
+        fields.push(spec.rss_id_field.clone());
+        columns.push(rss_id_array);
+        slot_schemas_out.push(ChunkSlotSchema::new(
+            spec.rss_id_slot,
+            spec.rss_id_field.name().clone(),
+            spec.rss_id_field.is_nullable(),
+            Some(scalar_type_desc(types::TPrimitiveType::INT)),
+            None,
+        ));
+
+        fields.push(spec.row_id_field.clone());
+        columns.push(row_id_array);
+        slot_schemas_out.push(ChunkSlotSchema::new(
+            spec.row_id_slot,
+            spec.row_id_field.name().clone(),
+            spec.row_id_field.is_nullable(),
+            Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+            None,
+        ));
+
+        let _ = (fields, output_chunk_schema);
+        Chunk::try_new_with_columns(
+            Arc::new(ChunkSchema::try_new(slot_schemas_out)?),
+            columns,
+        )
     }
 
     fn maybe_log_stall(&mut self, mode: &str) {

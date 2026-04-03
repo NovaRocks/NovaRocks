@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
@@ -22,8 +22,9 @@ use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
-use crate::exec::row_position::RowPositionSpec;
+use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter};
+use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::fs::scan_context::FileScanRange;
 use crate::internal_service;
 use crate::novarocks_logging::warn;
@@ -43,6 +44,7 @@ pub enum ScanMorsel {
     },
     StarRocksRange {
         index: usize,
+        tablet_id: i64,
     },
     JdbcSingle,
     Exchange,
@@ -70,7 +72,9 @@ impl ScanMorsel {
                 "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} external_datacache={:?}",
                 path, file_len, offset, length, scan_range_id, first_row_id, external_datacache
             ),
-            ScanMorsel::StarRocksRange { index } => format!("starrocks_range_index={index}"),
+            ScanMorsel::StarRocksRange { index, tablet_id } => {
+                format!("starrocks_range_index={index} tablet_id={tablet_id}")
+            }
             ScanMorsel::JdbcSingle => "jdbc_single".to_string(),
             ScanMorsel::Exchange => "exchange".to_string(),
             ScanMorsel::IcebergMetadata { index } => {
@@ -198,6 +202,14 @@ pub trait ScanOp: Send + Sync {
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
 }
 
+/// Metadata needed to re-scan a lake tablet for late materialization lookups.
+#[derive(Clone, Debug)]
+pub struct LakeGlmScanInfo {
+    pub ranges: Vec<StarRocksScanRange>,
+    pub properties: BTreeMap<String, String>,
+    pub lake_schema_meta: Option<LakeScanSchemaMeta>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RowPositionScanConfig {
     pub file_format: descriptors::THdfsFileFormat,
@@ -226,6 +238,8 @@ pub struct ScanNode {
     row_position: Option<RowPositionSpec>,
     row_position_scan: Option<RowPositionScanConfig>,
     row_position_ranges: Option<Vec<FileScanRange>>,
+    lake_row_position: Option<LakeRowPositionSpec>,
+    lake_glm_info: Option<LakeGlmScanInfo>,
 }
 
 impl ScanNode {
@@ -243,6 +257,8 @@ impl ScanNode {
             row_position: None,
             row_position_scan: None,
             row_position_ranges: None,
+            lake_row_position: None,
+            lake_glm_info: None,
         }
     }
 
@@ -304,6 +320,16 @@ impl ScanNode {
         self
     }
 
+    pub fn with_lake_row_position(mut self, spec: Option<LakeRowPositionSpec>) -> Self {
+        self.lake_row_position = spec;
+        self
+    }
+
+    pub fn with_lake_glm_info(mut self, info: Option<LakeGlmScanInfo>) -> Self {
+        self.lake_glm_info = info;
+        self
+    }
+
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
     }
@@ -355,6 +381,14 @@ impl ScanNode {
 
     pub fn row_position_ranges(&self) -> Option<&[FileScanRange]> {
         self.row_position_ranges.as_deref()
+    }
+
+    pub fn lake_row_position(&self) -> Option<&LakeRowPositionSpec> {
+        self.lake_row_position.as_ref()
+    }
+
+    pub fn lake_glm_info(&self) -> Option<&LakeGlmScanInfo> {
+        self.lake_glm_info.as_ref()
     }
 
     pub fn add_runtime_filter_specs(&mut self, specs: &[RuntimeFilterProbeSpec]) {

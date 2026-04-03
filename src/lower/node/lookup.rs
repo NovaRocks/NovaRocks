@@ -34,12 +34,6 @@ fn lower_row_pos_descs(
         let row_position_type = desc
             .row_position_type
             .ok_or_else(|| "missing row_position_type".to_string())?;
-        if row_position_type != descriptors::TRowPositionType::ICEBERG_V3_ROW_POSITION {
-            return Err(format!(
-                "unsupported row position type: {:?}",
-                row_position_type
-            ));
-        }
         let row_source_slot = desc
             .row_source_slot
             .ok_or_else(|| "missing row_source_slot".to_string())?;

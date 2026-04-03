@@ -31,8 +31,13 @@ use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
     Layout, chunk_schema_for_layout, chunk_schema_for_tuple, find_tuple_descriptor,
     layout_for_row_tuples, layout_from_slot_ids, slot_arrow_type_lookup,
+    slot_display_name_from_desc,
 };
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
+use crate::exec::node::scan::LakeGlmScanInfo;
+use crate::exec::row_position::{
+    LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
+};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
@@ -116,8 +121,121 @@ pub(crate) fn lower_lake_scan_node(
             .collect();
     }
 
+    // Detect lake GLM virtual column slots (synthesized by scan runner, not in storage).
+    // They must be excluded from the storage schemas so the native reader ignores them.
+    let slot_desc_lookup: HashMap<types::TSlotId, &descriptors::TSlotDescriptor> = desc_tbl
+        .slot_descriptors
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|s| s.id.map(|id| (id, s)))
+        .collect();
+
+    let mut source_id_info: Option<(SlotId, arrow::datatypes::Field)> = None;
+    let mut tablet_id_info: Option<(SlotId, arrow::datatypes::Field)> = None;
+    let mut rss_id_info: Option<(SlotId, arrow::datatypes::Field)> = None;
+    let mut row_id_info: Option<(SlotId, arrow::datatypes::Field)> = None;
+
+    // Separate virtual cols from storage cols; produce a storage-only order
+    let mut storage_order: Vec<(types::TTupleId, types::TSlotId)> =
+        Vec::with_capacity(scan_layout.order.len());
+    for entry @ (_tup_id, slot_id_raw) in &scan_layout.order {
+        let found_virtual = 'check: {
+            let Some(s) = slot_desc_lookup.get(slot_id_raw) else {
+                break 'check false;
+            };
+            let Ok(slot_id) = SlotId::try_from(*slot_id_raw) else {
+                break 'check false;
+            };
+            let Some(slot_type) = s.slot_type.as_ref() else {
+                break 'check false;
+            };
+            let Some(arrow_type) = crate::lower::type_lowering::arrow_type_from_desc(slot_type)
+            else {
+                break 'check false;
+            };
+            let name = slot_display_name_from_desc(s);
+            let nullable = s.is_nullable.unwrap_or(true);
+            if is_lake_source_id(&name) {
+                source_id_info = Some((
+                    slot_id,
+                    arrow::datatypes::Field::new(&name, arrow_type, nullable),
+                ));
+                break 'check true;
+            }
+            if is_lake_tablet_id(&name) {
+                tablet_id_info = Some((
+                    slot_id,
+                    arrow::datatypes::Field::new(&name, arrow_type, nullable),
+                ));
+                break 'check true;
+            }
+            if is_lake_rss_id(&name) {
+                rss_id_info = Some((
+                    slot_id,
+                    arrow::datatypes::Field::new(&name, arrow_type, nullable),
+                ));
+                break 'check true;
+            }
+            if is_lake_row_id(&name) {
+                row_id_info = Some((
+                    slot_id,
+                    arrow::datatypes::Field::new(&name, arrow_type, nullable),
+                ));
+                break 'check true;
+            }
+            false
+        };
+        if !found_virtual {
+            storage_order.push(*entry);
+        }
+    }
+
+    let lake_row_position_spec = match (source_id_info, tablet_id_info, rss_id_info, row_id_info) {
+        (None, None, None, None) => None,
+        (
+            Some((source_id_slot, source_id_field)),
+            Some((tablet_id_slot, tablet_id_field)),
+            Some((rss_id_slot, rss_id_field)),
+            Some((row_id_slot, row_id_field)),
+        ) => Some(LakeRowPositionSpec {
+            source_id_slot,
+            tablet_id_slot,
+            rss_id_slot,
+            row_id_slot,
+            source_id_field,
+            tablet_id_field,
+            rss_id_field,
+            row_id_field,
+        }),
+        _ => {
+            return Err(format!(
+                "LAKE_SCAN_NODE node_id={} lake row position slots must all be present together \
+                (_source_id_/_tablet_id_/_rss_id_/_row_id_)",
+                node.node_id
+            ));
+        }
+    };
+
+    if lake_row_position_spec.is_some() {
+        // Rebuild scan_layout with virtual cols removed
+        scan_layout.order = storage_order;
+        scan_layout.index = scan_layout
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (*key, i))
+            .collect();
+    }
+
     let scan_output_chunk_schema = chunk_schema_for_layout(desc_tbl, &scan_layout)?;
-    let required_chunk_schema = chunk_schema_for_tuple(desc_tbl, tuple_id)?;
+    // When lake GLM virtual cols are present, build required_chunk_schema from the storage-only
+    // layout; otherwise fall back to the full tuple layout.
+    let required_chunk_schema = if lake_row_position_spec.is_some() {
+        scan_output_chunk_schema.clone()
+    } else {
+        chunk_schema_for_tuple(desc_tbl, tuple_id)?
+    };
     let scan_output_schema = scan_output_chunk_schema.arrow_schema_ref();
     if !scan_output_chunk_schema.slot_ids().is_empty()
         && scan_output_chunk_schema.slot_ids().len() != scan_output_schema.fields().len()
@@ -378,13 +496,23 @@ pub(crate) fn lower_lake_scan_node(
         }),
     };
 
+    let lake_row_position_spec_active = lake_row_position_spec.is_some();
+
+    let lake_glm_info = lake_row_position_spec.as_ref().map(|_| LakeGlmScanInfo {
+        ranges: cfg.ranges.clone(),
+        properties: cfg.properties.clone(),
+        lake_schema_meta: cfg.lake_schema_meta.clone(),
+    });
+
     let scan = connectors
         .create_scan_node("starrocks", ScanConfig::StarRocks(cfg))?
         .with_node_id(node.node_id)
         .with_output_chunk_schema(scan_output_chunk_schema.clone())
         .with_limit(limit)
         .with_connector_io_tasks_per_scan_operator(connector_io_tasks_per_scan_operator)
-        .with_local_rf_waiting_set(local_rf_waiting_set(node));
+        .with_local_rf_waiting_set(local_rf_waiting_set(node))
+        .with_lake_row_position(lake_row_position_spec)
+        .with_lake_glm_info(lake_glm_info);
     let scan_lowered = Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan),
@@ -392,7 +520,9 @@ pub(crate) fn lower_lake_scan_node(
         layout: scan_layout,
     };
 
-    if dict_int_to_string.is_empty() || scan_lowered.layout.order == original_out_layout.order {
+    // Skip the dict-expansion projection if there's nothing to remap,
+    // or if lake GLM virtual cols were removed (that difference is not dict-related).
+    if dict_int_to_string.is_empty() || lake_row_position_spec_active {
         return Ok(scan_lowered);
     }
 

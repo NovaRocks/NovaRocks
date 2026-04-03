@@ -185,6 +185,7 @@ impl OperatorFactory for ScanSourceFactory {
             submit_failures: AtomicUsize::new(0),
             first_submit_failure_at: Mutex::new(None),
             row_position_registered: false,
+            lake_row_position_registered: false,
             incremental_registered: false,
         })
     }
@@ -215,6 +216,7 @@ struct ScanSourceOperator {
     submit_failures: AtomicUsize,
     first_submit_failure_at: Mutex<Option<Instant>>,
     row_position_registered: bool,
+    lake_row_position_registered: bool,
     incremental_registered: bool,
 }
 
@@ -257,6 +259,29 @@ impl ScanSourceOperator {
             ranges.to_vec(),
         )?;
         self.row_position_registered = true;
+        Ok(())
+    }
+
+    fn register_lake_row_position(&mut self, state: &RuntimeState) -> Result<(), String> {
+        if self.lake_row_position_registered {
+            return Ok(());
+        }
+        let Some(spec) = self.scan.lake_row_position() else {
+            self.lake_row_position_registered = true;
+            return Ok(());
+        };
+        let Some(info) = self.scan.lake_glm_info() else {
+            return Err("lake_row_position set but lake_glm_info missing".to_string());
+        };
+        let Some(query_id) = state.query_id() else {
+            return Err("lake row position requires query_id".to_string());
+        };
+        crate::runtime::query_context::query_context_manager().register_lake_glm(
+            query_id,
+            spec.source_id_slot,
+            info.clone(),
+        )?;
+        self.lake_row_position_registered = true;
         Ok(())
     }
 
@@ -639,6 +664,7 @@ impl ProcessorOperator for ScanSourceOperator {
     fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
         self.register_incremental_dispatch(state)?;
         self.register_row_position(state)?;
+        self.register_lake_row_position(state)?;
         self.async_state.ensure_mem_tracker(state);
         let chunk = self.async_state.pop_chunk()?;
         self.maybe_start_async_scan();

@@ -33,7 +33,7 @@ pub use crate::fs::scan_context::FileScanRange;
 pub use hdfs::HdfsScanConfig;
 pub use iceberg::IcebergMetadataScanConfig;
 pub use jdbc::JdbcScanConfig;
-pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanRange};
+pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};
 
 #[derive(Clone, Debug)]
 pub enum ScanConfig {

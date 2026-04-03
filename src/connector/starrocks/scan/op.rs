@@ -108,7 +108,7 @@ impl ScanOp for StarRocksScanOp {
         profile: Option<RuntimeProfile>,
         _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
-        let ScanMorsel::StarRocksRange { index } = morsel else {
+        let ScanMorsel::StarRocksRange { index, .. } = morsel else {
             return Err("starrocks scan received unexpected morsel".to_string());
         };
 
@@ -135,8 +135,15 @@ impl ScanOp for StarRocksScanOp {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        let morsels = (0..self.cfg.ranges.len())
-            .map(|index| ScanMorsel::StarRocksRange { index })
+        let morsels = self
+            .cfg
+            .ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| ScanMorsel::StarRocksRange {
+                index,
+                tablet_id: range.tablet_id,
+            })
             .collect();
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
     }

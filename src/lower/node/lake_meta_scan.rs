@@ -1322,6 +1322,13 @@ fn resolve_dict_scan_arrow_type(
     column_id: &str,
 ) -> Result<DataType, String> {
     let target = column_id.trim();
+
+    // JSON sub-column references (e.g., "history_content_json.field") are not
+    // dictionary-encoded storage columns; treat them as plain strings.
+    if target.contains('.') {
+        return Ok(DataType::Utf8);
+    }
+
     for column in &tablet_schema.column {
         let Some(name) = column.name.as_ref() else {
             continue;

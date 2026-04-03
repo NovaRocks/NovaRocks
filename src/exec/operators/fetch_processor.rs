@@ -38,7 +38,10 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::runtime::lookup::{decode_column_ipc, encode_column_ipc, execute_lookup_request};
+use crate::descriptors::TRowPositionType;
+use crate::runtime::lookup::{
+    decode_column_ipc, encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
+};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
 use crate::service::grpc_proto as internal_proto;
@@ -162,10 +165,14 @@ impl FetchProcessor {
                 continue;
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
-            if fetch_ref_slots.len() != 2 {
+            let is_lake = row_pos_desc.row_position_type
+                == TRowPositionType::LAKE_ROW_POSITION;
+            let expected_ref_slots = if is_lake { 3 } else { 2 };
+            if fetch_ref_slots.len() != expected_ref_slots {
                 return Err(format!(
-                    "FETCH_NODE node_id={} expects 2 fetch_ref_slots, got {}",
+                    "FETCH_NODE node_id={} expects {} fetch_ref_slots, got {}",
                     self.node_id,
+                    expected_ref_slots,
                     fetch_ref_slots.len()
                 ));
             }
@@ -179,23 +186,22 @@ impl FetchProcessor {
                 return Err("row_source_id column contains nulls".to_string());
             }
 
-            let scan_range_col = chunk.column_by_slot_id(fetch_ref_slots[0])?;
-            let row_id_col = chunk.column_by_slot_id(fetch_ref_slots[1])?;
-
             let groups = group_positions_by_backend(row_source_col)?;
             let mut group_results: Vec<HashMap<SlotId, ArrayRef>> = Vec::new();
             for (backend_id, positions) in &groups {
                 let indices =
                     UInt32Array::from(positions.iter().map(|v| *v as u32).collect::<Vec<_>>());
-                let scan_range =
-                    take(&scan_range_col, &indices, None).map_err(|e| e.to_string())?;
-                let row_id = take(&row_id_col, &indices, None).map_err(|e| e.to_string())?;
 
                 let mut request_columns = HashMap::new();
-                request_columns.insert(fetch_ref_slots[0], scan_range);
-                request_columns.insert(fetch_ref_slots[1], row_id);
+                for slot_id in fetch_ref_slots {
+                    let col = chunk.column_by_slot_id(*slot_id)?;
+                    let taken = take(col.as_ref(), &indices, None).map_err(|e| e.to_string())?;
+                    request_columns.insert(*slot_id, taken);
+                }
 
-                let response_columns = if self.is_local_backend(*backend_id)? {
+                let response_columns = if is_lake {
+                    execute_lake_lookup_request(query_id, *tuple_id, request_columns)?
+                } else if self.is_local_backend(*backend_id)? {
                     execute_lookup_request(query_id, *tuple_id, request_columns)?
                 } else {
                     self.lookup_remote(query_id, *tuple_id, &request_columns, *backend_id)?
