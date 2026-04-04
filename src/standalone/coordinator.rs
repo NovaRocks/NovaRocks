@@ -61,6 +61,7 @@ impl ExecutionCoordinator {
             fragment_results,
             root_fragment_id,
             edges,
+            rf_plan: _rf_plan,
         } = self.build_result;
         let exchange_host = self.exchange_host;
         let exchange_port = self.exchange_port;
