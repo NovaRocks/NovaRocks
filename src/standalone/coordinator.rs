@@ -494,6 +494,26 @@ impl ExecutionCoordinator {
         let handle = ResultSinkHandle::new();
         let exchange_finst_id = Some((root_instance_id.0, root_instance_id.1));
 
+        let root_query_id = Some(crate::runtime::query_context::QueryId {
+            hi: query_id_hi,
+            lo: query_id_lo,
+        });
+        let root_finst_id = Some(crate::common::types::UniqueId {
+            hi: root_instance_id.0,
+            lo: root_instance_id.1,
+        });
+        let root_runtime_state = Arc::new(RuntimeState::new(
+            None, // query_options
+            None, // cache_options
+            root_query_id,
+            root_exec_params.runtime_filter_params.clone(),
+            root_finst_id,
+            None, // backend_num
+            None, // mem_tracker
+            None, // spill_config
+            None, // spill_manager
+        ));
+
         execute_plan_with_pipeline(
             exec_plan,
             false,
@@ -502,8 +522,8 @@ impl ExecutionCoordinator {
             exchange_finst_id,
             None, // profiler
             pipeline_dop,
-            Arc::new(RuntimeState::default()),
-            None, // query_id
+            root_runtime_state,
+            root_query_id,
             None, // fe_addr
             None, // backend_num
         )?;

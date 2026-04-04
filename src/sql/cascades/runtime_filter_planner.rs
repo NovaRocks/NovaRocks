@@ -33,7 +33,7 @@ pub(crate) struct RuntimeFilterPlanResult {
 pub(crate) fn plan_runtime_filters(
     fragment_results: &mut [FragmentBuildResult],
     scan_tuple_owners: &HashMap<i32, ScanTupleOwner>,
-    join_fragment_map: &HashMap<i32, FragmentId>,
+    _join_fragment_map: &HashMap<i32, FragmentId>,
     join_distributions: &HashMap<i32, JoinDistribution>,
     pipeline_dop: i32,
 ) -> RuntimeFilterPlanResult {
