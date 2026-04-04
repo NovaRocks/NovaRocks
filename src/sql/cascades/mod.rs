@@ -6,6 +6,7 @@ pub(crate) mod cte_rewrite;
 pub(crate) mod extract;
 pub(crate) mod fragment_builder;
 pub(crate) mod memo;
+pub(crate) mod runtime_filter_planner;
 pub(crate) mod operator;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
