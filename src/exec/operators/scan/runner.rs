@@ -34,12 +34,12 @@ use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::node::BoxedExecIter;
+use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
-use crate::exec::row_position::RowPositionSpec;
-use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::row_position::LakeRowPositionSpec;
+use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
     filter_chunk_by_membership_filters_with_exprs,
@@ -575,17 +575,13 @@ impl ScanAsyncRunner {
         let source_id = i32::try_from(backend_id)
             .map_err(|_| format!("backend_id {} does not fit in int32", backend_id))?;
 
-        let source_id_array =
-            Arc::new(Int32Array::from(vec![source_id; row_count])) as ArrayRef;
+        let source_id_array = Arc::new(Int32Array::from(vec![source_id; row_count])) as ArrayRef;
         let tablet_id_array =
             Arc::new(Int64Array::from(vec![state.tablet_id; row_count])) as ArrayRef;
-        let rss_id_array =
-            Arc::new(Int32Array::from(vec![state.range_idx; row_count])) as ArrayRef;
+        let rss_id_array = Arc::new(Int32Array::from(vec![state.range_idx; row_count])) as ArrayRef;
 
         let start_offset = state.next_row_offset;
-        let row_id_values: Vec<i64> = (0..row_count as i64)
-            .map(|i| start_offset + i)
-            .collect();
+        let row_id_values: Vec<i64> = (0..row_count as i64).map(|i| start_offset + i).collect();
         state.next_row_offset += row_count as i64;
         let row_id_array = Arc::new(Int64Array::from(row_id_values)) as ArrayRef;
 
@@ -658,10 +654,7 @@ impl ScanAsyncRunner {
         ));
 
         let _ = (fields, output_chunk_schema);
-        Chunk::try_new_with_columns(
-            Arc::new(ChunkSchema::try_new(slot_schemas_out)?),
-            columns,
-        )
+        Chunk::try_new_with_columns(Arc::new(ChunkSchema::try_new(slot_schemas_out)?), columns)
     }
 
     fn maybe_log_stall(&mut self, mode: &str) {

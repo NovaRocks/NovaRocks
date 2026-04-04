@@ -102,8 +102,7 @@ impl SearchContext {
 
             if provided.satisfies(required) {
                 // --- Direct satisfaction path ---
-                let child_reqs =
-                    required_input_properties(&expr.op, required, expr.children.len());
+                let child_reqs = required_input_properties(&expr.op, required, expr.children.len());
 
                 // Compute own cost.
                 let own_stats = derive_statistics(expr, memo, &self.table_stats);

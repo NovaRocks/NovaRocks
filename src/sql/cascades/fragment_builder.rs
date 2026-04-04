@@ -13,6 +13,7 @@ use arrow::datatypes::DataType;
 
 use crate::data_sinks;
 use crate::exprs;
+use crate::partitions;
 use crate::plan_nodes;
 
 use crate::sql::cascades::operator::Operator;
@@ -35,19 +36,12 @@ use crate::sql::physical::expr_compiler::{self, ExprCompiler};
 use crate::sql::physical::nodes;
 use crate::sql::physical::resolve::{ColumnBinding, ExprScope, ResolvedTable};
 use crate::sql::physical::type_infer;
-use crate::sql::physical::{FragmentBuildResult, OutputColumn};
+use crate::sql::physical::{
+    FragmentBuildResult, FragmentEdge, FragmentEdgeKind, MultiFragmentBuildResult, OutputColumn,
+};
 
 use crate::sql::ir::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::plan::AggregateCall;
-
-// ---------------------------------------------------------------------------
-// Public result type
-// ---------------------------------------------------------------------------
-
-pub(crate) struct BuildResult {
-    pub fragments: Vec<FragmentBuildResult>,
-    pub root_fragment_id: FragmentId,
-}
 
 // ---------------------------------------------------------------------------
 // Internal visitor result
@@ -78,9 +72,13 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     next_slot_id: i32,
     next_tuple_id: i32,
     next_fragment_id: FragmentId,
+    /// Fragment ids for current visit context. Top is active fragment id.
+    fragment_stack: Vec<FragmentId>,
     /// Fragments finalized during visitation (child fragments from distribution
     /// boundaries and CTE produce fragments).
     completed_fragments: Vec<FragmentBuildResult>,
+    /// Fragment-to-fragment stream/multicast edges.
+    completed_edges: Vec<FragmentEdge>,
     /// CTE ID -> index in `completed_fragments`.
     cte_fragments: HashMap<CteId, usize>,
 }
@@ -94,7 +92,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         plan: &PhysicalPlanNode,
         catalog: &'a dyn CatalogProvider,
         current_database: &str,
-    ) -> Result<BuildResult, String> {
+    ) -> Result<MultiFragmentBuildResult, String> {
         let mut builder = PlanFragmentBuilder {
             catalog,
             current_database,
@@ -104,10 +102,30 @@ impl<'a> PlanFragmentBuilder<'a> {
             next_slot_id: 1,
             next_tuple_id: 1,
             next_fragment_id: 0,
+            fragment_stack: Vec::new(),
             completed_fragments: Vec::new(),
+            completed_edges: Vec::new(),
             cte_fragments: HashMap::new(),
         };
 
+        // Elide a root-level Gather: on a single node the top-level gather
+        // adds an unnecessary fragment boundary.
+        let plan = match &plan.op {
+            Operator::PhysicalDistribution(op)
+                if matches!(
+                    op.spec,
+                    crate::sql::cascades::property::DistributionSpec::Gather
+                ) =>
+            {
+                plan.children
+                    .first()
+                    .ok_or_else(|| "root PhysicalDistribution(Gather) missing child".to_string())?
+            }
+            _ => plan,
+        };
+
+        let root_fragment_id = builder.alloc_fragment_id();
+        builder.fragment_stack.push(root_fragment_id);
         let result = builder.visit(plan)?;
 
         // Build the shared descriptor table and exec params.  All fragments
@@ -135,7 +153,6 @@ impl<'a> PlanFragmentBuilder<'a> {
             .collect();
 
         // Build the root fragment with a result sink.
-        let root_fragment_id = builder.alloc_fragment_id();
         let root_fragment = FragmentBuildResult {
             fragment_id: root_fragment_id,
             plan: plan_nodes::TPlan::new(result.plan_nodes),
@@ -155,12 +172,13 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
 
         // Assemble all fragments: completed child fragments first, then root.
-        let mut fragments = builder.completed_fragments;
-        fragments.push(root_fragment);
+        let mut fragment_results = builder.completed_fragments;
+        fragment_results.push(root_fragment);
 
-        Ok(BuildResult {
-            fragments,
+        Ok(MultiFragmentBuildResult {
+            fragment_results,
             root_fragment_id,
+            edges: builder.completed_edges,
         })
     }
 
@@ -190,6 +208,13 @@ impl<'a> PlanFragmentBuilder<'a> {
         let id = self.next_fragment_id;
         self.next_fragment_id += 1;
         id
+    }
+
+    fn current_fragment_id(&self) -> Result<FragmentId, String> {
+        self.fragment_stack
+            .last()
+            .copied()
+            .ok_or_else(|| "no active fragment id in builder".to_string())
     }
 
     // -------------------------------------------------------------------
@@ -1366,15 +1391,109 @@ impl<'a> PlanFragmentBuilder<'a> {
     // visit_distribution
     // -------------------------------------------------------------------
 
+    fn build_output_partition(
+        &self,
+        spec: &crate::sql::cascades::property::DistributionSpec,
+        child_scope: &ExprScope,
+    ) -> Result<partitions::TDataPartition, String> {
+        match spec {
+            crate::sql::cascades::property::DistributionSpec::Gather => {
+                Ok(unpartitioned_stream_partition())
+            }
+            crate::sql::cascades::property::DistributionSpec::HashPartitioned(cols) => {
+                let mut partition_exprs = Vec::with_capacity(cols.len());
+                for col in cols {
+                    let binding = child_scope
+                        .resolve_column(col.qualifier.as_deref(), &col.column)?
+                        .clone();
+                    let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+                    partition_exprs.push(expr_compiler::build_slot_ref_texpr(
+                        binding.slot_id,
+                        binding.tuple_id,
+                        type_desc,
+                    ));
+                }
+                Ok(partitions::TDataPartition::new(
+                    partitions::TPartitionType::HASH_PARTITIONED,
+                    Some(partition_exprs),
+                    None::<Vec<partitions::TRangePartition>>,
+                    None::<Vec<partitions::TBucketProperty>>,
+                ))
+            }
+            crate::sql::cascades::property::DistributionSpec::Any => {
+                Err("PhysicalDistribution(Any) is not supported in fragment builder".to_string())
+            }
+        }
+    }
+
     fn visit_distribution(
         &mut self,
-        _op: &PhysicalDistributionOp,
+        op: &PhysicalDistributionOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        // In standalone mode (single node), distribution enforcers are logical
-        // markers for cost model purposes.  Actual execution doesn't need
-        // separate fragments — all data is local.  Pass through to child.
-        self.visit(&node.children[0])
+        if node.children.len() != 1 {
+            return Err(format!(
+                "PhysicalDistribution expected exactly 1 child, got {}",
+                node.children.len()
+            ));
+        }
+
+        let parent_fragment_id = self.current_fragment_id()?;
+        let child_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(child_fragment_id);
+        let child_result = self.visit(&node.children[0]);
+        self.fragment_stack.pop();
+        let child = child_result?;
+        let VisitResult {
+            plan_nodes,
+            scope,
+            tuple_ids,
+            cte_exchange_nodes,
+        } = child;
+
+        let output_partition = self.build_output_partition(&op.spec, &scope)?;
+        let exchange_partition_type = output_partition.type_.clone();
+
+        self.completed_fragments.push(FragmentBuildResult {
+            fragment_id: child_fragment_id,
+            plan: plan_nodes::TPlan::new(plan_nodes),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi(&[])?,
+            output_sink: build_noop_sink(),
+            output_columns: node.children[0]
+                .output_columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect(),
+            cte_id: None,
+            cte_exchange_nodes,
+        });
+
+        let exchange_node_id = self.alloc_node();
+        let exchange_node = nodes::build_exchange_node(
+            exchange_node_id,
+            tuple_ids.clone(),
+            exchange_partition_type,
+        );
+
+        self.completed_edges.push(FragmentEdge {
+            source_fragment_id: child_fragment_id,
+            target_fragment_id: parent_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition,
+            edge_kind: FragmentEdgeKind::Stream,
+        });
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope,
+            tuple_ids,
+            cte_exchange_nodes: Vec::new(),
+        })
     }
 
     // -------------------------------------------------------------------
@@ -1494,9 +1613,8 @@ impl<'a> PlanFragmentBuilder<'a> {
             let mut expr_list = Vec::new();
             for (col_idx, (_, child_binding)) in child_result.scope.iter_columns().enumerate() {
                 let output_type = first_child_cols.get(col_idx).map(|(_, b)| &b.data_type);
-                let needs_cast =
-                    matches!(child_binding.data_type, DataType::Null)
-                        && output_type.is_some_and(|t| !matches!(t, DataType::Null));
+                let needs_cast = matches!(child_binding.data_type, DataType::Null)
+                    && output_type.is_some_and(|t| !matches!(t, DataType::Null));
                 if needs_cast {
                     let target_type = output_type.unwrap();
                     let target_desc = type_infer::arrow_type_to_type_desc(target_type)?;
@@ -1720,7 +1838,11 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         self.desc_builder.add_tuple(exchange_tuple_id);
 
-        let exchange_node = nodes::build_exchange_node(exchange_node_id, vec![exchange_tuple_id]);
+        let exchange_node = nodes::build_exchange_node(
+            exchange_node_id,
+            vec![exchange_tuple_id],
+            partitions::TPartitionType::UNPARTITIONED,
+        );
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],
@@ -1734,6 +1856,15 @@ impl<'a> PlanFragmentBuilder<'a> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn unpartitioned_stream_partition() -> partitions::TDataPartition {
+    partitions::TDataPartition::new(
+        partitions::TPartitionType::UNPARTITIONED,
+        None::<Vec<crate::exprs::TExpr>>,
+        None::<Vec<partitions::TRangePartition>>,
+        None::<Vec<partitions::TBucketProperty>>,
+    )
+}
 
 fn build_result_sink() -> data_sinks::TDataSink {
     data_sinks::TDataSink::new(
@@ -1778,4 +1909,244 @@ fn build_noop_sink() -> data_sinks::TDataSink {
         None::<i64>,
         None::<data_sinks::TSplitDataStreamSink>,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use arrow::datatypes::DataType;
+    use tempfile::NamedTempFile;
+
+    use super::*;
+    use crate::plan_nodes;
+    use crate::sql::cascades::operator::{
+        Operator, PhysicalDistributionOp, PhysicalScanOp, PhysicalSortOp,
+    };
+    use crate::sql::cascades::physical_plan::PhysicalPlanNode;
+    use crate::sql::cascades::property::DistributionSpec;
+    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+    use crate::sql::ir::{ExprKind, OutputColumn, SortItem, TypedExpr};
+    use crate::sql::statistics::Statistics;
+
+    struct DummyCatalog;
+
+    impl CatalogProvider for DummyCatalog {
+        fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
+            Err("not used in scan-only builder tests".to_string())
+        }
+    }
+
+    fn output_columns() -> Vec<OutputColumn> {
+        vec![OutputColumn {
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+        }]
+    }
+
+    fn id_expr() -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: "id".to_string(),
+            },
+            data_type: DataType::Int32,
+            nullable: false,
+        }
+    }
+
+    fn stats() -> Statistics {
+        Statistics {
+            output_row_count: 3.0,
+            column_statistics: HashMap::new(),
+        }
+    }
+
+    fn scan_plan(path: PathBuf) -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    storage: TableStorage::LocalParquetFile { path },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    #[test]
+    fn build_splits_gather_distribution_into_stream_edge() {
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: id_expr(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+            }),
+            children: vec![PhysicalPlanNode {
+                op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                    spec: DistributionSpec::Gather,
+                }),
+                children: vec![scan_plan(file.path().to_path_buf())],
+                stats: stats(),
+                output_columns: output_columns(),
+            }],
+            stats: stats(),
+            output_columns: output_columns(),
+        };
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+
+        assert_eq!(build.fragment_results.len(), 2);
+        assert_eq!(build.edges.len(), 1);
+        assert!(matches!(
+            build.edges[0].edge_kind,
+            crate::sql::physical::FragmentEdgeKind::Stream
+        ));
+
+        let root = build
+            .fragment_results
+            .iter()
+            .find(|fragment| fragment.fragment_id == build.root_fragment_id)
+            .expect("root fragment");
+        assert!(
+            root.plan
+                .nodes
+                .iter()
+                .any(|node| { node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE })
+        );
+    }
+
+    #[test]
+    fn build_nested_gather_distribution_targets_immediate_parent_fragment() {
+        // Wrap the nested gathers inside a Sort so the root is NOT a Gather
+        // (root-level Gather is elided).
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalSort(PhysicalSortOp {
+                items: vec![SortItem {
+                    expr: id_expr(),
+                    asc: true,
+                    nulls_first: false,
+                }],
+            }),
+            children: vec![PhysicalPlanNode {
+                op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                    spec: DistributionSpec::Gather,
+                }),
+                children: vec![PhysicalPlanNode {
+                    op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                        spec: DistributionSpec::Gather,
+                    }),
+                    children: vec![scan_plan(file.path().to_path_buf())],
+                    stats: stats(),
+                    output_columns: output_columns(),
+                }],
+                stats: stats(),
+                output_columns: output_columns(),
+            }],
+            stats: stats(),
+            output_columns: output_columns(),
+        };
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        assert_eq!(build.fragment_results.len(), 3);
+        assert_eq!(build.edges.len(), 2);
+
+        // The inner gather targets its immediate parent (the outer gather fragment),
+        // not the root fragment directly.
+        let outer_gather_frag_id = build
+            .edges
+            .iter()
+            .find(|e| e.target_fragment_id == build.root_fragment_id)
+            .expect("edge to root")
+            .source_fragment_id;
+        assert!(build.edges.iter().any(|e| {
+            e.target_fragment_id == outer_gather_frag_id
+                && e.source_fragment_id != outer_gather_frag_id
+                && matches!(e.edge_kind, crate::sql::physical::FragmentEdgeKind::Stream)
+        }));
+    }
+
+    #[test]
+    fn build_maps_hash_distribution_to_hash_partitioned_edge() {
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::HashPartitioned(vec![
+                    crate::sql::cascades::property::ColumnRef {
+                        qualifier: None,
+                        column: "id".to_string(),
+                    },
+                ]),
+            }),
+            children: vec![scan_plan(file.path().to_path_buf())],
+            stats: stats(),
+            output_columns: output_columns(),
+        };
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        let edge = build.edges.first().expect("stream edge");
+        assert_eq!(
+            edge.output_partition.type_,
+            crate::partitions::TPartitionType::HASH_PARTITIONED
+        );
+        assert_eq!(
+            edge.output_partition
+                .partition_exprs
+                .as_ref()
+                .map(|v| v.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn build_rejects_any_distribution_in_fragment_builder() {
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::Any,
+            }),
+            children: vec![scan_plan(file.path().to_path_buf())],
+            stats: stats(),
+            output_columns: output_columns(),
+        };
+
+        let result = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default");
+        let err = result.err().expect("distribution any must fail");
+        assert!(err.contains("PhysicalDistribution(Any)"));
+    }
+
+    #[test]
+    fn build_elides_root_gather_distribution() {
+        let file = NamedTempFile::new().expect("temp parquet path");
+        let plan = PhysicalPlanNode {
+            op: Operator::PhysicalDistribution(PhysicalDistributionOp {
+                spec: DistributionSpec::Gather,
+            }),
+            children: vec![scan_plan(file.path().to_path_buf())],
+            stats: stats(),
+            output_columns: output_columns(),
+        };
+
+        let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
+        assert_eq!(build.fragment_results.len(), 1);
+        assert!(build.edges.is_empty());
+    }
 }

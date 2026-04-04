@@ -29,15 +29,17 @@ use crate::common::ids::SlotId;
 use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use crate::exec::node::scan::RowPositionScanConfig;
-use crate::exec::row_position::RowPositionDescriptor;
 use crate::exec::node::scan::{LakeGlmScanInfo, ScanMorsel};
-use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
+use crate::exec::row_position::RowPositionDescriptor;
 use crate::formats::{
     FileFormatConfig, build_format_iter, parquet::ParquetReadCachePolicy,
     parquet::ParquetScanConfig,
 };
 use crate::fs::scan_context::{FileScanContext, FileScanRange};
-use crate::lower::type_lowering::{arrow_type_from_desc, primitive_type_from_desc, scalar_type_desc};
+use crate::lower::type_lowering::{
+    arrow_type_from_desc, primitive_type_from_desc, scalar_type_desc,
+};
+use crate::novarocks_connectors::{StarRocksScanConfig, StarRocksScanOp};
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::types;
 
@@ -522,19 +524,15 @@ pub(crate) fn execute_lake_lookup_request(
     let mut response_positions: Vec<usize> = Vec::with_capacity(request_len);
 
     for (rss_id, mut positions_map) in rss_id_to_positions {
-        let range_idx = usize::try_from(rss_id)
-            .map_err(|_| format!("rss_id {} is out of range", rss_id))?;
-        let range = lake_info
-            .ranges
-            .get(range_idx)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "rss_id {} out of range (lake_glm_info has {} ranges)",
-                    rss_id,
-                    lake_info.ranges.len()
-                )
-            })?;
+        let range_idx =
+            usize::try_from(rss_id).map_err(|_| format!("rss_id {} is out of range", rss_id))?;
+        let range = lake_info.ranges.get(range_idx).cloned().ok_or_else(|| {
+            format!(
+                "rss_id {} out of range (lake_glm_info has {} ranges)",
+                rss_id,
+                lake_info.ranges.len()
+            )
+        })?;
 
         // Build a StarRocksScanConfig for just this one tablet
         let lookup_cfg = StarRocksScanConfig {
@@ -618,7 +616,10 @@ pub(crate) fn execute_lake_lookup_request(
     let mut response_indices = vec![u32::MAX; request_len];
     for (resp_idx, req_pos) in response_positions.iter().enumerate() {
         if response_indices[*req_pos] != u32::MAX {
-            return Err(format!("duplicate lake lookup response position {}", req_pos));
+            return Err(format!(
+                "duplicate lake lookup response position {}",
+                req_pos
+            ));
         }
         response_indices[*req_pos] = resp_idx as u32;
     }
@@ -639,4 +640,3 @@ pub(crate) fn execute_lake_lookup_request(
     }
     Ok(out)
 }
-

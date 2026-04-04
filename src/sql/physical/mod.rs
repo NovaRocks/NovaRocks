@@ -16,6 +16,7 @@ use arrow::datatypes::DataType;
 use crate::data_sinks;
 use crate::descriptors as thrift_descriptors;
 use crate::internal_service;
+use crate::partitions;
 use crate::plan_nodes;
 
 use super::catalog::CatalogProvider;
@@ -33,6 +34,7 @@ pub(crate) struct PlanBuildResult {
     pub output_columns: Vec<OutputColumn>,
 }
 
+#[derive(Clone)]
 pub(crate) struct OutputColumn {
     pub name: String,
     pub data_type: DataType,
@@ -40,11 +42,26 @@ pub(crate) struct OutputColumn {
 }
 
 /// Result of emitting a multi-fragment plan.
+pub(crate) enum FragmentEdgeKind {
+    Stream,
+    CteMulticast { cte_id: CteId },
+}
+
+pub(crate) struct FragmentEdge {
+    pub source_fragment_id: FragmentId,
+    pub target_fragment_id: FragmentId,
+    pub target_exchange_node_id: i32,
+    pub output_partition: partitions::TDataPartition,
+    pub edge_kind: FragmentEdgeKind,
+}
+
 pub(crate) struct MultiFragmentBuildResult {
     /// Per-fragment build results.
     pub fragment_results: Vec<FragmentBuildResult>,
     /// Which fragment is the root (result sink).
     pub root_fragment_id: FragmentId,
+    /// Fragment-to-fragment data edges.
+    pub edges: Vec<FragmentEdge>,
 }
 
 /// Physical emission result for a single fragment.

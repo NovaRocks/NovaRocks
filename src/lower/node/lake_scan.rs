@@ -25,7 +25,11 @@ use crate::connector::starrocks::fe_v2_meta::{
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::exec::expr::{ExprArena, ExprNode};
 use crate::exec::node::project::ProjectNode;
+use crate::exec::node::scan::LakeGlmScanInfo;
 use crate::exec::node::{ExecNode, ExecNodeKind};
+use crate::exec::row_position::{
+    LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
+};
 use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::lower::expr::parse_min_max_conjunct;
 use crate::lower::layout::{
@@ -34,10 +38,6 @@ use crate::lower::layout::{
     slot_display_name_from_desc,
 };
 use crate::lower::node::{Lowered, QueryGlobalDictMap, local_rf_waiting_set};
-use crate::exec::node::scan::LakeGlmScanInfo;
-use crate::exec::row_position::{
-    LakeRowPositionSpec, is_lake_row_id, is_lake_rss_id, is_lake_source_id, is_lake_tablet_id,
-};
 use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,

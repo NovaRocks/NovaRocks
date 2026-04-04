@@ -3403,7 +3403,157 @@ fn parse_add_files_sql(sql: &str) -> Result<(Vec<String>, String), String> {
 // Query plan build + execute (delegates to crate::sql::*)
 // ---------------------------------------------------------------------------
 
-use crate::sql::physical::PlanBuildResult;
+use crate::sql::physical::{FragmentEdgeKind, MultiFragmentBuildResult, PlanBuildResult};
+
+enum StandaloneExecutionPlan {
+    SingleFragment(PlanBuildResult),
+    Coordinated(MultiFragmentBuildResult),
+}
+
+enum StandaloneExecutionSelectionError {
+    LegacyCteFallbackRequired,
+    UnsupportedNonCteStreamGraph,
+}
+
+/// Recognize the narrow Task 1 compatibility shape where fragment splitting
+/// only wrapped the real root fragment in a single `EXCHANGE_NODE`.
+fn top_level_stream_root_wrapper_child_id(
+    br: &MultiFragmentBuildResult,
+) -> Option<crate::sql::fragment::FragmentId> {
+    use crate::plan_nodes::TPlanNodeType;
+
+    let root = br
+        .fragment_results
+        .iter()
+        .find(|f| f.fragment_id == br.root_fragment_id)?;
+    if root.cte_id.is_some() || !root.cte_exchange_nodes.is_empty() {
+        return None;
+    }
+    if root.plan.nodes.len() != 1 || root.plan.nodes[0].node_type != TPlanNodeType::EXCHANGE_NODE {
+        return None;
+    }
+    if br
+        .edges
+        .iter()
+        .any(|edge| edge.source_fragment_id == br.root_fragment_id)
+    {
+        return None;
+    }
+
+    let mut incoming_root_edges = br
+        .edges
+        .iter()
+        .filter(|edge| edge.target_fragment_id == br.root_fragment_id);
+    let edge = incoming_root_edges.next()?;
+    if incoming_root_edges.next().is_some() {
+        return None;
+    }
+    if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
+        return None;
+    }
+
+    let child_id = edge.source_fragment_id;
+    if child_id == br.root_fragment_id {
+        return None;
+    }
+
+    let child = br
+        .fragment_results
+        .iter()
+        .find(|f| f.fragment_id == child_id)?;
+    if child.plan.nodes.is_empty() {
+        return None;
+    }
+    Some(child_id)
+}
+
+/// Strip a top-level exchange-only wrapper introduced by a single Gather split.
+///
+/// The stripped child becomes the new root. This keeps Task 1 fragment-builder
+/// output intact while avoiding generic stream-edge execution in standalone.
+fn strip_top_level_stream_root_wrapper(
+    mut build_result: MultiFragmentBuildResult,
+) -> MultiFragmentBuildResult {
+    let Some(child_id) = top_level_stream_root_wrapper_child_id(&build_result) else {
+        return build_result;
+    };
+
+    let old_root_id = build_result.root_fragment_id;
+    build_result
+        .fragment_results
+        .retain(|fragment| fragment.fragment_id != old_root_id);
+    build_result.edges.retain(|edge| {
+        !(edge.source_fragment_id == child_id
+            && edge.target_fragment_id == old_root_id
+            && matches!(edge.edge_kind, FragmentEdgeKind::Stream))
+    });
+    build_result.root_fragment_id = child_id;
+    build_result
+}
+
+fn single_fragment_plan(build_result: MultiFragmentBuildResult) -> Result<PlanBuildResult, String> {
+    let fragment = build_result
+        .fragment_results
+        .into_iter()
+        .next()
+        .ok_or_else(|| "single-fragment build result missing fragment".to_string())?;
+    Ok(PlanBuildResult {
+        plan: fragment.plan,
+        desc_tbl: fragment.desc_tbl,
+        exec_params: fragment.exec_params,
+        output_columns: fragment.output_columns,
+    })
+}
+
+fn choose_standalone_execution(
+    build_result: MultiFragmentBuildResult,
+) -> Result<StandaloneExecutionPlan, StandaloneExecutionSelectionError> {
+    if build_result.fragment_results.len() == 1 {
+        return single_fragment_plan(build_result)
+            .map(StandaloneExecutionPlan::SingleFragment)
+            .map_err(|_| StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph);
+    }
+
+    let build_result = strip_top_level_stream_root_wrapper(build_result);
+    if build_result.fragment_results.len() == 1 {
+        return single_fragment_plan(build_result)
+            .map(StandaloneExecutionPlan::SingleFragment)
+            .map_err(|_| StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph);
+    }
+
+    let has_cte_fragments = build_result
+        .fragment_results
+        .iter()
+        .any(|f| f.cte_id.is_some());
+    let has_stream_edges = build_result
+        .edges
+        .iter()
+        .any(|edge| matches!(edge.edge_kind, FragmentEdgeKind::Stream));
+
+    // The cascades builder produces CTE fragments alongside Stream edges,
+    // but CTE multicast edges are not yet written to completed_edges.
+    // Fall back to the legacy CTE path which produces edges: Vec::new()
+    // and lets the coordinator wire CTE multicast via cte_exchange_nodes.
+    if has_cte_fragments && has_stream_edges {
+        return Err(StandaloneExecutionSelectionError::LegacyCteFallbackRequired);
+    }
+
+    // Multi-fragment plans go through the coordinator:
+    // - CTE-only (legacy path, edges empty) -> coordinator wires via cte_exchange_nodes
+    // - Stream-only (cascades path) -> coordinator wires via Stream edges
+    Ok(StandaloneExecutionPlan::Coordinated(build_result))
+}
+
+fn build_legacy_cte_multifragment_result(
+    resolved: crate::sql::ir::ResolvedQuery,
+    cte_registry: crate::sql::cte::CTERegistry,
+    catalog: &InMemoryCatalog,
+    current_database: &str,
+) -> Result<MultiFragmentBuildResult, String> {
+    let query_plan = crate::sql::planner::plan_query_legacy(resolved, cte_registry)?;
+    let fragment_plan = crate::sql::fragment::plan_fragments(query_plan);
+    crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)
+}
 
 /// Produce EXPLAIN output for a query without executing it.
 fn explain_query(
@@ -3443,6 +3593,8 @@ fn execute_query(
     // planner -> cascades -> fragment builder. The legacy QueryPlan/FragmentPlan
     // path remains only for compile-time compatibility and should not be used here.
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    let legacy_resolved = resolved.clone();
+    let legacy_cte_registry = cte_registry.clone();
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
@@ -3452,22 +3604,42 @@ fn execute_query(
         current_database,
     )?;
 
-    if build_result.fragments.len() == 1 {
-        let frag = build_result.fragments.into_iter().next().unwrap();
-        execute_plan(PlanBuildResult {
-            plan: frag.plan,
-            desc_tbl: frag.desc_tbl,
-            exec_params: frag.exec_params,
-            output_columns: frag.output_columns,
-        })
-    } else {
-        // Multi-fragment from distribution enforcement
-        let multi = crate::sql::physical::MultiFragmentBuildResult {
-            fragment_results: build_result.fragments,
-            root_fragment_id: build_result.root_fragment_id,
-        };
-        super::coordinator::ExecutionCoordinator::new(multi, "127.0.0.1".to_string(), exchange_port)
+    let execution_plan = match choose_standalone_execution(build_result) {
+        Ok(plan) => plan,
+        Err(StandaloneExecutionSelectionError::LegacyCteFallbackRequired) => {
+            let legacy_build_result = build_legacy_cte_multifragment_result(
+                legacy_resolved,
+                legacy_cte_registry,
+                catalog,
+                current_database,
+            )?;
+            choose_standalone_execution(legacy_build_result).map_err(|err| match err {
+                StandaloneExecutionSelectionError::LegacyCteFallbackRequired => {
+                    "legacy CTE fallback still requires unsupported Stream-edge execution"
+                        .to_string()
+                }
+                StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph => {
+                    "legacy CTE fallback produced unsupported non-CTE Stream edges".to_string()
+                }
+            })?
+        }
+        Err(StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph) => {
+            return Err(
+                "standalone only supports a top-level Gather stream wrapper; non-CTE Stream edges still require coordinator stream-edge support".to_string(),
+            );
+        }
+    };
+
+    match execution_plan {
+        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan),
+        StandaloneExecutionPlan::Coordinated(build_result) => {
+            super::coordinator::ExecutionCoordinator::new(
+                build_result,
+                "127.0.0.1".to_string(),
+                exchange_port,
+            )
             .execute()
+        }
     }
 }
 
@@ -3713,6 +3885,38 @@ mod tests {
         file
     }
 
+    fn build_fragments_for_query(sql: &str) -> crate::sql::physical::MultiFragmentBuildResult {
+        use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
+
+        let parquet = write_parquet_file();
+        let mut catalog = super::InMemoryCatalog::default();
+        catalog
+            .register(
+                "default",
+                super::build_parquet_table("tbl", parquet.path()).expect("build parquet table"),
+            )
+            .expect("register parquet table");
+
+        let normalized = normalize_for_raw_parse(sql).expect("normalize sql");
+        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
+            .try_with_sql(&normalized)
+            .expect("build parser");
+        let statement = parser.parse_statement().expect("parse statement");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query statement");
+        };
+
+        let (resolved, cte_registry) =
+            crate::sql::analyzer::analyze(&query, &catalog, "default").expect("analyze query");
+        let logical = crate::sql::planner::plan_query(resolved, cte_registry).expect("plan query");
+        let table_stats = super::build_table_stats_from_plan(&logical);
+        let physical = crate::sql::cascades::optimize(logical, &table_stats).expect("optimize");
+        crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
+            &physical, &catalog, "default",
+        )
+        .expect("build fragments")
+    }
+
     #[test]
     fn embedded_query_select_all_from_registered_parquet_table() {
         let parquet = write_parquet_file();
@@ -3748,6 +3952,42 @@ mod tests {
         let chunk = &result.chunks[0];
         assert_eq!(chunk.schema().fields().len(), 1);
         assert_eq!(chunk.schema().field(0).name(), "name");
+    }
+
+    #[test]
+    fn embedded_query_executes_with_unused_cte_definition() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query("WITH unused AS (SELECT id FROM tbl) SELECT name FROM tbl ORDER BY 1")
+            .expect("execute query with unused CTE");
+        assert_eq!(result.row_count(), 3);
+    }
+
+    #[test]
+    fn embedded_query_executes_with_dead_nested_cte_definition() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query(
+                "WITH unused AS ( \
+                    WITH inner_cte AS (SELECT id FROM tbl) \
+                    SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \
+                ) \
+                SELECT name FROM tbl ORDER BY 1",
+            )
+            .expect("execute query with dead nested CTE");
+        assert_eq!(result.row_count(), 3);
     }
 
     #[test]
@@ -3871,6 +4111,95 @@ mod tests {
         assert_eq!(result.row_count(), 3);
         let chunk = &result.chunks[0];
         assert_eq!(chunk.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn embedded_query_builder_splits_non_cte_join_into_multiple_fragments() {
+        let build = build_fragments_for_query(
+            "SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1",
+        );
+
+        assert!(
+            build.fragment_results.len() > 1,
+            "fragments={}",
+            build.fragment_results.len()
+        );
+        assert!(build.edges.iter().any(|edge| {
+            matches!(
+                edge.edge_kind,
+                crate::sql::physical::FragmentEdgeKind::Stream
+            )
+        }));
+    }
+
+    #[test]
+    fn embedded_query_explain_for_non_cte_join_shows_physical_exchange() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let explain = session
+            .query("EXPLAIN SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1")
+            .expect("execute explain");
+
+        let text = explain
+            .chunks
+            .iter()
+            .flat_map(|chunk| {
+                let col = chunk.batch.column(0);
+                let arr = col
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("string array");
+                (0..arr.len())
+                    .map(|idx| arr.value(idx).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("GATHER EXCHANGE") || text.contains("HASH EXCHANGE"),
+            "text={text}"
+        );
+    }
+
+    #[test]
+    fn embedded_query_executes_non_cte_join_through_stream_exchange() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query("SELECT a.id FROM tbl a JOIN tbl b ON a.id = b.id ORDER BY 1")
+            .expect("execute query");
+
+        assert_eq!(result.row_count(), 3);
+        let chunk = &result.chunks[0];
+        assert_eq!(chunk.schema().field(0).name(), "id");
+    }
+
+    #[test]
+    fn builder_preserves_cte_coordinator_shape_for_nested_cte_query() {
+        let build = build_fragments_for_query(
+            "WITH outer_cte AS ( \
+                WITH inner_cte AS (SELECT id FROM tbl) \
+                SELECT a.id FROM inner_cte a JOIN inner_cte b ON a.id = b.id \
+            ) \
+            SELECT x.id FROM outer_cte x JOIN outer_cte y ON x.id = y.id ORDER BY 1",
+        );
+
+        // Multiple fragments: root + CTE produce fragments + possible stream children.
+        assert!(build.fragment_results.len() > 1);
+
+        // At least one CTE produce fragment exists.
+        assert!(build.fragment_results.iter().any(|f| f.cte_id.is_some()));
     }
 
     #[test]

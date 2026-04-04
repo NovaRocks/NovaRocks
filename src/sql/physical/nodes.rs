@@ -534,6 +534,7 @@ fn build_hdfs_scan_range_params(
 pub(crate) fn build_exchange_node(
     node_id: i32,
     input_row_tuples: Vec<i32>,
+    partition_type: partitions::TPartitionType,
 ) -> plan_nodes::TPlanNode {
     let mut node = default_plan_node();
     node.node_id = node_id;
@@ -547,7 +548,7 @@ pub(crate) fn build_exchange_node(
         input_row_tuples,
         None::<plan_nodes::TSortInfo>,
         None::<i64>,
-        Some(partitions::TPartitionType::UNPARTITIONED),
+        Some(partition_type),
         None::<bool>,
         None::<plan_nodes::TLateMaterializeMode>,
     ));

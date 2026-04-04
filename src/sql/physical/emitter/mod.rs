@@ -163,6 +163,7 @@ pub(crate) fn emit_multi_fragment(
     Ok(super::MultiFragmentBuildResult {
         fragment_results,
         root_fragment_id: fragment_plan.root_fragment_id,
+        edges: Vec::new(),
     })
 }
 
@@ -345,7 +346,11 @@ impl<'a> ThriftEmitter<'a> {
         }
         self.desc_builder.add_tuple(tuple_id);
 
-        let exchange_plan_node = nodes::build_exchange_node(node_id, vec![tuple_id]);
+        let exchange_plan_node = nodes::build_exchange_node(
+            node_id,
+            vec![tuple_id],
+            crate::partitions::TPartitionType::UNPARTITIONED,
+        );
 
         // Record this CTE consume for the coordinator to wire up multicast destinations
         self.cte_exchange_nodes.push((node.cte_id, node_id));

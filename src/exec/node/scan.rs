@@ -18,13 +18,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter};
-use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::fs::scan_context::FileScanRange;
 use crate::internal_service;
 use crate::novarocks_logging::warn;

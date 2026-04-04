@@ -34,11 +34,11 @@ use arrow::compute::{concat, take};
 
 use crate::common::ids::SlotId;
 use crate::descriptors;
+use crate::descriptors::TRowPositionType;
 use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
-use crate::descriptors::TRowPositionType;
 use crate::runtime::lookup::{
     decode_column_ipc, encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
 };
@@ -165,8 +165,7 @@ impl FetchProcessor {
                 continue;
             }
             let fetch_ref_slots = &row_pos_desc.fetch_ref_slots;
-            let is_lake = row_pos_desc.row_position_type
-                == TRowPositionType::LAKE_ROW_POSITION;
+            let is_lake = row_pos_desc.row_position_type == TRowPositionType::LAKE_ROW_POSITION;
             let expected_ref_slots = if is_lake { 3 } else { 2 };
             if fetch_ref_slots.len() != expected_ref_slots {
                 return Err(format!(
