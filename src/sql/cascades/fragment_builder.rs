@@ -1812,13 +1812,14 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalCTEProduceOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
-        // Visit the child subtree that produces the CTE data.
-        let child = self.visit(&node.children[0])?;
-
-        // Finalize the child as a fragment marked with the CTE ID.
-        // The coordinator will replace the NOOP_SINK with a multicast sink
-        // after seeing all consumers.
+        // Allocate the CTE fragment ID before visiting the child so that
+        // any Distribution nodes inside the child correctly target this
+        // CTE fragment as their parent in the fragment_stack.
         let cte_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(cte_fragment_id);
+        let child_result = self.visit(&node.children[0]);
+        self.fragment_stack.pop();
+        let child = child_result?;
         let cte_fragment = FragmentBuildResult {
             fragment_id: cte_fragment_id,
             plan: plan_nodes::TPlan::new(child.plan_nodes),
@@ -1855,12 +1856,12 @@ impl<'a> PlanFragmentBuilder<'a> {
 
     fn visit_cte_consume(&mut self, op: &PhysicalCTEConsumeOp) -> Result<VisitResult, String> {
         // Verify the CTE produce fragment was already visited.
-        if !self.cte_fragments.contains_key(&op.cte_id) {
-            return Err(format!(
-                "CTE consume references unknown cte_id={}",
-                op.cte_id
-            ));
-        }
+        let cte_frag_idx = self
+            .cte_fragments
+            .get(&op.cte_id)
+            .copied()
+            .ok_or_else(|| format!("CTE consume references unknown cte_id={}", op.cte_id))?;
+        let cte_fragment_id = self.completed_fragments[cte_frag_idx].fragment_id;
 
         // Allocate an exchange node that will receive data from the CTE
         // produce fragment's multicast sink.
@@ -1898,6 +1899,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             vec![exchange_tuple_id],
             partitions::TPartitionType::UNPARTITIONED,
         );
+
+        // Record the CTE multicast edge so the coordinator can wire sinks.
+        let target_fragment_id = self.current_fragment_id()?;
+        self.completed_edges.push(FragmentEdge {
+            source_fragment_id: cte_fragment_id,
+            target_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition: unpartitioned_stream_partition(),
+            edge_kind: FragmentEdgeKind::CteMulticast { cte_id: op.cte_id },
+        });
 
         Ok(VisitResult {
             plan_nodes: vec![exchange_node],

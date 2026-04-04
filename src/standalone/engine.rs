@@ -3410,12 +3410,7 @@ enum StandaloneExecutionPlan {
     Coordinated(MultiFragmentBuildResult),
 }
 
-enum StandaloneExecutionSelectionError {
-    LegacyCteFallbackRequired,
-    UnsupportedNonCteStreamGraph,
-}
-
-/// Recognize the narrow Task 1 compatibility shape where fragment splitting
+/// Recognize the narrow compatibility shape where fragment splitting
 /// only wrapped the real root fragment in a single `EXCHANGE_NODE`.
 fn top_level_stream_root_wrapper_child_id(
     br: &MultiFragmentBuildResult,
@@ -3491,12 +3486,13 @@ fn strip_top_level_stream_root_wrapper(
     build_result
 }
 
-fn single_fragment_plan(build_result: MultiFragmentBuildResult) -> Result<PlanBuildResult, String> {
-    let fragment = build_result
-        .fragment_results
-        .into_iter()
-        .next()
-        .ok_or_else(|| "single-fragment build result missing fragment".to_string())?;
+fn single_fragment_plan(
+    build_result: MultiFragmentBuildResult,
+) -> Result<PlanBuildResult, MultiFragmentBuildResult> {
+    if build_result.fragment_results.len() != 1 {
+        return Err(build_result);
+    }
+    let fragment = build_result.fragment_results.into_iter().next().unwrap();
     Ok(PlanBuildResult {
         plan: fragment.plan,
         desc_tbl: fragment.desc_tbl,
@@ -3505,54 +3501,23 @@ fn single_fragment_plan(build_result: MultiFragmentBuildResult) -> Result<PlanBu
     })
 }
 
-fn choose_standalone_execution(
-    build_result: MultiFragmentBuildResult,
-) -> Result<StandaloneExecutionPlan, StandaloneExecutionSelectionError> {
+fn choose_standalone_execution(build_result: MultiFragmentBuildResult) -> StandaloneExecutionPlan {
     if build_result.fragment_results.len() == 1 {
-        return single_fragment_plan(build_result)
-            .map(StandaloneExecutionPlan::SingleFragment)
-            .map_err(|_| StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph);
+        match single_fragment_plan(build_result) {
+            Ok(plan) => return StandaloneExecutionPlan::SingleFragment(plan),
+            Err(br) => return StandaloneExecutionPlan::Coordinated(br),
+        }
     }
 
     let build_result = strip_top_level_stream_root_wrapper(build_result);
     if build_result.fragment_results.len() == 1 {
-        return single_fragment_plan(build_result)
-            .map(StandaloneExecutionPlan::SingleFragment)
-            .map_err(|_| StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph);
+        match single_fragment_plan(build_result) {
+            Ok(plan) => return StandaloneExecutionPlan::SingleFragment(plan),
+            Err(br) => return StandaloneExecutionPlan::Coordinated(br),
+        }
     }
 
-    let has_cte_fragments = build_result
-        .fragment_results
-        .iter()
-        .any(|f| f.cte_id.is_some());
-    let has_stream_edges = build_result
-        .edges
-        .iter()
-        .any(|edge| matches!(edge.edge_kind, FragmentEdgeKind::Stream));
-
-    // The cascades builder produces CTE fragments alongside Stream edges,
-    // but CTE multicast edges are not yet written to completed_edges.
-    // Fall back to the legacy CTE path which produces edges: Vec::new()
-    // and lets the coordinator wire CTE multicast via cte_exchange_nodes.
-    if has_cte_fragments && has_stream_edges {
-        return Err(StandaloneExecutionSelectionError::LegacyCteFallbackRequired);
-    }
-
-    // Multi-fragment plans go through the coordinator:
-    // - CTE-only (legacy path, edges empty) -> coordinator wires via cte_exchange_nodes
-    // - Stream-only (cascades path) -> coordinator wires via Stream edges
-    Ok(StandaloneExecutionPlan::Coordinated(build_result))
-}
-
-fn build_legacy_cte_multifragment_result(
-    resolved: crate::sql::ir::ResolvedQuery,
-    cte_registry: crate::sql::cte::CTERegistry,
-    catalog: &InMemoryCatalog,
-    current_database: &str,
-) -> Result<MultiFragmentBuildResult, String> {
-    let query_plan = crate::sql::planner::plan_query_legacy(resolved, cte_registry)?;
-    let fragment_plan = crate::sql::fragment::plan_fragments(query_plan);
-    crate::sql::physical::emit_multi_fragment(fragment_plan, catalog, current_database)
+    StandaloneExecutionPlan::Coordinated(build_result)
 }
 
 /// Produce EXPLAIN output for a query without executing it.
@@ -3593,8 +3558,6 @@ fn execute_query(
     // planner -> cascades -> fragment builder. The legacy QueryPlan/FragmentPlan
     // path remains only for compile-time compatibility and should not be used here.
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
-    let legacy_resolved = resolved.clone();
-    let legacy_cte_registry = cte_registry.clone();
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
     let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
@@ -3604,31 +3567,7 @@ fn execute_query(
         current_database,
     )?;
 
-    let execution_plan = match choose_standalone_execution(build_result) {
-        Ok(plan) => plan,
-        Err(StandaloneExecutionSelectionError::LegacyCteFallbackRequired) => {
-            let legacy_build_result = build_legacy_cte_multifragment_result(
-                legacy_resolved,
-                legacy_cte_registry,
-                catalog,
-                current_database,
-            )?;
-            choose_standalone_execution(legacy_build_result).map_err(|err| match err {
-                StandaloneExecutionSelectionError::LegacyCteFallbackRequired => {
-                    "legacy CTE fallback still requires unsupported Stream-edge execution"
-                        .to_string()
-                }
-                StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph => {
-                    "legacy CTE fallback produced unsupported non-CTE Stream edges".to_string()
-                }
-            })?
-        }
-        Err(StandaloneExecutionSelectionError::UnsupportedNonCteStreamGraph) => {
-            return Err(
-                "standalone only supports a top-level Gather stream wrapper; non-CTE Stream edges still require coordinator stream-edge support".to_string(),
-            );
-        }
-    };
+    let execution_plan = choose_standalone_execution(build_result);
 
     match execution_plan {
         StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan),

@@ -91,31 +91,38 @@ impl ExecutionCoordinator {
             .get(&root_fragment_id)
             .ok_or_else(|| "root fragment not found in instance map".to_string())?;
 
-        // Aggregate all fragment-local CTE consumer exchange nodes before
-        // moving fragments into root/CTE buckets.
+        // Aggregate CTE and Stream consumer exchange nodes from edges.
         let mut cte_consumers: BTreeMap<CteId, Vec<(FragmentId, i32)>> = BTreeMap::new();
         let mut per_fragment_exch_num_senders: BTreeMap<FragmentId, BTreeMap<i32, i32>> =
             BTreeMap::new();
-        for fr in &fragment_results {
-            for (cte_id, exchange_node_id) in &fr.cte_exchange_nodes {
+
+        for e in &edges {
+            per_fragment_exch_num_senders
+                .entry(e.target_fragment_id)
+                .or_default()
+                .insert(e.target_exchange_node_id, 1);
+
+            if let FragmentEdgeKind::CteMulticast { cte_id } = &e.edge_kind {
                 cte_consumers
                     .entry(*cte_id)
                     .or_default()
-                    .push((fr.fragment_id, *exchange_node_id));
-                per_fragment_exch_num_senders
-                    .entry(fr.fragment_id)
-                    .or_default()
-                    .insert(*exchange_node_id, 1);
+                    .push((e.target_fragment_id, e.target_exchange_node_id));
             }
         }
 
-        // Every fragment exchange that receives a Gather `Stream` edge must record one sender.
-        for e in &edges {
-            if matches!(e.edge_kind, FragmentEdgeKind::Stream) {
-                per_fragment_exch_num_senders
-                    .entry(e.target_fragment_id)
-                    .or_default()
-                    .insert(e.target_exchange_node_id, 1);
+        // Also collect CTE consumers from legacy cte_exchange_nodes field
+        // (used by the old emitter path which doesn't produce edges).
+        for fr in &fragment_results {
+            for (cte_id, exchange_node_id) in &fr.cte_exchange_nodes {
+                let consumers = cte_consumers.entry(*cte_id).or_default();
+                let entry = (fr.fragment_id, *exchange_node_id);
+                if !consumers.contains(&entry) {
+                    consumers.push(entry);
+                    per_fragment_exch_num_senders
+                        .entry(fr.fragment_id)
+                        .or_default()
+                        .insert(*exchange_node_id, 1);
+                }
             }
         }
 
