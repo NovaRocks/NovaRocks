@@ -548,37 +548,66 @@ impl<'a> PlanFragmentBuilder<'a> {
         // text order (e.g. `l_orderkey = o_orderkey`), which may not match the
         // join's left/right child assignment.  Try the natural order first; if
         // the left expr fails against the left scope, swap sides.
+        // If BOTH sides fail against the left scope, the pair belongs to a
+        // single side (e.g. inner predicates in a SEMI JOIN condition) and is
+        // demoted to other_join_conjuncts.
         let mut eq_join_conjuncts = Vec::new();
+        let mut demoted_eq_exprs: Vec<TypedExpr> = Vec::new();
         for (expr_a, expr_b) in &op.eq_conditions {
-            let (left_texpr, right_texpr) = {
-                let try_left = ExprCompiler::new(&left.scope).compile_typed(expr_a);
-                if let Ok(lt) = try_left {
-                    let rt = ExprCompiler::new(&right.scope).compile_typed(expr_b)?;
-                    (lt, rt)
+            let result = {
+                let try_left_a = ExprCompiler::new(&left.scope).compile_typed(expr_a);
+                if let Ok(lt) = try_left_a {
+                    ExprCompiler::new(&right.scope)
+                        .compile_typed(expr_b)
+                        .map(|rt| (lt, rt))
+                        .ok()
                 } else {
-                    // Swap: expr_a is from the right child, expr_b from the left.
-                    let lt = ExprCompiler::new(&left.scope).compile_typed(expr_b)?;
-                    let rt = ExprCompiler::new(&right.scope).compile_typed(expr_a)?;
-                    (lt, rt)
+                    // Swap: expr_a might be from the right child, expr_b from the left.
+                    let try_left_b = ExprCompiler::new(&left.scope).compile_typed(expr_b);
+                    if let Ok(lt) = try_left_b {
+                        ExprCompiler::new(&right.scope)
+                            .compile_typed(expr_a)
+                            .map(|rt| (lt, rt))
+                            .ok()
+                    } else {
+                        None
+                    }
                 }
             };
-            eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
-                left: left_texpr,
-                right: right_texpr,
-                opcode: Some(crate::opcodes::TExprOpcode::EQ),
-            });
+            if let Some((lt, rt)) = result {
+                eq_join_conjuncts.push(plan_nodes::TEqJoinCondition {
+                    left: lt,
+                    right: rt,
+                    opcode: Some(crate::opcodes::TExprOpcode::EQ),
+                });
+            } else {
+                // Both sides from the same input — demote to other_condition.
+                demoted_eq_exprs.push(TypedExpr {
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(expr_a.clone()),
+                        op: crate::sql::ir::BinOp::Eq,
+                        right: Box::new(expr_b.clone()),
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                });
+            }
         }
 
-        // Compile other conditions
-        let other_join_conjuncts = if let Some(ref cond) = op.other_condition {
+        // Compile other conditions (including demoted eq pairs).
+        let mut other_join_conjuncts = Vec::new();
+        {
             let mut merged = ExprScope::new();
             merged.merge(&left.scope);
             merged.merge(&right.scope);
             let mut compiler = ExprCompiler::new(&merged);
-            vec![compiler.compile_typed(cond)?]
-        } else {
-            vec![]
-        };
+            if let Some(ref cond) = op.other_condition {
+                other_join_conjuncts.push(compiler.compile_typed(cond)?);
+            }
+            for demoted in &demoted_eq_exprs {
+                other_join_conjuncts.push(compiler.compile_typed(demoted)?);
+            }
+        }
 
         let join_plan_node = nodes::build_hash_join_node(
             join_node_id,
@@ -617,11 +646,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => {}
         }
 
-        let mut merged_scope = left.scope;
-        merged_scope.merge(&right.scope);
-
-        let mut merged_tuple_ids = left.tuple_ids;
-        merged_tuple_ids.extend(right.tuple_ids);
+        // SEMI/ANTI joins only output columns from the surviving side.
+        let (merged_scope, merged_tuple_ids) = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti => (left.scope, left.tuple_ids),
+            JoinKind::RightSemi | JoinKind::RightAnti => (right.scope, right.tuple_ids),
+            _ => {
+                let mut scope = left.scope;
+                scope.merge(&right.scope);
+                let mut tids = left.tuple_ids;
+                tids.extend(right.tuple_ids);
+                (scope, tids)
+            }
+        };
 
         // Pre-order: join node, then left subtree, then right subtree
         let mut plan_nodes = vec![join_plan_node];
@@ -699,11 +735,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => {}
         }
 
-        let mut merged_scope = left.scope;
-        merged_scope.merge(&right.scope);
-
-        let mut merged_tuple_ids = left.tuple_ids;
-        merged_tuple_ids.extend(right.tuple_ids);
+        // SEMI/ANTI joins only output columns from the surviving side.
+        let (merged_scope, merged_tuple_ids) = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti => (left.scope, left.tuple_ids),
+            JoinKind::RightSemi | JoinKind::RightAnti => (right.scope, right.tuple_ids),
+            _ => {
+                let mut scope = left.scope;
+                scope.merge(&right.scope);
+                let mut tids = left.tuple_ids;
+                tids.extend(right.tuple_ids);
+                (scope, tids)
+            }
+        };
 
         let mut plan_nodes = vec![join_plan_node];
         plan_nodes.extend(left.plan_nodes);

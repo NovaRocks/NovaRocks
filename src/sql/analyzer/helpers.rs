@@ -63,15 +63,40 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
             .unwrap_or_else(|| format!("{expr}")),
         sqlast::Expr::Identifier(ident) => ident.value.clone(),
         sqlast::Expr::Function(f) => {
-            // Lowercase function name to match StarRocks FE behavior
-            let mut s = format!("{expr}");
+            // Lowercase function name to match StarRocks FE behavior.
+            // sqlparser's Display may uppercase SQL keywords, so we
+            // replace the function name portion with the lowercased form.
+            let display = format!("{expr}");
             let func_name = f.name.to_string();
-            if let Some(pos) = s.find(&func_name) {
-                s.replace_range(pos..pos + func_name.len(), &func_name.to_lowercase());
+            let func_lower = func_name.to_lowercase();
+            // Case-insensitive find and replace the function name prefix.
+            if let Some(pos) = display.to_lowercase().find(&func_lower) {
+                let mut result = String::with_capacity(display.len());
+                result.push_str(&display[..pos]);
+                result.push_str(&func_lower);
+                result.push_str(&display[pos + func_name.len()..]);
+                result
+            } else {
+                display
             }
-            s
         }
-        _ => format!("{expr}"),
+        // Expressions like SUBSTR, CAST, EXTRACT are rendered in uppercase by
+        // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.
+        other => {
+            let s = format!("{other}");
+            // Lowercase leading keyword (up to the first '(') if present.
+            if let Some(paren) = s.find('(') {
+                let prefix = &s[..paren];
+                // Only lowercase if the prefix is all-ASCII-alpha (a keyword).
+                if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
+                    format!("{}{}", prefix.to_lowercase(), &s[paren..])
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        }
     }
 }
 

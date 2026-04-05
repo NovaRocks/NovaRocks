@@ -6,13 +6,13 @@ pub(crate) mod cte_rewrite;
 pub(crate) mod extract;
 pub(crate) mod fragment_builder;
 pub(crate) mod memo;
-pub(crate) mod runtime_filter_planner;
 pub(crate) mod operator;
 pub(crate) mod physical_plan;
 pub(crate) mod property;
 pub(crate) mod rewriter;
 pub(crate) mod rule;
 pub(crate) mod rules;
+pub(crate) mod runtime_filter_planner;
 pub(crate) mod search;
 pub(crate) mod stats;
 
@@ -22,11 +22,19 @@ pub(crate) use physical_plan::PhysicalPlanNode;
 pub(crate) use property::{ColumnRef, DistributionSpec, OrderingSpec, PhysicalPropertySet};
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::sql::plan::LogicalPlan;
 use crate::sql::statistics::TableStatistics;
 use memo::MExpr;
 use rule::Rule;
+
+/// Wall-clock timeout for the entire optimization pipeline.
+const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Maximum number of memo groups allowed during exploration.
+/// Prevents exponential blowup from join associativity on large join graphs.
+const EXPLORE_MAX_GROUPS: usize = 5000;
 
 /// Main entry point for the Cascades optimizer.
 ///
@@ -38,6 +46,8 @@ pub(crate) fn optimize(
     plan: LogicalPlan,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Result<PhysicalPlanNode, String> {
+    let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
+
     // 1. RBO rewrite (predicate pushdown + join reorder + column pruning).
     let rewritten = rewriter::rewrite(plan, table_stats);
     // This is an intentional pre-Memo structural rewrite for CTE shape cleanup,
@@ -52,9 +62,13 @@ pub(crate) fn optimize(
     // 3. Derive initial statistics.
     stats::derive_group_statistics(&mut memo, table_stats);
 
+    check_deadline(deadline)?;
+
     // 4. Explore: apply transformation rules (logical -> logical).
     let transform_rules = rules::all_transformation_rules();
-    explore(&mut memo, &transform_rules);
+    explore(&mut memo, &transform_rules, deadline)?;
+
+    check_deadline(deadline)?;
 
     // 5. Implement: apply implementation rules (logical -> physical).
     let impl_rules = rules::all_implementation_rules();
@@ -63,24 +77,46 @@ pub(crate) fn optimize(
     // 6. Re-derive statistics for any newly created groups (e.g. from AggSplit).
     stats::derive_group_statistics(&mut memo, table_stats);
 
+    check_deadline(deadline)?;
+
     // 7. Top-down search with property enforcement.
     let root_required = PhysicalPropertySet::gather();
     let mut ctx = search::SearchContext::new(table_stats.clone());
     ctx.optimize_group(&memo, root_group, &root_required)?;
 
+    check_deadline(deadline)?;
+
     // 8. Extract best plan.
     extract::extract_best(&memo, root_group, &root_required, &ctx.winners)
 }
 
+fn check_deadline(deadline: Instant) -> Result<(), String> {
+    if Instant::now() > deadline {
+        return Err(format!(
+            "optimizer timeout: exceeded {}s budget",
+            OPTIMIZE_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(())
+}
+
 /// Apply transformation rules to all groups in a fixed-point loop.
 ///
-/// Iterates until no new expressions are added or the iteration limit is
-/// reached.  The limit prevents combinatorial explosion with join
-/// commutativity + associativity on large join graphs.
-const EXPLORE_MAX_ITERATIONS: usize = 8;
+/// Terminates when:
+/// - No new expressions are added (fixed-point)
+/// - Iteration limit reached
+/// - Memo group count exceeds budget (join associativity explosion guard)
+/// - Wall-clock deadline exceeded
+const EXPLORE_MAX_ITERATIONS: usize = 16;
 
-fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
+fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Result<(), String> {
     for _round in 0..EXPLORE_MAX_ITERATIONS {
+        if Instant::now() > deadline {
+            return Err(format!(
+                "optimizer timeout during exploration: exceeded {}s budget",
+                OPTIMIZE_TIMEOUT.as_secs()
+            ));
+        }
         let mut changed = false;
         let num_groups = memo.groups.len();
         for group_id in 0..num_groups {
@@ -110,11 +146,16 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>]) {
                     }
                 }
             }
+            // Stop if memo grew too large (exponential join enumeration).
+            if memo.groups.len() > EXPLORE_MAX_GROUPS {
+                return Ok(());
+            }
         }
         if !changed {
             break;
         }
     }
+    Ok(())
 }
 
 /// Apply implementation rules to all groups.
