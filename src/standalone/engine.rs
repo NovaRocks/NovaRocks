@@ -3557,10 +3557,14 @@ fn execute_query(
     // All non-recursive queries, including CTE queries, now flow through
     // planner -> cascades -> fragment builder. The legacy QueryPlan/FragmentPlan
     // path remains only for compile-time compatibility and should not be used here.
+    eprintln!("[execute_query] analyze start");
     let (resolved, cte_registry) = crate::sql::analyzer::analyze(query, catalog, current_database)?;
+    eprintln!("[execute_query] plan start");
     let logical = crate::sql::planner::plan_query(resolved, cte_registry)?;
     let table_stats = build_table_stats_from_plan(&logical);
+    eprintln!("[execute_query] optimize start");
     let physical = crate::sql::cascades::optimize(logical, &table_stats)?;
+    eprintln!("[execute_query] fragment_builder start");
     let build_result = crate::sql::cascades::fragment_builder::PlanFragmentBuilder::build(
         &physical,
         catalog,
@@ -3570,8 +3574,15 @@ fn execute_query(
     let execution_plan = choose_standalone_execution(build_result);
 
     match execution_plan {
-        StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan),
+        StandaloneExecutionPlan::SingleFragment(plan) => {
+            eprintln!("[execute_query] single fragment execute");
+            execute_plan(plan)
+        }
         StandaloneExecutionPlan::Coordinated(build_result) => {
+            eprintln!(
+                "[execute_query] coordinated execute ({} fragments)",
+                build_result.fragment_results.len()
+            );
             super::coordinator::ExecutionCoordinator::new(
                 build_result,
                 "127.0.0.1".to_string(),

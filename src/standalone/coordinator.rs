@@ -462,10 +462,15 @@ impl ExecutionCoordinator {
             "[coordinator] launching {} background fragments",
             cte_thrift_fragments.len()
         );
+        let cancel_query_id_hi = query_id_hi;
+        let cancel_query_id_lo = query_id_lo;
+        let all_instance_ids: Vec<(i64, i64)> = instance_map.values().copied().collect();
+
         for (cte_fr, thrift_fragment, cte_exec_params) in cte_thrift_fragments {
             let desc_tbl = cte_fr.desc_tbl.clone();
             let dop = pipeline_dop;
             let frag_id = cte_fr.fragment_id;
+            let cancel_instances = all_instance_ids.clone();
             let handle = std::thread::spawn(move || {
                 eprintln!("[coordinator] fragment {} started", frag_id);
                 let result = execute_fragment(
@@ -485,7 +490,13 @@ impl ExecutionCoordinator {
                 );
                 match &result {
                     Ok(_) => eprintln!("[coordinator] fragment {} completed OK", frag_id),
-                    Err(e) => eprintln!("[coordinator] fragment {} FAILED: {}", frag_id, e),
+                    Err(e) => {
+                        eprintln!("[coordinator] fragment {} FAILED: {}", frag_id, e);
+                        // Cancel all exchanges so blocked receivers (including root) unblock.
+                        for (hi, lo) in &cancel_instances {
+                            crate::runtime::exchange::cancel_fragment(*hi, *lo);
+                        }
+                    }
                 }
                 result.map(|_| ())
             });
