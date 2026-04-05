@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use crate::data_sinks;
 use crate::exec::expr::ExprArena;
+use crate::runtime_filter;
+use crate::sql::cascades::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
@@ -58,9 +60,10 @@ impl ExecutionCoordinator {
 
     pub(crate) fn execute(self) -> Result<QueryResult, String> {
         let MultiFragmentBuildResult {
-            fragment_results,
+            mut fragment_results,
             root_fragment_id,
             edges,
+            rf_plan,
         } = self.build_result;
         let exchange_host = self.exchange_host;
         let exchange_port = self.exchange_port;
@@ -127,6 +130,26 @@ impl ExecutionCoordinator {
             })
             .collect();
 
+        // ---------------------------------------------------------------
+        // 2. Wire multicast sinks for CTE fragments
+        // ---------------------------------------------------------------
+        // For each CTE produce fragment, build TMultiCastDataStreamSink with
+        // one TDataStreamSink per consumer exchange node across all fragments.
+        let brpc_addr = types::TNetworkAddress::new(exchange_host, exchange_port as i32);
+
+        // ---------------------------------------------------------------
+        // Runtime filter parameter assembly
+        // ---------------------------------------------------------------
+        let rf_params = match rf_plan {
+            Some(mut plan) => Some(setup_runtime_filter_params(
+                &mut plan,
+                &mut fragment_results,
+                &instance_map,
+                &brpc_addr,
+            )),
+            None => None,
+        };
+
         // Separate root, CTE produce fragments, and Stream-edge producers (Gather splits).
         let mut root_fragment: Option<FragmentBuildResult> = None;
         let mut cte_fragments: Vec<FragmentBuildResult> = Vec::new();
@@ -147,13 +170,6 @@ impl ExecutionCoordinator {
         }
         let root_fragment =
             root_fragment.ok_or_else(|| "root fragment not found in build results".to_string())?;
-
-        // ---------------------------------------------------------------
-        // 2. Wire multicast sinks for CTE fragments
-        // ---------------------------------------------------------------
-        // For each CTE produce fragment, build TMultiCastDataStreamSink with
-        // one TDataStreamSink per consumer exchange node across all fragments.
-        let brpc_addr = types::TNetworkAddress::new(exchange_host, exchange_port as i32);
 
         let mut cte_thrift_fragments: Vec<(
             FragmentBuildResult,
@@ -272,6 +288,9 @@ impl ExecutionCoordinator {
                 .get(&stream_fr.fragment_id)
                 .cloned()
                 .unwrap_or_default();
+            if let Some(ref rf) = rf_params {
+                stream_exec_params.runtime_filter_params = Some(rf.clone());
+            }
 
             cte_thrift_fragments.push((stream_fr, thrift_fragment, stream_exec_params));
         }
@@ -382,6 +401,9 @@ impl ExecutionCoordinator {
                 .get(&cte_fr.fragment_id)
                 .cloned()
                 .unwrap_or_default();
+            if let Some(ref rf) = rf_params {
+                cte_exec_params.runtime_filter_params = Some(rf.clone());
+            }
 
             cte_thrift_fragments.push((cte_fr, thrift_fragment, cte_exec_params));
         }
@@ -437,6 +459,9 @@ impl ExecutionCoordinator {
         root_exec_params.fragment_instance_id =
             types::TUniqueId::new(root_instance_id.0, root_instance_id.1);
         root_exec_params.per_exch_num_senders = per_exch_num_senders;
+        if let Some(ref rf) = rf_params {
+            root_exec_params.runtime_filter_params = Some(rf.clone());
+        }
 
         let mut tuple_slots = build_tuple_slot_order(Some(&desc_tbl));
         reorder_tuple_slots(&mut tuple_slots, Some(&desc_tbl));
@@ -469,6 +494,26 @@ impl ExecutionCoordinator {
         let handle = ResultSinkHandle::new();
         let exchange_finst_id = Some((root_instance_id.0, root_instance_id.1));
 
+        let root_query_id = Some(crate::runtime::query_context::QueryId {
+            hi: query_id_hi,
+            lo: query_id_lo,
+        });
+        let root_finst_id = Some(crate::common::types::UniqueId {
+            hi: root_instance_id.0,
+            lo: root_instance_id.1,
+        });
+        let root_runtime_state = Arc::new(RuntimeState::new(
+            None, // query_options
+            None, // cache_options
+            root_query_id,
+            root_exec_params.runtime_filter_params.clone(),
+            root_finst_id,
+            None, // backend_num
+            None, // mem_tracker
+            None, // spill_config
+            None, // spill_manager
+        ));
+
         execute_plan_with_pipeline(
             exec_plan,
             false,
@@ -477,8 +522,8 @@ impl ExecutionCoordinator {
             exchange_finst_id,
             None, // profiler
             pipeline_dop,
-            Arc::new(RuntimeState::default()),
-            None, // query_id
+            root_runtime_state,
+            root_query_id,
             None, // fe_addr
             None, // backend_num
         )?;
@@ -520,4 +565,68 @@ impl ExecutionCoordinator {
             chunks: handle.take_chunks(),
         })
     }
+}
+
+/// Build TRuntimeFilterParams from the RF planning result.
+fn setup_runtime_filter_params(
+    rf_plan: &mut RuntimeFilterPlanResult,
+    fragment_results: &mut [FragmentBuildResult],
+    instance_map: &BTreeMap<FragmentId, (i64, i64)>,
+    exchange_addr: &types::TNetworkAddress,
+) -> runtime_filter::TRuntimeFilterParams {
+    let mut id_to_prober_params: BTreeMap<i32, Vec<runtime_filter::TRuntimeFilterProberParams>> =
+        BTreeMap::new();
+    let mut builder_number: BTreeMap<i32, i32> = BTreeMap::new();
+
+    // Populate prober params for each probe-side filter.
+    for (frag_id, probes) in &rf_plan.probe_side_filters {
+        if let Some(&(hi, lo)) = instance_map.get(frag_id) {
+            for (filter_id, _scan_node_id) in probes {
+                let prober = runtime_filter::TRuntimeFilterProberParams::new(
+                    types::TUniqueId::new(hi, lo),
+                    exchange_addr.clone(),
+                );
+                id_to_prober_params
+                    .entry(*filter_id)
+                    .or_default()
+                    .push(prober);
+            }
+        }
+    }
+
+    // Builder number: always 1 in standalone (single instance per fragment).
+    for (_, filter_ids) in &rf_plan.build_side_filters {
+        for fid in filter_ids {
+            builder_number.insert(*fid, 1);
+        }
+    }
+
+    // Patch merge node addresses on remote filter descriptions.
+    for (_filter_id, desc) in rf_plan.all_filters.iter_mut() {
+        if desc.has_remote_targets == Some(true) {
+            desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
+        }
+    }
+    // Also patch inside the plan nodes.
+    for fr in fragment_results.iter_mut() {
+        for node in fr.plan.nodes.iter_mut() {
+            if let Some(ref mut hj) = node.hash_join_node {
+                if let Some(ref mut rf_descs) = hj.build_runtime_filters {
+                    for desc in rf_descs.iter_mut() {
+                        if desc.has_remote_targets == Some(true) {
+                            desc.runtime_filter_merge_nodes =
+                                Some(vec![exchange_addr.clone()]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    runtime_filter::TRuntimeFilterParams::new(
+        id_to_prober_params,
+        builder_number,
+        16_i64 * 1024 * 1024, // runtime_filter_max_size: 16MB default
+        None::<std::collections::BTreeSet<i32>>,
+    )
 }

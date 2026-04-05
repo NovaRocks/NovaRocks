@@ -164,6 +164,7 @@ pub(crate) fn emit_multi_fragment(
         fragment_results,
         root_fragment_id: fragment_plan.root_fragment_id,
         edges: Vec::new(),
+        rf_plan: None,
     })
 }
 

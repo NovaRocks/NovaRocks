@@ -62,6 +62,8 @@ pub(crate) struct MultiFragmentBuildResult {
     pub root_fragment_id: FragmentId,
     /// Fragment-to-fragment data edges.
     pub edges: Vec<FragmentEdge>,
+    /// Runtime filter planning result (populated for standalone mode).
+    pub rf_plan: Option<crate::sql::cascades::runtime_filter_planner::RuntimeFilterPlanResult>,
 }
 
 /// Physical emission result for a single fragment.

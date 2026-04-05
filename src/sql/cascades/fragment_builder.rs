@@ -60,6 +60,16 @@ struct VisitResult {
 }
 
 // ---------------------------------------------------------------------------
+// Scan/join ownership metadata (used by RF planning)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScanTupleOwner {
+    pub scan_node_id: i32,
+    pub fragment_id: FragmentId,
+}
+
+// ---------------------------------------------------------------------------
 // PlanFragmentBuilder
 // ---------------------------------------------------------------------------
 
@@ -81,6 +91,12 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     completed_edges: Vec<FragmentEdge>,
     /// CTE ID -> index in `completed_fragments`.
     cte_fragments: HashMap<CteId, usize>,
+    /// tuple_id -> owning scan node and fragment (for RF target identification).
+    pub(crate) scan_tuple_owners: HashMap<i32, ScanTupleOwner>,
+    /// hash join node_id -> fragment_id for RF eligibility.
+    pub(crate) join_fragment_map: HashMap<i32, FragmentId>,
+    /// hash join node_id -> JoinDistribution for RF join mode mapping.
+    pub(crate) join_distributions: HashMap<i32, crate::sql::cascades::operator::JoinDistribution>,
 }
 
 impl<'a> PlanFragmentBuilder<'a> {
@@ -106,6 +122,9 @@ impl<'a> PlanFragmentBuilder<'a> {
             completed_fragments: Vec::new(),
             completed_edges: Vec::new(),
             cte_fragments: HashMap::new(),
+            scan_tuple_owners: HashMap::new(),
+            join_fragment_map: HashMap::new(),
+            join_distributions: HashMap::new(),
         };
 
         // Elide a root-level Gather: on a single node the top-level gather
@@ -175,10 +194,29 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut fragment_results = builder.completed_fragments;
         fragment_results.push(root_fragment);
 
+        // Runtime filter planning pass: identify RF opportunities and patch
+        // join nodes with TRuntimeFilterDescription.
+        let pipeline_dop = std::thread::available_parallelism()
+            .map(|p| p.get().min(4))
+            .unwrap_or(4) as i32;
+        let rf_plan = super::runtime_filter_planner::plan_runtime_filters(
+            &mut fragment_results,
+            &builder.scan_tuple_owners,
+            &builder.join_fragment_map,
+            &builder.join_distributions,
+            pipeline_dop,
+        );
+        let rf_plan = if rf_plan.all_filters.is_empty() {
+            None
+        } else {
+            Some(rf_plan)
+        };
+
         Ok(MultiFragmentBuildResult {
             fragment_results,
             root_fragment_id,
             edges: builder.completed_edges,
+            rf_plan,
         })
     }
 
@@ -353,6 +391,16 @@ impl<'a> PlanFragmentBuilder<'a> {
             nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, pushed_conjuncts);
         self.scan_tables.push((scan_node_id, resolved));
 
+        // Track tuple -> scan node ownership for runtime filter planning.
+        let current_frag = self.current_fragment_id()?;
+        self.scan_tuple_owners.insert(
+            scan_tuple_id,
+            ScanTupleOwner {
+                scan_node_id,
+                fragment_id: current_frag,
+            },
+        );
+
         Ok(VisitResult {
             plan_nodes: vec![scan_plan_node],
             scope,
@@ -488,6 +536,13 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         let join_op = join_kind_to_op(op.join_type);
         let join_node_id = self.alloc_node();
+
+        // Track join node -> fragment for runtime filter planning.
+        if let Ok(frag_id) = self.current_fragment_id() {
+            self.join_fragment_map.insert(join_node_id, frag_id);
+        }
+        self.join_distributions
+            .insert(join_node_id, op.distribution.clone());
 
         // Compile eq conditions.  The eq_conditions pairs come from the SQL
         // text order (e.g. `l_orderkey = o_orderkey`), which may not match the
