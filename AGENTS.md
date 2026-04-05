@@ -275,8 +275,14 @@ StarRocks FE
 
 ### 8.2 Build Mode
 
-- **Debug build (`cargo build`)**: Use for functional testing and fast iteration. Default choice.
-- **Release build (`cargo build --release`)**: Use ONLY when testing performance (query latency, throughput). Release compilation is very slow and not suitable for rapid iteration.
+- **Debug build (`cargo build`)**: Use for bug investigation, functional fix verification, and fast iteration.  
+  Debug builds have fast incremental compilation (~10-20s) but slow query execution (~5-10× slower than release).  
+  **Use when**: fixing a specific bug and verifying the fix with 1-3 targeted queries.
+- **Release build (`cargo build --release`)**: Use for batch SQL suite testing (SSB, TPC-H, TPC-DS) and performance benchmarks.  
+  Release compilation is slow (~3-5 min full, ~30s incremental) but query execution is fast.  
+  **Use when**: running a full test suite (`--suite tpc-ds`) or measuring query latency/throughput.
+
+**Rule of thumb**: debug for coding → release for testing suites.
 
 ### 8.3 Code Quality
 
@@ -285,18 +291,34 @@ StarRocks FE
 - `cargo build`
 - `cargo test`
 
-### 8.3 SQL Regression Tests
+### 8.4 SQL Regression Tests
 
-Unified runner under `sql-tests`:
+Unified runner under `sql-tests`. Requires a MySQL-compatible server on port 9030.
+
+**Start standalone-server (no external FE needed):**
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite <suite> --mode <verify|record|diff>
+# Debug: fast compile, slow query (for fix verification)
+NO_PROXY=127.0.0.1,localhost cargo run -- standalone-server --port 9030
+
+# Release: slow compile, fast query (for suite testing)
+NO_PROXY=127.0.0.1,localhost cargo run --release -- standalone-server --port 9030
 ```
 
-Example:
+**Run test suites:**
 
 ```bash
-cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- --suite write-path --mode verify
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --suite <suite> --mode <verify|record|diff> [--query-timeout 60] [-j 4]
+```
+
+Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, etc.
+
+**Run specific cases:**
+
+```bash
+cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+  --suite tpc-ds --only q10,q35,q69 --mode verify
 ```
 
 ---

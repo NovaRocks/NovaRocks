@@ -125,38 +125,38 @@ pub(crate) fn plan_runtime_filters(
                 filter_id,
                 local_layout,
                 global_layout,
-                false,                                               // pipeline_level_multi_partitioned
-                1_i32,                                               // num_instances
-                pipeline_dop,                                        // num_drivers_per_instance
-                None::<Vec<i32>>,                                    // bucketseq_to_instance
-                None::<Vec<i32>>,                                    // bucketseq_to_driverseq
-                None::<Vec<i32>>,                                    // bucketseq_to_partition
-                None::<Vec<crate::partitions::TBucketProperty>>,     // bucket_properties
+                false,            // pipeline_level_multi_partitioned
+                1_i32,            // num_instances
+                pipeline_dop,     // num_drivers_per_instance
+                None::<Vec<i32>>, // bucketseq_to_instance
+                None::<Vec<i32>>, // bucketseq_to_driverseq
+                None::<Vec<i32>>, // bucketseq_to_partition
+                None::<Vec<crate::partitions::TBucketProperty>>, // bucket_properties
             );
 
             let mut target_map = BTreeMap::new();
             target_map.insert(scan_owner.scan_node_id, probe_expr.clone());
 
             let desc = runtime_filter::TRuntimeFilterDescription::new(
-                filter_id,                                                              // filter_id
-                build_expr.clone(),                                                     // build_expr
-                expr_order as i32,                                                      // expr_order
-                target_map,                                                             // plan_node_id_to_target_expr
-                has_remote_targets,                                                     // has_remote_targets
-                None::<i64>,                                                            // bloom_filter_size
-                None::<Vec<crate::types::TNetworkAddress>>,                             // runtime_filter_merge_nodes
-                build_join_mode,                                                        // build_join_mode
-                None::<crate::types::TUniqueId>,                                        // sender_finst_id
-                *join_node_id,                                                          // build_plan_node_id
-                None::<Vec<crate::types::TUniqueId>>,                                   // broadcast_grf_senders
-                None::<Vec<runtime_filter::TRuntimeFilterDestination>>,                 // broadcast_grf_destinations
-                None::<Vec<i32>>,                                                       // bucketseq_to_instance
-                None::<BTreeMap<i32, Vec<exprs::TExpr>>>,                               // plan_node_id_to_partition_by_exprs
-                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER,                   // filter_type
-                layout,                                                                 // layout
-                None::<bool>,                                                           // build_from_group_execution
-                None::<bool>,                                                           // is_broad_cast_join_in_skew
-                None::<i32>,                                                            // skew_shuffle_filter_id
+                filter_id,                                              // filter_id
+                build_expr.clone(),                                     // build_expr
+                expr_order as i32,                                      // expr_order
+                target_map,                                 // plan_node_id_to_target_expr
+                has_remote_targets,                         // has_remote_targets
+                None::<i64>,                                // bloom_filter_size
+                None::<Vec<crate::types::TNetworkAddress>>, // runtime_filter_merge_nodes
+                build_join_mode,                            // build_join_mode
+                None::<crate::types::TUniqueId>,            // sender_finst_id
+                *join_node_id,                              // build_plan_node_id
+                None::<Vec<crate::types::TUniqueId>>,       // broadcast_grf_senders
+                None::<Vec<runtime_filter::TRuntimeFilterDestination>>, // broadcast_grf_destinations
+                None::<Vec<i32>>,                                       // bucketseq_to_instance
+                None::<BTreeMap<i32, Vec<exprs::TExpr>>>, // plan_node_id_to_partition_by_exprs
+                runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER, // filter_type
+                layout,                                   // layout
+                None::<bool>,                             // build_from_group_execution
+                None::<bool>,                             // is_broad_cast_join_in_skew
+                None::<i32>,                              // skew_shuffle_filter_id
             );
 
             rf_descs.push(desc.clone());

@@ -14,8 +14,6 @@ use std::sync::Arc;
 
 use crate::data_sinks;
 use crate::exec::expr::ExprArena;
-use crate::runtime_filter;
-use crate::sql::cascades::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::executor::execute_plan_with_pipeline;
@@ -25,6 +23,8 @@ use crate::lower::thrift::lower_plan;
 use crate::partitions;
 use crate::planner;
 use crate::runtime::runtime_state::RuntimeState;
+use crate::runtime_filter;
+use crate::sql::cascades::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::sql::cte::CteId;
 use crate::sql::fragment::FragmentId;
 use crate::sql::physical::{
@@ -108,6 +108,32 @@ impl ExecutionCoordinator {
                     .or_default()
                     .push((e.target_fragment_id, e.target_exchange_node_id));
             }
+        }
+
+        // Debug: log fragment structure
+        eprintln!(
+            "[coordinator] fragments={} edges={} root={}",
+            fragment_results.len(),
+            edges.len(),
+            root_fragment_id
+        );
+        for e in &edges {
+            eprintln!(
+                "[coordinator] edge: frag {} -> frag {} (exch_node={}, kind={:?})",
+                e.source_fragment_id,
+                e.target_fragment_id,
+                e.target_exchange_node_id,
+                match &e.edge_kind {
+                    FragmentEdgeKind::Stream => "Stream",
+                    FragmentEdgeKind::CteMulticast { .. } => "CteMulticast",
+                }
+            );
+        }
+        for (fid, senders) in &per_fragment_exch_num_senders {
+            eprintln!(
+                "[coordinator] per_exch_num_senders[frag {}] = {:?}",
+                fid, senders
+            );
         }
 
         // Also collect CTE consumers from legacy cte_exchange_nodes field
@@ -432,10 +458,16 @@ impl ExecutionCoordinator {
 
         let mut cte_handles: Vec<std::thread::JoinHandle<Result<(), String>>> = Vec::new();
 
+        eprintln!(
+            "[coordinator] launching {} background fragments",
+            cte_thrift_fragments.len()
+        );
         for (cte_fr, thrift_fragment, cte_exec_params) in cte_thrift_fragments {
             let desc_tbl = cte_fr.desc_tbl.clone();
             let dop = pipeline_dop;
+            let frag_id = cte_fr.fragment_id;
             let handle = std::thread::spawn(move || {
+                eprintln!("[coordinator] fragment {} started", frag_id);
                 let result = execute_fragment(
                     &thrift_fragment,
                     Some(&desc_tbl),
@@ -451,6 +483,10 @@ impl ExecutionCoordinator {
                     None, // backend_num
                     None, // mem_tracker
                 );
+                match &result {
+                    Ok(_) => eprintln!("[coordinator] fragment {} completed OK", frag_id),
+                    Err(e) => eprintln!("[coordinator] fragment {} FAILED: {}", frag_id, e),
+                }
                 result.map(|_| ())
             });
             cte_handles.push(handle);
@@ -621,8 +657,7 @@ fn setup_runtime_filter_params(
                 if let Some(ref mut rf_descs) = hj.build_runtime_filters {
                     for desc in rf_descs.iter_mut() {
                         if desc.has_remote_targets == Some(true) {
-                            desc.runtime_filter_merge_nodes =
-                                Some(vec![exchange_addr.clone()]);
+                            desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
                         }
                     }
                 }

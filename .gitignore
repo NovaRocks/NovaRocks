@@ -15,6 +15,7 @@
 /sql-tests/.sql_test_catalog
 /tools/target
 /tests/sql-test-runner/target
+/.worktrees
 thirdparty/installed
 .DS_Store
 nosetests.xml

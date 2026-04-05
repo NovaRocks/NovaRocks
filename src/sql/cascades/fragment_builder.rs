@@ -646,16 +646,21 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => {}
         }
 
-        // SEMI/ANTI joins only output columns from the surviving side.
-        let (merged_scope, merged_tuple_ids) = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => (left.scope, left.tuple_ids),
-            JoinKind::RightSemi | JoinKind::RightAnti => (right.scope, right.tuple_ids),
+        // tuple_ids always includes both sides — the join node's row_tuples
+        // must reference all probe and build tuples.
+        let mut merged_tuple_ids = left.tuple_ids.clone();
+        merged_tuple_ids.extend(&right.tuple_ids);
+
+        // Output scope: SEMI/ANTI joins only expose the surviving side's
+        // columns to downstream operators (preventing stale column
+        // references when multiple SEMI joins are chained).
+        let merged_scope = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti => left.scope,
+            JoinKind::RightSemi | JoinKind::RightAnti => right.scope,
             _ => {
                 let mut scope = left.scope;
                 scope.merge(&right.scope);
-                let mut tids = left.tuple_ids;
-                tids.extend(right.tuple_ids);
-                (scope, tids)
+                scope
             }
         };
 
@@ -735,16 +740,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             _ => {}
         }
 
-        // SEMI/ANTI joins only output columns from the surviving side.
-        let (merged_scope, merged_tuple_ids) = match op.join_type {
-            JoinKind::LeftSemi | JoinKind::LeftAnti => (left.scope, left.tuple_ids),
-            JoinKind::RightSemi | JoinKind::RightAnti => (right.scope, right.tuple_ids),
+        // tuple_ids always includes both sides for the join node.
+        let mut merged_tuple_ids = left.tuple_ids.clone();
+        merged_tuple_ids.extend(&right.tuple_ids);
+
+        // Output scope: SEMI/ANTI only expose surviving side.
+        let merged_scope = match op.join_type {
+            JoinKind::LeftSemi | JoinKind::LeftAnti => left.scope,
+            JoinKind::RightSemi | JoinKind::RightAnti => right.scope,
             _ => {
                 let mut scope = left.scope;
                 scope.merge(&right.scope);
-                let mut tids = left.tuple_ids;
-                tids.extend(right.tuple_ids);
-                (scope, tids)
+                scope
             }
         };
 
