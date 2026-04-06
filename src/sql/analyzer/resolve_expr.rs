@@ -172,6 +172,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 let expr_typed = self.analyze_expr(between_expr, scope)?;
                 let low_typed = self.analyze_expr(low, scope)?;
                 let high_typed = self.analyze_expr(high, scope)?;
+                // Implicit cast: when comparing date/timestamp with string,
+                // cast the string to the date/timestamp type.
+                let low_typed = coerce_to_target_type(low_typed, &expr_typed.data_type);
+                let high_typed = coerce_to_target_type(high_typed, &expr_typed.data_type);
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),
@@ -1058,4 +1062,28 @@ fn infer_decimal_precision_scale(s: &str) -> (u8, i8) {
     let precision = precision.max(1).min(38) as u8;
     let scale = scale.min(38) as i8;
     (precision, scale)
+}
+
+/// Implicit cast: if `expr` is Utf8 and `target` is a date/timestamp type,
+/// wrap `expr` in a Cast to the target type. This matches StarRocks FE
+/// behavior where string literals are implicitly cast to date/timestamp
+/// in comparison contexts (BETWEEN, WHERE, etc.).
+fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
+    let needs_cast = matches!(expr.data_type, DataType::Utf8 | DataType::LargeUtf8)
+        && matches!(
+            target,
+            DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
+        );
+    if needs_cast {
+        TypedExpr {
+            nullable: expr.nullable,
+            data_type: target.clone(),
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target: target.clone(),
+            },
+        }
+    } else {
+        expr
+    }
 }
