@@ -46,6 +46,19 @@ pub(crate) fn arithmetic_result_type_with_op(
     right: &DataType,
     op: &str,
 ) -> DataType {
+    // StarRocks behavior: integer / integer → DOUBLE (not integer).
+    let is_div = op == "div";
+    let both_integral = matches!(
+        left,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) && matches!(
+        right,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    );
+    if is_div && both_integral {
+        return DataType::Float64;
+    }
+
     match (left, right) {
         // Decimal + Decimal -> Decimal (op-specific precision/scale)
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {

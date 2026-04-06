@@ -855,6 +855,28 @@ pub fn eval_div(
     )? {
         return Ok(arr);
     }
+    // StarRocks: integer / integer → DOUBLE. Cast integer inputs to Float64
+    // BEFORE dividing so that the result preserves fractional parts.
+    let both_integral = is_integer_type(lhs.data_type()) && is_integer_type(rhs.data_type());
+    if both_integral && matches!(output_type, DataType::Float64) {
+        let lhs_f = arrow::compute::cast(&lhs, &DataType::Float64)
+            .map_err(|e| format!("div cast lhs: {e}"))?;
+        let rhs_f = arrow::compute::cast(&rhs, &DataType::Float64)
+            .map_err(|e| format!("div cast rhs: {e}"))?;
+        let result = eval_numeric_binop_arrays(
+            lhs_f,
+            rhs_f,
+            |x, y| {
+                let result = div(x, y)?;
+                Ok(Arc::new(result))
+            },
+            |x, y| {
+                let result = div(x, y)?;
+                Ok(Arc::new(result))
+            },
+        )?;
+        return Ok(result);
+    }
     let result = eval_numeric_binop_arrays(
         lhs,
         rhs,
@@ -868,6 +890,20 @@ pub fn eval_div(
         },
     )?;
     cast_numeric_output(result, &output_type)
+}
+
+fn is_integer_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
 }
 
 /// Replace zero values in a numeric array with NULLs for safe division.
