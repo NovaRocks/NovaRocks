@@ -30,6 +30,8 @@ fn eval_with_factor(
     chunk: &Chunk,
     factor: i64,
 ) -> Result<ArrayRef, String> {
+    use arrow::array::Date32Array as ArrowDate32Array;
+
     let date_arr = arena.eval(args[0], chunk)?;
     let days_arr = arena.eval(args[1], chunk)?;
     let dts = extract_datetime_array(&date_arr)?;
@@ -39,6 +41,28 @@ fn eval_with_factor(
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
     let len = dts.len().max(days.len());
+
+    // Date32 output: return days since epoch instead of timestamp micros.
+    if matches!(output_type, DataType::Date32) {
+        let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            let dt = if dts.len() == 1 { dts[0] } else { dts[i] };
+            let day = if days.len() == 1 { days[0] } else { days[i] };
+            let Some(day) = day else {
+                out.push(None);
+                continue;
+            };
+            let delta = day * factor;
+            let v = dt.map(|d| {
+                let result = d + Duration::days(delta);
+                (result.date() - epoch).num_days() as i32
+            });
+            out.push(v);
+        }
+        return Ok(Arc::new(ArrowDate32Array::from(out)) as ArrayRef);
+    }
+
     let mut out = Vec::with_capacity(len);
     for i in 0..len {
         let dt = if dts.len() == 1 { dts[0] } else { dts[i] };

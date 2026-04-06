@@ -136,8 +136,19 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "now" | "current_timestamp" | "current_date" | "curdate" => {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
-        "date_format" | "from_unixtime" | "date_add" | "date_sub" | "adddate" | "subdate" => {
-            DataType::Utf8
+        "date_format" | "from_unixtime" => DataType::Utf8,
+        "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
+        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" => {
+            // Return the same type as the date/timestamp input argument.
+            if let Some(dt) = arg_types.first() {
+                match dt {
+                    DataType::Date32 => DataType::Date32,
+                    DataType::Timestamp(u, tz) => DataType::Timestamp(*u, tz.clone()),
+                    _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                }
+            } else {
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+            }
         }
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
         | "dayofyear" | "weekofyear" | "quarter" => DataType::Int32,

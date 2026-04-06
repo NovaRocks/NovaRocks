@@ -1947,8 +1947,19 @@ fn infer_scalar_function_return_type(
         "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" => Ok(
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         ),
-        "date_format" | "from_unixtime" | "date_add" | "date_sub" | "adddate" | "subdate"
-        | "time_format" => Ok(DataType::Utf8),
+        "date_format" | "from_unixtime" | "time_format" => Ok(DataType::Utf8),
+        "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
+        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" => {
+            let input_type = arg_types.first().cloned().unwrap_or(DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                None,
+            ));
+            Ok(match input_type {
+                DataType::Date32 => DataType::Date32,
+                DataType::Timestamp(u, tz) => DataType::Timestamp(u, tz),
+                _ => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            })
+        }
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
         | "yearweek" | "dayofyear" | "weekofyear" | "quarter" | "hour_from_unixtime" => {
             Ok(DataType::Int32)
