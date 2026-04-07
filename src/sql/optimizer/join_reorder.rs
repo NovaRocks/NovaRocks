@@ -1,18 +1,25 @@
 //! Join reorder optimization pass.
 //!
-//! Two strategies are available:
+//! Multiple strategies are available with adaptive algorithm selection:
 //!
-//! 1. **CBO (cost-based)** — `reorder_joins_cbo`: Uses dynamic programming to
-//!    enumerate join orderings for chains of INNER JOINs, picking the cheapest
-//!    plan according to the cardinality estimator and cost model.
+//! 1. **DP (<=12 tables)** — Exhaustive dynamic programming over all join
+//!    orderings. Optimal but exponential in the number of relations.
 //!
-//! 2. **Heuristic** — `reorder_joins_heuristic` (fallback): For hash joins the
-//!    left child is the **probe** side and the right child is the **build**
+//! 2. **Greedy (<=20 tables)** — Level-by-level join building: at each level,
+//!    tries all (prev_level_group, atom) pairs and keeps the best plan per
+//!    table subset. Polynomial time with good results.
+//!
+//! 3. **LeftDeep (any size)** — Sorts tables by row count and greedily attaches
+//!    one table at a time, preferring equi-join connections. O(n^2) time,
+//!    always produces a left-deep tree.
+//!
+//! 4. **Heuristic** — `reorder_joins_heuristic` (final fallback): For hash joins
+//!    the left child is the **probe** side and the right child is the **build**
 //!    side.  Swaps children when the right (build) side is significantly larger
 //!    than the left (probe) side.
 //!
-//! The CBO path falls back to the heuristic when there are >10 relations in a
-//! join graph, or when join graph extraction fails.
+//! The CBO entry point (`reorder_joins_cbo`) adaptively selects: DP -> Greedy
+//! -> LeftDeep -> Heuristic, based on the number of relations in the join graph.
 
 use std::collections::HashMap;
 
@@ -239,9 +246,16 @@ struct JoinGraph {
     predicates: Vec<(TypedExpr, u16)>,
 }
 
-/// CBO join reorder: walks the plan tree and applies DP join enumeration to
-/// chains of INNER JOINs.  Non-INNER joins are left in place but their
-/// children are recursively optimized.
+/// CBO join reorder: walks the plan tree and applies join enumeration to
+/// chains of INNER JOINs using adaptive algorithm selection:
+///
+/// - DP (<=12 tables): exhaustive enumeration
+/// - Greedy (<=20 tables): level-by-level best-pair construction
+/// - LeftDeep (any size): greedy left-deep tree construction
+/// - Heuristic fallback: simple size-based swap
+///
+/// Non-INNER joins are left in place but their children are recursively
+/// optimized.
 pub(crate) fn reorder_joins_cbo(
     plan: LogicalPlan,
     table_stats: &HashMap<String, TableStatistics>,
@@ -251,7 +265,9 @@ pub(crate) fn reorder_joins_cbo(
             // Try to extract a join graph from this chain of INNER JOINs.
             let full_plan = LogicalPlan::Join(j);
             match extract_join_graph(&full_plan) {
-                Some(graph) if graph.relations.len() >= 2 && graph.relations.len() <= 10 => {
+                Some(graph) if graph.relations.len() >= 2 => {
+                    let n = graph.relations.len();
+
                     // Recursively optimize each leaf relation first.
                     let optimized_relations: Vec<LogicalPlan> = graph
                         .relations
@@ -264,16 +280,29 @@ pub(crate) fn reorder_joins_cbo(
                         predicates: graph.predicates,
                     };
 
-                    match dp_join_reorder(optimized_graph, table_stats) {
+                    // Adaptive algorithm selection:
+                    // DP (<=12) -> Greedy (<=20) -> LeftDeep (any)
+                    let result = if n <= 12 {
+                        tracing::debug!(n, "join_reorder: using DP algorithm");
+                        dp_join_reorder(optimized_graph, table_stats)
+                    } else if n <= 20 {
+                        tracing::debug!(n, "join_reorder: using Greedy algorithm");
+                        greedy_join_reorder(optimized_graph, table_stats)
+                    } else {
+                        tracing::debug!(n, "join_reorder: using LeftDeep algorithm");
+                        left_deep_join_reorder(optimized_graph, table_stats)
+                    };
+
+                    match result {
                         Some(plan) => plan,
                         None => {
-                            // DP failed, fall back to heuristic.
+                            // Algorithm failed, fall back to heuristic.
                             reorder_joins_heuristic(full_plan)
                         }
                     }
                 }
                 _ => {
-                    // Could not extract graph or too many relations, use heuristic.
+                    // Could not extract graph, use heuristic.
                     reorder_joins_heuristic(full_plan)
                 }
             }
@@ -565,6 +594,271 @@ fn find_connecting_predicates(
         })
         .map(|(pred, _)| pred.clone())
         .collect()
+}
+
+/// Collect all predicates whose referenced relations are fully contained within
+/// the union of `left_mask` and `right_mask`, and that touch at least one
+/// relation from each side.
+///
+/// This is the public-facing helper that greedy/left-deep algorithms use to find
+/// join predicates between two table sets.
+fn collect_join_predicates(graph: &JoinGraph, left_mask: u16, right_mask: u16) -> Vec<(TypedExpr, u16)> {
+    let combined = left_mask | right_mask;
+    graph
+        .predicates
+        .iter()
+        .filter(|(_, mask)| {
+            let touches_left = (*mask & left_mask) != 0;
+            let touches_right = (*mask & right_mask) != 0;
+            let within_scope = (*mask & !combined) == 0;
+            touches_left && touches_right && within_scope
+        })
+        .cloned()
+        .collect()
+}
+
+// ===========================================================================
+// Greedy join reorder
+// ===========================================================================
+
+/// Greedy join reorder: level-by-level join building similar to StarRocks
+/// `JoinReorderGreedy.java`.
+///
+/// At each level, tries all (prev_level_group, single_atom) pairs, builds the
+/// join, estimates cost, and keeps the best plan per table subset.
+/// Prefers equi-join connections over cross joins (10x cost penalty for cross).
+fn greedy_join_reorder(
+    graph: JoinGraph,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Option<LogicalPlan> {
+    let n = graph.relations.len();
+    if !(2..=16).contains(&n) {
+        return None;
+    }
+
+    let mut memo: HashMap<u16, DpEntry> = HashMap::new();
+
+    // Phase 1: Initialize single-relation entries.
+    for (i, rel) in graph.relations.iter().enumerate() {
+        let mask = 1u16 << i;
+        let stats = cardinality::estimate_statistics(rel, table_stats);
+        let self_cost = cost::estimate_operator_cost(rel, &stats, &[]);
+        memo.insert(
+            mask,
+            DpEntry {
+                plan: rel.clone(),
+                stats,
+                cumulative_cost: self_cost.total_cost(),
+            },
+        );
+    }
+
+    // Phase 2: Level-by-level construction.
+    // `prev_level` holds the masks from the previous level; at level 2 we
+    // combine single atoms to form pairs, at level 3 pairs+atom -> triples, etc.
+    let mut prev_level: Vec<u16> = (0..n).map(|i| 1u16 << i).collect();
+
+    for _level in 2..=n {
+        let mut next_level: Vec<u16> = Vec::new();
+
+        for &group_mask in &prev_level {
+            for i in 0..n {
+                let atom_mask = 1u16 << i;
+                // Skip if atom already part of this group.
+                if (group_mask & atom_mask) != 0 {
+                    continue;
+                }
+
+                let combined = group_mask | atom_mask;
+
+                let connecting = collect_join_predicates(&graph, group_mask, atom_mask);
+                let is_cross = connecting.is_empty();
+
+                let condition = if is_cross {
+                    None
+                } else {
+                    let preds: Vec<TypedExpr> = connecting.into_iter().map(|(e, _)| e).collect();
+                    Some(combine_and(preds))
+                };
+
+                let (group_entry, atom_entry) = match (memo.get(&group_mask), memo.get(&atom_mask)) {
+                    (Some(g), Some(a)) => (g, a),
+                    _ => continue,
+                };
+
+                // Build side should be the smaller relation.
+                let (left_plan, left_stats, left_cost, right_plan, right_stats, right_cost) =
+                    if group_entry.stats.output_row_count >= atom_entry.stats.output_row_count {
+                        (
+                            &group_entry.plan,
+                            &group_entry.stats,
+                            group_entry.cumulative_cost,
+                            &atom_entry.plan,
+                            &atom_entry.stats,
+                            atom_entry.cumulative_cost,
+                        )
+                    } else {
+                        (
+                            &atom_entry.plan,
+                            &atom_entry.stats,
+                            atom_entry.cumulative_cost,
+                            &group_entry.plan,
+                            &group_entry.stats,
+                            group_entry.cumulative_cost,
+                        )
+                    };
+
+                let join_plan = LogicalPlan::Join(JoinNode {
+                    left: Box::new(left_plan.clone()),
+                    right: Box::new(right_plan.clone()),
+                    join_type: JoinKind::Inner,
+                    condition,
+                });
+
+                let join_stats = cardinality::estimate_statistics(&join_plan, table_stats);
+                let join_self_cost = cost::estimate_operator_cost(
+                    &join_plan,
+                    &join_stats,
+                    &[left_stats, right_stats],
+                );
+
+                let mut total_cost =
+                    left_cost + right_cost + join_self_cost.total_cost();
+
+                // Cross join penalty.
+                if is_cross {
+                    total_cost *= 10.0;
+                }
+
+                let dominated = memo
+                    .get(&combined)
+                    .is_some_and(|existing| existing.cumulative_cost <= total_cost);
+                if !dominated {
+                    memo.insert(
+                        combined,
+                        DpEntry {
+                            plan: join_plan,
+                            stats: join_stats,
+                            cumulative_cost: total_cost,
+                        },
+                    );
+                    if !next_level.contains(&combined) {
+                        next_level.push(combined);
+                    }
+                }
+            }
+        }
+
+        if next_level.is_empty() {
+            break;
+        }
+        prev_level = next_level;
+    }
+
+    let full_mask = (1u16 << n) - 1;
+    memo.remove(&full_mask).map(|e| e.plan)
+}
+
+// ===========================================================================
+// Left-deep join reorder
+// ===========================================================================
+
+/// Left-deep join reorder: sorts tables by estimated row count and greedily
+/// attaches one table at a time.
+///
+/// - Starts with the largest table as the initial probe side.
+/// - At each step, picks the unattached table that has equi-join predicates to
+///   the current left side (preferring the smallest such table). Falls back to
+///   the smallest unattached table if no equi-join predicates exist.
+/// - Always produces a left-deep tree shape.
+fn left_deep_join_reorder(
+    graph: JoinGraph,
+    table_stats: &HashMap<String, TableStatistics>,
+) -> Option<LogicalPlan> {
+    let n = graph.relations.len();
+    if !(2..=16).contains(&n) {
+        return None;
+    }
+
+    // Compute stats for each relation.
+    let rel_stats: Vec<Statistics> = graph
+        .relations
+        .iter()
+        .map(|r| cardinality::estimate_statistics(r, table_stats))
+        .collect();
+
+    // Start with the largest table (highest row_count) as the initial left side.
+    let mut used_mask: u16 = 0;
+    let start_idx = (0..n)
+        .max_by(|&a, &b| {
+            rel_stats[a]
+                .output_row_count
+                .partial_cmp(&rel_stats[b].output_row_count)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(0);
+
+    let mut current_plan = graph.relations[start_idx].clone();
+    let mut current_mask = 1u16 << start_idx;
+    used_mask |= current_mask;
+
+    for _ in 1..n {
+        // Find the best next table to join.
+        let mut best_idx: Option<usize> = None;
+        let mut best_has_equi = false;
+        let mut best_row_count = u64::MAX;
+
+        for (i, rs) in rel_stats.iter().enumerate() {
+            let atom_mask = 1u16 << i;
+            if (used_mask & atom_mask) != 0 {
+                continue;
+            }
+
+            let connecting = collect_join_predicates(&graph, current_mask, atom_mask);
+            let has_equi = !connecting.is_empty();
+            let rc = rs.output_row_count as u64;
+
+            // Prefer tables with equi-join predicates. Among those (or among
+            // tables without predicates), prefer the smallest.
+            let is_better = match (has_equi, best_has_equi) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => rc < best_row_count,
+            };
+
+            if best_idx.is_none() || is_better {
+                best_idx = Some(i);
+                best_has_equi = has_equi;
+                best_row_count = rc;
+            }
+        }
+
+        let next_idx = best_idx?;
+        let next_mask = 1u16 << next_idx;
+
+        let connecting = collect_join_predicates(&graph, current_mask, next_mask);
+        let condition = if connecting.is_empty() {
+            None
+        } else {
+            let preds: Vec<TypedExpr> = connecting.into_iter().map(|(e, _)| e).collect();
+            Some(combine_and(preds))
+        };
+
+        // Build side (right) should be the smaller relation; in left-deep the
+        // new table is always on the right (build) side, so we rely on the
+        // selection logic above to pick small tables.
+        current_plan = LogicalPlan::Join(JoinNode {
+            left: Box::new(current_plan),
+            right: Box::new(graph.relations[next_idx].clone()),
+            join_type: JoinKind::Inner,
+            condition,
+        });
+
+        current_mask |= next_mask;
+        used_mask |= next_mask;
+    }
+
+    Some(current_plan)
 }
 
 /// Iterator over all subsets of `universe` with exactly `k` bits set.

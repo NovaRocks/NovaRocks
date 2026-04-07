@@ -30,7 +30,7 @@ use memo::MExpr;
 use rule::Rule;
 
 /// Wall-clock timeout for the entire optimization pipeline.
-const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(3);
+const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum number of memo groups allowed during exploration.
 /// Prevents exponential blowup from join associativity on large join graphs.
@@ -123,6 +123,12 @@ fn explore(memo: &mut Memo, rules: &[Box<dyn Rule>], deadline: Instant) -> Resul
             let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for expr in &exprs {
                 for rule in rules {
+                    // Skip JoinAssociativity when the memo has grown large
+                    // to prevent combinatorial explosion. RBO join reorder
+                    // already handles join ordering for large join graphs.
+                    if rule.name() == "JoinAssociativity" && memo.groups.len() > 200 {
+                        continue;
+                    }
                     if rule.matches(&expr.op) {
                         let new_exprs = rule.apply(expr, memo);
                         for new_expr in new_exprs {
