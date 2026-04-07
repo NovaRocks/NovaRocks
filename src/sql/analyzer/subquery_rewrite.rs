@@ -73,7 +73,7 @@ impl<'a> AnalyzerContext<'a> {
         sq_info: SubqueryInfo,
         negated: bool,
     ) -> Result<(), String> {
-        let (resolved, inner_scope) =
+        let (mut resolved, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         let join_type = if negated {
@@ -82,70 +82,85 @@ impl<'a> AnalyzerContext<'a> {
             JoinKind::LeftSemi
         };
 
-        // For EXISTS, the subquery FROM becomes the right side of the join.
+        // For EXISTS, the subquery becomes the right side of a SEMI/ANTI JOIN.
         // The subquery WHERE is split into:
-        //   - correlation predicates → join ON condition
-        //   - remaining inner predicates → kept in the subquery WHERE
-        let (sub_from, sub_filter) = match resolved.body {
-            QueryBody::Select(sel) => (sel.from, sel.filter),
-            _ => return Err("EXISTS subquery must be a SELECT".into()),
+        //   - correlation predicates → SEMI JOIN ON condition
+        //   - remaining inner predicates → kept inside the subquery WHERE
+        //
+        // This ensures the subquery's internal joins (e.g. store_sales JOIN
+        // date_dim ON ss_sold_date_sk = d_date_sk) are preserved as proper
+        // joins within the subquery, rather than being hoisted into the
+        // semi-join condition which would leave a CROSS JOIN on the inner side.
+
+        // Extract correlation predicates from the subquery WHERE.
+        let corr_preds = if let QueryBody::Select(ref sel) = resolved.body {
+            if let Some(ref filter) = sel.filter {
+                extract_correlation_predicates(filter, &inner_scope, scope)
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
         };
 
-        let sub_rel = sub_from.ok_or("EXISTS subquery must have a FROM clause")?;
-
-        // Extract correlation predicates from the subquery WHERE
-        let join_condition = if let Some(ref filter) = sub_filter {
-            let corr_preds = extract_correlation_predicates(filter, &inner_scope, scope);
-            if corr_preds.is_empty() {
-                // No correlation — use full filter as join condition
-                sub_filter
-            } else {
-                // Build join condition from correlation predicates
-                let mut cond = TypedExpr {
+        let (sub_rel, join_condition) = if corr_preds.is_empty() {
+            // No correlation predicates found.
+            // Destructure subquery: use FROM as right side, full WHERE as join condition.
+            let (sub_from, sub_filter) = match resolved.body {
+                QueryBody::Select(sel) => (sel.from, sel.filter),
+                _ => return Err("EXISTS subquery must be a SELECT".into()),
+            };
+            let sub_rel = sub_from.ok_or("EXISTS subquery must have a FROM clause")?;
+            (sub_rel, sub_filter)
+        } else {
+            // Build join condition from ONLY the correlation predicates.
+            let mut cond = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(corr_preds[0].outer_col.clone()),
+                    op: corr_preds[0].op,
+                    right: Box::new(corr_preds[0].inner_col.clone()),
+                },
+            };
+            for pred in &corr_preds[1..] {
+                cond = TypedExpr {
                     data_type: DataType::Boolean,
                     nullable: false,
                     kind: ExprKind::BinaryOp {
-                        left: Box::new(corr_preds[0].outer_col.clone()),
-                        op: corr_preds[0].op,
-                        right: Box::new(corr_preds[0].inner_col.clone()),
+                        left: Box::new(cond),
+                        op: BinOp::And,
+                        right: Box::new(TypedExpr {
+                            data_type: DataType::Boolean,
+                            nullable: false,
+                            kind: ExprKind::BinaryOp {
+                                left: Box::new(pred.outer_col.clone()),
+                                op: pred.op,
+                                right: Box::new(pred.inner_col.clone()),
+                            },
+                        }),
                     },
                 };
-                for pred in &corr_preds[1..] {
-                    cond = TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        kind: ExprKind::BinaryOp {
-                            left: Box::new(cond),
-                            op: BinOp::And,
-                            right: Box::new(TypedExpr {
-                                data_type: DataType::Boolean,
-                                nullable: false,
-                                kind: ExprKind::BinaryOp {
-                                    left: Box::new(pred.outer_col.clone()),
-                                    op: pred.op,
-                                    right: Box::new(pred.inner_col.clone()),
-                                },
-                            }),
-                        },
-                    };
-                }
-                // Also include non-correlation predicates from the filter
-                let remaining = remove_correlation_preds_from_expr(filter, &corr_preds);
-                if let Some(remaining) = remaining {
-                    cond = TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                        kind: ExprKind::BinaryOp {
-                            left: Box::new(cond),
-                            op: BinOp::And,
-                            right: Box::new(remaining),
-                        },
-                    };
-                }
-                Some(cond)
             }
-        } else {
-            None
+
+            // Remove correlation predicates from the subquery's WHERE clause,
+            // keeping non-correlation predicates (inner join conditions, filters)
+            // inside the subquery.
+            if let QueryBody::Select(ref mut sel) = resolved.body {
+                if let Some(ref filter) = sel.filter {
+                    sel.filter = remove_correlation_preds_from_expr(filter, &corr_preds);
+                }
+            }
+
+            // Use the full subquery (with remaining internal WHERE) as the right
+            // side. This preserves inner joins like `store_sales JOIN date_dim`.
+            let sq_alias = format!("__exists_{}", sq_info.id);
+            let sub_rel = Relation::Subquery {
+                query: Box::new(resolved),
+                alias: sq_alias,
+            };
+
+            (sub_rel, Some(cond))
         };
 
         let current_from = select
@@ -299,16 +314,8 @@ impl<'a> AnalyzerContext<'a> {
                     negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
                 },
             };
-            Self::replace_placeholder_in_filter(
-                &mut select.filter,
-                sq_info.id,
-                &is_null_expr,
-            );
-            Self::replace_placeholder_in_filter(
-                &mut select.having,
-                sq_info.id,
-                &is_null_expr,
-            );
+            Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &is_null_expr);
+            Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &is_null_expr);
         } else {
             // Standard case: SEMI / ANTI JOIN
             let join_type = if negated {
@@ -360,8 +367,11 @@ impl<'a> AnalyzerContext<'a> {
         // extracted normally (matching StarRocks FE behaviour).
         if let QueryBody::Select(ref mut sel) = resolved_sub.body {
             if let Some(ref filter) = sel.filter {
-                sel.filter =
-                    Some(factor_common_correlation_from_or(filter, &inner_scope, scope));
+                sel.filter = Some(factor_common_correlation_from_or(
+                    filter,
+                    &inner_scope,
+                    scope,
+                ));
             }
         }
 
@@ -384,12 +394,13 @@ impl<'a> AnalyzerContext<'a> {
         let is_correlated = !corr_preds.is_empty();
 
         if is_correlated {
-            let (modified_sub, corr_join_conds) = self.build_correlated_scalar_subquery_from_resolved(
-                resolved_sub,
-                scope,
-                &sq_alias,
-                &corr_preds,
-            )?;
+            let (modified_sub, corr_join_conds) = self
+                .build_correlated_scalar_subquery_from_resolved(
+                    resolved_sub,
+                    scope,
+                    &sq_alias,
+                    &corr_preds,
+                )?;
 
             let scalar_output_name = modified_sub.output_columns[0].name.clone();
             let scalar_data_type = modified_sub.output_columns[0].data_type.clone();
@@ -649,12 +660,11 @@ impl<'a> AnalyzerContext<'a> {
         // the subquery's own columns, not outer scope columns) but use
         // merged_scope for column/expression resolution so that correlated
         // references can resolve against the outer scope.
-        let (projection, output_columns) =
-            self.analyze_projection_with_wildcard_scope(
-                &select.projection,
-                &merged_scope,
-                &inner_scope,
-            )?;
+        let (projection, output_columns) = self.analyze_projection_with_wildcard_scope(
+            &select.projection,
+            &merged_scope,
+            &inner_scope,
+        )?;
 
         // --- GROUP BY ---
         let group_by_exprs = match &select.group_by {
@@ -747,7 +757,6 @@ impl<'a> AnalyzerContext<'a> {
         sq_alias: &str,
         correlated_cols: &[CorrelationPred],
     ) -> Result<(ResolvedQuery, Option<TypedExpr>), String> {
-
         let mut join_conds: Vec<TypedExpr> = Vec::new();
         let mut extra_group_by: Vec<TypedExpr> = Vec::new();
         let mut extra_output: Vec<OutputColumn> = Vec::new();
@@ -1356,10 +1365,7 @@ fn is_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
 /// Check if an expression contains a SubqueryPlaceholder with the given id.
 fn has_placeholder(expr: &TypedExpr, id: usize) -> bool {
     match &expr.kind {
-        ExprKind::SubqueryPlaceholder {
-            id: pid,
-            ..
-        } => *pid == id,
+        ExprKind::SubqueryPlaceholder { id: pid, .. } => *pid == id,
         ExprKind::BinaryOp { left, right, .. } => {
             has_placeholder(left, id) || has_placeholder(right, id)
         }
@@ -1392,8 +1398,7 @@ fn factor_common_correlation_from_or(
     }
 
     // Collect AND conjuncts for each OR branch, identify correlation predicates
-    let branch_conjuncts: Vec<Vec<&TypedExpr>> =
-        branches.iter().map(|b| split_and(b)).collect();
+    let branch_conjuncts: Vec<Vec<&TypedExpr>> = branches.iter().map(|b| split_and(b)).collect();
 
     // Find correlation predicates (inner = outer) common to ALL branches
     let mut common_corr: Vec<TypedExpr> = Vec::new();

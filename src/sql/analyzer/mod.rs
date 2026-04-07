@@ -928,8 +928,7 @@ impl<'a> AnalyzerContext<'a> {
         for item in items {
             match item {
                 sqlast::SelectItem::Wildcard(_) => {
-                    for (qualifier, col_name, data_type, nullable) in
-                        wildcard_scope.iter_columns()
+                    for (qualifier, col_name, data_type, nullable) in wildcard_scope.iter_columns()
                     {
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
@@ -2004,6 +2003,56 @@ mod tests {
                 sel.filter.is_none() || !filter_has_placeholder(&sel.filter),
                 "filter should not contain SubqueryPlaceholder"
             );
+        } else {
+            panic!("expected Select body");
+        }
+    }
+
+    #[test]
+    fn exists_multi_table_subquery_keeps_inner_predicates_inside() {
+        // When the EXISTS subquery has multiple tables and a mix of correlation
+        // and inner-join predicates, the inner-join predicates must stay inside
+        // the subquery (not be hoisted into the SEMI JOIN condition).
+        // Without this, the inner side becomes a CROSS JOIN — catastrophic.
+        let sql = "SELECT o_orderkey FROM orders \
+                    WHERE EXISTS (SELECT * FROM lineitem, supplier \
+                                  WHERE l_orderkey = o_orderkey \
+                                  AND l_suppkey = s_suppkey \
+                                  AND s_name = 'test')";
+        let resolved = parse_and_analyze(sql).expect("analysis should succeed");
+        if let QueryBody::Select(sel) = &resolved.body {
+            let from = sel.from.as_ref().expect("should have FROM");
+            assert!(
+                has_join_kind(from, JoinKind::LeftSemi),
+                "EXISTS should be rewritten to LEFT SEMI JOIN"
+            );
+            // The right side of the SEMI JOIN should be a Subquery that
+            // contains the inner join condition (l_suppkey = s_suppkey) and
+            // the inner filter (s_name = 'test'), not hoisted to the
+            // semi-join ON clause.
+            if let Relation::Join(join_rel) = from {
+                // Right side must be a Subquery (not a bare multi-table scan)
+                match &join_rel.right {
+                    Relation::Subquery { query, .. } => {
+                        // The subquery should have a filter (the remaining
+                        // inner predicates after correlation extraction)
+                        if let QueryBody::Select(inner_sel) = &query.body {
+                            assert!(
+                                inner_sel.filter.is_some(),
+                                "inner subquery should keep non-correlation predicates as its WHERE, \
+                                 but filter was None"
+                            );
+                        } else {
+                            panic!("expected inner Select body");
+                        }
+                    }
+                    other => panic!(
+                        "right side of SEMI JOIN should be a Subquery (not a bare relation), got: {other:?}"
+                    ),
+                }
+            } else {
+                panic!("expected Join relation");
+            }
         } else {
             panic!("expected Select body");
         }
