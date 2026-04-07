@@ -57,6 +57,10 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
 
 pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
     match expr {
+        // Strip outer parentheses: `(col)` → display name of `col`.
+        // This matches how `SELECT distinct(col)` is parsed: DISTINCT is
+        // the SELECT modifier and `(col)` is a Nested expression.
+        sqlast::Expr::Nested(inner) => expr_display_name(inner),
         sqlast::Expr::CompoundIdentifier(parts) if parts.len() >= 2 => parts
             .last()
             .map(|i| i.value.clone())

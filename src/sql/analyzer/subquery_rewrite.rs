@@ -263,11 +263,22 @@ impl<'a> AnalyzerContext<'a> {
 
         // Analyze the subquery. We get back (resolved, inner_scope) where
         // inner_scope is the scope derived from the subquery's own FROM clause.
-        let (resolved_sub, inner_scope) =
+        let (mut resolved_sub, inner_scope) =
             self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         if resolved_sub.output_columns.is_empty() {
             return Err("scalar subquery must produce at least one output column".into());
+        }
+
+        // Factor out common correlation predicates from OR branches before
+        // extraction.  E.g. `(corr AND X) OR (corr AND Y)` → `corr AND (X OR Y)`
+        // so the correlation predicate lands at the top-level AND and can be
+        // extracted normally (matching StarRocks FE behaviour).
+        if let QueryBody::Select(ref mut sel) = resolved_sub.body {
+            if let Some(ref filter) = sel.filter {
+                sel.filter =
+                    Some(factor_common_correlation_from_or(filter, &inner_scope, scope));
+            }
         }
 
         // Detect correlation by examining the subquery's WHERE for predicates
@@ -289,8 +300,8 @@ impl<'a> AnalyzerContext<'a> {
         let is_correlated = !corr_preds.is_empty();
 
         if is_correlated {
-            let (modified_sub, corr_join_conds) = self.build_correlated_scalar_subquery(
-                &sq_info.subquery,
+            let (modified_sub, corr_join_conds) = self.build_correlated_scalar_subquery_from_resolved(
+                resolved_sub,
                 scope,
                 &sq_alias,
                 &corr_preds,
@@ -550,8 +561,16 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         // --- SELECT list ---
+        // Use inner_scope for wildcard expansion (SELECT * should only produce
+        // the subquery's own columns, not outer scope columns) but use
+        // merged_scope for column/expression resolution so that correlated
+        // references can resolve against the outer scope.
         let (projection, output_columns) =
-            self.analyze_projection(&select.projection, &merged_scope)?;
+            self.analyze_projection_with_wildcard_scope(
+                &select.projection,
+                &merged_scope,
+                &inner_scope,
+            )?;
 
         // --- GROUP BY ---
         let group_by_exprs = match &select.group_by {
@@ -634,16 +653,16 @@ impl<'a> AnalyzerContext<'a> {
         Ok((resolved_select, output_columns, inner_scope))
     }
 
-    /// Build a correlated scalar subquery as a derived table with GROUP BY
-    /// on the correlation keys.
-    fn build_correlated_scalar_subquery(
+    /// Build a correlated scalar subquery from an already-analyzed ResolvedQuery.
+    /// Uses the pre-analyzed (and potentially OR-factored) query instead of
+    /// re-analyzing from the raw AST, which would lose the OR factoring.
+    fn build_correlated_scalar_subquery_from_resolved(
         &self,
-        subquery: &sqlparser::ast::Query,
-        outer_scope: &AnalyzerScope,
+        resolved: ResolvedQuery,
+        _outer_scope: &AnalyzerScope,
         sq_alias: &str,
         correlated_cols: &[CorrelationPred],
     ) -> Result<(ResolvedQuery, Option<TypedExpr>), String> {
-        let resolved = self.analyze_query_in_scope(subquery, outer_scope)?;
 
         let mut join_conds: Vec<TypedExpr> = Vec::new();
         let mut extra_group_by: Vec<TypedExpr> = Vec::new();
@@ -1234,6 +1253,145 @@ fn remove_correlation_preds_from_expr(
 
 fn exprs_structurally_equal(a: &TypedExpr, b: &TypedExpr) -> bool {
     format!("{:?}", a.kind) == format!("{:?}", b.kind)
+}
+
+/// Factor out correlation predicates that appear in ALL branches of an OR.
+/// `(corr AND X) OR (corr AND Y)` → `corr AND (X OR Y)`
+///
+/// This matches StarRocks FE's subquery unnesting behavior: the common
+/// correlation key is lifted to a top-level AND so the normal correlation
+/// extraction can process it.
+fn factor_common_correlation_from_or(
+    expr: &TypedExpr,
+    inner_scope: &super::scope::AnalyzerScope,
+    outer_scope: &super::scope::AnalyzerScope,
+) -> TypedExpr {
+    // Only act on top-level OR
+    let branches = split_or(expr);
+    if branches.len() < 2 {
+        return expr.clone();
+    }
+
+    // Collect AND conjuncts for each OR branch, identify correlation predicates
+    let branch_conjuncts: Vec<Vec<&TypedExpr>> =
+        branches.iter().map(|b| split_and(b)).collect();
+
+    // Find correlation predicates (inner = outer) common to ALL branches
+    let mut common_corr: Vec<TypedExpr> = Vec::new();
+    if let Some(first_conjs) = branch_conjuncts.first() {
+        for candidate in first_conjs {
+            if !is_correlation_eq(candidate, inner_scope, outer_scope) {
+                continue;
+            }
+            let found_in_all = branch_conjuncts[1..]
+                .iter()
+                .all(|conjs| conjs.iter().any(|c| exprs_structurally_equal(c, candidate)));
+            if found_in_all {
+                common_corr.push((*candidate).clone());
+            }
+        }
+    }
+
+    if common_corr.is_empty() {
+        return expr.clone();
+    }
+
+    // Remove common correlation preds from each branch, rebuild OR
+    let mut new_branches: Vec<TypedExpr> = Vec::new();
+    for branch_conjs in &branch_conjuncts {
+        let remaining: Vec<TypedExpr> = branch_conjs
+            .iter()
+            .filter(|c| !common_corr.iter().any(|cc| exprs_structurally_equal(c, cc)))
+            .map(|c| (*c).clone())
+            .collect();
+        if remaining.is_empty() {
+            // Branch was only the correlation pred — becomes TRUE
+            new_branches.push(TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)),
+            });
+        } else {
+            new_branches.push(conjoin(remaining));
+        }
+    }
+
+    // Build: common_corr AND (remaining_branch1 OR remaining_branch2 OR ...)
+    let or_part = disjoin(new_branches);
+    let mut result_parts = common_corr;
+    result_parts.push(or_part);
+    conjoin(result_parts)
+}
+
+/// Check if an expression is a correlation equality: `inner_col = outer_col`.
+fn is_correlation_eq(
+    expr: &TypedExpr,
+    inner_scope: &super::scope::AnalyzerScope,
+    outer_scope: &super::scope::AnalyzerScope,
+) -> bool {
+    if let ExprKind::BinaryOp {
+        left,
+        op: BinOp::Eq,
+        right,
+    } = &expr.kind
+    {
+        let l_outer = is_outer_only_ref(left, inner_scope, outer_scope);
+        let r_outer = is_outer_only_ref(right, inner_scope, outer_scope);
+        (l_outer && !r_outer) || (!l_outer && r_outer)
+    } else {
+        false
+    }
+}
+
+/// Split an expression on AND into a flat list of conjuncts.
+fn split_and(expr: &TypedExpr) -> Vec<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let mut v = split_and(left);
+            v.extend(split_and(right));
+            v
+        }
+        ExprKind::Nested(inner) => split_and(inner),
+        _ => vec![expr],
+    }
+}
+
+/// Split an expression on OR into a flat list of disjuncts.
+fn split_or(expr: &TypedExpr) -> Vec<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => {
+            let mut v = split_or(left);
+            v.extend(split_or(right));
+            v
+        }
+        ExprKind::Nested(inner) => split_or(inner),
+        _ => vec![expr],
+    }
+}
+
+fn disjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
+    assert!(!exprs.is_empty());
+    if exprs.len() == 1 {
+        return exprs.pop().unwrap();
+    }
+    let first = exprs.remove(0);
+    exprs.into_iter().fold(first, |acc, e| TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::BinaryOp {
+            left: Box::new(acc),
+            op: BinOp::Or,
+            right: Box::new(e),
+        },
+    })
 }
 
 fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {

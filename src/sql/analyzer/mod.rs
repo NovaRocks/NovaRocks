@@ -912,6 +912,56 @@ impl<'a> AnalyzerContext<'a> {
         Ok((projection, output_columns))
     }
 
+    /// Like `analyze_projection` but uses `wildcard_scope` for `SELECT *`
+    /// expansion and `expr_scope` for all other expression resolution.
+    /// This prevents outer scope columns from leaking into wildcard expansion
+    /// inside correlated subqueries.
+    fn analyze_projection_with_wildcard_scope(
+        &self,
+        items: &[sqlast::SelectItem],
+        expr_scope: &AnalyzerScope,
+        wildcard_scope: &AnalyzerScope,
+    ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
+        let mut projection = Vec::new();
+        let mut output_columns = Vec::new();
+
+        for item in items {
+            match item {
+                sqlast::SelectItem::Wildcard(_) => {
+                    for (qualifier, col_name, data_type, nullable) in
+                        wildcard_scope.iter_columns()
+                    {
+                        let typed = TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: qualifier.clone(),
+                                column: col_name.clone(),
+                            },
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        };
+                        output_columns.push(OutputColumn {
+                            name: col_name.clone(),
+                            data_type: data_type.clone(),
+                            nullable: *nullable,
+                        });
+                        projection.push(ProjectItem {
+                            expr: typed,
+                            output_name: col_name.clone(),
+                        });
+                    }
+                }
+                // All other items use the full scope (including outer for correlation)
+                _ => {
+                    let (mut p, mut o) = self.analyze_projection(&[item.clone()], expr_scope)?;
+                    projection.append(&mut p);
+                    output_columns.append(&mut o);
+                }
+            }
+        }
+
+        Ok((projection, output_columns))
+    }
+
     /// Rebuild the FROM scope from an already-resolved Relation tree.
     /// Used by ORDER BY fallback when the expression doesn't match projection columns.
     fn rebuild_from_scope(&self, relation: &Relation) -> Result<((), AnalyzerScope), String> {
