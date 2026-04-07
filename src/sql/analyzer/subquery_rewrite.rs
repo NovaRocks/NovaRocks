@@ -191,22 +191,17 @@ impl<'a> AnalyzerContext<'a> {
         }
         let sub_output_col = resolved_sub.output_columns[0].clone();
 
-        let join_type = if negated {
-            JoinKind::LeftAnti
-        } else {
-            JoinKind::LeftSemi
-        };
+        // Check if the IN placeholder is inside an OR expression.
+        // If so, SEMI JOIN semantics are wrong — we need LEFT OUTER JOIN
+        // + IS [NOT] NULL replacement (matching StarRocks FE approach).
+        let inside_or = select
+            .filter
+            .as_ref()
+            .map(|f| is_placeholder_inside_or(f, sq_info.id))
+            .unwrap_or(false);
 
         let sq_alias = format!("__sq_{}", sq_info.id);
-        let sub_rel = Relation::Subquery {
-            query: Box::new(resolved_sub),
-            alias: sq_alias.clone(),
-        };
 
-        // Use unqualified column ref for the right side of the join condition.
-        // The physical planner resolves the right side against the subquery's
-        // own scope (which contains the original table columns, not the __sq_N
-        // alias), so a qualified reference like __sq_0.col would fail.
         let eq_cond = TypedExpr {
             data_type: DataType::Boolean,
             nullable: false,
@@ -228,7 +223,7 @@ impl<'a> AnalyzerContext<'a> {
             Some(&sq_alias),
             &sub_output_col.name,
             sub_output_col.data_type.clone(),
-            sub_output_col.nullable,
+            true, // nullable for LEFT OUTER JOIN
         );
 
         let current_from = select
@@ -236,15 +231,104 @@ impl<'a> AnalyzerContext<'a> {
             .take()
             .ok_or("IN subquery rewrite requires a FROM clause")?;
 
-        select.from = Some(Relation::Join(Box::new(JoinRelation {
-            left: current_from,
-            right: sub_rel,
-            join_type,
-            condition: Some(eq_cond),
-        })));
+        if inside_or {
+            // IN-inside-OR: use LEFT OUTER JOIN, replace placeholder with
+            // IS [NOT] NULL on the join key column (unqualified, which will
+            // resolve to the right side's column after JOIN scope merge).
+            // We use the right-side column name directly; after the LEFT
+            // OUTER JOIN, non-matching rows have NULL in the right column.
+            let match_col_name = format!("__in_match_{}", sq_info.id);
+            scope.add_column(
+                Some(&sq_alias),
+                &match_col_name,
+                sub_output_col.data_type.clone(),
+                true,
+            );
 
-        Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
-        Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
+            // Wrap the subquery to add a match-indicator column.
+            // Also mark as DISTINCT to prevent duplicate matches from
+            // multiplying left-side rows via the LEFT OUTER JOIN.
+            let mut modified_sub = resolved_sub;
+            if let QueryBody::Select(ref mut sel) = modified_sub.body {
+                sel.distinct = true;
+            }
+            modified_sub.output_columns.push(OutputColumn {
+                name: match_col_name.clone(),
+                data_type: sub_output_col.data_type.clone(),
+                nullable: true,
+            });
+            if let QueryBody::Select(ref mut sel) = modified_sub.body {
+                sel.projection.push(ProjectItem {
+                    expr: TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: None,
+                            column: sub_output_col.name.clone(),
+                        },
+                        data_type: sub_output_col.data_type.clone(),
+                        nullable: sub_output_col.nullable,
+                    },
+                    output_name: match_col_name.clone(),
+                });
+            }
+
+            let sub_rel = Relation::Subquery {
+                query: Box::new(modified_sub),
+                alias: sq_alias.clone(),
+            };
+
+            select.from = Some(Relation::Join(Box::new(JoinRelation {
+                left: current_from,
+                right: sub_rel,
+                join_type: JoinKind::LeftOuter,
+                condition: Some(eq_cond),
+            })));
+
+            // Replace the SubqueryPlaceholder with `match_col IS [NOT] NULL`
+            let is_null_expr = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::IsNull {
+                    expr: Box::new(TypedExpr {
+                        kind: ExprKind::ColumnRef {
+                            qualifier: None,
+                            column: match_col_name,
+                        },
+                        data_type: sub_output_col.data_type.clone(),
+                        nullable: true,
+                    }),
+                    negated: !negated, // IN → IS NOT NULL; NOT IN → IS NULL
+                },
+            };
+            Self::replace_placeholder_in_filter(
+                &mut select.filter,
+                sq_info.id,
+                &is_null_expr,
+            );
+            Self::replace_placeholder_in_filter(
+                &mut select.having,
+                sq_info.id,
+                &is_null_expr,
+            );
+        } else {
+            // Standard case: SEMI / ANTI JOIN
+            let join_type = if negated {
+                JoinKind::LeftAnti
+            } else {
+                JoinKind::LeftSemi
+            };
+            let sub_rel = Relation::Subquery {
+                query: Box::new(resolved_sub),
+                alias: sq_alias.clone(),
+            };
+            select.from = Some(Relation::Join(Box::new(JoinRelation {
+                left: current_from,
+                right: sub_rel,
+                join_type,
+                condition: Some(eq_cond),
+            })));
+            Self::remove_placeholder_from_filter(&mut select.filter, sq_info.id);
+            Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
+        }
 
         Ok(())
     }
@@ -1248,6 +1332,41 @@ fn remove_correlation_preds_from_expr(
             }
         }
         _ => Some(expr.clone()),
+    }
+}
+
+/// Check if a SubqueryPlaceholder with the given id appears under an OR node.
+fn is_placeholder_inside_or(expr: &TypedExpr, id: usize) -> bool {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => has_placeholder(left, id) || has_placeholder(right, id),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => is_placeholder_inside_or(left, id) || is_placeholder_inside_or(right, id),
+        ExprKind::Nested(inner) => is_placeholder_inside_or(inner, id),
+        _ => false,
+    }
+}
+
+/// Check if an expression contains a SubqueryPlaceholder with the given id.
+fn has_placeholder(expr: &TypedExpr, id: usize) -> bool {
+    match &expr.kind {
+        ExprKind::SubqueryPlaceholder {
+            id: pid,
+            ..
+        } => *pid == id,
+        ExprKind::BinaryOp { left, right, .. } => {
+            has_placeholder(left, id) || has_placeholder(right, id)
+        }
+        ExprKind::Nested(inner) => has_placeholder(inner, id),
+        ExprKind::UnaryOp { expr, .. } => has_placeholder(expr, id),
+        ExprKind::IsNull { expr, .. } => has_placeholder(expr, id),
+        _ => false,
     }
 }
 
