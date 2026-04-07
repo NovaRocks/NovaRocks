@@ -703,11 +703,8 @@ impl<'a> AnalyzerContext<'a> {
             }
 
             if let Some(ref filter) = sel.filter {
-                // Replace outer column references with corresponding inner columns,
-                // then remove pure tautologies (inner = inner).  This handles
-                // correlations inside OR branches that can't simply be removed.
-                let replaced = replace_outer_refs_with_inner(filter, correlated_cols);
-                sel.filter = simplify_tautologies(&replaced);
+                let remaining = remove_correlation_preds_from_expr(filter, correlated_cols);
+                sel.filter = remaining;
             }
         }
         for out_col in &extra_output {
@@ -1237,107 +1234,6 @@ fn remove_correlation_preds_from_expr(
 
 fn exprs_structurally_equal(a: &TypedExpr, b: &TypedExpr) -> bool {
     format!("{:?}", a.kind) == format!("{:?}", b.kind)
-}
-
-/// Replace outer column references with their corresponding inner column
-/// references throughout an expression tree.  This handles correlation
-/// predicates that appear inside OR branches where simple removal is impossible.
-fn replace_outer_refs_with_inner(expr: &TypedExpr, corr_preds: &[CorrelationPred]) -> TypedExpr {
-    // If this expression IS an outer column reference, replace it.
-    if let ExprKind::ColumnRef { qualifier, column } = &expr.kind {
-        for pred in corr_preds {
-            if let ExprKind::ColumnRef {
-                qualifier: ref oq,
-                column: ref oc,
-            } = pred.outer_col.kind
-            {
-                if qualifier == oq && column == oc {
-                    return pred.inner_col.clone();
-                }
-            }
-        }
-    }
-    // Recurse into sub-expressions.
-    match &expr.kind {
-        ExprKind::BinaryOp { left, op, right } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(replace_outer_refs_with_inner(left, corr_preds)),
-                op: *op,
-                right: Box::new(replace_outer_refs_with_inner(right, corr_preds)),
-            },
-        },
-        ExprKind::Nested(inner) => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Nested(Box::new(replace_outer_refs_with_inner(inner, corr_preds))),
-        },
-        _ => expr.clone(),
-    }
-}
-
-/// Remove tautological equality `col = col` (same column on both sides)
-/// that results from replacing outer refs with inner refs.
-fn simplify_tautologies(expr: &TypedExpr) -> Option<TypedExpr> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Eq,
-            right,
-        } if exprs_structurally_equal(left, right) => None, // tautology
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            let l = simplify_tautologies(left);
-            let r = simplify_tautologies(right);
-            match (l, r) {
-                (Some(l), Some(r)) => Some(TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(l),
-                        op: BinOp::And,
-                        right: Box::new(r),
-                    },
-                }),
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            }
-        }
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Or,
-            right,
-        } => {
-            let l = simplify_tautologies(left);
-            let r = simplify_tautologies(right);
-            match (l, r) {
-                (Some(l), Some(r)) => Some(TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(l),
-                        op: BinOp::Or,
-                        right: Box::new(r),
-                    },
-                }),
-                // If one OR branch is tautological (removed), the other still matters
-                (Some(l), None) => Some(l),
-                (None, Some(r)) => Some(r),
-                (None, None) => None,
-            }
-        }
-        ExprKind::Nested(inner) => simplify_tautologies(inner).map(|t| TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
-            kind: ExprKind::Nested(Box::new(t)),
-        }),
-        _ => Some(expr.clone()),
-    }
 }
 
 fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
