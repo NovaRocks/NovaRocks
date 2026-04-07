@@ -485,7 +485,10 @@ fn build_window_and_project(
             });
         }
         // The analytic operator requires input sorted by (partition_by, order_by).
-        // Insert a Sort node before the Window node.
+        // Insert a Sort node before the Window node using the first window
+        // function's sort keys.  When window functions have different
+        // partition/order signatures, the physical emitter splits them into
+        // separate Sort + Analytic nodes (see emit_window).
         let first_win = &window_exprs[0];
         let mut sort_items = Vec::new();
         for p in &first_win.partition_by {
@@ -524,6 +527,36 @@ fn build_window_and_project(
     } else {
         Ok(input)
     }
+}
+
+/// Group window expressions by their (partition_by, order_by) signature.
+/// Returns vec of (indices, signature_key) where each group shares the same
+/// partition/order and can be processed by a single Sort + Window node.
+fn group_window_exprs_by_signature(exprs: &[WindowExpr]) -> Vec<(Vec<usize>, String)> {
+    let mut groups: Vec<(Vec<usize>, String)> = Vec::new();
+    for (i, expr) in exprs.iter().enumerate() {
+        let sig = window_signature(expr);
+        if let Some(group) = groups.iter_mut().find(|(_, s)| *s == sig) {
+            group.0.push(i);
+        } else {
+            groups.push((vec![i], sig));
+        }
+    }
+    groups
+}
+
+fn window_signature(expr: &WindowExpr) -> String {
+    format!(
+        "P:{:?}|O:{:?}",
+        expr.partition_by
+            .iter()
+            .map(|e| format!("{:?}", e.kind))
+            .collect::<Vec<_>>(),
+        expr.order_by
+            .iter()
+            .map(|e| format!("{:?}:{}", e.expr.kind, e.asc))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn has_window_call(expr: &TypedExpr) -> bool {

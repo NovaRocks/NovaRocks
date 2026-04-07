@@ -12,7 +12,7 @@ mod emit_scan;
 mod emit_set_op;
 mod emit_sort;
 mod emit_values;
-mod emit_window;
+pub mod emit_window;
 pub(crate) mod helpers;
 
 use crate::exprs;

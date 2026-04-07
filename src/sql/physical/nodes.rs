@@ -369,6 +369,62 @@ pub(super) fn build_sort_node(
     Ok(node)
 }
 
+/// Build a sort node from pre-compiled expressions (for use in window
+/// function multi-group emission).
+pub(crate) fn build_sort_node_raw(
+    node_id: i32,
+    row_tuples: Vec<i32>,
+    ordering_exprs: Vec<exprs::TExpr>,
+    is_asc: Vec<bool>,
+    nulls_first_list: Vec<bool>,
+    limit: i64,
+    offset: Option<i64>,
+) -> plan_nodes::TPlanNode {
+    let use_top_n = limit > 0 && !ordering_exprs.is_empty();
+    let sort_info = plan_nodes::TSortInfo::new(
+        ordering_exprs,
+        is_asc,
+        nulls_first_list,
+        None::<Vec<exprs::TExpr>>,
+    );
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::SORT_NODE;
+    node.num_children = 1;
+    node.limit = limit;
+    node.row_tuples = row_tuples;
+    node.nullable_tuples = vec![];
+    node.compact_data = true;
+    node.sort_node = Some(plan_nodes::TSortNode {
+        sort_info,
+        use_top_n,
+        offset,
+        ordering_exprs: None,
+        is_asc_order: None,
+        is_default_limit: None,
+        nulls_first: None,
+        sort_tuple_slot_exprs: None,
+        has_outer_join_child: None,
+        sql_sort_keys: None,
+        analytic_partition_exprs: None,
+        partition_exprs: None,
+        partition_limit: None,
+        topn_type: None,
+        build_runtime_filters: None,
+        max_buffered_rows: None,
+        max_buffered_bytes: None,
+        late_materialization: None,
+        enable_parallel_merge: None,
+        analytic_partition_skewed: None,
+        pre_agg_exprs: None,
+        pre_agg_output_slot_id: None,
+        pre_agg_insert_local_shuffle: None,
+        parallel_merge_late_materialize_mode: None,
+        per_pipeline: None,
+    });
+    node
+}
+
 // ---------------------------------------------------------------------------
 // Exec params (scan ranges)
 // ---------------------------------------------------------------------------

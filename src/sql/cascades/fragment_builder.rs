@@ -990,6 +990,15 @@ impl<'a> PlanFragmentBuilder<'a> {
     ) -> Result<VisitResult, String> {
         use crate::sql::ir::{WindowBound, WindowFrameType};
 
+        // Group window expressions by (partition_by, order_by) signature.
+        // Different signatures need separate Sort + Analytic nodes.
+        let groups = crate::sql::physical::emitter::emit_window::group_win_exprs_by_sig(
+            &op.window_exprs,
+        );
+        if groups.len() > 1 {
+            return self.visit_window_multi_group(op, node, &groups);
+        }
+
         let child = self.visit(&node.children[0])?;
         let analytic_node_id = self.alloc_node();
 
@@ -1159,6 +1168,169 @@ impl<'a> PlanFragmentBuilder<'a> {
             tuple_ids: child.tuple_ids,
             cte_exchange_nodes: child.cte_exchange_nodes,
         })
+    }
+
+    /// Handle window functions with multiple different partition/order signatures.
+    /// Each group gets its own Sort + Analytic node, chained sequentially.
+    fn visit_window_multi_group(
+        &mut self,
+        op: &PhysicalWindowOp,
+        node: &PhysicalPlanNode,
+        groups: &[Vec<usize>],
+    ) -> Result<VisitResult, String> {
+        let mut current = self.visit(&node.children[0])?;
+
+        for group_indices in groups {
+            let group_exprs: Vec<_> = group_indices
+                .iter()
+                .map(|&i| op.window_exprs[i].clone())
+                .collect();
+            let first_win = &group_exprs[0];
+
+            // Build Sort node for this group's partition+order
+            let mut sort_ordering = Vec::new();
+            let mut sort_is_asc = Vec::new();
+            let mut sort_nulls_first_list = Vec::new();
+            for expr in &first_win.partition_by {
+                let mut compiler = ExprCompiler::new(&current.scope);
+                sort_ordering.push(compiler.compile_typed(expr)?);
+                sort_is_asc.push(true);
+                sort_nulls_first_list.push(true);
+            }
+            for item in &first_win.order_by {
+                let mut compiler = ExprCompiler::new(&current.scope);
+                sort_ordering.push(compiler.compile_typed(&item.expr)?);
+                sort_is_asc.push(item.asc);
+                sort_nulls_first_list.push(item.nulls_first);
+            }
+
+            if !sort_ordering.is_empty() {
+                let sort_node_id = self.alloc_node();
+                let sort_plan = nodes::build_sort_node_raw(
+                    sort_node_id,
+                    current.tuple_ids.clone(),
+                    sort_ordering,
+                    sort_is_asc,
+                    sort_nulls_first_list,
+                    -1,
+                    None,
+                );
+                let mut pnodes = vec![sort_plan];
+                pnodes.extend(current.plan_nodes);
+                current.plan_nodes = pnodes;
+            }
+
+            // Build Analytic node for this group
+            let analytic_node_id = self.alloc_node();
+            let intermediate_tuple_id = self.alloc_tuple();
+            let output_tuple_id = self.alloc_tuple();
+
+            let mut partition_exprs = Vec::new();
+            for expr in &first_win.partition_by {
+                let mut compiler = ExprCompiler::new(&current.scope);
+                partition_exprs.push(compiler.compile_typed(expr)?);
+            }
+            let mut order_by_exprs = Vec::new();
+            for item in &first_win.order_by {
+                let mut compiler = ExprCompiler::new(&current.scope);
+                order_by_exprs.push(compiler.compile_typed(&item.expr)?);
+            }
+
+            let mut analytic_functions = Vec::new();
+            for win_expr in &group_exprs {
+                let mut compiler = ExprCompiler::new(&current.scope);
+                let agg_call = AggregateCall {
+                    name: win_expr.name.clone(),
+                    args: win_expr.args.clone(),
+                    distinct: win_expr.distinct,
+                    result_type: win_expr.result_type.clone(),
+                    order_by: vec![],
+                };
+                analytic_functions.push(compiler.compile_aggregate_call_typed(&agg_call)?);
+            }
+
+            for (idx, win_expr) in group_exprs.iter().enumerate() {
+                let slot_id = self.alloc_slot();
+                self.desc_builder.add_slot(
+                    slot_id,
+                    intermediate_tuple_id,
+                    &format!("__win_intermediate_{idx}"),
+                    &win_expr.result_type,
+                    true,
+                    idx as i32,
+                );
+            }
+            self.desc_builder.add_tuple(intermediate_tuple_id);
+
+            let mut output_scope = ExprScope::new();
+            for (name, binding) in current.scope.iter_columns() {
+                output_scope.add_column(None, name.clone(), binding.clone());
+            }
+            for (idx, win_expr) in group_exprs.iter().enumerate() {
+                let slot_id = self.alloc_slot();
+                self.desc_builder.add_slot(
+                    slot_id,
+                    output_tuple_id,
+                    &win_expr.output_name,
+                    &win_expr.result_type,
+                    true,
+                    idx as i32,
+                );
+                output_scope.add_column(
+                    None,
+                    win_expr.output_name.clone(),
+                    ColumnBinding {
+                        tuple_id: output_tuple_id,
+                        slot_id,
+                        data_type: win_expr.result_type.clone(),
+                        nullable: true,
+                    },
+                );
+            }
+            self.desc_builder.add_tuple(output_tuple_id);
+
+            let analytic_tnode = plan_nodes::TAnalyticNode {
+                partition_exprs,
+                order_by_exprs,
+                analytic_functions,
+                window: None,
+                intermediate_tuple_id,
+                output_tuple_id,
+                buffered_tuple_id: None,
+                partition_by_eq: None,
+                order_by_eq: None,
+                sql_partition_keys: None,
+                sql_aggregate_functions: None,
+                has_outer_join_child: None,
+                use_hash_based_partition: None,
+                is_skewed: None,
+            };
+
+            let mut plan_node = nodes::default_plan_node();
+            plan_node.node_id = analytic_node_id;
+            plan_node.node_type = plan_nodes::TPlanNodeType::ANALYTIC_EVAL_NODE;
+            plan_node.num_children = 1;
+            plan_node.limit = -1;
+            let mut row_tuples = current.tuple_ids.clone();
+            row_tuples.push(output_tuple_id);
+            plan_node.row_tuples = row_tuples;
+            plan_node.nullable_tuples = vec![];
+            plan_node.analytic_node = Some(analytic_tnode);
+
+            let cte_exchange_nodes = current.cte_exchange_nodes.clone();
+            let mut pnodes = vec![plan_node];
+            pnodes.extend(current.plan_nodes);
+            let mut new_tuple_ids = current.tuple_ids;
+            new_tuple_ids.push(output_tuple_id);
+            current = VisitResult {
+                plan_nodes: pnodes,
+                scope: output_scope,
+                tuple_ids: new_tuple_ids,
+                cte_exchange_nodes,
+            };
+        }
+
+        Ok(current)
     }
 
     // -------------------------------------------------------------------
