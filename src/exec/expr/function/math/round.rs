@@ -265,7 +265,18 @@ pub fn eval_round(
                     };
                     let v = dec_arr.value(i);
                     let rounded = round_decimal(v, original_scale, target_scale)?;
-                    values.push(Some(rounded));
+                    // Adjust to output scale: round_decimal returns value
+                    // in target_scale, but output array uses out_scale.
+                    let adjusted = if target_scale < out_scale {
+                        let factor = pow10_i128((out_scale - target_scale) as usize)?;
+                        rounded.checked_mul(factor).ok_or("decimal overflow in round adjust")?
+                    } else if target_scale > out_scale {
+                        let factor = pow10_i128((target_scale - out_scale) as usize)?;
+                        div_round_i128(rounded, factor)
+                    } else {
+                        rounded
+                    };
+                    values.push(Some(adjusted));
                 }
                 let array = Decimal128Array::from(values)
                     .with_precision_and_scale(out_precision, out_scale)

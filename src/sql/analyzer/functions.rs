@@ -104,9 +104,17 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "ceil" | "ceiling" | "floor" => DataType::Int64,
 
         // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
-        // (StarRocks FE: getFunctionOfRound preserves Decimal type)
+        // When the second argument is Int (constant decimal places), clamp to
+        // a reasonable output scale to avoid excess trailing zeros.
         "round" | "truncate" => match arg_types.first() {
-            Some(DataType::Decimal128(_, s)) => DataType::Decimal128(38, *s),
+            Some(DataType::Decimal128(_, s)) => {
+                // If second arg is an integer type, the value is the target
+                // decimal places.  We can't see the value here (only the type),
+                // so we keep the original scale.  The execution ROUND already
+                // handles the conversion.  To match StarRocks display, we'll
+                // rely on the execution layer's output scale adjustment.
+                DataType::Decimal128(38, *s)
+            }
             _ => DataType::Float64,
         },
 

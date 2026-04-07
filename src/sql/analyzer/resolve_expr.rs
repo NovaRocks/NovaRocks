@@ -869,7 +869,19 @@ impl<'a> super::AnalyzerContext<'a> {
             })
         } else {
             // Scalar function
-            let return_type = infer_scalar_return_type(&name, &arg_types);
+            let mut return_type = infer_scalar_return_type(&name, &arg_types);
+            // For round/truncate with decimal input and constant 2nd arg,
+            // use the target decimal places as the output scale.
+            if matches!(name.as_str(), "round" | "truncate") {
+                if let DataType::Decimal128(p, s) = &return_type {
+                    if args_typed.len() >= 2 {
+                        if let ExprKind::Literal(LiteralValue::Int(d)) = &args_typed[1].kind {
+                            let target = (*d as i8).max(0).min(*s);
+                            return_type = DataType::Decimal128(*p, target);
+                        }
+                    }
+                }
+            }
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     name,
