@@ -316,7 +316,7 @@ pub(super) fn build_sort_node(
         ordering_exprs.push(texpr);
         let asc = item.options.asc.unwrap_or(true);
         is_asc.push(asc);
-        nulls_first.push(item.options.nulls_first.unwrap_or(!asc));
+        nulls_first.push(item.options.nulls_first.unwrap_or(asc));
     }
 
     let use_top_n = limit.is_some() && !ordering_exprs.is_empty();

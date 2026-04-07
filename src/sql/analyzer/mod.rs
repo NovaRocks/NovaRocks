@@ -782,6 +782,14 @@ impl<'a> AnalyzerContext<'a> {
         for item in &mut sel.projection {
             item.expr = replace_grouping_markers_in_typed_expr(&item.expr, &grouping_fn_args);
         }
+        // When no GROUPING() calls exist, synthesize one for the first rollup
+        // column so that __grouping_fn_0 is always in the GROUP BY.  This
+        // ensures ROLLUP levels are distinguishable even when grouped columns
+        // happen to have the same values (e.g., all NULLs).
+        if grouping_fn_args.is_empty() && !all_rollup_columns.is_empty() {
+            let virtual_name = "__grouping_fn_0".to_string();
+            grouping_fn_args.push((virtual_name, all_rollup_columns.clone()));
+        }
         // Also add each GROUPING() virtual column as a GROUP BY key so it
         // passes through the Aggregate operator.
         for (fn_name, _) in &grouping_fn_args {
@@ -1099,7 +1107,7 @@ impl<'a> AnalyzerContext<'a> {
             };
 
             let asc = ob.options.asc.unwrap_or(true);
-            let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+            let nulls_first = ob.options.nulls_first.unwrap_or(asc);
 
             sort_items.push(SortItem {
                 expr: typed,
@@ -1605,6 +1613,63 @@ fn replace_grouping_markers_in_typed_expr(
                 inner,
                 grouping_fn_args,
             ))),
+        },
+        ExprKind::WindowCall {
+            name,
+            args,
+            distinct,
+            partition_by,
+            order_by,
+            window_frame,
+        } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::WindowCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|a| replace_grouping_markers_in_typed_expr(a, grouping_fn_args))
+                    .collect(),
+                distinct: *distinct,
+                partition_by: partition_by
+                    .iter()
+                    .map(|p| replace_grouping_markers_in_typed_expr(p, grouping_fn_args))
+                    .collect(),
+                order_by: order_by
+                    .iter()
+                    .map(|ob| SortItem {
+                        expr: replace_grouping_markers_in_typed_expr(&ob.expr, grouping_fn_args),
+                        asc: ob.asc,
+                        nulls_first: ob.nulls_first,
+                    })
+                    .collect(),
+                window_frame: window_frame.clone(),
+            },
+        },
+        ExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => TypedExpr {
+            data_type: expr.data_type.clone(),
+            nullable: expr.nullable,
+            kind: ExprKind::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| Box::new(replace_grouping_markers_in_typed_expr(o, grouping_fn_args))),
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| {
+                        (
+                            replace_grouping_markers_in_typed_expr(w, grouping_fn_args),
+                            replace_grouping_markers_in_typed_expr(t, grouping_fn_args),
+                        )
+                    })
+                    .collect(),
+                else_expr: else_expr
+                    .as_ref()
+                    .map(|e| Box::new(replace_grouping_markers_in_typed_expr(e, grouping_fn_args))),
+            },
         },
         _ => expr.clone(),
     }

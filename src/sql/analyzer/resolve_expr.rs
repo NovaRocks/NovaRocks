@@ -628,17 +628,20 @@ impl<'a> super::AnalyzerContext<'a> {
                 (BinOp::Mod, dt)
             }
 
-            // String concatenation ||
+            // || is logical OR in MySQL/StarRocks default sql_mode.
+            // Non-boolean operands are implicitly cast to boolean.
             sqlast::BinaryOperator::StringConcat => {
-                // Desugar to concat() function call
+                let left_cast = implicit_cast_to_boolean(left_typed);
+                let right_cast = implicit_cast_to_boolean(right_typed);
+                let nullable = left_cast.nullable || right_cast.nullable;
                 return Ok(TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        name: "concat".to_string(),
-                        args: vec![left_typed, right_typed],
-                        distinct: false,
+                    kind: ExprKind::BinaryOp {
+                        left: Box::new(left_cast),
+                        op: BinOp::Or,
+                        right: Box::new(right_cast),
                     },
-                    data_type: DataType::Utf8,
-                    nullable: true,
+                    data_type: DataType::Boolean,
+                    nullable,
                 });
             }
 
@@ -896,7 +899,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 for ob in order_by_exprs {
                     let typed = self.analyze_expr(&ob.expr, scope)?;
                     let asc = ob.options.asc.unwrap_or(true);
-                    let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+                    let nulls_first = ob.options.nulls_first.unwrap_or(asc);
                     items.push(SortItem {
                         expr: typed,
                         asc,
@@ -933,7 +936,7 @@ impl<'a> super::AnalyzerContext<'a> {
         for ob in &spec.order_by {
             let typed = self.analyze_expr(&ob.expr, scope)?;
             let asc = ob.options.asc.unwrap_or(true);
-            let nulls_first = ob.options.nulls_first.unwrap_or(!asc);
+            let nulls_first = ob.options.nulls_first.unwrap_or(asc);
             order_by.push(SortItem {
                 expr: typed,
                 asc,
@@ -1085,5 +1088,22 @@ fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
         }
     } else {
         expr
+    }
+}
+
+/// Wrap a non-boolean expression with CAST(... AS BOOLEAN) for implicit
+/// boolean coercion (used by `||` as logical OR with string operands).
+fn implicit_cast_to_boolean(expr: TypedExpr) -> TypedExpr {
+    if expr.data_type == DataType::Boolean {
+        return expr;
+    }
+    let nullable = expr.nullable;
+    TypedExpr {
+        kind: ExprKind::Cast {
+            expr: Box::new(expr),
+            target: DataType::Boolean,
+        },
+        data_type: DataType::Boolean,
+        nullable,
     }
 }

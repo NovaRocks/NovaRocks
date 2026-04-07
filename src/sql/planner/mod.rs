@@ -360,6 +360,11 @@ fn plan_select(mut select: ResolvedSelect) -> Result<LogicalPlan, String> {
         current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
     }
 
+    // 5. SELECT DISTINCT → Aggregate on all output columns (deduplication)
+    if select.distinct {
+        current = build_distinct(current, &select.projection);
+    }
+
     Ok(current)
 }
 
@@ -424,7 +429,40 @@ fn plan_select_scoped(
         current = build_window_and_project(current, select.projection.clone(), &select.projection)?;
     }
 
+    // SELECT DISTINCT → Aggregate on all output columns (deduplication)
+    if select.distinct {
+        current = build_distinct(current, &select.projection);
+    }
+
     Ok(current)
+}
+
+/// Build a deduplication Aggregate for SELECT DISTINCT.
+/// Uses all projection columns as GROUP BY keys with no aggregate functions.
+fn build_distinct(input: LogicalPlan, projection: &[ProjectItem]) -> LogicalPlan {
+    let mut group_by = Vec::new();
+    let mut output_columns = Vec::new();
+    for item in projection {
+        group_by.push(TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: item.output_name.clone(),
+            },
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+        });
+        output_columns.push(OutputColumn {
+            name: item.output_name.clone(),
+            data_type: item.expr.data_type.clone(),
+            nullable: item.expr.nullable,
+        });
+    }
+    LogicalPlan::Aggregate(AggregateNode {
+        input: Box::new(input),
+        group_by,
+        aggregates: vec![],
+        output_columns,
+    })
 }
 
 /// Check if an expression contains any WindowCall.
@@ -446,8 +484,31 @@ fn build_window_and_project(
                 nullable: item.expr.nullable,
             });
         }
+        // The analytic operator requires input sorted by (partition_by, order_by).
+        // Insert a Sort node before the Window node.
+        let first_win = &window_exprs[0];
+        let mut sort_items = Vec::new();
+        for p in &first_win.partition_by {
+            sort_items.push(SortItem {
+                expr: p.clone(),
+                asc: true,
+                nulls_first: true,
+            });
+        }
+        for ob in &first_win.order_by {
+            sort_items.push(ob.clone());
+        }
+        let sorted_input = if sort_items.is_empty() {
+            input
+        } else {
+            LogicalPlan::Sort(SortNode {
+                input: Box::new(input),
+                items: sort_items,
+            })
+        };
+
         let windowed = LogicalPlan::Window(WindowNode {
-            input: Box::new(input),
+            input: Box::new(sorted_input),
             window_exprs,
             output_columns,
         });

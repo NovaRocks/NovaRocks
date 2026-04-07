@@ -64,15 +64,16 @@ pub(crate) fn arithmetic_result_type_with_op(
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
             decimal_arithmetic_result_type(*p1, *s1 as i8, *p2, *s2 as i8, op)
         }
-        // Decimal + Integer -> Decimal (integer treated as Decimal(19,0))
+        // Decimal (left) op Integer (right) -> Decimal
         (
             DataType::Decimal128(p, s),
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
-        )
-        | (
+        ) => decimal_arithmetic_result_type(*p, *s as i8, 19, 0, op),
+        // Integer (left) op Decimal (right) -> Decimal
+        (
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
             DataType::Decimal128(p, s),
-        ) => decimal_arithmetic_result_type(*p, *s as i8, 19, 0, op),
+        ) => decimal_arithmetic_result_type(19, 0, *p, *s as i8, op),
         // Decimal + Float -> Float64 (StarRocks FE: both sides promote to Double)
         (DataType::Decimal128(_, _), DataType::Float64 | DataType::Float32)
         | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,

@@ -320,12 +320,11 @@ impl<'a> AnalyzerContext<'a> {
                 condition: corr_join_conds,
             })));
 
-            // Use unqualified column ref for the replacement expression.
-            // The physical planner's scope for the joined subquery uses the
-            // original table names, not the __sq_N alias.
+            // Use qualified column ref so that multiple scalar subqueries
+            // producing columns with the same name resolve to distinct bindings.
             let replacement = TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    qualifier: None,
+                    qualifier: Some(sq_alias.clone()),
                     column: scalar_output_name,
                 },
                 data_type: scalar_data_type,
@@ -364,10 +363,11 @@ impl<'a> AnalyzerContext<'a> {
                 condition: None,
             })));
 
-            // Use unqualified column ref for the replacement expression.
+            // Use qualified column ref so that multiple scalar subqueries
+            // producing columns with the same name resolve to distinct bindings.
             let replacement = TypedExpr {
                 kind: ExprKind::ColumnRef {
-                    qualifier: None,
+                    qualifier: Some(sq_alias.clone()),
                     column: scalar_col.name.clone(),
                 },
                 data_type: scalar_col.data_type.clone(),
