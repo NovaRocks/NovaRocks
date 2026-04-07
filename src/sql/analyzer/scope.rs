@@ -38,10 +38,11 @@ impl AnalyzerScope {
                 );
             }
             self.unqualified
-                .insert(name_lower.clone(), (col.data_type.clone(), col.nullable));
+                .insert(name_lower, (col.data_type.clone(), col.nullable));
+            // Store original-case name in ordered for SELECT * display.
             self.ordered.push((
                 qualifier.map(|s| s.to_lowercase()),
-                name_lower,
+                col.name.clone(),
                 col.data_type.clone(),
                 col.nullable,
             ));
@@ -64,10 +65,11 @@ impl AnalyzerScope {
             );
         }
         self.unqualified
-            .insert(name_lower.clone(), (data_type.clone(), nullable));
+            .insert(name_lower, (data_type.clone(), nullable));
+        // Store original-case name in ordered for SELECT * display.
         self.ordered.push((
             qualifier.map(|s| s.to_lowercase()),
-            name_lower,
+            name.to_string(),
             data_type,
             nullable,
         ));
