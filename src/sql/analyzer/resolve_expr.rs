@@ -703,6 +703,30 @@ impl<'a> super::AnalyzerContext<'a> {
             result_type = DataType::Utf8; // fallback
         }
 
+        // Insert implicit CASTs for THEN/ELSE branches whose types don't
+        // match the unified result_type.  Without this, the execution
+        // engine's CASE may output the branch's original type (e.g., INT 0)
+        // instead of the wider type (e.g., DOUBLE 0.0), causing truncation.
+        let cast_if_needed = |expr: TypedExpr, target: &DataType| -> TypedExpr {
+            if &expr.data_type != target && expr.data_type != DataType::Null {
+                TypedExpr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(expr),
+                        target: target.clone(),
+                    },
+                    data_type: target.clone(),
+                    nullable: true,
+                }
+            } else {
+                expr
+            }
+        };
+        let when_then: Vec<(TypedExpr, TypedExpr)> = when_then
+            .into_iter()
+            .map(|(w, t)| (w, cast_if_needed(t, &result_type)))
+            .collect();
+        let else_typed = else_typed.map(|e| Box::new(cast_if_needed(*e, &result_type)));
+
         Ok(TypedExpr {
             kind: ExprKind::Case {
                 operand: operand_typed,
