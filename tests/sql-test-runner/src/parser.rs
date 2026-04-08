@@ -276,7 +276,40 @@ pub fn load_sql_case_from_file(
     });
 
     let sections: Vec<(usize, Vec<String>)> = if markers.is_empty() {
-        vec![(1, lines.clone())]
+        // No query markers: split by semicolons into separate statements.
+        // This handles files like q39 that have multiple SQL statements
+        // separated by ';' without '-- query N' markers.
+        let mut stmts: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut current_lines: Vec<String> = Vec::new();
+        let mut stmt_num = 1usize;
+        for line in &lines {
+            current_lines.push(line.clone());
+            let trimmed = line.trim();
+            if trimmed.ends_with(';') {
+                if !current_lines.iter().all(|l| {
+                    let t = l.trim();
+                    t.is_empty() || t.starts_with("--")
+                }) {
+                    stmts.push((stmt_num, std::mem::take(&mut current_lines)));
+                    stmt_num += 1;
+                } else {
+                    current_lines.clear();
+                }
+            }
+        }
+        // Remaining lines (no trailing ';')
+        if !current_lines.is_empty()
+            && !current_lines
+                .iter()
+                .all(|l| l.trim().is_empty() || l.trim().starts_with("--"))
+        {
+            stmts.push((stmt_num, current_lines));
+        }
+        if stmts.is_empty() {
+            vec![(1, lines.clone())]
+        } else {
+            stmts
+        }
     } else {
         markers
             .iter()
