@@ -516,7 +516,12 @@ impl<'a> ExprCompiler<'a> {
                     self.last_nullable = binding.nullable;
                     Ok(binding.data_type.clone())
                 } else {
-                    self.compile_typed_function_call(name, args)
+                    // Use the analyzer's data_type as override hint for the
+                    // return type. This handles cases like round(decimal, 2)
+                    // where the analyzer computed Decimal128(38, 2) but the
+                    // physical layer would re-infer Decimal128(38, 8) from
+                    // the input type alone.
+                    self.compile_typed_function_call_with_hint(name, args, &expr.data_type)
                 }
             }
             ExprKind::AggregateCall {
@@ -853,6 +858,15 @@ impl<'a> ExprCompiler<'a> {
         name: &str,
         args: &[TypedExpr],
     ) -> Result<DataType, String> {
+        self.compile_typed_function_call_with_hint(name, args, &DataType::Null)
+    }
+
+    fn compile_typed_function_call_with_hint(
+        &mut self,
+        name: &str,
+        args: &[TypedExpr],
+        type_hint: &DataType,
+    ) -> Result<DataType, String> {
         let parent_idx = self.nodes.len();
         self.nodes.push(default_expr_node()); // placeholder
 
@@ -862,7 +876,13 @@ impl<'a> ExprCompiler<'a> {
             arg_types.push(t);
         }
 
-        let return_type = infer_scalar_function_return_type(name, &arg_types)?;
+        let inferred = infer_scalar_function_return_type(name, &arg_types)?;
+        // Use the analyzer's type hint if available and more specific than inferred
+        let return_type = if *type_hint != DataType::Null {
+            type_hint.clone()
+        } else {
+            inferred
+        };
         let type_desc = arrow_type_to_type_desc(&return_type)?;
         let ret_type_desc = type_desc.clone();
 
@@ -1893,7 +1913,25 @@ fn infer_scalar_function_return_type(
         "ceil" | "ceiling" | "floor" => Ok(DataType::Int64),
         // round/truncate: Decimal input → Decimal128(38, scale); otherwise Float64
         "round" | "truncate" => Ok(match arg_types.first() {
-            Some(DataType::Decimal128(_, s)) => DataType::Decimal128(38, *s),
+            Some(DataType::Decimal128(_, s)) => {
+                // If second arg is a constant integer (target decimal places),
+                // use it as the output scale. Otherwise keep input scale.
+                let out_scale = if arg_types.len() >= 2 {
+                    match arg_types.get(1) {
+                        Some(DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {
+                            // Can't see the actual value here, use the analyzer's
+                            // output type which already has the correct scale.
+                            // Return the input scale as default; the analyzer's
+                            // DataType on the FunctionCall node will override.
+                            *s
+                        }
+                        _ => *s,
+                    }
+                } else {
+                    0 // round(x) → integer
+                };
+                DataType::Decimal128(38, out_scale)
+            }
             _ => DataType::Float64,
         }),
         "mod"
