@@ -38,7 +38,7 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{build_group_key_hashes, build_group_key_views};
 
-use super::{RuntimeFilterMembership, RuntimeInFilter, RuntimeMembershipFilter};
+use super::{RuntimeFilterMembership, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 
 /// Apply membership filters to a chunk and return the filtered chunk.
 pub(crate) fn filter_chunk_by_memberships(
@@ -220,6 +220,86 @@ pub(crate) fn filter_chunk_by_membership_filters_with_exprs(
         } else {
             current = filter.filter_chunk(chunk)?;
         }
+    }
+    Ok(current)
+}
+
+/// Apply min-max filters using expression mappings and return the filtered chunk.
+///
+/// For each `(filter_id, min_max_filter)` pair, looks up the probe expression via
+/// `exprs[filter_id]`, evaluates it on the chunk to obtain the probe column array,
+/// then applies `RuntimeMinMaxFilter::apply_to_array` to build a boolean selection
+/// mask.  Rows outside the `[min, max]` range are dropped.
+pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
+    arena: &ExprArena,
+    exprs: &HashMap<i32, ExprId>,
+    filters: &[(i32, Arc<RuntimeMinMaxFilter>)],
+    chunk: Chunk,
+) -> Result<Option<Chunk>, String> {
+    if filters.is_empty() {
+        return Ok(Some(chunk));
+    }
+    if chunk.is_empty() {
+        return Ok(Some(chunk));
+    }
+    let mut current = Some(chunk);
+    for (filter_id, filter) in filters {
+        let Some(chunk) = current else {
+            return Ok(None);
+        };
+        let Some(expr_id) = exprs.get(filter_id) else {
+            // No expression mapping for this filter_id — skip it.
+            eprintln!(
+                "[min_max_filter] skipping filter_id={} — no expr mapping",
+                filter_id
+            );
+            current = Some(chunk);
+            continue;
+        };
+        let array = match arena.eval(*expr_id, &chunk) {
+            Ok(array) => array,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("slot id") && msg.contains("not found in chunk") {
+                    eprintln!(
+                        "[min_max_filter] skipping filter_id={} — probe column not in chunk: {}",
+                        filter_id, msg
+                    );
+                    current = Some(chunk);
+                    continue;
+                }
+                return Err(msg);
+            }
+        };
+        let len = chunk.len();
+        let mut keep = vec![true; len];
+        // has_null=false, check_null=true  → null rows are excluded
+        filter.apply_to_array(&array, false, true, &mut keep)?;
+        if keep.iter().all(|v| *v) {
+            eprintln!(
+                "[min_max_filter] filter_id={} kept all {} rows",
+                filter_id, len
+            );
+            current = Some(chunk);
+            continue;
+        }
+        if keep.iter().all(|v| !*v) {
+            eprintln!(
+                "[min_max_filter] filter_id={} pruned all {} rows",
+                filter_id, len
+            );
+            current = None;
+            continue;
+        }
+        let kept = keep.iter().filter(|v| **v).count();
+        eprintln!(
+            "[min_max_filter] filter_id={} kept {}/{} rows",
+            filter_id, kept, len
+        );
+        let mask = BooleanArray::from(keep);
+        let filtered_batch =
+            filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
+        current = Some(Chunk::new_like(filtered_batch, &chunk));
     }
     Ok(current)
 }

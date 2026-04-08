@@ -43,6 +43,7 @@ pub(crate) mod min_max;
 
 pub(crate) use apply::{
     filter_chunk_by_in_filters_with_exprs, filter_chunk_by_membership_filters_with_exprs,
+    filter_chunk_by_min_max_filters_with_exprs,
 };
 pub(crate) use bitset::{RuntimeBitsetFilter, maybe_build_runtime_bitset_filter};
 pub(crate) use bloom::RuntimeBloomFilter;

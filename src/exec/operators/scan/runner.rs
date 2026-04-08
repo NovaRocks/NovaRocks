@@ -42,7 +42,7 @@ use crate::exec::row_position::LakeRowPositionSpec;
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{
     RuntimeInFilter, RuntimeMembershipFilter, filter_chunk_by_in_filters_with_exprs,
-    filter_chunk_by_membership_filters_with_exprs,
+    filter_chunk_by_membership_filters_with_exprs, filter_chunk_by_min_max_filters_with_exprs,
 };
 use crate::lower::type_lowering::scalar_type_desc;
 use crate::metrics;
@@ -769,12 +769,13 @@ impl ScanAsyncRunner {
         {
             let node_id = self.scan.node_id().unwrap_or(-1);
             debug!(
-                "scan runtime filter progress: node_id={} driver_id={} version={} in_filters={} membership_filters={} expected={} counter={}",
+                "scan runtime filter progress: node_id={} driver_id={} version={} in_filters={} membership_filters={} min_max_filters={} expected={} counter={}",
                 node_id,
                 self.driver_id,
                 version,
                 snapshot.in_filters().len(),
                 snapshot.membership_filters().len(),
+                snapshot.min_max_filters().len(),
                 expected_filters,
                 self.rf_debug_counter
             );
@@ -796,8 +797,9 @@ impl ScanAsyncRunner {
             }
             return Ok(Some(chunk));
         }
-        let filters_len =
-            (snapshot.in_filters().len() + snapshot.membership_filters().len()) as i64;
+        let filters_len = (snapshot.in_filters().len()
+            + snapshot.membership_filters().len()
+            + snapshot.min_max_filters().len()) as i64;
         let result = if let Some(profile) = self.profiles.as_ref() {
             let _timer = profile.common.scoped_timer(JOIN_RUNTIME_FILTER_TIME);
             let chunk = filter_chunk_by_membership_filters_with_exprs(
@@ -806,11 +808,20 @@ impl ScanAsyncRunner {
                 snapshot.membership_filters(),
                 chunk,
             )?;
-            match chunk {
+            let chunk = match chunk {
                 Some(chunk) => filter_chunk_by_in_filters_with_exprs(
                     &self.arena,
                     &self.runtime_filter_exprs,
                     snapshot.in_filters(),
+                    chunk,
+                )?,
+                None => None,
+            };
+            match chunk {
+                Some(chunk) => filter_chunk_by_min_max_filters_with_exprs(
+                    &self.arena,
+                    &self.runtime_filter_exprs,
+                    snapshot.min_max_filters(),
                     chunk,
                 ),
                 None => Ok(None),
@@ -822,11 +833,20 @@ impl ScanAsyncRunner {
                 snapshot.membership_filters(),
                 chunk,
             )?;
-            match chunk {
+            let chunk = match chunk {
                 Some(chunk) => filter_chunk_by_in_filters_with_exprs(
                     &self.arena,
                     &self.runtime_filter_exprs,
                     snapshot.in_filters(),
+                    chunk,
+                )?,
+                None => None,
+            };
+            match chunk {
+                Some(chunk) => filter_chunk_by_min_max_filters_with_exprs(
+                    &self.arena,
+                    &self.runtime_filter_exprs,
+                    snapshot.min_max_filters(),
                     chunk,
                 ),
                 None => Ok(None),

@@ -157,6 +157,9 @@ pub(crate) fn plan_runtime_filters(
                 None::<bool>,                             // build_from_group_execution
                 None::<bool>,                             // is_broad_cast_join_in_skew
                 None::<i32>,                              // skew_shuffle_filter_id
+                None::<bool>,                             // is_asc
+                None::<bool>,                             // is_nulls_first
+                None::<i64>,                              // limit
             );
 
             rf_descs.push(desc.clone());
