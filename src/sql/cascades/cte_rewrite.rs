@@ -143,7 +143,11 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
             let consumer = inline_single_use_ctes(*node.consumer, ctx);
             let consume_count = ctx.consume_count.get(&node.cte_id).copied().unwrap_or(0);
 
-            if ctx.produces.contains(&node.cte_id) && consume_count <= 1 {
+            // Always inline CTEs: the execution engine's MultiCast exchange
+            // for multi-consume CTEs has protocol issues. Inlining duplicates
+            // the computation but produces correct results.
+            // TODO: restore consume_count <= 1 once MultiCast is fixed.
+            if ctx.produces.contains(&node.cte_id) {
                 let produce_input = match produce {
                     LogicalPlan::CTEProduce(produce_node) if produce_node.cte_id == node.cte_id => {
                         *produce_node.input
