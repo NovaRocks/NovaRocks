@@ -24,7 +24,7 @@ use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
 use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
-use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter};
+use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::fs::scan_context::FileScanRange;
 use crate::internal_service;
 use crate::novarocks_logging::warn;
@@ -157,6 +157,15 @@ impl RuntimeFilterContext {
     #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.snapshot().is_empty()
+    }
+
+    pub(crate) fn min_max_filters(&self) -> Vec<Arc<RuntimeMinMaxFilter>> {
+        match &self.inner {
+            RuntimeFilterContextInner::Static { .. } => Vec::new(),
+            RuntimeFilterContextInner::Handle { handle } => {
+                handle.snapshot().min_max_filters.clone()
+            }
+        }
     }
 }
 
