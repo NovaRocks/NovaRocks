@@ -16,6 +16,10 @@ pub(crate) fn rewrite(
 ) -> LogicalPlan {
     let plan = crate::sql::optimizer::predicate_pushdown::push_down_predicates(plan);
     let plan = crate::sql::optimizer::join_reorder::reorder_joins_cbo(plan, table_stats);
+    // Second pushdown pass: after join reorder, newly formed joins may have
+    // cross-side predicates that can now be pushed into join conditions
+    // (e.g., OR factoring extracting common equi-joins at a lower level).
+    let plan = crate::sql::optimizer::predicate_pushdown::push_down_predicates(plan);
     let plan = crate::sql::optimizer::column_pruning::prune_columns(plan);
     plan
 }
