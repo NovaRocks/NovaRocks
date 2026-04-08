@@ -831,7 +831,9 @@ fn lower_probe_runtime_filter_specs(
             continue;
         };
         if let Some(filter_type) = desc.filter_type {
-            if filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER {
+            if filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
+                && filter_type != runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER
+            {
                 continue;
             }
         }
