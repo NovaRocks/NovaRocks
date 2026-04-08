@@ -121,9 +121,41 @@ impl<'a> AnalyzerContext<'a> {
             let join_cond = if corr_preds.is_empty() {
                 sub_filter
             } else {
-                // Build combined condition: correlation + non-correlation predicates
+                // Build combined condition: correlation + non-correlation predicates.
+                // Use unqualified column refs so the physical layer can resolve
+                // them against either join side without requiring specific aliases.
+                let unqualify_expr = |expr: &TypedExpr| -> TypedExpr {
+                    match &expr.kind {
+                        ExprKind::BinaryOp { left, op, right } => {
+                            let unq = |col: &TypedExpr| -> TypedExpr {
+                                if let ExprKind::ColumnRef { column, .. } = &col.kind {
+                                    TypedExpr {
+                                        kind: ExprKind::ColumnRef {
+                                            qualifier: None,
+                                            column: column.clone(),
+                                        },
+                                        data_type: col.data_type.clone(),
+                                        nullable: col.nullable,
+                                    }
+                                } else {
+                                    col.clone()
+                                }
+                            };
+                            TypedExpr {
+                                data_type: expr.data_type.clone(),
+                                nullable: expr.nullable,
+                                kind: ExprKind::BinaryOp {
+                                    left: Box::new(unq(left)),
+                                    op: *op,
+                                    right: Box::new(unq(right)),
+                                },
+                            }
+                        }
+                        _ => expr.clone(),
+                    }
+                };
                 let corr_cond = {
-                    let mut c = corr_preds[0].full_expr.clone();
+                    let mut c = unqualify_expr(&corr_preds[0].full_expr);
                     for pred in &corr_preds[1..] {
                         c = TypedExpr {
                             data_type: DataType::Boolean,
@@ -131,7 +163,7 @@ impl<'a> AnalyzerContext<'a> {
                             kind: ExprKind::BinaryOp {
                                 left: Box::new(c),
                                 op: BinOp::And,
-                                right: Box::new(pred.full_expr.clone()),
+                                right: Box::new(unqualify_expr(&pred.full_expr)),
                             },
                         };
                     }
