@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+pub(crate) mod streaming_state;
+
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
