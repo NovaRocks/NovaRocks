@@ -37,9 +37,11 @@ use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
-use crate::exec::node::aggregate::AggFunction;
+use crate::exec::node::aggregate::{AggFunction, TopNRuntimeFilterSpec};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
+use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
+use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 
 use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
@@ -81,6 +83,8 @@ pub struct AggregateProcessorFactory {
     output_intermediate: bool,
     direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
+    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
 }
 
 impl AggregateProcessorFactory {
@@ -92,6 +96,8 @@ impl AggregateProcessorFactory {
         output_intermediate: bool,
         direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
+        topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+        runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
     ) -> Self {
         let name = if node_id >= 0 {
             format!("AGGREGATE (id={node_id})")
@@ -106,6 +112,8 @@ impl AggregateProcessorFactory {
             output_intermediate,
             direct_input,
             output_chunk_schema,
+            topn_rf_specs,
+            runtime_filter_hub,
         }
     }
 }
@@ -140,6 +148,9 @@ impl OperatorFactory for AggregateProcessorFactory {
             profile_initialized: false,
             profiles: None,
             key_table_mem_tracker: None,
+            topn_rf_specs: self.topn_rf_specs.clone(),
+            runtime_filter_hub: self.runtime_filter_hub.clone(),
+            topn_rf_rows_since_publish: 0,
         })
     }
 }
@@ -168,6 +179,9 @@ struct AggregateProcessorOperator {
     profile_initialized: bool,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
+    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    topn_rf_rows_since_publish: usize,
 }
 
 impl Operator for AggregateProcessorOperator {
@@ -246,6 +260,51 @@ impl AggregateProcessorOperator {
             group_key_nullable,
         )?);
         Ok(())
+    }
+
+    fn try_publish_topn_runtime_filter(&mut self) {
+        const PUBLISH_THRESHOLD: usize = 4096;
+
+        if self.topn_rf_specs.is_empty() {
+            return;
+        }
+        let Some(hub) = &self.runtime_filter_hub else {
+            return;
+        };
+        let Some(key_table) = &self.key_table else {
+            return;
+        };
+        if self.topn_rf_rows_since_publish < PUBLISH_THRESHOLD {
+            return;
+        }
+
+        for spec in &self.topn_rf_specs {
+            if key_table.group_count() < spec.limit {
+                continue;
+            }
+            // Get the group-by key column at expr_order.
+            // This is where the FE bug manifests: wrong expr_order -> wrong column.
+            let key_columns = key_table.key_columns();
+            let Some(key_col) = key_columns.get(spec.expr_order) else {
+                continue;
+            };
+            let column_array = match key_col.to_array() {
+                Ok(arr) => arr,
+                Err(e) => {
+                    tracing::warn!("Failed to convert key column to array for TopN filter: {}", e);
+                    continue;
+                }
+            };
+            let filter = match RuntimeMinMaxFilter::from_array(spec.build_type, &column_array) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::warn!("Failed to build TopN MinMax filter: {}", e);
+                    continue;
+                }
+            };
+            hub.publish_min_max_filter(spec.filter_id, filter);
+        }
+        self.topn_rf_rows_since_publish = 0;
     }
 
     fn process(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
@@ -607,10 +666,13 @@ impl ProcessorOperator for AggregateProcessorOperator {
         if self.pending_output.is_some() {
             return Err("aggregate received input while output buffer is full".to_string());
         }
+        let num_rows = chunk.len();
         let out = self.process(chunk)?;
         if out.is_some() {
             return Err("aggregate produced output before finishing".to_string());
         }
+        self.topn_rf_rows_since_publish += num_rows;
+        self.try_publish_topn_runtime_filter();
         Ok(())
     }
 

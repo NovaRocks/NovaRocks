@@ -39,7 +39,7 @@ mod in_filter;
 mod local;
 mod membership;
 mod merger;
-mod min_max;
+pub(crate) mod min_max;
 
 pub(crate) use apply::{
     filter_chunk_by_in_filters_with_exprs, filter_chunk_by_membership_filters_with_exprs,
