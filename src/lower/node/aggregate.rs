@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::expr::ExprArena;
-use crate::exec::node::aggregate::{AggFunction, AggTypeSignature, AggregateNode};
+use crate::exec::node::aggregate::{
+    AggFunction, AggTypeSignature, AggregateNode, TopNRuntimeFilterSpec,
+};
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
 use crate::descriptors;
@@ -23,8 +25,9 @@ use crate::lower::expr::{lower_expr_node, lower_t_expr};
 use crate::lower::layout::{Layout, chunk_schema_for_layout};
 use crate::lower::node::Lowered;
 use crate::lower::type_lowering::arrow_type_from_desc;
+use crate::novarocks_logging::warn;
 
-use crate::{exprs, plan_nodes, types};
+use crate::{exprs, plan_nodes, runtime_filter, types};
 use arrow::datatypes::{DataType, Field, Fields};
 
 /// Lower an AGGREGATION_NODE plan node to a `Lowered` ExecNode.
@@ -122,6 +125,90 @@ pub(crate) fn lower_aggregate_node(
     })?;
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, out_layout)?;
 
+    // Parse TopN runtime filter specs from the aggregation node.
+    let mut topn_rf_specs = Vec::new();
+    if let Some(filters) = agg
+        .build_runtime_filters
+        .as_ref()
+        .filter(|v| !v.is_empty())
+    {
+        for desc in filters {
+            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
+                continue;
+            }
+            let filter_id = desc
+                .filter_id
+                .ok_or_else(|| "topn runtime filter missing filter_id".to_string())?;
+            let expr_order = desc
+                .expr_order
+                .ok_or_else(|| {
+                    format!("topn runtime filter {} missing expr_order", filter_id)
+                })?
+                as usize;
+
+            // Extract the build primitive type from build_expr.
+            let build_type = desc
+                .build_expr
+                .as_ref()
+                .and_then(|expr| expr.nodes.first())
+                .and_then(|node| node.type_.types.as_ref())
+                .and_then(|type_nodes| type_nodes.first())
+                .and_then(|tn| tn.scalar_type.as_ref())
+                .map(|st| st.type_)
+                .ok_or_else(|| {
+                    format!(
+                        "topn runtime filter {} missing build_expr type",
+                        filter_id
+                    )
+                })?;
+
+            // Resolve probe column name from plan_node_id_to_target_expr.
+            // Each entry maps a scan node ID to the probe TExpr. The probe
+            // expression is typically a SlotRef; we resolve the slot to a column
+            // name via the descriptor table. If resolution fails, store the
+            // slot_id as a string placeholder (will be fixed in Task 9).
+            let probe_column_name = desc
+                .plan_node_id_to_target_expr
+                .as_ref()
+                .and_then(|m| m.values().next())
+                .and_then(|probe_expr| probe_expr.nodes.first())
+                .and_then(|probe_node| probe_node.slot_ref.as_ref())
+                .and_then(|slot_ref| {
+                    let slot_id = slot_ref.slot_id;
+                    desc_tbl
+                        .slot_descriptors
+                        .as_ref()
+                        .and_then(|slots| {
+                            slots
+                                .iter()
+                                .find(|sd| sd.id == Some(slot_id))
+                                .and_then(|sd| sd.col_name.clone())
+                        })
+                        .or_else(|| Some(format!("__slot_{}", slot_id)))
+                })
+                .unwrap_or_default();
+
+            // The TopN limit comes from the plan node's limit field.
+            // A non-positive limit means no actual topn constraint; skip.
+            let limit = node.limit;
+            if limit <= 0 {
+                warn!(
+                    "topn runtime filter {} has non-positive limit {}, skipping",
+                    filter_id, limit
+                );
+                continue;
+            }
+
+            topn_rf_specs.push(TopNRuntimeFilterSpec {
+                filter_id,
+                expr_order,
+                build_type,
+                probe_column_name,
+                limit: limit as usize,
+            });
+        }
+    }
+
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
@@ -132,7 +219,7 @@ pub(crate) fn lower_aggregate_node(
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
                 output_chunk_schema,
-                topn_rf_specs: Vec::new(),
+                topn_rf_specs,
             }),
         },
         layout: out_layout.clone(),
