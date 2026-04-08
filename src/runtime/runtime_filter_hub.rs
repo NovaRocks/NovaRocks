@@ -580,7 +580,7 @@ impl RuntimeFilterHub {
         };
         if targets.is_empty() {
             debug!(
-                "runtime filter publish deferred: filter_id={} reason=no_targets",
+                "runtime filter publish min_max deferred: filter_id={} reason=no_targets",
                 filter_id
             );
             return;
@@ -590,7 +590,7 @@ impl RuntimeFilterHub {
             filter_id,
             targets.len()
         );
-        for target in targets {
+        for target in &targets {
             let entry = self.get_or_create_entry(target.node_id);
             entry.handle.update_min_max_filter(filter_id, Arc::clone(&filter));
         }

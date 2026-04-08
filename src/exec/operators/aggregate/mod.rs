@@ -283,24 +283,17 @@ impl AggregateProcessorOperator {
                 continue;
             }
             // Get the group-by key column at expr_order.
-            // This is where the FE bug manifests: wrong expr_order -> wrong column.
             let key_columns = key_table.key_columns();
             let Some(key_col) = key_columns.get(spec.expr_order) else {
                 continue;
             };
             let column_array = match key_col.to_array() {
                 Ok(arr) => arr,
-                Err(e) => {
-                    tracing::warn!("Failed to convert key column to array for TopN filter: {}", e);
-                    continue;
-                }
+                Err(_) => continue,
             };
             let filter = match RuntimeMinMaxFilter::from_array(spec.build_type, &column_array) {
                 Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!("Failed to build TopN MinMax filter: {}", e);
-                    continue;
-                }
+                Err(_) => continue,
             };
             hub.publish_min_max_filter(spec.filter_id, filter);
         }

@@ -129,7 +129,8 @@ impl ScanOp for StarRocksScanOp {
 
         // Apply MinMax runtime filters from TopN as storage-level predicates.
         if let Some(rf_ctx) = runtime_filters {
-            for (filter_id, filter) in rf_ctx.min_max_filters() {
+            let mm_filters = rf_ctx.min_max_filters();
+            for (filter_id, filter) in mm_filters {
                 if let Some(column_name) = cfg.topn_filter_column_map.get(&filter_id) {
                     match filter.to_min_max_predicates(column_name) {
                         Ok(preds) => cfg.min_max_predicates.extend(preds),

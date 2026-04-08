@@ -42,10 +42,10 @@ use crate::novarocks_config::config as novarocks_app_config;
 use crate::novarocks_connectors::{
     ConnectorRegistry, LakeScanSchemaMeta, ScanConfig, StarRocksScanConfig, StarRocksScanRange,
 };
-use crate::novarocks_logging::{debug, info};
+use crate::novarocks_logging::{debug, info, warn};
 use crate::runtime::query_context::QueryId;
 use crate::runtime::starlet_shard_registry::{self, S3StoreConfig};
-use crate::{descriptors, internal_service, plan_nodes, types};
+use crate::{descriptors, internal_service, plan_nodes, runtime_filter, types};
 
 /// Lower a LAKE_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_lake_scan_node(
@@ -466,6 +466,59 @@ pub(crate) fn lower_lake_scan_node(
         tablet_path_map.len()
     );
 
+    // Parse TOPN_FILTER probe descriptors to build filter_id -> column_name map.
+    let mut topn_filter_column_map = HashMap::new();
+    if let Some(descs) = node.probe_runtime_filters.as_ref().filter(|v| !v.is_empty()) {
+        for desc in descs {
+            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
+                continue;
+            }
+            let Some(filter_id) = desc.filter_id else {
+                warn!(
+                    "TOPN_FILTER probe descriptor missing filter_id: node_id={}",
+                    node.node_id
+                );
+                continue;
+            };
+            // Look up the probe expression targeted at this scan node.
+            let probe_column_name = desc
+                .plan_node_id_to_target_expr
+                .as_ref()
+                .and_then(|m| m.get(&node.node_id))
+                .and_then(|probe_expr| probe_expr.nodes.first())
+                .and_then(|probe_node| probe_node.slot_ref.as_ref())
+                .and_then(|slot_ref| {
+                    let slot_id = slot_ref.slot_id;
+                    // Resolve slot_id to column name via the descriptor table.
+                    desc_tbl
+                        .slot_descriptors
+                        .as_ref()
+                        .and_then(|slots| {
+                            slots
+                                .iter()
+                                .find(|sd| sd.id == Some(slot_id))
+                                .and_then(|sd| sd.col_name.clone())
+                        })
+                        .or_else(|| Some(format!("__slot_{}", slot_id)))
+                });
+            match probe_column_name {
+                Some(name) if !name.is_empty() => {
+                    debug!(
+                        "LAKE_SCAN_NODE node_id={} topn_filter_id={} -> column={}",
+                        node.node_id, filter_id, name
+                    );
+                    topn_filter_column_map.insert(filter_id, name);
+                }
+                _ => {
+                    warn!(
+                        "TOPN_FILTER probe filter_id={} could not resolve column name for node_id={}",
+                        filter_id, node.node_id
+                    );
+                }
+            }
+        }
+    }
+
     let cfg = StarRocksScanConfig {
         db_name: normalize_optional_table_name(&db_name, "__unknown_db__"),
         table_name: normalize_optional_table_name(&table_name, "__unknown_table__"),
@@ -494,7 +547,7 @@ pub(crate) fn lower_lake_scan_node(
                 lo: exec_params.query_id.lo,
             }),
         }),
-        topn_filter_column_map: std::collections::HashMap::new(),
+        topn_filter_column_map,
     };
 
     let lake_row_position_spec_active = lake_row_position_spec.is_some();

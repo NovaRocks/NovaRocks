@@ -188,12 +188,12 @@ pub(crate) fn lower_aggregate_node(
                 })
                 .unwrap_or_default();
 
-            // The TopN limit comes from the plan node's limit field.
-            // A non-positive limit means no actual topn constraint; skip.
-            let limit = node.limit;
+            // The TopN limit comes from the runtime filter description's topn field,
+            // NOT from the plan node's limit (which is the AGG node's own limit, often -1).
+            let limit = desc.limit.unwrap_or(0);
             if limit <= 0 {
                 warn!(
-                    "topn runtime filter {} has non-positive limit {}, skipping",
+                    "topn runtime filter {} has non-positive topn limit {}, skipping",
                     filter_id, limit
                 );
                 continue;

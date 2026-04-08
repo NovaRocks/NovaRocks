@@ -687,20 +687,20 @@ fn build_pipeline_for_node(
                 for func in &mut partial_functions {
                     func.input_is_intermediate = false;
                 }
-                build
-                    .pipeline
-                    .factories
-                    .push(Box::new(AggregateProcessorFactory::new(
-                        *node_id,
-                        Arc::clone(&ctx.arena),
-                        group_by.clone(),
-                        partial_functions,
-                        true,
-                        false,
-                        output_chunk_schema.clone(),
-                        Vec::new(),
-                        None,
-                    )));
+
+                let partial_agg_factory = Box::new(AggregateProcessorFactory::new(
+                    *node_id,
+                    Arc::clone(&ctx.arena),
+                    group_by.clone(),
+                    partial_functions,
+                    true,
+                    false,
+                    output_chunk_schema.clone(),
+                    topn_rf_specs.clone(),
+                    Some(Arc::clone(&ctx.runtime_filter_hub)),
+                ));
+
+                build.pipeline.factories.push(partial_agg_factory);
 
                 if output_slots.len() < group_by.len() {
                     return Err(format!(
@@ -734,8 +734,8 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
-                        topn_rf_specs.clone(),
-                        Some(Arc::clone(&ctx.runtime_filter_hub)),
+                        Vec::new(),
+                        None,
                     )));
                 return Ok(build);
             }
@@ -753,8 +753,8 @@ fn build_pipeline_for_node(
                     true,
                     false,
                     output_chunk_schema.clone(),
-                    Vec::new(),
-                    None,
+                    topn_rf_specs.clone(),
+                    Some(Arc::clone(&ctx.runtime_filter_hub)),
                 ));
                 build.pipeline.factories.push(local_factory);
 
@@ -796,8 +796,8 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
-                        topn_rf_specs.clone(),
-                        Some(Arc::clone(&ctx.runtime_filter_hub)),
+                        Vec::new(),
+                        None,
                     )));
 
                 let mut extra_pipelines = build.extra_pipelines;
