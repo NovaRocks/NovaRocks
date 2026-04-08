@@ -128,11 +128,7 @@ pub(crate) fn lower_aggregate_node(
 
     // Parse TopN runtime filter specs from the aggregation node.
     let mut topn_rf_specs = Vec::new();
-    if let Some(filters) = agg
-        .build_runtime_filters
-        .as_ref()
-        .filter(|v| !v.is_empty())
-    {
+    if let Some(filters) = agg.build_runtime_filters.as_ref().filter(|v| !v.is_empty()) {
         for desc in filters {
             if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
                 continue;
@@ -142,9 +138,7 @@ pub(crate) fn lower_aggregate_node(
                 .ok_or_else(|| "topn runtime filter missing filter_id".to_string())?;
             let expr_order = desc
                 .expr_order
-                .ok_or_else(|| {
-                    format!("topn runtime filter {} missing expr_order", filter_id)
-                })?
+                .ok_or_else(|| format!("topn runtime filter {} missing expr_order", filter_id))?
                 as usize;
 
             // Extract the build primitive type from build_expr.
@@ -157,10 +151,7 @@ pub(crate) fn lower_aggregate_node(
                 .and_then(|tn| tn.scalar_type.as_ref())
                 .map(|st| st.type_)
                 .ok_or_else(|| {
-                    format!(
-                        "topn runtime filter {} missing build_expr type",
-                        filter_id
-                    )
+                    format!("topn runtime filter {} missing build_expr type", filter_id)
                 })?;
 
             // Resolve probe column name from plan_node_id_to_target_expr.
@@ -210,24 +201,20 @@ pub(crate) fn lower_aggregate_node(
         }
     }
 
-    let streaming_preaggregation_mode = agg
-        .streaming_preaggregation_mode
-        .map(|mode| {
-            use crate::plan_nodes::TStreamingPreaggregationMode;
-            match mode {
-                TStreamingPreaggregationMode::AUTO => StreamingPreaggregationMode::Auto,
-                TStreamingPreaggregationMode::FORCE_STREAMING => {
-                    StreamingPreaggregationMode::ForceStreaming
-                }
-                TStreamingPreaggregationMode::FORCE_PREAGGREGATION => {
-                    StreamingPreaggregationMode::ForcePreaggregation
-                }
-                TStreamingPreaggregationMode::LIMITED_MEM => {
-                    StreamingPreaggregationMode::LimitedMem
-                }
-                _ => StreamingPreaggregationMode::Auto,
+    let streaming_preaggregation_mode = agg.streaming_preaggregation_mode.map(|mode| {
+        use crate::plan_nodes::TStreamingPreaggregationMode;
+        match mode {
+            TStreamingPreaggregationMode::AUTO => StreamingPreaggregationMode::Auto,
+            TStreamingPreaggregationMode::FORCE_STREAMING => {
+                StreamingPreaggregationMode::ForceStreaming
             }
-        });
+            TStreamingPreaggregationMode::FORCE_PREAGGREGATION => {
+                StreamingPreaggregationMode::ForcePreaggregation
+            }
+            TStreamingPreaggregationMode::LIMITED_MEM => StreamingPreaggregationMode::LimitedMem,
+            _ => StreamingPreaggregationMode::Auto,
+        }
+    });
 
     Ok(Lowered {
         node: ExecNode {

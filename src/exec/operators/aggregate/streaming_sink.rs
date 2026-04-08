@@ -36,12 +36,12 @@ use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
 use super::streaming_state::AggregateStreamingState;
-use super::{build_agg_views, ENABLE_GROUP_KEY_OPTIMIZATIONS};
+use super::{ENABLE_GROUP_KEY_OPTIMIZATIONS, build_agg_views};
 use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::hash_table::key_builder::{build_group_key_views, GroupKeyArrayView};
+use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
@@ -742,10 +742,7 @@ impl AggregateStreamingSinkOperator {
                     slot_schema.with_field_and_slot_id(*slot_id, field.as_ref().clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            Chunk::try_new_with_chunk_schema(
-                batch,
-                Arc::new(ChunkSchema::try_new(slot_schemas)?),
-            )
+            Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
         }
     }
 

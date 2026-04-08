@@ -687,8 +687,7 @@ fn build_pipeline_for_node(
                     streaming_state,
                 ));
                 let source_dop = build.pipeline.dop;
-                let downstream =
-                    new_source_pipeline_with_dop(ctx, source_factory, source_dop);
+                let downstream = new_source_pipeline_with_dop(ctx, source_factory, source_dop);
 
                 let mut extra_pipelines = build.extra_pipelines;
                 extra_pipelines.push(build.pipeline);
