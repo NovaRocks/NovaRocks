@@ -24,6 +24,18 @@ pub(crate) fn push_down_predicates(plan: LogicalPlan) -> LogicalPlan {
             let input = push_down_predicates(*node.input);
             push_filter_into(node.predicate, input)
         }
+        // For SEMI/ANTI joins: push right-child-only predicates from the join
+        // condition into the right child. This converts patterns like:
+        //   SEMI JOIN (CROSS(store_sales, date_dim)) ON (corr AND ss_sold_date_sk = d_date_sk)
+        // into:
+        //   SEMI JOIN (INNER(store_sales, date_dim, ON ss_sold_date_sk = d_date_sk)) ON (corr)
+        LogicalPlan::Join(join) if matches!(
+            join.join_type,
+            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti
+        ) => {
+            let optimized = push_semi_condition_into_children(join);
+            map_children(optimized, push_down_predicates)
+        }
         // Recurse into children for all other node types
         other => map_children(other, push_down_predicates),
     }
@@ -311,6 +323,59 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
     });
 
     wrap_remaining_filter(new_join, remaining)
+}
+
+/// For SEMI/ANTI joins, push predicates from the join condition that only
+/// reference the right child into the right child as a filter. This converts
+/// CROSS JOINs inside SEMI right sides into proper INNER JOINs.
+///
+/// Example:
+///   LEFT SEMI (store_sales CROSS date_dim) ON (corr AND ss_sold_date_sk = d_date_sk AND d_year = 2002)
+/// becomes:
+///   LEFT SEMI (store_sales INNER date_dim ON ss_sold_date_sk = d_date_sk WHERE d_year = 2002) ON (corr)
+fn push_semi_condition_into_children(join: JoinNode) -> LogicalPlan {
+    let Some(ref condition) = join.condition else {
+        return LogicalPlan::Join(join);
+    };
+
+    let conjuncts = split_and(condition.clone());
+    let right_cols = collect_output_columns(&join.right);
+
+    let mut keep_in_condition = Vec::new();
+    let mut push_to_right = Vec::new();
+
+    for conj in conjuncts {
+        let refs = collect_column_refs(&conj);
+        let all_in_right = refs.iter().all(|c| right_cols.contains(&c.to_lowercase()));
+        let any_in_right = refs.iter().any(|c| right_cols.contains(&c.to_lowercase()));
+
+        if !refs.is_empty() && all_in_right {
+            // Only references right side — push down
+            push_to_right.push(conj);
+        } else {
+            keep_in_condition.push(conj);
+        }
+    }
+
+    if push_to_right.is_empty() {
+        return LogicalPlan::Join(join);
+    }
+
+    let new_condition = if keep_in_condition.is_empty() {
+        None
+    } else {
+        Some(combine_and(keep_in_condition))
+    };
+
+    let pushed = combine_and(push_to_right);
+    let new_right = push_filter_into(pushed, *join.right);
+
+    LogicalPlan::Join(JoinNode {
+        left: join.left,
+        right: Box::new(new_right),
+        join_type: join.join_type,
+        condition: new_condition,
+    })
 }
 
 /// Merge new predicates into an existing (optional) join condition.
