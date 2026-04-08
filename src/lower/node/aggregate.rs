@@ -16,7 +16,8 @@
 // under the License.
 use crate::exec::expr::ExprArena;
 use crate::exec::node::aggregate::{
-    AggFunction, AggTypeSignature, AggregateNode, TopNRuntimeFilterSpec,
+    AggFunction, AggTypeSignature, AggregateNode, StreamingPreaggregationMode,
+    TopNRuntimeFilterSpec,
 };
 use crate::exec::node::{ExecNode, ExecNodeKind};
 
@@ -209,6 +210,25 @@ pub(crate) fn lower_aggregate_node(
         }
     }
 
+    let streaming_preaggregation_mode = agg
+        .streaming_preaggregation_mode
+        .map(|mode| {
+            use crate::plan_nodes::TStreamingPreaggregationMode;
+            match mode {
+                TStreamingPreaggregationMode::AUTO => StreamingPreaggregationMode::Auto,
+                TStreamingPreaggregationMode::FORCE_STREAMING => {
+                    StreamingPreaggregationMode::ForceStreaming
+                }
+                TStreamingPreaggregationMode::FORCE_PREAGGREGATION => {
+                    StreamingPreaggregationMode::ForcePreaggregation
+                }
+                TStreamingPreaggregationMode::LIMITED_MEM => {
+                    StreamingPreaggregationMode::LimitedMem
+                }
+                _ => StreamingPreaggregationMode::Auto,
+            }
+        });
+
     Ok(Lowered {
         node: ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
@@ -220,7 +240,7 @@ pub(crate) fn lower_aggregate_node(
                 input_is_intermediate,
                 output_chunk_schema,
                 topn_rf_specs,
-                streaming_preaggregation_mode: None,
+                streaming_preaggregation_mode,
             }),
         },
         layout: out_layout.clone(),
