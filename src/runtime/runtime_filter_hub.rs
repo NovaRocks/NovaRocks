@@ -24,7 +24,7 @@ use crate::exec::node::RuntimeFilterProbeSpec;
 use crate::exec::node::join::JoinRuntimeFilterSpec;
 use crate::exec::pipeline::dependency::{DependencyHandle, DependencyManager};
 use crate::exec::runtime_filter::{
-    RuntimeInFilter, RuntimeMembershipFilter, StarrocksRuntimeFilterType,
+    RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter, StarrocksRuntimeFilterType,
     decode_starrocks_in_filter, decode_starrocks_membership_filter, peek_starrocks_filter_type,
 };
 use crate::novarocks_logging::{debug, warn};
@@ -44,12 +44,14 @@ struct RuntimeFilterHandleInner {
 struct RuntimeFilterStore {
     in_filters: HashMap<i32, Arc<RuntimeInFilter>>,
     membership_filters: HashMap<i32, Arc<RuntimeMembershipFilter>>,
+    min_max_filters: HashMap<i32, Arc<RuntimeMinMaxFilter>>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuntimeFilterSnapshot {
     in_filters: Vec<Arc<RuntimeInFilter>>,
     membership_filters: Vec<Arc<RuntimeMembershipFilter>>,
+    pub(crate) min_max_filters: Vec<Arc<RuntimeMinMaxFilter>>,
 }
 
 impl RuntimeFilterHandle {
@@ -66,15 +68,20 @@ impl RuntimeFilterHandle {
         let guard = self.inner.store.read().expect("runtime filter handle lock");
         let mut in_filters = Vec::with_capacity(guard.in_filters.len());
         let mut membership_filters = Vec::with_capacity(guard.membership_filters.len());
+        let mut min_max_filters = Vec::with_capacity(guard.min_max_filters.len());
         for filter in guard.in_filters.values() {
             in_filters.push(Arc::clone(filter));
         }
         for filter in guard.membership_filters.values() {
             membership_filters.push(Arc::clone(filter));
         }
+        for filter in guard.min_max_filters.values() {
+            min_max_filters.push(Arc::clone(filter));
+        }
         RuntimeFilterSnapshot {
             in_filters,
             membership_filters,
+            min_max_filters,
         }
     }
 
@@ -102,6 +109,16 @@ impl RuntimeFilterHandle {
         self.inner.version.fetch_add(1, Ordering::AcqRel);
     }
 
+    fn update_min_max_filter(&self, filter_id: i32, filter: Arc<RuntimeMinMaxFilter>) {
+        let mut guard = self
+            .inner
+            .store
+            .write()
+            .expect("runtime filter handle lock");
+        guard.min_max_filters.insert(filter_id, filter);
+        self.inner.version.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn counts(&self) -> (usize, usize) {
         let guard = self.inner.store.read().expect("runtime filter handle lock");
         (guard.in_filters.len(), guard.membership_filters.len())
@@ -122,6 +139,7 @@ impl RuntimeFilterSnapshot {
         Self {
             in_filters,
             membership_filters,
+            min_max_filters: Vec::new(),
         }
     }
 
@@ -133,8 +151,12 @@ impl RuntimeFilterSnapshot {
         &self.membership_filters
     }
 
+    pub(crate) fn min_max_filters(&self) -> &[Arc<RuntimeMinMaxFilter>] {
+        &self.min_max_filters
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
-        self.in_filters.is_empty() && self.membership_filters.is_empty()
+        self.in_filters.is_empty() && self.membership_filters.is_empty() && self.min_max_filters.is_empty()
     }
 }
 
@@ -547,6 +569,30 @@ impl RuntimeFilterHub {
                 filter_id,
                 RuntimeFilterUpdate::Membership(filter_for_node),
             );
+        }
+    }
+
+    pub(crate) fn publish_min_max_filter(&self, filter_id: i32, filter: RuntimeMinMaxFilter) {
+        let filter = Arc::new(filter);
+        let targets = {
+            let guard = self.probe_targets.lock().expect("runtime filter hub lock");
+            guard.get(&filter_id).cloned().unwrap_or_default()
+        };
+        if targets.is_empty() {
+            debug!(
+                "runtime filter publish deferred: filter_id={} reason=no_targets",
+                filter_id
+            );
+            return;
+        }
+        debug!(
+            "runtime filter publish min_max filter: filter_id={} targets={}",
+            filter_id,
+            targets.len()
+        );
+        for target in targets {
+            let entry = self.get_or_create_entry(target.node_id);
+            entry.handle.update_min_max_filter(filter_id, Arc::clone(&filter));
         }
     }
 
