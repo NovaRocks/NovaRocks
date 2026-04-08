@@ -70,6 +70,11 @@ pub struct StarRocksScanConfig {
     pub profile_label: Option<String>,
     pub min_max_predicates: Vec<MinMaxPredicate>,
     pub lake_schema_meta: Option<LakeScanSchemaMeta>,
+    /// Maps TopN runtime filter_id → scan column name.
+    /// Populated during lowering so that execute_iter() can convert
+    /// `RuntimeMinMaxFilter` instances into `MinMaxPredicate` values
+    /// for storage-level segment pruning.
+    pub topn_filter_column_map: HashMap<i32, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +111,7 @@ impl ScanOp for StarRocksScanOp {
         &self,
         morsel: ScanMorsel,
         profile: Option<RuntimeProfile>,
-        _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
         let ScanMorsel::StarRocksRange { index, .. } = morsel else {
             return Err("starrocks scan received unexpected morsel".to_string());
@@ -121,6 +126,23 @@ impl ScanOp for StarRocksScanOp {
         let mut cfg = self.cfg.clone();
         cfg.ranges = vec![range];
         cfg.limit = None;
+
+        // Apply MinMax runtime filters from TopN as storage-level predicates.
+        if let Some(rf_ctx) = runtime_filters {
+            for (filter_id, filter) in rf_ctx.min_max_filters() {
+                if let Some(column_name) = cfg.topn_filter_column_map.get(&filter_id) {
+                    match filter.to_min_max_predicates(column_name) {
+                        Ok(preds) => cfg.min_max_predicates.extend(preds),
+                        Err(e) => {
+                            warn!(
+                                "failed to convert runtime min/max filter {} to predicates: {}",
+                                filter_id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let ctx = StarRocksExecutionContext::from_scan_config(&cfg)?;
 
@@ -546,6 +568,7 @@ mod tests {
             profile_label,
             min_max_predicates: Vec::new(),
             lake_schema_meta: None,
+            topn_filter_column_map: HashMap::new(),
         }
     }
 

@@ -51,7 +51,7 @@ struct RuntimeFilterStore {
 pub(crate) struct RuntimeFilterSnapshot {
     in_filters: Vec<Arc<RuntimeInFilter>>,
     membership_filters: Vec<Arc<RuntimeMembershipFilter>>,
-    pub(crate) min_max_filters: Vec<Arc<RuntimeMinMaxFilter>>,
+    pub(crate) min_max_filters: Vec<(i32, Arc<RuntimeMinMaxFilter>)>,
 }
 
 impl RuntimeFilterHandle {
@@ -75,8 +75,8 @@ impl RuntimeFilterHandle {
         for filter in guard.membership_filters.values() {
             membership_filters.push(Arc::clone(filter));
         }
-        for filter in guard.min_max_filters.values() {
-            min_max_filters.push(Arc::clone(filter));
+        for (filter_id, filter) in &guard.min_max_filters {
+            min_max_filters.push((*filter_id, Arc::clone(filter)));
         }
         RuntimeFilterSnapshot {
             in_filters,
@@ -151,7 +151,7 @@ impl RuntimeFilterSnapshot {
         &self.membership_filters
     }
 
-    pub(crate) fn min_max_filters(&self) -> &[Arc<RuntimeMinMaxFilter>] {
+    pub(crate) fn min_max_filters(&self) -> &[(i32, Arc<RuntimeMinMaxFilter>)] {
         &self.min_max_filters
     }
 

@@ -183,6 +183,7 @@ pub(crate) fn lower_starrocks_scan_node(
         profile_label: Some(format!("starrocks_scan_node_id={}", node.node_id)),
         min_max_predicates,
         lake_schema_meta: None,
+        topn_filter_column_map: std::collections::HashMap::new(),
     };
 
     let scan = connectors

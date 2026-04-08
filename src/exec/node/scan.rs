@@ -159,7 +159,7 @@ impl RuntimeFilterContext {
         self.snapshot().is_empty()
     }
 
-    pub(crate) fn min_max_filters(&self) -> Vec<Arc<RuntimeMinMaxFilter>> {
+    pub(crate) fn min_max_filters(&self) -> Vec<(i32, Arc<RuntimeMinMaxFilter>)> {
         match &self.inner {
             RuntimeFilterContextInner::Static { .. } => Vec::new(),
             RuntimeFilterContextInner::Handle { handle } => {

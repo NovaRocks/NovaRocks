@@ -494,6 +494,7 @@ pub(crate) fn lower_lake_scan_node(
                 lo: exec_params.query_id.lo,
             }),
         }),
+        topn_filter_column_map: std::collections::HashMap::new(),
     };
 
     let lake_row_position_spec_active = lake_row_position_spec.is_some();
