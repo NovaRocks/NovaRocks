@@ -260,6 +260,16 @@ impl<'a> AnalyzerContext<'a> {
 
         let sq_alias = format!("__sq_{}", sq_info.id);
 
+        // For IN subquery eq condition: use the subquery alias as qualifier
+        // for the right side to avoid tautology when both sides have the same
+        // bare column name (e.g., ss_item_sk IN (SELECT ss_item_sk FROM ...)).
+        let lhs_col_name = match &lhs_typed.kind {
+            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+            _ => None,
+        };
+        let rhs_needs_qualifier =
+            lhs_col_name.as_deref() == Some(&sub_output_col.name.to_lowercase());
+
         let eq_cond = TypedExpr {
             data_type: DataType::Boolean,
             nullable: false,
@@ -268,7 +278,11 @@ impl<'a> AnalyzerContext<'a> {
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
-                        qualifier: None,
+                        qualifier: if rhs_needs_qualifier {
+                            Some(sq_alias.clone())
+                        } else {
+                            None
+                        },
                         column: sub_output_col.name.clone(),
                     },
                     data_type: sub_output_col.data_type.clone(),

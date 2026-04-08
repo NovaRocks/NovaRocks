@@ -370,9 +370,14 @@ fn push_semi_condition_into_children(join: JoinNode) -> LogicalPlan {
 
         // Use qualified refs when available to handle self-joins
         // (e.g., catalog_sales cs1, catalog_sales cs2 — same bare names).
+        // But also check bare refs to avoid pushing cross-side predicates
+        // where one side is qualified and the other isn't.
         let is_right_only = if !qrefs.is_empty() {
-            // All qualified refs must be in right's qualified columns
-            qrefs.iter().all(|r| right_qcols.contains(r))
+            // All qualified refs must be in right's qualified columns,
+            // AND all bare refs must be right-only (not also in left).
+            let q_all_right = qrefs.iter().all(|r| right_qcols.contains(r));
+            let bare_any_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
+            q_all_right && !bare_any_left
         } else if !refs.is_empty() {
             // Fallback: all bare refs in right but NOT all in left
             // (avoids pushing cross-side predicates for self-joins)
