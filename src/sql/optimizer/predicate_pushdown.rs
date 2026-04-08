@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use arrow::datatypes::DataType;
 use crate::sql::ir::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::plan::*;
 
@@ -256,7 +257,21 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                     } else if is_left_join_variant {
                         remaining.push(conj);
                     } else {
-                        join_preds.push(conj);
+                        // For OR predicates, try to extract common equi-join
+                        // conditions shared by all OR branches. This handles:
+                        //   (cd_demo_sk=ss_cdemo_sk AND ...) OR (cd_demo_sk=ss_cdemo_sk AND ...)
+                        // → factor out cd_demo_sk=ss_cdemo_sk as join_pred,
+                        //   keep remaining OR as other condition.
+                        let (factored, or_remaining) =
+                            factor_common_eq_from_or(&conj, &left_cols, &right_cols);
+                        if !factored.is_empty() {
+                            join_preds.extend(factored);
+                            if let Some(rem) = or_remaining {
+                                remaining.push(rem);
+                            }
+                        } else {
+                            join_preds.push(conj);
+                        }
                     }
                 } else {
                     // Fallback: keep above the join as remaining filter.
@@ -391,6 +406,157 @@ fn push_semi_condition_into_children(join: JoinNode) -> LogicalPlan {
         join_type: join.join_type,
         condition: new_condition,
     })
+}
+
+/// Extract common equi-join conditions from all branches of an OR predicate.
+/// Returns (extracted_join_preds, remaining_or_predicate).
+///
+/// For: `(A=B AND X) OR (A=B AND Y)` where A is from left and B from right,
+/// extracts `A=B` as a join predicate and returns `X OR Y` as remaining.
+fn factor_common_eq_from_or(
+    expr: &TypedExpr,
+    left_cols: &HashSet<String>,
+    right_cols: &HashSet<String>,
+) -> (Vec<TypedExpr>, Option<TypedExpr>) {
+    // Split OR into branches
+    let branches = split_or_branches(expr);
+    if branches.len() < 2 {
+        return (vec![], None);
+    }
+
+    // Collect AND conjuncts per branch
+    let branch_conjuncts: Vec<Vec<&TypedExpr>> =
+        branches.iter().map(|b| split_and_refs(b)).collect();
+
+    // Find equi-join predicates (col=col where one side left, one right)
+    // that appear in ALL branches
+    let mut common_eqs: Vec<TypedExpr> = Vec::new();
+    if let Some(first) = branch_conjuncts.first() {
+        for candidate in first {
+            if !is_cross_side_eq(candidate, left_cols, right_cols) {
+                continue;
+            }
+            let in_all = branch_conjuncts[1..]
+                .iter()
+                .all(|conjs| conjs.iter().any(|c| expr_eq(c, candidate)));
+            if in_all {
+                common_eqs.push((*candidate).clone());
+            }
+        }
+    }
+
+    if common_eqs.is_empty() {
+        return (vec![], None);
+    }
+
+    // Build remaining OR: remove common eqs from each branch
+    let mut new_branches: Vec<TypedExpr> = Vec::new();
+    for branch in &branch_conjuncts {
+        let remaining: Vec<TypedExpr> = branch
+            .iter()
+            .filter(|c| !common_eqs.iter().any(|eq| expr_eq(c, eq)))
+            .map(|c| (*c).clone())
+            .collect();
+        if remaining.is_empty() {
+            // Branch was only the common eq → TRUE
+            new_branches.push(TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)),
+            });
+        } else {
+            new_branches.push(combine_and(remaining));
+        }
+    }
+
+    let or_remaining = if new_branches.iter().all(|b| {
+        matches!(b.kind, ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)))
+    }) {
+        None // All branches were just the common eq
+    } else {
+        let mut result = new_branches.remove(0);
+        for branch in new_branches {
+            result = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(result),
+                    op: crate::sql::ir::BinOp::Or,
+                    right: Box::new(branch),
+                },
+            };
+        }
+        Some(result)
+    };
+
+    (common_eqs, or_remaining)
+}
+
+fn split_or_branches(expr: &TypedExpr) -> Vec<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: crate::sql::ir::BinOp::Or,
+            right,
+        } => {
+            let mut v = split_or_branches(left);
+            v.extend(split_or_branches(right));
+            v
+        }
+        ExprKind::Nested(inner) => split_or_branches(inner),
+        _ => vec![expr],
+    }
+}
+
+fn split_and_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: crate::sql::ir::BinOp::And,
+            right,
+        } => {
+            let mut v = split_and_refs(left);
+            v.extend(split_and_refs(right));
+            v
+        }
+        ExprKind::Nested(inner) => split_and_refs(inner),
+        _ => vec![expr],
+    }
+}
+
+fn is_cross_side_eq(
+    expr: &TypedExpr,
+    left_cols: &HashSet<String>,
+    right_cols: &HashSet<String>,
+) -> bool {
+    if let ExprKind::BinaryOp {
+        left,
+        op: crate::sql::ir::BinOp::Eq,
+        right,
+    } = &expr.kind
+    {
+        let l_name = match &left.kind {
+            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+            _ => None,
+        };
+        let r_name = match &right.kind {
+            ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+            _ => None,
+        };
+        match (l_name, r_name) {
+            (Some(l), Some(r)) => {
+                (left_cols.contains(&l) && right_cols.contains(&r))
+                    || (left_cols.contains(&r) && right_cols.contains(&l))
+            }
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+fn expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
+    format!("{:?}", a.kind) == format!("{:?}", b.kind)
 }
 
 /// Merge new predicates into an existing (optional) join condition.
