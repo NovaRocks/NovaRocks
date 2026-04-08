@@ -1,6 +1,6 @@
 # Aggregate Streaming Sink/Source Operator for NovaRocks
 
-## Status: Spec Only — Not Yet Implemented
+## Status: Spec Finalized — Ready for Implementation
 
 ## Problem
 
@@ -62,62 +62,172 @@ Key behaviors:
 - Used for merge/finalize phase (phase 2)
 - Builds In-Filter (not TopN filter) at finalization
 
+## Design Decisions
+
+### Operator Trait: Reuse `ProcessorOperator` (Approach A)
+
+NovaRocks does not have separate `SinkOperator` / `SourceOperator` traits. All operators implement
+`ProcessorOperator`. The new streaming operators follow the established **AnalyticSink/Source
+pattern**:
+
+- **Sink convention**: `has_output()` → `false`, `pull_chunk()` → `Ok(None)`.
+  `push_chunk()` / `need_input()` / `set_finishing()` carry the real logic.
+- **Source convention**: `need_input()` → `false`, `push_chunk()` → error/no-op.
+  `has_output()` / `pull_chunk()` carry the real logic.
+- Factory: `OperatorFactory` with `is_sink() = true` / `is_source() = true`.
+
+This requires zero changes to pipeline/driver infrastructure.
+
+### Shared State: `AggregateStreamingState` (Mutex + VecDeque + Observable)
+
+Following the `AnalyticSharedState` pattern (`analytic_shared.rs`), shared state between Sink and
+Source uses:
+
+```rust
+pub(crate) struct AggregateStreamingState {
+    inner: Arc<Mutex<BufferState>>,
+    observable: Arc<Observable>,
+    buffer_limit: usize,  // from operator_buffer_chunks() config
+}
+
+struct BufferState {
+    chunks: VecDeque<Chunk>,
+    sink_finished: bool,
+    has_remaining_groups: bool,  // hash table not yet fully drained
+}
+```
+
+- **Sink writes**: `offer_chunk(chunk)` — pushes to `chunks`, notifies via `observable`
+- **Sink signals finish**: `mark_sink_finished()` — sets flag, notifies source
+- **Source reads**: `poll_chunk()` → `Option<Chunk>` from front of deque
+- **Backpressure**: `is_buffer_full()` → `chunks.len() >= buffer_limit`
+- **Source observable**: returned by `source_observable()` for driver scheduling
+
+The hash table, key table, aggregate states, and kernels remain **inside the Sink operator** (not
+in shared state). When the Sink finishes, it materializes remaining groups into chunks and pushes
+them into the buffer. The Source only reads from the buffer — it never touches the hash table
+directly.
+
+This is simpler than StarRocks's design (where Source can iterate the hash table directly), but
+avoids complex shared mutable access to the hash table across pipeline boundaries. The tradeoff is
+that the Sink must serialize remaining groups into the buffer at finish time, which adds one
+materialization pass but keeps the concurrency model clean.
+
+### Streaming Mode: FORCE_PREAGGREGATION Only (Initial Scope)
+
+Parse `streaming_preaggregation_mode` from thrift but only implement `FORCE_PREAGGREGATION`:
+- Always aggregate into hash table
+- Output intermediate results to buffer when buffer has space
+- Other modes (AUTO, FORCE_STREAMING, LIMITED_MEM) return unsupported error
+
 ## What NovaRocks Needs
 
-### Phase 1: Streaming Sink/Source (Required for TopN RF)
+### Component 1: AggregateStreamingSinkOperator
 
-Split the current `AggregateProcessorOperator` into:
+New operator implementing `ProcessorOperator` (sink convention):
 
-**`AggregateStreamingSinkOperator`** (new):
-- Implements `SinkOperator` trait (push-only, no pull)
-- Accepts chunks via `push_chunk()`
-- Aggregates into hash table
-- Publishes TopN RF via `try_publish_topn_runtime_filter()` per-chunk
-- Outputs partial results into a **bounded chunk buffer** (shared with source)
-- Returns `need_input() = false` when buffer is full (backpressure)
+```rust
+struct AggregateStreamingSinkOperator {
+    // Aggregation state (owned, not shared)
+    key_table: Option<KeyTable>,
+    group_states: Vec<agg::AggStatePtr>,
+    kernels: Option<agg::AggKernelSet>,
+    state_arena: agg::AggStateArena,
 
-**`AggregateStreamingSourceOperator`** (new):
-- Implements `SourceOperator` trait (pull-only, no push)
-- Pulls from the shared chunk buffer
-- When buffer empty and sink finished, pulls remaining groups from hash table
+    // Shared buffer with Source
+    streaming_state: AggregateStreamingState,
 
-**Shared state** between Sink and Source:
-- `Arc<AggregatorState>` containing:
-  - Hash table / key table
-  - Aggregate state arena
-  - Bounded chunk buffer (e.g., `crossbeam::ArrayQueue` or `tokio::sync::mpsc`)
-  - Finishing flag
+    // TopN runtime filter (existing logic, moved from ProcessorOperator)
+    topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+    runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    topn_rf_rows_since_publish: usize,
 
-### Phase 2: Pipeline Builder Changes
-
-When FE sends a streaming pre-aggregation node (`streaming_preaggregation_mode` is set):
-
-```
-Pipeline 1: ScanSource → AggStreamingSink
-Pipeline 2: AggStreamingSource → [HashExchangeSink or next operator]
+    // State flags
+    finishing: bool,
+    finished: bool,
+}
 ```
 
-The pipeline builder creates two separate pipelines connected by the shared aggregator state.
-This is analogous to how `LocalExchangeSink/Source` splits pipelines, but the exchange medium
-is the aggregator's chunk buffer instead of a generic exchange channel.
+Key behaviors:
+- `need_input()`: `!finishing && !finished`
+- `push_chunk()`:
+  1. Evaluate group-by exprs and aggregate inputs
+  2. Insert/update hash table (reuse existing `process()` logic)
+  3. Call `try_publish_topn_runtime_filter()` (existing code, unchanged)
+  4. **No intermediate output** — FORCE_PREAGGREGATION accumulates all data in hash table.
+     The pipeline split alone provides the yield points needed for TopN RF to work.
+- `set_finishing()`:
+  1. Materialize all groups from hash table into chunks
+  2. Push all result chunks into buffer via `offer_chunk()`
+  3. Call `streaming_state.mark_sink_finished()`
+- `has_output()`: `false` (sink convention)
+- `pull_chunk()`: `Ok(None)` (sink convention)
 
-When FE sends a blocking aggregation (merge/finalize phase):
+### Component 2: AggregateStreamingSourceOperator
+
+New operator implementing `ProcessorOperator` (source convention):
+
+```rust
+struct AggregateStreamingSourceOperator {
+    streaming_state: AggregateStreamingState,
+}
+```
+
+Key behaviors:
+- `has_output()`: `streaming_state.has_chunks()` (buffer non-empty, or sink finished with remaining)
+- `pull_chunk()`: `streaming_state.poll_chunk()`
+- `is_finished()`: `streaming_state.is_done()` (sink finished AND buffer empty)
+- `need_input()`: `false` (source convention)
+- `push_chunk()`: error (source convention)
+- `source_observable()`: `Some(streaming_state.observable())`
+
+### Component 3: AggregateStreamingState
+
+Shared state between Sink and Source (described in Design Decisions above). Lives in its own file
+following the `analytic_shared.rs` pattern.
+
+### Component 4: Pipeline Builder Changes
+
+When the pipeline builder encounters an `AggregateNode` with `streaming_preaggregation_mode` set
+(and the mode is not `None`):
 
 ```
-Pipeline: ExchangeSource → AggBlockingSink → AggBlockingSource → next operator
+Pipeline 1: [upstream operators] → AggregateStreamingSink
+Pipeline 2: AggregateStreamingSource → [downstream operators]
 ```
 
-This can remain as a single `ProcessorOperator` (current behavior) or be split into Sink/Source
-for consistency.
+The builder:
+1. Creates `AggregateStreamingState` (shared between factories)
+2. Creates `AggregateStreamingSinkFactory` with the shared state → appends to current pipeline
+3. Creates `AggregateStreamingSourceFactory` with the same shared state → starts new pipeline
+4. Continues building downstream operators on the new pipeline
 
-### Phase 3: Streaming Mode Selection
+This is analogous to how the builder handles `AnalyticNode` (creates `AnalyticSinkFactory` +
+`AnalyticSourceFactory` with shared `AnalyticSharedState`).
 
-Parse `TAggregationNode.streaming_preaggregation_mode` from thrift to decide:
-- `FORCE_PREAGGREGATION` → always aggregate, buffer when full
-- `FORCE_STREAMING` → pass through (useful for distribution-only pre-shuffle)
-- `AUTO` → switch dynamically based on aggregation ratio (advanced)
+When streaming mode is not set (blocking aggregation), the existing `AggregateProcessorOperator`
+is used unchanged.
 
-For initial implementation, `FORCE_PREAGGREGATION` is sufficient.
+### Component 5: Lowering Changes
+
+Add `streaming_preaggregation_mode` field to `AggregateNode`:
+
+```rust
+pub struct AggregateNode {
+    // ... existing fields ...
+    pub streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
+}
+
+pub enum StreamingPreaggregationMode {
+    Auto,
+    ForceStreaming,
+    ForcePreaggregation,
+    LimitedMem,
+}
+```
+
+Parse from `TAggregationNode.streaming_preaggregation_mode` (thrift field 7) in
+`lower_aggregate_node()`.
 
 ## Interaction with TopN Runtime Filter
 
@@ -127,10 +237,12 @@ The TopN RF publishing code already exists in the current `AggregateProcessorOpe
 
 When the operator is split into Streaming Sink/Source:
 - The **Sink** retains `try_publish_topn_runtime_filter()` (called per-chunk in `push_chunk()`)
-- The **Source** does NOT publish (it only reads from buffer/hash table)
-- The pipeline split ensures Scan and AGG Sink are in different pipelines
-- Backpressure from the bounded buffer throttles Scan
-- Scan checks for new filters on each `pull_chunk()` → `execute_iter()` per morsel
+- The **Source** does NOT publish (it only reads from buffer)
+- The pipeline split ensures Scan and AGG Sink are in different pipelines **but within the same
+  pipeline group** — Scan is in Pipeline 1 upstream of the Sink
+- Backpressure: when buffer is full, `Sink.need_input() = false` → driver stops pulling from Scan
+  → Scan's driver yields → on next scheduling, Scan checks RuntimeFilterHub for new filters
+- This yield-and-check cycle is the mechanism that makes TopN RF effective
 
 ## Thrift Fields to Parse
 
@@ -154,11 +266,11 @@ enum TStreamingPreaggregationMode {
 
 | File | Change |
 |------|--------|
-| `src/exec/operators/aggregate/streaming_sink.rs` | **New**: AggregateStreamingSinkOperator |
-| `src/exec/operators/aggregate/streaming_source.rs` | **New**: AggregateStreamingSourceOperator |
-| `src/exec/operators/aggregate/shared_state.rs` | **New**: Shared aggregator state with bounded buffer |
+| `src/exec/operators/aggregate/streaming_state.rs` | **New**: AggregateStreamingState (shared buffer) |
+| `src/exec/operators/aggregate/streaming_sink.rs` | **New**: AggregateStreamingSinkOperator + Factory |
+| `src/exec/operators/aggregate/streaming_source.rs` | **New**: AggregateStreamingSourceOperator + Factory |
 | `src/exec/operators/aggregate/mod.rs` | Re-export new types, keep existing ProcessorOperator for blocking |
-| `src/exec/node/aggregate.rs` | Add `streaming_mode` field to AggregateNode |
+| `src/exec/node/aggregate.rs` | Add `streaming_preaggregation_mode` field and enum |
 | `src/lower/node/aggregate.rs` | Parse `streaming_preaggregation_mode` from thrift |
 | `src/exec/pipeline/builder.rs` | Create two-pipeline structure for streaming AGG |
 
@@ -166,8 +278,10 @@ enum TStreamingPreaggregationMode {
 
 - AUTO mode (dynamic streaming/preaggregation switching)
 - LIMITED_MEM mode
+- FORCE_STREAMING mode (pass-through without aggregation)
 - SortedAggregateStreaming variant
 - Spillable aggregation variants
 - AGG In-Filter (separate from TopN RF, already partially exists)
 - Multi-column TopN filters
 - Remote filter publishing
+- Source directly iterating hash table (all output goes through buffer)
