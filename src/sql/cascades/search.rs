@@ -15,6 +15,15 @@ use super::stats::derive_statistics;
 use crate::sql::statistics::TableStatistics;
 
 // ---------------------------------------------------------------------------
+// Broadcast row-count threshold
+// ---------------------------------------------------------------------------
+
+/// Hard limit: if the build side (right child) of a broadcast hash join
+/// exceeds this many rows, skip the broadcast alternative entirely.
+/// Aligned with StarRocks `SessionVariable.DEFAULT_BROADCAST_ROW_COUNT_LIMIT`.
+const BROADCAST_ROW_COUNT_LIMIT: f64 = 500_000.0;
+
+// ---------------------------------------------------------------------------
 // Winner + Enforcer types
 // ---------------------------------------------------------------------------
 
@@ -98,6 +107,25 @@ impl SearchContext {
             // We must re-borrow the group each iteration because
             // optimize_group may be called recursively (but Memo is &-shared).
             let expr = &memo.groups[group_id].physical_exprs[expr_idx];
+
+            // --- Broadcast row-count threshold ---
+            // If this is a broadcast hash join, check whether the build side
+            // (right child) exceeds the hard row-count limit.  If so, skip
+            // this alternative entirely to avoid broadcasting large tables.
+            if let Operator::PhysicalHashJoin(ref j) = expr.op
+                && matches!(j.distribution, JoinDistribution::Broadcast)
+                && expr.children.get(1).is_some_and(|&build_group_id| {
+                    let build_stats = stats_for_group(
+                        &memo.groups[build_group_id],
+                        memo,
+                        &self.table_stats,
+                    );
+                    build_stats.output_row_count > BROADCAST_ROW_COUNT_LIMIT
+                })
+            {
+                continue;
+            }
+
             let provided = output_properties(&expr.op);
 
             if provided.satisfies(required) {

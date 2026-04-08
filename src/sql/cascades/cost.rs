@@ -11,6 +11,17 @@ use crate::sql::statistics::Statistics;
 /// Network transfer multiplier applied to data that crosses node boundaries.
 const NETWORK_COST: f64 = 1.5;
 
+/// Penalty multiplier for cross joins (matches StarRocks `CROSS_JOIN_COST_PENALTY`).
+const CROSS_JOIN_COST_PENALTY: f64 = 10.0;
+
+/// Penalty multiplier for non-equi hash joins (has `other_condition`).
+/// Matches StarRocks `HashJoinNode.EXECUTE_COST_PENALTY = 100`.
+const NON_EQUI_JOIN_COST_PENALTY: f64 = 100.0;
+
+/// Penalty multiplier for nest-loop join execution cost.
+/// NLJ is O(N*M) and should be heavily penalized relative to hash join.
+const NEST_LOOP_COST_PENALTY: f64 = 100.0;
+
 /// Estimate the self-cost of a single operator.
 ///
 /// `own_stats`   — output statistics of the operator itself.
@@ -59,10 +70,26 @@ pub(crate) fn compute_cost(
             let probe_size = child_stats.first().map(|s| s.compute_size()).unwrap_or(0.0);
             let build_size = child_stats.get(1).map(|s| s.compute_size()).unwrap_or(0.0);
 
-            match j.distribution {
+            let base_cost = match j.distribution {
                 JoinDistribution::Shuffle => (build_size + probe_size) * NETWORK_COST + probe_size,
                 JoinDistribution::Broadcast => build_size * NETWORK_COST + probe_size,
                 JoinDistribution::Colocate => probe_size,
+            };
+
+            // Apply cross join penalty (StarRocks: getCrossJoinCostPenalty = 10).
+            let cost_after_cross = if j.join_type == crate::sql::ir::JoinKind::Cross {
+                base_cost * CROSS_JOIN_COST_PENALTY
+            } else {
+                base_cost
+            };
+
+            // Apply non-equi join penalty: if the join has a residual
+            // other_condition, hash probing is less efficient (StarRocks:
+            // EXECUTE_COST_PENALTY = 100).
+            if j.other_condition.is_some() {
+                cost_after_cross * NON_EQUI_JOIN_COST_PENALTY
+            } else {
+                cost_after_cross
             }
         }
 
@@ -76,7 +103,7 @@ pub(crate) fn compute_cost(
                 .map(|s| s.output_row_count)
                 .unwrap_or(0.0);
             let avg_row_size = own_stats.avg_row_size();
-            left_rows * right_rows * avg_row_size
+            left_rows * right_rows * avg_row_size * NEST_LOOP_COST_PENALTY
         }
 
         Operator::PhysicalHashAggregate(a) => {
