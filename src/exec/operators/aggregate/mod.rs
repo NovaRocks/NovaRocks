@@ -28,6 +28,7 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 pub(crate) mod streaming_sink;
+pub(crate) mod streaming_source;
 pub(crate) mod streaming_state;
 
 use std::sync::Arc;
