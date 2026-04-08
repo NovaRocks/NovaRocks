@@ -31,7 +31,7 @@
 use std::sync::Arc;
 
 use crate::exec::expr::ExprArena;
-use crate::exec::node::aggregate::AggregateNode;
+use crate::exec::node::aggregate::{AggregateNode, StreamingPreaggregationMode};
 use crate::exec::node::analytic::AnalyticNode;
 use crate::exec::node::assert::AssertNumRowsNode;
 use crate::exec::node::filter::FilterNode;
@@ -59,7 +59,8 @@ use crate::exec::operators::AssertNumRowsProcessorFactory;
 use crate::exec::operators::analytic_shared::AnalyticSharedState;
 use crate::exec::operators::local_exchanger::{LocalExchangePartitionSpec, LocalExchanger};
 use crate::exec::operators::{
-    AggregateProcessorFactory, AnalyticSinkFactory, AnalyticSourceFactory,
+    AggregateProcessorFactory, AggregateStreamingSinkFactory, AggregateStreamingSourceFactory,
+    AggregateStreamingState, AnalyticSinkFactory, AnalyticSourceFactory,
     BroadcastJoinProbeProcessorFactory, ExceptSinkFactory, ExceptSourceFactory,
     ExchangeSourceFactory, FetchProcessorFactory, FilterProcessorFactory, HashJoinBuildSinkFactory,
     IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
@@ -661,6 +662,43 @@ fn build_pipeline_for_node(
 
             let dop = build.pipeline.dop.max(1);
             let all_update = functions.iter().all(|f| !f.input_is_intermediate);
+
+            // Streaming pre-aggregation: split into Sink (Pipeline 1) and Source (Pipeline 2).
+            if let Some(StreamingPreaggregationMode::ForcePreaggregation) =
+                streaming_preaggregation_mode
+            {
+                let streaming_state = AggregateStreamingState::new();
+                let sink_factory = Box::new(AggregateStreamingSinkFactory::new(
+                    *node_id,
+                    Arc::clone(&ctx.arena),
+                    group_by.clone(),
+                    functions.clone(),
+                    true, // output_intermediate: streaming pre-agg always outputs intermediate
+                    output_chunk_schema.clone(),
+                    topn_rf_specs.clone(),
+                    Some(Arc::clone(&ctx.runtime_filter_hub)),
+                    streaming_state.clone(),
+                ));
+                build.pipeline.factories.push(sink_factory);
+                build.pipeline.needs_sink = false;
+
+                let source_factory = Box::new(AggregateStreamingSourceFactory::new(
+                    *node_id,
+                    streaming_state,
+                ));
+                let source_dop = build.pipeline.dop;
+                let downstream =
+                    new_source_pipeline_with_dop(ctx, source_factory, source_dop);
+
+                let mut extra_pipelines = build.extra_pipelines;
+                extra_pipelines.push(build.pipeline);
+
+                return Ok(PipelineBuildResult {
+                    pipeline: downstream,
+                    extra_pipelines,
+                    stream: StreamDesc::any(source_dop),
+                });
+            }
 
             if !*need_finalize && !group_by.is_empty() && dop > 1 {
                 // StarRocks pipeline semantics: when an aggregate runs with pipeline DOP > 1, all
