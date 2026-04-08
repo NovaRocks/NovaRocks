@@ -38,7 +38,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 
 use crate::common::largeint;
-use crate::common::min_max_predicate::MinMaxPredicateValue;
+use crate::common::min_max_predicate::{MinMaxPredicate, MinMaxPredicateValue};
 use crate::types::TPrimitiveType;
 
 use super::codec::{read_i8, read_i16_le, read_i32_le, read_i64_le, read_u8, read_u64_le};
@@ -339,6 +339,36 @@ impl RuntimeMinMaxFilter {
             return Self::empty_range(ltype);
         };
         Ok(Self::new(ltype, true, min, max))
+    }
+
+    /// Convenience wrapper that builds a `RuntimeMinMaxFilter` from a single array.
+    ///
+    /// Used by the AGG operator to construct a TopN filter from a group-by key column.
+    pub(crate) fn from_array(ltype: TPrimitiveType, array: &ArrayRef) -> Result<Self, String> {
+        Self::from_arrays(ltype, std::slice::from_ref(array))
+    }
+
+    /// Converts this filter to a pair of storage-layer `MinMaxPredicate` values.
+    ///
+    /// Returns `[Ge(min), Le(max)]` so the scan operator can push the range down to storage.
+    /// Returns an empty `Vec` when `has_min_max` is false (no rows were observed).
+    pub(crate) fn to_min_max_predicates(
+        &self,
+        column_name: &str,
+    ) -> Result<Vec<MinMaxPredicate>, String> {
+        let Some((min_val, max_val)) = self.min_max_predicate_values()? else {
+            return Ok(vec![]);
+        };
+        Ok(vec![
+            MinMaxPredicate::Ge {
+                column: column_name.to_string(),
+                value: min_val,
+            },
+            MinMaxPredicate::Le {
+                column: column_name.to_string(),
+                value: max_val,
+            },
+        ])
     }
 
     pub(crate) fn merge_from(&mut self, other: &RuntimeMinMaxFilter) -> Result<(), String> {
