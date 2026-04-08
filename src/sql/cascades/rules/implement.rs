@@ -3,10 +3,37 @@
 //! Each struct implements the `Rule` trait. The `apply` method constructs the
 //! physical variant of the matched logical operator, preserving child GroupIds.
 
-use crate::sql::cascades::memo::{MExpr, Memo};
+use std::collections::HashSet;
+
+use arrow::datatypes::DataType;
+
+use crate::sql::cascades::memo::{GroupId, MExpr, Memo};
 use crate::sql::cascades::operator::*;
 use crate::sql::cascades::rule::{NewExpr, Rule, RuleType};
 use crate::sql::ir::{BinOp, ExprKind, JoinKind, TypedExpr};
+
+/// Get lowercase column names from a memo group's output columns.
+fn get_group_column_names(memo: &Memo, group_id: GroupId) -> HashSet<String> {
+    memo.groups
+        .get(group_id)
+        .and_then(|g| g.logical_props.as_ref())
+        .map(|props| {
+            props
+                .output_columns
+                .iter()
+                .map(|c| c.name.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract column name from a TypedExpr (if it's a ColumnRef).
+fn extract_column_name(expr: &TypedExpr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helper: extract equality conditions from a join predicate
@@ -75,7 +102,16 @@ fn collect_conjuncts(
             op: BinOp::Eq,
             right,
         } => {
-            eq_pairs.push((*left.clone(), *right.clone()));
+            // Only treat as equi-join key if BOTH sides are column refs.
+            // Expressions like `d_year = 2002` (column = constant) are filters,
+            // not equi-join keys.
+            let left_is_col = matches!(left.kind, ExprKind::ColumnRef { .. });
+            let right_is_col = matches!(right.kind, ExprKind::ColumnRef { .. });
+            if left_is_col && right_is_col {
+                eq_pairs.push((*left.clone(), *right.clone()));
+            } else {
+                others.push(expr.clone());
+            }
         }
         _ => {
             others.push(expr.clone());
@@ -342,11 +378,60 @@ impl Rule for JoinToHashJoin {
     fn matches(&self, op: &Operator) -> bool {
         matches!(op, Operator::LogicalJoin(_))
     }
-    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         let Operator::LogicalJoin(op) = &expr.op else {
             return vec![];
         };
-        let (eq_conds, other) = extract_eq_conditions(&op.condition, &op.join_type);
+        let (mut eq_conds, mut other) = extract_eq_conditions(&op.condition, &op.join_type);
+
+        // Filter eq_conditions: only keep pairs where one column is from the
+        // left child and the other from the right child.  This prevents inner
+        // predicates (e.g., ss_sold_date_sk = d_date_sk within a SEMI JOIN's
+        // right side) from being treated as equi-join keys.
+        if expr.children.len() == 2 {
+            let left_cols = get_group_column_names(memo, expr.children[0]);
+            let right_cols = get_group_column_names(memo, expr.children[1]);
+            let mut real_eq = Vec::new();
+            for (l, r) in eq_conds.drain(..) {
+                let l_name = extract_column_name(&l);
+                let r_name = extract_column_name(&r);
+                let is_cross_side = match (&l_name, &r_name) {
+                    (Some(ln), Some(rn)) => {
+                        (left_cols.contains(ln) && right_cols.contains(rn))
+                            || (left_cols.contains(rn) && right_cols.contains(ln))
+                    }
+                    _ => true, // can't determine, keep as eq
+                };
+                if is_cross_side {
+                    real_eq.push((l, r));
+                } else {
+                    // Demote to other_condition
+                    let demoted = TypedExpr {
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(l),
+                            op: BinOp::Eq,
+                            right: Box::new(r),
+                        },
+                    };
+                    other = Some(match other {
+                        Some(existing) => TypedExpr {
+                            data_type: DataType::Boolean,
+                            nullable: false,
+                            kind: ExprKind::BinaryOp {
+                                left: Box::new(existing),
+                                op: BinOp::And,
+                                right: Box::new(demoted),
+                            },
+                        },
+                        None => demoted,
+                    });
+                }
+            }
+            eq_conds = real_eq;
+        }
+
         if eq_conds.is_empty() {
             // No equality conditions — JoinToNestLoop should handle this.
             return vec![];

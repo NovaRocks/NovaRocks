@@ -35,7 +35,14 @@ impl Rule for JoinCommutativity {
     }
 
     fn matches(&self, op: &Operator) -> bool {
-        matches!(op, Operator::LogicalJoin(_))
+        // Only commute joins where both directions are well-supported by
+        // the execution engine.  SEMI/ANTI joins use LEFT variants only;
+        // flipping to RIGHT SEMI/ANTI causes tuple/slot mismatches in the
+        // fragment builder because the output schema assumptions differ.
+        matches!(op, Operator::LogicalJoin(j)
+            if matches!(j.join_type,
+                JoinKind::Inner | JoinKind::Cross | JoinKind::FullOuter
+                | JoinKind::LeftOuter | JoinKind::RightOuter))
     }
 
     fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
