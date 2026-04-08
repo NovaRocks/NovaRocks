@@ -103,64 +103,59 @@ impl<'a> AnalyzerContext<'a> {
             vec![]
         };
 
-        let (sub_rel, join_condition) = if corr_preds.is_empty() {
-            // No correlation predicates found.
-            // Destructure subquery: use FROM as right side, full WHERE as join condition.
+        let (sub_rel, join_condition) = {
+            // Destructure subquery: use FROM as right side, full WHERE as
+            // join condition (including both correlation and inner predicates).
+            // The optimizer's join reorder and cost model will handle turning
+            // inner predicates into proper hash joins.
             let (sub_from, sub_filter) = match resolved.body {
                 QueryBody::Select(sel) => (sel.from, sel.filter),
                 _ => return Err("EXISTS subquery must be a SELECT".into()),
             };
+
             let sub_rel = sub_from.ok_or("EXISTS subquery must have a FROM clause")?;
-            (sub_rel, sub_filter)
-        } else {
-            // Build join condition from ONLY the correlation predicates.
-            let mut cond = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(corr_preds[0].outer_col.clone()),
-                    op: corr_preds[0].op,
-                    right: Box::new(corr_preds[0].inner_col.clone()),
-                },
-            };
-            for pred in &corr_preds[1..] {
-                cond = TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::BinaryOp {
-                        left: Box::new(cond),
-                        op: BinOp::And,
-                        right: Box::new(TypedExpr {
+
+            // Build join condition: correlation predicates + remaining filter.
+            // For correlated EXISTS, extract correlation preds as equi-join keys
+            // and keep remaining predicates as other conditions.
+            let join_cond = if corr_preds.is_empty() {
+                sub_filter
+            } else {
+                // Build combined condition: correlation + non-correlation predicates
+                let corr_cond = {
+                    let mut c = corr_preds[0].full_expr.clone();
+                    for pred in &corr_preds[1..] {
+                        c = TypedExpr {
                             data_type: DataType::Boolean,
                             nullable: false,
                             kind: ExprKind::BinaryOp {
-                                left: Box::new(pred.outer_col.clone()),
-                                op: pred.op,
-                                right: Box::new(pred.inner_col.clone()),
+                                left: Box::new(c),
+                                op: BinOp::And,
+                                right: Box::new(pred.full_expr.clone()),
                             },
-                        }),
-                    },
+                        };
+                    }
+                    c
                 };
-            }
-
-            // Remove correlation predicates from the subquery's WHERE clause,
-            // keeping non-correlation predicates (inner join conditions, filters)
-            // inside the subquery.
-            if let QueryBody::Select(ref mut sel) = resolved.body {
-                if let Some(ref filter) = sel.filter {
-                    sel.filter = remove_correlation_preds_from_expr(filter, &corr_preds);
+                // Remaining non-correlation predicates
+                let remaining = sub_filter.as_ref().and_then(|f| {
+                    remove_correlation_preds_from_expr(f, &corr_preds)
+                });
+                match remaining {
+                    Some(rem) => Some(TypedExpr {
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(corr_cond),
+                            op: BinOp::And,
+                            right: Box::new(rem),
+                        },
+                    }),
+                    None => Some(corr_cond),
                 }
-            }
-
-            // Use the full subquery (with remaining internal WHERE) as the right
-            // side. This preserves inner joins like `store_sales JOIN date_dim`.
-            let sq_alias = format!("__exists_{}", sq_info.id);
-            let sub_rel = Relation::Subquery {
-                query: Box::new(resolved),
-                alias: sq_alias,
             };
 
-            (sub_rel, Some(cond))
+            (sub_rel, join_cond)
         };
 
         let current_from = select
