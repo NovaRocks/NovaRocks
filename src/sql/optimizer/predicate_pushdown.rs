@@ -225,7 +225,17 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                             .iter()
                             .all(|c| left_cols.contains(c) && right_cols.contains(c))
                     };
-                    if is_self_join_overlap {
+                    if is_self_join_overlap && q_in_left && q_in_right
+                        && !is_left_join_variant
+                        && matches!(join.join_type, JoinKind::Cross | JoinKind::Inner)
+                    {
+                        // Shared column names but qualified refs confirm both sides
+                        // are referenced (e.g., CTE.d_week_seq = date_dim.d_week_seq).
+                        // Only push for CROSS/INNER joins to enable CROSS → INNER
+                        // upgrade. Do NOT push for SEMI/ANTI/OUTER which have
+                        // different scope semantics.
+                        join_preds.push(conj);
+                    } else if is_self_join_overlap {
                         remaining.push(conj);
                     } else if is_left_join_variant
                         && refs.iter().all(|c| left_cols.contains(&c.to_lowercase()))

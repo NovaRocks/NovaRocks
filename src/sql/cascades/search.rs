@@ -368,25 +368,34 @@ pub(super) fn required_input_properties(
             vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
         }
 
-        // Shuffle join: [Hash(left_eq_keys), Hash(right_eq_keys)]
+        // Shuffle join: both children hash-partitioned on eq keys.
+        // Provide ALL eq column refs to each side — the fragment builder
+        // resolves only those that exist in each child's scope. This
+        // handles join reorder swapping the eq condition pair order.
         Operator::PhysicalHashJoin(j) => match j.distribution {
             JoinDistribution::Shuffle => {
-                let left_cols = eq_keys_to_column_refs(&j.eq_conditions, Side::Left);
-                let right_cols = eq_keys_to_column_refs(&j.eq_conditions, Side::Right);
+                let all_cols: Vec<ColumnRef> = j.eq_conditions.iter()
+                    .flat_map(|(l, r)| {
+                        let mut v = Vec::new();
+                        if let Some(c) = typed_expr_to_column_ref(l) { v.push(c); }
+                        if let Some(c) = typed_expr_to_column_ref(r) { v.push(c); }
+                        v
+                    })
+                    .collect();
                 vec![
                     PhysicalPropertySet {
-                        distribution: if left_cols.is_empty() {
+                        distribution: if all_cols.is_empty() {
                             DistributionSpec::Any
                         } else {
-                            DistributionSpec::HashPartitioned(left_cols)
+                            DistributionSpec::HashPartitioned(all_cols.clone())
                         },
                         ordering: OrderingSpec::Any,
                     },
                     PhysicalPropertySet {
-                        distribution: if right_cols.is_empty() {
+                        distribution: if all_cols.is_empty() {
                             DistributionSpec::Any
                         } else {
-                            DistributionSpec::HashPartitioned(right_cols)
+                            DistributionSpec::HashPartitioned(all_cols)
                         },
                         ordering: OrderingSpec::Any,
                     },

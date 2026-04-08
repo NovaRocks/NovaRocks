@@ -1678,16 +1678,32 @@ impl<'a> PlanFragmentBuilder<'a> {
                 Ok(unpartitioned_stream_partition())
             }
             crate::sql::cascades::property::DistributionSpec::HashPartitioned(cols) => {
-                let mut partition_exprs = Vec::with_capacity(cols.len());
-                for col in cols {
-                    let binding = child_scope
-                        .resolve_column(col.qualifier.as_deref(), &col.column)?
-                        .clone();
-                    let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
-                    partition_exprs.push(expr_compiler::build_slot_ref_texpr(
-                        binding.slot_id,
-                        binding.tuple_id,
-                        type_desc,
+                // For shuffle joins, cols contains ALL eq key columns from both
+                // sides. Pick the ones that resolve in this child's scope.
+                let mut partition_exprs = Vec::new();
+                let mut used = std::collections::HashSet::new();
+                for col in cols.iter() {
+                    if used.contains(&col.column.to_lowercase()) {
+                        continue; // skip duplicate column names
+                    }
+                    if let Ok(binding) =
+                        child_scope.resolve_column(col.qualifier.as_deref(), &col.column)
+                    {
+                        let binding = binding.clone();
+                        let type_desc =
+                            type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+                        partition_exprs.push(expr_compiler::build_slot_ref_texpr(
+                            binding.slot_id,
+                            binding.tuple_id,
+                            type_desc,
+                        ));
+                        used.insert(col.column.to_lowercase());
+                    }
+                }
+                if partition_exprs.is_empty() {
+                    return Err(format!(
+                        "no hash partition columns resolved in child scope from {:?}",
+                        cols.iter().map(|c| &c.column).collect::<Vec<_>>()
                     ));
                 }
                 Ok(partitions::TDataPartition::new(
