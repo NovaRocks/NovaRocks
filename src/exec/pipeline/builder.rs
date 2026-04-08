@@ -653,7 +653,7 @@ fn build_pipeline_for_node(
             need_finalize,
             input_is_intermediate: _input_is_intermediate,
             output_chunk_schema,
-            ..
+            topn_rf_specs,
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
             let output_slots = output_chunk_schema.slot_ids();
@@ -698,6 +698,8 @@ fn build_pipeline_for_node(
                         true,
                         false,
                         output_chunk_schema.clone(),
+                        Vec::new(),
+                        None,
                     )));
 
                 if output_slots.len() < group_by.len() {
@@ -732,6 +734,8 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        topn_rf_specs.clone(),
+                        Some(Arc::clone(&ctx.runtime_filter_hub)),
                     )));
                 return Ok(build);
             }
@@ -749,6 +753,8 @@ fn build_pipeline_for_node(
                     true,
                     false,
                     output_chunk_schema.clone(),
+                    Vec::new(),
+                    None,
                 ));
                 build.pipeline.factories.push(local_factory);
 
@@ -790,6 +796,8 @@ fn build_pipeline_for_node(
                         false,
                         true,
                         output_chunk_schema.clone(),
+                        topn_rf_specs.clone(),
+                        Some(Arc::clone(&ctx.runtime_filter_hub)),
                     )));
 
                 let mut extra_pipelines = build.extra_pipelines;
@@ -810,6 +818,8 @@ fn build_pipeline_for_node(
                 !*need_finalize,
                 false,
                 output_chunk_schema.clone(),
+                topn_rf_specs.clone(),
+                Some(Arc::clone(&ctx.runtime_filter_hub)),
             ));
 
             if *need_finalize && dop > 1 {
