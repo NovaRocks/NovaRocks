@@ -340,17 +340,32 @@ fn push_semi_condition_into_children(join: JoinNode) -> LogicalPlan {
 
     let conjuncts = split_and(condition.clone());
     let right_cols = collect_output_columns(&join.right);
+    let left_cols = collect_output_columns(&join.left);
+    let right_qcols = collect_qualified_output_columns(&join.right);
 
     let mut keep_in_condition = Vec::new();
     let mut push_to_right = Vec::new();
 
     for conj in conjuncts {
         let refs = collect_column_refs(&conj);
-        let all_in_right = refs.iter().all(|c| right_cols.contains(&c.to_lowercase()));
-        let any_in_right = refs.iter().any(|c| right_cols.contains(&c.to_lowercase()));
+        let qrefs = collect_qualified_column_refs(&conj);
 
-        if !refs.is_empty() && all_in_right {
-            // Only references right side — push down
+        // Use qualified refs when available to handle self-joins
+        // (e.g., catalog_sales cs1, catalog_sales cs2 — same bare names).
+        let is_right_only = if !qrefs.is_empty() {
+            // All qualified refs must be in right's qualified columns
+            qrefs.iter().all(|r| right_qcols.contains(r))
+        } else if !refs.is_empty() {
+            // Fallback: all bare refs in right but NOT all in left
+            // (avoids pushing cross-side predicates for self-joins)
+            let all_in_right = refs.iter().all(|c| right_cols.contains(&c.to_lowercase()));
+            let any_in_left = refs.iter().any(|c| left_cols.contains(&c.to_lowercase()));
+            all_in_right && !any_in_left
+        } else {
+            false
+        };
+
+        if is_right_only {
             push_to_right.push(conj);
         } else {
             keep_in_condition.push(conj);

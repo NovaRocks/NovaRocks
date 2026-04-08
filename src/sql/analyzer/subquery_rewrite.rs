@@ -124,11 +124,27 @@ impl<'a> AnalyzerContext<'a> {
                 // Build combined condition: correlation + non-correlation predicates.
                 // Use unqualified column refs so the physical layer can resolve
                 // them against either join side without requiring specific aliases.
-                let unqualify_expr = |expr: &TypedExpr| -> TypedExpr {
+                // For correlation conditions, unqualify column refs to help
+                // the physical layer resolve them. BUT for self-joins (same
+                // bare column name on both sides), keep qualifiers to avoid
+                // producing tautologies like `col = col`.
+                let maybe_unqualify = |expr: &TypedExpr| -> TypedExpr {
                     match &expr.kind {
                         ExprKind::BinaryOp { left, op, right } => {
+                            let l_name = match &left.kind {
+                                ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+                                _ => None,
+                            };
+                            let r_name = match &right.kind {
+                                ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
+                                _ => None,
+                            };
+                            let same_bare_name = l_name.is_some() && l_name == r_name;
+
                             let unq = |col: &TypedExpr| -> TypedExpr {
-                                if let ExprKind::ColumnRef { column, .. } = &col.kind {
+                                if same_bare_name {
+                                    col.clone() // Keep qualifier for self-join
+                                } else if let ExprKind::ColumnRef { column, .. } = &col.kind {
                                     TypedExpr {
                                         kind: ExprKind::ColumnRef {
                                             qualifier: None,
@@ -155,7 +171,7 @@ impl<'a> AnalyzerContext<'a> {
                     }
                 };
                 let corr_cond = {
-                    let mut c = unqualify_expr(&corr_preds[0].full_expr);
+                    let mut c = maybe_unqualify(&corr_preds[0].full_expr);
                     for pred in &corr_preds[1..] {
                         c = TypedExpr {
                             data_type: DataType::Boolean,
@@ -163,7 +179,7 @@ impl<'a> AnalyzerContext<'a> {
                             kind: ExprKind::BinaryOp {
                                 left: Box::new(c),
                                 op: BinOp::And,
-                                right: Box::new(unqualify_expr(&pred.full_expr)),
+                                right: Box::new(maybe_unqualify(&pred.full_expr)),
                             },
                         };
                     }
@@ -350,6 +366,46 @@ impl<'a> AnalyzerContext<'a> {
             } else {
                 JoinKind::LeftSemi
             };
+
+            // For NOT IN (negated=true), add IS NOT NULL filter on the
+            // subquery output column. In standard SQL, NOT IN returns
+            // UNKNOWN when any subquery value is NULL, effectively
+            // filtering out all rows. By excluding NULLs from the
+            // subquery result, LEFT ANTI JOIN produces correct NOT IN
+            // semantics (matching StarRocks FE's null-aware anti join).
+            let mut resolved_sub = resolved_sub;
+            if negated {
+                let not_null_pred = TypedExpr {
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    kind: ExprKind::IsNull {
+                        expr: Box::new(TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                qualifier: None,
+                                column: sub_output_col.name.clone(),
+                            },
+                            data_type: sub_output_col.data_type.clone(),
+                            nullable: sub_output_col.nullable,
+                        }),
+                        negated: true, // IS NOT NULL
+                    },
+                };
+                if let QueryBody::Select(ref mut sel) = resolved_sub.body {
+                    sel.filter = Some(match sel.filter.take() {
+                        Some(existing) => TypedExpr {
+                            data_type: DataType::Boolean,
+                            nullable: false,
+                            kind: ExprKind::BinaryOp {
+                                left: Box::new(existing),
+                                op: BinOp::And,
+                                right: Box::new(not_null_pred),
+                            },
+                        },
+                        None => not_null_pred,
+                    });
+                }
+            }
+
             let sub_rel = Relation::Subquery {
                 query: Box::new(resolved_sub),
                 alias: sq_alias.clone(),
