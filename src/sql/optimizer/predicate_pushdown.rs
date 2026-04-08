@@ -211,10 +211,21 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                 let all_in_left = qrefs.iter().all(|r| left_qcols.contains(r));
                 let all_in_right = qrefs.iter().all(|r| right_qcols.contains(r));
 
-                if all_in_left && !all_in_right {
+                // Guard against false "left-only" or "right-only" classification
+                // when unqualified refs are ambiguous (present in both sides).
+                // E.g., `d_week_seq = __sq_2.d_week_seq` has refs:
+                //   (None, "d_week_seq")  — in both left & right qcols
+                //   (Some("__sq_2"), "d_week_seq") — only in right qcols
+                // `all_in_right` would be true, but the unqualified ref is
+                // genuinely a left-side column. Treat as join predicate.
+                let any_ambiguous_in_both = qrefs.iter().any(|r| {
+                    left_qcols.contains(r) && right_qcols.contains(r)
+                });
+
+                if all_in_left && !all_in_right && !any_ambiguous_in_both {
                     // Qualified analysis shows left-only
                     left_preds.push(conj);
-                } else if all_in_right && !all_in_left {
+                } else if all_in_right && !all_in_left && !any_ambiguous_in_both {
                     // Qualified analysis shows right-only
                     match join.join_type {
                         JoinKind::Inner
