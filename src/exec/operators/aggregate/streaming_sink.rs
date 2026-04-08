@@ -14,98 +14,74 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Hash-aggregation processor for grouped and global aggregate execution.
+//! Streaming aggregate sink operator for Phase 1 pre-aggregation.
 //!
 //! Responsibilities:
-//! - Builds and updates group-key hash tables with aggregate kernels over streaming input chunks.
-//! - Finalizes in-memory aggregate states into output chunks while tracking memory consumption.
+//! - Owns the hash table and aggregate state for streaming pre-aggregation.
+//! - Follows the sink convention: `has_output() = false`, `pull_chunk() = None`.
+//! - On `set_finishing()`, materializes all groups and pushes result chunks into a shared
+//!   `AggregateStreamingState` buffer.
+//! - Publishes TopN runtime filters during `push_chunk()`.
 //!
 //! Key exported interfaces:
-//! - Types: `AggregateProcessorFactory`.
+//! - Types: `AggregateStreamingSinkFactory`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
-
-pub(crate) mod streaming_sink;
-pub(crate) mod streaming_state;
 
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
+use super::streaming_state::AggregateStreamingState;
+use super::{build_agg_views, ENABLE_GROUP_KEY_OPTIMIZATIONS};
 use crate::common::failpoint;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::hash_table::key_builder::{build_group_key_views, GroupKeyArrayView};
+use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
+use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, TopNRuntimeFilterSpec};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::runtime_filter::min_max::RuntimeMinMaxFilter;
-use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
-
-use crate::exec::hash_table::key_builder::{GroupKeyArrayView, build_group_key_views};
-use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
-use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
 use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::runtime_filter_hub::RuntimeFilterHub;
 use crate::runtime::runtime_state::RuntimeState;
 
-pub(super) const ENABLE_GROUP_KEY_OPTIMIZATIONS: bool = true;
-
-pub(super) fn build_agg_views<'a>(
-    kernels: &[agg::AggKernelEntry],
-    functions: &[AggFunction],
-    arrays: &'a [Option<ArrayRef>],
-) -> Result<Vec<agg::AggInputView<'a>>, String> {
-    if arrays.len() != kernels.len() || arrays.len() != functions.len() {
-        return Err("aggregate arrays length mismatch".to_string());
-    }
-    let mut views = Vec::with_capacity(kernels.len());
-    for idx in 0..kernels.len() {
-        let array = arrays
-            .get(idx)
-            .ok_or_else(|| "aggregate input missing".to_string())?;
-        let view = if functions[idx].input_is_intermediate {
-            kernels[idx].build_merge_view(array)?
-        } else {
-            kernels[idx].build_input_view(array)?
-        };
-        views.push(view);
-    }
-    Ok(views)
-}
-
-/// Factory that constructs aggregate processors backed by group-key hash tables and aggregate kernels.
-pub struct AggregateProcessorFactory {
+/// Factory that constructs streaming aggregate sink operators for Phase 1 pre-aggregation.
+pub struct AggregateStreamingSinkFactory {
     name: String,
     arena: Arc<ExprArena>,
     group_by: Vec<ExprId>,
     functions: Vec<AggFunction>,
     output_intermediate: bool,
-    direct_input: bool,
     output_chunk_schema: ChunkSchemaRef,
     topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
     runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+    streaming_state: AggregateStreamingState,
 }
 
-impl AggregateProcessorFactory {
+impl AggregateStreamingSinkFactory {
     pub fn new(
         node_id: i32,
         arena: Arc<ExprArena>,
         group_by: Vec<ExprId>,
         functions: Vec<AggFunction>,
         output_intermediate: bool,
-        direct_input: bool,
         output_chunk_schema: ChunkSchemaRef,
         topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
         runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
+        state: AggregateStreamingState,
     ) -> Self {
         let name = if node_id >= 0 {
-            format!("AGGREGATE (id={node_id})")
+            format!("AGGREGATE_STREAMING_SINK (id={node_id})")
         } else {
-            "AGGREGATE".to_string()
+            "AGGREGATE_STREAMING_SINK".to_string()
         };
         Self {
             name,
@@ -113,21 +89,21 @@ impl AggregateProcessorFactory {
             group_by,
             functions,
             output_intermediate,
-            direct_input,
             output_chunk_schema,
             topn_rf_specs,
             runtime_filter_hub,
+            streaming_state: state,
         }
     }
 }
 
-impl OperatorFactory for AggregateProcessorFactory {
+impl OperatorFactory for AggregateStreamingSinkFactory {
     fn name(&self) -> &str {
         &self.name
     }
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
-        Box::new(AggregateProcessorOperator {
+        Box::new(AggregateStreamingSinkOperator {
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             group_by: self.group_by.clone(),
@@ -138,27 +114,27 @@ impl OperatorFactory for AggregateProcessorFactory {
             state_ptrs: Vec::new(),
             kernels: None,
             output_intermediate: self.output_intermediate,
-            direct_input: self.direct_input,
             initialized: false,
             data_initialized: false,
-            pending_output: None,
             finishing: false,
-            finalized: false,
             finished: false,
             output_schema: None,
             output_chunk_schema: Arc::clone(&self.output_chunk_schema),
             observed_group_key_nullable: vec![false; self.group_by.len()],
-            profile_initialized: false,
-            profiles: None,
             key_table_mem_tracker: None,
             topn_rf_specs: self.topn_rf_specs.clone(),
             runtime_filter_hub: self.runtime_filter_hub.clone(),
             topn_rf_rows_since_publish: 0,
+            streaming_state: self.streaming_state.clone(),
         })
+    }
+
+    fn is_sink(&self) -> bool {
+        true
     }
 }
 
-struct AggregateProcessorOperator {
+struct AggregateStreamingSinkOperator {
     name: String,
     arena: Arc<ExprArena>,
     group_by: Vec<ExprId>,
@@ -169,25 +145,21 @@ struct AggregateProcessorOperator {
     state_ptrs: Vec<agg::AggStatePtr>,
     kernels: Option<agg::AggKernelSet>,
     output_intermediate: bool,
-    direct_input: bool,
     initialized: bool,
     data_initialized: bool,
-    pending_output: Option<Chunk>,
     finishing: bool,
-    finalized: bool,
     finished: bool,
     output_schema: Option<SchemaRef>,
     output_chunk_schema: ChunkSchemaRef,
     observed_group_key_nullable: Vec<bool>,
-    profile_initialized: bool,
-    profiles: Option<crate::runtime::profile::OperatorProfiles>,
     key_table_mem_tracker: Option<Arc<MemTracker>>,
     topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
     runtime_filter_hub: Option<Arc<RuntimeFilterHub>>,
     topn_rf_rows_since_publish: usize,
+    streaming_state: AggregateStreamingState,
 }
 
-impl Operator for AggregateProcessorOperator {
+impl Operator for AggregateStreamingSinkOperator {
     fn name(&self) -> &str {
         &self.name
     }
@@ -201,10 +173,6 @@ impl Operator for AggregateProcessorOperator {
             table.set_mem_tracker(Arc::clone(&key_table));
         }
         self.key_table_mem_tracker = Some(key_table);
-    }
-
-    fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
-        self.profiles = Some(profiles);
     }
 
     fn prepare(&mut self) -> Result<(), String> {
@@ -224,27 +192,7 @@ impl Operator for AggregateProcessorOperator {
     }
 }
 
-impl AggregateProcessorOperator {
-    fn init_profile_if_needed(&mut self) {
-        if self.profile_initialized {
-            return;
-        }
-        self.profile_initialized = true;
-        let grouping_keys = self.group_by.len();
-        let funcs = self
-            .functions
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if let Some(profile) = self.profiles.as_ref() {
-            profile
-                .common
-                .add_info_string("GroupingKeys", format!("{grouping_keys}"));
-            profile.common.add_info_string("AggregateFunctions", funcs);
-        }
-    }
-
+impl AggregateStreamingSinkOperator {
     fn rebuild_output_schema(&mut self, group_key_nullable: Option<&[bool]>) -> Result<(), String> {
         let kernels = self
             .kernels
@@ -303,14 +251,13 @@ impl AggregateProcessorOperator {
         self.topn_rf_rows_since_publish = 0;
     }
 
-    fn process(&mut self, chunk: Chunk) -> Result<Option<Chunk>, String> {
+    fn process(&mut self, chunk: Chunk) -> Result<(), String> {
         if self.finished {
-            return Ok(None);
+            return Ok(());
         }
-        self.init_profile_if_needed();
 
         if chunk.is_empty() && chunk.schema().fields().is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
         let group_arrays = self.eval_group_by_arrays(&chunk)?;
@@ -322,7 +269,7 @@ impl AggregateProcessorOperator {
             .map_err(|e| e.to_string())?;
 
         if chunk.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
 
         if !self.group_by.is_empty() {
@@ -338,13 +285,6 @@ impl AggregateProcessorOperator {
         }
 
         let num_rows = chunk.len();
-        if let Some(profile) = self.profiles.as_ref() {
-            profile.common.counter_add(
-                "InputRowCount",
-                crate::metrics::TUnit::UNIT,
-                num_rows as i64,
-            );
-        }
         if self.group_by.is_empty() {
             self.ensure_scalar_group().map_err(|e| e.to_string())?;
             let state_ptr = *self
@@ -375,7 +315,7 @@ impl AggregateProcessorOperator {
                         .map_err(|e| e.to_string())?;
                 }
             }
-            return Ok(None);
+            return Ok(());
         }
 
         let key_views = build_group_key_views(&group_arrays).map_err(|e| e.to_string())?;
@@ -556,12 +496,12 @@ impl AggregateProcessorOperator {
         self.key_table = Some(key_table);
         result?;
 
-        Ok(None)
+        Ok(())
     }
 
-    fn finish(&mut self) -> Result<Option<Chunk>, String> {
+    fn finish_to_chunks(&mut self) -> Result<Vec<Chunk>, String> {
         if self.finished {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         if !self.initialized {
@@ -599,7 +539,7 @@ impl AggregateProcessorOperator {
                     .clone()
                     .unwrap_or_else(|| Arc::new(Schema::new(Vec::<Field>::new())));
                 let batch = RecordBatch::new_empty(schema);
-                return Ok(Some(self.output_chunk_from_batch(batch)?));
+                return Ok(vec![self.output_chunk_from_batch(batch)?]);
             }
         }
 
@@ -639,106 +579,34 @@ impl AggregateProcessorOperator {
         }
         .map_err(|e| e.to_string())?;
         self.drop_group_states();
-        Ok(Some(self.output_chunk_from_batch(batch)?))
-    }
-}
-
-impl ProcessorOperator for AggregateProcessorOperator {
-    fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && self.pending_output.is_none()
+        Ok(vec![self.output_chunk_from_batch(batch)?])
     }
 
-    fn has_output(&self) -> bool {
-        self.pending_output.is_some()
-    }
-
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished {
+    fn init_from_plan(&mut self) -> Result<(), String> {
+        if self.initialized {
             return Ok(());
         }
-        if self.finishing {
-            return Err("aggregate received input after set_finishing".to_string());
+
+        let expected_group_types = self.expected_group_types()?;
+        let expected_agg_types = self.expected_agg_input_types()?;
+
+        if !expected_group_types.is_empty() {
+            self.key_table = Some(KeyTable::new(
+                expected_group_types.clone(),
+                ENABLE_GROUP_KEY_OPTIMIZATIONS,
+            )?);
         }
-        if self.pending_output.is_some() {
-            return Err("aggregate received input while output buffer is full".to_string());
+
+        let kernels = agg::build_kernel_set(&self.functions, &expected_agg_types)?;
+        self.kernels = Some(kernels);
+        if self.kernels.is_some() {
+            self.rebuild_output_schema(None)?;
         }
-        let num_rows = chunk.len();
-        let out = self.process(chunk)?;
-        if out.is_some() {
-            return Err("aggregate produced output before finishing".to_string());
-        }
-        self.topn_rf_rows_since_publish += num_rows;
-        self.try_publish_topn_runtime_filter();
+        self.initialized = true;
         Ok(())
-    }
-
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        let out = self.pending_output.take();
-        if self.finishing && self.finalized && self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(out)
-    }
-
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        if self.finished {
-            return Ok(());
-        }
-        self.finishing = true;
-        if self.finalized {
-            return Ok(());
-        }
-        if self.pending_output.is_some() {
-            return Ok(());
-        }
-        let out = self.finish()?;
-        if failpoint::should_trigger(failpoint::FORCE_RESET_AGGREGATOR_AFTER_STREAMING_SINK_FINISH)
-        {
-            self.reset_after_streaming_finish();
-        }
-        self.pending_output = out;
-        self.finalized = true;
-        if self.pending_output.is_none() {
-            self.finished = true;
-        }
-        Ok(())
-    }
-}
-
-impl AggregateProcessorOperator {
-    fn reset_after_streaming_finish(&mut self) {
-        self.drop_group_states();
-        self.state_ptrs.clear();
-        self.observed_group_key_nullable.clear();
-        self.key_table = None;
-        self.kernels = None;
-        self.output_schema = None;
     }
 
     fn eval_group_by_arrays(&self, chunk: &Chunk) -> Result<Vec<ArrayRef>, String> {
-        if self.direct_input {
-            if self.output_chunk_schema.slot_ids().len() < self.group_by.len() {
-                return Err(format!(
-                    "aggregate direct input missing group by slot ids: group_by={} output_slots={}",
-                    self.group_by.len(),
-                    self.output_chunk_schema.slot_ids().len()
-                ));
-            }
-            let mut arrays = Vec::with_capacity(self.group_by.len());
-            for slot_id in self
-                .output_chunk_schema
-                .slot_ids()
-                .iter()
-                .take(self.group_by.len())
-            {
-                arrays.push(
-                    chunk
-                        .column_by_slot_id(*slot_id)
-                        .map_err(|e| e.to_string())?,
-                );
-            }
-            return Ok(arrays);
-        }
         let mut arrays = Vec::with_capacity(self.group_by.len());
         for expr in &self.group_by {
             let array = self.arena.eval(*expr, chunk).map_err(|e| e.to_string())?;
@@ -748,37 +616,6 @@ impl AggregateProcessorOperator {
     }
 
     fn eval_agg_arrays(&self, chunk: &Chunk) -> Result<Vec<Option<ArrayRef>>, String> {
-        if self.direct_input {
-            let start = self.group_by.len();
-            if self.output_chunk_schema.slot_ids().len() < start + self.functions.len() {
-                return Err(format!(
-                    "aggregate direct input missing aggregate slot ids: group_by={} functions={} output_slots={}",
-                    self.group_by.len(),
-                    self.functions.len(),
-                    self.output_chunk_schema.slot_ids().len()
-                ));
-            }
-            let mut arrays = Vec::with_capacity(self.functions.len());
-            for idx in 0..self.functions.len() {
-                let slot_id = *self
-                    .output_chunk_schema
-                    .slot_ids()
-                    .get(start + idx)
-                    .ok_or_else(|| {
-                        format!(
-                            "aggregate direct input missing slot id at index {} (output_slots={})",
-                            start + idx,
-                            self.output_chunk_schema.slot_ids().len()
-                        )
-                    })?;
-                arrays.push(Some(
-                    chunk
-                        .column_by_slot_id(slot_id)
-                        .map_err(|e| e.to_string())?,
-                ));
-            }
-            return Ok(arrays);
-        }
         let mut arrays = Vec::with_capacity(self.functions.len());
         for func in &self.functions {
             let array = if func.inputs.is_empty() {
@@ -843,29 +680,6 @@ impl AggregateProcessorOperator {
         self.data_initialized = true;
         Ok(())
     }
-    fn init_from_plan(&mut self) -> Result<(), String> {
-        if self.initialized {
-            return Ok(());
-        }
-
-        let expected_group_types = self.expected_group_types()?;
-        let expected_agg_types = self.expected_agg_input_types()?;
-
-        if !expected_group_types.is_empty() {
-            self.key_table = Some(KeyTable::new(
-                expected_group_types.clone(),
-                ENABLE_GROUP_KEY_OPTIMIZATIONS,
-            )?);
-        }
-
-        let kernels = agg::build_kernel_set(&self.functions, &expected_agg_types)?;
-        self.kernels = Some(kernels);
-        if self.kernels.is_some() {
-            self.rebuild_output_schema(None)?;
-        }
-        self.initialized = true;
-        Ok(())
-    }
 
     fn refresh_output_schema_for_group_arrays(
         &mut self,
@@ -928,10 +742,10 @@ impl AggregateProcessorOperator {
                     slot_schema.with_field_and_slot_id(*slot_id, field.as_ref().clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            return Chunk::try_new_with_chunk_schema(
+            Chunk::try_new_with_chunk_schema(
                 batch,
                 Arc::new(ChunkSchema::try_new(slot_schemas)?),
-            );
+            )
         }
     }
 
@@ -955,13 +769,6 @@ impl AggregateProcessorOperator {
         let mut types = Vec::with_capacity(self.functions.len());
         for func in &self.functions {
             if func.input_is_intermediate {
-                // Merge aggregates consume *intermediate state* produced by a previous aggregation
-                // stage. In StarRocks plans, the input SlotRef for that intermediate column may
-                // still carry the *final output type* (e.g. avg(decimal) has ret_type DECIMAL but
-                // intermediate_type VARBINARY), so relying on the expression type can be wrong.
-                //
-                // Prefer FE-provided type signature (TFunction.aggregate_fn.intermediate_type)
-                // when available to build the correct merge view and kernel spec.
                 if let Some(sig) = func.types.as_ref() {
                     if let Some(intermediate) = sig.intermediate_type.as_ref() {
                         if matches!(intermediate, DataType::Null) {
@@ -1130,7 +937,49 @@ impl AggregateProcessorOperator {
     }
 }
 
-impl Drop for AggregateProcessorOperator {
+impl ProcessorOperator for AggregateStreamingSinkOperator {
+    fn need_input(&self) -> bool {
+        !self.finishing && !self.finished
+    }
+
+    fn has_output(&self) -> bool {
+        false
+    }
+
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        if self.finishing {
+            return Err("aggregate streaming sink received input after set_finishing".to_string());
+        }
+        let num_rows = chunk.len();
+        self.process(chunk)?;
+        self.topn_rf_rows_since_publish += num_rows;
+        self.try_publish_topn_runtime_filter();
+        Ok(())
+    }
+
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        Ok(None)
+    }
+
+    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finishing = true;
+        let chunks = self.finish_to_chunks()?;
+        for chunk in chunks {
+            self.streaming_state.offer_chunk(chunk);
+        }
+        self.streaming_state.mark_sink_finished();
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for AggregateStreamingSinkOperator {
     fn drop(&mut self) {
         self.drop_group_states();
     }

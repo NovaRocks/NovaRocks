@@ -57,6 +57,7 @@ mod values_source;
 pub use crate::connector::iceberg::IcebergTableSinkFactory;
 pub use crate::connector::starrocks::sink::OlapTableSinkFactory;
 pub use aggregate::AggregateProcessorFactory;
+pub use aggregate::streaming_sink::AggregateStreamingSinkFactory;
 pub use analytic_sink::AnalyticSinkFactory;
 pub use analytic_source::AnalyticSourceFactory;
 pub use assert_num_rows_processor::AssertNumRowsProcessorFactory;
