@@ -761,6 +761,7 @@ mod tests {
                     input_is_intermediate: false,
                     output_chunk_schema,
                     topn_rf_specs: Vec::new(),
+                    streaming_preaggregation_mode: None,
                 }),
             },
         };

@@ -220,6 +220,7 @@ pub(crate) fn lower_aggregate_node(
                 input_is_intermediate,
                 output_chunk_schema,
                 topn_rf_specs,
+                streaming_preaggregation_mode: None,
             }),
         },
         layout: out_layout.clone(),

@@ -56,6 +56,14 @@ pub struct TopNRuntimeFilterSpec {
     pub limit: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamingPreaggregationMode {
+    Auto,
+    ForceStreaming,
+    ForcePreaggregation,
+    LimitedMem,
+}
+
 #[derive(Clone, Debug)]
 pub struct AggregateNode {
     pub input: Box<ExecNode>,
@@ -68,4 +76,5 @@ pub struct AggregateNode {
     pub input_is_intermediate: bool,
     pub output_chunk_schema: ChunkSchemaRef,
     pub topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
+    pub streaming_preaggregation_mode: Option<StreamingPreaggregationMode>,
 }
