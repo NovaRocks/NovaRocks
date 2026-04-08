@@ -132,6 +132,7 @@ pub(crate) fn lower_aggregate_node(
                 need_finalize: agg.need_finalize,
                 input_is_intermediate,
                 output_chunk_schema,
+                topn_rf_specs: Vec::new(),
             }),
         },
         layout: out_layout.clone(),

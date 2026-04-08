@@ -653,6 +653,7 @@ fn build_pipeline_for_node(
             need_finalize,
             input_is_intermediate: _input_is_intermediate,
             output_chunk_schema,
+            ..
         }) => {
             let mut build = build_pipeline_for_node(input, ctx)?;
             let output_slots = output_chunk_schema.slot_ids();
@@ -1327,6 +1328,7 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
+                topn_rf_specs: Vec::new(),
             }),
         };
 
@@ -1348,6 +1350,7 @@ mod tests {
                 need_finalize: true,
                 input_is_intermediate: false,
                 output_chunk_schema: Arc::clone(&agg_output_chunk_schema),
+                topn_rf_specs: Vec::new(),
             }),
         };
 
@@ -1425,6 +1428,7 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: true,
                 output_chunk_schema: agg_output_chunk_schema,
+                topn_rf_specs: Vec::new(),
             }),
         };
 
@@ -1503,6 +1507,7 @@ mod tests {
                 need_finalize: false,
                 input_is_intermediate: false,
                 output_chunk_schema: agg_output_chunk_schema,
+                topn_rf_specs: Vec::new(),
             }),
         };
 

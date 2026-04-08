@@ -269,6 +269,7 @@ mod tests {
                         ])),
                         &[SlotId::new(1), SlotId::new(2)],
                     ),
+                    topn_rf_specs: Vec::new(),
                 }),
             },
         };
@@ -1378,6 +1379,7 @@ mod tests {
                         ])),
                         &[SlotId::new(3), SlotId::new(4)],
                     ),
+                    topn_rf_specs: Vec::new(),
                 }),
             },
         };

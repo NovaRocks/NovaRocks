@@ -17,6 +17,7 @@
 use crate::exec::chunk::ChunkSchemaRef;
 use crate::exec::expr::ExprId;
 use crate::exec::node::ExecNode;
+use crate::types::TPrimitiveType;
 use arrow::datatypes::DataType;
 
 #[derive(Clone, Debug)]
@@ -40,6 +41,21 @@ pub struct AggFunction {
     pub types: Option<AggTypeSignature>,
 }
 
+/// Spec for a TopN runtime filter built by the AGG operator.
+/// `expr_order` indexes into the group-by columns to select which column
+/// to compute min/max from. The FE bug hardcodes this to 0.
+#[derive(Clone, Debug)]
+pub struct TopNRuntimeFilterSpec {
+    pub filter_id: i32,
+    pub expr_order: usize,
+    /// The primitive type of the build expression (from FE).
+    pub build_type: TPrimitiveType,
+    /// The column name on the probe (scan) side that this filter targets.
+    pub probe_column_name: String,
+    /// TopN limit — filter is only published when group count >= limit.
+    pub limit: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct AggregateNode {
     pub input: Box<ExecNode>,
@@ -51,4 +67,5 @@ pub struct AggregateNode {
     /// Mixed merge/update aggregates are supported via per-function flags.
     pub input_is_intermediate: bool,
     pub output_chunk_schema: ChunkSchemaRef,
+    pub topn_rf_specs: Vec<TopNRuntimeFilterSpec>,
 }
