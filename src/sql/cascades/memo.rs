@@ -3,7 +3,10 @@
 //! The Memo stores equivalence classes (Groups) of expressions (MExprs).
 //! Each MExpr holds an Operator and references its children as GroupIds.
 
+use std::collections::HashMap;
+
 use super::operator::Operator;
+use crate::sql::cte::CteId;
 use crate::sql::ir::OutputColumn;
 
 // ---------------------------------------------------------------------------
@@ -21,11 +24,18 @@ pub(crate) type Cost = f64;
 #[derive(Clone, Debug)]
 pub(crate) struct Memo {
     pub(crate) groups: Vec<Group>,
+    /// Mapping from CTE id to the GroupId of the CTEProduce node.
+    /// Populated during plan-to-memo conversion so that CTEConsume
+    /// nodes can look up the produce group's row count.
+    pub(crate) cte_produce_groups: HashMap<CteId, GroupId>,
 }
 
 impl Memo {
     pub(crate) fn new() -> Self {
-        Self { groups: Vec::new() }
+        Self {
+            groups: Vec::new(),
+            cte_produce_groups: HashMap::new(),
+        }
     }
 
     /// Create a new group containing a single expression. Returns the new GroupId.

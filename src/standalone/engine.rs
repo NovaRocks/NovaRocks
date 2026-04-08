@@ -3685,7 +3685,12 @@ fn collect_scan_stats(
                 &s.table.storage
             {
                 if let Some(ts) = crate::sql::statistics::build_table_statistics(files) {
-                    out.insert(s.table.name.clone(), ts);
+                    // Insert by table name (canonical key).
+                    out.insert(s.table.name.clone(), ts.clone());
+                    // Also insert by alias so that aliased scans can find their stats.
+                    if let Some(ref alias) = s.alias {
+                        out.insert(alias.clone(), ts);
+                    }
                 }
             }
         }

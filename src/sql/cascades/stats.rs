@@ -46,12 +46,29 @@ pub(crate) fn derive_statistics(
                 column_statistics: HashMap::new(),
             }
         }
-        // TODO: derive CTEConsume stats from the corresponding CTEProduce group
-        // once we add a cte_id -> group_id mapping to Memo.
-        Operator::LogicalCTEConsume(_) => Statistics {
-            output_row_count: 1000.0,
-            column_statistics: HashMap::new(),
-        },
+        Operator::LogicalCTEConsume(cte) => {
+            // Look up the CTEProduce group's row count from the memo.
+            if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
+                if let Some(ref props) = memo.groups[produce_group_id].logical_props {
+                    Statistics {
+                        output_row_count: props.row_count,
+                        column_statistics: HashMap::new(),
+                    }
+                } else {
+                    // CTEProduce group not yet derived (should not happen in bottom-up order).
+                    Statistics {
+                        output_row_count: 10_000.0,
+                        column_statistics: HashMap::new(),
+                    }
+                }
+            } else {
+                // No mapping found; conservative fallback.
+                Statistics {
+                    output_row_count: 10_000.0,
+                    column_statistics: HashMap::new(),
+                }
+            }
+        }
         Operator::LogicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
         // -- Unary operators (single child) --
@@ -208,12 +225,13 @@ pub(crate) fn derive_statistics(
 
         // -- Physical operators: derive the same way as their logical counterparts --
         Operator::PhysicalScan(scan) => {
-            let key = scan
-                .alias
+            let alias_key = scan.alias.as_deref().map(|a| a.to_lowercase());
+            let table_key = scan.table.name.to_lowercase();
+            let ts_opt = alias_key
                 .as_deref()
-                .unwrap_or(&scan.table.name)
-                .to_lowercase();
-            if let Some(ts) = table_stats.get(&key) {
+                .and_then(|k| table_stats.get(k))
+                .or_else(|| table_stats.get(&table_key));
+            if let Some(ts) = ts_opt {
                 let row_count = ts.row_count.max(1) as f64;
                 let mut selectivity = 1.0;
                 for pred in &scan.predicates {
@@ -238,13 +256,14 @@ pub(crate) fn derive_statistics(
                     column_statistics,
                 }
             } else {
+                let default_rows = estimate_default_row_count(&scan.table.name);
                 let column_statistics: HashMap<String, ColumnStatistic> = scan
                     .columns
                     .iter()
                     .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
                     .collect();
                 Statistics {
-                    output_row_count: 10_000.0,
+                    output_row_count: default_rows,
                     column_statistics,
                 }
             }
@@ -444,11 +463,27 @@ pub(crate) fn derive_statistics(
 
         Operator::PhysicalCTEProduce(_) => child_statistics(memo, &expr.children, 0),
 
-        // TODO: derive from corresponding CTEProduce group (see logical arm above).
-        Operator::PhysicalCTEConsume(_) => Statistics {
-            output_row_count: 1000.0,
-            column_statistics: HashMap::new(),
-        },
+        Operator::PhysicalCTEConsume(cte) => {
+            // Look up the CTEProduce group's row count from the memo.
+            if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
+                if let Some(ref props) = memo.groups[produce_group_id].logical_props {
+                    Statistics {
+                        output_row_count: props.row_count,
+                        column_statistics: HashMap::new(),
+                    }
+                } else {
+                    Statistics {
+                        output_row_count: 10_000.0,
+                        column_statistics: HashMap::new(),
+                    }
+                }
+            } else {
+                Statistics {
+                    output_row_count: 10_000.0,
+                    column_statistics: HashMap::new(),
+                }
+            }
+        }
 
         Operator::PhysicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
@@ -602,13 +637,17 @@ fn derive_scan(
     scan: &super::operator::LogicalScanOp,
     table_stats: &HashMap<String, TableStatistics>,
 ) -> Statistics {
-    let key = scan
-        .alias
+    // Try alias first, then fall back to the canonical table name.
+    // `collect_scan_stats` inserts by table name, but the scan node
+    // may have an alias that differs from the table name.
+    let alias_key = scan.alias.as_deref().map(|a| a.to_lowercase());
+    let table_key = scan.table.name.to_lowercase();
+    let ts_opt = alias_key
         .as_deref()
-        .unwrap_or(&scan.table.name)
-        .to_lowercase();
+        .and_then(|k| table_stats.get(k))
+        .or_else(|| table_stats.get(&table_key));
 
-    if let Some(ts) = table_stats.get(&key) {
+    if let Some(ts) = ts_opt {
         let row_count = ts.row_count.max(1) as f64;
 
         // Apply scan-level predicate selectivity.
@@ -638,17 +677,104 @@ fn derive_scan(
             column_statistics,
         }
     } else {
-        // No table stats available: use defaults.
+        // No table stats available: use heuristic defaults based on table name.
+        let default_rows = estimate_default_row_count(&scan.table.name);
         let column_statistics: HashMap<String, ColumnStatistic> = scan
             .columns
             .iter()
             .map(|c| (c.name.to_lowercase(), ColumnStatistic::unknown()))
             .collect();
         Statistics {
-            output_row_count: 10_000.0,
+            output_row_count: default_rows,
             column_statistics,
         }
     }
+}
+
+/// Heuristic row count estimation for tables without real statistics.
+///
+/// Large fact tables (containing "sales", "returns", "inventory", etc.)
+/// get a larger default, while small dimension tables ("customer_demographics",
+/// "date_dim", "time_dim", etc.) get a smaller default. This prevents the
+/// optimizer from treating all unknown tables equally, which can lead to
+/// bad join ordering.
+fn estimate_default_row_count(table_name: &str) -> f64 {
+    let name = table_name.to_lowercase();
+
+    // Large fact tables: high row count default.
+    const FACT_TABLE_PATTERNS: &[&str] = &[
+        "store_sales",
+        "web_sales",
+        "catalog_sales",
+        "store_returns",
+        "web_returns",
+        "catalog_returns",
+        "inventory",
+        "lineitem",
+        "lineorder",
+        "orders",
+        "partsupp",
+    ];
+    for pattern in FACT_TABLE_PATTERNS {
+        if name == *pattern || name.ends_with(&format!(".{}", pattern)) {
+            return 1_000_000.0;
+        }
+    }
+
+    // Medium dimension tables: moderate row count default.
+    const MEDIUM_TABLE_PATTERNS: &[&str] = &[
+        "customer",
+        "customer_address",
+        "item",
+        "web_page",
+        "catalog_page",
+        "store",
+        "promotion",
+        "household_demographics",
+        "part",
+        "supplier",
+    ];
+    for pattern in MEDIUM_TABLE_PATTERNS {
+        if name == *pattern || name.ends_with(&format!(".{}", pattern)) {
+            return 100_000.0;
+        }
+    }
+
+    // Small dimension tables: low row count default.
+    const SMALL_TABLE_PATTERNS: &[&str] = &[
+        "customer_demographics",
+        "date_dim",
+        "time_dim",
+        "income_band",
+        "reason",
+        "ship_mode",
+        "warehouse",
+        "web_site",
+        "call_center",
+        "nation",
+        "region",
+    ];
+    for pattern in SMALL_TABLE_PATTERNS {
+        if name == *pattern || name.ends_with(&format!(".{}", pattern)) {
+            return 10_000.0;
+        }
+    }
+
+    // General heuristic: names containing "fact" or "sales" or "returns"
+    // suggest a large table.
+    if name.contains("sales")
+        || name.contains("returns")
+        || name.contains("fact")
+        || name.contains("lineitem")
+    {
+        return 1_000_000.0;
+    }
+    if name.contains("_dim") || name.contains("dimension") {
+        return 10_000.0;
+    }
+
+    // Default for completely unknown tables.
+    100_000.0
 }
 
 /// Derive join statistics from a `LogicalJoinOp` and child stats.
@@ -1189,6 +1315,92 @@ mod tests {
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((limit_props.row_count - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn cte_consume_propagates_produce_row_count() {
+        // Create a plan: CTEAnchor(CTEProduce(Scan), CTEConsume)
+        // The CTEConsume should inherit the produce group's row count,
+        // not use the old hardcoded 1000.
+        let (name, ts) = make_table_stats("orders", 250_000, &[("id", 100_000.0)]);
+        let mut table_stats = HashMap::new();
+        table_stats.insert(name, ts);
+
+        let scan = scan_plan("orders", &["id"]);
+        let produce = LogicalPlan::CTEProduce(CTEProduceNode {
+            cte_id: 1,
+            input: Box::new(scan),
+            output_columns: vec![OutputColumn {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+        });
+        let consume = LogicalPlan::CTEConsume(CTEConsumeNode {
+            cte_id: 1,
+            alias: "cte_orders".to_string(),
+            output_columns: vec![OutputColumn {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            }],
+        });
+        let anchor = LogicalPlan::CTEAnchor(CTEAnchorNode {
+            cte_id: 1,
+            produce: Box::new(produce),
+            consumer: Box::new(consume),
+        });
+
+        let mut memo = Memo::new();
+        logical_plan_to_memo(&anchor, &mut memo);
+        derive_group_statistics(&mut memo, &table_stats);
+
+        // Group 0: Scan (250000 rows from table stats)
+        let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
+        assert!((scan_props.row_count - 250_000.0).abs() < 1.0);
+
+        // Group 1: CTEProduce (passthrough from scan = 250000)
+        let produce_props = memo.groups[1].logical_props.as_ref().unwrap();
+        assert!((produce_props.row_count - 250_000.0).abs() < 1.0);
+
+        // Group 2: CTEConsume (should propagate produce group's row count)
+        let consume_props = memo.groups[2].logical_props.as_ref().unwrap();
+        assert!(
+            (consume_props.row_count - 250_000.0).abs() < 1.0,
+            "CTEConsume should propagate produce group's row count (250000), got {}",
+            consume_props.row_count
+        );
+
+        // Group 3: CTEAnchor (passthrough from consumer = 250000)
+        let anchor_props = memo.groups[3].logical_props.as_ref().unwrap();
+        assert!((anchor_props.row_count - 250_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn default_row_count_fact_table() {
+        // A fact table without stats should get a large default.
+        let rows = estimate_default_row_count("store_sales");
+        assert_eq!(rows, 1_000_000.0);
+    }
+
+    #[test]
+    fn default_row_count_small_dim() {
+        // A small dimension table should get a small default.
+        let rows = estimate_default_row_count("date_dim");
+        assert_eq!(rows, 10_000.0);
+    }
+
+    #[test]
+    fn default_row_count_medium_table() {
+        let rows = estimate_default_row_count("customer");
+        assert_eq!(rows, 100_000.0);
+    }
+
+    #[test]
+    fn default_row_count_unknown_table() {
+        // Completely unknown table gets the general default.
+        let rows = estimate_default_row_count("my_custom_table");
+        assert_eq!(rows, 100_000.0);
     }
 
     #[test]

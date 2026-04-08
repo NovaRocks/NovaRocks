@@ -271,7 +271,10 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
                 op,
                 children: vec![child],
             };
-            memo.new_group(expr)
+            let group_id = memo.new_group(expr);
+            // Register the CTEProduce group so CTEConsume can look up its stats.
+            memo.cte_produce_groups.insert(node.cte_id, group_id);
+            group_id
         }
     }
 }
