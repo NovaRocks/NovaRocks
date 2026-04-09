@@ -1,4 +1,4 @@
--- query 24
+-- query 1
 with ssales as
 (select c_last_name
       ,c_first_name
@@ -51,6 +51,7 @@ order by c_last_name
         ,c_first_name
         ,s_store_name
 ;
+-- query 2
 with ssales as
 (select c_last_name
       ,c_first_name

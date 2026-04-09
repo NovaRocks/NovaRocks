@@ -663,42 +663,6 @@ fn build_pipeline_for_node(
             let dop = build.pipeline.dop.max(1);
             let all_update = functions.iter().all(|f| !f.input_is_intermediate);
 
-            // Streaming pre-aggregation: split into Sink (Pipeline 1) and Source (Pipeline 2).
-            if let Some(StreamingPreaggregationMode::ForcePreaggregation) =
-                streaming_preaggregation_mode
-            {
-                let streaming_state = AggregateStreamingState::new();
-                let sink_factory = Box::new(AggregateStreamingSinkFactory::new(
-                    *node_id,
-                    Arc::clone(&ctx.arena),
-                    group_by.clone(),
-                    functions.clone(),
-                    true, // output_intermediate: streaming pre-agg always outputs intermediate
-                    output_chunk_schema.clone(),
-                    topn_rf_specs.clone(),
-                    Some(Arc::clone(&ctx.runtime_filter_hub)),
-                    streaming_state.clone(),
-                ));
-                build.pipeline.factories.push(sink_factory);
-                build.pipeline.needs_sink = false;
-
-                let source_factory = Box::new(AggregateStreamingSourceFactory::new(
-                    *node_id,
-                    streaming_state,
-                ));
-                let source_dop = build.pipeline.dop;
-                let downstream = new_source_pipeline_with_dop(ctx, source_factory, source_dop);
-
-                let mut extra_pipelines = build.extra_pipelines;
-                extra_pipelines.push(build.pipeline);
-
-                return Ok(PipelineBuildResult {
-                    pipeline: downstream,
-                    extra_pipelines,
-                    stream: StreamDesc::any(source_dop),
-                });
-            }
-
             if !*need_finalize && !group_by.is_empty() && dop > 1 {
                 // StarRocks pipeline semantics: when an aggregate runs with pipeline DOP > 1, all
                 // rows for a given group key must be processed by the same driver within the
@@ -845,6 +809,47 @@ fn build_pipeline_for_node(
                     pipeline: downstream,
                     extra_pipelines,
                     stream: StreamDesc::any(downstream_dop),
+                });
+            }
+
+            // Streaming pre-aggregation: split into Sink (Pipeline 1) and Source (Pipeline 2).
+            // This creates a pipeline boundary that enables TopN runtime filter yield points.
+            // The ensure_hash above (for !need_finalize && group_by && dop > 1) already
+            // guarantees group-key ownership per driver, so the per-driver streaming aggregate
+            // won't produce duplicate groups.
+            if matches!(
+                streaming_preaggregation_mode,
+                Some(StreamingPreaggregationMode::ForcePreaggregation)
+            ) {
+                let streaming_state = AggregateStreamingState::new();
+                let sink_factory = Box::new(AggregateStreamingSinkFactory::new(
+                    *node_id,
+                    Arc::clone(&ctx.arena),
+                    group_by.clone(),
+                    functions.clone(),
+                    !*need_finalize,
+                    output_chunk_schema.clone(),
+                    topn_rf_specs.clone(),
+                    Some(Arc::clone(&ctx.runtime_filter_hub)),
+                    streaming_state.clone(),
+                ));
+                build.pipeline.factories.push(sink_factory);
+                build.pipeline.needs_sink = false;
+
+                let source_factory = Box::new(AggregateStreamingSourceFactory::new(
+                    *node_id,
+                    streaming_state,
+                ));
+                let source_dop = build.pipeline.dop;
+                let downstream = new_source_pipeline_with_dop(ctx, source_factory, source_dop);
+
+                let mut extra_pipelines = build.extra_pipelines;
+                extra_pipelines.push(build.pipeline);
+
+                return Ok(PipelineBuildResult {
+                    pipeline: downstream,
+                    extra_pipelines,
+                    stream: StreamDesc::any(source_dop),
                 });
             }
 

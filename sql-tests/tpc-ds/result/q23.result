@@ -1,5 +1,7 @@
+-- query 1
 sum(sales)
 17030.91
+-- query 2
 c_last_name	c_first_name	sales
 NULL	Robert	598.86
 Brown	Monika	6031.52
