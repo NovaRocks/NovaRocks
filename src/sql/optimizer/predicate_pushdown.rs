@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
-use arrow::datatypes::DataType;
 use crate::sql::ir::{ExprKind, JoinKind, TypedExpr};
 use crate::sql::plan::*;
+use arrow::datatypes::DataType;
 
 use super::expr_utils::{
     collect_column_refs, collect_output_columns, collect_qualified_column_refs,
@@ -30,10 +30,12 @@ pub(crate) fn push_down_predicates(plan: LogicalPlan) -> LogicalPlan {
         //   SEMI JOIN (CROSS(store_sales, date_dim)) ON (corr AND ss_sold_date_sk = d_date_sk)
         // into:
         //   SEMI JOIN (INNER(store_sales, date_dim, ON ss_sold_date_sk = d_date_sk)) ON (corr)
-        LogicalPlan::Join(join) if matches!(
-            join.join_type,
-            JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti
-        ) => {
+        LogicalPlan::Join(join)
+            if matches!(
+                join.join_type,
+                JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::RightSemi | JoinKind::RightAnti
+            ) =>
+        {
             let optimized = push_semi_condition_into_children(join);
             map_children(optimized, push_down_predicates)
         }
@@ -218,9 +220,9 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                 //   (Some("__sq_2"), "d_week_seq") — only in right qcols
                 // `all_in_right` would be true, but the unqualified ref is
                 // genuinely a left-side column. Treat as join predicate.
-                let any_ambiguous_in_both = qrefs.iter().any(|r| {
-                    left_qcols.contains(r) && right_qcols.contains(r)
-                });
+                let any_ambiguous_in_both = qrefs
+                    .iter()
+                    .any(|r| left_qcols.contains(r) && right_qcols.contains(r));
 
                 if all_in_left && !all_in_right && !any_ambiguous_in_both {
                     // Qualified analysis shows left-only
@@ -252,7 +254,9 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> Logical
                             .iter()
                             .all(|c| left_cols.contains(c) && right_cols.contains(c))
                     };
-                    if is_self_join_overlap && q_in_left && q_in_right
+                    if is_self_join_overlap
+                        && q_in_left
+                        && q_in_right
                         && !is_left_join_variant
                         && matches!(join.join_type, JoinKind::Cross | JoinKind::Inner)
                     {
@@ -489,7 +493,10 @@ fn factor_common_eq_from_or(
     }
 
     let or_remaining = if new_branches.iter().all(|b| {
-        matches!(b.kind, ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)))
+        matches!(
+            b.kind,
+            ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true))
+        )
     }) {
         None // All branches were just the common eq
     } else {
@@ -529,30 +536,58 @@ fn factor_common_eq_from_or_any_side(
     let mut common_eqs: Vec<TypedExpr> = Vec::new();
     if let Some(first) = branch_conjuncts.first() {
         for candidate in first {
-            if !is_any_eq(candidate) { continue; }
-            let in_all = branch_conjuncts[1..].iter()
+            if !is_any_eq(candidate) {
+                continue;
+            }
+            let in_all = branch_conjuncts[1..]
+                .iter()
                 .all(|conjs| conjs.iter().any(|c| expr_eq(c, candidate)));
-            if in_all { common_eqs.push((*candidate).clone()); }
+            if in_all {
+                common_eqs.push((*candidate).clone());
+            }
         }
     }
-    if common_eqs.is_empty() { return (vec![], None); }
+    if common_eqs.is_empty() {
+        return (vec![], None);
+    }
 
     let mut new_branches: Vec<TypedExpr> = Vec::new();
     for branch in &branch_conjuncts {
-        let remaining: Vec<TypedExpr> = branch.iter()
+        let remaining: Vec<TypedExpr> = branch
+            .iter()
             .filter(|c| !common_eqs.iter().any(|eq| expr_eq(c, eq)))
-            .map(|c| (*c).clone()).collect();
+            .map(|c| (*c).clone())
+            .collect();
         if remaining.is_empty() {
-            new_branches.push(TypedExpr { data_type: DataType::Boolean, nullable: false,
-                kind: ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)) });
-        } else { new_branches.push(combine_and(remaining)); }
+            new_branches.push(TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)),
+            });
+        } else {
+            new_branches.push(combine_and(remaining));
+        }
     }
-    let or_rem = if new_branches.iter().all(|b| matches!(b.kind, ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true)))) {
+    let or_rem = if new_branches.iter().all(|b| {
+        matches!(
+            b.kind,
+            ExprKind::Literal(crate::sql::ir::LiteralValue::Bool(true))
+        )
+    }) {
         None
     } else {
         let mut r = new_branches.remove(0);
-        for b in new_branches { r = TypedExpr { data_type: DataType::Boolean, nullable: false,
-            kind: ExprKind::BinaryOp { left: Box::new(r), op: crate::sql::ir::BinOp::Or, right: Box::new(b) } }; }
+        for b in new_branches {
+            r = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(r),
+                    op: crate::sql::ir::BinOp::Or,
+                    right: Box::new(b),
+                },
+            };
+        }
         Some(r)
     };
     (common_eqs, or_rem)

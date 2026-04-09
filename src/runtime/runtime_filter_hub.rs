@@ -156,7 +156,9 @@ impl RuntimeFilterSnapshot {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.in_filters.is_empty() && self.membership_filters.is_empty() && self.min_max_filters.is_empty()
+        self.in_filters.is_empty()
+            && self.membership_filters.is_empty()
+            && self.min_max_filters.is_empty()
     }
 }
 
@@ -592,7 +594,9 @@ impl RuntimeFilterHub {
         );
         for target in &targets {
             let entry = self.get_or_create_entry(target.node_id);
-            entry.handle.update_min_max_filter(filter_id, Arc::clone(&filter));
+            entry
+                .handle
+                .update_min_max_filter(filter_id, Arc::clone(&filter));
         }
     }
 

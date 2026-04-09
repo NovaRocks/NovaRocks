@@ -38,7 +38,9 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::hash_table::key_builder::{build_group_key_hashes, build_group_key_views};
 
-use super::{RuntimeFilterMembership, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
+use super::{
+    RuntimeFilterMembership, RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter,
+};
 
 /// Apply membership filters to a chunk and return the filtered chunk.
 pub(crate) fn filter_chunk_by_memberships(
@@ -297,8 +299,7 @@ pub(crate) fn filter_chunk_by_min_max_filters_with_exprs(
             filter_id, kept, len
         );
         let mask = BooleanArray::from(keep);
-        let filtered_batch =
-            filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
+        let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
         current = Some(Chunk::new_like(filtered_batch, &chunk));
     }
     Ok(current)

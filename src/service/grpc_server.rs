@@ -90,24 +90,40 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                     }
                 };
 
-                let result =
-                    internal_rpc::handle_transmit_chunk(proto::starrocks::PTransmitChunkParams {
-                        finst_id: Some(proto::starrocks::PUniqueId {
-                            hi: req.finst_id_hi,
-                            lo: req.finst_id_lo,
-                        }),
-                        node_id: Some(req.node_id),
-                        sender_id: Some(req.sender_id),
-                        be_number: Some(req.be_number),
-                        eos: Some(req.eos),
-                        sequence: Some(req.sequence),
-                        chunks: vec![proto::starrocks::ChunkPb {
-                            data: Some(req.payload),
-                            data_size: Some(0),
-                            ..Default::default()
-                        }],
+                let params = proto::starrocks::PTransmitChunkParams {
+                    finst_id: Some(proto::starrocks::PUniqueId {
+                        hi: req.finst_id_hi,
+                        lo: req.finst_id_lo,
+                    }),
+                    node_id: Some(req.node_id),
+                    sender_id: Some(req.sender_id),
+                    be_number: Some(req.be_number),
+                    eos: Some(req.eos),
+                    sequence: Some(req.sequence),
+                    chunks: vec![proto::starrocks::ChunkPb {
+                        data: Some(req.payload),
+                        data_size: Some(0),
                         ..Default::default()
-                    });
+                    }],
+                    ..Default::default()
+                };
+                // handle_transmit_chunk includes Arrow IPC decoding which is CPU-intensive.
+                // Offload to the blocking thread pool so async worker threads stay free for I/O.
+                let result = match tokio::task::spawn_blocking(move || {
+                    internal_rpc::handle_transmit_chunk(params)
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(tonic::Status::internal(format!(
+                                "exchange handler panicked: {e}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                };
                 if let Some(status) = result.status.as_ref() {
                     if status.status_code != 0 {
                         let _ = tx

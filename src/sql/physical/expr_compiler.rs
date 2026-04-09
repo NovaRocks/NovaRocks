@@ -1918,7 +1918,9 @@ fn infer_scalar_function_return_type(
                 // use it as the output scale. Otherwise keep input scale.
                 let out_scale = if arg_types.len() >= 2 {
                     match arg_types.get(1) {
-                        Some(DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64) => {
+                        Some(
+                            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+                        ) => {
                             // Can't see the actual value here, use the analyzer's
                             // output type which already has the correct scale.
                             // Return the input scale as default; the analyzer's

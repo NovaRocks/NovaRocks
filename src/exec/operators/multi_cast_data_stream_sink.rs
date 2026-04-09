@@ -302,20 +302,18 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
         if self.finished {
             return None;
         }
+        // Return the first inner sink's observable unconditionally.
+        // The observable fires when the exchange send queue drains, which is the
+        // correct wakeup signal regardless of which inner sink triggered the block.
+        // Checking need_input() here would be a TOCTOU race: by the time the
+        // scheduler calls sink_observable(), the blocking inner sink may already
+        // be ready again, causing a spurious None and a fragment failure.
         for sink in &self.sinks {
-            let allowed = sink
-                .limit_remaining
-                .as_ref()
-                .map(|remaining| remaining.load(Ordering::SeqCst) > 0)
-                .unwrap_or(true);
-            if !allowed {
-                continue;
-            }
             let Some(inner) = sink.op.as_processor_ref() else {
-                return None;
+                continue;
             };
-            if !inner.need_input() {
-                return inner.sink_observable();
+            if let Some(obs) = inner.sink_observable() {
+                return Some(obs);
             }
         }
         None

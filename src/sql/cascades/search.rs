@@ -115,11 +115,8 @@ impl SearchContext {
             if let Operator::PhysicalHashJoin(ref j) = expr.op
                 && matches!(j.distribution, JoinDistribution::Broadcast)
                 && expr.children.get(1).is_some_and(|&build_group_id| {
-                    let build_stats = stats_for_group(
-                        &memo.groups[build_group_id],
-                        memo,
-                        &self.table_stats,
-                    );
+                    let build_stats =
+                        stats_for_group(&memo.groups[build_group_id], memo, &self.table_stats);
                     build_stats.output_row_count > BROADCAST_ROW_COUNT_LIMIT
                 })
             {
@@ -374,11 +371,17 @@ pub(super) fn required_input_properties(
         // handles join reorder swapping the eq condition pair order.
         Operator::PhysicalHashJoin(j) => match j.distribution {
             JoinDistribution::Shuffle => {
-                let all_cols: Vec<ColumnRef> = j.eq_conditions.iter()
+                let all_cols: Vec<ColumnRef> = j
+                    .eq_conditions
+                    .iter()
                     .flat_map(|(l, r)| {
                         let mut v = Vec::new();
-                        if let Some(c) = typed_expr_to_column_ref(l) { v.push(c); }
-                        if let Some(c) = typed_expr_to_column_ref(r) { v.push(c); }
+                        if let Some(c) = typed_expr_to_column_ref(l) {
+                            v.push(c);
+                        }
+                        if let Some(c) = typed_expr_to_column_ref(r) {
+                            v.push(c);
+                        }
                         v
                     })
                     .collect();

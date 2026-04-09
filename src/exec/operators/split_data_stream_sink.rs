@@ -287,12 +287,16 @@ impl ProcessorOperator for SplitDataStreamSinkOperator {
         if self.finished {
             return None;
         }
+        // Return the first inner sink's observable unconditionally.
+        // Checking need_input() here would be a TOCTOU race: by the time the
+        // scheduler calls sink_observable(), the blocking inner sink may already
+        // be ready, causing a spurious None and a fragment failure.
         for sink in &self.sinks {
             let Some(inner) = sink.op.as_processor_ref() else {
-                return None;
+                continue;
             };
-            if !inner.need_input() {
-                return inner.sink_observable();
+            if let Some(obs) = inner.sink_observable() {
+                return Some(obs);
             }
         }
         None

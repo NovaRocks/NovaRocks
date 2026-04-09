@@ -170,7 +170,11 @@ pub(crate) fn lower_starrocks_scan_node(
 
     // Parse TOPN_FILTER probe descriptors to build filter_id -> column_name map.
     let mut topn_filter_column_map = HashMap::new();
-    if let Some(descs) = node.probe_runtime_filters.as_ref().filter(|v| !v.is_empty()) {
+    if let Some(descs) = node
+        .probe_runtime_filters
+        .as_ref()
+        .filter(|v| !v.is_empty())
+    {
         for desc in descs {
             if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER) {
                 continue;

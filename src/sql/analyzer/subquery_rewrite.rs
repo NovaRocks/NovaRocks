@@ -186,9 +186,9 @@ impl<'a> AnalyzerContext<'a> {
                     c
                 };
                 // Remaining non-correlation predicates
-                let remaining = sub_filter.as_ref().and_then(|f| {
-                    remove_correlation_preds_from_expr(f, &corr_preds)
-                });
+                let remaining = sub_filter
+                    .as_ref()
+                    .and_then(|f| remove_correlation_preds_from_expr(f, &corr_preds));
                 match remaining {
                     Some(rem) => Some(TypedExpr {
                         data_type: DataType::Boolean,

@@ -269,7 +269,9 @@ pub fn eval_round(
                     // in target_scale, but output array uses out_scale.
                     let adjusted = if target_scale < out_scale {
                         let factor = pow10_i128((out_scale - target_scale) as usize)?;
-                        rounded.checked_mul(factor).ok_or("decimal overflow in round adjust")?
+                        rounded
+                            .checked_mul(factor)
+                            .ok_or("decimal overflow in round adjust")?
                     } else if target_scale > out_scale {
                         let factor = pow10_i128((target_scale - out_scale) as usize)?;
                         div_round_i128(rounded, factor)

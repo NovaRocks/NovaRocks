@@ -602,7 +602,11 @@ fn find_connecting_predicates(
 ///
 /// This is the public-facing helper that greedy/left-deep algorithms use to find
 /// join predicates between two table sets.
-fn collect_join_predicates(graph: &JoinGraph, left_mask: u16, right_mask: u16) -> Vec<(TypedExpr, u16)> {
+fn collect_join_predicates(
+    graph: &JoinGraph,
+    left_mask: u16,
+    right_mask: u16,
+) -> Vec<(TypedExpr, u16)> {
     let combined = left_mask | right_mask;
     graph
         .predicates
@@ -681,7 +685,8 @@ fn greedy_join_reorder(
                     Some(combine_and(preds))
                 };
 
-                let (group_entry, atom_entry) = match (memo.get(&group_mask), memo.get(&atom_mask)) {
+                let (group_entry, atom_entry) = match (memo.get(&group_mask), memo.get(&atom_mask))
+                {
                     (Some(g), Some(a)) => (g, a),
                     _ => continue,
                 };
@@ -722,8 +727,7 @@ fn greedy_join_reorder(
                     &[left_stats, right_stats],
                 );
 
-                let mut total_cost =
-                    left_cost + right_cost + join_self_cost.total_cost();
+                let mut total_cost = left_cost + right_cost + join_self_cost.total_cost();
 
                 // Cross join penalty.
                 if is_cross {

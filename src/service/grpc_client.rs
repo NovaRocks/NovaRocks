@@ -19,7 +19,6 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use tonic::transport::Channel;
-use tracing::debug;
 
 use crate::common::types::UniqueId;
 use crate::novarocks_logging::error;
@@ -40,42 +39,34 @@ fn channels() -> &'static ChannelCache {
     })
 }
 
-async fn get_channel(host: &str, port: u16) -> Result<Channel, String> {
+/// Return a cached channel for the given endpoint, creating one if needed.
+///
+/// Must be called from within an async Tokio context (inside data_block_on or
+/// a spawned task), because `connect()` drives TCP+HTTP2 setup via the reactor.
+/// One channel per (host, port) is sufficient — HTTP/2 multiplexes all
+/// concurrent RPCs over the single connection.
+async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String> {
     let key = format!("{host}:{port}");
-    // Temporarily disable cache to test timeout fix
-    // if let Some(ch) = channels()
-    //     .mu
-    //     .lock()
-    //     .expect("channel cache lock")
-    //     .get(&key)
-    //     .cloned()
-    // {
-    //     debug!("get_channel: using CACHED channel for {}", key);
-    //     return Ok(ch);
-    // }
-
-    debug!(
-        "get_channel: creating NEW channel for {} with timeout=600s",
-        key
-    );
-    let endpoint = format!("http://{host}:{port}")
+    {
+        let guard = channels().mu.lock().expect("channel cache lock");
+        if let Some(ch) = guard.get(&key).cloned() {
+            return Ok(ch);
+        }
+    }
+    let ch = format!("http://{host}:{port}")
         .parse::<tonic::transport::Endpoint>()
         .map_err(|e| format!("invalid endpoint: {e}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(10));
-
-    let ch = endpoint
+        .connect_timeout(Duration::from_secs(10))
         .connect()
         .await
         .map_err(|e| format!("connect exchange endpoint failed: {e}"))?;
-
     channels()
         .mu
         .lock()
         .expect("channel cache lock")
-        .insert(key.clone(), ch.clone());
-    debug!("get_channel: channel created and cached for {}", key);
+        .insert(key, ch.clone());
     Ok(ch)
 }
 
@@ -110,7 +101,7 @@ pub fn send_chunks(
     };
 
     data_block_on(async move {
-        let ch = get_channel(&host, port).await?;
+        let ch = get_or_create_channel(&host, port).await?;
         let mut cli = proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)
             .max_encoding_message_size(64 * 1024 * 1024)
             .max_decoding_message_size(64 * 1024 * 1024);
@@ -138,7 +129,7 @@ pub fn transmit_runtime_filter(
     let port = dest_port;
     let runtime_handle = data_runtime_handle()?;
     runtime_handle.spawn(async move {
-        let ch = match get_channel(&dest_host, port).await {
+        let ch = match get_or_create_channel(&dest_host, port).await {
             Ok(v) => v,
             Err(e) => {
                 error!(
@@ -181,7 +172,7 @@ pub fn lookup(
     let dest_host = dest_host.to_string();
     let port = dest_port;
     data_block_on(async move {
-        let ch = get_channel(&dest_host, port)
+        let ch = get_or_create_channel(&dest_host, port)
             .await
             .map_err(|e| format!("lookup connect failed: dest={dest_host}:{port} error={e}"))?;
         let mut cli = proto::novarocks::nova_rocks_grpc_client::NovaRocksGrpcClient::new(ch)

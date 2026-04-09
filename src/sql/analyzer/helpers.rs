@@ -84,7 +84,25 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 display
             }
         }
-        // Expressions like SUBSTR, CAST, EXTRACT are rendered in uppercase by
+        // CAST: uppercase keyword, StarRocks-style type names (DECIMAL64/DECIMAL128),
+        // wrap inner with parentheses if it's not a simple identifier or literal.
+        sqlast::Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let inner_str = expr_display_name_with_parens(inner);
+            let type_str = format_cast_type(data_type);
+            format!("CAST({inner_str} AS {type_str})")
+        }
+        // Binary ops: wrap each operand with parentheses unless it's a simple
+        // identifier or literal, matching StarRocks AST2StringVisitor behavior.
+        sqlast::Expr::BinaryOp { left, op, right } => {
+            let left_str = expr_display_name_with_parens(left);
+            let right_str = expr_display_name_with_parens(right);
+            format!("{left_str} {op} {right_str}")
+        }
+        // Expressions like SUBSTR, EXTRACT are rendered in uppercase by
         // sqlparser's Display. Lowercase leading keyword to match StarRocks FE.
         other => {
             let s = format!("{other}");
@@ -101,6 +119,51 @@ pub(super) fn expr_display_name(expr: &sqlast::Expr) -> String {
                 s
             }
         }
+    }
+}
+
+/// Wraps `expr_display_name(expr)` in parentheses unless the expression is
+/// a simple identifier or literal — matching StarRocks `printWithParentheses`.
+fn expr_display_name_with_parens(expr: &sqlast::Expr) -> String {
+    match expr {
+        sqlast::Expr::Identifier(_) | sqlast::Expr::CompoundIdentifier(_) => {
+            expr_display_name(expr)
+        }
+        sqlast::Expr::Value(_) => expr_display_name(expr),
+        sqlast::Expr::Nested(inner) => expr_display_name_with_parens(inner),
+        _ => format!("({})", expr_display_name(expr)),
+    }
+}
+
+/// Format a CAST target type using StarRocks-style names.
+/// DECIMAL(p,s) is promoted to DECIMAL32/DECIMAL64/DECIMAL128 to match
+/// the analyzed type name that StarRocks FE emits in column aliases.
+fn format_cast_type(data_type: &sqlast::DataType) -> String {
+    match data_type {
+        sqlast::DataType::Decimal(info)
+        | sqlast::DataType::Dec(info)
+        | sqlast::DataType::Numeric(info) => match info {
+            sqlast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                let kind = decimal_kind(*p);
+                format!("{kind}({p},{s})")
+            }
+            sqlast::ExactNumberInfo::Precision(p) => {
+                let kind = decimal_kind(*p);
+                format!("{kind}({p},0)")
+            }
+            sqlast::ExactNumberInfo::None => "DECIMAL128(38,0)".to_string(),
+        },
+        other => format!("{other}"),
+    }
+}
+
+fn decimal_kind(precision: u64) -> &'static str {
+    if precision <= 9 {
+        "DECIMAL32"
+    } else if precision <= 18 {
+        "DECIMAL64"
+    } else {
+        "DECIMAL128"
     }
 }
 

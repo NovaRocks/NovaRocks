@@ -992,9 +992,8 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Group window expressions by (partition_by, order_by) signature.
         // Different signatures need separate Sort + Analytic nodes.
-        let groups = crate::sql::physical::emitter::emit_window::group_win_exprs_by_sig(
-            &op.window_exprs,
-        );
+        let groups =
+            crate::sql::physical::emitter::emit_window::group_win_exprs_by_sig(&op.window_exprs);
         if groups.len() > 1 {
             return self.visit_window_multi_group(op, node, &groups);
         }
@@ -1690,8 +1689,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         child_scope.resolve_column(col.qualifier.as_deref(), &col.column)
                     {
                         let binding = binding.clone();
-                        let type_desc =
-                            type_infer::arrow_type_to_type_desc(&binding.data_type)?;
+                        let type_desc = type_infer::arrow_type_to_type_desc(&binding.data_type)?;
                         partition_exprs.push(expr_compiler::build_slot_ref_texpr(
                             binding.slot_id,
                             binding.tuple_id,
