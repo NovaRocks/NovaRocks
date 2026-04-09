@@ -23,6 +23,7 @@ use crate::exec::pipeline::schedule::observer::Observable;
 
 struct BufferState {
     chunks: VecDeque<Chunk>,
+    pending_sinks: usize,
     sink_finished: bool,
 }
 
@@ -34,10 +35,14 @@ pub(crate) struct AggregateStreamingState {
 }
 
 impl AggregateStreamingState {
-    pub(crate) fn new() -> Self {
+    /// Create a new streaming state expecting `sink_count` sink operators to finish.
+    /// With DOP > 1 there are multiple sink drivers sharing this state; all must finish
+    /// before the source is allowed to see `is_done() = true`.
+    pub(crate) fn new(sink_count: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(BufferState {
                 chunks: VecDeque::new(),
+                pending_sinks: sink_count.max(1),
                 sink_finished: false,
             })),
             observable: Arc::new(Observable::new()),
@@ -57,11 +62,17 @@ impl AggregateStreamingState {
         notify.arm();
     }
 
-    /// Mark the Sink as finished. No more chunks will be offered.
+    /// Mark one sink driver as finished. When all sink drivers have called this,
+    /// the state transitions to fully finished so the source can drain and stop.
     pub(crate) fn mark_sink_finished(&self) {
         let notify = self.observable.defer_notify();
         let mut guard = self.inner.lock().expect("streaming state lock");
-        guard.sink_finished = true;
+        if guard.pending_sinks > 0 {
+            guard.pending_sinks -= 1;
+        }
+        if guard.pending_sinks == 0 {
+            guard.sink_finished = true;
+        }
         drop(guard);
         notify.arm();
     }

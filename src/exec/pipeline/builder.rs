@@ -821,7 +821,7 @@ fn build_pipeline_for_node(
                 streaming_preaggregation_mode,
                 Some(StreamingPreaggregationMode::ForcePreaggregation)
             ) {
-                let streaming_state = AggregateStreamingState::new();
+                let streaming_state = AggregateStreamingState::new(dop.max(1) as usize);
                 let sink_factory = Box::new(AggregateStreamingSinkFactory::new(
                     *node_id,
                     Arc::clone(&ctx.arena),
