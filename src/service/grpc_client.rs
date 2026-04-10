@@ -59,6 +59,9 @@ async fn get_or_create_channel(host: &str, port: u16) -> Result<Channel, String>
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
+        .initial_stream_window_size(Some(32 * 1024 * 1024))
+        .initial_connection_window_size(Some(128 * 1024 * 1024))
         .connect()
         .await
         .map_err(|e| format!("connect exchange endpoint failed: {e}"))?;
@@ -106,17 +109,10 @@ pub fn send_chunks(
             .max_encoding_message_size(64 * 1024 * 1024)
             .max_decoding_message_size(64 * 1024 * 1024);
 
-        let stream = tokio_stream::once(req);
-        let resp = cli
-            .exchange(stream)
+        cli.exchange_unary(req)
             .await
             .map_err(|e| format!("exchange rpc failed: {e}"))?;
-        let mut inbound = resp.into_inner();
-        // Wait for the server ack to confirm delivery.
-        match inbound.message().await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("exchange ack recv failed: {e}")),
-        }
+        Ok(())
     })?
 }
 

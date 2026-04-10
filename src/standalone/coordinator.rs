@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::novarocks_logging::debug;
 use crate::data_sinks;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::{ExecPlan, push_down_local_runtime_filters};
@@ -97,10 +98,11 @@ impl ExecutionCoordinator {
             BTreeMap::new();
 
         for e in &edges {
-            per_fragment_exch_num_senders
+            *per_fragment_exch_num_senders
                 .entry(e.target_fragment_id)
                 .or_default()
-                .insert(e.target_exchange_node_id, 1);
+                .entry(e.target_exchange_node_id)
+                .or_insert(0) += 1;
 
             if let FragmentEdgeKind::CteMulticast { cte_id } = &e.edge_kind {
                 cte_consumers
@@ -108,32 +110,6 @@ impl ExecutionCoordinator {
                     .or_default()
                     .push((e.target_fragment_id, e.target_exchange_node_id));
             }
-        }
-
-        // Debug: log fragment structure
-        eprintln!(
-            "[coordinator] fragments={} edges={} root={}",
-            fragment_results.len(),
-            edges.len(),
-            root_fragment_id
-        );
-        for e in &edges {
-            eprintln!(
-                "[coordinator] edge: frag {} -> frag {} (exch_node={}, kind={:?})",
-                e.source_fragment_id,
-                e.target_fragment_id,
-                e.target_exchange_node_id,
-                match &e.edge_kind {
-                    FragmentEdgeKind::Stream => "Stream",
-                    FragmentEdgeKind::CteMulticast { .. } => "CteMulticast",
-                }
-            );
-        }
-        for (fid, senders) in &per_fragment_exch_num_senders {
-            eprintln!(
-                "[coordinator] per_exch_num_senders[frag {}] = {:?}",
-                fid, senders
-            );
         }
 
         // Also collect CTE consumers from legacy cte_exchange_nodes field
@@ -144,12 +120,25 @@ impl ExecutionCoordinator {
                 let entry = (fr.fragment_id, *exchange_node_id);
                 if !consumers.contains(&entry) {
                     consumers.push(entry);
-                    per_fragment_exch_num_senders
+                    *per_fragment_exch_num_senders
                         .entry(fr.fragment_id)
                         .or_default()
-                        .insert(*exchange_node_id, 1);
+                        .entry(*exchange_node_id)
+                        .or_insert(0) += 1;
                 }
             }
+        }
+
+        debug!(
+            "coordinator topology: fragments={} edges={} root={}",
+            fragment_results.len(), edges.len(), root_fragment_id
+        );
+        for e in &edges {
+            debug!(
+                "coordinator edge: frag {} -> frag {} (exch_node={}, kind={:?})",
+                e.source_fragment_id, e.target_fragment_id, e.target_exchange_node_id,
+                match &e.edge_kind { FragmentEdgeKind::Stream => "Stream", FragmentEdgeKind::CteMulticast { .. } => "CteMulticast" }
+            );
         }
 
         let stream_source_ids: BTreeSet<FragmentId> = edges
@@ -238,48 +227,46 @@ impl ExecutionCoordinator {
                 None::<Vec<partitions::TBucketProperty>>,
             );
 
-            let mut sinks = Vec::new();
-            let mut destinations = Vec::new();
-            for (consumer_fragment_id, exchange_node_id) in &consumer_exchange_nodes {
-                let stream_sink = data_sinks::TDataStreamSink::new(
-                    *exchange_node_id,
-                    unpartitioned.clone(),
-                    None::<bool>,     // ignore_not_found
-                    None::<bool>,     // is_merge
-                    None::<i32>,      // dest_dop
-                    None::<Vec<i32>>, // output_columns
-                    None::<i64>,      // limit
-                );
-                sinks.push(stream_sink);
+            // Stream producers have exactly one consumer.  Use a plain
+            // TDataStreamSink (like StarRocks FE) instead of a MultiCast
+            // wrapper so that the pipeline driver's finishing logic correctly
+            // waits for the EOS gRPC round-trip to complete.
+            let (consumer_fragment_id, exchange_node_id) = consumer_exchange_nodes[0];
 
-                let consumer_instance_id = *instance_map
-                    .get(consumer_fragment_id)
-                    .ok_or_else(|| {
-                        format!(
-                            "consumer fragment instance ID not found for fragment_id={consumer_fragment_id}"
-                        )
-                    })?;
+            let stream_sink = data_sinks::TDataStreamSink::new(
+                exchange_node_id,
+                unpartitioned.clone(),
+                None::<bool>,     // ignore_not_found
+                None::<bool>,     // is_merge
+                None::<i32>,      // dest_dop
+                None::<Vec<i32>>, // output_columns
+                None::<i64>,      // limit
+            );
 
-                let dest = data_sinks::TPlanFragmentDestination::new(
-                    types::TUniqueId::new(consumer_instance_id.0, consumer_instance_id.1),
-                    None::<types::TNetworkAddress>, // deprecated_server
-                    Some(brpc_addr.clone()),        // brpc_server
-                    None::<i32>,                    // pipeline_driver_sequence
-                );
-                destinations.push(vec![dest]);
-            }
+            let consumer_instance_id = *instance_map
+                .get(&consumer_fragment_id)
+                .ok_or_else(|| {
+                    format!(
+                        "consumer fragment instance ID not found for fragment_id={consumer_fragment_id}"
+                    )
+                })?;
 
-            let multi_cast_sink = data_sinks::TMultiCastDataStreamSink::new(sinks, destinations);
+            let dest = data_sinks::TPlanFragmentDestination::new(
+                types::TUniqueId::new(consumer_instance_id.0, consumer_instance_id.1),
+                None::<types::TNetworkAddress>, // deprecated_server
+                Some(brpc_addr.clone()),        // brpc_server
+                None::<i32>,                    // pipeline_driver_sequence
+            );
 
             let output_sink = data_sinks::TDataSink::new(
-                data_sinks::TDataSinkType::MULTI_CAST_DATA_STREAM_SINK,
-                None::<data_sinks::TDataStreamSink>,
+                data_sinks::TDataSinkType::DATA_STREAM_SINK,
+                Some(stream_sink),
                 None::<data_sinks::TResultSink>,
                 None::<data_sinks::TMysqlTableSink>,
                 None::<data_sinks::TExportSink>,
                 None::<data_sinks::TOlapTableSink>,
                 None::<data_sinks::TMemoryScratchSink>,
-                Some(multi_cast_sink),
+                None::<data_sinks::TMultiCastDataStreamSink>,
                 None::<data_sinks::TSchemaTableSink>,
                 None::<data_sinks::TIcebergTableSink>,
                 None::<data_sinks::THiveTableSink>,
@@ -321,6 +308,7 @@ impl ExecutionCoordinator {
                 .get(&stream_fr.fragment_id)
                 .cloned()
                 .unwrap_or_default();
+            stream_exec_params.destinations = Some(vec![dest]);
             if let Some(ref rf) = rf_params {
                 stream_exec_params.runtime_filter_params = Some(rf.clone());
             }
@@ -458,21 +446,13 @@ impl ExecutionCoordinator {
 
         let mut cte_handles: Vec<std::thread::JoinHandle<Result<(), String>>> = Vec::new();
 
-        eprintln!(
-            "[coordinator] launching {} background fragments",
-            cte_thrift_fragments.len()
-        );
-        let cancel_query_id_hi = query_id_hi;
-        let cancel_query_id_lo = query_id_lo;
         let all_instance_ids: Vec<(i64, i64)> = instance_map.values().copied().collect();
 
         for (cte_fr, thrift_fragment, cte_exec_params) in cte_thrift_fragments {
             let desc_tbl = cte_fr.desc_tbl.clone();
             let dop = pipeline_dop;
-            let frag_id = cte_fr.fragment_id;
             let cancel_instances = all_instance_ids.clone();
             let handle = std::thread::spawn(move || {
-                eprintln!("[coordinator] fragment {} started", frag_id);
                 let result = execute_fragment(
                     &thrift_fragment,
                     Some(&desc_tbl),
@@ -488,14 +468,10 @@ impl ExecutionCoordinator {
                     None, // backend_num
                     None, // mem_tracker
                 );
-                match &result {
-                    Ok(_) => eprintln!("[coordinator] fragment {} completed OK", frag_id),
-                    Err(e) => {
-                        eprintln!("[coordinator] fragment {} FAILED: {}", frag_id, e);
-                        // Cancel all exchanges so blocked receivers (including root) unblock.
-                        for (hi, lo) in &cancel_instances {
-                            crate::runtime::exchange::cancel_fragment(*hi, *lo);
-                        }
+                if let Err(ref _e) = result {
+                    // Cancel all exchanges so blocked receivers (including root) unblock.
+                    for (hi, lo) in &cancel_instances {
+                        crate::runtime::exchange::cancel_fragment(*hi, *lo);
                     }
                 }
                 result.map(|_| ())

@@ -487,14 +487,17 @@ impl<'a> PlanFragmentBuilder<'a> {
                 },
             );
 
-            // Also register with qualifier if the expression is a column ref
+            // Also register with qualifier if the expression is a column ref.
+            // Use add_qualified_alias to avoid pushing a duplicate entry into
+            // the ordered list (which would inflate iter_columns and break
+            // UNION output slot counts).
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
             } = item.expr.kind
             {
-                project_scope.add_column(
-                    Some(q.clone()),
+                project_scope.add_qualified_alias(
+                    q.clone(),
                     column.clone(),
                     ColumnBinding {
                         tuple_id: project_tuple_id,
@@ -809,13 +812,14 @@ impl<'a> PlanFragmentBuilder<'a> {
                 nullable,
             };
             agg_scope.add_column(None, name, binding.clone());
-            // Also register with qualifier for post-aggregate qualified refs
+            // Also register with qualifier for post-aggregate qualified refs.
+            // Use add_qualified_alias to avoid inflating iter_columns.
             if let ExprKind::ColumnRef {
                 qualifier: Some(ref q),
                 ref column,
             } = gb_expr.kind
             {
-                agg_scope.add_column(Some(q.clone()), column.clone(), binding);
+                agg_scope.add_qualified_alias(q.clone(), column.clone(), binding);
             }
             grouping_exprs.push(texpr);
         }

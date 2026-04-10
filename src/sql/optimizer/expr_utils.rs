@@ -142,9 +142,20 @@ pub(super) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             .map(|item| item.output_name.to_lowercase())
             .collect(),
         LogicalPlan::Join(j) => {
-            let mut cols = collect_output_columns(&j.left);
-            cols.extend(collect_output_columns(&j.right));
-            cols
+            let left_only = matches!(
+                j.join_type,
+                crate::sql::ir::JoinKind::LeftSemi
+                    | crate::sql::ir::JoinKind::LeftAnti
+                    | crate::sql::ir::JoinKind::RightSemi
+                    | crate::sql::ir::JoinKind::RightAnti
+            );
+            if left_only {
+                collect_output_columns(&j.left)
+            } else {
+                let mut cols = collect_output_columns(&j.left);
+                cols.extend(collect_output_columns(&j.right));
+                cols
+            }
         }
         LogicalPlan::Aggregate(a) => a
             .output_columns

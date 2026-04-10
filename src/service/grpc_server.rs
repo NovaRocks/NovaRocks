@@ -164,6 +164,45 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
         Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
+    async fn exchange_unary(
+        &self,
+        request: tonic::Request<proto::novarocks::ExchangeRequest>,
+    ) -> Result<tonic::Response<proto::novarocks::ExchangeResponse>, tonic::Status> {
+        let req = request.into_inner();
+        let params = proto::starrocks::PTransmitChunkParams {
+            finst_id: Some(proto::starrocks::PUniqueId {
+                hi: req.finst_id_hi,
+                lo: req.finst_id_lo,
+            }),
+            node_id: Some(req.node_id),
+            sender_id: Some(req.sender_id),
+            be_number: Some(req.be_number),
+            eos: Some(req.eos),
+            sequence: Some(req.sequence),
+            chunks: vec![proto::starrocks::ChunkPb {
+                data: Some(req.payload),
+                data_size: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            internal_rpc::handle_transmit_chunk(params)
+        })
+        .await
+        .map_err(|e| {
+            tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
+        })?;
+        if let Some(status) = result.status.as_ref() {
+            if status.status_code != 0 {
+                return Err(tonic::Status::internal(status.error_msgs.join("; ")));
+            }
+        }
+        Ok(tonic::Response::new(proto::novarocks::ExchangeResponse {
+            ack_sequence: req.sequence,
+        }))
+    }
+
     async fn transmit_runtime_filter(
         &self,
         request: tonic::Request<proto::starrocks::PTransmitRuntimeFilterParams>,
@@ -573,7 +612,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
         );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(4)
+            .worker_threads(8)
             .build()
             .expect("build standalone grpc server runtime");
 
@@ -589,6 +628,10 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
 
             let server = Server::builder()
+                .initial_stream_window_size(Some(32 * 1024 * 1024))
+                .initial_connection_window_size(Some(128 * 1024 * 1024))
+                .max_concurrent_streams(Some(4096))
+                .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
                 .add_service(svc)
                 .serve_with_shutdown(addr, async move {
                     while !*shutdown.borrow() {

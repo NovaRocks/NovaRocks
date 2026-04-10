@@ -518,6 +518,17 @@ fn factor_common_eq_from_or(
     (common_eqs, or_remaining)
 }
 
+/// Factor common equi-join conditions out of OR predicates for join reorder.
+///
+/// Extracts `col=col` equalities that appear in ALL OR branches so the
+/// join graph can see them as independent binary predicates.
+pub(super) fn factor_common_eq_from_or_for_reorder(
+    expr: &TypedExpr,
+) -> (Vec<TypedExpr>, Option<TypedExpr>) {
+    let empty = HashSet::new();
+    factor_common_eq_from_or_any_side(expr, &empty, &empty)
+}
+
 /// Like factor_common_eq_from_or but extracts ANY common col=col eq
 /// (not just cross-side). Same-side eqs will be pushed to children.
 fn factor_common_eq_from_or_any_side(

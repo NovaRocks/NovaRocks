@@ -922,14 +922,34 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::ir::O
         }
 
         // Join: concatenate both sides' output columns.
-        Operator::LogicalJoin(_) => {
-            let mut cols = vec![];
-            for &child_id in &expr.children {
-                if let Some(ref props) = memo.groups[child_id].logical_props {
-                    cols.extend(props.output_columns.clone());
+        // SEMI/ANTI joins only produce the left side.
+        Operator::LogicalJoin(j) => {
+            let left_only = matches!(
+                j.join_type,
+                crate::sql::ir::JoinKind::LeftSemi
+                    | crate::sql::ir::JoinKind::LeftAnti
+                    | crate::sql::ir::JoinKind::RightSemi
+                    | crate::sql::ir::JoinKind::RightAnti
+            );
+            if left_only {
+                if let Some(&child_id) = expr.children.first() {
+                    memo.groups[child_id]
+                        .logical_props
+                        .as_ref()
+                        .map(|p| p.output_columns.clone())
+                        .unwrap_or_default()
+                } else {
+                    vec![]
                 }
+            } else {
+                let mut cols = vec![];
+                for &child_id in &expr.children {
+                    if let Some(ref props) = memo.groups[child_id].logical_props {
+                        cols.extend(props.output_columns.clone());
+                    }
+                }
+                cols
             }
-            cols
         }
 
         // Union/Intersect/Except: use first child's output columns.

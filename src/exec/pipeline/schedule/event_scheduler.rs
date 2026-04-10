@@ -380,7 +380,8 @@ impl EventScheduler {
             return;
         }
 
-        if task.check_is_ready() {
+        let is_ready = task.check_is_ready();
+        if is_ready {
             task.set_ready();
             task.set_in_blocked(false);
             task.set_need_check_reschedule(false);

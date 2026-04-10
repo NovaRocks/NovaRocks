@@ -635,9 +635,13 @@ fn lower_node_with_children(
         }
     };
 
-    if node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE
-        || is_scan_node_type(node.node_type)
-    {
+    // Attach probe runtime filter specs to scan nodes only.
+    // Exchange source nodes are cross-fragment data channels; attaching RF
+    // specs creates a RuntimeFilterProbe dependency that may never be
+    // satisfied in multi-fragment coordinated execution, causing pipeline
+    // hangs.  Runtime filters should be applied at the scan level in the
+    // producing fragment instead.
+    if is_scan_node_type(node.node_type) {
         if let Some(specs) = node
             .probe_runtime_filters
             .as_ref()
@@ -653,11 +657,7 @@ fn lower_node_with_children(
             })
         {
             if !specs.is_empty() {
-                if node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE {
-                    attach_probe_runtime_filter_specs_to_exchange(&mut lowered.node, &specs);
-                } else {
-                    attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
-                }
+                attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
             }
         }
     }

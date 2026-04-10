@@ -33,7 +33,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::exec::pipeline::schedule::observer::{Observable, Observer};
-use crate::novarocks_logging::debug;
 
 static NEXT_DEP_MANAGER_ID: AtomicUsize = AtomicUsize::new(1);
 static NEXT_DEP_ID: AtomicUsize = AtomicUsize::new(1);
@@ -94,14 +93,6 @@ impl Dependency {
         if !prev {
             let notify = self.observable.defer_notify();
             notify.arm();
-            if should_log_dep(&self.name) {
-                debug!(
-                    "Dependency ready: dep_id={} name={} observers={}",
-                    self.id,
-                    self.name,
-                    self.observable.num_observers()
-                );
-            }
         }
     }
 
@@ -110,21 +101,11 @@ impl Dependency {
     }
 
     pub fn add_waiter(&self, observer: Observer) {
-        let ready_before = self.is_ready();
-        if ready_before {
+        if self.is_ready() {
             observer();
             return;
         }
         self.observable.add_observer(observer);
-        if should_log_dep(&self.name) {
-            debug!(
-                "Dependency add_waiter: dep_id={} name={} ready_before={} observers_after={}",
-                self.id,
-                self.name,
-                ready_before,
-                self.observable.num_observers()
-            );
-        }
         if self.is_ready() {
             let notify = self.observable.defer_notify();
             notify.arm();
@@ -169,14 +150,6 @@ impl DependencyManager {
         let dep = self.get_or_create(name.to_string());
         dep.set_blocked();
     }
-}
-
-fn should_log_dep(name: &str) -> bool {
-    name.starts_with("join_build:")
-        || name.starts_with("broadcast_join_build:")
-        || name.starts_with("nljoin_build:")
-        || name.starts_with("local_exchange:")
-        || name.starts_with("local_rf:")
 }
 
 impl Default for DependencyManager {

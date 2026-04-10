@@ -252,7 +252,6 @@ impl Operator for ExchangeSourceOperator {
         }
         let receiver = exchange::get_receiver_handle(self.node.key, self.node.expected_senders)?;
         self.receiver = Some(receiver);
-        self.start = Some(Instant::now());
         debug!(
             "ExchangeSource prepared: finst={} node_id={} expected_senders={} timeout={:?}",
             self.node.key.finst_uuid(),

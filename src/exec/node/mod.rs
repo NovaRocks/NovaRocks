@@ -381,29 +381,13 @@ fn push_down_local_runtime_filters_inner(
             let filtered = filter_specs_for_child(arena, inherited, input);
             push_down_local_runtime_filters_inner(input, arena, &filtered);
         }
-        ExecNodeKind::ExchangeSource(exchange) => {
-            if inherited.is_empty() {
-                return;
-            }
-            let output_slots: HashSet<SlotId> = exchange
-                .expected_chunk_schema
-                .slot_ids()
-                .iter()
-                .copied()
-                .collect();
-            let filtered = filter_specs_by_output_slots(arena, inherited, &output_slots);
-            if filtered.is_empty() {
-                return;
-            }
-            let specs: Vec<RuntimeFilterProbeSpec> = filtered
-                .iter()
-                .map(|spec| RuntimeFilterProbeSpec {
-                    filter_id: spec.filter_id,
-                    expr_id: spec.expr_id,
-                    slot_id: spec.slot_id,
-                })
-                .collect();
-            exchange.add_runtime_filter_specs(&specs);
+        ExecNodeKind::ExchangeSource(_exchange) => {
+            // Do not push runtime filter specs to exchange source nodes.
+            // Exchange sources are cross-fragment data channels; runtime filters
+            // should be applied at the scan level in the producing fragment.
+            // Pushing specs here creates a RuntimeFilterProbe dependency that
+            // may never be satisfied in multi-fragment coordinated execution,
+            // causing the pipeline to hang.
         }
         ExecNodeKind::Scan(scan) => {
             if inherited.is_empty() {

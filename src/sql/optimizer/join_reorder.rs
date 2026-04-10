@@ -261,8 +261,8 @@ pub(crate) fn reorder_joins_cbo(
     table_stats: &HashMap<String, TableStatistics>,
 ) -> LogicalPlan {
     match plan {
-        LogicalPlan::Join(j) if j.join_type == JoinKind::Inner => {
-            // Try to extract a join graph from this chain of INNER JOINs.
+        LogicalPlan::Join(j) if matches!(j.join_type, JoinKind::Inner | JoinKind::Cross) => {
+            // Try to extract a join graph from this chain of INNER/CROSS JOINs.
             let full_plan = LogicalPlan::Join(j);
             match extract_join_graph(&full_plan) {
                 Some(graph) if graph.relations.len() >= 2 => {
@@ -394,9 +394,31 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
         .map(|r| collect_qualified_output_columns(r))
         .collect();
 
+    // Pre-process: factor common equi-join conditions out of OR predicates
+    // so the join graph sees them as independent binary predicates.
+    // e.g. (cd_demo_sk=ss_cdemo_sk AND ... OR cd_demo_sk=ss_cdemo_sk AND ...)
+    // → cd_demo_sk=ss_cdemo_sk (factored) + remaining OR
+    let mut expanded_predicates: Vec<TypedExpr> = Vec::new();
+    let all_cols: std::collections::HashSet<String> = relation_columns
+        .iter()
+        .flat_map(|s| s.iter().map(|r| r.1.clone()))
+        .collect();
+    for pred in raw_predicates {
+        let (factored, remaining) =
+            crate::sql::optimizer::predicate_pushdown::factor_common_eq_from_or_for_reorder(&pred);
+        if factored.is_empty() {
+            expanded_predicates.push(pred);
+        } else {
+            expanded_predicates.extend(factored);
+            if let Some(rem) = remaining {
+                expanded_predicates.push(rem);
+            }
+        }
+    }
+
     // Classify each predicate by which relations it touches.
     let mut predicates = Vec::new();
-    for pred in raw_predicates {
+    for pred in expanded_predicates {
         let refs = crate::sql::optimizer::expr_utils::collect_qualified_column_refs(&pred);
         let mut mask: u16 = 0;
         for qref in &refs {
@@ -415,21 +437,34 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
     })
 }
 
-/// Recursively flatten a tree of INNER JOINs into leaf relations and
-/// predicate conjuncts.
+/// Recursively flatten a tree of INNER/CROSS JOINs into leaf relations and
+/// predicate conjuncts.  CROSS JOINs (condition=None) are treated as INNER
+/// joins with no predicate, allowing the reorder algorithm to see all tables.
 fn flatten_inner_joins(
     plan: &LogicalPlan,
     relations: &mut Vec<LogicalPlan>,
     predicates: &mut Vec<TypedExpr>,
 ) {
     match plan {
-        LogicalPlan::Join(j) if j.join_type == JoinKind::Inner => {
+        LogicalPlan::Join(j) if matches!(j.join_type, JoinKind::Inner | JoinKind::Cross) => {
             flatten_inner_joins(&j.left, relations, predicates);
             flatten_inner_joins(&j.right, relations, predicates);
             if let Some(ref cond) = j.condition {
                 let conjuncts = split_and(cond.clone());
                 predicates.extend(conjuncts);
             }
+        }
+        // Absorb Filter nodes sitting on top of Inner/Cross joins so that
+        // their predicates participate in join reorder.
+        LogicalPlan::Filter(f)
+            if matches!(
+                f.input.as_ref(),
+                LogicalPlan::Join(j) if matches!(j.join_type, JoinKind::Inner | JoinKind::Cross)
+            ) =>
+        {
+            let conjuncts = split_and(f.predicate.clone());
+            predicates.extend(conjuncts);
+            flatten_inner_joins(&f.input, relations, predicates);
         }
         _ => {
             relations.push(plan.clone());

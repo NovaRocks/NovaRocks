@@ -7,6 +7,7 @@ import "lake_service.proto";
 
 service NovaRocksGrpc {
   rpc Exchange(stream ExchangeRequest) returns (stream ExchangeResponse);
+  rpc ExchangeUnary(ExchangeRequest) returns (ExchangeResponse);
   rpc TransmitRuntimeFilter(starrocks.PTransmitRuntimeFilterParams)
       returns (starrocks.PTransmitRuntimeFilterResult);
   rpc Lookup(starrocks.PLookUpRequest) returns (starrocks.PLookUpResponse);
