@@ -186,6 +186,14 @@ ORDER BY LAST_REFRESH_START_TIME DESC;
 -- query 27
 select TABLE_NAME, LAST_REFRESH_ERROR_CODE, IS_ACTIVE, INACTIVE_REASON from information_schema.materialized_views where TABLE_SCHEMA = 'test_show_materialized_view' and table_name like '%bad_name%' ORDER BY LAST_REFRESH_START_TIME DESC;
 
+-- query 27a
+select
+    TABLE_NAME,
+    if(LAST_REFRESH_TIME is null, 'null', 'not_null') as LAST_REFRESH_TIME_STATUS
+from information_schema.materialized_views
+where TABLE_SCHEMA = 'test_show_materialized_view' and table_name like '%user_tags_mv1%'
+ORDER BY LAST_REFRESH_START_TIME DESC;
+
 -- query 28
 -- @skip_result_check=true
 SELECT * FROM information_schema.materialized_views WHERE TABLE_SCHEMA = 'test_show_materialized_view' and table_name = 'user_tags_mv1';

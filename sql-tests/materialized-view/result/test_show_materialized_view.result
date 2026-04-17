@@ -51,4 +51,8 @@ user_tags_mv1	true	<empty>
 -- query 27
 TABLE_NAME	LAST_REFRESH_ERROR_CODE	IS_ACTIVE	INACTIVE_REASON
 
+-- query 27a
+TABLE_NAME	LAST_REFRESH_TIME_STATUS
+user_tags_mv1	not_null
+
 -- query 39

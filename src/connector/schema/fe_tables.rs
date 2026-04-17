@@ -1313,6 +1313,11 @@ fn build_materialized_view_row(info: &frontend_service::TMaterializedViewStatus)
         "LAST_REFRESH_JOB_ID",
         info.last_refresh_job_id.as_deref(),
     );
+    put_ts_text(
+        &mut row,
+        "LAST_REFRESH_TIME",
+        info.last_refresh_time.as_deref(),
+    );
     row
 }
 

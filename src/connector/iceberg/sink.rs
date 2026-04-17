@@ -313,8 +313,17 @@ impl IcebergTableSinkOperator {
         state: &RuntimeState,
         partition: &str,
     ) -> Result<(String, String), String> {
-        let base = normalize_path(&self.plan.data_location)?;
-        let base = base.trim_end_matches('/');
+        // Preserve the caller-supplied URI scheme (e.g. "file:///tmp/...") in the
+        // paths we return, so that:
+        //   1. FE's prefix check in IcebergMetadata.getIcebergRelativePartitionPath
+        //      sees a partition_path whose scheme matches tableDataLocation and the
+        //      raw startsWith succeeds.
+        //   2. The iceberg manifest entry stores the data file path in the same URI
+        //      form as the table's declared location, matching upstream StarRocks
+        //      BE behaviour (HdfsFileSystem preserves the scheme end-to-end).
+        // Scheme stripping for the actual local file write happens inside
+        // write_parquet_file instead of here.
+        let base = self.plan.data_location.trim_end_matches('/').to_string();
         let finst = state
             .fragment_instance_id()
             .map(|id| format!("{:x}_{:x}", id.hi, id.lo))
@@ -327,11 +336,13 @@ impl IcebergTableSinkOperator {
 
         if partition.is_empty() {
             let path = format!("{base}/{file_name}");
-            Ok((path.clone(), base.to_string()))
+            Ok((path, base))
         } else {
-            let partition_path = format!("{base}/{partition}");
-            let path = format!("{partition_path}{file_name}");
-            Ok((path, partition_path.trim_end_matches('/').to_string()))
+            let partition_path = format!("{base}/{partition}")
+                .trim_end_matches('/')
+                .to_string();
+            let path = format!("{partition_path}/{file_name}");
+            Ok((path, partition_path))
         }
     }
 }
@@ -736,7 +747,10 @@ fn write_parquet_file(
         return Ok(write_result);
     }
 
-    let path_buf = PathBuf::from(path);
+    // Local filesystem write: the path reported back to FE keeps its URI scheme
+    // (e.g. "file:///tmp/..."), but ::fs APIs need a bare posix path.
+    let local_path = normalize_path(path)?;
+    let path_buf = PathBuf::from(&local_path);
     if let Some(parent) = path_buf.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create parquet dir failed: {e}"))?;
     }
