@@ -43,6 +43,7 @@ pub fn load_expected_results(
     result_path: &Path,
     multi_step: bool,
     marker_re: &Regex,
+    single_step_query_number: Option<usize>,
 ) -> Option<BTreeMap<usize, ResultSet>> {
     use crate::parser::extract_query_number;
 
@@ -85,9 +86,16 @@ pub fn load_expected_results(
         return Some(result_sets);
     }
 
+    // Single-result mode: the entire file is the result of the one
+    // result-bearing step. Its query_number is supplied by the caller — the
+    // step may not be step 1 (e.g., CREATE/INSERT/.../SELECT puts SELECT at
+    // step 4). Falls back to 1 if the caller does not supply a number.
     let result_set =
         parse_result_set(&content.lines().map(ToString::to_string).collect::<Vec<_>>());
-    Some(BTreeMap::from([(1usize, result_set)]))
+    Some(BTreeMap::from([(
+        single_step_query_number.unwrap_or(1),
+        result_set,
+    )]))
 }
 
 pub fn write_result_file(
@@ -431,7 +439,37 @@ pub fn step_has_implicit_skip_result(step: &SqlStep) -> bool {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase();
-    normalized.starts_with("refresh materialized view ") && normalized.contains(" with sync mode")
+    if normalized.starts_with("refresh materialized view ") && normalized.contains(" with sync mode")
+    {
+        return true;
+    }
+    // DDL / DML statements do not produce recordable rowsets. Treat them as
+    // implicit skip_result_check so only real queries (SELECT/SHOW/WITH/etc.)
+    // need a recorded result set. This lets legacy tests that issue
+    // CREATE/INSERT/DROP before an assertion SELECT work without requiring
+    // every step to carry an explicit `-- @skip_result_check=true` marker.
+    const DDL_DML_PREFIXES: &[&str] = &[
+        "create ",
+        "drop ",
+        "alter ",
+        "truncate ",
+        "rename ",
+        "insert ",
+        "update ",
+        "delete ",
+        "merge ",
+        "set ",
+        "use ",
+        "grant ",
+        "revoke ",
+        "analyze ",
+        "refresh ",
+        "submit ",
+        "cancel ",
+    ];
+    DDL_DML_PREFIXES
+        .iter()
+        .any(|p| normalized.starts_with(p))
 }
 
 pub fn step_retry_count(step: &SqlStep) -> usize {

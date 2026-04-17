@@ -410,7 +410,21 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         };
     }
 
-    let multi_step = case.steps.len() > 1;
+    // multi_step here controls the recorded-result format, not step execution.
+    // Count only steps that need a recorded result set — DDL/DML and REFRESH
+    // MV steps are implicit-skip and do not contribute to the expected-result
+    // file structure.
+    let result_bearing_steps: Vec<&SqlStep> = case
+        .steps
+        .iter()
+        .filter(|step| step_requires_recorded_result(step))
+        .collect();
+    let multi_step = result_bearing_steps.len() > 1;
+    let single_step_query_number = if !multi_step {
+        result_bearing_steps.first().map(|s| s.query_number)
+    } else {
+        None
+    };
     let case_path = ctx
         .result_dir
         .as_ref()
@@ -482,7 +496,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     // --- load expected results ---
     let expected_results = if ctx.mode == Mode::Verify && ctx.verify_enabled {
         if let Some(path) = case_path.as_ref().filter(|p| p.exists()) {
-            match load_expected_results(path, multi_step, &ctx.marker_re) {
+            match load_expected_results(path, multi_step, &ctx.marker_re, single_step_query_number)
+            {
                 Some(results) => Some(results),
                 None => {
                     let _ = writeln!(
@@ -2033,7 +2048,7 @@ mod tests {
         fs::write(&path, "\n").expect("write empty file");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
         let loaded =
-            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
+            load_expected_results(&path, false, &marker_re, None).expect("must parse empty result file");
         let result_set = loaded.get(&1).expect("single-step result");
         assert!(result_set.header.is_empty());
         assert!(result_set.rows.is_empty());
@@ -2048,7 +2063,7 @@ mod tests {
         assert_eq!(content, "");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
         let loaded =
-            load_expected_results(&path, false, &marker_re).expect("must parse empty result file");
+            load_expected_results(&path, false, &marker_re, None).expect("must parse empty result file");
         let result_set = loaded.get(&1).expect("single-step result");
         assert!(result_set.header.is_empty());
         assert!(result_set.rows.is_empty());
@@ -2076,7 +2091,7 @@ mod tests {
             ),
         ]);
         write_result_file(&path, &result_sets, true).expect("write multi-step result file");
-        let loaded = load_expected_results(&path, true, &marker_re)
+        let loaded = load_expected_results(&path, true, &marker_re, None)
             .expect("must parse multi-step result file");
         assert_eq!(loaded, result_sets);
         let _ = fs::remove_file(path);
@@ -2087,7 +2102,7 @@ mod tests {
         let path = temp_result_path("bad_multi_step");
         fs::write(&path, "count(*)\n1\n").expect("write bad multi-step file");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, true, &marker_re);
+        let loaded = load_expected_results(&path, true, &marker_re, None);
         assert!(loaded.is_none());
         let _ = fs::remove_file(path);
     }
@@ -2101,7 +2116,7 @@ mod tests {
         )
         .expect("write result file");
         let marker_re = Regex::new(r"(?i)^--\s*query\s+(\d+)(?:\s+.*)?$").expect("marker regex");
-        let loaded = load_expected_results(&path, true, &marker_re).expect("load result");
+        let loaded = load_expected_results(&path, true, &marker_re, None).expect("load result");
         assert_eq!(
             loaded.get(&1).expect("query 1"),
             &ResultSet {
