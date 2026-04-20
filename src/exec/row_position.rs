@@ -58,12 +58,45 @@ pub fn is_lake_row_id(name: &str) -> bool {
     name.eq_ignore_ascii_case(LAKE_ROW_ID_COL)
 }
 
+// Iceberg v2 row-level DELETE virtual column names used by
+// `DeleteAnalyzer`'s `INSERT INTO iceberg_delete_sink SELECT _file, _pos, ...`
+// rewrite. `_file` is a per-scan-range constant delivered via
+// `THdfsScanRange.extended_columns`; `_pos` is per-row and the BE parquet
+// reader synthesizes it from the row's absolute position within the file.
+pub const ICEBERG_FILE_PATH_COL: &str = "_file";
+pub const ICEBERG_ROW_POS_COL: &str = "_pos";
+
+pub fn is_iceberg_file_path(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ICEBERG_FILE_PATH_COL)
+}
+
+pub fn is_iceberg_row_pos(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ICEBERG_ROW_POS_COL)
+}
+
 #[derive(Clone, Debug)]
 pub struct RowPositionDescriptor {
     pub row_position_type: descriptors::TRowPositionType,
     pub row_source_slot: SlotId,
     pub fetch_ref_slots: Vec<SlotId>,
     pub lookup_ref_slots: Vec<SlotId>,
+}
+
+/// Iceberg v2 virtual columns `_file` / `_pos` used by row-level DELETE.
+/// Both are optional: only the slots present in the SELECT list (and therefore
+/// in the scan-node output layout) are set.
+#[derive(Clone, Debug, Default)]
+pub struct IcebergVirtualSpec {
+    pub file_path_slot: Option<SlotId>,
+    pub row_pos_slot: Option<SlotId>,
+    pub file_path_field: Option<Field>,
+    pub row_pos_field: Option<Field>,
+}
+
+impl IcebergVirtualSpec {
+    pub fn is_empty(&self) -> bool {
+        self.file_path_slot.is_none() && self.row_pos_slot.is_none()
+    }
 }
 
 /// Row position spec for Iceberg V3 tables (scan_range_id + row_id).

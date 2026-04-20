@@ -37,6 +37,7 @@ use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanNode};
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::exec::row_position::IcebergVirtualSpec;
 use crate::exec::row_position::LakeRowPositionSpec;
 use crate::exec::row_position::RowPositionSpec;
 use crate::exec::runtime_filter::{
@@ -48,7 +49,7 @@ use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::types;
-use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array};
+use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -162,6 +163,7 @@ pub(super) struct ScanAsyncRunner {
     driver_id: i32,
     row_position_state: Option<RowPositionState>,
     lake_row_position_state: Option<LakeRowPositionState>,
+    iceberg_virtual_state: Option<IcebergVirtualState>,
 }
 
 struct RowPositionState {
@@ -175,6 +177,24 @@ struct LakeRowPositionState {
     spec: LakeRowPositionSpec,
     tablet_id: i64,
     range_idx: i32,
+    next_row_offset: i64,
+}
+
+/// Per-scan-range state that the Iceberg `_file` / `_pos` virtual columns
+/// draw from while chunks stream out.
+///
+/// - `file_path`: copied from the current morsel's `path` — every row in this
+///   scan range shares the same `_file` value (a parquet file produces one
+///   morsel in NovaRocks today; splits would need per-morsel accumulation,
+///   which this struct naturally gives because state is rebuilt per morsel).
+/// - `next_row_offset`: absolute row position within the underlying parquet
+///   file. Starts at `first_row_id` (0 when the morsel covers the whole file)
+///   and grows by the number of rows materialized so far. Predicate filters
+///   run later, so `_pos` captures the pre-filter position that row-level
+///   DELETE readers rely on.
+struct IcebergVirtualState {
+    spec: IcebergVirtualSpec,
+    file_path: String,
     next_row_offset: i64,
 }
 
@@ -213,6 +233,7 @@ impl ScanAsyncRunner {
             driver_id,
             row_position_state: None,
             lake_row_position_state: None,
+            iceberg_virtual_state: None,
         }
     }
 
@@ -320,12 +341,14 @@ impl ScanAsyncRunner {
                     self.current_morsel = None;
                     self.row_position_state = None;
                     self.lake_row_position_state = None;
+                    self.iceberg_virtual_state = None;
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
                 self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
+                self.iceberg_virtual_state = self.build_iceberg_virtual_state(&morsel)?;
                 let start = Instant::now();
                 self.morsel_iter = Some(
                     self.scan
@@ -351,6 +374,7 @@ impl ScanAsyncRunner {
                         failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
                         Duration::from_millis(25),
                     );
+                    let chunk = self.append_iceberg_virtual_columns(chunk)?;
                     let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
                         continue;
@@ -398,6 +422,7 @@ impl ScanAsyncRunner {
                     self.current_morsel = None;
                     self.row_position_state = None;
                     self.lake_row_position_state = None;
+                    self.iceberg_virtual_state = None;
                     self.last_progress = Instant::now();
                     continue;
                 }
@@ -465,6 +490,124 @@ impl ScanAsyncRunner {
             range_idx: i32::try_from(*index).unwrap_or(i32::MAX),
             next_row_offset: 0,
         })
+    }
+
+    fn build_iceberg_virtual_state(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<IcebergVirtualState>, String> {
+        let Some(spec) = self.scan.iceberg_virtual() else {
+            return Ok(None);
+        };
+        let ScanMorsel::FileRange {
+            path, first_row_id, ..
+        } = morsel
+        else {
+            return Err(
+                "iceberg _file/_pos virtual columns require file range morsels".to_string(),
+            );
+        };
+        Ok(Some(IcebergVirtualState {
+            spec: spec.clone(),
+            file_path: path.clone(),
+            next_row_offset: first_row_id.unwrap_or(0),
+        }))
+    }
+
+    fn append_iceberg_virtual_columns(&mut self, chunk: Chunk) -> Result<Chunk, String> {
+        let Some(state) = self.iceberg_virtual_state.as_mut() else {
+            return Ok(chunk);
+        };
+        let row_count = chunk.len();
+        if row_count == 0 {
+            return Ok(chunk);
+        }
+
+        // Pre-build the constant / row-indexed arrays up front so they can be
+        // cheaply cloned into the output regardless of slot order.
+        let file_path_array = state
+            .spec
+            .file_path_slot
+            .map(|_| Arc::new(StringArray::from(vec![state.file_path.as_str(); row_count])) as ArrayRef);
+        let pos_array = state.spec.row_pos_slot.map(|_| {
+            let start = state.next_row_offset;
+            let values: Vec<i64> = (0..row_count as i64).map(|i| start + i).collect();
+            Arc::new(Int64Array::from(values)) as ArrayRef
+        });
+        // `_pos` must capture the pre-filter absolute position, so advance the
+        // counter before any downstream predicates drop rows.
+        state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
+
+        let mut field_map = HashMap::new();
+        let chunk_schema = chunk.schema();
+        for (idx, slot_schema) in chunk.chunk_schema().slots().iter().enumerate() {
+            let field = chunk_schema.field(idx);
+            field_map.insert(slot_schema.slot_id(), (field, slot_schema.clone()));
+        }
+
+        let output_chunk_schema = self.scan.output_chunk_schema();
+        let output_slots = output_chunk_schema.slot_ids();
+        let mut fields = Vec::with_capacity(output_slots.len());
+        let mut columns = Vec::with_capacity(output_slots.len());
+        let mut slot_schemas = Vec::with_capacity(output_slots.len());
+        for slot_id in output_slots {
+            if Some(*slot_id) == state.spec.file_path_slot {
+                let field = state
+                    .spec
+                    .file_path_field
+                    .as_ref()
+                    .ok_or_else(|| "iceberg _file slot missing field metadata".to_string())?;
+                fields.push(field.clone());
+                columns.push(
+                    file_path_array
+                        .as_ref()
+                        .expect("file_path_array built when slot exists")
+                        .clone(),
+                );
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    field.name().clone(),
+                    field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::VARCHAR)),
+                    None,
+                ));
+                continue;
+            }
+            if Some(*slot_id) == state.spec.row_pos_slot {
+                let field = state
+                    .spec
+                    .row_pos_field
+                    .as_ref()
+                    .ok_or_else(|| "iceberg _pos slot missing field metadata".to_string())?;
+                fields.push(field.clone());
+                columns.push(
+                    pos_array
+                        .as_ref()
+                        .expect("pos_array built when slot exists")
+                        .clone(),
+                );
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    field.name().clone(),
+                    field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    None,
+                ));
+                continue;
+            }
+            let (field, slot_schema) = field_map.get(slot_id).ok_or_else(|| {
+                format!(
+                    "missing field for slot_id {} in iceberg virtual chunk assembly",
+                    slot_id
+                )
+            })?;
+            fields.push(field.as_ref().clone());
+            columns.push(chunk.column_by_slot_id(*slot_id)?);
+            slot_schemas.push(slot_schema.clone());
+        }
+
+        let _ = fields;
+        Chunk::try_new_with_columns(Arc::new(ChunkSchema::try_new(slot_schemas)?), columns)
     }
 
     fn append_row_position_columns(&mut self, chunk: Chunk) -> Result<Chunk, String> {

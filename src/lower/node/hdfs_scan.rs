@@ -45,6 +45,27 @@ pub(crate) fn cache_iceberg_table_locations(desc_tbl: Option<&descriptors::TDesc
     crate::connector::iceberg::cache_iceberg_table_locations(desc_tbl);
 }
 
+/// Build a `ChunkSchema` covering only the given slot ids, preserving their
+/// order and copying per-slot metadata from `parent`. Used to expose a
+/// physical-columns-only schema to the parquet reader when the scan node's
+/// output layout also includes synthesized virtual columns.
+fn sub_chunk_schema(
+    _desc_tbl: &descriptors::TDescriptorTable,
+    slot_ids: &[crate::common::ids::SlotId],
+    parent: &crate::exec::chunk::ChunkSchemaRef,
+) -> Result<crate::exec::chunk::ChunkSchemaRef, String> {
+    let mut slots = Vec::with_capacity(slot_ids.len());
+    for slot_id in slot_ids {
+        let slot = parent
+            .slot(*slot_id)
+            .ok_or_else(|| format!("parquet chunk schema missing slot_id {}", slot_id))?;
+        slots.push(slot.clone());
+    }
+    Ok(std::sync::Arc::new(
+        crate::exec::chunk::ChunkSchema::try_new(slots)?,
+    ))
+}
+
 fn apply_path_rewrite(ranges: &mut [FileScanRange]) -> Result<(), String> {
     let cfg = match novarocks_app_config() {
         Ok(cfg) => cfg,
@@ -349,6 +370,10 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut row_source_field: Option<arrow::datatypes::Field> = None;
     let mut scan_range_field: Option<arrow::datatypes::Field> = None;
     let mut row_id_field: Option<arrow::datatypes::Field> = None;
+    let mut iceberg_virtual_file_slot: Option<SlotId> = None;
+    let mut iceberg_virtual_pos_slot: Option<SlotId> = None;
+    let mut iceberg_virtual_file_field: Option<arrow::datatypes::Field> = None;
+    let mut iceberg_virtual_pos_field: Option<arrow::datatypes::Field> = None;
 
     for (tuple_id, slot_id) in &out_layout.order {
         let slot_id = SlotId::try_from(*slot_id)?;
@@ -389,6 +414,28 @@ pub(crate) fn lower_hdfs_scan_node(
             }
             row_id_slot = Some(slot_id);
             row_id_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            continue;
+        }
+        if crate::exec::row_position::is_iceberg_file_path(&name) {
+            if primitive != types::TPrimitiveType::VARCHAR {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} _file slot_id={} expects VARCHAR, got {:?}",
+                    node.node_id, slot_id, primitive
+                ));
+            }
+            iceberg_virtual_file_slot = Some(slot_id);
+            iceberg_virtual_file_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            continue;
+        }
+        if crate::exec::row_position::is_iceberg_row_pos(&name) {
+            if primitive != types::TPrimitiveType::BIGINT {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} _pos slot_id={} expects BIGINT, got {:?}",
+                    node.node_id, slot_id, primitive
+                ));
+            }
+            iceberg_virtual_pos_slot = Some(slot_id);
+            iceberg_virtual_pos_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
 
@@ -854,9 +901,15 @@ pub(crate) fn lower_hdfs_scan_node(
         .transpose()?
         .flatten();
     let output_chunk_schema = chunk_schema_for_layout(desc_tbl, &out_layout)?;
+    // Parquet reader only materializes physical data columns (iceberg `_file` /
+    // `_pos` are synthesized by the scan runner afterwards), so its chunk
+    // schema must omit virtual-column slots to keep the column-count check on
+    // the parquet side happy.
+    let parquet_chunk_schema =
+        sub_chunk_schema(desc_tbl, &data_slot_ids, &output_chunk_schema)?;
     let parquet_cfg = ParquetScanConfig {
         columns: data_columns,
-        chunk_schema: output_chunk_schema.clone(),
+        chunk_schema: parquet_chunk_schema,
         slot_types: data_slot_types,
         case_sensitive,
         enable_page_index,
@@ -931,6 +984,12 @@ pub(crate) fn lower_hdfs_scan_node(
         .with_row_position(row_position_spec)
         .with_row_position_scan(row_position_scan)
         .with_row_position_ranges(row_position_ranges)
+        .with_iceberg_virtual(Some(crate::exec::row_position::IcebergVirtualSpec {
+            file_path_slot: iceberg_virtual_file_slot,
+            row_pos_slot: iceberg_virtual_pos_slot,
+            file_path_field: iceberg_virtual_file_field,
+            row_pos_field: iceberg_virtual_pos_field,
+        }))
         .with_local_rf_waiting_set(local_rf_waiting_set(node));
     Ok(Lowered {
         node: ExecNode {

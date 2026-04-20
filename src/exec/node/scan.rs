@@ -23,7 +23,7 @@ use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::{BoxedExecIter, RuntimeFilterProbeSpec};
-use crate::exec::row_position::{LakeRowPositionSpec, RowPositionSpec};
+use crate::exec::row_position::{IcebergVirtualSpec, LakeRowPositionSpec, RowPositionSpec};
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::fs::scan_context::FileScanRange;
 use crate::internal_service;
@@ -249,6 +249,7 @@ pub struct ScanNode {
     row_position_ranges: Option<Vec<FileScanRange>>,
     lake_row_position: Option<LakeRowPositionSpec>,
     lake_glm_info: Option<LakeGlmScanInfo>,
+    iceberg_virtual: Option<IcebergVirtualSpec>,
 }
 
 impl ScanNode {
@@ -268,6 +269,7 @@ impl ScanNode {
             row_position_ranges: None,
             lake_row_position: None,
             lake_glm_info: None,
+            iceberg_virtual: None,
         }
     }
 
@@ -339,6 +341,11 @@ impl ScanNode {
         self
     }
 
+    pub fn with_iceberg_virtual(mut self, spec: Option<IcebergVirtualSpec>) -> Self {
+        self.iceberg_virtual = spec.filter(|s| !s.is_empty());
+        self
+    }
+
     pub fn node_id(&self) -> Option<i32> {
         self.node_id
     }
@@ -398,6 +405,10 @@ impl ScanNode {
 
     pub fn lake_glm_info(&self) -> Option<&LakeGlmScanInfo> {
         self.lake_glm_info.as_ref()
+    }
+
+    pub fn iceberg_virtual(&self) -> Option<&IcebergVirtualSpec> {
+        self.iceberg_virtual.as_ref()
     }
 
     pub fn add_runtime_filter_specs(&mut self, specs: &[RuntimeFilterProbeSpec]) {
