@@ -498,19 +498,33 @@ pub(crate) fn execute_fragment(
                     backend_num,
                 )?;
             }
-            data_sinks::TDataSinkType::ICEBERG_TABLE_SINK => {
+            data_sinks::TDataSinkType::ICEBERG_TABLE_SINK
+            | data_sinks::TDataSinkType::ICEBERG_DELETE_SINK => {
+                let sink_type_name = if sink.type_ == data_sinks::TDataSinkType::ICEBERG_DELETE_SINK
+                {
+                    "ICEBERG_DELETE_SINK"
+                } else {
+                    "ICEBERG_TABLE_SINK"
+                };
                 let iceberg_sink = sink.iceberg_table_sink.as_ref().ok_or_else(|| {
-                    "ICEBERG_TABLE_SINK missing iceberg_table_sink payload".to_string()
+                    format!("{sink_type_name} missing iceberg_table_sink payload")
                 })?;
                 let output_exprs = fragment
                     .output_exprs
                     .as_ref()
-                    .ok_or_else(|| "ICEBERG_TABLE_SINK missing output_exprs".to_string())?;
+                    .ok_or_else(|| format!("{sink_type_name} missing output_exprs"))?;
                 let desc_tbl = desc_tbl
-                    .ok_or_else(|| "ICEBERG_TABLE_SINK requires descriptor table".to_string())?;
+                    .ok_or_else(|| format!("{sink_type_name} requires descriptor table"))?;
+
+                let mode = if sink.type_ == data_sinks::TDataSinkType::ICEBERG_DELETE_SINK {
+                    crate::connector::iceberg::sink::IcebergSinkMode::PositionDeletes
+                } else {
+                    crate::connector::iceberg::sink::IcebergSinkMode::Data
+                };
 
                 let sink_factory = IcebergTableSinkFactory::try_new(
                     iceberg_sink.clone(),
+                    mode,
                     output_exprs,
                     &lowered.layout,
                     desc_tbl,

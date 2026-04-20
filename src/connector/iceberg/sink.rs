@@ -35,18 +35,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray, UInt32Array,
+    Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use base64::Engine;
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::data_type::AsBytes;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::{Statistics, ValueStatistics};
+
+// Iceberg spec v2: reserved field ids used by position-delete files. Reader
+// implementations in Spark/Trino/Flink key off these ids, so they must be
+// preserved exactly in the parquet file metadata.
+const ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID: i32 = 2_147_483_546;
+const ICEBERG_POSITION_DELETE_POS_FIELD_ID: i32 = 2_147_483_545;
+const ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN: &str = "file_path";
+const ICEBERG_POSITION_DELETE_POS_COLUMN: &str = "pos";
 
 use super::schema::build_full_output_schema;
 use crate::exec::chunk::Chunk;
@@ -60,6 +68,16 @@ use crate::runtime::runtime_state::RuntimeState;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::{data_sinks, descriptors, exprs, types};
 
+/// Selects which kind of Iceberg file this sink writes. The caller picks the
+/// mode based on the upstream `TDataSinkType` (`ICEBERG_TABLE_SINK` →
+/// `Data`, `ICEBERG_DELETE_SINK` → `PositionDeletes`), so the sink struct
+/// doesn't have to parse anything extra out of the thrift payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcebergSinkMode {
+    Data,
+    PositionDeletes,
+}
+
 #[derive(Clone)]
 /// Factory for Iceberg table sinks that write output chunks into committed table files.
 pub struct IcebergTableSinkFactory {
@@ -70,11 +88,23 @@ pub struct IcebergTableSinkFactory {
 
 #[derive(Clone)]
 struct IcebergSinkPlan {
+    /// Chooses between data-file and position-delete write paths. Derived
+    /// from the upstream `TDataSinkType` by the caller of `try_new`.
+    mode: IcebergSinkMode,
     data_location: String,
     object_store_s3: Option<S3StoreConfig>,
     file_format: String,
     compression: types::TCompressionType,
+    /// For `DATA` sinks this is the full iceberg column schema the writer
+    /// materializes. For `POSITION_DELETES` sinks this is always the fixed
+    /// `[file_path, pos]` parquet schema the Iceberg v2 spec mandates; the
+    /// writer only materializes the first two entries of `output_exprs`.
     output_schema: SchemaRef,
+    /// For `DATA` sinks: one expression per iceberg data column.
+    /// For `POSITION_DELETES` sinks: `[file_path_expr, pos_expr,
+    /// partition_source_expr_0, partition_source_expr_1, ...]` — the partition
+    /// source columns remain available for transform evaluation routing even
+    /// though they never reach the output parquet file.
     output_exprs: Vec<ExprId>,
     partition_exprs: Vec<ExprId>,
     partition_column_names: Vec<String>,
@@ -84,6 +114,7 @@ struct IcebergSinkPlan {
 impl IcebergTableSinkFactory {
     pub(crate) fn try_new(
         sink: data_sinks::TIcebergTableSink,
+        mode: IcebergSinkMode,
         output_exprs: &[exprs::TExpr],
         layout: &Layout,
         desc_tbl: &descriptors::TDescriptorTable,
@@ -95,18 +126,36 @@ impl IcebergTableSinkFactory {
             lower_output_exprs(output_exprs, &mut arena, layout, last_query_id, fe_addr)?;
 
         let iceberg_table = resolve_iceberg_table(desc_tbl, sink.target_table_id)?;
-        let output_schema = build_output_schema(&iceberg_table)?;
-
-        if output_exprs.len() != output_schema.fields().len() {
-            return Err(format!(
-                "iceberg sink output expr count mismatch: exprs={} columns={}",
-                output_exprs.len(),
-                output_schema.fields().len()
-            ));
-        }
 
         let (partition_column_names, transform_exprs, mut partition_exprs) =
             build_partition_exprs(&iceberg_table)?;
+
+        let output_schema = match mode {
+            IcebergSinkMode::Data => {
+                let schema = build_output_schema(&iceberg_table)?;
+                if output_exprs.len() != schema.fields().len() {
+                    return Err(format!(
+                        "iceberg sink output expr count mismatch: exprs={} columns={}",
+                        output_exprs.len(),
+                        schema.fields().len()
+                    ));
+                }
+                schema
+            }
+            IcebergSinkMode::PositionDeletes => {
+                let expected = 2 + partition_column_names.len();
+                if output_exprs.len() != expected {
+                    return Err(format!(
+                        "iceberg position-delete sink expects {} output exprs \
+                        (file_path, pos, <{} partition cols>); got {}",
+                        expected,
+                        partition_column_names.len(),
+                        output_exprs.len(),
+                    ));
+                }
+                build_position_delete_output_schema()
+            }
+        };
         if !partition_exprs.is_empty() {
             let slot_map = build_column_slot_map(
                 output_exprs,
@@ -133,6 +182,7 @@ impl IcebergTableSinkFactory {
         }
 
         let plan = IcebergSinkPlan {
+            mode,
             data_location,
             object_store_s3,
             file_format,
@@ -218,42 +268,77 @@ impl ProcessorOperator for IcebergTableSinkOperator {
         if chunk.is_empty() {
             return Ok(());
         }
+        match self.plan.mode {
+            IcebergSinkMode::Data => self.push_chunk_data(state, chunk),
+            IcebergSinkMode::PositionDeletes => self.push_chunk_position_delete(state, chunk),
+        }
+    }
 
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        Ok(None)
+    }
+
+    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl IcebergTableSinkOperator {
+    fn build_file_path(
+        &mut self,
+        state: &RuntimeState,
+        partition: &str,
+    ) -> Result<(String, String), String> {
+        self.build_file_path_with_prefix(state, partition, "data")
+    }
+
+    fn build_file_path_with_prefix(
+        &mut self,
+        state: &RuntimeState,
+        partition: &str,
+        prefix: &str,
+    ) -> Result<(String, String), String> {
+        // Preserve the caller-supplied URI scheme (e.g. "file:///tmp/...") in the
+        // paths we return, so that:
+        //   1. FE's prefix check in IcebergMetadata.getIcebergRelativePartitionPath
+        //      sees a partition_path whose scheme matches tableDataLocation and the
+        //      raw startsWith succeeds.
+        //   2. The iceberg manifest entry stores the data file path in the same URI
+        //      form as the table's declared location, matching upstream StarRocks
+        //      BE behaviour (HdfsFileSystem preserves the scheme end-to-end).
+        // Scheme stripping for the actual local file write happens inside
+        // write_parquet_file instead of here.
+        let base = self.plan.data_location.trim_end_matches('/').to_string();
+        let finst = state
+            .fragment_instance_id()
+            .map(|id| format!("{:x}_{:x}", id.hi, id.lo))
+            .unwrap_or_else(|| "finst_unknown".to_string());
+        let file_name = format!(
+            "{}-{}-driver{}-{}.parquet",
+            prefix, finst, self.driver_id, self.file_seq
+        );
+        self.file_seq = self.file_seq.saturating_add(1);
+
+        if partition.is_empty() {
+            let path = format!("{base}/{file_name}");
+            Ok((path, base))
+        } else {
+            let partition_path = format!("{base}/{partition}")
+                .trim_end_matches('/')
+                .to_string();
+            let path = format!("{partition_path}/{file_name}");
+            Ok((path, partition_path))
+        }
+    }
+
+    fn push_chunk_data(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
         let output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, &chunk)?;
         let output_arrays = align_arrays_to_schema(output_arrays, &self.plan.output_schema)?;
         let batch = RecordBatch::try_new(Arc::clone(&self.plan.output_schema), output_arrays)
             .map_err(|e| format!("iceberg sink build batch failed: {e}"))?;
 
-        let mut partition_groups = HashMap::new();
-        if self.plan.partition_exprs.is_empty() {
-            partition_groups.insert(
-                PartitionKey::default(),
-                PartitionGroup {
-                    indices: (0..batch.num_rows() as u32).collect(),
-                },
-            );
-        } else {
-            let partition_arrays = eval_exprs(&self.arena, &self.plan.partition_exprs, &chunk)?;
-            for row in 0..batch.num_rows() {
-                let (partition, fingerprint) = iceberg_partition_key_for_row(
-                    &self.plan.partition_column_names,
-                    &self.plan.transform_exprs,
-                    &partition_arrays,
-                    row,
-                )?;
-                let key = PartitionKey {
-                    path: partition,
-                    null_fingerprint: fingerprint,
-                };
-                partition_groups
-                    .entry(key)
-                    .or_insert_with(|| PartitionGroup {
-                        indices: Vec::new(),
-                    })
-                    .indices
-                    .push(row as u32);
-            }
-        }
+        let partition_groups = self.partition_group_indices(&chunk, batch.num_rows())?;
 
         for (key, group) in partition_groups {
             let indices = UInt32Array::from(group.indices);
@@ -297,54 +382,171 @@ impl ProcessorOperator for IcebergTableSinkOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
-        Ok(None)
+    fn push_chunk_position_delete(
+        &mut self,
+        state: &RuntimeState,
+        chunk: Chunk,
+    ) -> Result<(), String> {
+        // output_exprs is [file_path_expr, pos_expr, partition_source_expr_0, ...].
+        // We only materialize the first two into the parquet file; the remaining
+        // expressions are kept around so that `plan.partition_exprs` (which were
+        // rewritten to reference the partition source SLOT_REFs in try_new) can
+        // be evaluated against `chunk` on the existing DATA-sink code path.
+        let all_output_arrays = eval_exprs(&self.arena, &self.plan.output_exprs, &chunk)?;
+        if all_output_arrays.len() < 2 {
+            return Err(format!(
+                "iceberg position-delete sink expected at least 2 output arrays, got {}",
+                all_output_arrays.len()
+            ));
+        }
+        let file_path_pos_arrays = vec![all_output_arrays[0].clone(), all_output_arrays[1].clone()];
+        let delete_arrays = align_arrays_to_schema(file_path_pos_arrays, &self.plan.output_schema)?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.plan.output_schema), delete_arrays)
+            .map_err(|e| format!("iceberg position-delete sink build batch failed: {e}"))?;
+
+        let partition_groups = self.partition_group_indices(&chunk, batch.num_rows())?;
+
+        for (key, group) in partition_groups {
+            // Sort indices by (file_path, pos) to produce a well-ordered
+            // position-delete file. Iceberg readers rely on this ordering to do
+            // binary search when the referenced data file is uniform; mixed-file
+            // delete files still benefit from locality.
+            let mut sortable: Vec<u32> = group.indices;
+            let file_path_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    "iceberg position-delete sink: file_path array expected as Utf8".to_string()
+                })?;
+            let pos_col = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    "iceberg position-delete sink: pos array expected as Int64".to_string()
+                })?;
+            if file_path_col.null_count() > 0 || pos_col.null_count() > 0 {
+                return Err(
+                    "iceberg position-delete sink rejects NULL file_path or pos".to_string()
+                );
+            }
+            sortable.sort_by(|a, b| {
+                let a = *a as usize;
+                let b = *b as usize;
+                match file_path_col.value(a).cmp(file_path_col.value(b)) {
+                    Ordering::Equal => pos_col.value(a).cmp(&pos_col.value(b)),
+                    other => other,
+                }
+            });
+
+            let indices = UInt32Array::from(sortable);
+            let part_batch = arrow::compute::take_record_batch(&batch, &indices)
+                .map_err(|e| format!("iceberg position-delete sink take batch failed: {e}"))?;
+            if part_batch.num_rows() == 0 {
+                continue;
+            }
+            let (file_path, partition_path) =
+                self.build_file_path_with_prefix(state, &key.path, "delete")?;
+            let write_result = write_parquet_file(
+                &file_path,
+                self.plan.object_store_s3.as_ref(),
+                Arc::clone(&self.plan.output_schema),
+                &part_batch,
+                self.plan.compression,
+            )?;
+
+            // Iceberg spec allows `referenced_data_file` to be populated only
+            // when every position in this delete file points at the same data
+            // file. Readers use it to prune delete files at plan time.
+            let referenced_data_file = unique_file_path(&part_batch)?;
+
+            let data_file = types::TIcebergDataFile {
+                path: Some(file_path),
+                format: Some(self.plan.file_format.clone()),
+                record_count: Some(part_batch.num_rows() as i64),
+                file_size_in_bytes: Some(write_result.file_size as i64),
+                partition_path: Some(partition_path),
+                split_offsets: write_result.split_offsets,
+                column_stats: write_result.column_stats,
+                partition_null_fingerprint: Some(key.null_fingerprint),
+                file_content: Some(types::TIcebergFileContent::POSITION_DELETES),
+                referenced_data_file,
+            };
+
+            let commit_info = types::TSinkCommitInfo {
+                iceberg_data_file: Some(data_file),
+                hive_file_info: None,
+                is_overwrite: None,
+                staging_dir: None,
+                is_rewrite: None,
+            };
+            state.add_sink_commit_info(commit_info);
+        }
+
+        Ok(())
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        self.finished = true;
-        Ok(())
+    fn partition_group_indices(
+        &self,
+        chunk: &Chunk,
+        num_rows: usize,
+    ) -> Result<HashMap<PartitionKey, PartitionGroup>, String> {
+        let mut partition_groups = HashMap::new();
+        if self.plan.partition_exprs.is_empty() {
+            partition_groups.insert(
+                PartitionKey::default(),
+                PartitionGroup {
+                    indices: (0..num_rows as u32).collect(),
+                },
+            );
+            return Ok(partition_groups);
+        }
+        let partition_arrays = eval_exprs(&self.arena, &self.plan.partition_exprs, chunk)?;
+        for row in 0..num_rows {
+            let (partition, fingerprint) = iceberg_partition_key_for_row(
+                &self.plan.partition_column_names,
+                &self.plan.transform_exprs,
+                &partition_arrays,
+                row,
+            )?;
+            let key = PartitionKey {
+                path: partition,
+                null_fingerprint: fingerprint,
+            };
+            partition_groups
+                .entry(key)
+                .or_insert_with(|| PartitionGroup {
+                    indices: Vec::new(),
+                })
+                .indices
+                .push(row as u32);
+        }
+        Ok(partition_groups)
     }
 }
 
-impl IcebergTableSinkOperator {
-    fn build_file_path(
-        &mut self,
-        state: &RuntimeState,
-        partition: &str,
-    ) -> Result<(String, String), String> {
-        // Preserve the caller-supplied URI scheme (e.g. "file:///tmp/...") in the
-        // paths we return, so that:
-        //   1. FE's prefix check in IcebergMetadata.getIcebergRelativePartitionPath
-        //      sees a partition_path whose scheme matches tableDataLocation and the
-        //      raw startsWith succeeds.
-        //   2. The iceberg manifest entry stores the data file path in the same URI
-        //      form as the table's declared location, matching upstream StarRocks
-        //      BE behaviour (HdfsFileSystem preserves the scheme end-to-end).
-        // Scheme stripping for the actual local file write happens inside
-        // write_parquet_file instead of here.
-        let base = self.plan.data_location.trim_end_matches('/').to_string();
-        let finst = state
-            .fragment_instance_id()
-            .map(|id| format!("{:x}_{:x}", id.hi, id.lo))
-            .unwrap_or_else(|| "finst_unknown".to_string());
-        let file_name = format!(
-            "data-{}-driver{}-{}.parquet",
-            finst, self.driver_id, self.file_seq
-        );
-        self.file_seq = self.file_seq.saturating_add(1);
-
-        if partition.is_empty() {
-            let path = format!("{base}/{file_name}");
-            Ok((path, base))
-        } else {
-            let partition_path = format!("{base}/{partition}")
-                .trim_end_matches('/')
-                .to_string();
-            let path = format!("{partition_path}/{file_name}");
-            Ok((path, partition_path))
+/// Returns the single file_path referenced by every row in a position-delete
+/// batch, or `None` when multiple distinct data files are referenced.
+///
+/// Iceberg spec `referenced_data_file` is only safe to populate in the
+/// uniform-reference case.
+fn unique_file_path(batch: &RecordBatch) -> Result<Option<String>, String> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    let file_path_col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "position-delete batch missing file_path Utf8 column".to_string())?;
+    let first = file_path_col.value(0);
+    for row in 1..batch.num_rows() {
+        if file_path_col.value(row) != first {
+            return Ok(None);
         }
     }
+    Ok(Some(first.to_string()))
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -486,6 +688,32 @@ fn resolve_iceberg_table(
 
 fn build_output_schema(iceberg: &descriptors::TIcebergTable) -> Result<SchemaRef, String> {
     build_full_output_schema(iceberg)
+}
+
+/// Arrow/parquet schema for an Iceberg v2 position-delete file.
+///
+/// Iceberg spec mandates `file_path: required string (field_id=2147483546)` and
+/// `pos: required long (field_id=2147483545)`. External engines (Spark, Trino,
+/// Flink) key off these exact field ids, so they must be preserved verbatim in
+/// the parquet file-level schema metadata. `nullable=false` maps to
+/// Iceberg-spec `required`.
+fn build_position_delete_output_schema() -> SchemaRef {
+    let file_path = Field::new(
+        ICEBERG_POSITION_DELETE_FILE_PATH_COLUMN,
+        DataType::Utf8,
+        false,
+    )
+    .with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string(),
+    )]));
+    let pos = Field::new(ICEBERG_POSITION_DELETE_POS_COLUMN, DataType::Int64, false).with_metadata(
+        HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string(),
+        )]),
+    );
+    Arc::new(Schema::new(vec![file_path, pos]))
 }
 
 fn build_partition_exprs(
@@ -1208,7 +1436,15 @@ mod tests {
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
 
-    use super::{align_arrays_to_schema, iceberg_partition_key_for_row, write_parquet_to_bytes};
+    use arrow::array::StringArray;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    use super::{
+        ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID, ICEBERG_POSITION_DELETE_POS_FIELD_ID,
+        align_arrays_to_schema, build_position_delete_output_schema, iceberg_partition_key_for_row,
+        unique_file_path, write_parquet_to_bytes,
+    };
 
     #[test]
     fn test_align_arrays_to_schema_casts_int64_to_int32() {
@@ -1336,5 +1572,176 @@ mod tests {
 
         assert_eq!(value_counts.get(&1), Some(&1));
         assert_eq!(null_value_counts.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn test_position_delete_schema_carries_iceberg_field_ids() {
+        let schema = build_position_delete_output_schema();
+        assert_eq!(schema.fields().len(), 2);
+
+        let file_path_field = schema.field(0);
+        assert_eq!(file_path_field.name(), "file_path");
+        assert_eq!(file_path_field.data_type(), &DataType::Utf8);
+        assert!(!file_path_field.is_nullable());
+        assert_eq!(
+            file_path_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID.to_string()),
+        );
+
+        let pos_field = schema.field(1);
+        assert_eq!(pos_field.name(), "pos");
+        assert_eq!(pos_field.data_type(), &DataType::Int64);
+        assert!(!pos_field.is_nullable());
+        assert_eq!(
+            pos_field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&ICEBERG_POSITION_DELETE_POS_FIELD_ID.to_string()),
+        );
+    }
+
+    #[test]
+    fn test_position_delete_parquet_preserves_spec_field_ids() {
+        // Round-trip check: write a position-delete batch out to parquet bytes
+        // and confirm the parquet file-level schema exposes the Iceberg-spec
+        // field ids. External engines (Spark/Trino) key off these exact ids.
+        let schema = build_position_delete_output_schema();
+        let file_paths = Arc::new(StringArray::from(vec![
+            "s3://b/path/data-a.parquet",
+            "s3://b/path/data-a.parquet",
+        ]));
+        let positions = Arc::new(Int64Array::from(vec![0_i64, 5]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![file_paths, positions])
+            .expect("build record batch");
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let (bytes, _write_result) =
+            write_parquet_to_bytes(Arc::clone(&schema), &batch, props).expect("write parquet");
+
+        let reader =
+            SerializedFileReader::new(bytes::Bytes::from(bytes)).expect("open parquet bytes");
+        let schema_desc = reader.metadata().file_metadata().schema_descr();
+        let columns = schema_desc.columns();
+        assert_eq!(columns.len(), 2);
+        // Parquet ColumnDescriptor carries the field_id from SchemaElement::field_id.
+        assert_eq!(
+            columns[0].self_type().get_basic_info().id(),
+            ICEBERG_POSITION_DELETE_FILE_PATH_FIELD_ID
+        );
+        assert_eq!(
+            columns[1].self_type().get_basic_info().id(),
+            ICEBERG_POSITION_DELETE_POS_FIELD_ID
+        );
+    }
+
+    #[test]
+    fn test_position_delete_parquet_roundtrip_values() {
+        // Ensures the file_path / pos values survive write + read and that the
+        // ArrowReader can reconstruct them. Ordering by (file_path, pos) is the
+        // writer's responsibility; this test just validates the write plumbing.
+        let schema = build_position_delete_output_schema();
+        let file_paths = Arc::new(StringArray::from(vec!["s3://b/a", "s3://b/a", "s3://b/b"]));
+        let positions = Arc::new(Int64Array::from(vec![1_i64, 7, 0]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![file_paths, positions])
+            .expect("build record batch");
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let (bytes, _) =
+            write_parquet_to_bytes(Arc::clone(&schema), &batch, props).expect("write parquet");
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+            .expect("builder")
+            .build()
+            .expect("reader");
+        let mut out = Vec::new();
+        for rb in reader {
+            out.push(rb.expect("batch"));
+        }
+        assert_eq!(out.len(), 1);
+        let rb = &out[0];
+        assert_eq!(rb.num_rows(), 3);
+        let fp = rb
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("fp col");
+        let pos = rb
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("pos col");
+        assert_eq!(fp.value(0), "s3://b/a");
+        assert_eq!(pos.value(2), 0);
+    }
+
+    #[test]
+    fn test_position_delete_writes_on_disk_for_external_verification() {
+        // Drop a real parquet file under a known path so external tools
+        // (pyarrow / pyiceberg / Spark) can cross-check the Iceberg spec
+        // invariants (field_ids, required-ness, values) produced by this
+        // writer. Skips cleanly when the target directory is not writable.
+        let dir = std::env::var_os("NOVAROCKS_POS_DELETE_E2E_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/novarocks-pos-delete-e2e"));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let schema = build_position_delete_output_schema();
+        let file_paths = Arc::new(StringArray::from(vec![
+            "s3://bucket/data-a.parquet",
+            "s3://bucket/data-a.parquet",
+            "s3://bucket/data-b.parquet",
+        ]));
+        let positions = Arc::new(Int64Array::from(vec![0_i64, 5, 3]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![file_paths, positions])
+            .expect("build record batch");
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let (bytes, _) = write_parquet_to_bytes(Arc::clone(&schema), &batch, props).unwrap();
+
+        let path = dir.join("e2e_position_delete.parquet");
+        std::fs::write(&path, &bytes).expect("write parquet tmp file");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_unique_file_path_uniform_and_mixed() {
+        let schema = build_position_delete_output_schema();
+
+        let uniform = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["s3://b/a", "s3://b/a"])),
+                Arc::new(Int64Array::from(vec![0_i64, 5])),
+            ],
+        )
+        .expect("uniform batch");
+        assert_eq!(
+            unique_file_path(&uniform).expect("uniform"),
+            Some("s3://b/a".to_string()),
+        );
+
+        let mixed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["s3://b/a", "s3://b/b"])),
+                Arc::new(Int64Array::from(vec![0_i64, 0])),
+            ],
+        )
+        .expect("mixed batch");
+        assert_eq!(unique_file_path(&mixed).expect("mixed"), None);
+
+        let empty = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(Vec::<&str>::new())),
+                Arc::new(Int64Array::from(Vec::<i64>::new())),
+            ],
+        )
+        .expect("empty batch");
+        assert_eq!(unique_file_path(&empty).expect("empty"), None);
     }
 }
