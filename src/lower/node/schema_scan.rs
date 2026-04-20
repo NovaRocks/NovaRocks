@@ -292,7 +292,6 @@ mod tests {
             cross_join_node: None,
             lake_scan_node: None,
             nestloop_join_node: None,
-            starrocks_scan_node: None,
             stream_scan_node: None,
             stream_join_node: None,
             stream_agg_node: None,
@@ -300,6 +299,7 @@ mod tests {
             fetch_node: None,
             look_up_node: None,
             benchmark_scan_node: None,
+            cache_stats_scan_node: None,
         }
     }
 

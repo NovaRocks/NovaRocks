@@ -86,6 +86,8 @@ pub(crate) fn forward_show_result(
             .and_then(|thread_id| i32::try_from(thread_id).ok()),
         None::<i64>,
         Some(true),
+        None::<bool>,
+        None::<Vec<String>>,
         None::<i64>,
     );
     let response = with_frontend_client(fe_addr, |client| {
@@ -278,6 +280,15 @@ mod tests {
             Some("db1".to_string()),
             Some(1),
             None::<i64>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<String>,
             None::<String>,
             None::<String>,
         );

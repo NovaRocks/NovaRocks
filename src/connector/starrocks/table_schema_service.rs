@@ -230,7 +230,7 @@ impl TableSchemaService {
     ) -> Result<TTabletSchema, TableSchemaError> {
         let rpc_request = frontend_service::TBatchGetTableSchemaRequest {
             requests: Some(vec![frontend_service::TGetTableSchemaRequest {
-                schema_meta: Some(crate::plan_nodes::TTableSchemaMeta {
+                schema_key: Some(crate::descriptors::TTableSchemaKey {
                     db_id: Some(request.db_id),
                     table_id: Some(request.table_id),
                     schema_id: Some(request.schema_id),

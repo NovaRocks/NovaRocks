@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <deque>
 #include <functional>
 #include <iomanip>
@@ -58,6 +59,22 @@
 #include "StatusCode_types.h"
 
 namespace {
+
+void dump_failed_exec_plan_fragment_attachment(const std::string& attachment) {
+    static std::atomic<int> dump_seq{0};
+    const int seq = dump_seq.fetch_add(1);
+    const std::string path =
+            "/tmp/novarocks-exec-plan-fragment-fail-" + std::to_string(::getpid()) + "-" + std::to_string(seq) + ".bin";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        std::cerr << "[WARN] failed to open exec plan fragment dump file: " << path << std::endl;
+        return;
+    }
+    out.write(attachment.data(), static_cast<std::streamsize>(attachment.size()));
+    out.close();
+    std::cerr << "[WARN] dumped failed exec plan fragment attachment to " << path
+              << " (" << attachment.size() << " bytes)" << std::endl;
+}
 
 enum class AttachmentProtocol {
     Binary,
@@ -1130,6 +1147,7 @@ private:
         starrocks::TExecPlanFragmentParams params;
         std::string err;
         if (!thrift_deserialize(attachment, proto, &params, &err)) {
+            dump_failed_exec_plan_fragment_attachment(attachment);
             status_err(response->mutable_status(), starrocks::TStatusCode::INTERNAL_ERROR,
                        "failed to deserialize TExecPlanFragmentParams: " + err);
             return;

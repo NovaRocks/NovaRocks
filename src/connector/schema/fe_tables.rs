@@ -325,6 +325,15 @@ fn fetch_routine_load_jobs(
         ctx.txn_id,
         ctx.label.clone(),
         ctx.type_.clone(),
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
     );
     let response = with_frontend_client(fe_addr, |client| {
         client
@@ -359,6 +368,15 @@ fn fetch_stream_loads(
         ctx.txn_id,
         ctx.label.clone(),
         ctx.type_.clone(),
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
     );
     let response = with_frontend_client(fe_addr, |client| {
         client
@@ -1316,7 +1334,7 @@ fn build_materialized_view_row(info: &frontend_service::TMaterializedViewStatus)
     put_ts_text(
         &mut row,
         "LAST_REFRESH_TIME",
-        info.last_refresh_time.as_deref(),
+        info.last_refresh_finished_time.as_deref(),
     );
     row
 }
@@ -1337,6 +1355,7 @@ fn build_task_run_row(info: &frontend_service::TTaskRunInfo) -> SchemaRow {
     put_opt_str(&mut row, "PROGRESS", info.progress.as_deref());
     put_opt_str(&mut row, "EXTRA_MESSAGE", info.extra_message.as_deref());
     put_opt_str(&mut row, "PROPERTIES", info.properties.as_deref());
+    put_opt_str(&mut row, "WAREHOUSE", info.warehouse.as_deref());
     put_i64_from_string(&mut row, "JOB_ID", info.job_id.as_deref());
     put_ts_seconds_positive(&mut row, "PROCESS_TIME", info.process_time);
     row
@@ -1934,6 +1953,7 @@ mod tests {
             extra_message: Some("done".to_string()),
             properties: Some("{\"k\":\"v\"}".to_string()),
             catalog: Some("default_catalog".to_string()),
+            warehouse: Some("default_warehouse".to_string()),
             job_id: Some("42".to_string()),
             process_time: Some(1_700_000_300),
         };
@@ -1945,11 +1965,14 @@ mod tests {
             Some(&SchemaValue::Utf8("default_catalog".to_string()))
         );
         assert_eq!(
+            row.get(&normalize_column_key("WAREHOUSE")),
+            Some(&SchemaValue::Utf8("default_warehouse".to_string()))
+        );
+        assert_eq!(
             row.get(&normalize_column_key("JOB_ID")),
             Some(&SchemaValue::Int64(42))
         );
         assert!(row.contains_key(&normalize_column_key("PROCESS_TIME")));
-        assert!(!row.contains_key(&normalize_column_key("WAREHOUSE")));
     }
 }
 

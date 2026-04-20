@@ -33,6 +33,15 @@ pub(crate) fn fetch_rows(
         None::<i64>,
         ctx.label.clone(),
         None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<String>,
     );
     let response = with_frontend_client(fe_addr, |client| {
         client.get_loads(request).map_err(|err| err.to_string())

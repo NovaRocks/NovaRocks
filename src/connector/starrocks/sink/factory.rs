@@ -846,6 +846,7 @@ pub(crate) fn create_automatic_partitions(
         Some(table_id),
         Some(partition_values),
         Some(is_temp),
+        None::<i32>,
     );
     let retry_interval = Duration::from_millis(config::fe_rpc_retry_interval_ms().clamp(1, 5_000));
     let deadline = Instant::now() + Duration::from_millis(config::fe_rpc_timeout_ms().max(1));

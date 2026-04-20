@@ -38,7 +38,6 @@ mod schema_scan;
 mod select;
 mod set_op;
 mod sort;
-mod starrocks_scan;
 mod table_function;
 mod union;
 
@@ -79,7 +78,6 @@ pub(crate) use schema_scan::lower_schema_scan_node;
 pub(crate) use select::lower_select_node;
 pub(crate) use set_op::{lower_except_node, lower_intersect_node};
 pub(crate) use sort::lower_sort_node;
-pub(crate) use starrocks_scan::lower_starrocks_scan_node;
 pub(crate) use table_function::lower_table_function_node;
 pub(crate) use union::lower_union_node;
 
@@ -139,7 +137,6 @@ pub(crate) fn test_plan_node(
         cross_join_node: None,
         lake_scan_node: None,
         nestloop_join_node: None,
-        starrocks_scan_node: None,
         stream_scan_node: None,
         stream_join_node: None,
         stream_agg_node: None,
@@ -147,6 +144,7 @@ pub(crate) fn test_plan_node(
         fetch_node: None,
         look_up_node: None,
         benchmark_scan_node: None,
+        cache_stats_scan_node: None,
     }
 }
 
@@ -519,15 +517,6 @@ fn lower_node_with_children(
             connectors,
             out_layout,
         )?,
-        t if t == plan_nodes::TPlanNodeType::STARROCKS_SCAN_NODE => lower_starrocks_scan_node(
-            node,
-            desc_tbl,
-            tuple_slots,
-            layout_hints,
-            exec_params,
-            query_opts,
-            connectors,
-        )?,
         t if t == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE => lower_lake_scan_node(
             node,
             desc_tbl,
@@ -765,7 +754,6 @@ fn is_scan_node_type(t: plan_nodes::TPlanNodeType) -> bool {
             | plan_nodes::TPlanNodeType::FILE_SCAN_NODE
             | plan_nodes::TPlanNodeType::JDBC_SCAN_NODE
             | plan_nodes::TPlanNodeType::HDFS_SCAN_NODE
-            | plan_nodes::TPlanNodeType::STARROCKS_SCAN_NODE
             | plan_nodes::TPlanNodeType::LAKE_SCAN_NODE
             | plan_nodes::TPlanNodeType::SCHEMA_SCAN_NODE
     )

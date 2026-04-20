@@ -665,6 +665,7 @@ fn build_put_request(
         escape: options.escape,
         partial_update_mode: options.partial_update_mode,
         payload_compression_type: options.payload_compression_type.clone(),
+        envelope: None,
         warehouse: warehouse.map(ToString::to_string),
         backend_id: backend_id::backend_id(),
     })

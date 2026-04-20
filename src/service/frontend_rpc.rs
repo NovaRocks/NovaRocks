@@ -963,6 +963,7 @@ mod tests {
             Some(2),
             Some(vec![vec!["2025-01-01".to_string()]]),
             Some(false),
+            None::<i32>,
         );
 
         let response = manager
@@ -1033,7 +1034,7 @@ mod tests {
         }));
         let schema_request = frontend_service::TBatchGetTableSchemaRequest {
             requests: Some(vec![frontend_service::TGetTableSchemaRequest {
-                schema_meta: Some(crate::plan_nodes::TTableSchemaMeta {
+                schema_key: Some(crate::descriptors::TTableSchemaKey {
                     db_id: Some(1),
                     table_id: Some(2),
                     schema_id: Some(3),
@@ -1050,6 +1051,7 @@ mod tests {
             Some(2),
             Some(vec![vec!["2025-01-01".to_string()]]),
             Some(false),
+            None::<i32>,
         );
 
         let server_addr = server.addr().clone();

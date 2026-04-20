@@ -80,6 +80,9 @@ pub(crate) fn build_scan_node(
         None::<Vec<types::TSlotId>>,
         None::<bool>,
         None::<Vec<partitions::TBucketProperty>>,
+        None::<bool>,
+        None::<i64>,
+        None::<Vec<plan_nodes::TColumnAccessPath>>,
     ));
 
     node
@@ -575,7 +578,6 @@ pub(crate) fn default_plan_node() -> plan_nodes::TPlanNode {
         cross_join_node: None,
         lake_scan_node: None,
         nestloop_join_node: None,
-        starrocks_scan_node: None,
         stream_scan_node: None,
         stream_join_node: None,
         stream_agg_node: None,
@@ -583,5 +585,6 @@ pub(crate) fn default_plan_node() -> plan_nodes::TPlanNode {
         fetch_node: None,
         look_up_node: None,
         benchmark_scan_node: None,
+        cache_stats_scan_node: None,
     }
 }

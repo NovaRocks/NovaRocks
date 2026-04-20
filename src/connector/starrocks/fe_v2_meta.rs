@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn lake_scan_schema_fetch_allows_placeholder_catalog_ids() {
         let request = crate::frontend_service::TGetTableSchemaRequest {
-            schema_meta: Some(crate::plan_nodes::TTableSchemaMeta {
+            schema_key: Some(crate::descriptors::TTableSchemaKey {
                 db_id: Some(-1),
                 table_id: Some(70_528),
                 schema_id: Some(70_528),
@@ -576,13 +576,13 @@ mod tests {
             query_id: Some(crate::types::TUniqueId { hi: 1, lo: 2 }),
             txn_id: None,
         };
-        let schema_meta = request
-            .schema_meta
+        let schema_key = request
+            .schema_key
             .as_ref()
-            .expect("schema_meta should be set");
-        assert_eq!(schema_meta.db_id, Some(-1));
-        assert_eq!(schema_meta.table_id, Some(70_528));
-        assert_eq!(schema_meta.schema_id, Some(70_528));
+            .expect("schema_key should be set");
+        assert_eq!(schema_key.db_id, Some(-1));
+        assert_eq!(schema_key.table_id, Some(70_528));
+        assert_eq!(schema_key.schema_id, Some(70_528));
         assert!(request.query_id.is_some());
     }
 }

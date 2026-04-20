@@ -46,6 +46,7 @@ impl DescriptorTableBuilder {
             Some(nullable),
             None::<i32>,
             None::<String>,
+            None::<bool>,
         ));
     }
 

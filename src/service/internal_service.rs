@@ -1718,7 +1718,6 @@ mod tests {
             None::<plan_nodes::TCrossJoinNode>,
             None::<plan_nodes::TLakeScanNode>,
             None::<plan_nodes::TNestLoopJoinNode>,
-            None::<plan_nodes::TStarRocksScanNode>,
             None::<plan_nodes::TStreamScanNode>,
             None::<plan_nodes::TStreamJoinNode>,
             None::<plan_nodes::TStreamAggregationNode>,
@@ -1726,6 +1725,7 @@ mod tests {
             fetch_node,
             None::<plan_nodes::TLookUpNode>,
             None::<plan_nodes::TBenchmarkScanNode>,
+            None::<plan_nodes::TCacheStatsScanNode>,
         )
     }
 

@@ -378,23 +378,23 @@ pub(crate) fn lower_lake_scan_node(
         table_desc.table_name.trim().to_string()
     };
 
-    let schema_meta = lake
-        .schema_meta
+    let schema_key = lake
+        .schema_key
         .as_ref()
-        .ok_or_else(|| "LAKE_SCAN_NODE missing schema_meta".to_string())?;
-    let db_id = schema_meta
+        .ok_or_else(|| "LAKE_SCAN_NODE missing schema_key".to_string())?;
+    let db_id = schema_key
         .db_id
-        .ok_or_else(|| "LAKE_SCAN_NODE schema_meta missing db_id".to_string())?;
-    let table_id = schema_meta
+        .ok_or_else(|| "LAKE_SCAN_NODE schema_key missing db_id".to_string())?;
+    let table_id = schema_key
         .table_id
-        .ok_or_else(|| "LAKE_SCAN_NODE schema_meta missing table_id".to_string())?;
-    let schema_id = schema_meta
+        .ok_or_else(|| "LAKE_SCAN_NODE schema_key missing table_id".to_string())?;
+    let schema_id = schema_key
         .schema_id
-        .ok_or_else(|| "LAKE_SCAN_NODE schema_meta missing schema_id".to_string())?;
+        .ok_or_else(|| "LAKE_SCAN_NODE schema_key missing schema_id".to_string())?;
 
     if table_id != table_desc.id {
         return Err(format!(
-            "LAKE_SCAN_NODE schema_meta.table_id={} mismatches descriptor table_id={}",
+            "LAKE_SCAN_NODE schema_key.table_id={} mismatches descriptor table_id={}",
             table_id, table_desc.id
         ));
     }
