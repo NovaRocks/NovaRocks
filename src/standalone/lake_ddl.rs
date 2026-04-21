@@ -1,4 +1,5 @@
 use prost::Message;
+use std::collections::HashSet;
 
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
@@ -278,10 +279,23 @@ fn build_tablet_schema(
         .iter()
         .map(|column| normalize_identifier(column))
         .collect::<Result<Vec<_>, _>>()?;
+    let mut key_column_set = HashSet::with_capacity(key_columns.len());
+    for key_column in &key_columns {
+        if !key_column_set.insert(key_column.clone()) {
+            return Err(format!(
+                "duplicate key column `{key_column}` in managed standalone CREATE TABLE"
+            ));
+        }
+    }
+
+    let mut key_indices = Vec::with_capacity(key_columns.len());
     let mut thrift_columns = Vec::with_capacity(columns.len());
     for (idx, column) in columns.iter().enumerate() {
         let normalized = normalize_identifier(&column.name)?;
-        let is_key = key_columns.iter().any(|candidate| candidate == &normalized);
+        let is_key = key_column_set.contains(&normalized);
+        if is_key {
+            key_indices.push(idx as i32);
+        }
         thrift_columns.push(crate::descriptors::TColumn {
             column_name: normalized,
             column_type: Some(sql_type_to_tcolumn_type(&column.data_type)?),
@@ -300,13 +314,36 @@ fn build_tablet_schema(
             type_desc: None,
         });
     }
-    let key_count = thrift_columns
-        .iter()
-        .filter(|column| column.is_key == Some(true))
-        .count();
-    if key_count == 0 {
+    if key_columns.is_empty() {
         return Err("managed standalone CREATE TABLE requires at least one key column".to_string());
     }
+    if key_indices.len() != key_columns.len() {
+        let missing = key_columns
+            .into_iter()
+            .filter(|key| {
+                !thrift_columns
+                    .iter()
+                    .any(|column| column.column_name == *key)
+            })
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "managed standalone CREATE TABLE key columns are missing from table schema: {}",
+            missing.join(", ")
+        ));
+    }
+    if key_indices.is_empty() {
+        return Err("managed standalone CREATE TABLE requires at least one key column".to_string());
+    }
+    let expected_prefix = (0..key_indices.len())
+        .map(|idx| idx as i32)
+        .collect::<Vec<_>>();
+    if key_indices != expected_prefix {
+        return Err(
+            "managed standalone CREATE TABLE requires key columns to be a leading column prefix"
+                .to_string(),
+        );
+    }
+    let key_count = key_indices.len();
     Ok(crate::agent_service::TTabletSchema {
         short_key_column_count: i16::try_from(key_count)
             .map_err(|_| "too many key columns for tablet schema".to_string())?,
@@ -318,8 +355,8 @@ fn build_tablet_schema(
         indexes: None,
         is_in_memory: Some(false),
         id: Some(1),
-        sort_key_idxes: Some((0..key_count).map(|idx| idx as i32).collect()),
-        sort_key_unique_ids: Some((0..key_count).map(|idx| idx as i32).collect()),
+        sort_key_idxes: Some(key_indices.clone()),
+        sort_key_unique_ids: Some(key_indices),
         schema_version: Some(0),
         compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
         compression_level: None,

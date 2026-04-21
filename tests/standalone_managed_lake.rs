@@ -7,8 +7,13 @@ use novarocks::standalone::{StandaloneNovaRocks, StandaloneOptions};
 
 #[test]
 fn create_table_bootstraps_tablets_into_object_store() {
-    let harness = ManagedLakeTestHarness::new("create_table_bootstraps_tablets_into_object_store")
-        .expect("create managed lake harness");
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("create_table_bootstraps_tablets_into_object_store")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
     let engine = StandaloneNovaRocks::open(StandaloneOptions {
         config_path: Some(harness.config_path.clone()),
         metadata_db_path: None,
@@ -67,8 +72,12 @@ fn create_table_bootstraps_tablets_into_object_store() {
 
 #[test]
 fn reopen_restores_managed_table_snapshot() {
-    let harness = ManagedLakeTestHarness::new("reopen_restores_managed_table_snapshot")
-        .expect("create managed lake harness");
+    let Some(harness) = ManagedLakeTestHarness::maybe_new("reopen_restores_managed_table_snapshot")
+        .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
     let initial = StandaloneNovaRocks::open(StandaloneOptions {
         config_path: Some(harness.config_path.clone()),
         metadata_db_path: None,
@@ -134,4 +143,41 @@ fn reopen_restores_managed_table_snapshot() {
         )
         .expect("table count");
     assert_eq!(table_count, 1);
+}
+
+#[test]
+fn create_table_rejects_invalid_key_columns() {
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("create_table_rejects_invalid_key_columns")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
+    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("open standalone engine");
+    let session = engine.session();
+
+    let missing = session
+        .execute(
+            "create table missing_key (v int, k int) duplicate key(missing) distributed by hash(v) buckets 2",
+        )
+        .expect_err("missing key column should fail");
+    assert!(
+        missing.contains("key columns are missing from table schema"),
+        "err={missing}"
+    );
+
+    let non_prefix = session
+        .execute(
+            "create table non_prefix_key (v int, k int) duplicate key(k) distributed by hash(v) buckets 2",
+        )
+        .expect_err("non-prefix key column should fail");
+    assert!(
+        non_prefix.contains("leading column prefix"),
+        "err={non_prefix}"
+    );
 }

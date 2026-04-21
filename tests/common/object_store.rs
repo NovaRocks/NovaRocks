@@ -5,10 +5,10 @@ use tempfile::TempDir;
 use novarocks::fs::object_store::{ObjectStoreConfig, build_oss_operator};
 use novarocks::runtime::global_async_runtime::data_block_on;
 
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:9000";
 const DEFAULT_ACCESS_KEY_ID: &str = "admin";
 const DEFAULT_ACCESS_KEY_SECRET: &str = "admin123";
 const DEFAULT_BUCKET: &str = "novarocks";
+const OBJECT_STORE_ENV: &str = "AWS_S3_ENDPOINT";
 
 pub struct ManagedLakeTestHarness {
     _temp_dir: TempDir,
@@ -20,7 +20,10 @@ pub struct ManagedLakeTestHarness {
 }
 
 impl ManagedLakeTestHarness {
-    pub fn new(test_name: &str) -> Result<Self, String> {
+    pub fn maybe_new(test_name: &str) -> Result<Option<Self>, String> {
+        let Ok(endpoint) = std::env::var(OBJECT_STORE_ENV) else {
+            return Ok(None);
+        };
         let temp_dir = tempfile::tempdir().map_err(|e| format!("create tempdir failed: {e}"))?;
         let config_path = temp_dir.path().join("novarocks.toml");
         let metadata_db_path = temp_dir.path().join("standalone.sqlite");
@@ -37,8 +40,6 @@ impl ManagedLakeTestHarness {
             std::env::var("NOVAROCKS_TEST_BUCKET").unwrap_or_else(|_| DEFAULT_BUCKET.to_string());
         let warehouse_prefix = format!("standalone-managed-lake-tests/{run_id}");
         let warehouse_uri = format!("s3://{bucket}/{warehouse_prefix}");
-        let endpoint =
-            std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
         let access_key_id =
             std::env::var("MINIO_ROOT_USER").unwrap_or_else(|_| DEFAULT_ACCESS_KEY_ID.to_string());
         let access_key_secret = std::env::var("MINIO_ROOT_PASSWORD")
@@ -81,13 +82,19 @@ enable_path_style_access = true
         )
         .map_err(|e| format!("write managed lake test config failed: {e}"))?;
 
-        Ok(Self {
+        Ok(Some(Self {
             _temp_dir: temp_dir,
             config_path,
             metadata_db_path,
             warehouse_uri,
             object_store_config,
             warehouse_prefix,
+        }))
+    }
+
+    pub fn new(test_name: &str) -> Result<Self, String> {
+        Self::maybe_new(test_name)?.ok_or_else(|| {
+            format!("managed lake object-store tests require {OBJECT_STORE_ENV} to be set")
         })
     }
 
