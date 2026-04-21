@@ -165,7 +165,7 @@ pub(crate) fn create_managed_table(
                 column_name: normalize_identifier(&column.name)
                     .unwrap_or_else(|_| column.name.to_ascii_lowercase()),
                 logical_type: logical_type_name(&column.data_type),
-                nullable: true,
+                nullable: column.nullable,
             }
         }));
     snapshot.partitions.push(StoredManagedPartition {
@@ -301,7 +301,7 @@ fn build_tablet_schema(
             column_type: Some(sql_type_to_tcolumn_type(&column.data_type)?),
             aggregation_type: None,
             is_key: Some(is_key),
-            is_allow_null: Some(true),
+            is_allow_null: Some(column.nullable),
             default_value: None,
             default_expr: None,
             is_bloom_filter_column: Some(false),
@@ -368,9 +368,8 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
         SqlType::TinyInt => (crate::types::TPrimitiveType::TINYINT, Some(1), None, None),
         SqlType::SmallInt => (crate::types::TPrimitiveType::SMALLINT, Some(2), None, None),
         SqlType::Int => (crate::types::TPrimitiveType::INT, Some(4), None, None),
-        SqlType::BigInt | SqlType::LargeInt => {
-            (crate::types::TPrimitiveType::BIGINT, Some(8), None, None)
-        }
+        SqlType::BigInt => (crate::types::TPrimitiveType::BIGINT, Some(8), None, None),
+        SqlType::LargeInt => (crate::types::TPrimitiveType::LARGEINT, Some(16), None, None),
         SqlType::Float => (crate::types::TPrimitiveType::FLOAT, Some(4), None, None),
         SqlType::Double => (crate::types::TPrimitiveType::DOUBLE, Some(8), None, None),
         SqlType::String => (
@@ -408,7 +407,8 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
         SqlType::TinyInt => Some(1),
         SqlType::SmallInt => Some(2),
         SqlType::Int => Some(4),
-        SqlType::BigInt | SqlType::LargeInt | SqlType::DateTime | SqlType::Time => Some(8),
+        SqlType::BigInt | SqlType::DateTime | SqlType::Time => Some(8),
+        SqlType::LargeInt => Some(16),
         SqlType::Float => Some(4),
         SqlType::Double => Some(8),
         SqlType::Boolean => Some(1),

@@ -149,7 +149,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         let sql_type = parse_sql_type_definition(parser)?;
 
         let mut aggregation = None;
-        let mut _nullable = true;
+        let mut nullable = true;
         let mut _comment = None;
 
         // Parse optional NOT NULL, NULL, DEFAULT, COMMENT, AUTO_INCREMENT, etc.
@@ -159,9 +159,9 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
             {
                 aggregation = Some(parsed);
             } else if parser.parse_keywords(&[Keyword::NOT, Keyword::NULL]) {
-                _nullable = false;
+                nullable = false;
             } else if parser.parse_keyword(Keyword::NULL) {
-                _nullable = true;
+                nullable = true;
             } else if parser.parse_keyword(Keyword::DEFAULT) {
                 // Skip the default value expression
                 skip_default_value(parser);
@@ -185,6 +185,7 @@ fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDe
         columns.push(TableColumnDef {
             name: col_name,
             data_type: sql_type,
+            nullable,
             aggregation,
         });
     }
@@ -462,6 +463,25 @@ mod tests {
         match stmt.kind {
             CreateTableKind::Iceberg { bucket_count, .. } => {
                 assert_eq!(bucket_count, Some(3));
+            }
+            other => panic!("unexpected create table kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_parser_preserves_column_nullability() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(
+                "create table tbl (id int not null, note string null) duplicate key(id) distributed by hash(id) buckets 3",
+            )
+            .expect("parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
+        match stmt.kind {
+            CreateTableKind::Iceberg { columns, .. } => {
+                assert_eq!(columns.len(), 2);
+                assert!(!columns[0].nullable);
+                assert!(columns[1].nullable);
             }
             other => panic!("unexpected create table kind: {other:?}"),
         }

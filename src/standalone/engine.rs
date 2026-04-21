@@ -2683,7 +2683,7 @@ fn create_local_table_from_columns(
         .iter()
         .map(|col| {
             let dt = sql_type_to_arrow_type(&col.data_type)?;
-            Ok(Field::new(&col.name, dt, true))
+            Ok(Field::new(&col.name, dt, col.nullable))
         })
         .collect::<Result<Vec<_>, String>>()?;
 

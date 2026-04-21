@@ -77,6 +77,7 @@ pub(crate) struct GenerateSeriesSelect {
 pub(crate) struct TableColumnDef {
     pub name: String,
     pub data_type: SqlType,
+    pub nullable: bool,
     pub aggregation: Option<ColumnAggregation>,
 }
 

@@ -1,5 +1,7 @@
 mod common;
 
+use novarocks::service::grpc_client::proto::starrocks::TabletSchemaPb;
+use prost::Message;
 use rusqlite::Connection;
 
 use common::object_store::ManagedLakeTestHarness;
@@ -180,4 +182,70 @@ fn create_table_rejects_invalid_key_columns() {
         non_prefix.contains("leading column prefix"),
         "err={non_prefix}"
     );
+}
+
+#[test]
+fn create_table_preserves_largeint_and_not_null_columns() {
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("create_table_preserves_largeint_and_not_null_columns")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
+    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("open standalone engine");
+
+    engine
+        .session()
+        .execute(
+            "create table typed_tbl (id largeint not null, note string null) duplicate key(id) distributed by hash(id) buckets 2",
+        )
+        .expect("create managed table");
+
+    let conn = Connection::open(&harness.metadata_db_path).expect("open sqlite metadata");
+    let columns = conn
+        .prepare(
+            "SELECT column_name, logical_type, nullable
+             FROM table_columns
+             ORDER BY ordinal",
+        )
+        .expect("prepare column query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        })
+        .expect("query managed columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect managed columns");
+    assert_eq!(
+        columns,
+        vec![
+            ("id".to_string(), "LARGEINT".to_string(), false),
+            ("note".to_string(), "STRING".to_string(), true),
+        ]
+    );
+    let tablet_schema_pb: Vec<u8> = conn
+        .query_row(
+            "SELECT s.tablet_schema_pb
+             FROM table_schemas s
+             JOIN tables t ON t.current_schema_id = s.schema_id
+             WHERE t.name = 'typed_tbl'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("load tablet schema pb");
+    let tablet_schema =
+        TabletSchemaPb::decode(tablet_schema_pb.as_slice()).expect("decode tablet schema pb");
+    assert_eq!(tablet_schema.column.len(), 2);
+    assert_eq!(tablet_schema.column[0].r#type, "LARGEINT");
+    assert_eq!(tablet_schema.column[0].is_nullable, Some(false));
+    assert_eq!(tablet_schema.column[1].r#type, "VARCHAR");
+    assert_eq!(tablet_schema.column[1].is_nullable, Some(true));
 }
