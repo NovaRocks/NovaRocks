@@ -29,6 +29,21 @@ pub struct S3FileInfo {
     pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManagedTabletRef {
+    pub tablet_id: i64,
+    pub partition_id: i64,
+    pub version: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PhysicalTableLayout {
+    pub db_id: i64,
+    pub table_id: i64,
+    pub schema_id: i64,
+    pub tablets: Vec<ManagedTabletRef>,
+}
+
 #[derive(Clone, Debug)]
 pub enum TableStorage {
     LocalParquetFile {
@@ -50,4 +65,12 @@ pub struct TableDef {
 /// Catalog abstraction for SQL analysis.
 pub trait CatalogProvider {
     fn get_table(&self, database: &str, table: &str) -> Result<TableDef, String>;
+
+    fn get_physical_layout(
+        &self,
+        _database: &str,
+        _table: &str,
+    ) -> Result<Option<PhysicalTableLayout>, String> {
+        Ok(None)
+    }
 }

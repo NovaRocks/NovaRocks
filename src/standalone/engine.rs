@@ -37,7 +37,9 @@ use super::iceberg::{
     register_existing_table as register_existing_iceberg_table,
 };
 use super::lake_ddl::create_managed_table;
-use super::lake_recovery::{ManagedLakeCatalog, ManagedLakeConfig, runtime_registered};
+use super::lake_recovery::{
+    ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
+};
 use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 
 #[derive(Clone, Debug, Default)]
@@ -4747,15 +4749,18 @@ fn restore_managed_lake(
     state: &Arc<StandaloneState>,
     snapshot: &MetadataSnapshot,
 ) -> Result<(), String> {
-    for database in &snapshot.managed.databases {
-        state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock")
-            .create_database(&database.name)?;
-    }
     let rebuilt =
         ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), snapshot.managed.clone())?;
+    {
+        let mut catalog = state
+            .catalog
+            .write()
+            .expect("standalone catalog write lock");
+        for database in &snapshot.managed.databases {
+            catalog.create_database(&database.name)?;
+        }
+        register_managed_tables_in_catalog(&mut catalog, &rebuilt)?;
+    }
     rebuilt.re_register_active_tablet_runtimes()?;
     let mut guard = state
         .managed_lake

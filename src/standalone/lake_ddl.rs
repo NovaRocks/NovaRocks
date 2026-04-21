@@ -9,7 +9,9 @@ use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc,
 
 use super::catalog::normalize_identifier;
 use super::engine::{StandaloneState, StatementResult};
-use super::lake_recovery::{ManagedLakeCatalog, ManagedLakeConfig};
+use super::lake_recovery::{
+    ManagedLakeCatalog, ManagedLakeConfig, register_managed_table_in_catalog,
+};
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
     StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
@@ -200,6 +202,14 @@ pub(crate) fn create_managed_table(
     metadata_store.replace_managed_snapshot(&snapshot)?;
     rebuilt.re_register_active_tablet_runtimes()?;
     *guard = rebuilt;
+    let runtime = guard.table(&resolved.database, &resolved.table)?.clone();
+    drop(guard);
+
+    let mut catalog = state
+        .catalog
+        .write()
+        .expect("standalone catalog write lock");
+    register_managed_table_in_catalog(&mut catalog, &runtime)?;
     Ok(StatementResult::Ok)
 }
 

@@ -1,17 +1,25 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use arrow::datatypes::Fields;
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use prost::Message;
+use std::sync::Arc;
 
 use crate::common::app_config::StandaloneManagedLakeConfig as AppManagedLakeConfig;
+use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
+use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{
     TabletWriteContext, get_tablet_runtime, register_tablet_runtime, remove_tablet_runtime,
 };
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
-use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
 use super::catalog::normalize_identifier;
+use super::catalog::{
+    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+};
 use super::iceberg_add_files::parse_s3_path;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState,
@@ -326,4 +334,386 @@ pub(crate) fn snapshot_is_empty(snapshot: &ManagedSnapshot) -> bool {
 
 pub(crate) fn runtime_registered(tablet_id: i64) -> bool {
     get_tablet_runtime(tablet_id).is_ok()
+}
+
+pub(crate) fn register_managed_table_in_catalog(
+    catalog: &mut InMemoryCatalog,
+    runtime: &ManagedTableRuntime,
+) -> Result<(), String> {
+    let table = managed_table_def(runtime)?;
+    let layout = managed_physical_layout(runtime)?;
+    catalog.register_managed_table(&runtime.database_name, table, layout)
+}
+
+pub(crate) fn register_managed_tables_in_catalog(
+    catalog: &mut InMemoryCatalog,
+    managed: &ManagedLakeCatalog,
+) -> Result<(), String> {
+    let mut keys = managed.tables_by_name.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    for (database, table) in keys {
+        let runtime = managed
+            .tables_by_name
+            .get(&(database, table))
+            .ok_or_else(|| "managed catalog changed during registration".to_string())?;
+        register_managed_table_in_catalog(catalog, runtime)?;
+    }
+    Ok(())
+}
+
+fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> {
+    let schema_columns = visible_tablet_columns_by_name(&runtime.tablet_schema)?;
+    let mut columns = Vec::with_capacity(runtime.columns.len());
+    for column in &runtime.columns {
+        let schema_column = schema_columns.get(&column.column_name).ok_or_else(|| {
+            format!(
+                "managed table {}.{} is missing schema metadata for column `{}`",
+                runtime.database_name, runtime.table.name, column.column_name
+            )
+        })?;
+        columns.push(ColumnDef {
+            name: column.column_name.clone(),
+            data_type: arrow_type_from_tablet_column(schema_column)?,
+            nullable: column.nullable,
+        });
+    }
+    Ok(TableDef {
+        name: runtime.table.name.clone(),
+        columns,
+        storage: TableStorage::S3ParquetFiles {
+            files: vec![],
+            cloud_properties: BTreeMap::new(),
+        },
+    })
+}
+
+fn managed_physical_layout(runtime: &ManagedTableRuntime) -> Result<PhysicalTableLayout, String> {
+    let active_partition_versions = runtime
+        .partitions
+        .iter()
+        .filter(|partition| partition.state == ManagedPartitionState::Active)
+        .map(|partition| (partition.partition_id, partition.visible_version))
+        .collect::<HashMap<_, _>>();
+    let active_index_ids = runtime
+        .indexes
+        .iter()
+        .filter(|index| index.state == ManagedIndexState::Active)
+        .map(|index| index.index_id)
+        .collect::<HashSet<_>>();
+
+    let tablets = runtime
+        .tablets
+        .iter()
+        .filter(|tablet| active_index_ids.contains(&tablet.index_id))
+        .filter_map(|tablet| {
+            active_partition_versions
+                .get(&tablet.partition_id)
+                .copied()
+                .map(|version| ManagedTabletRef {
+                    tablet_id: tablet.tablet_id,
+                    partition_id: tablet.partition_id,
+                    version,
+                })
+        })
+        .collect();
+    Ok(PhysicalTableLayout {
+        db_id: runtime.table.db_id,
+        table_id: runtime.table.table_id,
+        schema_id: runtime.table.current_schema_id,
+        tablets,
+    })
+}
+
+fn visible_tablet_columns_by_name(
+    tablet_schema: &TabletSchemaPb,
+) -> Result<HashMap<String, ColumnPb>, String> {
+    let mut columns = HashMap::new();
+    for column in &tablet_schema.column {
+        if column.visible == Some(false) {
+            continue;
+        }
+        let name = column
+            .name
+            .as_deref()
+            .ok_or_else(|| "managed tablet schema column missing name".to_string())?;
+        let key = normalize_identifier(name)?;
+        if columns.insert(key.clone(), column.clone()).is_some() {
+            return Err(format!(
+                "managed tablet schema has duplicate column `{key}`"
+            ));
+        }
+    }
+    Ok(columns)
+}
+
+fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> {
+    let raw_type = column.r#type.trim().to_ascii_uppercase();
+    let base_type = raw_type
+        .split('(')
+        .next()
+        .unwrap_or(raw_type.as_str())
+        .trim();
+    match base_type {
+        "BOOLEAN" => Ok(DataType::Boolean),
+        "TINYINT" => Ok(DataType::Int8),
+        "SMALLINT" => Ok(DataType::Int16),
+        "INT" => Ok(DataType::Int32),
+        "BIGINT" => Ok(DataType::Int64),
+        "LARGEINT" => Ok(DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)),
+        "FLOAT" => Ok(DataType::Float32),
+        "DOUBLE" => Ok(DataType::Float64),
+        "DATE" | "DATE_V2" => Ok(DataType::Date32),
+        "DATETIME" | "DATETIME_V2" | "TIMESTAMP" | "TIME" => {
+            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
+        }
+        "CHAR" | "VARCHAR" | "STRING" => Ok(DataType::Utf8),
+        "BINARY" | "VARBINARY" => Ok(DataType::Binary),
+        "DECIMAL" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
+            let precision = column
+                .precision
+                .and_then(|value| u8::try_from(value).ok())
+                .ok_or_else(|| format!("managed DECIMAL column missing precision: {raw_type}"))?;
+            let scale = column
+                .frac
+                .and_then(|value| i8::try_from(value).ok())
+                .ok_or_else(|| format!("managed DECIMAL column missing scale: {raw_type}"))?;
+            Ok(DataType::Decimal128(precision, scale))
+        }
+        "DECIMALV2" => Ok(DataType::Decimal128(
+            LEGACY_DECIMALV2_PRECISION,
+            LEGACY_DECIMALV2_SCALE,
+        )),
+        "ARRAY" => {
+            let item_column = column.children_columns.first().ok_or_else(|| {
+                format!(
+                    "managed ARRAY column `{}` is missing item type",
+                    column.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })?;
+            let item_type = arrow_type_from_tablet_column(item_column)?;
+            Ok(DataType::List(Arc::new(Field::new(
+                "item",
+                item_type,
+                item_column.is_nullable.unwrap_or(true),
+            ))))
+        }
+        "MAP" => {
+            let key_column = column.children_columns.first().ok_or_else(|| {
+                format!(
+                    "managed MAP column `{}` is missing key type",
+                    column.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })?;
+            let value_column = column.children_columns.get(1).ok_or_else(|| {
+                format!(
+                    "managed MAP column `{}` is missing value type",
+                    column.name.as_deref().unwrap_or("<unnamed>")
+                )
+            })?;
+            let entries = Fields::from(vec![
+                Field::new("key", arrow_type_from_tablet_column(key_column)?, false),
+                Field::new(
+                    "value",
+                    arrow_type_from_tablet_column(value_column)?,
+                    value_column.is_nullable.unwrap_or(true),
+                ),
+            ]);
+            Ok(DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+                false,
+            ))
+        }
+        "STRUCT" => {
+            let mut fields = Vec::with_capacity(column.children_columns.len());
+            for child in &column.children_columns {
+                let child_name = child
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("field_{}", fields.len()));
+                fields.push(Field::new(
+                    child_name,
+                    arrow_type_from_tablet_column(child)?,
+                    child.is_nullable.unwrap_or(true),
+                ));
+            }
+            Ok(DataType::Struct(Fields::from(fields)))
+        }
+        other => Err(format!("unsupported managed tablet column type `{other}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::grpc_client::proto::starrocks::ColumnPb;
+    use crate::standalone::catalog::DEFAULT_DATABASE;
+
+    #[test]
+    fn register_managed_tables_in_catalog_populates_logical_table_and_layout() {
+        let runtime = ManagedTableRuntime {
+            database_name: DEFAULT_DATABASE.to_string(),
+            table: StoredManagedTable {
+                table_id: 20,
+                db_id: 10,
+                name: "managed_tbl".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 30,
+                state: ManagedTableState::Active,
+            },
+            schema: StoredManagedSchema {
+                schema_id: 30,
+                table_id: 20,
+                schema_version: 0,
+                tablet_schema_pb: vec![],
+            },
+            tablet_schema: TabletSchemaPb {
+                column: vec![
+                    ColumnPb {
+                        unique_id: 0,
+                        name: Some("id".to_string()),
+                        r#type: "INT".to_string(),
+                        is_nullable: Some(false),
+                        ..Default::default()
+                    },
+                    ColumnPb {
+                        unique_id: 1,
+                        name: Some("items".to_string()),
+                        r#type: "ARRAY".to_string(),
+                        is_nullable: Some(true),
+                        children_columns: vec![ColumnPb {
+                            unique_id: 2,
+                            name: Some("item".to_string()),
+                            r#type: "VARCHAR".to_string(),
+                            is_nullable: Some(true),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            columns: vec![
+                StoredManagedColumn {
+                    schema_id: 30,
+                    ordinal: 0,
+                    column_name: "id".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                },
+                StoredManagedColumn {
+                    schema_id: 30,
+                    ordinal: 1,
+                    column_name: "items".to_string(),
+                    logical_type: "ARRAY<STRING>".to_string(),
+                    nullable: true,
+                },
+            ],
+            partitions: vec![
+                StoredManagedPartition {
+                    partition_id: 100,
+                    table_id: 20,
+                    name: "p0".to_string(),
+                    visible_version: 7,
+                    next_version: 8,
+                    state: ManagedPartitionState::Active,
+                },
+                StoredManagedPartition {
+                    partition_id: 101,
+                    table_id: 20,
+                    name: "p1".to_string(),
+                    visible_version: 9,
+                    next_version: 10,
+                    state: ManagedPartitionState::Active,
+                },
+            ],
+            indexes: vec![StoredManagedIndex {
+                index_id: 200,
+                table_id: 20,
+                partition_id: 100,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Active,
+            }],
+            tablets: vec![
+                StoredManagedTablet {
+                    tablet_id: 300,
+                    partition_id: 100,
+                    index_id: 200,
+                    bucket_seq: 0,
+                    tablet_root_path: "s3://warehouse/db_10/table_20/tablet_300".to_string(),
+                },
+                StoredManagedTablet {
+                    tablet_id: 301,
+                    partition_id: 101,
+                    index_id: 200,
+                    bucket_seq: 1,
+                    tablet_root_path: "s3://warehouse/db_10/table_20/tablet_301".to_string(),
+                },
+            ],
+        };
+        let managed = ManagedLakeCatalog {
+            config: None,
+            snapshot: ManagedSnapshot::default(),
+            tables_by_name: HashMap::from([(
+                (DEFAULT_DATABASE.to_string(), "managed_tbl".to_string()),
+                runtime,
+            )]),
+        };
+        let mut catalog = InMemoryCatalog::default();
+
+        register_managed_tables_in_catalog(&mut catalog, &managed)
+            .expect("register managed tables in catalog");
+
+        let table = catalog
+            .get(DEFAULT_DATABASE, "managed_tbl")
+            .expect("logical table");
+        assert_eq!(table.name, "managed_tbl");
+        assert_eq!(
+            table.columns,
+            vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "items".to_string(),
+                    data_type: DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                    nullable: true,
+                },
+            ]
+        );
+        assert!(matches!(
+            table.storage,
+            TableStorage::S3ParquetFiles {
+                files,
+                cloud_properties
+            } if files.is_empty() && cloud_properties == BTreeMap::new()
+        ));
+
+        let layout = catalog
+            .get_physical_layout(DEFAULT_DATABASE, "managed_tbl")
+            .expect("physical layout")
+            .expect("managed layout");
+        assert_eq!(
+            layout,
+            PhysicalTableLayout {
+                db_id: 10,
+                table_id: 20,
+                schema_id: 30,
+                tablets: vec![
+                    ManagedTabletRef {
+                        tablet_id: 300,
+                        partition_id: 100,
+                        version: 7,
+                    },
+                    ManagedTabletRef {
+                        tablet_id: 301,
+                        partition_id: 101,
+                        version: 9,
+                    },
+                ],
+            }
+        );
+    }
 }
