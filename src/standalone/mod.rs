@@ -9,6 +9,7 @@ pub(crate) mod iceberg_add_files;
 pub(crate) mod iceberg_s3_storage;
 pub(crate) mod lake_ddl;
 pub(crate) mod lake_recovery;
+pub(crate) mod lake_txn;
 mod server;
 pub(crate) mod store;
 

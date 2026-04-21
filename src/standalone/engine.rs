@@ -1016,15 +1016,25 @@ impl StandaloneSession {
                 };
                 if let Ok(table_name) = crate::sql::parser::dialect::convert_object_name(raw_name) {
                     if let Ok(resolved) = resolve_local_table_name(&table_name, current_database) {
-                        let guard = self
+                        let is_managed = self
                             .inner
-                            .catalog
+                            .managed_lake
                             .read()
-                            .expect("standalone catalog read lock");
-                        if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
-                            drop(guard);
-                            return self
-                                .execute_insert_values_sqlparser(insert, &resolved, &table_def);
+                            .expect("standalone managed lake read lock")
+                            .contains_table(&resolved.database, &resolved.table)
+                            .unwrap_or(false);
+                        if !is_managed {
+                            let guard = self
+                                .inner
+                                .catalog
+                                .read()
+                                .expect("standalone catalog read lock");
+                            if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
+                                drop(guard);
+                                return self.execute_insert_values_sqlparser(
+                                    insert, &resolved, &table_def,
+                                );
+                            }
                         }
                     }
                 }
@@ -2144,10 +2154,13 @@ fn execute_insert_statement(
                 .expect("standalone managed lake read lock")
                 .contains_table(&resolved.database, &resolved.table)?
             {
-                return Err(format!(
-                    "INSERT is not supported for managed standalone lake tables yet: {}.{}",
-                    resolved.database, resolved.table
-                ));
+                return super::lake_txn::insert_into_managed_lake_table(
+                    state,
+                    name,
+                    columns,
+                    source,
+                    current_database,
+                );
             }
             let guard = state.catalog.read().expect("standalone catalog read lock");
             if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
@@ -2222,7 +2235,7 @@ fn insert_generate_series_rows(
     Ok(())
 }
 
-fn reorder_insert_rows(
+pub(crate) fn reorder_insert_rows(
     rows: &[Vec<Literal>],
     insert_columns: &[String],
     target_columns: &[ColumnDef],
@@ -3175,7 +3188,7 @@ fn json_value_to_field(value: Option<&Value>) -> Option<String> {
 }
 
 /// Generate series rows for local table insert.
-fn insert_generate_series_rows_local(
+pub(crate) fn insert_generate_series_rows_local(
     source: &GenerateSeriesSelect,
     insert_columns: &[String],
     target_columns: &[ColumnDef],
@@ -3227,7 +3240,7 @@ fn read_local_parquet_data(path: &Path, columns: &[ColumnDef]) -> Result<RecordB
 }
 
 /// Build a RecordBatch from literal value rows for a local table.
-fn build_local_insert_batch(
+pub(crate) fn build_local_insert_batch(
     columns: &[ColumnDef],
     rows: &[Vec<Literal>],
 ) -> Result<RecordBatch, String> {
@@ -4528,9 +4541,9 @@ fn concat_or_empty_batches(
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-struct ResolvedLocalTableName {
-    database: String,
-    table: String,
+pub(crate) struct ResolvedLocalTableName {
+    pub(crate) database: String,
+    pub(crate) table: String,
 }
 
 #[derive(Clone, Debug)]

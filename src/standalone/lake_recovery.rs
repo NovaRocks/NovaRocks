@@ -58,11 +58,13 @@ impl ManagedLakeConfig {
         })
     }
 
-    pub(crate) fn tablet_root_path(&self, db_id: i64, table_id: i64, tablet_id: i64) -> String {
-        format!(
-            "{}/db_{db_id}/table_{table_id}/tablet_{tablet_id}",
-            self.warehouse_uri
-        )
+    pub(crate) fn tablet_root_path(&self, db_id: i64, table_id: i64, _tablet_id: i64) -> String {
+        // All tablets for a partition share the same root so the bundle-metadata
+        // scheme (`meta/0000000000000000_<version>.meta`) and the scanner's
+        // partition_storage_path lookup stay in lockstep. Per-tablet files are
+        // disambiguated inside the shared meta/ and data/ directories by the
+        // tablet_id- and txn_id-prefixed filenames StarRocks emits.
+        format!("{}/db_{db_id}/table_{table_id}", self.warehouse_uri)
     }
 }
 
@@ -102,6 +104,51 @@ impl ManagedLakeCatalog {
         let db = normalize_identifier(database_name)?;
         let table = normalize_identifier(table_name)?;
         Ok(self.tables_by_name.contains_key(&(db, table)))
+    }
+
+    /// Bump the visible_version/next_version for `partition_id` in both the
+    /// raw snapshot and the cached table runtime. Returns the table id that
+    /// owns the partition so the caller can re-register the logical layout.
+    pub(crate) fn advance_partition_version(
+        &mut self,
+        partition_id: i64,
+        new_visible_version: i64,
+    ) -> Result<i64, String> {
+        let mut table_id = None;
+        for partition in self.snapshot.partitions.iter_mut() {
+            if partition.partition_id == partition_id {
+                if new_visible_version <= partition.visible_version {
+                    return Err(format!(
+                        "refuse to advance partition {partition_id} from version {} to {}",
+                        partition.visible_version, new_visible_version
+                    ));
+                }
+                partition.visible_version = new_visible_version;
+                partition.next_version = new_visible_version + 1;
+                table_id = Some(partition.table_id);
+                break;
+            }
+        }
+        let table_id = table_id
+            .ok_or_else(|| format!("managed snapshot is missing partition {partition_id}"))?;
+        for runtime in self.tables_by_name.values_mut() {
+            if runtime.table.table_id != table_id {
+                continue;
+            }
+            for partition in runtime.partitions.iter_mut() {
+                if partition.partition_id == partition_id {
+                    partition.visible_version = new_visible_version;
+                    partition.next_version = new_visible_version + 1;
+                }
+            }
+        }
+        Ok(table_id)
+    }
+
+    pub(crate) fn runtime_by_table_id(&self, table_id: i64) -> Option<&ManagedTableRuntime> {
+        self.tables_by_name
+            .values()
+            .find(|runtime| runtime.table.table_id == table_id)
     }
 
     pub(crate) fn rebuild(

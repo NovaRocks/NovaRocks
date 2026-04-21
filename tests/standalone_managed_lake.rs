@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
 use novarocks::service::grpc_client::proto::starrocks::TabletSchemaPb;
 use prost::Message;
 use rusqlite::Connection;
@@ -7,8 +9,31 @@ use rusqlite::Connection;
 use common::object_store::ManagedLakeTestHarness;
 use novarocks::standalone::{StandaloneNovaRocks, StandaloneOptions};
 
+/// Managed-lake integration tests write into a process-global tablet runtime
+/// registry (plus segment/batch caches) via the StarRocks lake connector. Run
+/// them serially so allocations of tablet_id=1, 2, … across independent SQLite
+/// metadata stores don't collide with each other in that shared in-memory
+/// state.
+///
+/// NOTE: `novarocks_config::CONFIG` is a `OnceLock`, so once a single test has
+/// initialized it the entire process shares that config. In practice that
+/// means running multiple managed-lake tests in one `cargo test` invocation
+/// will make later tests observe the earlier tempdir's SQLite/warehouse URIs
+/// and fail. Invoke each test individually (`cargo test --test
+/// standalone_managed_lake <name>`) until the global config is refactored to
+/// allow per-session overrides.
+fn managed_lake_test_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let mutex = LOCK.get_or_init(|| Mutex::new(()));
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 #[test]
 fn create_table_bootstraps_tablets_into_object_store() {
+    let _guard = managed_lake_test_lock();
     let Some(harness) =
         ManagedLakeTestHarness::maybe_new("create_table_bootstraps_tablets_into_object_store")
             .expect("create managed lake harness")
@@ -74,6 +99,7 @@ fn create_table_bootstraps_tablets_into_object_store() {
 
 #[test]
 fn reopen_restores_managed_table_snapshot() {
+    let _guard = managed_lake_test_lock();
     let Some(harness) = ManagedLakeTestHarness::maybe_new("reopen_restores_managed_table_snapshot")
         .expect("create managed lake harness")
     else {
@@ -149,6 +175,7 @@ fn reopen_restores_managed_table_snapshot() {
 
 #[test]
 fn select_from_empty_managed_table_returns_empty_result() {
+    let _guard = managed_lake_test_lock();
     let Some(harness) =
         ManagedLakeTestHarness::maybe_new("select_from_empty_managed_table_returns_empty_result")
             .expect("create managed lake harness")
@@ -182,6 +209,7 @@ fn select_from_empty_managed_table_returns_empty_result() {
 
 #[test]
 fn create_table_rejects_invalid_key_columns() {
+    let _guard = managed_lake_test_lock();
     let Some(harness) =
         ManagedLakeTestHarness::maybe_new("create_table_rejects_invalid_key_columns")
             .expect("create managed lake harness")
@@ -218,7 +246,116 @@ fn create_table_rejects_invalid_key_columns() {
 }
 
 #[test]
+fn managed_lake_insert_and_select_round_trips() {
+    let _guard = managed_lake_test_lock();
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("managed_lake_insert_and_select_round_trips")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
+    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("open standalone engine");
+    let session = engine.session();
+
+    session
+        .execute(
+            "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+        )
+        .expect("create managed table");
+
+    session
+        .execute("insert into orders values (1, 'a'), (2, 'b'), (3, NULL)")
+        .expect("insert values");
+
+    let info = engine
+        .managed_table_info("default", "orders")
+        .expect("inspect managed table");
+    assert_eq!(info.visible_version, 2);
+
+    let result = session
+        .query("select k1, v1 from orders order by k1")
+        .expect("select rows");
+    assert_eq!(result.row_count(), 3);
+
+    let conn = Connection::open(&harness.metadata_db_path).expect("open sqlite metadata");
+    let txn_row: (String, i64, i64) = conn
+        .query_row(
+            "SELECT state, base_version, commit_version FROM txns ORDER BY txn_id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("txn row");
+    assert_eq!(txn_row.0, "VISIBLE");
+    assert_eq!(txn_row.1, 1);
+    assert_eq!(txn_row.2, 2);
+    let partition_version: i64 = conn
+        .query_row(
+            "SELECT visible_version FROM partitions WHERE table_id = (SELECT table_id FROM tables WHERE name = 'orders')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("partition version");
+    assert_eq!(partition_version, 2);
+}
+
+#[test]
+fn managed_lake_insert_hashes_rows_across_tablets() {
+    let _guard = managed_lake_test_lock();
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("managed_lake_insert_hashes_rows_across_tablets")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
+    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("open standalone engine");
+    let session = engine.session();
+
+    session
+        .execute(
+            "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+        )
+        .expect("create managed table");
+
+    session
+        .execute("insert into orders values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')")
+        .expect("insert values");
+
+    let info = engine
+        .managed_table_info("default", "orders")
+        .expect("inspect managed table");
+    assert_eq!(info.tablets.len(), 2);
+    for tablet in &info.tablets {
+        let objects = harness
+            .list_tablet_objects(&tablet.tablet_root_path)
+            .expect("list tablet objects");
+        let has_data_file = objects.iter().any(|path| path.contains("/data/"));
+        assert!(
+            has_data_file,
+            "expected insert to produce a data file for tablet {}: {objects:?}",
+            tablet.tablet_id
+        );
+    }
+    assert_eq!(info.visible_version, 2);
+
+    let result = session
+        .query("select k1, v1 from orders order by k1")
+        .expect("select rows");
+    assert_eq!(result.row_count(), 4);
+}
+
+#[test]
 fn create_table_preserves_largeint_and_not_null_columns() {
+    let _guard = managed_lake_test_lock();
     let Some(harness) =
         ManagedLakeTestHarness::maybe_new("create_table_preserves_largeint_and_not_null_columns")
             .expect("create managed lake harness")
