@@ -17,6 +17,7 @@
 
 mod jvm;
 pub mod metadata;
+pub mod position_delete;
 pub mod schema;
 pub mod sink;
 mod state;

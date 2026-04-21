@@ -63,7 +63,7 @@ use crate::novarocks_logging::debug;
 use crate::runtime::profile::{RuntimeProfile, clamp_u128_to_i64};
 use crate::types;
 use page_selection::build_row_selection_for_row_groups;
-use reader::ParquetCachedReader;
+pub(crate) use reader::ParquetCachedReader;
 use row_group_selector::select_row_groups_for_range;
 
 static PARQUET_COALESCE_CONTROLLER: AdaptiveCoalesceController = AdaptiveCoalesceController::new();
@@ -2044,6 +2044,7 @@ mod tests {
                 scan_range_id: -1,
                 first_row_id: None,
                 external_datacache: None,
+                delete_files: Vec::new(),
             }],
             None,
             None,

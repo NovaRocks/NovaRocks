@@ -19,6 +19,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::iceberg::position_delete::{
+    IcebergDeleteFileSpec, convert_scan_range_delete_files, load_position_deletes,
+};
 use crate::descriptors;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp};
@@ -101,6 +104,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id,
             first_row_id,
             external_datacache,
+            delete_files,
         } = morsel
         else {
             return Err("hdfs scan received unexpected morsel".to_string());
@@ -114,6 +118,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id,
             first_row_id,
             external_datacache: external_datacache.clone(),
+            delete_files,
         }];
         let scan = FileScanContext::build(
             ranges,
@@ -159,6 +164,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: r.scan_range_id,
                 first_row_id: r.first_row_id,
                 external_datacache: r.external_datacache.clone(),
+                delete_files: r.delete_files.clone(),
             });
         }
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
@@ -262,6 +268,10 @@ impl ScanOp for HdfsScanOp {
                 (-1, None)
             };
 
+            let delete_files = convert_scan_range_delete_files(
+                &format!("HDFS_SCAN incremental morsel (scan_range_id={scan_range_id})"),
+                hdfs_range,
+            )?;
             morsels.push(ScanMorsel::FileRange {
                 path,
                 file_len,
@@ -270,6 +280,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id,
                 first_row_id,
                 external_datacache: build_external_datacache_options(hdfs_range),
+                delete_files,
             });
         }
 
@@ -287,6 +298,81 @@ impl ScanOp for HdfsScanOp {
             }
         }
         Some(prefix.to_string())
+    }
+
+    fn load_iceberg_position_deletes(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        let ScanMorsel::FileRange {
+            path, delete_files, ..
+        } = morsel
+        else {
+            return Ok(None);
+        };
+        if delete_files.is_empty() {
+            return Ok(None);
+        }
+        // Build a one-off scan context across the data file and all its delete
+        // files so a single OpenDAL operator resolves OSS / HDFS credentials
+        // for the entire set. We reuse `FileScanContext::build` for scheme
+        // classification and credential resolution, passing zero-length
+        // ranges because we never read the data file through this context —
+        // only the delete parquet files are read.
+        let mut loader_ranges: Vec<crate::fs::scan_context::FileScanRange> =
+            Vec::with_capacity(1 + delete_files.len());
+        loader_ranges.push(crate::fs::scan_context::FileScanRange {
+            path: path.clone(),
+            file_len: 0,
+            offset: 0,
+            length: 0,
+            scan_range_id: -1,
+            first_row_id: None,
+            external_datacache: None,
+            delete_files: Vec::new(),
+        });
+        for del in delete_files {
+            loader_ranges.push(crate::fs::scan_context::FileScanRange {
+                path: del.path.clone(),
+                file_len: del.length.unwrap_or(0),
+                offset: 0,
+                length: del.length.unwrap_or(0),
+                scan_range_id: -1,
+                first_row_id: None,
+                external_datacache: None,
+                delete_files: Vec::new(),
+            });
+        }
+        let ctx = crate::fs::scan_context::FileScanContext::build(
+            loader_ranges,
+            None,
+            self.cfg.object_store_config.as_ref(),
+        )?;
+        // After credential resolution `ctx.ranges` carries scheme-normalized
+        // paths suitable for the OpenDAL operator, but the delete parquet
+        // files record the data-file path exactly as the Iceberg writer saw
+        // it (`oss://bucket/...`, `hdfs://ns/...`, or an absolute filesystem
+        // path). Compare against the original morsel path so writer-recorded
+        // rows match regardless of how OpenDAL normalized the prefix.
+        let data_file_path = path.clone();
+        let normalized_delete_specs: Vec<IcebergDeleteFileSpec> = ctx
+            .ranges
+            .iter()
+            .skip(1)
+            .zip(delete_files.iter())
+            .map(|(resolved, original)| IcebergDeleteFileSpec {
+                path: resolved.path.clone(),
+                file_format: original.file_format,
+                length: original.length,
+            })
+            .collect();
+        let deleted =
+            load_position_deletes(&normalized_delete_specs, &data_file_path, &ctx.factory)?;
+        if deleted.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(deleted))
+        }
     }
 }
 
@@ -455,6 +541,7 @@ mod tests {
                 scan_range_id: 7,
                 first_row_id: Some(10),
                 external_datacache: None,
+                delete_files: Vec::new(),
             }],
             original_range_count: 1,
             has_more: true,

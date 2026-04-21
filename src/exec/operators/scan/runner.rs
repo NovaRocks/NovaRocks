@@ -51,6 +51,7 @@ use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::types;
 use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
+use roaring::RoaringTreemap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -164,6 +165,7 @@ pub(super) struct ScanAsyncRunner {
     row_position_state: Option<RowPositionState>,
     lake_row_position_state: Option<LakeRowPositionState>,
     iceberg_virtual_state: Option<IcebergVirtualState>,
+    iceberg_delete_filter_state: Option<IcebergDeleteFilterState>,
 }
 
 struct RowPositionState {
@@ -195,6 +197,19 @@ struct LakeRowPositionState {
 struct IcebergVirtualState {
     spec: IcebergVirtualSpec,
     file_path: String,
+    next_row_offset: i64,
+}
+
+/// Iceberg v2 merge-on-read state owned by the scan runner.
+///
+/// - `deleted`: absolute row positions within the current data file that
+///   prior DELETE / UPDATE / MERGE snapshots have retired, aggregated across
+///   every position-delete file the FE attached to the morsel.
+/// - `next_row_offset`: mirror of `IcebergVirtualState::next_row_offset` —
+///   both advance by the pre-filter chunk size so they stay in sync even
+///   when only one of them is active.
+struct IcebergDeleteFilterState {
+    deleted: RoaringTreemap,
     next_row_offset: i64,
 }
 
@@ -234,6 +249,7 @@ impl ScanAsyncRunner {
             row_position_state: None,
             lake_row_position_state: None,
             iceberg_virtual_state: None,
+            iceberg_delete_filter_state: None,
         }
     }
 
@@ -342,6 +358,7 @@ impl ScanAsyncRunner {
                     self.row_position_state = None;
                     self.lake_row_position_state = None;
                     self.iceberg_virtual_state = None;
+                    self.iceberg_delete_filter_state = None;
                     self.last_progress = Instant::now();
                     return Ok(None);
                 };
@@ -349,6 +366,8 @@ impl ScanAsyncRunner {
                 self.row_position_state = self.build_row_position_state(&morsel)?;
                 self.lake_row_position_state = self.build_lake_row_position_state(&morsel);
                 self.iceberg_virtual_state = self.build_iceberg_virtual_state(&morsel)?;
+                self.iceberg_delete_filter_state =
+                    self.build_iceberg_delete_filter_state(&morsel)?;
                 let start = Instant::now();
                 self.morsel_iter = Some(
                     self.scan
@@ -374,7 +393,13 @@ impl ScanAsyncRunner {
                         failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
                         Duration::from_millis(25),
                     );
-                    let chunk = self.append_iceberg_virtual_columns(chunk)?;
+                    let Some((chunk, kept_positions)) =
+                        self.apply_iceberg_position_delete_filter(chunk)?
+                    else {
+                        continue;
+                    };
+                    let chunk =
+                        self.append_iceberg_virtual_columns(chunk, kept_positions.as_deref())?;
                     let chunk = self.append_row_position_columns(chunk)?;
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
                         continue;
@@ -423,6 +448,7 @@ impl ScanAsyncRunner {
                     self.row_position_state = None;
                     self.lake_row_position_state = None;
                     self.iceberg_virtual_state = None;
+                    self.iceberg_delete_filter_state = None;
                     self.last_progress = Instant::now();
                     continue;
                 }
@@ -514,7 +540,107 @@ impl ScanAsyncRunner {
         }))
     }
 
-    fn append_iceberg_virtual_columns(&mut self, chunk: Chunk) -> Result<Chunk, String> {
+    fn build_iceberg_delete_filter_state(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<IcebergDeleteFilterState>, String> {
+        let ScanMorsel::FileRange {
+            delete_files,
+            first_row_id,
+            ..
+        } = morsel
+        else {
+            return Ok(None);
+        };
+        if delete_files.is_empty() {
+            return Ok(None);
+        }
+        let Some(deleted) = self.scan.load_iceberg_position_deletes(morsel)? else {
+            return Ok(None);
+        };
+        Ok(Some(IcebergDeleteFilterState {
+            deleted,
+            next_row_offset: first_row_id.unwrap_or(0),
+        }))
+    }
+
+    /// Apply Iceberg v2 merge-on-read filtering to the materialized chunk.
+    ///
+    /// Returns:
+    /// - `Ok(None)` when the chunk is fully deleted by MoR; caller drops it.
+    /// - `Ok(Some((chunk, None)))` when no MoR state is active — chunk
+    ///   unchanged, no position list produced.
+    /// - `Ok(Some((chunk, Some(kept_positions))))` when MoR filtered the
+    ///   chunk; `kept_positions[i]` is the absolute data-file row position
+    ///   of the `i`th surviving row, used by `_file` / `_pos` virtual column
+    ///   synthesis.
+    ///
+    /// Advances both the MoR counter and the virtual-column counter by the
+    /// pre-filter row count so that subsequent chunks remain correctly
+    /// aligned with the data file even if the whole chunk is dropped.
+    fn apply_iceberg_position_delete_filter(
+        &mut self,
+        chunk: Chunk,
+    ) -> Result<Option<(Chunk, Option<Vec<i64>>)>, String> {
+        let row_count = chunk.len();
+        if row_count == 0 {
+            return Ok(Some((chunk, None)));
+        }
+
+        let Some(state) = self.iceberg_delete_filter_state.as_mut() else {
+            // Keep the virtual-column counter in sync even when there is no
+            // MoR state — done inside `append_iceberg_virtual_columns`.
+            return Ok(Some((chunk, None)));
+        };
+
+        let start = state.next_row_offset;
+        state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
+
+        // Build the boolean keep mask for the chunk. In the common case
+        // (no row deleted) we can short-circuit and hand the chunk back
+        // untouched.
+        let mut mask_values = Vec::with_capacity(row_count);
+        let mut kept_count = 0usize;
+        for offset in 0..row_count as i64 {
+            let pos = start + offset;
+            let keep = pos < 0 || !state.deleted.contains(pos as u64);
+            if keep {
+                kept_count += 1;
+            }
+            mask_values.push(keep);
+        }
+
+        if kept_count == row_count {
+            // Chunk is untouched — return the original chunk but still feed
+            // the kept positions to downstream virtual-column synthesis so
+            // `_pos` matches the actual data-file positions.
+            let kept_positions: Vec<i64> = (0..row_count as i64).map(|i| start + i).collect();
+            return Ok(Some((chunk, Some(kept_positions))));
+        }
+        if kept_count == 0 {
+            return Ok(None);
+        }
+
+        let mask = BooleanArray::from(mask_values.clone());
+        let filtered_batch = filter_record_batch(&chunk.batch, &mask)
+            .map_err(|e| format!("iceberg MoR filter failed: {e}"))?;
+        let mut kept_positions = Vec::with_capacity(kept_count);
+        for (i, keep) in mask_values.into_iter().enumerate() {
+            if keep {
+                kept_positions.push(start + i as i64);
+            }
+        }
+        Ok(Some((
+            Chunk::new_like(filtered_batch, &chunk),
+            Some(kept_positions),
+        )))
+    }
+
+    fn append_iceberg_virtual_columns(
+        &mut self,
+        chunk: Chunk,
+        kept_positions: Option<&[i64]>,
+    ) -> Result<Chunk, String> {
         let Some(state) = self.iceberg_virtual_state.as_mut() else {
             return Ok(chunk);
         };
@@ -529,13 +655,25 @@ impl ScanAsyncRunner {
             Arc::new(StringArray::from(vec![state.file_path.as_str(); row_count])) as ArrayRef
         });
         let pos_array = state.spec.row_pos_slot.map(|_| {
-            let start = state.next_row_offset;
-            let values: Vec<i64> = (0..row_count as i64).map(|i| start + i).collect();
-            Arc::new(Int64Array::from(values)) as ArrayRef
+            // When MoR has filtered the chunk, `kept_positions` holds the
+            // absolute data-file position of every surviving row. Otherwise
+            // the chunk is in raw file order starting at `next_row_offset`.
+            if let Some(positions) = kept_positions {
+                Arc::new(Int64Array::from(positions.to_vec())) as ArrayRef
+            } else {
+                let start = state.next_row_offset;
+                let values: Vec<i64> = (0..row_count as i64).map(|i| start + i).collect();
+                Arc::new(Int64Array::from(values)) as ArrayRef
+            }
         });
         // `_pos` must capture the pre-filter absolute position, so advance the
-        // counter before any downstream predicates drop rows.
-        state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
+        // counter by the pre-filter row count before any downstream predicates
+        // drop more rows. When MoR supplied `kept_positions`, the counter has
+        // already been advanced by the MoR filter — skip double-advancement in
+        // that case.
+        if kept_positions.is_none() {
+            state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
+        }
 
         let mut field_map = HashMap::new();
         let chunk_schema = chunk.schema();
@@ -1193,6 +1331,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     external_datacache: None,
+                    delete_files: Vec::new(),
                 }],
                 false,
             ))

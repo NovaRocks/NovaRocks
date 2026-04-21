@@ -726,6 +726,7 @@ mod tests {
                     scan_range_id: 9,
                     first_row_id: Some(0),
                     external_datacache: None,
+                    delete_files: Vec::new(),
                 }],
             )
             .expect("register glm scan ranges");

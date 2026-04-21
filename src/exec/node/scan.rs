@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
 use crate::connector::starrocks::scan::{LakeScanSchemaMeta, StarRocksScanRange};
 use crate::descriptors;
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
@@ -41,6 +42,9 @@ pub enum ScanMorsel {
         scan_range_id: i32,
         first_row_id: Option<i64>,
         external_datacache: Option<ExternalDataCacheRangeOptions>,
+        /// Iceberg v2 position-delete files that apply to this data file.
+        /// Empty for append-only tables and for v1 scans.
+        delete_files: Vec<IcebergDeleteFileSpec>,
     },
     StarRocksRange {
         index: usize,
@@ -68,9 +72,17 @@ impl ScanMorsel {
                 scan_range_id,
                 first_row_id,
                 external_datacache,
+                delete_files,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} external_datacache={:?}",
-                path, file_len, offset, length, scan_range_id, first_row_id, external_datacache
+                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} external_datacache={:?} delete_files={}",
+                path,
+                file_len,
+                offset,
+                length,
+                scan_range_id,
+                first_row_id,
+                external_datacache,
+                delete_files.len()
             ),
             ScanMorsel::StarRocksRange { index, tablet_id } => {
                 format!("starrocks_range_index={index} tablet_id={tablet_id}")
@@ -209,6 +221,21 @@ pub trait ScanOp: Send + Sync {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String>;
+
+    /// Load Iceberg v2 position-delete files attached to `morsel` and collect
+    /// the row positions they retire for the morsel's data file. Returns
+    /// `Ok(None)` when the morsel has no delete files (the common case);
+    /// returns `Ok(Some(set))` otherwise.
+    ///
+    /// Only the HDFS connector knows how to open the delete-file parquet
+    /// (it owns the object-store credentials the FE handed down), so every
+    /// other scan op inherits the default no-op implementation.
+    fn load_iceberg_position_deletes(
+        &self,
+        _morsel: &ScanMorsel,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        Ok(None)
+    }
 }
 
 /// Metadata needed to re-scan a lake tablet for late materialization lookups.
@@ -465,6 +492,13 @@ impl ScanNode {
         let mut morsels = self.op.build_morsels()?;
         morsels.ensure_non_empty(self.accept_empty_scan_ranges);
         Ok(morsels)
+    }
+
+    pub fn load_iceberg_position_deletes(
+        &self,
+        morsel: &ScanMorsel,
+    ) -> Result<Option<roaring::RoaringTreemap>, String> {
+        self.op.load_iceberg_position_deletes(morsel)
     }
 }
 

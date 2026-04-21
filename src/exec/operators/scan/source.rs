@@ -782,6 +782,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     external_datacache: None,
+                    delete_files: Vec::new(),
                 })
                 .collect();
             Ok(ScanMorsels::new(morsels, false))

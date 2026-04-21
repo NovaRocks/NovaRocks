@@ -305,6 +305,7 @@ impl ScanOp for FileLoadScanOp {
                 scan_range_id: r.scan_range_id,
                 first_row_id: r.first_row_id,
                 external_datacache: r.external_datacache.clone(),
+                delete_files: r.delete_files.clone(),
             });
         }
         Ok(ScanMorsels::new(morsels, self.cfg.has_more))
@@ -487,6 +488,7 @@ pub(crate) fn lower_file_scan_node(
                 scan_range_id: next_scan_range_id,
                 first_row_id: None,
                 external_datacache: None,
+                delete_files: Vec::new(),
             });
             next_scan_range_id = next_scan_range_id.saturating_add(1);
         }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::cache::ExternalDataCacheRangeOptions;
+use crate::connector::iceberg::position_delete::IcebergDeleteFileSpec;
 use crate::fs::opendal::OpendalRangeReaderFactory;
 use crate::fs::path::{ScanPathScheme, classify_scan_paths, resolve_opendal_paths};
 use crate::novarocks_logging::debug;
@@ -29,6 +30,11 @@ pub struct FileScanRange {
     pub scan_range_id: i32,
     pub first_row_id: Option<i64>,
     pub external_datacache: Option<ExternalDataCacheRangeOptions>,
+    /// Iceberg v2 position-delete files attached to this data-file range.
+    /// Empty for v1 or append-only scans. Populated by the HDFS scan lowering
+    /// from `THdfsScanRange.delete_files`; equality-delete entries are
+    /// rejected at lowering.
+    pub delete_files: Vec<IcebergDeleteFileSpec>,
 }
 
 #[derive(Clone)]

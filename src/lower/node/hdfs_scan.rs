@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
+use crate::connector::iceberg::position_delete::convert_scan_range_delete_files;
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType, build_projected_output_schema,
@@ -644,16 +645,10 @@ pub(crate) fn lower_hdfs_scan_node(
                 node.node_id
             ));
         }
-        if hdfs_range
-            .delete_files
-            .as_ref()
-            .is_some_and(|v| !v.is_empty())
-        {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} does not support delete files (append-only only)",
-                node.node_id
-            ));
-        }
+        let iceberg_delete_files = convert_scan_range_delete_files(
+            &format!("HDFS_SCAN_NODE node_id={}", node.node_id),
+            hdfs_range,
+        )?;
         if hdfs_range.deletion_vector_descriptor.is_some() {
             return Err(format!(
                 "HDFS_SCAN_NODE node_id={} does not support deletion vectors (append-only only)",
@@ -779,6 +774,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 scan_range_id,
                 first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
                 external_datacache: external_datacache.clone(),
+                delete_files: iceberg_delete_files.clone(),
             });
         } else if let Some(rp) = hdfs_range.relative_path.as_ref().filter(|s| !s.is_empty()) {
             let table_id = hdfs_range.table_id.ok_or_else(|| {
@@ -803,6 +799,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 scan_range_id,
                 first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
                 external_datacache,
+                delete_files: iceberg_delete_files,
             });
         }
     }
