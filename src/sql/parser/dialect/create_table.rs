@@ -46,6 +46,7 @@ pub(crate) fn parse_create_table_statement(
     // Parse trailing clauses: ENGINE, KEY type, COMMENT, PARTITION, DISTRIBUTED, ORDER BY, PROPERTIES
     let mut _engine = None;
     let mut key_desc = None;
+    let mut bucket_count = None;
     let mut properties = Vec::new();
 
     // Consume all remaining clauses until EOF or semicolon
@@ -78,7 +79,7 @@ pub(crate) fn parse_create_table_statement(
         } else if peek_word_eq(parser, 0, "PARTITION") {
             skip_until_keyword_or_eof(parser, &["DISTRIBUTED", "ORDER", "PROPERTIES"]);
         } else if peek_word_eq(parser, 0, "DISTRIBUTED") {
-            skip_until_keyword_or_eof(parser, &["ORDER", "PROPERTIES"]);
+            bucket_count = parse_bucket_count(parser)?;
         } else if parser.parse_keyword(Keyword::ORDER) {
             // ORDER BY (...)
             let _ = parser.parse_keyword(Keyword::BY);
@@ -95,10 +96,41 @@ pub(crate) fn parse_create_table_statement(
     let kind = CreateTableKind::Iceberg {
         columns,
         key_desc,
+        bucket_count,
         properties,
     };
 
     Ok(CreateTableStmt { name, kind })
+}
+
+fn parse_bucket_count(parser: &mut Parser<'_>) -> Result<Option<u32>, String> {
+    parser.next_token(); // DISTRIBUTED
+    loop {
+        if parser.peek_token_ref().token == Token::EOF
+            || parser.peek_token_ref().token == Token::SemiColon
+            || peek_word_eq(parser, 0, "ORDER")
+            || peek_word_eq(parser, 0, "PROPERTIES")
+        {
+            return Ok(None);
+        }
+        if peek_word_eq(parser, 0, "BUCKETS") {
+            parser.next_token(); // BUCKETS
+            let token = parser.next_token();
+            return match token.token {
+                Token::Number(value, _) => {
+                    Ok(Some(value.parse::<u32>().map_err(|e| {
+                        format!("invalid BUCKETS value `{value}`: {e}")
+                    })?))
+                }
+                other => Err(format!("expected numeric BUCKETS value, got {other}")),
+            };
+        }
+        if parser.peek_token_ref().token == Token::LParen {
+            skip_parenthesized(parser);
+        } else {
+            parser.next_token();
+        }
+    }
 }
 
 fn parse_column_definitions(parser: &mut Parser<'_>) -> Result<Vec<TableColumnDef>, String> {
@@ -370,7 +402,10 @@ fn skip_default_value(parser: &mut Parser<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use sqlparser::parser::Parser;
+
     use super::parse_create_table_statement;
+    use crate::sql::parser::ast::CreateTableKind;
     use crate::sql::parser::dialect::StarRocksDialect;
 
     #[test]
@@ -413,5 +448,22 @@ mod tests {
             stmt.is_ok(),
             "expected nested complex type DDL to parse: {stmt:?}"
         );
+    }
+
+    #[test]
+    fn create_table_parser_preserves_bucket_count() {
+        let dialect = StarRocksDialect;
+        let mut parser = Parser::new(&dialect)
+            .try_with_sql(
+                "create table tbl (id int) duplicate key(id) distributed by hash(id) buckets 3",
+            )
+            .expect("parser");
+        let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
+        match stmt.kind {
+            CreateTableKind::Iceberg { bucket_count, .. } => {
+                assert_eq!(bucket_count, Some(3));
+            }
+            other => panic!("unexpected create table kind: {other:?}"),
+        }
     }
 }

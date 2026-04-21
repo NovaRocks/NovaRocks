@@ -38,6 +38,7 @@ pub(crate) enum CreateTableKind {
     Iceberg {
         columns: Vec<TableColumnDef>,
         key_desc: Option<TableKeyDesc>,
+        bucket_count: Option<u32>,
         properties: Vec<(String, String)>,
     },
 }

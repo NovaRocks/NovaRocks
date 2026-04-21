@@ -36,6 +36,8 @@ use super::iceberg::{
     list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
+use super::lake_ddl::create_managed_table;
+use super::lake_recovery::{ManagedLakeCatalog, ManagedLakeConfig, runtime_registered};
 use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 
 #[derive(Clone, Debug, Default)]
@@ -56,6 +58,27 @@ pub struct QueryResultColumn {
 pub struct QueryResult {
     pub columns: Vec<QueryResultColumn>,
     pub chunks: Vec<Chunk>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneManagedTabletInfo {
+    pub tablet_id: i64,
+    pub bucket_seq: i64,
+    pub tablet_root_path: String,
+    pub runtime_registered: bool,
+    pub snapshot_version: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneManagedTableInfo {
+    pub database_name: String,
+    pub table_name: String,
+    pub table_id: i64,
+    pub current_schema_id: i64,
+    pub keys_type: String,
+    pub bucket_num: i64,
+    pub visible_version: i64,
+    pub tablets: Vec<StandaloneManagedTabletInfo>,
 }
 
 #[derive(Clone, Debug)]
@@ -150,28 +173,45 @@ fn append_string_query_rows(result: QueryResult, rows: Vec<String>) -> Result<Qu
     build_string_query_result(&column_name, merged_rows)
 }
 
-#[derive(Default)]
-struct StandaloneState {
-    catalog: RwLock<InMemoryCatalog>,
-    iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
-    local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
-    materialized_views: RwLock<HashMap<(String, String), StandaloneMaterializedView>>,
-    materialized_view_seq: AtomicU64,
-    metadata_store: Option<SqliteMetadataStore>,
-    exchange_port: u16,
+pub(crate) struct StandaloneState {
+    pub(crate) catalog: RwLock<InMemoryCatalog>,
+    pub(crate) iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
+    pub(crate) local_table_semantics: RwLock<HashMap<(String, String), LocalTableSemantics>>,
+    pub(crate) materialized_views: RwLock<HashMap<(String, String), StandaloneMaterializedView>>,
+    pub(crate) materialized_view_seq: AtomicU64,
+    pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
+    pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
+    pub(crate) metadata_store: Option<SqliteMetadataStore>,
+    pub(crate) exchange_port: u16,
+}
+
+impl Default for StandaloneState {
+    fn default() -> Self {
+        Self {
+            catalog: RwLock::new(InMemoryCatalog::default()),
+            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            local_table_semantics: RwLock::new(HashMap::new()),
+            materialized_views: RwLock::new(HashMap::new()),
+            materialized_view_seq: AtomicU64::new(0),
+            managed_lake: RwLock::new(ManagedLakeCatalog::default()),
+            managed_lake_config: None,
+            metadata_store: None,
+            exchange_port: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
-struct LocalTableSemantics {
-    key_desc: Option<TableKeyDesc>,
-    column_aggregations: HashMap<String, ColumnAggregation>,
+pub(crate) struct LocalTableSemantics {
+    pub(crate) key_desc: Option<TableKeyDesc>,
+    pub(crate) column_aggregations: HashMap<String, ColumnAggregation>,
 }
 
 #[derive(Clone, Debug)]
-struct StandaloneMaterializedView {
-    name: String,
-    create_seq: u64,
-    bitmap_count_rewrite: bool,
+pub(crate) struct StandaloneMaterializedView {
+    pub(crate) name: String,
+    pub(crate) create_seq: u64,
+    pub(crate) bitmap_count_rewrite: bool,
 }
 
 #[derive(Clone)]
@@ -201,7 +241,10 @@ impl StandaloneNovaRocks {
             opts.metadata_db_path.as_deref(),
             opts.config_path.as_deref(),
         )?;
+        let managed_lake_config = resolve_managed_lake_config()?;
         let inner = Arc::new(StandaloneState {
+            managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
+            managed_lake_config,
             metadata_store,
             exchange_port,
             ..Default::default()
@@ -215,6 +258,65 @@ impl StandaloneNovaRocks {
         StandaloneSession {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    pub fn managed_table_info(
+        &self,
+        database_name: &str,
+        table_name: &str,
+    ) -> Result<StandaloneManagedTableInfo, String> {
+        let managed = self
+            .inner
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock");
+        let runtime = managed.table(database_name, table_name)?;
+        let visible_version = runtime
+            .partitions
+            .iter()
+            .map(|partition| partition.visible_version)
+            .max()
+            .unwrap_or(1);
+        let object_store_profile = managed
+            .config
+            .as_ref()
+            .map(|config| {
+                crate::connector::starrocks::ObjectStoreProfile::from_s3_store_config(&config.s3)
+            })
+            .transpose()?;
+        let tablets = runtime
+            .tablets
+            .iter()
+            .map(|tablet| {
+                let snapshot_version = object_store_profile.as_ref().and_then(|profile| {
+                    crate::formats::starrocks::metadata::load_tablet_snapshot(
+                        tablet.tablet_id,
+                        visible_version,
+                        &tablet.tablet_root_path,
+                        Some(profile),
+                    )
+                    .ok()
+                    .map(|snapshot| snapshot.version)
+                });
+                StandaloneManagedTabletInfo {
+                    tablet_id: tablet.tablet_id,
+                    bucket_seq: tablet.bucket_seq,
+                    tablet_root_path: tablet.tablet_root_path.clone(),
+                    runtime_registered: runtime_registered(tablet.tablet_id),
+                    snapshot_version,
+                }
+            })
+            .collect();
+        Ok(StandaloneManagedTableInfo {
+            database_name: runtime.database_name.clone(),
+            table_name: runtime.table.name.clone(),
+            table_id: runtime.table.table_id,
+            current_schema_id: runtime.table.current_schema_id,
+            keys_type: runtime.table.keys_type.clone(),
+            bucket_num: runtime.table.bucket_num,
+            visible_version,
+            tablets,
+        })
     }
 
     pub fn register_parquet_table(
@@ -308,6 +410,13 @@ impl StandaloneNovaRocks {
 }
 
 impl StandaloneSession {
+    pub fn execute(&self, sql: &str) -> Result<(), String> {
+        match self.execute_in_context(sql, None, DEFAULT_DATABASE)? {
+            StatementResult::Ok => Ok(()),
+            StatementResult::Query(_) => Err("statement returned rows".to_string()),
+        }
+    }
+
     pub fn query(&self, sql: &str) -> Result<QueryResult, String> {
         match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Query(result) => Ok(result),
@@ -626,6 +735,7 @@ impl StandaloneSession {
                     return Ok(StatementResult::Query(result));
                 }
 
+                reject_managed_table_queries(&self.inner, query, current_database)?;
                 let catalog = self
                     .inner
                     .catalog
@@ -1771,10 +1881,21 @@ fn execute_create_table_statement(
         CreateTableKind::Iceberg {
             columns,
             key_desc,
+            bucket_count,
             properties,
         } => {
             // When there is no iceberg catalog context, create a local parquet table
             if current_catalog.is_none() && stmt.name.parts.len() <= 2 {
+                if state.managed_lake_config.is_some() {
+                    return create_managed_table(
+                        state.as_ref(),
+                        &stmt.name,
+                        current_database,
+                        &columns,
+                        key_desc.as_ref(),
+                        bucket_count,
+                    );
+                }
                 return create_local_table_from_columns(
                     state,
                     &stmt.name,
@@ -1901,6 +2022,18 @@ fn execute_drop_table_statement(
     _force: bool,
 ) -> Result<StatementResult, String> {
     if current_catalog.is_none() && name.parts.len() <= 2 {
+        let resolved = resolve_local_table_name(name, current_database)?;
+        if state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock")
+            .contains_table(&resolved.database, &resolved.table)?
+        {
+            return Err(format!(
+                "DROP TABLE is not supported for managed standalone lake tables yet: {}.{}",
+                resolved.database, resolved.table
+            ));
+        }
         match resolve_local_table_name(name, current_database) {
             Ok(resolved) => {
                 let mut guard = state
@@ -1954,6 +2087,17 @@ fn execute_truncate_table_statement(
     current_database: &str,
 ) -> Result<StatementResult, String> {
     let resolved = resolve_local_table_name(name, current_database)?;
+    if state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock")
+        .contains_table(&resolved.database, &resolved.table)?
+    {
+        return Err(format!(
+            "TRUNCATE TABLE is not supported for managed standalone lake tables yet: {}.{}",
+            resolved.database, resolved.table
+        ));
+    }
     let guard = state.catalog.read().expect("standalone catalog read lock");
     let table_def = guard.get(&resolved.database, &resolved.table)?;
     let path = match &table_def.storage {
@@ -1993,6 +2137,17 @@ fn execute_insert_statement(
     // When there is no iceberg catalog context, try local table insert
     if current_catalog.is_none() && name.parts.len() <= 2 {
         if let Ok(resolved) = resolve_local_table_name(name, current_database) {
+            if state
+                .managed_lake
+                .read()
+                .expect("standalone managed lake read lock")
+                .contains_table(&resolved.database, &resolved.table)?
+            {
+                return Err(format!(
+                    "INSERT is not supported for managed standalone lake tables yet: {}.{}",
+                    resolved.database, resolved.table
+                ));
+            }
             let guard = state.catalog.read().expect("standalone catalog read lock");
             if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
                 drop(guard);
@@ -4506,6 +4661,15 @@ fn resolve_metadata_store(
     resolved_path.map(SqliteMetadataStore::open).transpose()
 }
 
+fn resolve_managed_lake_config() -> Result<Option<ManagedLakeConfig>, String> {
+    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    let Some(standalone) = cfg.standalone_server.as_ref() else {
+        return Ok(None);
+    };
+    let app_cfg = standalone.managed_lake_config()?;
+    app_cfg.map(ManagedLakeConfig::from_app_config).transpose()
+}
+
 fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -4526,6 +4690,7 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     };
     let snapshot = store.load_snapshot()?;
     restore_local_catalog(state, &snapshot)?;
+    restore_managed_lake(state, &snapshot)?;
     restore_iceberg_catalogs(state, &snapshot)?;
     Ok(())
 }
@@ -4575,6 +4740,28 @@ fn restore_iceberg_catalogs(
         let entry = guard.get(catalog)?;
         register_existing_iceberg_table(&entry, namespace, table)?;
     }
+    Ok(())
+}
+
+fn restore_managed_lake(
+    state: &Arc<StandaloneState>,
+    snapshot: &MetadataSnapshot,
+) -> Result<(), String> {
+    for database in &snapshot.managed.databases {
+        state
+            .catalog
+            .write()
+            .expect("standalone catalog write lock")
+            .create_database(&database.name)?;
+    }
+    let rebuilt =
+        ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), snapshot.managed.clone())?;
+    rebuilt.re_register_active_tablet_runtimes()?;
+    let mut guard = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    *guard = rebuilt;
     Ok(())
 }
 
@@ -4731,6 +4918,27 @@ fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> 
     names.sort();
     names.dedup();
     names
+}
+
+fn reject_managed_table_queries(
+    state: &Arc<StandaloneState>,
+    query: &sqlparser::ast::Query,
+    current_database: &str,
+) -> Result<(), String> {
+    let managed = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock");
+    for table_name in extract_table_names_from_query(query) {
+        if managed.contains_table(current_database, &table_name)? {
+            return Err(format!(
+                "managed standalone lake table scan is not wired yet: {}.{}",
+                normalize_identifier(current_database)?,
+                normalize_identifier(&table_name)?,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut Vec<String>) {
