@@ -51,19 +51,7 @@ pub struct StandaloneOptions {
     pub metadata_db_path: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
-pub struct QueryResultColumn {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub logical_type: Option<crate::sql::SqlType>,
-}
-
-#[derive(Clone, Debug)]
-pub struct QueryResult {
-    pub columns: Vec<QueryResultColumn>,
-    pub chunks: Vec<Chunk>,
-}
+pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandaloneManagedTabletInfo {
@@ -113,16 +101,6 @@ pub(crate) struct StandaloneStreamLoadResult {
 pub(crate) enum StatementResult {
     Query(QueryResult),
     Ok,
-}
-
-impl QueryResult {
-    pub fn row_count(&self) -> usize {
-        self.chunks.iter().map(Chunk::len).sum()
-    }
-
-    pub fn into_chunks(self) -> Vec<Chunk> {
-        self.chunks
-    }
 }
 
 pub(crate) fn build_string_query_result(
