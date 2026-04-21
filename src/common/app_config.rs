@@ -1050,7 +1050,10 @@ impl std::fmt::Debug for JdbcConfig {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{IcebergConfig, NovaRocksConfig, RuntimeConfig, StandaloneServerConfig};
+    use super::{
+        IcebergConfig, NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig,
+    };
 
     #[test]
     fn test_server_priority_networks_default_is_empty() {
@@ -1209,6 +1212,121 @@ user = "root"
         let standalone = cfg.standalone_server.expect("standalone config");
         assert_eq!(standalone.warehouse_uri, None);
         assert!(standalone.object_store.is_none());
+    }
+
+    #[test]
+    fn test_standalone_server_managed_lake_config_normalizes_required_fields() {
+        let standalone = StandaloneServerConfig {
+            warehouse_uri: Some(" s3://novarocks/standalone ".to_string()),
+            object_store: Some(StandaloneObjectStoreConfig {
+                endpoint: Some(" http://127.0.0.1:9000 ".to_string()),
+                access_key_id: Some(" admin ".to_string()),
+                access_key_secret: Some(" admin123 ".to_string()),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            }),
+            ..StandaloneServerConfig::default()
+        };
+
+        assert_eq!(
+            standalone
+                .managed_lake_config()
+                .expect("managed lake config"),
+            Some(StandaloneManagedLakeConfig {
+                warehouse_uri: "s3://novarocks/standalone".to_string(),
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                access_key_id: "admin".to_string(),
+                access_key_secret: "admin123".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            })
+        );
+    }
+
+    #[test]
+    fn test_standalone_server_managed_lake_config_returns_none_without_warehouse_uri() {
+        let standalone = StandaloneServerConfig::default();
+        assert_eq!(
+            standalone
+                .managed_lake_config()
+                .expect("managed lake config"),
+            None
+        );
+
+        let standalone = StandaloneServerConfig {
+            warehouse_uri: Some("   ".to_string()),
+            ..StandaloneServerConfig::default()
+        };
+        assert_eq!(
+            standalone
+                .managed_lake_config()
+                .expect("managed lake config"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_standalone_server_managed_lake_config_validates_required_object_store_fields() {
+        let base = StandaloneServerConfig {
+            warehouse_uri: Some("s3://novarocks/standalone".to_string()),
+            object_store: Some(StandaloneObjectStoreConfig {
+                endpoint: Some("http://127.0.0.1:9000".to_string()),
+                access_key_id: Some("admin".to_string()),
+                access_key_secret: Some("admin123".to_string()),
+                region: None,
+                enable_path_style_access: None,
+            }),
+            ..StandaloneServerConfig::default()
+        };
+
+        let cases = vec![
+            (
+                StandaloneServerConfig {
+                    object_store: None,
+                    ..base.clone()
+                },
+                "standalone managed lake requires [standalone_server.object_store]",
+            ),
+            (
+                StandaloneServerConfig {
+                    object_store: Some(StandaloneObjectStoreConfig {
+                        endpoint: None,
+                        ..base.object_store.clone().expect("object store")
+                    }),
+                    ..base.clone()
+                },
+                "standalone managed lake requires object_store.endpoint",
+            ),
+            (
+                StandaloneServerConfig {
+                    object_store: Some(StandaloneObjectStoreConfig {
+                        access_key_id: None,
+                        ..base.object_store.clone().expect("object store")
+                    }),
+                    ..base.clone()
+                },
+                "standalone managed lake requires object_store.access_key_id",
+            ),
+            (
+                StandaloneServerConfig {
+                    object_store: Some(StandaloneObjectStoreConfig {
+                        access_key_secret: None,
+                        ..base.object_store.clone().expect("object store")
+                    }),
+                    ..base
+                },
+                "standalone managed lake requires object_store.access_key_secret",
+            ),
+        ];
+
+        for (standalone, expected) in cases {
+            assert_eq!(
+                standalone
+                    .managed_lake_config()
+                    .expect_err("managed lake error"),
+                expected
+            );
+        }
     }
 
     #[test]
