@@ -638,6 +638,13 @@ pub fn oss_block_on<F>(future: F) -> Result<F::Output, String>
 where
     F: Future,
 {
+    // When invoked from a Tokio worker (e.g. the MySQL server's
+    // spawn_blocking closure) `data_block_on` refuses to nest. In that case
+    // the ambient runtime handle is still usable for blocking since we're on
+    // a dedicated blocking thread, so fall through to `handle.block_on`.
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Ok(handle.block_on(future));
+    }
     data_block_on(future)
 }
 

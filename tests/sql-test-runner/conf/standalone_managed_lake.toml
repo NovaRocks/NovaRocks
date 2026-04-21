@@ -1,0 +1,24 @@
+# NovaRocks standalone-server config for running the write-path
+# managed-lake SQL regressions against a local MinIO.
+#
+# Usage:
+#     NO_PROXY=127.0.0.1,localhost \
+#     cargo run --release -- standalone-server --config \
+#       tests/sql-test-runner/conf/standalone_managed_lake.toml
+#     cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
+#       --suite write-path --only managed_lake_insert_select --mode verify
+
+[server]
+host = "127.0.0.1"
+
+[standalone_server]
+mysql_port = 9030
+user = "root"
+metadata_db_path = "tmp/standalone-managed-lake.sqlite"
+warehouse_uri = "s3://novarocks/sql-tests-managed-lake"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+access_key_secret = "admin123"
+enable_path_style_access = true
