@@ -36,7 +36,10 @@ use super::iceberg::{
     list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-use super::lake_ddl::create_managed_table;
+use super::lake_ddl::{
+    create_managed_table, drop_managed_table as drop_managed_lake_table,
+    truncate_managed_table as truncate_managed_lake_table,
+};
 use super::lake_recovery::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
@@ -2040,10 +2043,7 @@ fn execute_drop_table_statement(
             .expect("standalone managed lake read lock")
             .contains_table(&resolved.database, &resolved.table)?
         {
-            return Err(format!(
-                "DROP TABLE is not supported for managed standalone lake tables yet: {}.{}",
-                resolved.database, resolved.table
-            ));
+            return drop_managed_lake_table(state, &resolved.database, &resolved.table);
         }
         match resolve_local_table_name(name, current_database) {
             Ok(resolved) => {
@@ -2104,10 +2104,7 @@ fn execute_truncate_table_statement(
         .expect("standalone managed lake read lock")
         .contains_table(&resolved.database, &resolved.table)?
     {
-        return Err(format!(
-            "TRUNCATE TABLE is not supported for managed standalone lake tables yet: {}.{}",
-            resolved.database, resolved.table
-        ));
+        return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
     }
     let guard = state.catalog.read().expect("standalone catalog read lock");
     let table_def = guard.get(&resolved.database, &resolved.table)?;

@@ -6,7 +6,8 @@
 #     cargo run --release -- standalone-server --config \
 #       tests/sql-test-runner/conf/standalone_managed_lake.toml
 #     cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
-#       --suite write-path --only managed_lake_insert_select --mode verify
+#       --config tests/sql-test-runner/conf/standalone_managed_lake.conf \
+#       --suite write-path --only managed_lake_insert_select,managed_lake_lifecycle --mode verify
 
 [server]
 host = "127.0.0.1"

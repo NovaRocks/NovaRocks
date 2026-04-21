@@ -18,8 +18,6 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
-pub mod object_store;
-
 use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;

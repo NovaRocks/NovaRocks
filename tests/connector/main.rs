@@ -126,6 +126,7 @@ fn test_iceberg_connector_module() {
             scan_range_id: -1,
             first_row_id: None,
             external_datacache: None,
+            delete_files: Vec::new(),
         }],
         original_range_count: 1,
         has_more: false,

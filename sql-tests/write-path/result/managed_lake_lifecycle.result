@@ -1,0 +1,12 @@
+-- query 2
+k1	v1
+1	a
+2	b
+
+-- query 4
+count()
+0
+
+-- query 6
+k1	v1
+10	z

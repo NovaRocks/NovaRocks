@@ -27,6 +27,7 @@ pub(crate) struct ManagedSnapshot {
     pub indexes: Vec<StoredManagedIndex>,
     pub tablets: Vec<StoredManagedTablet>,
     pub txns: Vec<StoredManagedTxn>,
+    pub erase_jobs: Vec<StoredManagedEraseJob>,
 }
 
 impl ManagedSnapshot {
@@ -40,6 +41,7 @@ impl ManagedSnapshot {
             && self.indexes.is_empty()
             && self.tablets.is_empty()
             && self.txns.is_empty()
+            && self.erase_jobs.is_empty()
     }
 }
 
@@ -128,6 +130,19 @@ pub(crate) struct StoredManagedTxn {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedEraseJob {
+    pub job_id: i64,
+    pub job_kind: ManagedEraseJobKind,
+    pub table_id: i64,
+    pub partition_id: Option<i64>,
+    pub root_path: String,
+    pub state: ManagedEraseJobState,
+    pub retry_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedManagedTxn {
     pub txn_id: i64,
@@ -137,11 +152,28 @@ pub(crate) struct PreparedManagedTxn {
     pub commit_version: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StageManagedTruncateRequest {
+    pub table_id: i64,
+    pub db_id: i64,
+    pub bucket_num: i64,
+    pub partition_name: String,
+    pub warehouse_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StagedManagedTruncate {
+    pub partition_id: i64,
+    pub index_id: i64,
+    pub tablet_ids: Vec<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ManagedTableState {
     Creating,
     #[default]
     Active,
+    Dropping,
     Failed,
 }
 
@@ -150,6 +182,7 @@ impl ManagedTableState {
         match self {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
+            Self::Dropping => "DROPPING",
             Self::Failed => "FAILED",
         }
     }
@@ -158,6 +191,7 @@ impl ManagedTableState {
         match value {
             "CREATING" => Ok(Self::Creating),
             "ACTIVE" => Ok(Self::Active),
+            "DROPPING" => Ok(Self::Dropping),
             "FAILED" => Ok(Self::Failed),
             _ => Err(format!("unknown managed table state `{value}`")),
         }
@@ -169,6 +203,7 @@ pub(crate) enum ManagedPartitionState {
     Creating,
     #[default]
     Active,
+    Retired,
     Failed,
 }
 
@@ -177,6 +212,7 @@ impl ManagedPartitionState {
         match self {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
+            Self::Retired => "RETIRED",
             Self::Failed => "FAILED",
         }
     }
@@ -185,6 +221,7 @@ impl ManagedPartitionState {
         match value {
             "CREATING" => Ok(Self::Creating),
             "ACTIVE" => Ok(Self::Active),
+            "RETIRED" => Ok(Self::Retired),
             "FAILED" => Ok(Self::Failed),
             _ => Err(format!("unknown managed partition state `{value}`")),
         }
@@ -196,6 +233,7 @@ pub(crate) enum ManagedIndexState {
     Creating,
     #[default]
     Active,
+    Retired,
     Failed,
 }
 
@@ -204,6 +242,7 @@ impl ManagedIndexState {
         match self {
             Self::Creating => "CREATING",
             Self::Active => "ACTIVE",
+            Self::Retired => "RETIRED",
             Self::Failed => "FAILED",
         }
     }
@@ -212,8 +251,61 @@ impl ManagedIndexState {
         match value {
             "CREATING" => Ok(Self::Creating),
             "ACTIVE" => Ok(Self::Active),
+            "RETIRED" => Ok(Self::Retired),
             "FAILED" => Ok(Self::Failed),
             _ => Err(format!("unknown managed index state `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedEraseJobKind {
+    DropTable,
+    DropPartition,
+}
+
+impl ManagedEraseJobKind {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::DropTable => "DROP_TABLE",
+            Self::DropPartition => "DROP_PARTITION",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "DROP_TABLE" => Ok(Self::DropTable),
+            "DROP_PARTITION" => Ok(Self::DropPartition),
+            _ => Err(format!("unknown managed erase job kind `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedEraseJobState {
+    Pending,
+    Running,
+    Failed,
+    Finished,
+}
+
+impl ManagedEraseJobState {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Running => "RUNNING",
+            Self::Failed => "FAILED",
+            Self::Finished => "FINISHED",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "RUNNING" => Ok(Self::Running),
+            "FAILED" => Ok(Self::Failed),
+            "FINISHED" => Ok(Self::Finished),
+            _ => Err(format!("unknown managed erase job state `{value}`")),
         }
     }
 }
@@ -396,6 +488,7 @@ impl SqliteMetadataStore {
             .map_err(|e| format!("begin managed snapshot transaction failed: {e}"))?;
 
         for table in [
+            "erase_jobs",
             "txns",
             "tablets",
             "indexes",
@@ -582,10 +675,266 @@ impl SqliteMetadataStore {
                 )
                 .map_err(|e| format!("persist managed txn failed: {e}"))?;
             }
+
+            for erase_job in &snapshot.erase_jobs {
+                tx.execute(
+                    "INSERT INTO erase_jobs(
+                        job_id,
+                        job_kind,
+                        table_id,
+                        partition_id,
+                        root_path,
+                        state,
+                        retry_at_ms,
+                        updated_at_ms,
+                        last_error
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        erase_job.job_id,
+                        erase_job.job_kind.as_sql_str(),
+                        erase_job.table_id,
+                        erase_job.partition_id,
+                        erase_job.root_path,
+                        erase_job.state.as_sql_str(),
+                        erase_job.retry_at_ms,
+                        erase_job.updated_at_ms,
+                        erase_job.last_error,
+                    ],
+                )
+                .map_err(|e| format!("persist managed erase job failed: {e}"))?;
+            }
         }
 
         tx.commit()
             .map_err(|e| format!("commit managed snapshot failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn drop_managed_table(&self, table_id: i64, root_path: &str) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin drop_managed_table transaction failed: {e}"))?;
+        let inflight_txn_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM txns
+                 WHERE table_id = ?1 AND state IN ('PREPARED', 'WRITTEN')",
+                params![table_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count inflight txns for table {table_id} failed: {e}"))?;
+        if inflight_txn_count > 0 {
+            return Err(format!(
+                "cannot drop managed table {table_id}: inflight managed txns exist"
+            ));
+        }
+        let next_job_id: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("allocate erase job id failed: {e}"))?;
+        tx.execute(
+            "UPDATE tables SET state = 'DROPPING' WHERE table_id = ?1",
+            params![table_id],
+        )
+        .map_err(|e| format!("mark managed table dropping failed: {e}"))?;
+        tx.execute(
+            "UPDATE partitions SET state = 'RETIRED'
+             WHERE table_id = ?1 AND state = 'ACTIVE'",
+            params![table_id],
+        )
+        .map_err(|e| format!("retire managed partitions failed: {e}"))?;
+        tx.execute(
+            "UPDATE indexes SET state = 'RETIRED'
+             WHERE table_id = ?1 AND state = 'ACTIVE'",
+            params![table_id],
+        )
+        .map_err(|e| format!("retire managed indexes failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO erase_jobs(
+                job_id,
+                job_kind,
+                table_id,
+                partition_id,
+                root_path,
+                state,
+                retry_at_ms,
+                updated_at_ms,
+                last_error
+            ) VALUES (?1, 'DROP_TABLE', ?2, NULL, ?3, 'PENDING', NULL, strftime('%s','now') * 1000, NULL)",
+            params![next_job_id, table_id, root_path],
+        )
+        .map_err(|e| format!("insert drop-table erase job failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit drop_managed_table failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn stage_truncate_partition(
+        &self,
+        req: StageManagedTruncateRequest,
+    ) -> Result<StagedManagedTruncate, String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin stage_truncate_partition transaction failed: {e}"))?;
+        let inflight_txn_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM txns
+                 WHERE table_id = ?1 AND state IN ('PREPARED', 'WRITTEN')",
+                params![req.table_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count inflight txns for truncate failed: {e}"))?;
+        if inflight_txn_count > 0 {
+            return Err(format!(
+                "cannot truncate managed table {} while inflight managed txns exist",
+                req.table_id
+            ));
+        }
+        let partition_id: i64 = tx
+            .query_row(
+                "SELECT next_partition_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_partition_id failed: {e}"))?;
+        let index_id: i64 = tx
+            .query_row(
+                "SELECT next_index_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_index_id failed: {e}"))?;
+        let first_tablet_id: i64 = tx
+            .query_row(
+                "SELECT next_tablet_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_tablet_id failed: {e}"))?;
+        tx.execute(
+            "UPDATE global_meta
+             SET next_partition_id = ?1, next_index_id = ?2, next_tablet_id = ?3
+             WHERE singleton = 1",
+            params![
+                partition_id + 1,
+                index_id + 1,
+                first_tablet_id + req.bucket_num
+            ],
+        )
+        .map_err(|e| format!("bump truncate ids failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO partitions(
+                partition_id,
+                table_id,
+                name,
+                visible_version,
+                next_version,
+                state
+            ) VALUES (?1, ?2, ?3, 1, 2, 'CREATING')",
+            params![partition_id, req.table_id, req.partition_name],
+        )
+        .map_err(|e| format!("insert creating partition failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO indexes(index_id, table_id, partition_id, index_type, state)
+             VALUES (?1, ?2, ?3, 'BASE', 'CREATING')",
+            params![index_id, req.table_id, partition_id],
+        )
+        .map_err(|e| format!("insert creating index failed: {e}"))?;
+        let partition_root_path = format!(
+            "{}/db_{}/table_{}/partition_{}",
+            req.warehouse_uri.trim_end_matches('/'),
+            req.db_id,
+            req.table_id,
+            partition_id
+        );
+        let mut tablet_ids = Vec::new();
+        for bucket_seq in 0..req.bucket_num {
+            let tablet_id = first_tablet_id + bucket_seq;
+            tx.execute(
+                "INSERT INTO tablets(tablet_id, partition_id, index_id, bucket_seq, tablet_root_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    tablet_id,
+                    partition_id,
+                    index_id,
+                    bucket_seq,
+                    partition_root_path,
+                ],
+            )
+            .map_err(|e| format!("insert creating tablet failed: {e}"))?;
+            tablet_ids.push(tablet_id);
+        }
+        tx.commit()
+            .map_err(|e| format!("commit stage_truncate_partition failed: {e}"))?;
+        Ok(StagedManagedTruncate {
+            partition_id,
+            index_id,
+            tablet_ids,
+        })
+    }
+
+    pub(crate) fn activate_truncate_partition(
+        &self,
+        table_id: i64,
+        old_partition_id: i64,
+        new_partition_id: i64,
+        new_index_id: i64,
+        retired_root_path: &str,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin activate_truncate_partition transaction failed: {e}"))?;
+        let next_job_id: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(job_id), 0) + 1 FROM erase_jobs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("allocate erase job id failed: {e}"))?;
+        tx.execute(
+            "UPDATE partitions
+             SET state = CASE
+                 WHEN partition_id = ?1 THEN 'ACTIVE'
+                 WHEN partition_id = ?2 THEN 'RETIRED'
+                 ELSE state
+             END
+             WHERE table_id = ?3",
+            params![new_partition_id, old_partition_id, table_id],
+        )
+        .map_err(|e| format!("switch partition states failed: {e}"))?;
+        tx.execute(
+            "UPDATE indexes
+             SET state = CASE
+                 WHEN index_id = ?1 THEN 'ACTIVE'
+                 WHEN partition_id = ?2 THEN 'RETIRED'
+                 ELSE state
+             END
+             WHERE table_id = ?3",
+            params![new_index_id, old_partition_id, table_id],
+        )
+        .map_err(|e| format!("switch index states failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO erase_jobs(
+                job_id,
+                job_kind,
+                table_id,
+                partition_id,
+                root_path,
+                state,
+                retry_at_ms,
+                updated_at_ms,
+                last_error
+            ) VALUES (?1, 'DROP_PARTITION', ?2, ?3, ?4, 'PENDING', NULL, strftime('%s','now') * 1000, NULL)",
+            params![next_job_id, table_id, old_partition_id, retired_root_path],
+        )
+        .map_err(|e| format!("insert truncate erase job failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit activate_truncate_partition failed: {e}"))?;
         Ok(())
     }
 
@@ -688,6 +1037,33 @@ impl SqliteMetadataStore {
                 params![table_id],
             )
             .map_err(|e| format!("mark table failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_creating_partition(&self, partition_id: i64) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin delete_creating_partition transaction failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM tablets WHERE partition_id = ?1",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete creating tablets failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM indexes
+             WHERE partition_id = ?1 AND state = 'CREATING'",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete creating indexes failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM partitions
+             WHERE partition_id = ?1 AND state = 'CREATING'",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete creating partition failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit delete_creating_partition failed: {e}"))?;
         Ok(())
     }
 
@@ -810,6 +1186,14 @@ impl SqliteMetadataStore {
 
     fn init_schema(&self) -> Result<(), String> {
         let conn = self.connection()?;
+        let current_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| format!("read standalone metadata schema version failed: {e}"))?;
+        if current_version != 0 && current_version != 3 {
+            return Err(format!(
+                "unsupported standalone metadata schema version {current_version}; delete the metadata db and reopen"
+            ));
+        }
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -889,6 +1273,17 @@ impl SqliteMetadataStore {
                 retry_at_ms INTEGER,
                 updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS erase_jobs (
+                job_id INTEGER PRIMARY KEY,
+                job_kind TEXT NOT NULL,
+                table_id INTEGER NOT NULL,
+                partition_id INTEGER,
+                root_path TEXT NOT NULL,
+                state TEXT NOT NULL,
+                retry_at_ms INTEGER,
+                updated_at_ms INTEGER NOT NULL,
+                last_error TEXT
+            );
             CREATE TABLE IF NOT EXISTS iceberg_catalogs (
                 name TEXT PRIMARY KEY,
                 properties_json TEXT NOT NULL
@@ -904,7 +1299,7 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
@@ -1152,6 +1547,46 @@ impl SqliteMetadataStore {
                 .map_err(|e| format!("read managed txns failed: {e}"))?
         };
 
+        let erase_jobs = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        job_id,
+                        job_kind,
+                        table_id,
+                        partition_id,
+                        root_path,
+                        state,
+                        retry_at_ms,
+                        updated_at_ms,
+                        last_error
+                     FROM erase_jobs
+                     ORDER BY job_id",
+                )
+                .map_err(|e| format!("prepare managed erase_jobs query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let job_kind = ManagedEraseJobKind::from_sql_str(&row.get::<_, String>(1)?)
+                        .map_err(invalid_state_sql_error)?;
+                    let state = ManagedEraseJobState::from_sql_str(&row.get::<_, String>(5)?)
+                        .map_err(invalid_state_sql_error)?;
+                    Ok(StoredManagedEraseJob {
+                        job_id: row.get(0)?,
+                        job_kind,
+                        table_id: row.get(2)?,
+                        partition_id: row.get(3)?,
+                        root_path: row.get(4)?,
+                        state,
+                        retry_at_ms: row.get(6)?,
+                        updated_at_ms: row.get(7)?,
+                        last_error: row.get(8)?,
+                    })
+                })
+                .map_err(|e| format!("query managed erase_jobs failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed erase_jobs failed: {e}"))?
+        };
+
         if global == ManagedGlobalMeta::default()
             && (!databases.is_empty()
                 || !tables.is_empty()
@@ -1160,7 +1595,8 @@ impl SqliteMetadataStore {
                 || !partitions.is_empty()
                 || !indexes.is_empty()
                 || !tablets.is_empty()
-                || !txns.is_empty())
+                || !txns.is_empty()
+                || !erase_jobs.is_empty())
         {
             return Err("managed metadata missing global_meta row".to_string());
         }
@@ -1175,6 +1611,7 @@ impl SqliteMetadataStore {
             indexes,
             tablets,
             txns,
+            erase_jobs,
         })
     }
 }
@@ -1216,10 +1653,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
-        ManagedTableState, ManagedTxnState, SqliteMetadataStore, StoredManagedColumn,
-        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-        StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
+        ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
+        ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
+        SqliteMetadataStore, StageManagedTruncateRequest, StoredManagedColumn,
+        StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex, StoredManagedPartition,
+        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
 
     #[test]
@@ -1296,6 +1734,82 @@ mod tests {
                 retry_at_ms: Some(1_234),
                 updated_at_ms: 5_678,
             }],
+            erase_jobs: Vec::new(),
+        };
+
+        store
+            .replace_managed_snapshot(&expected)
+            .expect("persist snapshot");
+
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        assert_eq!(snapshot.managed, expected);
+    }
+
+    #[test]
+    fn standalone_store_round_trips_lifecycle_states_and_erase_jobs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+
+        let expected = ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+                next_db_id: 2,
+                next_table_id: 3,
+                next_partition_id: 4,
+                next_index_id: 5,
+                next_tablet_id: 6,
+                next_txn_id: 7,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+                state: ManagedTableState::Dropping,
+            }],
+            schemas: vec![],
+            columns: vec![],
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 3,
+                next_version: 4,
+                state: ManagedPartitionState::Retired,
+            }],
+            indexes: vec![StoredManagedIndex {
+                index_id: 30,
+                table_id: 10,
+                partition_id: 20,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Retired,
+            }],
+            tablets: vec![StoredManagedTablet {
+                tablet_id: 40,
+                partition_id: 20,
+                index_id: 30,
+                bucket_seq: 0,
+                tablet_root_path: "s3://bucket/warehouse/db_1/table_10/partition_20".to_string(),
+            }],
+            txns: vec![],
+            erase_jobs: vec![StoredManagedEraseJob {
+                job_id: 50,
+                job_kind: ManagedEraseJobKind::DropTable,
+                table_id: 10,
+                partition_id: None,
+                root_path: "s3://bucket/warehouse/db_1/table_10".to_string(),
+                state: ManagedEraseJobState::Pending,
+                retry_at_ms: None,
+                updated_at_ms: 0,
+                last_error: None,
+            }],
         };
 
         store
@@ -1351,6 +1865,7 @@ mod tests {
             indexes: Vec::new(),
             tablets: Vec::new(),
             txns: Vec::new(),
+            erase_jobs: Vec::new(),
         };
         store
             .replace_managed_snapshot(&snapshot)
@@ -1430,5 +1945,76 @@ mod tests {
             .expect("partition row");
         assert_eq!(partition.visible_version, 1);
         assert_eq!(partition.next_version, 2);
+    }
+
+    #[test]
+    fn drop_managed_table_rejects_inflight_txns() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let _prepared = store.prepare_txn(10, 20, 1).expect("prepare txn");
+
+        let err = store
+            .drop_managed_table(10, "s3://test/warehouse/db_1/table_10")
+            .expect_err("drop should reject inflight txns");
+        assert!(err.contains("inflight managed txns"), "err={err}");
+    }
+
+    #[test]
+    fn drop_managed_table_marks_metadata_and_enqueues_drop_job() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+
+        store
+            .drop_managed_table(10, "s3://test/warehouse/db_1/table_10")
+            .expect("drop managed table");
+
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        assert_eq!(
+            snapshot.managed.tables[0].state,
+            ManagedTableState::Dropping
+        );
+        assert_eq!(
+            snapshot.managed.partitions[0].state,
+            ManagedPartitionState::Retired
+        );
+        assert_eq!(snapshot.managed.erase_jobs.len(), 1);
+        assert_eq!(
+            snapshot.managed.erase_jobs[0].job_kind,
+            ManagedEraseJobKind::DropTable
+        );
+    }
+
+    #[test]
+    fn activate_truncate_partition_switches_active_partition_and_enqueues_erase() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let staged = store
+            .stage_truncate_partition(StageManagedTruncateRequest {
+                table_id: 10,
+                db_id: 1,
+                bucket_num: 2,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://test/warehouse".to_string(),
+            })
+            .expect("stage truncate");
+
+        store
+            .activate_truncate_partition(
+                10,
+                20,
+                staged.partition_id,
+                staged.index_id,
+                "s3://test/warehouse/db_1/table_10/partition_20",
+            )
+            .expect("activate truncate");
+
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        assert!(snapshot.managed.partitions.iter().any(|partition| {
+            partition.partition_id == staged.partition_id
+                && partition.state == ManagedPartitionState::Active
+        }));
+        assert!(snapshot.managed.partitions.iter().any(|partition| {
+            partition.partition_id == 20 && partition.state == ManagedPartitionState::Retired
+        }));
+        assert!(snapshot.managed.erase_jobs.iter().any(|job| {
+            job.job_kind == ManagedEraseJobKind::DropPartition && job.partition_id == Some(20)
+        }));
     }
 }
