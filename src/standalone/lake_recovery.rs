@@ -22,9 +22,9 @@ use super::catalog::{
 };
 use super::iceberg_add_files::parse_s3_path;
 use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState,
-    StoredManagedColumn, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-    StoredManagedTable, StoredManagedTablet,
+    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
+    SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
+    StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
 };
 
 #[derive(Clone, Debug)]
@@ -365,6 +365,81 @@ pub(crate) struct ManagedTableRuntime {
     pub(crate) partitions: Vec<StoredManagedPartition>,
     pub(crate) indexes: Vec<StoredManagedIndex>,
     pub(crate) tablets: Vec<StoredManagedTablet>,
+}
+
+/// Reconcile non-terminal state left behind by a crashed process.
+///
+/// Invoked before the in-memory catalog is rebuilt from the freshly-loaded
+/// snapshot. Mutates `snapshot` in place to reflect the terminal state that
+/// was persisted, so the rebuild sees a consistent view.
+///
+/// * `CREATING` tables are finalized as `FAILED` — their tablets may or may
+///   not exist on object storage but there is no safe way to finish the
+///   bootstrap, so we keep them out of the active catalog.
+/// * `PREPARED` txns are aborted — the rowset write never completed.
+/// * `WRITTEN` txns are replayed by `replay`, then marked `VISIBLE`. The
+///   partition's visible/next version is also advanced.
+pub(crate) fn reconcile_on_open<F>(
+    store: &SqliteMetadataStore,
+    snapshot: &mut ManagedSnapshot,
+    mut replay: F,
+) -> Result<(), String>
+where
+    F: FnMut(&ManagedSnapshot, &super::store::StoredManagedTxn) -> Result<(), String>,
+{
+    let failed_table_ids: Vec<i64> = snapshot
+        .tables
+        .iter()
+        .filter(|table| table.state == ManagedTableState::Creating)
+        .map(|table| table.table_id)
+        .collect();
+    for table_id in &failed_table_ids {
+        store.mark_table_failed(*table_id)?;
+    }
+    for table in snapshot.tables.iter_mut() {
+        if failed_table_ids.contains(&table.table_id) {
+            table.state = ManagedTableState::Failed;
+        }
+    }
+
+    let mut aborted = Vec::new();
+    let mut replayed = Vec::new();
+    for txn in &snapshot.txns {
+        match txn.state {
+            ManagedTxnState::Prepared => aborted.push(txn.txn_id),
+            ManagedTxnState::Written => replayed.push(txn.clone()),
+            _ => {}
+        }
+    }
+
+    for txn_id in &aborted {
+        store.mark_txn_aborted(*txn_id)?;
+    }
+
+    for txn in &replayed {
+        replay(snapshot, txn)?;
+        store.mark_txn_visible(txn.txn_id, txn.commit_version)?;
+    }
+
+    for txn in snapshot.txns.iter_mut() {
+        if aborted.contains(&txn.txn_id) {
+            txn.state = ManagedTxnState::Aborted;
+            txn.retry_at_ms = None;
+        } else if replayed.iter().any(|r| r.txn_id == txn.txn_id) {
+            txn.state = ManagedTxnState::Visible;
+        }
+    }
+    for txn in &replayed {
+        for partition in snapshot.partitions.iter_mut() {
+            if partition.partition_id == txn.partition_id
+                && partition.visible_version < txn.commit_version
+            {
+                partition.visible_version = txn.commit_version;
+                partition.next_version = txn.commit_version + 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn snapshot_is_empty(snapshot: &ManagedSnapshot) -> bool {
@@ -778,5 +853,141 @@ mod tests {
             arrow_type_from_tablet_column(&column).expect("time arrow type"),
             DataType::Time64(TimeUnit::Microsecond)
         );
+    }
+
+    fn test_store_with_snapshot(snapshot: &ManagedSnapshot) -> (tempfile::TempDir, SqliteMetadataStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
+            .expect("open store");
+        store
+            .replace_managed_snapshot(snapshot)
+            .expect("persist snapshot");
+        (dir, store)
+    }
+
+    fn snapshot_seed() -> ManagedSnapshot {
+        use crate::standalone::store::{
+            ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
+        };
+        ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: "s3://test/warehouse".to_string(),
+                next_db_id: 2,
+                next_table_id: 20,
+                next_partition_id: 110,
+                next_index_id: 30,
+                next_tablet_id: 400,
+                next_txn_id: 60,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 100,
+                state: ManagedTableState::Active,
+            }],
+            schemas: vec![StoredManagedSchema {
+                schema_id: 100,
+                table_id: 10,
+                schema_version: 0,
+                tablet_schema_pb: vec![],
+            }],
+            columns: Vec::new(),
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 1,
+                next_version: 2,
+                state: ManagedPartitionState::Active,
+            }],
+            indexes: Vec::new(),
+            tablets: Vec::new(),
+            txns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_on_open_marks_creating_tables_failed() {
+        let mut snapshot = snapshot_seed();
+        snapshot.tables[0].state = ManagedTableState::Creating;
+        let (_dir, store) = test_store_with_snapshot(&snapshot);
+
+        reconcile_on_open(&store, &mut snapshot, |_, _| {
+            panic!("no txns should trigger replay")
+        })
+        .expect("reconcile");
+
+        assert_eq!(snapshot.tables[0].state, ManagedTableState::Failed);
+        let persisted = store.load_snapshot().expect("load snapshot");
+        assert_eq!(persisted.managed.tables[0].state, ManagedTableState::Failed);
+    }
+
+    #[test]
+    fn reconcile_on_open_aborts_prepared_txns_without_replay() {
+        use crate::standalone::store::StoredManagedTxn;
+        let mut snapshot = snapshot_seed();
+        snapshot.txns.push(StoredManagedTxn {
+            txn_id: 90,
+            table_id: 10,
+            partition_id: 20,
+            base_version: 1,
+            commit_version: 2,
+            state: ManagedTxnState::Prepared,
+            retry_at_ms: Some(42),
+            updated_at_ms: 0,
+        });
+        let (_dir, store) = test_store_with_snapshot(&snapshot);
+
+        reconcile_on_open(&store, &mut snapshot, |_, _| {
+            panic!("no WRITTEN txns should trigger replay")
+        })
+        .expect("reconcile");
+
+        assert_eq!(snapshot.txns[0].state, ManagedTxnState::Aborted);
+        assert!(snapshot.txns[0].retry_at_ms.is_none());
+        assert_eq!(snapshot.partitions[0].visible_version, 1);
+        let persisted = store.load_snapshot().expect("load snapshot");
+        assert_eq!(persisted.managed.txns[0].state, ManagedTxnState::Aborted);
+        assert_eq!(persisted.managed.partitions[0].visible_version, 1);
+    }
+
+    #[test]
+    fn reconcile_on_open_replays_written_txns_and_advances_partition() {
+        use crate::standalone::store::StoredManagedTxn;
+        let mut snapshot = snapshot_seed();
+        snapshot.txns.push(StoredManagedTxn {
+            txn_id: 91,
+            table_id: 10,
+            partition_id: 20,
+            base_version: 1,
+            commit_version: 2,
+            state: ManagedTxnState::Written,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+        });
+        let (_dir, store) = test_store_with_snapshot(&snapshot);
+        let mut replay_calls = 0;
+
+        reconcile_on_open(&store, &mut snapshot, |_, txn| {
+            replay_calls += 1;
+            assert_eq!(txn.txn_id, 91);
+            Ok(())
+        })
+        .expect("reconcile");
+
+        assert_eq!(replay_calls, 1);
+        assert_eq!(snapshot.txns[0].state, ManagedTxnState::Visible);
+        assert_eq!(snapshot.partitions[0].visible_version, 2);
+        assert_eq!(snapshot.partitions[0].next_version, 3);
+        let persisted = store.load_snapshot().expect("load snapshot");
+        assert_eq!(persisted.managed.txns[0].state, ManagedTxnState::Visible);
+        assert_eq!(persisted.managed.partitions[0].visible_version, 2);
     }
 }

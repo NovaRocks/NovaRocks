@@ -685,6 +685,16 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    pub(crate) fn mark_table_failed(&self, table_id: i64) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE tables SET state = 'FAILED' WHERE table_id = ?1",
+                params![table_id],
+            )
+            .map_err(|e| format!("mark table failed: {e}"))?;
+        Ok(())
+    }
+
     pub(crate) fn upsert_iceberg_catalog(
         &self,
         catalog_name: &str,

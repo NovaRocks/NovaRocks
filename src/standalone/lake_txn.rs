@@ -311,11 +311,28 @@ fn publish_managed_txn(
     plan: &ManagedInsertPlan,
     prepared: &super::store::PreparedManagedTxn,
 ) -> Result<(), String> {
+    publish_tablets_at_version(
+        plan.tablets.iter().map(|tablet| tablet.tablet_id).collect(),
+        prepared.txn_id,
+        prepared.base_version,
+        prepared.commit_version,
+    )
+}
+
+/// Drive `publish_version` for a specific txn against the given tablet ids.
+/// Also used by restart recovery to finish a `WRITTEN` txn whose rowsets are
+/// already on object storage.
+pub(crate) fn publish_tablets_at_version(
+    tablet_ids: Vec<i64>,
+    txn_id: i64,
+    base_version: i64,
+    commit_version: i64,
+) -> Result<(), String> {
     let request = PublishVersionRequest {
-        tablet_ids: plan.tablets.iter().map(|tablet| tablet.tablet_id).collect(),
-        txn_ids: vec![prepared.txn_id],
-        base_version: Some(prepared.base_version),
-        new_version: Some(prepared.commit_version),
+        tablet_ids,
+        txn_ids: vec![txn_id],
+        base_version: Some(base_version),
+        new_version: Some(commit_version),
         commit_time: None,
         timeout_ms: None,
         txn_infos: Vec::new(),

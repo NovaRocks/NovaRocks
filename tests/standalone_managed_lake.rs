@@ -354,6 +354,84 @@ fn managed_lake_insert_hashes_rows_across_tablets() {
 }
 
 #[test]
+fn reopen_reconciles_written_txn_into_visible_state() {
+    let _guard = managed_lake_test_lock();
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("reopen_reconciles_written_txn_into_visible_state")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
+    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("open standalone engine");
+    engine
+        .session()
+        .execute(
+            "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+        )
+        .expect("create managed table");
+    engine
+        .session()
+        .execute("insert into orders values (1, 'a'), (2, 'b'), (3, 'c')")
+        .expect("insert values");
+    let info = engine
+        .managed_table_info("default", "orders")
+        .expect("inspect managed table");
+    assert_eq!(info.visible_version, 2);
+    drop(engine);
+
+    // Rewind the control plane to the WRITTEN-but-not-yet-VISIBLE state as if
+    // the process had crashed between rowset append and publish. The next open
+    // of the engine must complete the publish and promote the txn to VISIBLE.
+    let conn = Connection::open(&harness.metadata_db_path).expect("open sqlite");
+    conn.execute(
+        "UPDATE txns SET state = 'WRITTEN' WHERE txn_id = (SELECT MAX(txn_id) FROM txns)",
+        [],
+    )
+    .expect("rewind txn to WRITTEN");
+    conn.execute(
+        "UPDATE partitions SET visible_version = 1, next_version = 2
+         WHERE table_id = (SELECT table_id FROM tables WHERE name = 'orders')",
+        [],
+    )
+    .expect("rewind partition to v1");
+
+    let reopened = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("reopen engine triggers reconciliation");
+
+    let conn = Connection::open(&harness.metadata_db_path).expect("reopen sqlite");
+    let txn_state: String = conn
+        .query_row(
+            "SELECT state FROM txns ORDER BY txn_id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("txn state post-reconcile");
+    assert_eq!(txn_state, "VISIBLE");
+    let partition_version: i64 = conn
+        .query_row(
+            "SELECT visible_version FROM partitions WHERE table_id = (SELECT table_id FROM tables WHERE name = 'orders')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("partition version post-reconcile");
+    assert_eq!(partition_version, 2);
+
+    let result = reopened
+        .session()
+        .query("select k1 from orders order by k1")
+        .expect("select after recovery");
+    assert_eq!(result.row_count(), 3);
+}
+
+#[test]
 fn create_table_preserves_largeint_and_not_null_columns() {
     let _guard = managed_lake_test_lock();
     let Some(harness) =

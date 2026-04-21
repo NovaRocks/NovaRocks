@@ -4761,8 +4761,31 @@ fn restore_managed_lake(
     state: &Arc<StandaloneState>,
     snapshot: &MetadataSnapshot,
 ) -> Result<(), String> {
-    let rebuilt =
-        ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), snapshot.managed.clone())?;
+    let Some(store) = state.metadata_store.as_ref() else {
+        return Ok(());
+    };
+    let mut managed = snapshot.managed.clone();
+    super::lake_recovery::reconcile_on_open(store, &mut managed, |snapshot, txn| {
+        let tablet_ids = snapshot
+            .tablets
+            .iter()
+            .filter(|tablet| {
+                snapshot.indexes.iter().any(|index| {
+                    index.index_id == tablet.index_id
+                        && index.table_id == txn.table_id
+                        && index.partition_id == txn.partition_id
+                })
+            })
+            .map(|tablet| tablet.tablet_id)
+            .collect::<Vec<_>>();
+        super::lake_txn::publish_tablets_at_version(
+            tablet_ids,
+            txn.txn_id,
+            txn.base_version,
+            txn.commit_version,
+        )
+    })?;
+    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), managed)?;
     {
         let mut catalog = state
             .catalog
