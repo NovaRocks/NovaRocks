@@ -298,7 +298,9 @@ pub struct StandaloneManagedLakeConfig {
 }
 
 impl StandaloneServerConfig {
-    pub fn managed_lake_config(&self) -> Result<Option<StandaloneManagedLakeConfig>> {
+    pub fn managed_lake_config(
+        &self,
+    ) -> std::result::Result<Option<StandaloneManagedLakeConfig>, String> {
         let Some(warehouse_uri) = self
             .warehouse_uri
             .as_ref()
@@ -309,23 +311,21 @@ impl StandaloneServerConfig {
         };
 
         let object_store = self.object_store.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("standalone managed lake requires [standalone_server.object_store]")
+            "standalone managed lake requires [standalone_server.object_store]".to_string()
         })?;
         let endpoint = object_store
             .endpoint
             .as_ref()
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("standalone managed lake requires object_store.endpoint")
-            })?;
+            .ok_or_else(|| "standalone managed lake requires object_store.endpoint".to_string())?;
         let access_key_id = object_store
             .access_key_id
             .as_ref()
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                anyhow::anyhow!("standalone managed lake requires object_store.access_key_id")
+                "standalone managed lake requires object_store.access_key_id".to_string()
             })?;
         let access_key_secret = object_store
             .access_key_secret
@@ -333,7 +333,7 @@ impl StandaloneServerConfig {
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                anyhow::anyhow!("standalone managed lake requires object_store.access_key_secret")
+                "standalone managed lake requires object_store.access_key_secret".to_string()
             })?;
 
         Ok(Some(StandaloneManagedLakeConfig {
