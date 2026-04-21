@@ -300,6 +300,7 @@ mod tests {
                 Some(true),
                 None::<i32>,
                 None::<String>,
+                None::<bool>,
             )]),
             vec![descriptors::TTupleDescriptor::new(
                 Some(tuple_id),

@@ -757,6 +757,7 @@ mod tests {
             is_nullable: Some(true),
             col_unique_id: None,
             col_physical_name: col_physical_name.map(ToString::to_string),
+            is_virtual_column: None,
         }
     }
 
@@ -807,6 +808,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(6),
@@ -823,6 +825,7 @@ mod tests {
                     is_nullable: Some(true),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(5),
@@ -839,6 +842,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(6),
@@ -855,6 +859,7 @@ mod tests {
                     is_nullable: Some(true),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
             ],
             vec![],
@@ -908,6 +913,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(7),
@@ -924,6 +930,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
             ],
             vec![],

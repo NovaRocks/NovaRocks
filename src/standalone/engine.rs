@@ -413,7 +413,7 @@ impl StandaloneNovaRocks {
 
 impl StandaloneSession {
     pub fn execute(&self, sql: &str) -> Result<(), String> {
-        match self.execute_in_context(sql, None, DEFAULT_DATABASE)? {
+        match self.execute_in_context(sql, None, DEFAULT_DATABASE, None)? {
             StatementResult::Ok => Ok(()),
             StatementResult::Query(_) => Err("statement returned rows".to_string()),
         }
@@ -737,7 +737,6 @@ impl StandaloneSession {
                     return Ok(StatementResult::Query(result));
                 }
 
-                reject_managed_table_queries(&self.inner, query, current_database)?;
                 let catalog = self
                     .inner
                     .catalog
@@ -4925,27 +4924,6 @@ fn extract_table_names_from_query(query: &sqlparser::ast::Query) -> Vec<String> 
     names
 }
 
-fn reject_managed_table_queries(
-    state: &Arc<StandaloneState>,
-    query: &sqlparser::ast::Query,
-    current_database: &str,
-) -> Result<(), String> {
-    let managed = state
-        .managed_lake
-        .read()
-        .expect("standalone managed lake read lock");
-    for table_name in extract_table_names_from_query(query) {
-        if managed.contains_table(current_database, &table_name)? {
-            return Err(format!(
-                "managed standalone lake table scan is not wired yet: {}.{}",
-                normalize_identifier(current_database)?,
-                normalize_identifier(&table_name)?,
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn extract_table_names_from_set_expr(expr: &sqlparser::ast::SetExpr, names: &mut Vec<String>) {
     match expr {
         sqlparser::ast::SetExpr::Select(s) => {
@@ -5997,8 +5975,8 @@ mod tests {
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("nums list array");
-        let values = nums
-            .value(0)
+        let values_ref = nums.value(0);
+        let values = values_ref
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("int64 values");
@@ -6045,7 +6023,8 @@ mod tests {
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("key array");
-        let DataType::Map(entries_field, _) = batch.schema().field(0).data_type() else {
+        let schema = batch.schema();
+        let DataType::Map(entries_field, _) = schema.field(0).data_type() else {
             panic!("expected map field");
         };
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
@@ -6103,7 +6082,8 @@ mod tests {
 
         let casted =
             super::cast_batch_to_schema(&source_batch, &target_schema).expect("cast batch");
-        let DataType::Map(entries_field, _) = casted.schema().field(0).data_type() else {
+        let casted_schema = casted.schema();
+        let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
             panic!("expected MAP column");
         };
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
@@ -6161,7 +6141,8 @@ mod tests {
             .expect("key array");
 
         assert!(keys.is_null(0));
-        let DataType::Map(entries_field, _) = round_tripped.schema().field(0).data_type() else {
+        let round_schema = round_tripped.schema();
+        let DataType::Map(entries_field, _) = round_schema.field(0).data_type() else {
             panic!("expected map field");
         };
         let DataType::Struct(entry_fields) = entries_field.data_type() else {

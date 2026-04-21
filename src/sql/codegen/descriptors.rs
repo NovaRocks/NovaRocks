@@ -1,4 +1,5 @@
 use arrow::datatypes::DataType;
+use std::collections::BTreeSet;
 
 use crate::descriptors;
 use crate::types;
@@ -8,6 +9,8 @@ use super::type_infer::arrow_type_to_type_desc;
 pub(crate) struct DescriptorTableBuilder {
     slots: Vec<descriptors::TSlotDescriptor>,
     tuples: Vec<descriptors::TTupleDescriptor>,
+    tables: Vec<descriptors::TTableDescriptor>,
+    table_ids: BTreeSet<types::TTableId>,
 }
 
 impl DescriptorTableBuilder {
@@ -15,6 +18,8 @@ impl DescriptorTableBuilder {
         Self {
             slots: Vec::new(),
             tuples: Vec::new(),
+            tables: Vec::new(),
+            table_ids: BTreeSet::new(),
         }
     }
 
@@ -62,13 +67,46 @@ impl DescriptorTableBuilder {
         ));
     }
 
-    pub fn add_tuple(&mut self, tuple_id: types::TTupleId) {
+    pub fn add_tuple(&mut self, tuple_id: types::TTupleId, table_id: Option<types::TTableId>) {
         self.tuples.push(descriptors::TTupleDescriptor::new(
             Some(tuple_id),
             Some(0), // byte_size
             Some(0), // num_null_bytes
-            None::<types::TTableId>,
+            table_id,
             Some(0), // num_null_slots
+        ));
+    }
+
+    pub fn add_table(
+        &mut self,
+        table_id: types::TTableId,
+        db_name: &str,
+        table_name: &str,
+        num_cols: i32,
+    ) {
+        if !self.table_ids.insert(table_id) {
+            return;
+        }
+        self.tables.push(descriptors::TTableDescriptor::new(
+            table_id,
+            types::TTableType::OLAP_TABLE,
+            num_cols,
+            0,
+            table_name.to_string(),
+            db_name.to_string(),
+            None::<descriptors::TMySQLTable>,
+            None::<descriptors::TOlapTable>,
+            None::<descriptors::TSchemaTable>,
+            None::<descriptors::TBrokerTable>,
+            None::<descriptors::TEsTable>,
+            None::<descriptors::TJDBCTable>,
+            None::<descriptors::THdfsTable>,
+            None::<descriptors::TIcebergTable>,
+            None::<descriptors::THudiTable>,
+            None::<descriptors::TDeltaLakeTable>,
+            None::<descriptors::TFileTable>,
+            None::<descriptors::TTableFunctionTable>,
+            None::<descriptors::TPaimonTable>,
         ));
     }
 
@@ -86,7 +124,11 @@ impl DescriptorTableBuilder {
         descriptors::TDescriptorTable::new(
             Some(self.slots),
             self.tuples,
-            None::<Vec<descriptors::TTableDescriptor>>,
+            if self.tables.is_empty() {
+                None::<Vec<descriptors::TTableDescriptor>>
+            } else {
+                Some(self.tables)
+            },
             None::<bool>,
         )
     }

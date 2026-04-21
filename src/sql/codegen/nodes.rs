@@ -21,6 +21,18 @@ pub(crate) fn build_scan_node(
     resolved: &ResolvedTable,
     conjuncts: Vec<exprs::TExpr>,
 ) -> plan_nodes::TPlanNode {
+    if resolved.physical_layout.is_some() {
+        return build_lake_scan_node(node_id, scan_tuple_id, resolved, conjuncts);
+    }
+    build_hdfs_scan_node(node_id, scan_tuple_id, resolved, conjuncts)
+}
+
+fn build_hdfs_scan_node(
+    node_id: i32,
+    scan_tuple_id: i32,
+    resolved: &ResolvedTable,
+    conjuncts: Vec<exprs::TExpr>,
+) -> plan_nodes::TPlanNode {
     let mut node = default_plan_node();
     node.node_id = node_id;
     node.node_type = plan_nodes::TPlanNodeType::HDFS_SCAN_NODE;
@@ -84,6 +96,66 @@ pub(crate) fn build_scan_node(
         None::<i64>,
         None::<Vec<plan_nodes::TColumnAccessPath>>,
     ));
+
+    node
+}
+
+fn build_lake_scan_node(
+    node_id: i32,
+    scan_tuple_id: i32,
+    resolved: &ResolvedTable,
+    conjuncts: Vec<exprs::TExpr>,
+) -> plan_nodes::TPlanNode {
+    let layout = resolved
+        .physical_layout
+        .as_ref()
+        .expect("managed scan requires physical layout");
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::LAKE_SCAN_NODE;
+    node.num_children = 0;
+    node.limit = -1;
+    node.row_tuples = vec![scan_tuple_id];
+    node.nullable_tuples = vec![];
+    node.conjuncts = if conjuncts.is_empty() {
+        None
+    } else {
+        Some(conjuncts)
+    };
+    node.compact_data = true;
+    node.lake_scan_node = Some(plan_nodes::TLakeScanNode {
+        tuple_id: scan_tuple_id,
+        key_column_name: vec![],
+        key_column_type: vec![],
+        is_preaggregation: false,
+        sort_column: None,
+        rollup_name: None,
+        sql_predicates: None,
+        enable_column_expr_predicate: None,
+        dict_string_id_to_int_ids: None,
+        unused_output_column_name: None,
+        sort_key_column_names: None,
+        bucket_exprs: None,
+        column_access_paths: None,
+        sorted_by_keys_per_tablet: None,
+        output_chunk_by_bucket: None,
+        output_asc_hint: None,
+        partition_order_hint: None,
+        enable_topn_filter_back_pressure: None,
+        back_pressure_max_rounds: None,
+        back_pressure_throttle_time: None,
+        back_pressure_throttle_time_upper_bound: None,
+        back_pressure_num_rows: None,
+        schema_key: Some(descriptors::TTableSchemaKey::new(
+            Some(layout.db_id),
+            Some(layout.table_id),
+            Some(layout.schema_id),
+        )),
+        enable_prune_column_after_index_filter: None,
+        enable_gin_filter: None,
+        next_uniq_id: None,
+        enable_global_late_materialization: None,
+    });
 
     node
 }
@@ -367,21 +439,35 @@ pub(crate) fn build_exec_params_multi(
 
     for (scan_node_id, resolved) in scan_tables {
         let scan_node_id = *scan_node_id;
-        let ranges = match &resolved.table.storage {
-            TableStorage::LocalParquetFile { path } => {
-                let metadata = std::fs::metadata(path)
-                    .map_err(|e| format!("stat parquet file failed: {e}"))?;
-                let file_len = i64::try_from(metadata.len())
-                    .map_err(|_| "parquet file is too large".to_string())?;
-                vec![build_hdfs_scan_range_params(
-                    &path.display().to_string(),
-                    file_len,
-                )]
+        let ranges = if let Some(layout) = resolved.physical_layout.as_ref() {
+            if layout.tablets.is_empty() {
+                return Err(format!(
+                    "managed table {}.{} has no active tablets",
+                    resolved.database, resolved.table.name
+                ));
             }
-            TableStorage::S3ParquetFiles { files, .. } => files
+            layout
+                .tablets
                 .iter()
-                .map(|f| build_hdfs_scan_range_params(&f.path, f.size))
-                .collect(),
+                .map(|tablet| build_internal_scan_range_params(resolved, layout, tablet))
+                .collect()
+        } else {
+            match &resolved.table.storage {
+                TableStorage::LocalParquetFile { path } => {
+                    let metadata = std::fs::metadata(path)
+                        .map_err(|e| format!("stat parquet file failed: {e}"))?;
+                    let file_len = i64::try_from(metadata.len())
+                        .map_err(|_| "parquet file is too large".to_string())?;
+                    vec![build_hdfs_scan_range_params(
+                        &path.display().to_string(),
+                        file_len,
+                    )]
+                }
+                TableStorage::S3ParquetFiles { files, .. } => files
+                    .iter()
+                    .map(|f| build_hdfs_scan_range_params(&f.path, f.size))
+                    .collect(),
+            }
         };
         per_node_scan_ranges.insert(scan_node_id, ranges);
     }
@@ -405,6 +491,46 @@ pub(crate) fn build_exec_params_multi(
         None::<bool>,
         None::<Vec<internal_service::TExecDebugOption>>,
     ))
+}
+
+fn build_internal_scan_range_params(
+    resolved: &ResolvedTable,
+    layout: &crate::sql::catalog::PhysicalTableLayout,
+    tablet: &crate::sql::catalog::ManagedTabletRef,
+) -> internal_service::TScanRangeParams {
+    let internal_scan_range = plan_nodes::TInternalScanRange::new(
+        vec![],
+        layout.schema_id.to_string(),
+        tablet.version.to_string(),
+        tablet.version.to_string(),
+        tablet.tablet_id,
+        resolved.database.clone(),
+        None::<Vec<plan_nodes::TKeyRange>>,
+        None::<String>,
+        Some(resolved.table.name.clone()),
+        Some(tablet.partition_id),
+        None::<i64>,
+        Some(true),
+        None::<i32>,
+        Some(false),
+        Some(false),
+        None::<i64>,
+    );
+
+    internal_service::TScanRangeParams::new(
+        plan_nodes::TScanRange::new(
+            Some(internal_scan_range),
+            None::<Vec<u8>>,
+            None::<plan_nodes::TBrokerScanRange>,
+            None::<plan_nodes::TEsScanRange>,
+            None::<plan_nodes::THdfsScanRange>,
+            None::<plan_nodes::TBinlogScanRange>,
+            None::<plan_nodes::TBenchmarkScanRange>,
+        ),
+        None::<i32>,
+        Some(false),
+        Some(false),
+    )
 }
 
 // ---------------------------------------------------------------------------

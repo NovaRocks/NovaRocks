@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
 
-use crate::sql::catalog::TableDef;
+use crate::sql::catalog::{PhysicalTableLayout, TableDef};
 use crate::types;
 
 #[derive(Clone, Debug)]
@@ -10,6 +10,7 @@ pub(crate) struct ResolvedTable {
     #[allow(dead_code)]
     pub database: String,
     pub table: TableDef,
+    pub physical_layout: Option<PhysicalTableLayout>,
     #[allow(dead_code)]
     pub alias: Option<String>,
 }

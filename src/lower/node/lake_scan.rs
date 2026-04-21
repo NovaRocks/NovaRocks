@@ -852,6 +852,12 @@ fn normalize_partition_storage_path(path: &str, tablet_id: i64) -> Result<String
             tablet_id
         ));
     }
+    let standalone_tablet_suffix = format!("/tablet_{tablet_id}");
+    if let Some(prefix) = trimmed.strip_suffix(&standalone_tablet_suffix)
+        && !prefix.is_empty()
+    {
+        return Ok(prefix.trim_end_matches('/').to_string());
+    }
     let tablet_id_suffix = format!("/{tablet_id}");
     if let Some(prefix) = trimmed.strip_suffix(&tablet_id_suffix)
         && !prefix.is_empty()
@@ -889,7 +895,7 @@ mod tests {
         let tablet_path_map = HashMap::from([
             (101, "s3://bucket/root/7/101".to_string()),
             (102, "s3://bucket/root/7/102/".to_string()),
-            (201, "s3://bucket/root/8".to_string()),
+            (201, "s3://bucket/root/8/tablet_201".to_string()),
         ]);
 
         let paths = build_partition_storage_paths(&ranges, &tablet_path_map)

@@ -1979,6 +1979,7 @@ mod tests {
                         is_nullable: Some(false),
                         col_unique_id: None,
                         col_physical_name: None,
+                        is_virtual_column: None,
                     },
                     descriptors::TSlotDescriptor {
                         id: Some(2),
@@ -1995,6 +1996,7 @@ mod tests {
                         is_nullable: Some(true),
                         col_unique_id: None,
                         col_physical_name: None,
+                        is_virtual_column: None,
                     },
                     descriptors::TSlotDescriptor {
                         id: Some(3),
@@ -2011,6 +2013,7 @@ mod tests {
                         is_nullable: Some(true),
                         col_unique_id: None,
                         col_physical_name: None,
+                        is_virtual_column: None,
                     },
                     descriptors::TSlotDescriptor {
                         id: Some(4),
@@ -2027,6 +2030,7 @@ mod tests {
                         is_nullable: Some(true),
                         col_unique_id: None,
                         col_physical_name: None,
+                        is_virtual_column: None,
                     },
                 ],
                 tuple_desc: descriptors::TTupleDescriptor {
@@ -2062,6 +2066,7 @@ mod tests {
                 partition_columns: None,
                 partition_exprs: None,
                 enable_automatic_partition: Some(false),
+                distribution_type: None,
             },
             location: descriptors::TOlapTableLocationParam {
                 db_id: 1,
@@ -2233,6 +2238,7 @@ mod tests {
                         is_nullable: Some(false),
                         col_unique_id: Some(0),
                         col_physical_name: None,
+                        is_virtual_column: None,
                     },
                     descriptors::TSlotDescriptor {
                         id: Some(1),
@@ -2249,6 +2255,7 @@ mod tests {
                         is_nullable: Some(false),
                         col_unique_id: None,
                         col_physical_name: None,
+                        is_virtual_column: None,
                     },
                 ],
                 tuple_desc: descriptors::TTupleDescriptor {
@@ -2279,6 +2286,7 @@ mod tests {
                 partition_columns: None,
                 partition_exprs: None,
                 enable_automatic_partition: Some(false),
+                distribution_type: None,
             },
             location: descriptors::TOlapTableLocationParam {
                 db_id: 1,

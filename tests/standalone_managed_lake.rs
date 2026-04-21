@@ -148,6 +148,39 @@ fn reopen_restores_managed_table_snapshot() {
 }
 
 #[test]
+fn select_from_empty_managed_table_returns_empty_result() {
+    let Some(harness) =
+        ManagedLakeTestHarness::maybe_new("select_from_empty_managed_table_returns_empty_result")
+            .expect("create managed lake harness")
+    else {
+        eprintln!("skipping managed lake object-store test: AWS_S3_ENDPOINT is not set");
+        return;
+    };
+    let engine = StandaloneNovaRocks::open(StandaloneOptions {
+        config_path: Some(harness.config_path.clone()),
+        metadata_db_path: None,
+    })
+    .expect("open standalone engine");
+
+    engine
+        .session()
+        .execute(
+            "create table tbl (id int, name string) duplicate key(id) distributed by hash(id) buckets 2",
+        )
+        .expect("create managed table");
+
+    let result = engine
+        .session()
+        .query("select * from tbl")
+        .expect("query managed table");
+    assert_eq!(result.row_count(), 0);
+    assert_eq!(result.chunks.len(), 0);
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.columns[0].name, "id");
+    assert_eq!(result.columns[1].name, "name");
+}
+
+#[test]
 fn create_table_rejects_invalid_key_columns() {
     let Some(harness) =
         ManagedLakeTestHarness::maybe_new("create_table_rejects_invalid_key_columns")

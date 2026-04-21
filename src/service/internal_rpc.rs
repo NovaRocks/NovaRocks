@@ -415,6 +415,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(2),
@@ -431,6 +432,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(3),
@@ -447,6 +449,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
                 descriptors::TSlotDescriptor {
                     id: Some(4),
@@ -463,6 +466,7 @@ mod tests {
                     is_nullable: Some(false),
                     col_unique_id: None,
                     col_physical_name: None,
+                    is_virtual_column: None,
                 },
             ]),
             table_descriptors: None,

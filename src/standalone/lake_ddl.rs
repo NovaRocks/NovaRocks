@@ -401,6 +401,15 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
         SqlType::Array(_) => {
             return Err("managed standalone CREATE TABLE does not support ARRAY yet".to_string());
         }
+        SqlType::Binary => {
+            return Err("managed standalone CREATE TABLE does not support BINARY yet".to_string());
+        }
+        SqlType::Map(_, _) => {
+            return Err("managed standalone CREATE TABLE does not support MAP yet".to_string());
+        }
+        SqlType::Struct(_) => {
+            return Err("managed standalone CREATE TABLE does not support STRUCT yet".to_string());
+        }
     };
     Ok(crate::types::TColumnType {
         type_: primitive,
@@ -423,7 +432,11 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
         SqlType::Double => Some(8),
         SqlType::Boolean => Some(1),
         SqlType::Date => Some(4),
-        SqlType::Decimal { .. } | SqlType::Array(_) => None,
+        SqlType::Decimal { .. }
+        | SqlType::Array(_)
+        | SqlType::Binary
+        | SqlType::Map(_, _)
+        | SqlType::Struct(_) => None,
     }
 }
 
@@ -443,6 +456,15 @@ fn logical_type_name(data_type: &SqlType) -> String {
         SqlType::Time => "TIME".to_string(),
         SqlType::Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
         SqlType::Array(inner) => format!("ARRAY<{}>", logical_type_name(inner)),
+        SqlType::Binary => "BINARY".to_string(),
+        SqlType::Map(k, v) => format!("MAP<{},{}>", logical_type_name(k), logical_type_name(v)),
+        SqlType::Struct(fields) => {
+            let mut parts = Vec::with_capacity(fields.len());
+            for (name, ty) in fields {
+                parts.push(format!("{} {}", name, logical_type_name(ty)));
+            }
+            format!("STRUCT<{}>", parts.join(","))
+        }
     }
 }
 

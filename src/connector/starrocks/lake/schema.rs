@@ -1548,6 +1548,7 @@ mod tests {
                 is_nullable: Some(false),
                 col_unique_id: slot_unique_id,
                 col_physical_name: None,
+                is_virtual_column: None,
             }],
             tuple_desc: crate::descriptors::TTupleDescriptor {
                 id: Some(1),

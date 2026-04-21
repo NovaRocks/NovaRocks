@@ -334,6 +334,18 @@ impl<'a> PlanFragmentBuilder<'a> {
             .as_ref()
             .map(|cols| cols.iter().map(|c| c.to_lowercase()).collect());
 
+        let physical_layout = self
+            .catalog
+            .get_physical_layout(&op.database, &op.table.name)?;
+        if let Some(layout) = physical_layout.as_ref() {
+            self.desc_builder.add_table(
+                layout.table_id,
+                &op.database,
+                &op.table.name,
+                op.table.columns.len() as i32,
+            );
+        }
+
         for (idx, col) in op.table.columns.iter().enumerate() {
             if let Some(ref req) = required {
                 if !req.contains(&col.name.to_lowercase()) {
@@ -370,8 +382,6 @@ impl<'a> PlanFragmentBuilder<'a> {
                 scope.add_column(Some(op.table.name.clone()), col.name.clone(), binding);
             }
         }
-        self.desc_builder.add_tuple(scan_tuple_id);
-
         // Compile predicates pushed down by the optimizer
         let pushed_conjuncts = if op.predicates.is_empty() {
             vec![]
@@ -387,8 +397,16 @@ impl<'a> PlanFragmentBuilder<'a> {
         let resolved = ResolvedTable {
             database: op.database.clone(),
             table: op.table.clone(),
+            physical_layout,
             alias: op.alias.clone(),
         };
+        self.desc_builder.add_tuple(
+            scan_tuple_id,
+            resolved
+                .physical_layout
+                .as_ref()
+                .map(|layout| layout.table_id),
+        );
 
         let scan_plan_node =
             nodes::build_scan_node(scan_node_id, scan_tuple_id, &resolved, pushed_conjuncts);
@@ -519,7 +537,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
         }
 
-        self.desc_builder.add_tuple(project_tuple_id);
+        self.desc_builder.add_tuple(project_tuple_id, None);
         let project_plan_node =
             nodes::build_project_node(project_node_id, project_tuple_id, slot_map);
 
@@ -962,7 +980,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             aggregate_functions.push(texpr);
         }
 
-        self.desc_builder.add_tuple(agg_tuple_id);
+        self.desc_builder.add_tuple(agg_tuple_id, None);
         let agg_plan_node = nodes::build_aggregation_node(
             agg_node_id,
             agg_tuple_id,
@@ -1355,7 +1373,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 idx as i32,
             );
         }
-        self.desc_builder.add_tuple(intermediate_tuple_id);
+        self.desc_builder.add_tuple(intermediate_tuple_id, None);
 
         // Register output slots
         let mut output_scope = ExprScope::new();
@@ -1384,7 +1402,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 },
             );
         }
-        self.desc_builder.add_tuple(output_tuple_id);
+        self.desc_builder.add_tuple(output_tuple_id, None);
 
         // Window frame
         let window = first_win.window_frame.as_ref().map(|frame| {
@@ -1575,7 +1593,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     idx as i32,
                 );
             }
-            self.desc_builder.add_tuple(intermediate_tuple_id);
+            self.desc_builder.add_tuple(intermediate_tuple_id, None);
 
             let mut output_scope = ExprScope::new();
             for (name, binding) in current.scope.iter_columns() {
@@ -1603,7 +1621,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                     },
                 );
             }
-            self.desc_builder.add_tuple(output_tuple_id);
+            self.desc_builder.add_tuple(output_tuple_id, None);
 
             let window = first_win.window_frame.as_ref().map(|frame| {
                 let window_type = match frame.frame_type {
@@ -1732,7 +1750,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 },
             );
         }
-        self.desc_builder.add_tuple(output_tuple_id);
+        self.desc_builder.add_tuple(output_tuple_id, None);
 
         let empty_scope = ExprScope::new();
         let mut const_expr_lists = Vec::with_capacity(op.rows.len());
@@ -1967,7 +1985,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             virtual_slot_ids.push(slot);
         }
 
-        self.desc_builder.add_tuple(virtual_tuple_id);
+        self.desc_builder.add_tuple(virtual_tuple_id, None);
 
         // Build slot_id_set_list and all_rollup_slot_ids
         let all_rollup_slot_ids: BTreeSet<i32> = op
@@ -2327,7 +2345,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 },
             );
         }
-        self.desc_builder.add_tuple(output_tuple_id);
+        self.desc_builder.add_tuple(output_tuple_id, None);
 
         let mut result_expr_lists = Vec::with_capacity(child_results.len());
         for child_result in &child_results {
@@ -2444,7 +2462,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             );
         }
 
-        self.desc_builder.add_tuple(agg_tuple_id);
+        self.desc_builder.add_tuple(agg_tuple_id, None);
         let agg_plan_node = nodes::build_aggregation_node(
             agg_node_id,
             agg_tuple_id,
@@ -2572,7 +2590,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             // Also register with the CTE alias as qualifier
             scope.add_column(Some(op.alias.clone()), col.name.clone(), binding);
         }
-        self.desc_builder.add_tuple(exchange_tuple_id);
+        self.desc_builder.add_tuple(exchange_tuple_id, None);
 
         let exchange_node = nodes::build_exchange_node(
             exchange_node_id,
@@ -2659,7 +2677,7 @@ fn build_noop_sink() -> data_sinks::TDataSink {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
 
     use arrow::datatypes::DataType;
@@ -2668,7 +2686,9 @@ mod tests {
     use super::*;
     use crate::plan_nodes;
     use crate::sql::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
-    use crate::sql::catalog::{CatalogProvider, ColumnDef, TableDef, TableStorage};
+    use crate::sql::catalog::{
+        CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+    };
     use crate::sql::optimizer::operator::{
         Operator, PhysicalDistributionOp, PhysicalScanOp, PhysicalSortOp,
     };
@@ -2681,6 +2701,32 @@ mod tests {
     impl CatalogProvider for DummyCatalog {
         fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
             Err("not used in scan-only builder tests".to_string())
+        }
+
+        fn get_physical_layout(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<PhysicalTableLayout>, String> {
+            Ok(None)
+        }
+    }
+
+    struct ManagedCatalog {
+        layout: PhysicalTableLayout,
+    }
+
+    impl CatalogProvider for ManagedCatalog {
+        fn get_table(&self, _database: &str, _table: &str) -> Result<TableDef, String> {
+            Err("not used in managed scan builder tests".to_string())
+        }
+
+        fn get_physical_layout(
+            &self,
+            _database: &str,
+            _table: &str,
+        ) -> Result<Option<PhysicalTableLayout>, String> {
+            Ok(Some(self.layout.clone()))
         }
     }
 
@@ -2722,6 +2768,33 @@ mod tests {
                         nullable: false,
                     }],
                     storage: TableStorage::LocalParquetFile { path },
+                },
+                alias: None,
+                columns: output_columns(),
+                predicates: vec![],
+                required_columns: None,
+            }),
+            children: vec![],
+            stats: stats(),
+            output_columns: output_columns(),
+        }
+    }
+
+    fn managed_scan_plan() -> PhysicalPlanNode {
+        PhysicalPlanNode {
+            op: Operator::PhysicalScan(PhysicalScanOp {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "managed_t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int32,
+                        nullable: false,
+                    }],
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![],
+                        cloud_properties: BTreeMap::new(),
+                    },
                 },
                 alias: None,
                 columns: output_columns(),
@@ -2894,5 +2967,76 @@ mod tests {
         let build = PlanFragmentBuilder::build(&plan, &DummyCatalog, "default").expect("build");
         assert_eq!(build.fragment_results.len(), 1);
         assert!(build.edges.is_empty());
+    }
+
+    #[test]
+    fn build_managed_scan_emits_lake_scan_with_internal_ranges() {
+        let layout = PhysicalTableLayout {
+            db_id: 11,
+            table_id: 22,
+            schema_id: 33,
+            tablets: vec![ManagedTabletRef {
+                tablet_id: 101,
+                partition_id: 201,
+                version: 7,
+            }],
+        };
+        let plan = managed_scan_plan();
+        let catalog = ManagedCatalog { layout };
+
+        let build = PlanFragmentBuilder::build(&plan, &catalog, "default").expect("build");
+        assert_eq!(build.fragment_results.len(), 1);
+        let root = build.fragment_results.first().expect("root fragment");
+        let scan_node = root
+            .plan
+            .nodes
+            .iter()
+            .find(|node| node.node_type == plan_nodes::TPlanNodeType::LAKE_SCAN_NODE)
+            .expect("lake scan node");
+        let lake = scan_node
+            .lake_scan_node
+            .as_ref()
+            .expect("lake scan payload");
+        let schema_key = lake.schema_key.as_ref().expect("schema_key");
+        assert_eq!(schema_key.db_id, Some(11));
+        assert_eq!(schema_key.table_id, Some(22));
+        assert_eq!(schema_key.schema_id, Some(33));
+
+        let tuple_desc = root
+            .desc_tbl
+            .tuple_descriptors
+            .iter()
+            .find(|tuple| tuple.id == Some(1))
+            .expect("managed scan tuple descriptor");
+        assert_eq!(tuple_desc.table_id, Some(22));
+
+        let table_descs = root
+            .desc_tbl
+            .table_descriptors
+            .as_ref()
+            .expect("table descriptors");
+        let table_desc = table_descs
+            .iter()
+            .find(|table| table.id == 22)
+            .expect("managed table descriptor");
+        assert_eq!(table_desc.db_name, "default");
+        assert_eq!(table_desc.table_name, "managed_t");
+
+        let ranges = root
+            .exec_params
+            .per_node_scan_ranges
+            .get(&1)
+            .expect("scan ranges");
+        assert_eq!(ranges.len(), 1);
+        let internal = ranges[0]
+            .scan_range
+            .internal_scan_range
+            .as_ref()
+            .expect("internal scan range");
+        assert_eq!(internal.tablet_id, 101);
+        assert_eq!(internal.partition_id, Some(201));
+        assert_eq!(internal.version, "7");
+        assert_eq!(internal.db_name, "default");
+        assert_eq!(internal.table_name.as_deref(), Some("managed_t"));
     }
 }
