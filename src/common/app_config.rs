@@ -236,6 +236,20 @@ pub struct StandaloneTableConfig {
     pub path: PathBuf,
 }
 
+#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+pub struct StandaloneObjectStoreConfig {
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    #[serde(default)]
+    pub access_key_secret: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub enable_path_style_access: Option<bool>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct StandaloneServerConfig {
     #[serde(default = "default_standalone_server_mysql_port")]
@@ -244,6 +258,10 @@ pub struct StandaloneServerConfig {
     pub user: String,
     #[serde(default)]
     pub metadata_db_path: Option<PathBuf>,
+    #[serde(default)]
+    pub warehouse_uri: Option<String>,
+    #[serde(default)]
+    pub object_store: Option<StandaloneObjectStoreConfig>,
     #[serde(default)]
     pub tables: Vec<StandaloneTableConfig>,
 }
@@ -262,8 +280,70 @@ impl Default for StandaloneServerConfig {
             mysql_port: default_standalone_server_mysql_port(),
             user: default_standalone_server_user(),
             metadata_db_path: None,
+            warehouse_uri: None,
+            object_store: None,
             tables: Vec::new(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandaloneManagedLakeConfig {
+    pub warehouse_uri: String,
+    pub endpoint: String,
+    pub access_key_id: String,
+    pub access_key_secret: String,
+    pub region: Option<String>,
+    pub enable_path_style_access: Option<bool>,
+}
+
+impl StandaloneServerConfig {
+    pub fn managed_lake_config(&self) -> Result<Option<StandaloneManagedLakeConfig>> {
+        let Some(warehouse_uri) = self
+            .warehouse_uri
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let object_store = self.object_store.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("standalone managed lake requires [standalone_server.object_store]")
+        })?;
+        let endpoint = object_store
+            .endpoint
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("standalone managed lake requires object_store.endpoint")
+            })?;
+        let access_key_id = object_store
+            .access_key_id
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("standalone managed lake requires object_store.access_key_id")
+            })?;
+        let access_key_secret = object_store
+            .access_key_secret
+            .as_ref()
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("standalone managed lake requires object_store.access_key_secret")
+            })?;
+
+        Ok(Some(StandaloneManagedLakeConfig {
+            warehouse_uri: warehouse_uri.to_string(),
+            endpoint: endpoint.to_string(),
+            access_key_id: access_key_id.to_string(),
+            access_key_secret: access_key_secret.to_string(),
+            region: object_store.region.clone(),
+            enable_path_style_access: object_store.enable_path_style_access,
+        }))
     }
 }
 
@@ -1048,6 +1128,8 @@ starlet_port = 19070
                 mysql_port: 9030,
                 user: "root".to_string(),
                 metadata_db_path: None,
+                warehouse_uri: None,
+                object_store: None,
                 tables: Vec::new(),
             })
         );
@@ -1078,6 +1160,55 @@ path = "data/tbl.parquet"
         assert_eq!(standalone.tables.len(), 1);
         assert_eq!(standalone.tables[0].name, "tbl");
         assert_eq!(standalone.tables[0].path, PathBuf::from("data/tbl.parquet"));
+    }
+
+    #[test]
+    fn test_standalone_server_parses_managed_lake_object_store() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[standalone_server]
+mysql_port = 9030
+user = "root"
+metadata_db_path = "meta/standalone.sqlite"
+warehouse_uri = "s3://novarocks/standalone"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:9000"
+access_key_id = "admin"
+access_key_secret = "admin123"
+enable_path_style_access = true
+"#,
+        )
+        .expect("parse config");
+
+        let standalone = cfg.standalone_server.expect("standalone config");
+        assert_eq!(
+            standalone.warehouse_uri.as_deref(),
+            Some("s3://novarocks/standalone")
+        );
+        let object_store = standalone.object_store.expect("object_store");
+        assert_eq!(
+            object_store.endpoint.as_deref(),
+            Some("http://127.0.0.1:9000")
+        );
+        assert_eq!(object_store.access_key_id.as_deref(), Some("admin"));
+        assert_eq!(object_store.enable_path_style_access, Some(true));
+    }
+
+    #[test]
+    fn test_standalone_server_defaults_without_managed_lake_section() {
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[standalone_server]
+mysql_port = 9030
+user = "root"
+"#,
+        )
+        .expect("parse config");
+
+        let standalone = cfg.standalone_server.expect("standalone config");
+        assert_eq!(standalone.warehouse_uri, None);
+        assert!(standalone.object_store.is_none());
     }
 
     #[test]
