@@ -463,9 +463,10 @@ fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> 
         "FLOAT" => Ok(DataType::Float32),
         "DOUBLE" => Ok(DataType::Float64),
         "DATE" | "DATE_V2" => Ok(DataType::Date32),
-        "DATETIME" | "DATETIME_V2" | "TIMESTAMP" | "TIME" => {
+        "DATETIME" | "DATETIME_V2" | "TIMESTAMP" => {
             Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
+        "TIME" => Ok(DataType::Time64(TimeUnit::Microsecond)),
         "CHAR" | "VARCHAR" | "STRING" => Ok(DataType::Utf8),
         "BINARY" | "VARBINARY" => Ok(DataType::Binary),
         "DECIMAL" | "DECIMAL32" | "DECIMAL64" | "DECIMAL128" => {
@@ -714,6 +715,21 @@ mod tests {
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn arrow_type_from_tablet_column_preserves_time_semantics() {
+        let column = ColumnPb {
+            unique_id: 7,
+            name: Some("t".to_string()),
+            r#type: "TIME".to_string(),
+            is_nullable: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            arrow_type_from_tablet_column(&column).expect("time arrow type"),
+            DataType::Time64(TimeUnit::Microsecond)
         );
     }
 }
