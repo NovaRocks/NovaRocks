@@ -112,6 +112,7 @@ pub enum SqlType {
     Double,
     Decimal { precision: u8, scale: i8 },
     String,
+    Binary,
     Boolean,
     Date,
     DateTime,

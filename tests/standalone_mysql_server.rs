@@ -160,6 +160,38 @@ fn assert_hadoop_catalog_metadata_compat(
     );
 }
 
+fn run_curl_stream_load(
+    http_port: u16,
+    db: &str,
+    table: &str,
+    payload: &str,
+    headers: &[&str],
+) -> String {
+    let mut cmd = Command::new("curl");
+    cmd.arg("-s")
+        .arg("--http2-prior-knowledge")
+        .arg("--location-trusted")
+        .arg("-u")
+        .arg("root:")
+        .arg("--data-binary")
+        .arg(payload)
+        .arg("-XPUT");
+    for header in headers {
+        cmd.arg("-H").arg(header);
+    }
+    cmd.arg(format!(
+        "http://127.0.0.1:{http_port}/api/{db}/{table}/_stream_load"
+    ));
+    let output = cmd.output().expect("run curl stream load");
+    assert!(
+        output.status.success(),
+        "curl stream load failed: status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("decode curl stdout")
+}
+
 #[test]
 fn standalone_mysql_server_accepts_queries_and_session_noops() {
     let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b")), (3, None)]);
@@ -605,4 +637,59 @@ metadata_db_path = "meta/catalog.db"
         rows,
         vec![(1, Some("a".to_string())), (2, Some("b".to_string()))]
     );
+}
+
+#[test]
+fn standalone_mysql_server_supports_json_stream_load_for_local_tables() {
+    let mysql_port = alloc_port();
+    let http_port = alloc_port();
+    let config = NamedTempFile::new().expect("create config");
+    std::fs::write(
+        config.path(),
+        format!(
+            r#"[server]
+http_port = {http_port}
+
+[standalone_server]
+mysql_port = {mysql_port}
+user = "root"
+"#
+        ),
+    )
+    .expect("write config");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config.path().display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(mysql_port);
+
+    conn.query_drop("create database analytics")
+        .expect("create database");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop("create table t2(c1 int, c2 varbinary)")
+        .expect("create local table");
+
+    let response = run_curl_stream_load(
+        http_port,
+        "analytics",
+        "t2",
+        r#"[{"c1":"1","c2":"1234"}]"#,
+        &[
+            "strip_outer_array: true",
+            "format:JSON",
+            "Expect:100-continue",
+            r#"jsonpaths: ["$.c1","$.c2"]"#,
+            "columns: c1,c2",
+        ],
+    );
+    assert!(
+        response.contains(r#""Status":"Success""#),
+        "unexpected stream load response: {response}"
+    );
+
+    let rows: Vec<(i32, String)> = conn.query("select * from t2").expect("select loaded rows");
+    assert_eq!(rows, vec![(1, "1234".to_string())]);
 }

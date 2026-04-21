@@ -991,6 +991,7 @@ fn iceberg_type_for_sql_type(data_type: &SqlType, next_field_id: &mut i32) -> Re
             scale: 0,
         }),
         SqlType::String => Type::Primitive(PrimitiveType::String),
+        SqlType::Binary => Type::Primitive(PrimitiveType::Binary),
         SqlType::Boolean => Type::Primitive(PrimitiveType::Boolean),
         SqlType::Date => Type::Primitive(PrimitiveType::Date),
         SqlType::DateTime => Type::Primitive(PrimitiveType::Timestamp),

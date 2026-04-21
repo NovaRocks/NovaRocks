@@ -131,15 +131,14 @@ pub(crate) fn convert_sql_type(data_type: sqlast::DataType) -> Result<SqlType, S
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         )),
-        sqlast::DataType::Varbinary(_) => Ok(SqlType::String),
-        sqlast::DataType::Binary(_) => Ok(SqlType::String),
+        sqlast::DataType::Varbinary(_) | sqlast::DataType::Binary(_) => Ok(SqlType::Binary),
         sqlast::DataType::Custom(name, modifiers) => {
             let n = name.to_string().to_lowercase();
             match n.as_str() {
                 "string" => Ok(SqlType::String),
                 "largeint" => Ok(SqlType::LargeInt),
                 "json" | "jsonb" => Ok(SqlType::String),
-                "varbinary" => Ok(SqlType::String),
+                "varbinary" | "binary" => Ok(SqlType::Binary),
                 "decimal32" | "decimal64" | "decimal128" => {
                     let (precision, scale) = parse_custom_decimal_modifiers(&modifiers);
                     Ok(SqlType::Decimal { precision, scale })

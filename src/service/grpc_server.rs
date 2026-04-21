@@ -17,11 +17,19 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
+use axum::Router;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
+use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::body::boxed;
+use tonic::codegen::Service;
+use tonic::server::NamedService;
 use tonic::service::Routes;
 use tonic::transport::Server;
 
@@ -256,6 +264,73 @@ fn summarize_top_counts(counts: &HashMap<String, usize>, top_n: usize) -> String
         .join(",")
 }
 
+async fn grpc_unimplemented_fallback() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (tonic::Status::GRPC_STATUS, HeaderValue::from_static("12")),
+            (
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            ),
+        ],
+    )
+}
+
+#[derive(Clone)]
+struct AxumGrpcService<S> {
+    inner: S,
+}
+
+impl<S> AxumGrpcService<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S> Service<axum::http::Request<axum::body::Body>> for AxumGrpcService<S>
+where
+    S: Service<
+            axum::http::Request<tonic::body::BoxBody>,
+            Response = axum::http::Response<tonic::body::BoxBody>,
+            Error = std::convert::Infallible,
+        > + Clone,
+{
+    type Response = axum::http::Response<tonic::body::BoxBody>;
+    type Error = std::convert::Infallible;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        self.inner.call(req.map(boxed))
+    }
+}
+
+fn build_novarocks_http_app(grpc_routes: Routes) -> Router {
+    grpc_routes
+        .into_axum_router()
+        .route(
+            "/api/:db/:table/_stream_load",
+            put(stream_load_http::handle_stream_load),
+        )
+        .route(
+            "/api/transaction/load",
+            put(stream_load_http::handle_transaction_load),
+        )
+        .route(
+            "/api/transaction/:txn_op",
+            post(stream_load_http::handle_transaction_op)
+                .put(stream_load_http::handle_transaction_op),
+        )
+        .route(
+            "/api/_load_tracking/:hi/:lo",
+            get(load_tracking_http::handle_load_tracking_log),
+        )
+}
+
 #[tonic::async_trait]
 impl proto::staros::starlet_server::Starlet for StarletGrpcService {
     async fn add_shard(
@@ -458,26 +533,7 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-            let grpc_routes = Routes::new(svc);
-            let app = grpc_routes
-                .into_axum_router()
-                .route(
-                    "/api/:db/:table/_stream_load",
-                    put(stream_load_http::handle_stream_load),
-                )
-                .route(
-                    "/api/transaction/load",
-                    put(stream_load_http::handle_transaction_load),
-                )
-                .route(
-                    "/api/transaction/:txn_op",
-                    post(stream_load_http::handle_transaction_op)
-                        .put(stream_load_http::handle_transaction_op),
-                )
-                .route(
-                    "/api/_load_tracking/:hi/:lo",
-                    get(load_tracking_http::handle_load_tracking_log),
-                );
+            let app = build_novarocks_http_app(Routes::new(svc));
             let novarocks_server = Server::builder()
                 .accept_http1(true)
                 .add_routes(Routes::from(app))
@@ -625,14 +681,36 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+            let grpc_path = format!(
+                "/{}/*rest",
+                <proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer<GrpcService> as NamedService>::NAME
+            );
+            let grpc_service = AxumGrpcService::new(svc);
+            let app = Router::new()
+                .route_service(&grpc_path, grpc_service)
+                .route(
+                    "/api/:db/:table/_stream_load",
+                    put(stream_load_http::handle_stream_load),
+                )
+                .route(
+                    "/api/transaction/load",
+                    put(stream_load_http::handle_transaction_load),
+                )
+                .route(
+                    "/api/transaction/:txn_op",
+                    post(stream_load_http::handle_transaction_op)
+                        .put(stream_load_http::handle_transaction_op),
+                )
+                .route(
+                    "/api/_load_tracking/:hi/:lo",
+                    get(load_tracking_http::handle_load_tracking_log),
+                )
+                .fallback(grpc_unimplemented_fallback);
+            let listener = TokioTcpListener::bind(addr)
+                .await
+                .expect("bind standalone grpc/http addr");
 
-            let server = Server::builder()
-                .initial_stream_window_size(Some(32 * 1024 * 1024))
-                .initial_connection_window_size(Some(128 * 1024 * 1024))
-                .max_concurrent_streams(Some(4096))
-                .http2_keepalive_interval(Some(std::time::Duration::from_secs(30)))
-                .add_service(svc)
-                .serve_with_shutdown(addr, async move {
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                     while !*shutdown.borrow() {
                         if shutdown.changed().await.is_err() {
                             break;

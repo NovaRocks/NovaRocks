@@ -140,6 +140,7 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
         metadata_db_path: None,
     })?;
     preload_tables(&engine, &resolved.tables)?;
+    super::register_stream_load_engine(engine.clone());
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

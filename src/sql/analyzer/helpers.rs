@@ -24,6 +24,7 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
         sqlast::DataType::Char(_)
         | sqlast::DataType::Character(_)
         | sqlast::DataType::String(_) => Ok(DataType::Utf8),
+        sqlast::DataType::Varbinary(_) | sqlast::DataType::Binary(_) => Ok(DataType::Binary),
         sqlast::DataType::Date => Ok(DataType::Date32),
         sqlast::DataType::Datetime(_) | sqlast::DataType::Timestamp(_, _) => Ok(
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
@@ -48,6 +49,7 @@ pub(super) fn sql_type_to_arrow(sql_type: &sqlast::DataType) -> Result<DataType,
                     crate::common::largeint::LARGEINT_BYTE_WIDTH,
                 )),
                 "json" | "jsonb" => Ok(DataType::Utf8),
+                "varbinary" | "binary" => Ok(DataType::Binary),
                 "array" => custom_array_type_to_arrow(sql_type),
                 "map" => custom_map_type_to_arrow(sql_type),
                 "struct" => custom_struct_type_to_arrow(sql_type),

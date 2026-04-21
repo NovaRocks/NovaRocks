@@ -364,7 +364,11 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         }
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
-        "hll_hash" | "ds_hll_count_distinct_state" | "to_bitmap" => DataType::Binary,
+        "hll_hash"
+        | "ds_hll_count_distinct_state"
+        | "to_bitmap"
+        | "to_binary"
+        | "encode_row_id" => DataType::Binary,
         "array_length" | "array_position" | "cardinality" | "map_size" => DataType::Int32,
         "grouping" | "grouping_id" => DataType::Int64,
         "array_min" | "array_max" => match arg_types.first() {
@@ -675,6 +679,14 @@ mod tests {
         assert_eq!(
             infer_scalar_return_type("array_position", &[int_array, DataType::Int32]),
             DataType::Int32
+        );
+    }
+
+    #[test]
+    fn infer_scalar_return_type_for_to_binary_is_binary() {
+        assert_eq!(
+            infer_scalar_return_type("to_binary", &[DataType::Utf8, DataType::Utf8]),
+            DataType::Binary
         );
     }
 
