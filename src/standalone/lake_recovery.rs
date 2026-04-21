@@ -855,10 +855,12 @@ mod tests {
         );
     }
 
-    fn test_store_with_snapshot(snapshot: &ManagedSnapshot) -> (tempfile::TempDir, SqliteMetadataStore) {
+    fn test_store_with_snapshot(
+        snapshot: &ManagedSnapshot,
+    ) -> (tempfile::TempDir, SqliteMetadataStore) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
-            .expect("open store");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
         store
             .replace_managed_snapshot(snapshot)
             .expect("persist snapshot");

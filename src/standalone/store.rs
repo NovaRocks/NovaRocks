@@ -641,11 +641,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
-    pub(crate) fn mark_txn_visible(
-        &self,
-        txn_id: i64,
-        commit_version: i64,
-    ) -> Result<(), String> {
+    pub(crate) fn mark_txn_visible(&self, txn_id: i64, commit_version: i64) -> Result<(), String> {
         let conn = self.connection()?;
         let tx = conn
             .unchecked_transaction()

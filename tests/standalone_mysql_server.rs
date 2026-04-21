@@ -703,12 +703,10 @@ fn standalone_mysql_server_managed_lake_round_trip() {
         return;
     }
     let endpoint = std::env::var("AWS_S3_ENDPOINT").unwrap();
-    let access_key_id =
-        std::env::var("MINIO_ROOT_USER").unwrap_or_else(|_| "admin".to_string());
+    let access_key_id = std::env::var("MINIO_ROOT_USER").unwrap_or_else(|_| "admin".to_string());
     let access_key_secret =
         std::env::var("MINIO_ROOT_PASSWORD").unwrap_or_else(|_| "admin123".to_string());
-    let bucket =
-        std::env::var("NOVAROCKS_TEST_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+    let bucket = std::env::var("NOVAROCKS_TEST_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
 
     let temp_dir = TempDir::new().expect("tempdir");
     let metadata_db_path = temp_dir.path().join("standalone.sqlite");
@@ -720,8 +718,7 @@ fn standalone_mysql_server_managed_lake_round_trip() {
             .expect("system clock")
             .as_nanos()
     );
-    let warehouse_uri =
-        format!("s3://{bucket}/standalone-managed-lake-mysql-tests/{run_id}");
+    let warehouse_uri = format!("s3://{bucket}/standalone-managed-lake-mysql-tests/{run_id}");
     let mysql_port = alloc_port();
     let config_path = temp_dir.path().join("novarocks.toml");
     std::fs::write(

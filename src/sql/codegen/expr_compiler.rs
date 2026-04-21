@@ -1647,12 +1647,9 @@ fn infer_scalar_function_return_type(
         "hll_union" | "hll_raw_agg" | "ds_hll_count_distinct_union" => Ok(DataType::Binary),
 
         // Misc
-        "version"
-        | "database"
-        | "current_user"
-        | "user"
-        | "bitmap_to_string"
-        | "from_binary" => Ok(DataType::Utf8),
+        "version" | "database" | "current_user" | "user" | "bitmap_to_string" | "from_binary" => {
+            Ok(DataType::Utf8)
+        }
         "sleep" => Ok(DataType::Boolean),
         "uuid" | "typeof" => Ok(DataType::Utf8),
         "murmur_hash3_32" => Ok(DataType::Int32),
@@ -1811,7 +1808,6 @@ fn infer_map_constructor_return_type(arg_types: &[DataType]) -> DataType {
 }
 
 // ---------------------------------------------------------------------------
-
 
 // ---------------------------------------------------------------------------
 // Aggregate function type inference

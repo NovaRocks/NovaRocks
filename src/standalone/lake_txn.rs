@@ -8,7 +8,9 @@ use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
 };
 use crate::connector::starrocks::lake::{append_lake_txn_log_with_chunk_rowset, publish_version};
-use crate::connector::starrocks::sink::routing::{build_unpartitioned_hash_routing, route_chunk_rows};
+use crate::connector::starrocks::sink::routing::{
+    build_unpartitioned_hash_routing, route_chunk_rows,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
@@ -54,11 +56,8 @@ pub(crate) fn insert_into_managed_lake_table(
         .metadata_store
         .as_ref()
         .ok_or_else(|| "managed lake insert requires sqlite metadata store".to_string())?;
-    let prepared = metadata_store.prepare_txn(
-        plan.table_id,
-        plan.partition_id,
-        plan.base_version,
-    )?;
+    let prepared =
+        metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
 
     let write_outcome = write_routed_chunks(state, &plan, &chunk, prepared.txn_id);
     if let Err(err) = write_outcome {
@@ -118,9 +117,7 @@ fn load_insert_plan(
     let active_partition = runtime
         .partitions
         .iter()
-        .find(|partition| {
-            partition.state == super::store::ManagedPartitionState::Active
-        })
+        .find(|partition| partition.state == super::store::ManagedPartitionState::Active)
         .cloned()
         .ok_or_else(|| {
             format!(
@@ -211,16 +208,16 @@ fn derive_distributed_slot_ids(
         let idx = columns
             .iter()
             .position(|col| col.name.eq_ignore_ascii_case(&lowered))
-            .ok_or_else(|| {
-                format!("distribution key `{name}` not found in logical column list")
-            })?;
+            .ok_or_else(|| format!("distribution key `{name}` not found in logical column list"))?;
         slot_ids.push(SlotId::new(idx as u32 + 1));
     }
     Ok(slot_ids)
 }
 
 fn build_chunk_for_insert(batch: RecordBatch, num_columns: usize) -> Result<Chunk, String> {
-    let slot_ids = (1..=num_columns as u32).map(SlotId::new).collect::<Vec<_>>();
+    let slot_ids = (1..=num_columns as u32)
+        .map(SlotId::new)
+        .collect::<Vec<_>>();
     let chunk_schema =
         ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
     Ok(Chunk::new_with_chunk_schema(batch, chunk_schema))
@@ -304,7 +301,10 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
         .map_err(|e| format!("take routed rows failed: {e}"))?;
     let batch = RecordBatch::try_new(chunk.batch.schema(), columns)
         .map_err(|e| format!("build routed batch failed: {e}"))?;
-    Ok(Chunk::new_with_chunk_schema(batch, chunk.chunk_schema_ref()))
+    Ok(Chunk::new_with_chunk_schema(
+        batch,
+        chunk.chunk_schema_ref(),
+    ))
 }
 
 fn publish_managed_txn(
