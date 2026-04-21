@@ -128,6 +128,15 @@ pub(crate) struct StoredManagedTxn {
     pub updated_at_ms: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedManagedTxn {
+    pub txn_id: i64,
+    pub table_id: i64,
+    pub partition_id: i64,
+    pub base_version: i64,
+    pub commit_version: i64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ManagedTableState {
     Creating,
@@ -577,6 +586,102 @@ impl SqliteMetadataStore {
 
         tx.commit()
             .map_err(|e| format!("commit managed snapshot failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_txn(
+        &self,
+        table_id: i64,
+        partition_id: i64,
+        base_version: i64,
+    ) -> Result<PreparedManagedTxn, String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin prepare_txn transaction failed: {e}"))?;
+        let txn_id: i64 = tx
+            .query_row(
+                "SELECT next_txn_id FROM global_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("read next_txn_id failed: {e}"))?;
+        let commit_version = base_version + 1;
+        tx.execute(
+            "UPDATE global_meta SET next_txn_id = ?1 WHERE singleton = 1",
+            params![txn_id + 1],
+        )
+        .map_err(|e| format!("bump next_txn_id failed: {e}"))?;
+        tx.execute(
+            "INSERT INTO txns(
+                txn_id, table_id, partition_id, base_version, commit_version, state, retry_at_ms, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, 'PREPARED', NULL, strftime('%s','now') * 1000)",
+            params![txn_id, table_id, partition_id, base_version, commit_version],
+        )
+        .map_err(|e| format!("insert prepared txn failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit prepare_txn failed: {e}"))?;
+        Ok(PreparedManagedTxn {
+            txn_id,
+            table_id,
+            partition_id,
+            base_version,
+            commit_version,
+        })
+    }
+
+    pub(crate) fn mark_txn_written(&self, txn_id: i64) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE txns SET state = 'WRITTEN', updated_at_ms = strftime('%s','now') * 1000
+                 WHERE txn_id = ?1",
+                params![txn_id],
+            )
+            .map_err(|e| format!("mark txn written failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_txn_visible(
+        &self,
+        txn_id: i64,
+        commit_version: i64,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin mark_txn_visible transaction failed: {e}"))?;
+        let partition_id: i64 = tx
+            .query_row(
+                "SELECT partition_id FROM txns WHERE txn_id = ?1",
+                params![txn_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load partition for txn {txn_id} failed: {e}"))?;
+        tx.execute(
+            "UPDATE txns SET state = 'VISIBLE', updated_at_ms = strftime('%s','now') * 1000
+             WHERE txn_id = ?1",
+            params![txn_id],
+        )
+        .map_err(|e| format!("mark txn visible failed: {e}"))?;
+        tx.execute(
+            "UPDATE partitions SET visible_version = ?1, next_version = ?2
+             WHERE partition_id = ?3",
+            params![commit_version, commit_version + 1, partition_id],
+        )
+        .map_err(|e| format!("advance partition version failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit mark_txn_visible failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_txn_aborted(&self, txn_id: i64) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE txns SET state = 'ABORTED', updated_at_ms = strftime('%s','now') * 1000, retry_at_ms = NULL
+                 WHERE txn_id = ?1",
+                params![txn_id],
+            )
+            .map_err(|e| format!("mark txn aborted failed: {e}"))?;
         Ok(())
     }
 
@@ -1193,5 +1298,131 @@ mod tests {
 
         let snapshot = store.load_snapshot().expect("load snapshot");
         assert_eq!(snapshot.managed, expected);
+    }
+
+    fn bootstrapped_store_for_txn() -> (tempfile::TempDir, SqliteMetadataStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+        let snapshot = ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: "s3://test/warehouse".to_string(),
+                next_db_id: 2,
+                next_table_id: 11,
+                next_partition_id: 21,
+                next_index_id: 31,
+                next_tablet_id: 41,
+                next_txn_id: 50,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 100,
+                state: ManagedTableState::Active,
+            }],
+            schemas: vec![StoredManagedSchema {
+                schema_id: 100,
+                table_id: 10,
+                schema_version: 0,
+                tablet_schema_pb: vec![],
+            }],
+            columns: Vec::new(),
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 1,
+                next_version: 2,
+                state: ManagedPartitionState::Active,
+            }],
+            indexes: Vec::new(),
+            tablets: Vec::new(),
+            txns: Vec::new(),
+        };
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+        (dir, store)
+    }
+
+    #[test]
+    fn prepare_txn_allocates_unique_ids_and_inserts_prepared_row() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let first = store.prepare_txn(10, 20, 1).expect("prepare first");
+        let second = store.prepare_txn(10, 20, 1).expect("prepare second");
+        assert_eq!(first.txn_id, 50);
+        assert_eq!(first.table_id, 10);
+        assert_eq!(first.partition_id, 20);
+        assert_eq!(first.base_version, 1);
+        assert_eq!(first.commit_version, 2);
+        assert_eq!(second.txn_id, 51);
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        assert_eq!(snapshot.managed.txns.len(), 2);
+        assert!(
+            snapshot
+                .managed
+                .txns
+                .iter()
+                .all(|txn| txn.state == ManagedTxnState::Prepared)
+        );
+        assert_eq!(snapshot.managed.global.next_txn_id, 52);
+    }
+
+    #[test]
+    fn mark_txn_written_and_visible_advances_partition_version() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let prepared = store.prepare_txn(10, 20, 1).expect("prepare txn");
+        store
+            .mark_txn_written(prepared.txn_id)
+            .expect("mark written");
+        let after_written = store.load_snapshot().expect("load after written");
+        assert_eq!(
+            after_written.managed.txns[0].state,
+            ManagedTxnState::Written
+        );
+
+        store
+            .mark_txn_visible(prepared.txn_id, prepared.commit_version)
+            .expect("mark visible");
+        let after_visible = store.load_snapshot().expect("load after visible");
+        assert_eq!(
+            after_visible.managed.txns[0].state,
+            ManagedTxnState::Visible
+        );
+        let partition = after_visible
+            .managed
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == 20)
+            .expect("partition row");
+        assert_eq!(partition.visible_version, 2);
+        assert_eq!(partition.next_version, 3);
+    }
+
+    #[test]
+    fn mark_txn_aborted_does_not_touch_partition_version() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let prepared = store.prepare_txn(10, 20, 1).expect("prepare txn");
+        store
+            .mark_txn_aborted(prepared.txn_id)
+            .expect("mark aborted");
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        assert_eq!(snapshot.managed.txns[0].state, ManagedTxnState::Aborted);
+        assert!(snapshot.managed.txns[0].retry_at_ms.is_none());
+        let partition = snapshot
+            .managed
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == 20)
+            .expect("partition row");
+        assert_eq!(partition.visible_version, 1);
+        assert_eq!(partition.next_version, 2);
     }
 }
