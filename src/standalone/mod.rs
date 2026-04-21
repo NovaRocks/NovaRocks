@@ -1,7 +1,6 @@
 use std::sync::OnceLock;
 
 pub(crate) mod catalog;
-pub(crate) mod coordinator;
 mod engine;
 pub(crate) mod hadoop_catalog;
 pub(crate) mod iceberg;

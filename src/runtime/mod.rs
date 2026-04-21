@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 pub mod backend_id;
+pub(crate) mod coordinator;
 pub mod exchange;
 pub mod exchange_scan;
 pub mod exec_env;

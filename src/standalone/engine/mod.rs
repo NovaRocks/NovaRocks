@@ -5455,7 +5455,7 @@ fn execute_query(
     match execution_plan {
         StandaloneExecutionPlan::SingleFragment(plan) => execute_plan(plan, query_opts),
         StandaloneExecutionPlan::Coordinated(build_result) => {
-            super::coordinator::ExecutionCoordinator::new(
+            crate::runtime::coordinator::ExecutionCoordinator::new(
                 build_result,
                 "127.0.0.1".to_string(),
                 exchange_port,

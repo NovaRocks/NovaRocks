@@ -1,4 +1,4 @@
-//! Execution coordinator for multi-fragment standalone SQL execution.
+//! Execution coordinator for multi-fragment SQL execution.
 //!
 //! Wires and runs:
 //! - CTE produce fragments (multicast to consumer exchange nodes)
@@ -33,7 +33,7 @@ use crate::sql::codegen::{
 use crate::sql::optimizer::runtime_filter_planner::RuntimeFilterPlanResult;
 use crate::types;
 
-use super::engine::{QueryResult, QueryResultColumn};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 
 /// Coordinates multi-fragment CTE query execution.
 ///
