@@ -3,11 +3,8 @@ use std::sync::OnceLock;
 pub(crate) mod catalog;
 mod engine;
 pub(crate) mod iceberg;
-pub(crate) mod lake_ddl;
-pub(crate) mod lake_recovery;
-pub(crate) mod lake_txn;
+pub(crate) mod lake;
 mod server;
-pub(crate) mod store;
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 pub use crate::sql::catalog::{ColumnDef, TableDef, TableStorage};

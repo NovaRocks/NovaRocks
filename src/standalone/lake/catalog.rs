@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use prost::Message;
-use std::sync::Arc;
 
-use crate::common::app_config::StandaloneManagedLakeConfig as AppManagedLakeConfig;
 use crate::common::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::common::largeint::LARGEINT_BYTE_WIDTH;
 use crate::connector::starrocks::ObjectStoreProfile;
@@ -13,60 +12,18 @@ use crate::connector::starrocks::lake::context::{
     TabletWriteContext, get_tablet_runtime, register_tablet_runtime, remove_tablet_runtime,
 };
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
-use super::catalog::normalize_identifier;
-use super::catalog::{
-    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
-};
-use super::iceberg::add_files::parse_s3_path;
+use super::config::ManagedLakeConfig;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
     SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
     StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
 };
-
-#[derive(Clone, Debug)]
-pub(crate) struct ManagedLakeConfig {
-    pub(crate) warehouse_uri: String,
-    pub(crate) s3: S3StoreConfig,
-}
-
-impl ManagedLakeConfig {
-    pub(crate) fn from_app_config(config: AppManagedLakeConfig) -> Result<Self, String> {
-        let warehouse_uri = config
-            .warehouse_uri
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
-        if warehouse_uri.is_empty() {
-            return Err("standalone managed lake warehouse_uri is empty".to_string());
-        }
-        let (bucket, root) = parse_s3_path(&warehouse_uri)?;
-        Ok(Self {
-            warehouse_uri,
-            s3: S3StoreConfig {
-                endpoint: config.endpoint.trim().to_string(),
-                bucket,
-                root: root.trim_matches('/').to_string(),
-                access_key_id: config.access_key_id.trim().to_string(),
-                access_key_secret: config.access_key_secret.trim().to_string(),
-                region: config.region.as_ref().map(|value| value.trim().to_string()),
-                enable_path_style_access: config.enable_path_style_access,
-            },
-        })
-    }
-
-    pub(crate) fn tablet_root_path(&self, db_id: i64, table_id: i64, partition_id: i64) -> String {
-        // All tablets in a partition share the same root so partition replacement
-        // can switch visibility without rewriting tablet-internal object layout.
-        format!(
-            "{}/db_{db_id}/table_{table_id}/partition_{partition_id}",
-            self.warehouse_uri
-        )
-    }
-}
+use super::super::catalog::{
+    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+    normalize_identifier,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ManagedLakeCatalog {
@@ -720,6 +677,7 @@ fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
     use crate::standalone::catalog::DEFAULT_DATABASE;
 
@@ -920,7 +878,7 @@ mod tests {
     }
 
     fn snapshot_seed() -> ManagedSnapshot {
-        use crate::standalone::store::{
+        use crate::standalone::lake::store::{
             ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
         };
         ManagedSnapshot {
@@ -1087,7 +1045,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_aborts_prepared_txns_without_replay() {
-        use crate::standalone::store::StoredManagedTxn;
+        use crate::standalone::lake::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 90,
@@ -1116,7 +1074,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_replays_written_txns_and_advances_partition() {
-        use crate::standalone::store::StoredManagedTxn;
+        use crate::standalone::lake::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 91,

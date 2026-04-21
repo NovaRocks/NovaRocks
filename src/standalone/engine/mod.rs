@@ -36,14 +36,14 @@ use super::iceberg::{
     list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-use super::lake_ddl::{
+use super::lake::ddl::{
     create_managed_table, drop_managed_table as drop_managed_lake_table,
     truncate_managed_table as truncate_managed_lake_table,
 };
-use super::lake_recovery::{
+use super::lake::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
-use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
+use super::lake::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -2129,7 +2129,7 @@ fn execute_insert_statement(
                 .expect("standalone managed lake read lock")
                 .contains_table(&resolved.database, &resolved.table)?
             {
-                return super::lake_txn::insert_into_managed_lake_table(
+                return super::lake::txn::insert_into_managed_lake_table(
                     state,
                     name,
                     columns,
@@ -4740,7 +4740,7 @@ fn restore_managed_lake(
         return Ok(());
     };
     let mut managed = snapshot.managed.clone();
-    super::lake_recovery::reconcile_on_open(store, &mut managed, |snapshot, txn| {
+    super::lake::reconcile_on_open(store, &mut managed, |snapshot, txn| {
         let tablet_ids = snapshot
             .tablets
             .iter()
@@ -4753,7 +4753,7 @@ fn restore_managed_lake(
             })
             .map(|tablet| tablet.tablet_id)
             .collect::<Vec<_>>();
-        super::lake_txn::publish_tablets_at_version(
+        super::lake::txn::publish_tablets_at_version(
             tablet_ids,
             txn.txn_id,
             txn.base_version,
