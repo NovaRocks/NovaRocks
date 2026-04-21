@@ -2,10 +2,7 @@ use std::sync::OnceLock;
 
 pub(crate) mod catalog;
 mod engine;
-pub(crate) mod hadoop_catalog;
 pub(crate) mod iceberg;
-pub(crate) mod iceberg_add_files;
-pub(crate) mod iceberg_s3_storage;
 pub(crate) mod lake_ddl;
 pub(crate) mod lake_recovery;
 pub(crate) mod lake_txn;

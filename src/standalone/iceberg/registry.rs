@@ -32,7 +32,7 @@ use tokio::runtime::Handle;
 
 use crate::runtime::global_async_runtime::data_block_on;
 
-use super::catalog::{ColumnDef, normalize_identifier};
+use super::super::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 #[derive(Default)]
@@ -155,7 +155,7 @@ pub(crate) fn namespace_exists(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
-        let (_, root_prefix) = super::iceberg_add_files::parse_s3_path(&entry.warehouse_uri)
+        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
@@ -199,7 +199,7 @@ pub(crate) fn list_tables(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for list tables: {e}"))?;
-        let (_, root_prefix) = super::iceberg_add_files::parse_s3_path(&entry.warehouse_uri)
+        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
@@ -324,7 +324,7 @@ pub(crate) fn load_table(
         // S3 path: discover metadata from S3 directly
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
-        let (_, root_prefix) = super::iceberg_add_files::parse_s3_path(&entry.warehouse_uri)
+        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let meta_prefix = format!(
             "{}/{}/{}/metadata/",
@@ -361,7 +361,7 @@ pub(crate) fn load_table(
             format!("{warehouse_trimmed}/{ns_name}/{tbl_name}/metadata/{metadata_file_name}");
 
         let storage_factory =
-            super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+            super::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
                 .ok_or_else(|| "missing S3 properties for FileIO".to_string())?;
         let file_io = iceberg::io::FileIOBuilder::new(Arc::new(storage_factory)).build();
 
@@ -742,14 +742,14 @@ fn build_catalog_entry(
         || raw_warehouse.starts_with("oss://");
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
+        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(
             properties,
         )
         .ok_or_else(|| {
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
         })?;
-        let (bucket, _root_prefix) = super::iceberg_add_files::parse_s3_path(&raw_warehouse)
+        let (bucket, _root_prefix) = super::add_files::parse_s3_path(&raw_warehouse)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let cfg = crate::fs::object_store::ObjectStoreConfig {
             endpoint: s3_factory.endpoint.clone(),
@@ -808,7 +808,7 @@ pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<super::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory = super::iceberg_s3_storage::S3StorageFactory::from_catalog_properties(
+        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(
             &entry.properties,
         )
         .ok_or_else(|| {

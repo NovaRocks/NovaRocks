@@ -912,7 +912,7 @@ impl StandaloneSession {
             .expect("iceberg catalog read lock");
         let entry = guard.get(&catalog_name)?;
         drop(guard);
-        let count = super::iceberg_add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
+        let count = super::iceberg::add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
         let msg = format!("Added {count} file(s)");
         build_string_query_result("status", vec![msg]).map(StatementResult::Query)
     }

@@ -20,7 +20,7 @@ use super::catalog::normalize_identifier;
 use super::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
 };
-use super::iceberg_add_files::parse_s3_path;
+use super::iceberg::add_files::parse_s3_path;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
     SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
