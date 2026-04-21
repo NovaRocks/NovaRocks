@@ -1106,9 +1106,9 @@ where
 mod tests {
     use super::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
-        ManagedTableState, SqliteMetadataStore, StoredManagedColumn, StoredManagedDatabase,
-        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
-        StoredManagedTablet,
+        ManagedTableState, ManagedTxnState, SqliteMetadataStore, StoredManagedColumn,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
 
     #[test]
@@ -1117,73 +1117,81 @@ mod tests {
         let store =
             SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
 
+        let expected = ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: "s3://novarocks/standalone".to_string(),
+                next_db_id: 2,
+                next_table_id: 11,
+                next_partition_id: 21,
+                next_index_id: 31,
+                next_tablet_id: 41,
+                next_txn_id: 51,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 100,
+                state: ManagedTableState::Creating,
+            }],
+            schemas: vec![StoredManagedSchema {
+                schema_id: 100,
+                table_id: 10,
+                schema_version: 1,
+                tablet_schema_pb: vec![1, 2, 3],
+            }],
+            columns: vec![StoredManagedColumn {
+                schema_id: 100,
+                ordinal: 0,
+                column_name: "k1".to_string(),
+                logical_type: "INT".to_string(),
+                nullable: false,
+            }],
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 1,
+                next_version: 2,
+                state: ManagedPartitionState::Failed,
+            }],
+            indexes: vec![StoredManagedIndex {
+                index_id: 30,
+                table_id: 10,
+                partition_id: 20,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Creating,
+            }],
+            tablets: vec![StoredManagedTablet {
+                tablet_id: 40,
+                partition_id: 20,
+                index_id: 30,
+                bucket_seq: 0,
+                tablet_root_path: "s3://novarocks/standalone/db_1/table_10/tablet_40".to_string(),
+            }],
+            txns: vec![StoredManagedTxn {
+                txn_id: 50,
+                table_id: 10,
+                partition_id: 20,
+                base_version: 1,
+                commit_version: 2,
+                state: ManagedTxnState::Written,
+                retry_at_ms: Some(1_234),
+                updated_at_ms: 5_678,
+            }],
+        };
+
         store
-            .replace_managed_snapshot(&ManagedSnapshot {
-                global: ManagedGlobalMeta {
-                    warehouse_uri: "s3://novarocks/standalone".to_string(),
-                    next_db_id: 2,
-                    next_table_id: 11,
-                    next_partition_id: 21,
-                    next_index_id: 31,
-                    next_tablet_id: 41,
-                    next_txn_id: 51,
-                },
-                databases: vec![StoredManagedDatabase {
-                    db_id: 1,
-                    name: "analytics".to_string(),
-                }],
-                tables: vec![StoredManagedTable {
-                    table_id: 10,
-                    db_id: 1,
-                    name: "orders".to_string(),
-                    keys_type: "DUP_KEYS".to_string(),
-                    bucket_num: 2,
-                    current_schema_id: 100,
-                    state: ManagedTableState::Active,
-                }],
-                schemas: vec![StoredManagedSchema {
-                    schema_id: 100,
-                    table_id: 10,
-                    schema_version: 1,
-                    tablet_schema_pb: vec![1, 2, 3],
-                }],
-                columns: vec![StoredManagedColumn {
-                    schema_id: 100,
-                    ordinal: 0,
-                    column_name: "k1".to_string(),
-                    logical_type: "INT".to_string(),
-                    nullable: false,
-                }],
-                partitions: vec![StoredManagedPartition {
-                    partition_id: 20,
-                    table_id: 10,
-                    name: "p0".to_string(),
-                    visible_version: 1,
-                    next_version: 2,
-                    state: ManagedPartitionState::Active,
-                }],
-                indexes: vec![StoredManagedIndex {
-                    index_id: 30,
-                    table_id: 10,
-                    partition_id: 20,
-                    index_type: "BASE".to_string(),
-                    state: ManagedIndexState::Active,
-                }],
-                tablets: vec![StoredManagedTablet {
-                    tablet_id: 40,
-                    partition_id: 20,
-                    index_id: 30,
-                    bucket_seq: 0,
-                    tablet_root_path: "s3://novarocks/standalone/db_1/table_10/tablet_40"
-                        .to_string(),
-                }],
-                txns: vec![],
-            })
+            .replace_managed_snapshot(&expected)
             .expect("persist snapshot");
 
         let snapshot = store.load_snapshot().expect("load snapshot");
-        assert_eq!(snapshot.managed.tables.len(), 1);
-        assert_eq!(snapshot.managed.partitions[0].visible_version, 1);
-        assert_eq!(snapshot.managed.tablets[0].tablet_id, 40);
+        assert_eq!(snapshot.managed, expected);
     }
 }
