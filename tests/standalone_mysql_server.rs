@@ -581,7 +581,7 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 }
 
 #[test]
-fn standalone_mysql_server_restores_local_metadata_from_sqlite_config() {
+fn standalone_mysql_server_does_not_restore_external_preloaded_parquet_tables_from_sqlite_config() {
     let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b"))]);
     let config_dir = TempDir::new().expect("create config dir");
     let config_path = config_dir.path().join("novarocks.toml");
@@ -632,10 +632,12 @@ metadata_db_path = "meta/catalog.db"
     let mut conn = server.connect_root(restart_port);
     conn.query_drop("use analytics").expect("use analytics");
 
-    let rows: Vec<(i32, Option<String>)> = conn.query("select * from tbl").expect("select *");
-    assert_eq!(
-        rows,
-        vec![(1, Some("a".to_string())), (2, Some("b".to_string()))]
+    let err = conn
+        .query_drop("select * from tbl")
+        .expect_err("external parquet table must not be restored");
+    assert!(
+        err.to_string().to_lowercase().contains("unknown table"),
+        "err={err}"
     );
 }
 

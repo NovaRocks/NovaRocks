@@ -36,7 +36,7 @@ use super::iceberg::{
     list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable, StoredLocalTable};
+use super::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -4541,15 +4541,6 @@ fn restore_local_catalog(
     for database_name in &snapshot.local_databases {
         guard.create_database(database_name)?;
     }
-    for StoredLocalTable {
-        database,
-        table,
-        path,
-    } in &snapshot.local_tables
-    {
-        let table = build_parquet_table(table, path)?;
-        guard.register(database, table)?;
-    }
     Ok(())
 }
 
@@ -4600,28 +4591,19 @@ fn persist_local_database_if_needed(
 }
 
 fn persist_local_table_if_needed(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
-    path: &Path,
+    _state: &Arc<StandaloneState>,
+    _database_name: &str,
+    _table_name: &str,
+    _path: &Path,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        if database_name != DEFAULT_DATABASE {
-            store.upsert_local_database(database_name)?;
-        }
-        store.upsert_local_table(database_name, table_name, path)?;
-    }
     Ok(())
 }
 
 fn delete_local_table_if_needed(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
+    _state: &Arc<StandaloneState>,
+    _database_name: &str,
+    _table_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_local_table(database_name, table_name)?;
-    }
     Ok(())
 }
 
@@ -6527,7 +6509,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_session_restores_local_metadata_from_sqlite() {
+    fn embedded_session_does_not_restore_external_preloaded_parquet_tables() {
         let parquet = write_parquet_file();
         let metadata_dir = TempDir::new().expect("create metadata dir");
         let metadata_db_path = metadata_dir.path().join("standalone.sqlite");
@@ -6538,49 +6520,21 @@ mod tests {
                 metadata_db_path: Some(metadata_db_path.clone()),
             })
             .expect("open engine");
-            let session = engine.session();
-
-            let create_db = session
-                .execute_in_database("create database analytics", "default")
-                .expect("create database");
-            assert!(matches!(create_db, StatementResult::Ok));
-
-            let create_table_sql = format!(
-                r#"create table tbl properties("path"="{}")"#,
-                parquet.path().display()
-            );
-            let create_table = session
-                .execute_in_database(&create_table_sql, "analytics")
-                .expect("create table");
-            assert!(matches!(create_table, StatementResult::Ok));
+            engine
+                .register_parquet_table("ext_tbl", parquet.path())
+                .expect("register external parquet");
         }
 
-        let restored = StandaloneNovaRocks::open(StandaloneOptions {
+        let reopened = StandaloneNovaRocks::open(StandaloneOptions {
             config_path: None,
             metadata_db_path: Some(metadata_db_path),
         })
         .expect("reopen engine");
-        assert!(
-            restored
-                .database_exists("analytics")
-                .expect("check restored database")
-        );
-
-        let session = restored.session();
-        let result = session
-            .execute_in_database("select name from tbl where id = 2", "analytics")
-            .expect("query restored table");
-        let StatementResult::Query(result) = result else {
-            panic!("expected query result");
-        };
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
+        let err = reopened
+            .session()
+            .query("select * from ext_tbl")
+            .expect_err("external preload must not be restored");
+        assert!(err.contains("unknown table"), "err={err}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Clone, Debug)]
 pub(crate) struct SqliteMetadataStore {
@@ -10,17 +10,233 @@ pub(crate) struct SqliteMetadataStore {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MetadataSnapshot {
     pub local_databases: Vec<String>,
-    pub local_tables: Vec<StoredLocalTable>,
+    pub managed: ManagedSnapshot,
     pub iceberg_catalogs: Vec<StoredIcebergCatalog>,
     pub iceberg_namespaces: Vec<StoredIcebergNamespace>,
     pub iceberg_tables: Vec<StoredIcebergTable>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ManagedSnapshot {
+    pub global: ManagedGlobalMeta,
+    pub databases: Vec<StoredManagedDatabase>,
+    pub tables: Vec<StoredManagedTable>,
+    pub schemas: Vec<StoredManagedSchema>,
+    pub columns: Vec<StoredManagedColumn>,
+    pub partitions: Vec<StoredManagedPartition>,
+    pub indexes: Vec<StoredManagedIndex>,
+    pub tablets: Vec<StoredManagedTablet>,
+    pub txns: Vec<StoredManagedTxn>,
+}
+
+impl ManagedSnapshot {
+    fn is_empty(&self) -> bool {
+        self.global == ManagedGlobalMeta::default()
+            && self.databases.is_empty()
+            && self.tables.is_empty()
+            && self.schemas.is_empty()
+            && self.columns.is_empty()
+            && self.partitions.is_empty()
+            && self.indexes.is_empty()
+            && self.tablets.is_empty()
+            && self.txns.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ManagedGlobalMeta {
+    pub warehouse_uri: String,
+    pub next_db_id: i64,
+    pub next_table_id: i64,
+    pub next_partition_id: i64,
+    pub next_index_id: i64,
+    pub next_tablet_id: i64,
+    pub next_txn_id: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StoredLocalTable {
-    pub database: String,
-    pub table: String,
-    pub path: PathBuf,
+pub(crate) struct StoredManagedDatabase {
+    pub db_id: i64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedTable {
+    pub table_id: i64,
+    pub db_id: i64,
+    pub name: String,
+    pub keys_type: String,
+    pub bucket_num: i64,
+    pub current_schema_id: i64,
+    pub state: ManagedTableState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedSchema {
+    pub schema_id: i64,
+    pub table_id: i64,
+    pub schema_version: i64,
+    pub tablet_schema_pb: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedColumn {
+    pub schema_id: i64,
+    pub ordinal: i64,
+    pub column_name: String,
+    pub logical_type: String,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedPartition {
+    pub partition_id: i64,
+    pub table_id: i64,
+    pub name: String,
+    pub visible_version: i64,
+    pub next_version: i64,
+    pub state: ManagedPartitionState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedIndex {
+    pub index_id: i64,
+    pub table_id: i64,
+    pub partition_id: i64,
+    pub index_type: String,
+    pub state: ManagedIndexState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedTablet {
+    pub tablet_id: i64,
+    pub partition_id: i64,
+    pub index_id: i64,
+    pub bucket_seq: i64,
+    pub tablet_root_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredManagedTxn {
+    pub txn_id: i64,
+    pub table_id: i64,
+    pub partition_id: i64,
+    pub base_version: i64,
+    pub commit_version: i64,
+    pub state: ManagedTxnState,
+    pub retry_at_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManagedTableState {
+    Creating,
+    #[default]
+    Active,
+    Failed,
+}
+
+impl ManagedTableState {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Active => "ACTIVE",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "CREATING" => Ok(Self::Creating),
+            "ACTIVE" => Ok(Self::Active),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(format!("unknown managed table state `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManagedPartitionState {
+    Creating,
+    #[default]
+    Active,
+    Failed,
+}
+
+impl ManagedPartitionState {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Active => "ACTIVE",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "CREATING" => Ok(Self::Creating),
+            "ACTIVE" => Ok(Self::Active),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(format!("unknown managed partition state `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManagedIndexState {
+    Creating,
+    #[default]
+    Active,
+    Failed,
+}
+
+impl ManagedIndexState {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Active => "ACTIVE",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "CREATING" => Ok(Self::Creating),
+            "ACTIVE" => Ok(Self::Active),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(format!("unknown managed index state `{value}`")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManagedTxnState {
+    #[default]
+    Prepared,
+    Written,
+    Visible,
+    Aborted,
+}
+
+impl ManagedTxnState {
+    fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "PREPARED",
+            Self::Written => "WRITTEN",
+            Self::Visible => "VISIBLE",
+            Self::Aborted => "ABORTED",
+        }
+    }
+
+    fn from_sql_str(value: &str) -> Result<Self, String> {
+        match value {
+            "PREPARED" => Ok(Self::Prepared),
+            "WRITTEN" => Ok(Self::Written),
+            "VISIBLE" => Ok(Self::Visible),
+            "ABORTED" => Ok(Self::Aborted),
+            _ => Err(format!("unknown managed txn state `{value}`")),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,27 +280,7 @@ impl SqliteMetadataStore {
         let conn = self.connection()?;
         let local_databases =
             query_single_text_column(&conn, "SELECT name FROM local_databases ORDER BY name", [])?;
-
-        let local_tables = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT database_name, table_name, path
-                     FROM local_tables
-                     ORDER BY database_name, table_name",
-                )
-                .map_err(|e| format!("prepare local_tables query failed: {e}"))?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(StoredLocalTable {
-                        database: row.get(0)?,
-                        table: row.get(1)?,
-                        path: PathBuf::from(row.get::<_, String>(2)?),
-                    })
-                })
-                .map_err(|e| format!("query local_tables failed: {e}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("read local_tables failed: {e}"))?
-        };
+        let managed = self.load_managed_snapshot(&conn)?;
 
         let iceberg_catalogs = {
             let mut stmt = conn
@@ -153,7 +349,7 @@ impl SqliteMetadataStore {
 
         Ok(MetadataSnapshot {
             local_databases,
-            local_tables,
+            managed,
             iceberg_catalogs,
             iceberg_namespaces,
             iceberg_tables,
@@ -171,37 +367,6 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
-    pub(crate) fn upsert_local_table(
-        &self,
-        database_name: &str,
-        table_name: &str,
-        path: &Path,
-    ) -> Result<(), String> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO local_tables(database_name, table_name, path)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(database_name, table_name) DO UPDATE SET path = excluded.path",
-            params![database_name, table_name, path.display().to_string()],
-        )
-        .map_err(|e| format!("persist local table failed: {e}"))?;
-        Ok(())
-    }
-
-    pub(crate) fn delete_local_table(
-        &self,
-        database_name: &str,
-        table_name: &str,
-    ) -> Result<(), String> {
-        let conn = self.connection()?;
-        conn.execute(
-            "DELETE FROM local_tables WHERE database_name = ?1 AND table_name = ?2",
-            params![database_name, table_name],
-        )
-        .map_err(|e| format!("delete local table metadata failed: {e}"))?;
-        Ok(())
-    }
-
     pub(crate) fn delete_local_database(&self, database_name: &str) -> Result<(), String> {
         let conn = self.connection()?;
         conn.execute(
@@ -209,11 +374,209 @@ impl SqliteMetadataStore {
             params![database_name],
         )
         .map_err(|e| format!("delete local database metadata failed: {e}"))?;
-        conn.execute(
-            "DELETE FROM local_tables WHERE database_name = ?1",
-            params![database_name],
-        )
-        .map_err(|e| format!("delete local database tables metadata failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn replace_managed_snapshot(
+        &self,
+        snapshot: &ManagedSnapshot,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin managed snapshot transaction failed: {e}"))?;
+
+        for table in [
+            "txns",
+            "tablets",
+            "indexes",
+            "partitions",
+            "table_columns",
+            "table_schemas",
+            "tables",
+            "databases",
+            "global_meta",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .map_err(|e| format!("clear managed table `{table}` failed: {e}"))?;
+        }
+
+        if !snapshot.is_empty() {
+            tx.execute(
+                "INSERT INTO global_meta(
+                    singleton,
+                    warehouse_uri,
+                    next_db_id,
+                    next_table_id,
+                    next_partition_id,
+                    next_index_id,
+                    next_tablet_id,
+                    next_txn_id
+                ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    snapshot.global.warehouse_uri,
+                    snapshot.global.next_db_id,
+                    snapshot.global.next_table_id,
+                    snapshot.global.next_partition_id,
+                    snapshot.global.next_index_id,
+                    snapshot.global.next_tablet_id,
+                    snapshot.global.next_txn_id,
+                ],
+            )
+            .map_err(|e| format!("persist managed global metadata failed: {e}"))?;
+
+            for database in &snapshot.databases {
+                tx.execute(
+                    "INSERT INTO databases(db_id, name) VALUES (?1, ?2)",
+                    params![database.db_id, database.name],
+                )
+                .map_err(|e| format!("persist managed database failed: {e}"))?;
+            }
+
+            for table in &snapshot.tables {
+                tx.execute(
+                    "INSERT INTO tables(
+                        table_id,
+                        db_id,
+                        name,
+                        keys_type,
+                        bucket_num,
+                        current_schema_id,
+                        state
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        table.table_id,
+                        table.db_id,
+                        table.name,
+                        table.keys_type,
+                        table.bucket_num,
+                        table.current_schema_id,
+                        table.state.as_sql_str(),
+                    ],
+                )
+                .map_err(|e| format!("persist managed table failed: {e}"))?;
+            }
+
+            for schema in &snapshot.schemas {
+                tx.execute(
+                    "INSERT INTO table_schemas(schema_id, table_id, schema_version, tablet_schema_pb)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        schema.schema_id,
+                        schema.table_id,
+                        schema.schema_version,
+                        schema.tablet_schema_pb,
+                    ],
+                )
+                .map_err(|e| format!("persist managed schema failed: {e}"))?;
+            }
+
+            for column in &snapshot.columns {
+                tx.execute(
+                    "INSERT INTO table_columns(
+                        schema_id,
+                        ordinal,
+                        column_name,
+                        logical_type,
+                        nullable
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        column.schema_id,
+                        column.ordinal,
+                        column.column_name,
+                        column.logical_type,
+                        bool_to_sql_int(column.nullable),
+                    ],
+                )
+                .map_err(|e| format!("persist managed column failed: {e}"))?;
+            }
+
+            for partition in &snapshot.partitions {
+                tx.execute(
+                    "INSERT INTO partitions(
+                        partition_id,
+                        table_id,
+                        name,
+                        visible_version,
+                        next_version,
+                        state
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        partition.partition_id,
+                        partition.table_id,
+                        partition.name,
+                        partition.visible_version,
+                        partition.next_version,
+                        partition.state.as_sql_str(),
+                    ],
+                )
+                .map_err(|e| format!("persist managed partition failed: {e}"))?;
+            }
+
+            for index in &snapshot.indexes {
+                tx.execute(
+                    "INSERT INTO indexes(index_id, table_id, partition_id, index_type, state)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        index.index_id,
+                        index.table_id,
+                        index.partition_id,
+                        index.index_type,
+                        index.state.as_sql_str(),
+                    ],
+                )
+                .map_err(|e| format!("persist managed index failed: {e}"))?;
+            }
+
+            for tablet in &snapshot.tablets {
+                tx.execute(
+                    "INSERT INTO tablets(
+                        tablet_id,
+                        partition_id,
+                        index_id,
+                        bucket_seq,
+                        tablet_root_path
+                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        tablet.tablet_id,
+                        tablet.partition_id,
+                        tablet.index_id,
+                        tablet.bucket_seq,
+                        tablet.tablet_root_path,
+                    ],
+                )
+                .map_err(|e| format!("persist managed tablet failed: {e}"))?;
+            }
+
+            for txn in &snapshot.txns {
+                tx.execute(
+                    "INSERT INTO txns(
+                        txn_id,
+                        table_id,
+                        partition_id,
+                        base_version,
+                        commit_version,
+                        state,
+                        retry_at_ms,
+                        updated_at_ms
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        txn.txn_id,
+                        txn.table_id,
+                        txn.partition_id,
+                        txn.base_version,
+                        txn.commit_version,
+                        txn.state.as_sql_str(),
+                        txn.retry_at_ms,
+                        txn.updated_at_ms,
+                    ],
+                )
+                .map_err(|e| format!("persist managed txn failed: {e}"))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("commit managed snapshot failed: {e}"))?;
         Ok(())
     }
 
@@ -339,15 +702,81 @@ impl SqliteMetadataStore {
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
+            PRAGMA foreign_keys = ON;
             PRAGMA synchronous = NORMAL;
             CREATE TABLE IF NOT EXISTS local_databases (
                 name TEXT PRIMARY KEY
             );
-            CREATE TABLE IF NOT EXISTS local_tables (
-                database_name TEXT NOT NULL,
-                table_name TEXT NOT NULL,
-                path TEXT NOT NULL,
-                PRIMARY KEY (database_name, table_name)
+            DROP TABLE IF EXISTS local_tables;
+            CREATE TABLE IF NOT EXISTS global_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                warehouse_uri TEXT NOT NULL,
+                next_db_id INTEGER NOT NULL,
+                next_table_id INTEGER NOT NULL,
+                next_partition_id INTEGER NOT NULL,
+                next_index_id INTEGER NOT NULL,
+                next_tablet_id INTEGER NOT NULL,
+                next_txn_id INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS databases (
+                db_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+            CREATE TABLE IF NOT EXISTS tables (
+                table_id INTEGER PRIMARY KEY,
+                db_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                keys_type TEXT NOT NULL,
+                bucket_num INTEGER NOT NULL,
+                current_schema_id INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                UNIQUE(db_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS table_schemas (
+                schema_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                schema_version INTEGER NOT NULL,
+                tablet_schema_pb BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS table_columns (
+                schema_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                column_name TEXT NOT NULL,
+                logical_type TEXT NOT NULL,
+                nullable INTEGER NOT NULL,
+                PRIMARY KEY (schema_id, ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS partitions (
+                partition_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                visible_version INTEGER NOT NULL,
+                next_version INTEGER NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS indexes (
+                index_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                partition_id INTEGER NOT NULL,
+                index_type TEXT NOT NULL,
+                state TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tablets (
+                tablet_id INTEGER PRIMARY KEY,
+                partition_id INTEGER NOT NULL,
+                index_id INTEGER NOT NULL,
+                bucket_seq INTEGER NOT NULL,
+                tablet_root_path TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS txns (
+                txn_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                partition_id INTEGER NOT NULL,
+                base_version INTEGER NOT NULL,
+                commit_version INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                retry_at_ms INTEGER,
+                updated_at_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS iceberg_catalogs (
                 name TEXT PRIMARY KEY,
@@ -364,16 +793,295 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
         Ok(())
     }
+
+    fn load_managed_snapshot(&self, conn: &Connection) -> Result<ManagedSnapshot, String> {
+        let global = conn
+            .query_row(
+                "SELECT
+                    warehouse_uri,
+                    next_db_id,
+                    next_table_id,
+                    next_partition_id,
+                    next_index_id,
+                    next_tablet_id,
+                    next_txn_id
+                 FROM global_meta
+                 WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(ManagedGlobalMeta {
+                        warehouse_uri: row.get(0)?,
+                        next_db_id: row.get(1)?,
+                        next_table_id: row.get(2)?,
+                        next_partition_id: row.get(3)?,
+                        next_index_id: row.get(4)?,
+                        next_tablet_id: row.get(5)?,
+                        next_txn_id: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("query managed global metadata failed: {e}"))?
+            .unwrap_or_default();
+
+        let databases = {
+            let mut stmt = conn
+                .prepare("SELECT db_id, name FROM databases ORDER BY db_id")
+                .map_err(|e| format!("prepare managed databases query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(StoredManagedDatabase {
+                        db_id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })
+                .map_err(|e| format!("query managed databases failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed databases failed: {e}"))?
+        };
+
+        let tables = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        table_id,
+                        db_id,
+                        name,
+                        keys_type,
+                        bucket_num,
+                        current_schema_id,
+                        state
+                     FROM tables
+                     ORDER BY table_id",
+                )
+                .map_err(|e| format!("prepare managed tables query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let state = ManagedTableState::from_sql_str(&row.get::<_, String>(6)?)
+                        .map_err(invalid_state_sql_error)?;
+                    Ok(StoredManagedTable {
+                        table_id: row.get(0)?,
+                        db_id: row.get(1)?,
+                        name: row.get(2)?,
+                        keys_type: row.get(3)?,
+                        bucket_num: row.get(4)?,
+                        current_schema_id: row.get(5)?,
+                        state,
+                    })
+                })
+                .map_err(|e| format!("query managed tables failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed tables failed: {e}"))?
+        };
+
+        let schemas = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT schema_id, table_id, schema_version, tablet_schema_pb
+                     FROM table_schemas
+                     ORDER BY schema_id",
+                )
+                .map_err(|e| format!("prepare managed schemas query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(StoredManagedSchema {
+                        schema_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        schema_version: row.get(2)?,
+                        tablet_schema_pb: row.get(3)?,
+                    })
+                })
+                .map_err(|e| format!("query managed schemas failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed schemas failed: {e}"))?
+        };
+
+        let columns = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT schema_id, ordinal, column_name, logical_type, nullable
+                     FROM table_columns
+                     ORDER BY schema_id, ordinal",
+                )
+                .map_err(|e| format!("prepare managed columns query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(StoredManagedColumn {
+                        schema_id: row.get(0)?,
+                        ordinal: row.get(1)?,
+                        column_name: row.get(2)?,
+                        logical_type: row.get(3)?,
+                        nullable: row.get::<_, i64>(4)? != 0,
+                    })
+                })
+                .map_err(|e| format!("query managed columns failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed columns failed: {e}"))?
+        };
+
+        let partitions = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        partition_id,
+                        table_id,
+                        name,
+                        visible_version,
+                        next_version,
+                        state
+                     FROM partitions
+                     ORDER BY partition_id",
+                )
+                .map_err(|e| format!("prepare managed partitions query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let state = ManagedPartitionState::from_sql_str(&row.get::<_, String>(5)?)
+                        .map_err(invalid_state_sql_error)?;
+                    Ok(StoredManagedPartition {
+                        partition_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        name: row.get(2)?,
+                        visible_version: row.get(3)?,
+                        next_version: row.get(4)?,
+                        state,
+                    })
+                })
+                .map_err(|e| format!("query managed partitions failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed partitions failed: {e}"))?
+        };
+
+        let indexes = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT index_id, table_id, partition_id, index_type, state
+                     FROM indexes
+                     ORDER BY index_id",
+                )
+                .map_err(|e| format!("prepare managed indexes query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let state = ManagedIndexState::from_sql_str(&row.get::<_, String>(4)?)
+                        .map_err(invalid_state_sql_error)?;
+                    Ok(StoredManagedIndex {
+                        index_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        partition_id: row.get(2)?,
+                        index_type: row.get(3)?,
+                        state,
+                    })
+                })
+                .map_err(|e| format!("query managed indexes failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed indexes failed: {e}"))?
+        };
+
+        let tablets = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT tablet_id, partition_id, index_id, bucket_seq, tablet_root_path
+                     FROM tablets
+                     ORDER BY tablet_id",
+                )
+                .map_err(|e| format!("prepare managed tablets query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(StoredManagedTablet {
+                        tablet_id: row.get(0)?,
+                        partition_id: row.get(1)?,
+                        index_id: row.get(2)?,
+                        bucket_seq: row.get(3)?,
+                        tablet_root_path: row.get(4)?,
+                    })
+                })
+                .map_err(|e| format!("query managed tablets failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed tablets failed: {e}"))?
+        };
+
+        let txns = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT
+                        txn_id,
+                        table_id,
+                        partition_id,
+                        base_version,
+                        commit_version,
+                        state,
+                        retry_at_ms,
+                        updated_at_ms
+                     FROM txns
+                     ORDER BY txn_id",
+                )
+                .map_err(|e| format!("prepare managed txns query failed: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let state = ManagedTxnState::from_sql_str(&row.get::<_, String>(5)?)
+                        .map_err(invalid_state_sql_error)?;
+                    Ok(StoredManagedTxn {
+                        txn_id: row.get(0)?,
+                        table_id: row.get(1)?,
+                        partition_id: row.get(2)?,
+                        base_version: row.get(3)?,
+                        commit_version: row.get(4)?,
+                        state,
+                        retry_at_ms: row.get(6)?,
+                        updated_at_ms: row.get(7)?,
+                    })
+                })
+                .map_err(|e| format!("query managed txns failed: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("read managed txns failed: {e}"))?
+        };
+
+        if global == ManagedGlobalMeta::default()
+            && (!databases.is_empty()
+                || !tables.is_empty()
+                || !schemas.is_empty()
+                || !columns.is_empty()
+                || !partitions.is_empty()
+                || !indexes.is_empty()
+                || !tablets.is_empty()
+                || !txns.is_empty())
+        {
+            return Err("managed metadata missing global_meta row".to_string());
+        }
+
+        Ok(ManagedSnapshot {
+            global,
+            databases,
+            tables,
+            schemas,
+            columns,
+            partitions,
+            indexes,
+            tablets,
+            txns,
+        })
+    }
 }
 
 fn json_to_sql_error(err: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
+}
+
+fn invalid_state_sql_error(err: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+    )
+}
+
+fn bool_to_sql_int(value: bool) -> i64 {
+    if value { 1 } else { 0 }
 }
 
 fn query_single_text_column<P>(
@@ -392,4 +1100,90 @@ where
         .map_err(|e| format!("execute query `{sql}` failed: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read query `{sql}` failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
+        ManagedTableState, SqliteMetadataStore, StoredManagedColumn, StoredManagedDatabase,
+        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
+        StoredManagedTablet,
+    };
+
+    #[test]
+    fn standalone_store_round_trips_managed_lake_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+
+        store
+            .replace_managed_snapshot(&ManagedSnapshot {
+                global: ManagedGlobalMeta {
+                    warehouse_uri: "s3://novarocks/standalone".to_string(),
+                    next_db_id: 2,
+                    next_table_id: 11,
+                    next_partition_id: 21,
+                    next_index_id: 31,
+                    next_tablet_id: 41,
+                    next_txn_id: 51,
+                },
+                databases: vec![StoredManagedDatabase {
+                    db_id: 1,
+                    name: "analytics".to_string(),
+                }],
+                tables: vec![StoredManagedTable {
+                    table_id: 10,
+                    db_id: 1,
+                    name: "orders".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 2,
+                    current_schema_id: 100,
+                    state: ManagedTableState::Active,
+                }],
+                schemas: vec![StoredManagedSchema {
+                    schema_id: 100,
+                    table_id: 10,
+                    schema_version: 1,
+                    tablet_schema_pb: vec![1, 2, 3],
+                }],
+                columns: vec![StoredManagedColumn {
+                    schema_id: 100,
+                    ordinal: 0,
+                    column_name: "k1".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                }],
+                partitions: vec![StoredManagedPartition {
+                    partition_id: 20,
+                    table_id: 10,
+                    name: "p0".to_string(),
+                    visible_version: 1,
+                    next_version: 2,
+                    state: ManagedPartitionState::Active,
+                }],
+                indexes: vec![StoredManagedIndex {
+                    index_id: 30,
+                    table_id: 10,
+                    partition_id: 20,
+                    index_type: "BASE".to_string(),
+                    state: ManagedIndexState::Active,
+                }],
+                tablets: vec![StoredManagedTablet {
+                    tablet_id: 40,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 0,
+                    tablet_root_path: "s3://novarocks/standalone/db_1/table_10/tablet_40"
+                        .to_string(),
+                }],
+                txns: vec![],
+            })
+            .expect("persist snapshot");
+
+        let snapshot = store.load_snapshot().expect("load snapshot");
+        assert_eq!(snapshot.managed.tables.len(), 1);
+        assert_eq!(snapshot.managed.partitions[0].visible_version, 1);
+        assert_eq!(snapshot.managed.tablets[0].tablet_id, 40);
+    }
 }
