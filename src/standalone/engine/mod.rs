@@ -166,6 +166,8 @@ pub(crate) struct StandaloneState {
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
     pub(crate) metadata_store: Option<SqliteMetadataStore>,
     pub(crate) exchange_port: u16,
+    #[cfg(test)]
+    pub(crate) _test_guard: Option<TestSerializationGuard>,
 }
 
 impl Default for StandaloneState {
@@ -180,8 +182,32 @@ impl Default for StandaloneState {
             managed_lake_config: None,
             metadata_store: None,
             exchange_port: 0,
+            #[cfg(test)]
+            _test_guard: None,
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) struct TestSerializationGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+unsafe impl Send for TestSerializationGuard {}
+
+#[cfg(test)]
+unsafe impl Sync for TestSerializationGuard {}
+
+#[cfg(test)]
+fn acquire_standalone_test_guard() -> TestSerializationGuard {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    TestSerializationGuard { _guard: guard }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -209,14 +235,23 @@ pub struct StandaloneSession {
 
 impl StandaloneNovaRocks {
     pub fn open(opts: StandaloneOptions) -> Result<Self, String> {
+        #[cfg(test)]
+        let _test_guard = Some(acquire_standalone_test_guard());
         match opts.config_path.as_deref() {
             Some(path) => {
                 novarocks_config::init_from_path(path)
                     .map_err(|e| format!("load config failed: {e}"))?;
             }
             None => {
-                novarocks_config::init_from_env_or_default()
-                    .map_err(|e| format!("load config failed: {e}"))?;
+                #[cfg(test)]
+                {
+                    novarocks_config::install_default_for_test();
+                }
+                #[cfg(not(test))]
+                {
+                    novarocks_config::init_from_env_or_default()
+                        .map_err(|e| format!("load config failed: {e}"))?;
+                }
             }
         }
         let exchange_port = ensure_standalone_exchange_server()?;
@@ -230,6 +265,8 @@ impl StandaloneNovaRocks {
             managed_lake_config,
             metadata_store,
             exchange_port,
+            #[cfg(test)]
+            _test_guard,
             ..Default::default()
         });
         restore_metadata_if_needed(&inner)?;
@@ -3219,6 +3256,45 @@ fn read_local_parquet_data(path: &Path, columns: &[ColumnDef]) -> Result<RecordB
 }
 
 /// Build a RecordBatch from literal value rows for a local table.
+fn normalize_map_entries_nullability(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Map(entries_field, ordered) => {
+            let inner = normalize_map_entries_nullability(entries_field.data_type());
+            let new_field = Arc::new(Field::new(entries_field.name(), inner, false));
+            DataType::Map(new_field, *ordered)
+        }
+        DataType::List(field) => {
+            let inner = normalize_map_entries_nullability(field.data_type());
+            let new_field = Arc::new(Field::new(field.name(), inner, field.is_nullable()));
+            DataType::List(new_field)
+        }
+        DataType::LargeList(field) => {
+            let inner = normalize_map_entries_nullability(field.data_type());
+            let new_field = Arc::new(Field::new(field.name(), inner, field.is_nullable()));
+            DataType::LargeList(new_field)
+        }
+        DataType::FixedSizeList(field, size) => {
+            let inner = normalize_map_entries_nullability(field.data_type());
+            let new_field = Arc::new(Field::new(field.name(), inner, field.is_nullable()));
+            DataType::FixedSizeList(new_field, *size)
+        }
+        DataType::Struct(fields) => {
+            let new_fields = fields
+                .iter()
+                .map(|field| {
+                    Arc::new(Field::new(
+                        field.name(),
+                        normalize_map_entries_nullability(field.data_type()),
+                        field.is_nullable(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            DataType::Struct(new_fields.into())
+        }
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn build_local_insert_batch(
     columns: &[ColumnDef],
     rows: &[Vec<Literal>],
@@ -3226,7 +3302,13 @@ pub(crate) fn build_local_insert_batch(
     let schema = Arc::new(Schema::new(
         columns
             .iter()
-            .map(|c| Field::new(&c.name, c.data_type.clone(), c.nullable))
+            .map(|c| {
+                Field::new(
+                    &c.name,
+                    normalize_map_entries_nullability(&c.data_type),
+                    c.nullable,
+                )
+            })
             .collect::<Vec<_>>(),
     ));
 
@@ -3258,7 +3340,8 @@ fn build_local_literal_array(
     use arrow::array::*;
     use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
 
-    match data_type {
+    let data_type = normalize_map_entries_nullability(data_type);
+    match &data_type {
         DataType::Int8 => Ok(Arc::new(Int8Array::from(
             values
                 .iter()
@@ -3600,7 +3683,7 @@ fn build_local_literal_array(
             let entries_field = Arc::new(Field::new(
                 entries_field.name(),
                 DataType::Struct(entries_fields),
-                entries_field.is_nullable(),
+                false,
             ));
             Ok(Arc::new(MapArray::new(
                 entries_field,

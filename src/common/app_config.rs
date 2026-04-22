@@ -17,9 +17,16 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
-static CONFIG: OnceLock<NovaRocksConfig> = OnceLock::new();
+static CONFIG: OnceLock<RwLock<&'static NovaRocksConfig>> = OnceLock::new();
+
+fn install_config(cfg: NovaRocksConfig) -> &'static NovaRocksConfig {
+    let leaked: &'static NovaRocksConfig = Box::leak(Box::new(cfg));
+    let lock = CONFIG.get_or_init(|| RwLock::new(leaked));
+    *lock.write().expect("novarocks config lock poisoned") = leaked;
+    leaked
+}
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -38,26 +45,22 @@ fn default_sys_log_roll_num() -> usize {
 }
 
 pub fn init_from_path(path: impl AsRef<Path>) -> Result<&'static NovaRocksConfig> {
-    if let Some(cfg) = CONFIG.get() {
-        return Ok(cfg);
-    }
     let path = path.as_ref().to_path_buf();
-    if !path.exists() {
+    let cfg = if !path.exists() {
         eprintln!(
             "WARNING: config file '{}' not found, using built-in defaults",
             path.display()
         );
-        let _ = CONFIG.set(NovaRocksConfig::default());
-        return Ok(CONFIG.get().expect("CONFIG set"));
-    }
-    let cfg = NovaRocksConfig::load_from_file(&path)?;
-    let _ = CONFIG.set(cfg);
-    Ok(CONFIG.get().expect("CONFIG set"))
+        NovaRocksConfig::default()
+    } else {
+        NovaRocksConfig::load_from_file(&path)?
+    };
+    Ok(install_config(cfg))
 }
 
 pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
-    if let Some(cfg) = CONFIG.get() {
-        return Ok(cfg);
+    if let Some(lock) = CONFIG.get() {
+        return Ok(*lock.read().expect("novarocks config lock poisoned"));
     }
     if let Ok(p) = std::env::var("NOVAROCKS_CONFIG") {
         let p = p.trim();
@@ -69,16 +72,24 @@ pub fn init_from_env_or_default() -> Result<&'static NovaRocksConfig> {
     let default_path = PathBuf::from("novarocks.toml");
     if default_path.exists() {
         let cfg = NovaRocksConfig::load_from_file(&default_path)?;
-        let _ = CONFIG.set(cfg);
-        return Ok(CONFIG.get().expect("CONFIG set"));
+        return Ok(install_config(cfg));
     }
 
     eprintln!("WARNING: config file 'novarocks.toml' not found, using built-in defaults");
-    let _ = CONFIG.set(NovaRocksConfig::default());
-    Ok(CONFIG.get().expect("CONFIG set"))
+    Ok(install_config(NovaRocksConfig::default()))
+}
+
+/// Force-install the built-in default config, replacing any existing global config.
+/// Intended for test setup where each test must start from a known-clean config.
+#[cfg(test)]
+pub fn install_default_for_test() -> &'static NovaRocksConfig {
+    install_config(NovaRocksConfig::default())
 }
 
 pub fn config() -> Result<&'static NovaRocksConfig> {
+    if let Some(lock) = CONFIG.get() {
+        return Ok(*lock.read().expect("novarocks config lock poisoned"));
+    }
     init_from_env_or_default()
 }
 
