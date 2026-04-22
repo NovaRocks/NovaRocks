@@ -46,8 +46,14 @@ use super::lake::{
 };
 
 pub(crate) mod local;
+pub(crate) mod sqlparse;
 
 use self::local::aggregate::merge_aggregate_table_rows_if_needed;
+use self::sqlparse::materialized_view::{
+    looks_like_show_alter_materialized_view, materialized_view_key,
+    parse_create_materialized_view_name, parse_drop_materialized_view_name,
+    parse_refresh_materialized_view_name, supports_bitmap_count_rewrite,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -1274,99 +1280,15 @@ impl StandaloneSession {
     }
 }
 
-fn materialized_view_key(current_database: &str, name: &str) -> Result<(String, String), String> {
-    Ok((
-        normalize_identifier(current_database)?,
-        normalize_identifier(name)?,
-    ))
-}
-
-fn strip_optional_identifier_quotes(token: &str) -> &str {
+pub(crate) fn strip_optional_identifier_quotes(token: &str) -> &str {
     token.trim_end_matches(';').trim_matches('`')
 }
 
-fn parse_create_materialized_view_name(sql: &str) -> Option<String> {
-    let mut parts = sql.split_whitespace();
-    if !parts.next()?.eq_ignore_ascii_case("create") {
-        return None;
-    }
-    if !parts.next()?.eq_ignore_ascii_case("materialized") {
-        return None;
-    }
-    if !parts.next()?.eq_ignore_ascii_case("view") {
-        return None;
-    }
-    let maybe_name = parts.next()?;
-    let name = if maybe_name.eq_ignore_ascii_case("if") {
-        if !parts.next()?.eq_ignore_ascii_case("not") {
-            return None;
-        }
-        if !parts.next()?.eq_ignore_ascii_case("exists") {
-            return None;
-        }
-        parts.next()?
-    } else {
-        maybe_name
-    };
-    Some(strip_optional_identifier_quotes(name).to_string())
-}
-
-fn parse_drop_materialized_view_name(sql: &str) -> Option<String> {
-    let mut parts = sql.split_whitespace();
-    if !parts.next()?.eq_ignore_ascii_case("drop") {
-        return None;
-    }
-    if !parts.next()?.eq_ignore_ascii_case("materialized") {
-        return None;
-    }
-    if !parts.next()?.eq_ignore_ascii_case("view") {
-        return None;
-    }
-    let maybe_name = parts.next()?;
-    let name = if maybe_name.eq_ignore_ascii_case("if") {
-        if !parts.next()?.eq_ignore_ascii_case("exists") {
-            return None;
-        }
-        parts.next()?
-    } else {
-        maybe_name
-    };
-    Some(strip_optional_identifier_quotes(name).to_string())
-}
-
-fn parse_refresh_materialized_view_name(sql: &str) -> Option<String> {
-    let mut parts = sql.split_whitespace();
-    if !parts.next()?.eq_ignore_ascii_case("refresh") {
-        return None;
-    }
-    if !parts.next()?.eq_ignore_ascii_case("materialized") {
-        return None;
-    }
-    if !parts.next()?.eq_ignore_ascii_case("view") {
-        return None;
-    }
-    Some(strip_optional_identifier_quotes(parts.next()?).to_string())
-}
-
-fn looks_like_show_alter_materialized_view(sql: &str) -> bool {
-    let mut parts = sql.split_whitespace();
-    matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("show"))
-        && matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("alter"))
-        && matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("materialized"))
-        && matches!(parts.next(), Some(head) if head.eq_ignore_ascii_case("view"))
-}
-
-fn canonicalize_sql_for_match(sql: &str) -> String {
+pub(crate) fn canonicalize_sql_for_match(sql: &str) -> String {
     sql.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
-}
-
-fn supports_bitmap_count_rewrite(sql: &str) -> bool {
-    canonicalize_sql_for_match(sql).contains(
-        "as select c1, bitmap_agg(c2), bitmap_agg(c3), bitmap_agg(c4) from t1 group by c1",
-    )
 }
 
 /// Convert a sqlparser INSERT AST to our custom InsertStmt.
