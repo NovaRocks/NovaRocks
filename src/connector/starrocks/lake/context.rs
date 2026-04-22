@@ -321,6 +321,20 @@ pub(crate) fn clear_tablet_runtime_cache_for_test() {
     }
 }
 
+/// Serialize tests that touch the global tablet runtime registry and the
+/// starlet shard registry. Holds the shared `starlet_shard_registry` test
+/// mutex and clears both registries so tests observe a known-empty state.
+/// Every test that calls `register_tablet_runtime`, `remove_tablet_runtime`,
+/// `clear_tablet_runtime_cache_for_test`, or reaches into
+/// `starlet_shard_registry` must hold this guard for its full duration.
+#[cfg(test)]
+pub(crate) fn lock_runtime_test_state() -> std::sync::MutexGuard<'static, ()> {
+    let guard = crate::runtime::starlet_shard_registry::lock_for_test();
+    crate::runtime::starlet_shard_registry::clear_for_test();
+    clear_tablet_runtime_cache_for_test();
+    guard
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -344,8 +358,7 @@ mod tests {
 
     #[test]
     fn runtime_lookup_fails_after_cache_clear_without_persistence() {
-        starlet_shard_registry::clear_for_test();
-        clear_tablet_runtime_cache_for_test();
+        let _guard = super::lock_runtime_test_state();
         let tablet_id = 79_001;
         let root = std::env::temp_dir()
             .join("novarocks_lake_context_test")

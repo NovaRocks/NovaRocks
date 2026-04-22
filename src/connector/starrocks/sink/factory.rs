@@ -1933,7 +1933,7 @@ mod tests {
     };
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+        TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::lower::layout::Layout;
     use crate::service::frontend_rpc::test_clear_shared_host_pools;
@@ -2473,6 +2473,7 @@ mod tests {
 
     #[test]
     fn write_slot_bindings_use_projected_output_ordinals_for_rollup_agg_columns() {
+        let _guard = lock_runtime_test_state();
         let sink = test_sink_with_aliased_agg_slots();
         let projected_output_slot_ids = vec![
             SlotId::new(1),
@@ -2502,6 +2503,7 @@ mod tests {
 
     #[test]
     fn write_slot_bindings_use_output_expr_ordinals_when_aliases_do_not_match_physical_mv_names() {
+        let _guard = lock_runtime_test_state();
         let sink = test_sink_with_aliased_agg_slots();
         let output_exprs = vec![
             slot_ref_expr(1),
@@ -2531,6 +2533,7 @@ mod tests {
 
     #[test]
     fn write_slot_bindings_skip_hidden_op_for_primary_key_delete_plan() {
+        let _guard = lock_runtime_test_state();
         let sink = test_pk_sink_with_hidden_op_slot();
         let output_exprs = vec![slot_ref_expr(1), slot_ref_expr(6)];
         let (bindings, op_slot_id) = resolve_write_slot_bindings(
@@ -2548,6 +2551,7 @@ mod tests {
 
     #[test]
     fn automatic_partition_plan_does_not_require_shadow_partitions() {
+        let _guard = lock_runtime_test_state();
         let mut sink = test_sink_with_aliased_agg_slots();
         sink.partition.partition_columns = Some(vec!["ds".to_string()]);
         sink.partition.enable_automatic_partition = Some(true);
@@ -2574,6 +2578,7 @@ mod tests {
 
     #[test]
     fn extract_partition_literal_value_formats_bool_as_uppercase() {
+        let _guard = lock_runtime_test_state();
         let expr = exprs::TExpr {
             nodes: vec![exprs::TExprNode {
                 node_type: exprs::TExprNodeType::BOOL_LITERAL,
@@ -2592,7 +2597,7 @@ mod tests {
 
     #[test]
     fn write_index_prefers_registered_runtime_schema_for_rollup_tablets() {
-        clear_tablet_runtime_cache_for_test();
+        let _guard = lock_runtime_test_state();
         let dir = tempdir().expect("create tempdir");
         let runtime_schema = test_mv_tablet_schema();
         register_tablet_runtime(&TabletWriteContext {
@@ -2619,12 +2624,11 @@ mod tests {
             resolved.column[3].aggregation.as_deref(),
             Some("BITMAP_UNION")
         );
-
-        clear_tablet_runtime_cache_for_test();
     }
 
     #[test]
     fn plain_slot_ref_output_projection_is_forced_for_index_where_clause() {
+        let _guard = lock_runtime_test_state();
         let mut sink = test_sink_with_aliased_agg_slots();
         sink.schema.indexes[0].where_clause = Some(exprs::TExpr {
             nodes: vec![exprs::TExprNode {
@@ -2670,6 +2674,7 @@ mod tests {
 
     #[test]
     fn create_automatic_partitions_retries_end_of_file() {
+        let _guard = lock_runtime_test_state();
         test_clear_shared_host_pools();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_server = Arc::clone(&calls);
@@ -2719,6 +2724,7 @@ mod tests {
 
     #[test]
     fn create_automatic_partitions_marks_temp_for_dynamic_overwrite() {
+        let _guard = lock_runtime_test_state();
         test_clear_shared_host_pools();
         let saw_temp = Arc::new(AtomicBool::new(false));
         let saw_temp_for_server = Arc::clone(&saw_temp);
@@ -2761,6 +2767,7 @@ mod tests {
 
     #[test]
     fn create_automatic_partitions_retries_multiple_end_of_file() {
+        let _guard = lock_runtime_test_state();
         test_clear_shared_host_pools();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_server = Arc::clone(&calls);

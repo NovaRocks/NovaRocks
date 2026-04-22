@@ -3124,12 +3124,7 @@ mod tests {
         VacuumRequest, tablet_stat_request, txn_log_pb,
     };
 
-    fn lock_runtime_test_state() -> MutexGuard<'static, ()> {
-        let guard = starlet_shard_registry::lock_for_test();
-        starlet_shard_registry::clear_for_test();
-        clear_tablet_runtime_cache_for_test();
-        guard
-    }
+    use crate::connector::starrocks::lake::context::lock_runtime_test_state;
 
     fn test_tablet_schema(schema_id: i64) -> TabletSchemaPb {
         TabletSchemaPb {

@@ -1658,7 +1658,7 @@ mod tests {
     use crate::agent_service::TAlterTabletReqV2;
     use crate::connector::starrocks::lake::context::PartialUpdateWritePolicy;
     use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+        TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::descriptors;
     use crate::service::grpc_client::proto::starrocks::{
@@ -1672,6 +1672,7 @@ mod tests {
 
     #[test]
     fn initial_empty_v1_metadata_without_schema_is_expected() {
+        let _guard = lock_runtime_test_state();
         let mut metadata = TabletMetadataPb::default();
         metadata.id = Some(123);
         metadata.version = Some(1);
@@ -1680,6 +1681,7 @@ mod tests {
 
     #[test]
     fn non_initial_or_non_empty_metadata_without_schema_is_not_expected() {
+        let _guard = lock_runtime_test_state();
         let mut metadata = TabletMetadataPb::default();
         metadata.id = Some(123);
         metadata.version = Some(2);
@@ -1699,6 +1701,7 @@ mod tests {
 
     #[test]
     fn schemas_equivalent_compares_nested_children_recursively() {
+        let _guard = lock_runtime_test_state();
         let lhs = test_schema(
             1,
             vec![test_struct_column(
@@ -1730,6 +1733,7 @@ mod tests {
 
     #[test]
     fn schemas_equivalent_ignores_schema_id_when_column_layout_matches() {
+        let _guard = lock_runtime_test_state();
         let lhs = test_schema(
             1,
             vec![test_struct_column(
@@ -1754,6 +1758,7 @@ mod tests {
 
     #[test]
     fn missing_or_mismatched_initial_schema_requires_patch() {
+        let _guard = lock_runtime_test_state();
         let target = test_schema(7, vec![test_scalar_column(11, "v1", "INT")]);
 
         let missing = TabletMetadataPb::default();
@@ -1770,7 +1775,7 @@ mod tests {
 
     #[test]
     fn resolve_target_schema_prefers_runtime_schema_for_new_tablet() {
-        clear_tablet_runtime_cache_for_test();
+        let _guard = lock_runtime_test_state();
         let root = tempdir().expect("tempdir");
         let runtime_schema = test_schema(
             88,
@@ -1806,12 +1811,11 @@ mod tests {
             .expect("resolve target schema");
 
         assert_eq!(resolved, runtime_schema);
-        clear_tablet_runtime_cache_for_test();
     }
 
     #[test]
     fn resolve_target_schema_errors_when_only_stale_metadata_is_available() {
-        clear_tablet_runtime_cache_for_test();
+        let _guard = lock_runtime_test_state();
         let base_schema = test_schema(
             77,
             vec![
@@ -1833,6 +1837,7 @@ mod tests {
 
     #[test]
     fn build_rollup_expr_input_accepts_runtime_fields_without_slot_type() {
+        let _guard = lock_runtime_test_state();
         let mut request = test_alter_request(1, 2);
         request.desc_tbl = Some(descriptors::TDescriptorTable {
             slot_descriptors: Some(vec![descriptors::TSlotDescriptor {
@@ -1874,6 +1879,7 @@ mod tests {
 
     #[test]
     fn schema_change_allows_primary_keys_without_delete_vectors() {
+        let _guard = lock_runtime_test_state();
         let mut schema = test_schema(
             1,
             vec![
@@ -1891,6 +1897,7 @@ mod tests {
 
     #[test]
     fn schema_change_rejects_primary_keys_with_delete_files() {
+        let _guard = lock_runtime_test_state();
         let mut schema = test_schema(
             1,
             vec![
@@ -1922,6 +1929,7 @@ mod tests {
 
     #[test]
     fn schema_change_transforms_primary_key_batches_without_rejection() {
+        let _guard = lock_runtime_test_state();
         let mut schema = test_schema(
             1,
             vec![

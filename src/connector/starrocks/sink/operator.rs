@@ -2655,7 +2655,7 @@ mod tests {
     use crate::common::ids::SlotId;
     use crate::connector::starrocks::fe_v2_meta::LakeTableIdentity;
     use crate::connector::starrocks::lake::context::{
-        AutoIncrementWritePolicy, clear_tablet_runtime_cache_for_test, register_tablet_runtime,
+        AutoIncrementWritePolicy, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::{TabletWriteContext, txn_log::read_txn_log_if_exists};
     use crate::connector::starrocks::sink::auto_increment::clear_auto_increment_cache_for_test;
@@ -3364,7 +3364,7 @@ mod tests {
 
     #[test]
     fn ingest_auto_partition_response_updates_all_index_write_plans() {
-        clear_tablet_runtime_cache_for_test();
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let primary_tablet_schema = test_tablet_schema();
         let secondary_tablet_schema = test_tablet_schema();
@@ -3503,11 +3503,11 @@ mod tests {
                 .tablet_ids,
             vec![9917]
         );
-        clear_tablet_runtime_cache_for_test();
     }
 
     #[test]
     fn sink_retryable_error_detection_matches_temporary_and_5xx_patterns() {
+        let _guard = lock_runtime_test_state();
         assert!(is_retryable_sink_write_error(
             "write object failed: Unexpected (temporary) at Writer::close"
         ));
@@ -3521,6 +3521,7 @@ mod tests {
 
     #[test]
     fn align_batch_preserves_duplicate_schema_slot_bindings() {
+        let _guard = lock_runtime_test_state();
         let batch = slot_bound_batch_with_op(false);
         let aligned = align_batch_to_schema_slot_bindings(
             &batch,
@@ -3550,6 +3551,7 @@ mod tests {
 
     #[test]
     fn align_batch_duplicate_bindings_with_op_column() {
+        let _guard = lock_runtime_test_state();
         let batch = slot_bound_batch_with_op(true);
         let aligned = align_batch_to_schema_slot_bindings(
             &batch,
@@ -3595,6 +3597,7 @@ mod tests {
 
     #[test]
     fn align_batch_does_not_alias_data_slot_to_op_column() {
+        let _guard = lock_runtime_test_state();
         let batch = slot_bound_batch_with_op(false);
         let aligned = align_batch_to_schema_slot_bindings(
             &batch,
@@ -3617,6 +3620,7 @@ mod tests {
 
     #[test]
     fn partition_rejection_message_matches_information_schema_expectation() {
+        let _guard = lock_runtime_test_state();
         let days = chrono::NaiveDate::from_ymd_opt(2022, 1, 14)
             .expect("valid date")
             .num_days_from_ce()
@@ -3641,6 +3645,7 @@ mod tests {
 
     #[test]
     fn filter_rows_for_tablet_schema_rejects_null_rows_with_tracking_log() {
+        let _guard = lock_runtime_test_state();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k1", DataType::Int64, true),
@@ -3671,6 +3676,7 @@ mod tests {
 
     #[test]
     fn filter_rows_for_tablet_schema_materializes_auto_increment_defaults() {
+        let _guard = lock_runtime_test_state();
         test_clear_shared_host_pools();
         clear_auto_increment_cache_for_test();
         let saw_requests = Arc::new(AtomicUsize::new(0));
@@ -3736,6 +3742,7 @@ mod tests {
 
     #[test]
     fn filter_rows_for_tablet_schema_rejects_explicit_auto_increment_nulls() {
+        let _guard = lock_runtime_test_state();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Date32, false),
@@ -3770,6 +3777,7 @@ mod tests {
 
     #[test]
     fn apply_index_where_clause_filters_false_and_null_rows() {
+        let _guard = lock_runtime_test_state();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k7", DataType::Int16, true),
@@ -3816,6 +3824,7 @@ mod tests {
 
     #[test]
     fn apply_index_where_clause_filters_string_predicate_rows() {
+        let _guard = lock_runtime_test_state();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k2", DataType::Utf8, true),
@@ -3862,6 +3871,7 @@ mod tests {
 
     #[test]
     fn apply_index_where_clause_filters_projected_target_chunk() {
+        let _guard = lock_runtime_test_state();
         let predicate_batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k2", DataType::Utf8, true),
@@ -3960,6 +3970,7 @@ mod tests {
 
     #[test]
     fn align_batch_recovers_op_from_slot_when_name_is_generic() {
+        let _guard = lock_runtime_test_state();
         let batch = slot_bound_batch_with_unnamed_op_slot();
         let aligned = align_batch_to_schema_slot_bindings(
             &batch,
@@ -3981,6 +3992,7 @@ mod tests {
 
     #[test]
     fn output_projection_materializes_literal_op_column_before_routing() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_id = 9904;
         let partition_id = 3004;
@@ -4033,6 +4045,7 @@ mod tests {
 
     #[test]
     fn prepare_sink_chunks_projects_partition_columns_before_auto_partition() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_id = 9905;
         let partition_id = 3005;
@@ -4083,6 +4096,7 @@ mod tests {
 
     #[test]
     fn set_finishing_retries_temporary_append_failure_without_duplicate_rowset() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_id = 9901;
         let partition_id = 3001;
@@ -4123,6 +4137,7 @@ mod tests {
 
     #[test]
     fn set_finishing_small_chunks_are_aggregated_before_append() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_id = 9920;
         let partition_id = 3020;
@@ -4159,6 +4174,7 @@ mod tests {
 
     #[test]
     fn set_finishing_multi_tablet_routing_keeps_tablet_boundaries() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_a_root_path = tmp.path().join("tablet_9910").to_string_lossy().to_string();
         let tablet_b_root_path = tmp.path().join("tablet_9911").to_string_lossy().to_string();
@@ -4201,6 +4217,7 @@ mod tests {
 
     #[test]
     fn finalize_shared_merges_runtime_write_targets_across_drivers() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let table_id = 7011;
         let schema = test_tablet_schema();
@@ -4322,6 +4339,7 @@ mod tests {
 
     #[test]
     fn set_finishing_non_primary_key_falls_back_when_alignment_fails() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_id = 9903;
         let partition_id = 3003;
@@ -4360,6 +4378,7 @@ mod tests {
 
     #[test]
     fn set_finishing_primary_key_mixed_op_chunk_writes_rowset_and_del_file() {
+        let _guard = lock_runtime_test_state();
         let tmp = tempdir().expect("create tempdir");
         let tablet_id = 9902;
         let partition_id = 3002;
@@ -4397,6 +4416,7 @@ mod tests {
 
     #[test]
     fn align_batch_keeps_duplicate_slot_bindings() {
+        let _guard = lock_runtime_test_state();
         let schema = Arc::new(Schema::new(vec![
             Field::new("idx", DataType::Int64, false),
             Field::new("v", DataType::Utf8, false),
@@ -4447,6 +4467,7 @@ mod tests {
 
     #[test]
     fn partition_scalar_value_normalizes_utf8_datetime_fraction() {
+        let _guard = lock_runtime_test_state();
         let values = StringArray::from(vec![
             "2024-08-30 19:02:13.44",
             "2024-08-30 19:02:13",
@@ -4474,6 +4495,7 @@ mod tests {
 
     #[test]
     fn partition_scalar_value_formats_timestamp_with_fixed_micros() {
+        let _guard = lock_runtime_test_state();
         let micros =
             chrono::NaiveDateTime::parse_from_str("2024-08-30 19:02:13.44", "%Y-%m-%d %H:%M:%S%.f")
                 .expect("parse datetime")
@@ -4488,6 +4510,7 @@ mod tests {
 
     #[test]
     fn partition_scalar_value_formats_bool_as_uppercase() {
+        let _guard = lock_runtime_test_state();
         let values = BooleanArray::from(vec![true, false]);
         assert_eq!(
             super::partition_scalar_value_to_string(&values, 0).expect("true bool partition"),
@@ -4501,6 +4524,7 @@ mod tests {
 
     #[test]
     fn collect_partition_values_prefers_column_name_when_slot_binding_mismatches() {
+        let _guard = lock_runtime_test_state();
         let schema = Arc::new(Schema::new(vec![
             Field::new("ts", DataType::Utf8, true),
             Field::new("original_ts", DataType::Utf8, true),
