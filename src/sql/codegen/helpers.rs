@@ -251,7 +251,7 @@ pub(crate) fn agg_call_display_name_from_parts(
     if matches!(name, "group_concat" | "string_agg") {
         return group_concat_display_name_from_parts(name, args, distinct, order_by);
     }
-    let distinct = distinct || matches!(name, "array_agg_distinct" | "array_unique_agg");
+    let distinct = distinct || matches!(name, "array_agg_distinct");
     let display_name = canonical_agg_display_name(name);
 
     let args_display = if args.is_empty() {
