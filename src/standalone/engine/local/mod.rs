@@ -2,3 +2,5 @@
 //! insert path, stream load, aggregate merge.
 //!
 //! Populated incrementally during the PR1 refactor.
+
+pub(crate) mod aggregate;
