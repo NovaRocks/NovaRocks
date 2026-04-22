@@ -6,3 +6,4 @@
 pub(crate) mod aggregate;
 pub(crate) mod insert;
 pub(crate) mod parquet;
+pub(crate) mod stream_load;
