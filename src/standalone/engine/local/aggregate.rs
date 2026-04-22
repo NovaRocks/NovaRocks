@@ -9,7 +9,9 @@ use arrow::record_batch::RecordBatch;
 
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
 use crate::standalone::catalog::{ColumnDef, normalize_identifier};
-use crate::standalone::engine::{LiteralKey, compare_literals, literal_from_batch, literal_to_key};
+use crate::standalone::engine::sqlparse::expr::{
+    LiteralKey, compare_literals, literal_from_batch, literal_to_key,
+};
 
 pub(crate) fn merge_aggregate_table_rows_if_needed(
     columns: &[ColumnDef],

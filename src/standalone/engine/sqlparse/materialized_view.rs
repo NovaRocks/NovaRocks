@@ -6,7 +6,8 @@
 //! statements to its own handlers.
 
 use crate::standalone::catalog::normalize_identifier;
-use crate::standalone::engine::{canonicalize_sql_for_match, strip_optional_identifier_quotes};
+
+use super::expr::{canonicalize_sql_for_match, strip_optional_identifier_quotes};
 
 pub(crate) fn materialized_view_key(
     current_database: &str,

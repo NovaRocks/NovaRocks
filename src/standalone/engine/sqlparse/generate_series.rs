@@ -9,10 +9,10 @@ use sqlparser::ast as sqlast;
 
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
 use crate::standalone::catalog::{ColumnDef, normalize_identifier};
-use crate::standalone::engine::{
-    cast_literal, eval_literal_arithmetic, reorder_insert_rows, sqlparser_expr_to_literal,
-};
+use crate::standalone::engine::reorder_insert_rows;
 use crate::standalone::iceberg::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
+
+use super::expr::{cast_literal, eval_literal_arithmetic, sqlparser_expr_to_literal};
 
 pub(crate) fn parse_generate_series_function_expr(
     expr: &sqlast::Expr,
