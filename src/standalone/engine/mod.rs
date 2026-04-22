@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use arrow::array::{Array, ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use futures::TryStreamExt;
 use tokio::runtime::Handle;
 
 use crate::exec::chunk::{Chunk, ChunkSchema};
@@ -21,11 +20,11 @@ use crate::sql::parser::ast::GenerateSeriesSelect;
 use crate::sql::parser::ast::{CreateTableKind, Expr, InsertSource, Literal, ObjectName};
 
 use self::local::{
-    ColumnDef, DEFAULT_DATABASE, InMemoryCatalog, TableDef, TableStorage, build_parquet_table,
+    DEFAULT_DATABASE, InMemoryCatalog, TableDef, TableStorage, build_parquet_table,
     normalize_identifier,
 };
 use super::iceberg::{
-    IcebergCatalogRegistry, IcebergLoadedTable, create_namespace as create_iceberg_namespace,
+    IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
     create_table as create_iceberg_table, drop_namespace as drop_iceberg_namespace,
     drop_table as drop_iceberg_table, insert_rows as insert_iceberg_rows,
     list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
@@ -40,18 +39,14 @@ use super::lake::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
 
+pub(crate) mod iceberg_glue;
 pub(crate) mod local;
 pub(crate) mod name_resolve;
 pub(crate) mod sqlparse;
 
-use self::name_resolve::{
-    ResolvedIcebergNamespaceName, ResolvedIcebergTableName, normalize_optional_identifier,
-    resolve_iceberg_namespace_name, resolve_iceberg_table_name,
-    resolve_iceberg_table_name_explicit,
-};
 pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_name};
+use self::name_resolve::{resolve_iceberg_namespace_name, resolve_iceberg_table_name};
 
-use self::local::aggregate::merge_aggregate_table_rows_if_needed;
 use self::local::insert::insert_into_local_table;
 pub(crate) use self::local::insert::{build_local_insert_batch, reorder_insert_rows};
 use self::local::parquet::{cast_batch_to_schema, read_local_parquet_data, write_parquet_to_path};
@@ -1766,141 +1761,6 @@ fn execute_insert_statement(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Iceberg helpers
-// ---------------------------------------------------------------------------
-
-fn load_full_iceberg_batch(loaded: &IcebergLoadedTable) -> Result<RecordBatch, String> {
-    let batches = block_on_standalone_async(async {
-        loaded
-            .table
-            .scan()
-            .build()
-            .map_err(|e| format!("build iceberg scan failed: {e}"))?
-            .to_arrow()
-            .await
-            .map_err(|e| format!("open iceberg arrow stream failed: {e}"))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| format!("read iceberg scan batches failed: {e}"))
-    })??;
-    let normalized_batches = batches
-        .into_iter()
-        .map(|batch| normalize_iceberg_source_batch(batch, &loaded.columns))
-        .collect::<Result<Vec<_>, _>>()?;
-    let combined = concat_or_empty_batches(&loaded.columns, normalized_batches)?;
-    apply_iceberg_table_semantics_if_needed(loaded, combined)
-}
-
-fn apply_iceberg_table_semantics_if_needed(
-    loaded: &IcebergLoadedTable,
-    batch: RecordBatch,
-) -> Result<RecordBatch, String> {
-    let Some(merged_rows) = merge_aggregate_table_rows_if_needed(
-        &loaded.columns,
-        loaded.key_desc.as_ref(),
-        &loaded.column_aggregations,
-        &batch,
-    )?
-    else {
-        return Ok(batch);
-    };
-    super::iceberg::build_insert_batch(loaded, &merged_rows)
-}
-
-fn normalize_iceberg_source_batch(
-    batch: RecordBatch,
-    columns: &[ColumnDef],
-) -> Result<RecordBatch, String> {
-    let field_indices = iceberg_field_indices(&batch)?;
-    let arrays = batch
-        .schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(idx, _)| batch.column(idx).clone())
-        .collect::<Vec<_>>();
-    let arrays = columns
-        .iter()
-        .map(|column| {
-            let normalized = normalize_identifier(&column.name)
-                .map_err(|e| format!("normalize source column `{}` failed: {e}", column.name))?;
-            let batch_idx = field_indices
-                .get(&normalized)
-                .copied()
-                .ok_or_else(|| format!("iceberg source batch missing column `{}`", column.name))?;
-            normalize_iceberg_array_type(&arrays[batch_idx], &column.name, &column.data_type)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>(),
-    ));
-    RecordBatch::try_new(schema, arrays)
-        .map_err(|e| format!("rebuild normalized iceberg source batch failed: {e}"))
-}
-
-fn iceberg_field_indices(batch: &RecordBatch) -> Result<HashMap<String, usize>, String> {
-    let mut indices = HashMap::with_capacity(batch.num_columns());
-    for (idx, field) in batch.schema().fields().iter().enumerate() {
-        let normalized = normalize_identifier(field.name()).map_err(|e| {
-            format!(
-                "normalize iceberg batch column name `{}` failed: {e}",
-                field.name()
-            )
-        })?;
-        if indices.insert(normalized.clone(), idx).is_some() {
-            return Err(format!(
-                "duplicate iceberg batch column `{}` after normalization",
-                field.name()
-            ));
-        }
-    }
-    Ok(indices)
-}
-
-fn normalize_iceberg_array_type(
-    array: &ArrayRef,
-    column_name: &str,
-    target_type: &DataType,
-) -> Result<ArrayRef, String> {
-    if array.data_type() == target_type {
-        return Ok(array.clone());
-    }
-    arrow::compute::cast(array, target_type).map_err(|e| {
-        format!(
-            "cast iceberg column `{column_name}` from {:?} to {:?} failed: {e}",
-            array.data_type(),
-            target_type
-        )
-    })
-}
-
-pub(crate) fn concat_or_empty_batches(
-    columns: &[ColumnDef],
-    batches: Vec<RecordBatch>,
-) -> Result<RecordBatch, String> {
-    if let Some(first) = batches.first() {
-        arrow::compute::concat_batches(&first.schema(), batches.iter())
-            .map_err(|e| format!("concat standalone batches failed: {e}"))
-    } else {
-        let schema = Arc::new(Schema::new(
-            columns
-                .iter()
-                .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-                .collect::<Vec<_>>(),
-        ));
-        let arrays = columns
-            .iter()
-            .map(|column| arrow::array::new_empty_array(&column.data_type))
-            .collect::<Vec<_>>();
-        RecordBatch::try_new(schema, arrays)
-            .map_err(|e| format!("build empty standalone batch failed: {e}"))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Metadata persistence
 // ---------------------------------------------------------------------------
 
@@ -2165,7 +2025,7 @@ fn delete_iceberg_catalog_if_needed(
 // Utility functions
 // ---------------------------------------------------------------------------
 
-fn block_on_standalone_async<F>(future: F) -> Result<F::Output, String>
+pub(crate) fn block_on_standalone_async<F>(future: F) -> Result<F::Output, String>
 where
     F: std::future::Future,
 {
