@@ -4,4 +4,5 @@
 //! Populated incrementally during the PR1 refactor.
 
 pub(crate) mod aggregate;
+pub(crate) mod insert;
 pub(crate) mod parquet;
