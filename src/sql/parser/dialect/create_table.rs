@@ -441,8 +441,10 @@ mod tests {
             PROPERTIES ("replication_num" = "1")
         "#;
 
+        let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)
+            .expect("normalize should succeed");
         let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
-            .try_with_sql(sql)
+            .try_with_sql(&normalized)
             .expect("build parser");
         let stmt = parse_create_table_statement(&mut parser);
         assert!(
