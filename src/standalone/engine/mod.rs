@@ -41,7 +41,15 @@ use super::lake::{
 };
 
 pub(crate) mod local;
+pub(crate) mod name_resolve;
 pub(crate) mod sqlparse;
+
+use self::name_resolve::{
+    ResolvedIcebergNamespaceName, ResolvedIcebergTableName, normalize_optional_identifier,
+    resolve_iceberg_namespace_name, resolve_iceberg_table_name,
+    resolve_iceberg_table_name_explicit,
+};
+pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_name};
 
 use self::local::aggregate::merge_aggregate_table_rows_if_needed;
 use self::local::insert::insert_into_local_table;
@@ -1890,123 +1898,6 @@ pub(crate) fn concat_or_empty_batches(
         RecordBatch::try_new(schema, arrays)
             .map_err(|e| format!("build empty standalone batch failed: {e}"))
     }
-}
-
-// ---------------------------------------------------------------------------
-// Table resolution helpers
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedLocalTableName {
-    pub(crate) database: String,
-    pub(crate) table: String,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedIcebergNamespaceName {
-    catalog: String,
-    namespace: String,
-}
-
-#[derive(Clone, Debug)]
-struct ResolvedIcebergTableName {
-    catalog: String,
-    namespace: String,
-    table: String,
-}
-
-fn resolve_local_table_name(
-    name: &ObjectName,
-    current_database: &str,
-) -> Result<ResolvedLocalTableName, String> {
-    match name.parts.as_slice() {
-        [table] => Ok(ResolvedLocalTableName {
-            database: normalize_identifier(current_database)?,
-            table: normalize_identifier(table)?,
-        }),
-        [database, table] => Ok(ResolvedLocalTableName {
-            database: normalize_identifier(database)?,
-            table: normalize_identifier(table)?,
-        }),
-        _ => Err(format!(
-            "local table name must be `<table>` or `<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-fn resolve_iceberg_namespace_name(
-    name: ObjectName,
-    current_catalog: Option<&str>,
-) -> Result<ResolvedIcebergNamespaceName, String> {
-    match (
-        normalize_optional_identifier(current_catalog)?,
-        name.parts.as_slice(),
-    ) {
-        (Some(catalog), [namespace]) => Ok(ResolvedIcebergNamespaceName {
-            catalog,
-            namespace: normalize_identifier(namespace)?,
-        }),
-        (_, [catalog, namespace]) => Ok(ResolvedIcebergNamespaceName {
-            catalog: normalize_identifier(catalog)?,
-            namespace: normalize_identifier(namespace)?,
-        }),
-        _ => Err(format!(
-            "iceberg database name must be `<database>` with current catalog or `<catalog>.<database>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-fn resolve_iceberg_table_name(
-    name: ObjectName,
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> Result<ResolvedIcebergTableName, String> {
-    match (
-        normalize_optional_identifier(current_catalog)?,
-        name.parts.as_slice(),
-    ) {
-        (Some(catalog), [table]) => Ok(ResolvedIcebergTableName {
-            catalog,
-            namespace: normalize_identifier(current_database)?,
-            table: normalize_identifier(table)?,
-        }),
-        (Some(catalog), [namespace, table]) => Ok(ResolvedIcebergTableName {
-            catalog,
-            namespace: normalize_identifier(namespace)?,
-            table: normalize_identifier(table)?,
-        }),
-        (_, [catalog, namespace, table]) => Ok(ResolvedIcebergTableName {
-            catalog: normalize_identifier(catalog)?,
-            namespace: normalize_identifier(namespace)?,
-            table: normalize_identifier(table)?,
-        }),
-        _ => Err(format!(
-            "iceberg table name must be `<table>`/`<database>.<table>` with current catalog or `<catalog>.<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        )),
-    }
-}
-
-fn resolve_iceberg_table_name_explicit(
-    name: &ObjectName,
-) -> Result<ResolvedIcebergTableName, String> {
-    let [catalog, namespace, table] = name.parts.as_slice() else {
-        return Err(format!(
-            "iceberg table name must be `<catalog>.<database>.<table>`, got `{}`",
-            name.parts.join(".")
-        ));
-    };
-    Ok(ResolvedIcebergTableName {
-        catalog: normalize_identifier(catalog)?,
-        namespace: normalize_identifier(namespace)?,
-        table: normalize_identifier(table)?,
-    })
-}
-
-fn normalize_optional_identifier(raw: Option<&str>) -> Result<Option<String>, String> {
-    raw.map(normalize_identifier).transpose()
 }
 
 // ---------------------------------------------------------------------------
