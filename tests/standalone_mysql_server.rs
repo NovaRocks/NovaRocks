@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -190,6 +190,92 @@ fn run_curl_stream_load(
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("decode curl stdout")
+}
+
+fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+    let stripped = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let authority = stripped.split('/').next().unwrap_or(stripped);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) => return false,
+        },
+        None => {
+            let default_port = if endpoint.starts_with("https://") {
+                443
+            } else {
+                80
+            };
+            (authority, default_port)
+        }
+    };
+    std::net::TcpStream::connect_timeout(
+        &format!("{host}:{port}")
+            .parse()
+            .expect("managed lake endpoint socket addr"),
+        Duration::from_secs(1),
+    )
+    .is_ok()
+}
+
+fn maybe_write_managed_lake_config(mysql_port: u16) -> Option<(TempDir, PathBuf)> {
+    let endpoint =
+        std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+    if !managed_lake_endpoint_reachable(&endpoint) {
+        eprintln!(
+            "skipping standalone managed-lake mysql test: object store endpoint is unreachable: {endpoint}"
+        );
+        return None;
+    }
+
+    let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
+        .or_else(|_| std::env::var("MINIO_ROOT_USER"))
+        .unwrap_or_else(|_| "admin".to_string());
+    let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+        .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
+        .unwrap_or_else(|_| "admin123".to_string());
+    let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+    let root_prefix =
+        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+    let run_id = format!(
+        "mysql_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let root_prefix = root_prefix.trim_matches('/');
+    let warehouse_uri = if root_prefix.is_empty() {
+        format!("s3://{bucket}/{run_id}")
+    } else {
+        format!("s3://{bucket}/{root_prefix}/{run_id}")
+    };
+
+    let config_dir = TempDir::new().expect("create managed lake config dir");
+    let config_path = config_dir.path().join("novarocks.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"[standalone_server]
+mysql_port = {mysql_port}
+user = "root"
+metadata_db_path = "meta/catalog.db"
+warehouse_uri = "{warehouse_uri}"
+
+[standalone_server.object_store]
+endpoint = "{endpoint}"
+access_key_id = "{access_key_id}"
+access_key_secret = "{access_key_secret}"
+enable_path_style_access = true
+"#
+        ),
+    )
+    .expect("write managed lake config");
+    Some((config_dir, config_path))
 }
 
 #[test]
@@ -694,4 +780,67 @@ user = "root"
 
     let rows: Vec<(i32, String)> = conn.query("select * from t2").expect("select loaded rows");
     assert_eq!(rows, vec![(1, "1234".to_string())]);
+}
+
+#[test]
+fn standalone_mysql_server_managed_lake_round_trip() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop("create database analytics")
+        .expect("create database");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+    )
+    .expect("create managed table");
+    conn.query_drop("insert into orders values (1, 'a'), (2, 'b')")
+        .expect("insert rows");
+
+    let rows: Vec<(Option<i32>, Option<String>)> = conn
+        .query("select k1, v1 from orders order by k1")
+        .expect("select inserted rows");
+    assert_eq!(
+        rows,
+        vec![
+            (Some(1), Some("a".to_string())),
+            (Some(2), Some("b".to_string()))
+        ]
+    );
+
+    conn.query_drop("truncate table orders")
+        .expect("truncate managed table");
+    let empty_rows: Vec<(Option<i32>, Option<String>)> = conn
+        .query("select k1, v1 from orders order by k1")
+        .expect("select after truncate");
+    assert!(empty_rows.is_empty(), "rows after truncate: {empty_rows:?}");
+
+    conn.query_drop("insert into orders values (3, 'c')")
+        .expect("insert after truncate");
+    let rows_after_reinsert: Vec<(Option<i32>, Option<String>)> = conn
+        .query("select k1, v1 from orders order by k1")
+        .expect("select after reinsert");
+    assert_eq!(rows_after_reinsert, vec![(Some(3), Some("c".to_string()))]);
+
+    conn.query_drop("drop table orders")
+        .expect("drop managed table");
+    let err = conn
+        .query::<(i32,), _>("select k1 from orders")
+        .expect_err("query after managed drop should fail");
+    assert!(
+        err.to_string()
+            .to_ascii_lowercase()
+            .contains("unknown table"),
+        "unexpected error after managed drop: {err}"
+    );
 }

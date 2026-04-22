@@ -16,12 +16,12 @@ use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
-use super::catalog::register_managed_table_in_catalog;
 use super::super::catalog::ColumnDef;
 use super::super::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     insert_generate_series_rows_local, reorder_insert_rows,
 };
+use super::catalog::register_managed_table_in_catalog;
 
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
 /// control plane, route rows across tablets, append native-format rowsets,

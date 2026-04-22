@@ -1040,6 +1040,174 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    pub(crate) fn list_runnable_erase_jobs(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<StoredManagedEraseJob>, String> {
+        let snapshot = self.load_snapshot()?;
+        Ok(snapshot
+            .managed
+            .erase_jobs
+            .into_iter()
+            .filter(|job| {
+                matches!(
+                    job.state,
+                    ManagedEraseJobState::Pending | ManagedEraseJobState::Failed
+                ) && job
+                    .retry_at_ms
+                    .is_none_or(|retry_at_ms| retry_at_ms <= now_ms)
+            })
+            .collect())
+    }
+
+    pub(crate) fn claim_erase_job(&self, job_id: i64) -> Result<bool, String> {
+        let changed = self
+            .connection()?
+            .execute(
+                "UPDATE erase_jobs
+                 SET state = 'RUNNING', updated_at_ms = strftime('%s','now') * 1000
+                 WHERE job_id = ?1 AND state IN ('PENDING', 'FAILED')",
+                params![job_id],
+            )
+            .map_err(|e| format!("claim erase job failed: {e}"))?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn finish_erase_job(&self, job_id: i64) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE erase_jobs
+                 SET state = 'FINISHED',
+                     updated_at_ms = strftime('%s','now') * 1000,
+                     retry_at_ms = NULL,
+                     last_error = NULL
+                 WHERE job_id = ?1",
+                params![job_id],
+            )
+            .map_err(|e| format!("finish erase job failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn fail_erase_job(
+        &self,
+        job_id: i64,
+        last_error: &str,
+        retry_at_ms: i64,
+    ) -> Result<(), String> {
+        self.connection()?
+            .execute(
+                "UPDATE erase_jobs
+                 SET state = 'FAILED',
+                     updated_at_ms = strftime('%s','now') * 1000,
+                     retry_at_ms = ?2,
+                     last_error = ?3
+                 WHERE job_id = ?1",
+                params![job_id, retry_at_ms, last_error],
+            )
+            .map_err(|e| format!("fail erase job failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn purge_retired_table_metadata(&self, table_id: i64) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin purge_retired_table_metadata transaction failed: {e}"))?;
+        let is_dropping: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tables WHERE table_id = ?1 AND state = 'DROPPING'
+                 )",
+                params![table_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load dropping table state failed: {e}"))?;
+        if !is_dropping {
+            return Err(format!(
+                "cannot purge managed table {table_id}: table is not in DROPPING state"
+            ));
+        }
+        tx.execute("DELETE FROM txns WHERE table_id = ?1", params![table_id])
+            .map_err(|e| format!("delete retired table txns failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM tablets
+             WHERE partition_id IN (
+                 SELECT partition_id FROM partitions WHERE table_id = ?1
+             )",
+            params![table_id],
+        )
+        .map_err(|e| format!("delete retired table tablets failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM table_columns
+             WHERE schema_id IN (
+                 SELECT schema_id FROM table_schemas WHERE table_id = ?1
+             )",
+            params![table_id],
+        )
+        .map_err(|e| format!("delete retired table columns failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM table_schemas WHERE table_id = ?1",
+            params![table_id],
+        )
+        .map_err(|e| format!("delete retired table schemas failed: {e}"))?;
+        tx.execute("DELETE FROM indexes WHERE table_id = ?1", params![table_id])
+            .map_err(|e| format!("delete retired table indexes failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM partitions WHERE table_id = ?1",
+            params![table_id],
+        )
+        .map_err(|e| format!("delete retired table partitions failed: {e}"))?;
+        tx.execute("DELETE FROM tables WHERE table_id = ?1", params![table_id])
+            .map_err(|e| format!("delete dropping table row failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit purge_retired_table_metadata failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn purge_retired_partition_metadata(&self, partition_id: i64) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            format!("begin purge_retired_partition_metadata transaction failed: {e}")
+        })?;
+        let is_retired: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM partitions WHERE partition_id = ?1 AND state = 'RETIRED'
+                 )",
+                params![partition_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load retired partition state failed: {e}"))?;
+        if !is_retired {
+            return Err(format!(
+                "cannot purge managed partition {partition_id}: partition is not in RETIRED state"
+            ));
+        }
+        tx.execute(
+            "DELETE FROM txns WHERE partition_id = ?1",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete retired partition txns failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM tablets WHERE partition_id = ?1",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete retired partition tablets failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM indexes WHERE partition_id = ?1",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete retired partition indexes failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM partitions WHERE partition_id = ?1",
+            params![partition_id],
+        )
+        .map_err(|e| format!("delete retired partition row failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit purge_retired_partition_metadata failed: {e}"))?;
+        Ok(())
+    }
+
     pub(crate) fn delete_creating_partition(&self, partition_id: i64) -> Result<(), String> {
         let conn = self.connection()?;
         let tx = conn
@@ -2016,5 +2184,279 @@ mod tests {
         assert!(snapshot.managed.erase_jobs.iter().any(|job| {
             job.job_kind == ManagedEraseJobKind::DropPartition && job.partition_id == Some(20)
         }));
+    }
+
+    #[test]
+    fn list_runnable_erase_jobs_filters_by_state_and_retry_deadline() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let mut snapshot = store.load_snapshot().expect("load snapshot").managed;
+        snapshot.erase_jobs = vec![
+            StoredManagedEraseJob {
+                job_id: 1,
+                job_kind: ManagedEraseJobKind::DropTable,
+                table_id: 10,
+                partition_id: None,
+                root_path: "s3://test/warehouse/db_1/table_10".to_string(),
+                state: ManagedEraseJobState::Pending,
+                retry_at_ms: None,
+                updated_at_ms: 0,
+                last_error: None,
+            },
+            StoredManagedEraseJob {
+                job_id: 2,
+                job_kind: ManagedEraseJobKind::DropPartition,
+                table_id: 10,
+                partition_id: Some(20),
+                root_path: "s3://test/warehouse/db_1/table_10/partition_20".to_string(),
+                state: ManagedEraseJobState::Failed,
+                retry_at_ms: Some(1_000),
+                updated_at_ms: 0,
+                last_error: Some("temporary".to_string()),
+            },
+            StoredManagedEraseJob {
+                job_id: 3,
+                job_kind: ManagedEraseJobKind::DropPartition,
+                table_id: 10,
+                partition_id: Some(21),
+                root_path: "s3://test/warehouse/db_1/table_10/partition_21".to_string(),
+                state: ManagedEraseJobState::Failed,
+                retry_at_ms: Some(5_000),
+                updated_at_ms: 0,
+                last_error: Some("wait".to_string()),
+            },
+            StoredManagedEraseJob {
+                job_id: 4,
+                job_kind: ManagedEraseJobKind::DropPartition,
+                table_id: 10,
+                partition_id: Some(22),
+                root_path: "s3://test/warehouse/db_1/table_10/partition_22".to_string(),
+                state: ManagedEraseJobState::Running,
+                retry_at_ms: None,
+                updated_at_ms: 0,
+                last_error: None,
+            },
+            StoredManagedEraseJob {
+                job_id: 5,
+                job_kind: ManagedEraseJobKind::DropPartition,
+                table_id: 10,
+                partition_id: Some(23),
+                root_path: "s3://test/warehouse/db_1/table_10/partition_23".to_string(),
+                state: ManagedEraseJobState::Finished,
+                retry_at_ms: None,
+                updated_at_ms: 0,
+                last_error: None,
+            },
+        ];
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+
+        let runnable = store
+            .list_runnable_erase_jobs(1_000)
+            .expect("list runnable jobs");
+        let job_ids = runnable.iter().map(|job| job.job_id).collect::<Vec<_>>();
+        assert_eq!(job_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn claim_finish_fail_erase_job_updates_state() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let mut snapshot = store.load_snapshot().expect("load snapshot").managed;
+        snapshot.erase_jobs = vec![StoredManagedEraseJob {
+            job_id: 1,
+            job_kind: ManagedEraseJobKind::DropTable,
+            table_id: 10,
+            partition_id: None,
+            root_path: "s3://test/warehouse/db_1/table_10".to_string(),
+            state: ManagedEraseJobState::Pending,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+            last_error: None,
+        }];
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+
+        assert!(store.claim_erase_job(1).expect("claim erase job"));
+        store
+            .fail_erase_job(1, "temporary", 4_000)
+            .expect("fail erase job");
+        assert!(
+            !store
+                .claim_erase_job(999)
+                .expect("claim missing erase job should be false")
+        );
+        assert!(
+            store
+                .claim_erase_job(1)
+                .expect("reclaim failed erase job should succeed")
+        );
+        store.finish_erase_job(1).expect("finish erase job");
+
+        let loaded = store.load_snapshot().expect("load snapshot");
+        assert_eq!(loaded.managed.erase_jobs.len(), 1);
+        let job = &loaded.managed.erase_jobs[0];
+        assert_eq!(job.state, ManagedEraseJobState::Finished);
+        assert!(job.retry_at_ms.is_none());
+        assert!(job.last_error.is_none());
+    }
+
+    #[test]
+    fn purge_retired_table_metadata_removes_table_owned_rows() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let mut snapshot = store.load_snapshot().expect("load snapshot").managed;
+        snapshot.tables[0].state = ManagedTableState::Dropping;
+        snapshot.schemas.push(StoredManagedSchema {
+            schema_id: 101,
+            table_id: 10,
+            schema_version: 1,
+            tablet_schema_pb: vec![1, 2, 3],
+        });
+        snapshot.columns.push(StoredManagedColumn {
+            schema_id: 101,
+            ordinal: 0,
+            column_name: "k1".to_string(),
+            logical_type: "INT".to_string(),
+            nullable: false,
+        });
+        snapshot.partitions[0].state = ManagedPartitionState::Retired;
+        snapshot.indexes.push(StoredManagedIndex {
+            index_id: 30,
+            table_id: 10,
+            partition_id: 20,
+            index_type: "BASE".to_string(),
+            state: ManagedIndexState::Retired,
+        });
+        snapshot.tablets.push(StoredManagedTablet {
+            tablet_id: 40,
+            partition_id: 20,
+            index_id: 30,
+            bucket_seq: 0,
+            tablet_root_path: "s3://test/warehouse/db_1/table_10/partition_20".to_string(),
+        });
+        snapshot.txns.push(StoredManagedTxn {
+            txn_id: 60,
+            table_id: 10,
+            partition_id: 20,
+            base_version: 1,
+            commit_version: 2,
+            state: ManagedTxnState::Visible,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+        });
+        snapshot.erase_jobs = vec![StoredManagedEraseJob {
+            job_id: 1,
+            job_kind: ManagedEraseJobKind::DropTable,
+            table_id: 10,
+            partition_id: None,
+            root_path: "s3://test/warehouse/db_1/table_10".to_string(),
+            state: ManagedEraseJobState::Running,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+            last_error: None,
+        }];
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+
+        store
+            .purge_retired_table_metadata(10)
+            .expect("purge retired table");
+
+        let loaded = store.load_snapshot().expect("load snapshot");
+        assert_eq!(loaded.managed.databases.len(), 1);
+        assert!(loaded.managed.tables.is_empty());
+        assert!(loaded.managed.schemas.is_empty());
+        assert!(loaded.managed.columns.is_empty());
+        assert!(loaded.managed.partitions.is_empty());
+        assert!(loaded.managed.indexes.is_empty());
+        assert!(loaded.managed.tablets.is_empty());
+        assert!(loaded.managed.txns.is_empty());
+        assert_eq!(loaded.managed.erase_jobs.len(), 1);
+    }
+
+    #[test]
+    fn purge_retired_partition_metadata_keeps_active_replacement_partition() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let mut snapshot = store.load_snapshot().expect("load snapshot").managed;
+        snapshot.partitions[0].state = ManagedPartitionState::Retired;
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: 21,
+            table_id: 10,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Active,
+        });
+        snapshot.indexes = vec![
+            StoredManagedIndex {
+                index_id: 30,
+                table_id: 10,
+                partition_id: 20,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Retired,
+            },
+            StoredManagedIndex {
+                index_id: 31,
+                table_id: 10,
+                partition_id: 21,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Active,
+            },
+        ];
+        snapshot.tablets = vec![
+            StoredManagedTablet {
+                tablet_id: 40,
+                partition_id: 20,
+                index_id: 30,
+                bucket_seq: 0,
+                tablet_root_path: "s3://test/warehouse/db_1/table_10/partition_20".to_string(),
+            },
+            StoredManagedTablet {
+                tablet_id: 41,
+                partition_id: 21,
+                index_id: 31,
+                bucket_seq: 0,
+                tablet_root_path: "s3://test/warehouse/db_1/table_10/partition_21".to_string(),
+            },
+        ];
+        snapshot.txns.push(StoredManagedTxn {
+            txn_id: 60,
+            table_id: 10,
+            partition_id: 20,
+            base_version: 1,
+            commit_version: 2,
+            state: ManagedTxnState::Visible,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+        });
+        snapshot.txns.push(StoredManagedTxn {
+            txn_id: 61,
+            table_id: 10,
+            partition_id: 21,
+            base_version: 0,
+            commit_version: 1,
+            state: ManagedTxnState::Visible,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+        });
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+
+        store
+            .purge_retired_partition_metadata(20)
+            .expect("purge retired partition");
+
+        let loaded = store.load_snapshot().expect("load snapshot");
+        assert_eq!(loaded.managed.tables.len(), 1);
+        assert_eq!(loaded.managed.partitions.len(), 1);
+        assert_eq!(loaded.managed.partitions[0].partition_id, 21);
+        assert_eq!(loaded.managed.indexes.len(), 1);
+        assert_eq!(loaded.managed.indexes[0].partition_id, 21);
+        assert_eq!(loaded.managed.tablets.len(), 1);
+        assert_eq!(loaded.managed.tablets[0].partition_id, 21);
+        assert_eq!(loaded.managed.txns.len(), 1);
+        assert_eq!(loaded.managed.txns[0].partition_id, 21);
     }
 }

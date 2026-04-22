@@ -40,10 +40,10 @@ use super::lake::ddl::{
     create_managed_table, drop_managed_table as drop_managed_lake_table,
     truncate_managed_table as truncate_managed_lake_table,
 };
+use super::lake::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 use super::lake::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
-use super::lake::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
 
 #[derive(Clone, Debug, Default)]
 pub struct StandaloneOptions {
@@ -234,6 +234,9 @@ impl StandaloneNovaRocks {
         });
         restore_metadata_if_needed(&inner)?;
         ensure_dual_table(&inner)?;
+        if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
+            super::lake::erase::spawn_erase_worker(Arc::clone(&inner));
+        }
         Ok(Self { inner })
     }
 
@@ -912,7 +915,8 @@ impl StandaloneSession {
             .expect("iceberg catalog read lock");
         let entry = guard.get(&catalog_name)?;
         drop(guard);
-        let count = super::iceberg::add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
+        let count =
+            super::iceberg::add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
         let msg = format!("Added {count} file(s)");
         build_string_query_result("status", vec![msg]).map(StatementResult::Query)
     }
@@ -5742,6 +5746,94 @@ mod tests {
         file
     }
 
+    fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+        let stripped = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(endpoint);
+        let authority = stripped.split('/').next().unwrap_or(stripped);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => match port.parse::<u16>() {
+                Ok(port) => (host, port),
+                Err(_) => return false,
+            },
+            None => {
+                let default_port = if endpoint.starts_with("https://") {
+                    443
+                } else {
+                    80
+                };
+                (authority, default_port)
+            }
+        };
+        std::net::TcpStream::connect_timeout(
+            &format!("{host}:{port}")
+                .parse()
+                .expect("managed lake endpoint socket addr"),
+            std::time::Duration::from_secs(1),
+        )
+        .is_ok()
+    }
+
+    fn maybe_managed_lake_config() -> Option<(TempDir, std::path::PathBuf, std::path::PathBuf)> {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        if !managed_lake_endpoint_reachable(&endpoint) {
+            eprintln!(
+                "skipping managed lake test: object store endpoint is unreachable: {endpoint}"
+            );
+            return None;
+        }
+
+        let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("MINIO_ROOT_USER"))
+            .unwrap_or_else(|_| "admin".to_string());
+        let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
+            .unwrap_or_else(|_| "admin123".to_string());
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let root_prefix =
+            std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        let run_id = format!(
+            "engine_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root_prefix = root_prefix.trim_matches('/');
+        let warehouse_uri = if root_prefix.is_empty() {
+            format!("s3://{bucket}/{run_id}")
+        } else {
+            format!("s3://{bucket}/{root_prefix}/{run_id}")
+        };
+
+        let dir = TempDir::new().expect("create managed lake config dir");
+        let metadata_dir = dir.path().join("meta");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        let metadata_db_path = metadata_dir.join("standalone.sqlite");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[standalone_server]
+user = "root"
+metadata_db_path = "meta/standalone.sqlite"
+warehouse_uri = "{warehouse_uri}"
+
+[standalone_server.object_store]
+endpoint = "{endpoint}"
+access_key_id = "{access_key_id}"
+access_key_secret = "{access_key_secret}"
+enable_path_style_access = true
+"#
+            ),
+        )
+        .expect("write managed lake config");
+        Some((dir, config_path, metadata_db_path))
+    }
+
     fn build_fragments_for_query(sql: &str) -> crate::sql::codegen::MultiFragmentBuildResult {
         use crate::sql::parser::dialect::{StarRocksDialect, normalize_for_raw_parse};
 
@@ -6801,5 +6893,277 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string array");
         assert_eq!(names.value(0), "b");
+    }
+
+    #[test]
+    fn embedded_session_reopen_cleans_incomplete_managed_truncate_stage_partition() {
+        use crate::standalone::lake::store::{
+            ManagedIndexState, ManagedPartitionState, SqliteMetadataStore, StoredManagedIndex,
+            StoredManagedPartition, StoredManagedTablet,
+        };
+
+        let Some((_dir, config_path, metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+
+        {
+            let engine = StandaloneNovaRocks::open(StandaloneOptions {
+                config_path: Some(config_path.clone()),
+                metadata_db_path: None,
+            })
+            .expect("open engine");
+            engine
+                .session()
+                .execute(
+                    "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+                )
+                .expect("create managed table");
+        }
+
+        let store = SqliteMetadataStore::open(&metadata_db_path).expect("open store");
+        let mut snapshot = store.load_snapshot().expect("load snapshot").managed;
+        let table = snapshot
+            .tables
+            .iter()
+            .find(|table| table.name == "orders")
+            .cloned()
+            .expect("orders table");
+        let creating_partition_id = snapshot.global.next_partition_id;
+        let creating_index_id = snapshot.global.next_index_id;
+        let creating_tablet_id = snapshot.global.next_tablet_id;
+        snapshot.global.next_partition_id += 1;
+        snapshot.global.next_index_id += 1;
+        snapshot.global.next_tablet_id += 1;
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: creating_partition_id,
+            table_id: table.table_id,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Creating,
+        });
+        snapshot.indexes.push(StoredManagedIndex {
+            index_id: creating_index_id,
+            table_id: table.table_id,
+            partition_id: creating_partition_id,
+            index_type: "BASE".to_string(),
+            state: ManagedIndexState::Creating,
+        });
+        snapshot.tablets.push(StoredManagedTablet {
+            tablet_id: creating_tablet_id,
+            partition_id: creating_partition_id,
+            index_id: creating_index_id,
+            bucket_seq: 0,
+            tablet_root_path: format!(
+                "{}/db_{}/table_{}/partition_{}",
+                snapshot.global.warehouse_uri, table.db_id, table.table_id, creating_partition_id
+            ),
+        });
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist staged snapshot");
+
+        let reopened = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("reopen engine");
+        let result = reopened
+            .session()
+            .query("select * from orders")
+            .expect("query reopened managed table");
+        assert_eq!(result.row_count(), 0);
+
+        let reloaded = store.load_snapshot().expect("reload snapshot").managed;
+        assert!(
+            !reloaded
+                .partitions
+                .iter()
+                .any(|partition| partition.state == ManagedPartitionState::Creating)
+        );
+        assert!(
+            !reloaded
+                .indexes
+                .iter()
+                .any(|index| index.state == ManagedIndexState::Creating)
+        );
+        assert!(
+            !reloaded
+                .tablets
+                .iter()
+                .any(|tablet| tablet.partition_id == creating_partition_id)
+        );
+    }
+
+    #[test]
+    fn embedded_session_reopen_keeps_truncated_managed_table_empty() {
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+
+        {
+            let engine = StandaloneNovaRocks::open(StandaloneOptions {
+                config_path: Some(config_path.clone()),
+                metadata_db_path: None,
+            })
+            .expect("open engine");
+            let session = engine.session();
+            session
+                .execute(
+                    "create table orders (k1 int, v1 string) duplicate key(k1) distributed by hash(k1) buckets 2",
+                )
+                .expect("create managed table");
+            session
+                .execute("insert into orders values (1, 'a'), (2, 'b')")
+                .expect("insert managed rows");
+            session
+                .execute("truncate table orders")
+                .expect("truncate table");
+        }
+
+        let reopened = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("reopen engine");
+        let result = reopened
+            .session()
+            .query("select * from orders")
+            .expect("query truncated managed table");
+        assert_eq!(result.row_count(), 0);
+    }
+
+    #[test]
+    fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
+        use crate::standalone::lake::store::{
+            ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
+            ManagedPartitionState, ManagedSnapshot, ManagedTableState, SqliteMetadataStore,
+            StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
+            StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+        };
+
+        let config_dir = TempDir::new().expect("create config dir");
+        let metadata_dir = config_dir.path().join("meta");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        let metadata_db_path = metadata_dir.join("standalone.sqlite");
+        let config_path = config_dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[standalone_server]
+user = "root"
+metadata_db_path = "meta/standalone.sqlite"
+warehouse_uri = "s3://test/warehouse"
+
+[standalone_server.object_store]
+endpoint = "http://127.0.0.1:1"
+access_key_id = "ak"
+access_key_secret = "sk"
+enable_path_style_access = true
+"#,
+        )
+        .expect("write config");
+
+        let store = SqliteMetadataStore::open(&metadata_db_path).expect("open store");
+        store
+            .replace_managed_snapshot(&ManagedSnapshot {
+                global: ManagedGlobalMeta {
+                    warehouse_uri: "s3://test/warehouse".to_string(),
+                    next_db_id: 2,
+                    next_table_id: 11,
+                    next_partition_id: 21,
+                    next_index_id: 31,
+                    next_tablet_id: 41,
+                    next_txn_id: 51,
+                },
+                databases: vec![StoredManagedDatabase {
+                    db_id: 1,
+                    name: "analytics".to_string(),
+                }],
+                tables: vec![StoredManagedTable {
+                    table_id: 10,
+                    db_id: 1,
+                    name: "orders".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 1,
+                    current_schema_id: 100,
+                    state: ManagedTableState::Dropping,
+                }],
+                schemas: vec![StoredManagedSchema {
+                    schema_id: 100,
+                    table_id: 10,
+                    schema_version: 0,
+                    tablet_schema_pb: vec![],
+                }],
+                columns: Vec::new(),
+                partitions: vec![StoredManagedPartition {
+                    partition_id: 20,
+                    table_id: 10,
+                    name: "p0".to_string(),
+                    visible_version: 1,
+                    next_version: 2,
+                    state: ManagedPartitionState::Retired,
+                }],
+                indexes: vec![StoredManagedIndex {
+                    index_id: 30,
+                    table_id: 10,
+                    partition_id: 20,
+                    index_type: "BASE".to_string(),
+                    state: ManagedIndexState::Retired,
+                }],
+                tablets: vec![StoredManagedTablet {
+                    tablet_id: 40,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 0,
+                    tablet_root_path: "s3://test/warehouse/db_1/table_10/partition_20".to_string(),
+                }],
+                txns: Vec::new(),
+                erase_jobs: vec![StoredManagedEraseJob {
+                    job_id: 1,
+                    job_kind: ManagedEraseJobKind::DropTable,
+                    table_id: 10,
+                    partition_id: None,
+                    root_path: "s3://test/warehouse".to_string(),
+                    state: ManagedEraseJobState::Pending,
+                    retry_at_ms: None,
+                    updated_at_ms: 0,
+                    last_error: None,
+                }],
+            })
+            .expect("persist snapshot");
+
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+
+        let started = std::time::Instant::now();
+        loop {
+            let snapshot = store.load_snapshot().expect("load snapshot");
+            let job = snapshot
+                .managed
+                .erase_jobs
+                .first()
+                .expect("erase job should exist");
+            if job.state == ManagedEraseJobState::Failed {
+                assert!(
+                    job.last_error
+                        .as_deref()
+                        .is_some_and(|msg| msg.contains("empty managed lake root")),
+                    "job should record root validation failure, got {:?}",
+                    job.last_error
+                );
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "erase worker did not mark pending job failed within timeout: state={:?}",
+                job.state
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        drop(engine);
     }
 }

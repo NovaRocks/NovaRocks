@@ -742,10 +742,8 @@ fn build_catalog_entry(
         || raw_warehouse.starts_with("oss://");
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(
-            properties,
-        )
-        .ok_or_else(|| {
+        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(properties)
+            .ok_or_else(|| {
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
         })?;

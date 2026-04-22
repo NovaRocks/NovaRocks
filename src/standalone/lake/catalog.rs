@@ -14,15 +14,15 @@ use crate::connector::starrocks::lake::context::{
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
+use super::super::catalog::{
+    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
+    normalize_identifier,
+};
 use super::config::ManagedLakeConfig;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
     SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
     StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
-};
-use super::super::catalog::{
-    ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
-    normalize_identifier,
 };
 
 #[derive(Clone, Debug, Default)]

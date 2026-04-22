@@ -836,7 +836,6 @@ fn classify_query_error(err: &str) -> ErrorKind {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,5 +895,4 @@ mod tests {
             None
         );
     }
-
 }
