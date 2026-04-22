@@ -17,13 +17,11 @@ use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::novarocks_config;
 use crate::plan_nodes::TFileFormatType;
 use crate::runtime::global_async_runtime::data_block_on;
-use crate::sql::parser::ast::{
-    ColumnAggregation, CreateTableKind, Expr, InsertSource, Literal, ObjectName, TableKeyDesc,
-};
-use crate::sql::parser::ast::{GenerateSeriesSelect, TableColumnDef};
+use crate::sql::parser::ast::GenerateSeriesSelect;
+use crate::sql::parser::ast::{CreateTableKind, Expr, InsertSource, Literal, ObjectName};
 
-use super::catalog::{
-    ColumnDef, DEFAULT_DATABASE, InMemoryCatalog, TableStorage, build_parquet_table,
+use self::local::{
+    ColumnDef, DEFAULT_DATABASE, InMemoryCatalog, TableDef, TableStorage, build_parquet_table,
     normalize_identifier,
 };
 use super::iceberg::{
@@ -50,9 +48,16 @@ use self::local::insert::insert_into_local_table;
 pub(crate) use self::local::insert::{build_local_insert_batch, reorder_insert_rows};
 use self::local::parquet::{cast_batch_to_schema, read_local_parquet_data, write_parquet_to_path};
 use self::local::stream_load::stream_load_local_table;
+use self::local::{
+    LocalTableSemantics, apply_local_table_semantics_if_needed, create_local_table_from_columns,
+    ensure_dual_in_database, ensure_dual_table, remove_local_database_semantics,
+    remove_local_table_semantics,
+};
+#[cfg(test)]
+use self::sqlparse::expr::sql_type_to_arrow_type;
 use self::sqlparse::expr::{
-    canonicalize_sql_for_match, parse_kv_properties, sql_type_to_arrow_type,
-    sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal,
+    canonicalize_sql_for_match, parse_kv_properties, sqlparser_expr_to_custom_expr,
+    sqlparser_expr_to_literal,
 };
 pub(crate) use self::sqlparse::generate_series::insert_generate_series_rows_local;
 use self::sqlparse::generate_series::{
@@ -227,12 +232,6 @@ fn acquire_standalone_test_guard() -> TestSerializationGuard {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     TestSerializationGuard { _guard: guard }
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct LocalTableSemantics {
-    pub(crate) key_desc: Option<TableKeyDesc>,
-    pub(crate) column_aggregations: HashMap<String, ColumnAggregation>,
 }
 
 #[derive(Clone, Debug)]
@@ -1183,7 +1182,7 @@ impl StandaloneSession {
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        let updated = super::catalog::TableDef {
+        let updated = TableDef {
             name: table_def.name.clone(),
             columns: table_def.columns.clone(),
             storage: TableStorage::LocalParquetFile { path },
@@ -1216,7 +1215,7 @@ impl StandaloneSession {
         &self,
         insert: &sqlparser::ast::Insert,
         resolved: &ResolvedLocalTableName,
-        table_def: &super::catalog::TableDef,
+        table_def: &TableDef,
     ) -> Result<StatementResult, String> {
         use sqlparser::ast as sqlast;
 
@@ -1279,7 +1278,7 @@ impl StandaloneSession {
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        let updated = super::catalog::TableDef {
+        let updated = TableDef {
             name: table_def.name.clone(),
             columns: table_def.columns.clone(),
             storage: TableStorage::LocalParquetFile { path },
@@ -1758,199 +1757,6 @@ fn execute_insert_statement(
 // Local parquet table helpers
 // ---------------------------------------------------------------------------
 
-/// Create a local parquet table from SQL column definitions.
-fn create_local_table_from_columns(
-    state: &Arc<StandaloneState>,
-    name: &ObjectName,
-    current_database: &str,
-    columns: &[TableColumnDef],
-    key_desc: Option<&TableKeyDesc>,
-) -> Result<StatementResult, String> {
-    let resolved = resolve_local_table_name(name, current_database)?;
-
-    // Convert SQL columns to Arrow fields
-    let arrow_fields: Vec<Field> = columns
-        .iter()
-        .map(|col| {
-            let dt = sql_type_to_arrow_type(&col.data_type)?;
-            Ok(Field::new(&col.name, dt, col.nullable))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let arrow_schema = Arc::new(Schema::new(arrow_fields.clone()));
-
-    // Build ColumnDefs for the catalog
-    let catalog_columns: Vec<ColumnDef> = arrow_fields
-        .iter()
-        .map(|f| ColumnDef {
-            name: f.name().clone(),
-            data_type: f.data_type().clone(),
-            nullable: f.is_nullable(),
-        })
-        .collect();
-
-    // Create a temporary directory for the table data
-    let data_dir = std::env::temp_dir().join("novarocks_local_tables");
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("create local table data directory failed: {e}"))?;
-    let table_file = data_dir.join(format!("{}_{}.parquet", resolved.database, resolved.table));
-
-    // Write an empty parquet file with the schema
-    let empty_arrays: Vec<ArrayRef> = arrow_fields
-        .iter()
-        .map(|f| arrow::array::new_empty_array(f.data_type()))
-        .collect();
-    let empty_batch = RecordBatch::try_new(Arc::clone(&arrow_schema), empty_arrays)
-        .map_err(|e| format!("build empty batch failed: {e}"))?;
-    write_parquet_to_path(&table_file, &empty_batch)?;
-
-    // Register in catalog
-    let table_def = super::catalog::TableDef {
-        name: normalize_identifier(name.leaf())?,
-        columns: catalog_columns,
-        storage: TableStorage::LocalParquetFile {
-            path: table_file.clone(),
-        },
-    };
-    let mut guard = state
-        .catalog
-        .write()
-        .expect("standalone catalog write lock");
-    guard.register(&resolved.database, table_def)?;
-    drop(guard);
-    update_local_table_semantics(
-        state,
-        &resolved.database,
-        &resolved.table,
-        columns,
-        key_desc,
-    )?;
-    persist_local_table_if_needed(state, &resolved.database, &resolved.table, &table_file)?;
-    Ok(StatementResult::Ok)
-}
-
-fn update_local_table_semantics(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
-    columns: &[TableColumnDef],
-    key_desc: Option<&TableKeyDesc>,
-) -> Result<(), String> {
-    let key = (
-        normalize_identifier(database_name)?,
-        normalize_identifier(table_name)?,
-    );
-    let column_aggregations = columns
-        .iter()
-        .filter_map(|column| {
-            column.aggregation.map(|aggregation| {
-                Ok::<_, String>((normalize_identifier(&column.name)?, aggregation))
-            })
-        })
-        .collect::<Result<HashMap<_, _>, _>>()?;
-    let semantics = LocalTableSemantics {
-        key_desc: key_desc.cloned(),
-        column_aggregations,
-    };
-    state
-        .local_table_semantics
-        .write()
-        .expect("standalone local table semantics write lock")
-        .insert(key, semantics);
-    Ok(())
-}
-
-fn get_local_table_semantics(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
-) -> Result<Option<LocalTableSemantics>, String> {
-    let key = (
-        normalize_identifier(database_name)?,
-        normalize_identifier(table_name)?,
-    );
-    Ok(state
-        .local_table_semantics
-        .read()
-        .expect("standalone local table semantics read lock")
-        .get(&key)
-        .cloned())
-}
-
-fn remove_local_table_semantics(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-    table_name: &str,
-) -> Result<(), String> {
-    let key = (
-        normalize_identifier(database_name)?,
-        normalize_identifier(table_name)?,
-    );
-    state
-        .local_table_semantics
-        .write()
-        .expect("standalone local table semantics write lock")
-        .remove(&key);
-    Ok(())
-}
-
-fn remove_local_database_semantics(
-    state: &Arc<StandaloneState>,
-    database_name: &str,
-) -> Result<(), String> {
-    let database_key = normalize_identifier(database_name)?;
-    state
-        .local_table_semantics
-        .write()
-        .expect("standalone local table semantics write lock")
-        .retain(|(db, _), _| db != &database_key);
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Dual table (virtual 1-row table for SELECT without FROM)
-// ---------------------------------------------------------------------------
-
-fn ensure_dual_table(state: &Arc<StandaloneState>) -> Result<(), String> {
-    ensure_dual_in_database(state, DEFAULT_DATABASE)
-}
-
-fn ensure_dual_in_database(state: &Arc<StandaloneState>, database: &str) -> Result<(), String> {
-    let guard = state.catalog.read().expect("standalone catalog read lock");
-    if guard.get(database, "__dual__").is_ok() {
-        return Ok(());
-    }
-    drop(guard);
-
-    // Create a 1-row parquet with a single dummy column
-    let dir = std::env::temp_dir().join("novarocks_dual");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create dual table dir failed: {e}"))?;
-    let path = dir.join(format!("dual_{}.parquet", database));
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
-        arrow::datatypes::Field::new("__dummy__", arrow::datatypes::DataType::Int8, true),
-    ]));
-    let col = std::sync::Arc::new(arrow::array::Int8Array::from(vec![Some(0i8)]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![col])
-        .map_err(|e| format!("build dual batch failed: {e}"))?;
-    write_parquet_to_path(&path, &batch)?;
-
-    let table = super::catalog::TableDef {
-        name: "__dual__".to_string(),
-        columns: vec![super::catalog::ColumnDef {
-            name: "__dummy__".to_string(),
-            data_type: arrow::datatypes::DataType::Int8,
-            nullable: true,
-        }],
-        storage: TableStorage::LocalParquetFile { path },
-    };
-    let mut guard = state
-        .catalog
-        .write()
-        .expect("standalone catalog write lock");
-    guard.register(database, table).ok(); // ignore if already exists
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Iceberg helpers
 // ---------------------------------------------------------------------------
@@ -1991,28 +1797,6 @@ fn apply_iceberg_table_semantics_if_needed(
         return Ok(batch);
     };
     super::iceberg::build_insert_batch(loaded, &merged_rows)
-}
-
-pub(crate) fn apply_local_table_semantics_if_needed(
-    state: &Arc<StandaloneState>,
-    resolved: &ResolvedLocalTableName,
-    columns: &[ColumnDef],
-    batch: RecordBatch,
-) -> Result<RecordBatch, String> {
-    let Some(semantics) = get_local_table_semantics(state, &resolved.database, &resolved.table)?
-    else {
-        return Ok(batch);
-    };
-    let Some(merged_rows) = merge_aggregate_table_rows_if_needed(
-        columns,
-        semantics.key_desc.as_ref(),
-        &semantics.column_aggregations,
-        &batch,
-    )?
-    else {
-        return Ok(batch);
-    };
-    build_local_insert_batch(columns, &merged_rows)
 }
 
 fn normalize_iceberg_source_batch(

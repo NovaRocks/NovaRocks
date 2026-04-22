@@ -7,8 +7,8 @@ use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
+use super::{ColumnDef, normalize_identifier};
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
-use crate::standalone::catalog::{ColumnDef, normalize_identifier};
 use crate::standalone::engine::sqlparse::expr::{
     LiteralKey, compare_literals, literal_from_batch, literal_to_key,
 };

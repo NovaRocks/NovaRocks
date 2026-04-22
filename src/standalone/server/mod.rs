@@ -23,7 +23,7 @@ use crate::novarocks_config::{
 use crate::version;
 
 use self::encoding::write_query_result;
-use super::catalog::{DEFAULT_DATABASE, normalize_identifier};
+use super::engine::local::{DEFAULT_DATABASE, normalize_identifier};
 use super::engine::{StandaloneNovaRocks, StandaloneOptions, StatementResult};
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;

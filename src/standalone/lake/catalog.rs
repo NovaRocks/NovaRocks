@@ -14,7 +14,7 @@ use crate::connector::starrocks::lake::context::{
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
-use super::super::catalog::{
+use super::super::engine::local::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     normalize_identifier,
 };
@@ -679,7 +679,7 @@ mod tests {
     use super::*;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::ColumnPb;
-    use crate::standalone::catalog::DEFAULT_DATABASE;
+    use crate::standalone::engine::local::DEFAULT_DATABASE;
 
     #[test]
     fn register_managed_tables_in_catalog_populates_logical_table_and_layout() {

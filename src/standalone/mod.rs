@@ -1,6 +1,5 @@
 use std::sync::OnceLock;
 
-pub(crate) mod catalog;
 mod engine;
 pub(crate) mod iceberg;
 pub(crate) mod lake;

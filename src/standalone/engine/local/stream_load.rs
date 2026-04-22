@@ -11,9 +11,9 @@ use std::sync::Arc;
 use csv::{ReaderBuilder, Terminator, Trim};
 use serde_json::Value;
 
+use super::{TableDef, normalize_identifier};
 use crate::plan_nodes::TFileFormatType;
 use crate::sql::parser::ast::{InsertSource, Literal};
-use crate::standalone::catalog::{TableDef, normalize_identifier};
 use crate::standalone::engine::{
     ResolvedLocalTableName, StandaloneState, StandaloneStreamLoadRequest,
     StandaloneStreamLoadResult,

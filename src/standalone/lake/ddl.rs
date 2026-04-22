@@ -8,7 +8,7 @@ use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
-use super::super::catalog::normalize_identifier;
+use super::super::engine::local::normalize_identifier;
 use super::super::engine::{StandaloneState, StatementResult};
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
 use super::config::ManagedLakeConfig;
@@ -821,8 +821,8 @@ mod tests {
 
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
-    use crate::standalone::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
     use crate::standalone::engine::StandaloneState;
+    use crate::standalone::engine::local::{DEFAULT_DATABASE, InMemoryCatalog};
     use crate::standalone::lake::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
         ManagedTableState, ManagedTxnState, SqliteMetadataStore, StoredManagedColumn,

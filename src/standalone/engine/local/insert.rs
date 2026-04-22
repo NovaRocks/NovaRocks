@@ -12,8 +12,8 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
+use super::{ColumnDef, TableDef, TableStorage, normalize_identifier};
 use crate::sql::parser::ast::{InsertSource, Literal};
-use crate::standalone::catalog::{ColumnDef, TableDef, TableStorage, normalize_identifier};
 use crate::standalone::engine::sqlparse::expr::{
     latin1_string_to_bytes, literal_to_i128_for_integer,
 };

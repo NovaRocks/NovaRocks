@@ -16,7 +16,7 @@ use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
-use super::super::catalog::ColumnDef;
+use super::super::engine::local::ColumnDef;
 use super::super::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     insert_generate_series_rows_local, reorder_insert_rows,
@@ -380,12 +380,12 @@ fn resolve_managed_name(
 ) -> Result<ResolvedLocalTableName, String> {
     match name.parts.as_slice() {
         [table] => Ok(ResolvedLocalTableName {
-            database: super::super::catalog::normalize_identifier(current_database)?,
-            table: super::super::catalog::normalize_identifier(table)?,
+            database: super::super::engine::local::normalize_identifier(current_database)?,
+            table: super::super::engine::local::normalize_identifier(table)?,
         }),
         [database, table] => Ok(ResolvedLocalTableName {
-            database: super::super::catalog::normalize_identifier(database)?,
-            table: super::super::catalog::normalize_identifier(table)?,
+            database: super::super::engine::local::normalize_identifier(database)?,
+            table: super::super::engine::local::normalize_identifier(table)?,
         }),
         _ => Err(format!(
             "managed table name must be `<table>` or `<database>.<table>`, got `{}`",
