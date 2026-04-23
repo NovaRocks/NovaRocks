@@ -893,6 +893,21 @@ mod tests {
         (dir, store)
     }
 
+    fn test_managed_config() -> ManagedLakeConfig {
+        ManagedLakeConfig {
+            warehouse_uri: "s3://test/warehouse".to_string(),
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                root: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+        }
+    }
+
     fn snapshot_seed() -> ManagedSnapshot {
         use crate::standalone::lake::store::{
             ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
@@ -1121,5 +1136,27 @@ mod tests {
         let persisted = store.load_snapshot().expect("load snapshot");
         assert_eq!(persisted.managed.txns[0].state, ManagedTxnState::Visible);
         assert_eq!(persisted.managed.partitions[0].visible_version, 2);
+    }
+
+    #[test]
+    fn rebuild_preserves_kind_column() {
+        let mut snapshot = snapshot_seed();
+        // snapshot_seed creates a kind='TABLE' row by default; spot-check.
+        let rebuilt = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot.clone())
+            .expect("rebuild");
+        let runtime = rebuilt
+            .table("analytics", "orders")
+            .expect("runtime")
+            .clone();
+        assert_eq!(runtime.table.kind, ManagedTableKind::Table);
+
+        snapshot.tables[0].kind = ManagedTableKind::MaterializedView;
+        let rebuilt_mv = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot)
+            .expect("rebuild mv");
+        let runtime_mv = rebuilt_mv
+            .table("analytics", "orders")
+            .expect("runtime")
+            .clone();
+        assert_eq!(runtime_mv.table.kind, ManagedTableKind::MaterializedView);
     }
 }
