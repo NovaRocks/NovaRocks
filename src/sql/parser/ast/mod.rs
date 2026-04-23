@@ -32,9 +32,6 @@ pub(crate) struct DropDatabaseStmt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CreateTableKind {
-    LocalParquet {
-        path: String,
-    },
     Iceberg {
         columns: Vec<TableColumnDef>,
         key_desc: Option<TableKeyDesc>,

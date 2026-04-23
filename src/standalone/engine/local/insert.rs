@@ -18,8 +18,7 @@ use crate::standalone::engine::sqlparse::expr::{
     latin1_string_to_bytes, literal_to_i128_for_integer,
 };
 use crate::standalone::engine::{
-    ResolvedLocalTableName, StandaloneState, apply_local_table_semantics_if_needed,
-    insert_generate_series_rows_local,
+    ResolvedLocalTableName, StandaloneState, insert_generate_series_rows_local,
 };
 
 use super::parquet::{
@@ -137,9 +136,6 @@ pub(crate) fn insert_into_local_table(
     } else {
         new_batch
     };
-    let combined =
-        apply_local_table_semantics_if_needed(state, resolved, &table_def.columns, combined)?;
-
     // Write back
     write_parquet_to_path(&path, &combined)?;
 

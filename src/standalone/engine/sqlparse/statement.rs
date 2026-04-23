@@ -12,28 +12,17 @@
 
 use std::sync::Arc;
 
-use arrow::array::ArrayRef;
-use arrow::record_batch::RecordBatch;
-
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
 };
-use crate::standalone::engine::local::{
-    TableStorage, build_parquet_table, create_local_table_from_columns, ensure_dual_in_database,
-    insert::{insert_into_local_table, reorder_insert_rows},
-    normalize_identifier,
-    parquet::write_parquet_to_path,
-    remove_local_database_semantics, remove_local_table_semantics,
-};
+use crate::standalone::engine::local::{insert::reorder_insert_rows, normalize_identifier};
 use crate::standalone::engine::name_resolve::{
     resolve_iceberg_namespace_name, resolve_iceberg_table_name, resolve_local_table_name,
 };
 use crate::standalone::engine::{
     StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
-    delete_local_database_if_needed, delete_local_table_if_needed,
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
-    persist_local_database_if_needed, persist_local_table_if_needed,
 };
 use crate::standalone::iceberg::{
     create_namespace as create_iceberg_namespace, create_table as create_iceberg_table,
@@ -46,7 +35,7 @@ use crate::standalone::lake::ddl::{
     truncate_managed_table as truncate_managed_lake_table,
 };
 
-use super::expr::{parse_kv_properties, sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
+use super::expr::{sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
 use super::generate_series::{insert_generate_series_rows, parse_generate_series_function_expr};
 
 /// Convert a sqlparser INSERT AST to our custom InsertStmt.
@@ -159,10 +148,7 @@ pub(crate) fn execute_create_database_statement(
             .write()
             .expect("standalone catalog write lock");
         guard.create_database(name.leaf())?;
-        let database_name = normalize_identifier(name.leaf())?;
         drop(guard);
-        persist_local_database_if_needed(state, &database_name)?;
-        ensure_dual_in_database(state, &database_name)?;
         return Ok(StatementResult::Ok);
     }
 
@@ -184,53 +170,30 @@ pub(crate) fn execute_create_table_statement(
     current_database: &str,
 ) -> Result<StatementResult, String> {
     match stmt.kind {
-        CreateTableKind::LocalParquet { path } => {
-            let resolved = resolve_local_table_name(&stmt.name, current_database)?;
-            let table = build_parquet_table(stmt.name.leaf(), &path)?;
-            let persisted_path = match &table.storage {
-                TableStorage::LocalParquetFile { path } => path.clone(),
-                TableStorage::S3ParquetFiles { .. } => {
-                    return Err("LocalParquet CREATE TABLE does not support S3".to_string());
-                }
-            };
-            let mut guard = state
-                .catalog
-                .write()
-                .expect("standalone catalog write lock");
-            guard.register(&resolved.database, table)?;
-            drop(guard);
-            persist_local_table_if_needed(
-                state,
-                &resolved.database,
-                &resolved.table,
-                &persisted_path,
-            )?;
-            Ok(StatementResult::Ok)
-        }
         CreateTableKind::Iceberg {
             columns,
             key_desc,
             bucket_count,
             properties,
         } => {
-            // When there is no iceberg catalog context, create a local parquet table
+            // Two-part (or one-part) names in the default catalog land on
+            // managed lake. The local parquet backend has been removed, so a
+            // missing managed-lake config is a hard error rather than a
+            // silent fallback.
             if current_catalog.is_none() && stmt.name.parts.len() <= 2 {
-                if state.managed_lake_config.is_some() {
-                    return create_managed_table(
-                        state.as_ref(),
-                        &stmt.name,
-                        current_database,
-                        &columns,
-                        key_desc.as_ref(),
-                        bucket_count,
+                if state.managed_lake_config.is_none() {
+                    return Err(
+                        "managed lake is not configured; set `warehouse_uri` to run CREATE TABLE"
+                            .to_string(),
                     );
                 }
-                return create_local_table_from_columns(
-                    state,
+                return create_managed_table(
+                    state.as_ref(),
                     &stmt.name,
                     current_database,
                     &columns,
                     key_desc.as_ref(),
+                    bucket_count,
                 );
             }
 
@@ -294,10 +257,7 @@ pub(crate) fn execute_drop_database_statement(
             .expect("standalone catalog write lock");
         match guard.drop_database(name.leaf()) {
             Ok(()) => {
-                let database_name = normalize_identifier(name.leaf())?;
                 drop(guard);
-                remove_local_database_semantics(state, &database_name)?;
-                delete_local_database_if_needed(state, &database_name)?;
                 return Ok(StatementResult::Ok);
             }
             Err(err) if if_exists && err.contains("unknown database") => {
@@ -360,23 +320,15 @@ pub(crate) fn execute_drop_table_statement(
         {
             return drop_managed_lake_table(state, &resolved.database, &resolved.table);
         }
-        match resolve_local_table_name(name, current_database) {
-            Ok(resolved) => {
-                let mut guard = state
-                    .catalog
-                    .write()
-                    .expect("standalone catalog write lock");
-                match guard.drop_table(&resolved.database, &resolved.table) {
-                    Ok(()) => {
-                        drop(guard);
-                        remove_local_table_semantics(state, &resolved.database, &resolved.table)?;
-                        delete_local_table_if_needed(state, &resolved.database, &resolved.table)?;
-                        Ok(StatementResult::Ok)
-                    }
-                    Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
-                    Err(err) => Err(err),
-                }
-            }
+        // Not a managed table: still allow dropping a logical entry from the
+        // in-memory catalog (used during iceberg materialization); otherwise
+        // honour IF EXISTS.
+        let mut guard = state
+            .catalog
+            .write()
+            .expect("standalone catalog write lock");
+        match guard.drop_table(&resolved.database, &resolved.table) {
+            Ok(()) => Ok(StatementResult::Ok),
             Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
             Err(err) => Err(err),
         }
@@ -421,32 +373,10 @@ pub(crate) fn execute_truncate_table_statement(
     {
         return truncate_managed_lake_table(state, &resolved.database, &resolved.table);
     }
-    let guard = state.catalog.read().expect("standalone catalog read lock");
-    let table_def = guard.get(&resolved.database, &resolved.table)?;
-    let path = match &table_def.storage {
-        TableStorage::LocalParquetFile { path } => path.clone(),
-        TableStorage::S3ParquetFiles { .. } => {
-            return Err("TRUNCATE TABLE is not supported for S3 tables".to_string());
-        }
-    };
-    let schema = Arc::new(arrow::datatypes::Schema::new(
-        table_def
-            .columns
-            .iter()
-            .map(|c| arrow::datatypes::Field::new(&c.name, c.data_type.clone(), c.nullable))
-            .collect::<Vec<_>>(),
-    ));
-    drop(guard);
-    // Write an empty parquet file with the schema to truncate the table
-    let empty_arrays: Vec<ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|f| arrow::array::new_empty_array(f.data_type()))
-        .collect();
-    let empty_batch = RecordBatch::try_new(schema, empty_arrays)
-        .map_err(|e| format!("build empty batch for truncate failed: {e}"))?;
-    write_parquet_to_path(&path, &empty_batch)?;
-    Ok(StatementResult::Ok)
+    Err(format!(
+        "TRUNCATE TABLE only supports managed-lake tables: {}.{}",
+        resolved.database, resolved.table
+    ))
 }
 
 pub(crate) fn execute_insert_statement(
@@ -457,7 +387,7 @@ pub(crate) fn execute_insert_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    // When there is no iceberg catalog context, try local table insert
+    // Two-part names in the default catalog route to managed lake.
     if current_catalog.is_none() && name.parts.len() <= 2 {
         if let Ok(resolved) = resolve_local_table_name(name, current_database) {
             if state
@@ -473,11 +403,6 @@ pub(crate) fn execute_insert_statement(
                     source,
                     current_database,
                 );
-            }
-            let guard = state.catalog.read().expect("standalone catalog read lock");
-            if let Ok(table_def) = guard.get(&resolved.database, &resolved.table) {
-                drop(guard);
-                return insert_into_local_table(state, &resolved, &table_def, columns, source);
             }
         }
     }
@@ -733,71 +658,6 @@ fn strip_catalog_in_factor(factor: &mut sqlparser::ast::TableFactor) {
         }
         _ => {}
     }
-}
-
-// ---------------------------------------------------------------------------
-// Local-parquet CREATE TABLE without column defs
-// ---------------------------------------------------------------------------
-
-/// Try to parse `CREATE TABLE <name> PROPERTIES("path"="...")` -- a
-/// local-parquet shorthand that omits column definitions (schema is inferred
-/// from the parquet file).  Returns `None` if the SQL does not match this
-/// pattern so the caller can fall through to the standard parser.
-pub(crate) fn try_parse_local_parquet_create_table(
-    sql: &str,
-) -> Result<Option<crate::sql::parser::ast::CreateTableStmt>, String> {
-    use crate::sql::parser::dialect::{StarRocksDialect, peek_word_eq};
-    use sqlparser::keywords::Keyword;
-    use sqlparser::tokenizer::Token;
-
-    let dialect = StarRocksDialect;
-    let mut parser = sqlparser::parser::Parser::new(&dialect)
-        .try_with_sql(sql)
-        .map_err(|e| format!("sql parser error: {e}"))?;
-
-    // Consume CREATE [EXTERNAL] [TEMPORARY] TABLE [IF NOT EXISTS]
-    if !parser.parse_keyword(Keyword::CREATE) {
-        return Ok(None);
-    }
-    let _ = parser.parse_keyword(Keyword::EXTERNAL);
-    let _ = parser.parse_keyword(Keyword::TEMPORARY);
-    if !parser.parse_keyword(Keyword::TABLE) {
-        return Ok(None);
-    }
-    let _ = parser.parse_keywords(&[Keyword::IF, Keyword::NOT, Keyword::EXISTS]);
-
-    // Parse table name
-    let raw_name = parser
-        .parse_object_name(false)
-        .map_err(|e| format!("parse table name: {e}"))?;
-    let name = crate::sql::parser::dialect::convert_object_name(raw_name)?;
-
-    // If next token is '(' this is a standard column-def CREATE TABLE, not ours.
-    if parser.peek_token_ref().token == Token::LParen {
-        return Ok(None);
-    }
-
-    // Expect PROPERTIES keyword
-    if !peek_word_eq(&parser, 0, "PROPERTIES") {
-        return Ok(None);
-    }
-    parser.next_token(); // consume PROPERTIES
-
-    // Parse key-value properties: ("k"="v", ...)
-    let props = parse_kv_properties(&mut parser)?;
-
-    let path = props
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("path"))
-        .map(|(_, v)| v.clone())
-        .ok_or_else(|| {
-            "CREATE TABLE ... PROPERTIES must include a \"path\" property".to_string()
-        })?;
-
-    Ok(Some(crate::sql::parser::ast::CreateTableStmt {
-        name,
-        kind: CreateTableKind::LocalParquet { path },
-    }))
 }
 
 // ---------------------------------------------------------------------------
