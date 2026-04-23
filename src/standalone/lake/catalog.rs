@@ -1002,22 +1002,8 @@ mod tests {
         snapshot.tables[0].state = ManagedTableState::Dropping;
         snapshot.partitions[0].state = ManagedPartitionState::Retired;
 
-        let rebuilt = ManagedLakeCatalog::rebuild(
-            Some(ManagedLakeConfig {
-                warehouse_uri: "s3://test/warehouse".to_string(),
-                s3: S3StoreConfig {
-                    endpoint: "http://127.0.0.1:9000".to_string(),
-                    bucket: "test".to_string(),
-                    root: "warehouse".to_string(),
-                    access_key_id: "ak".to_string(),
-                    access_key_secret: "sk".to_string(),
-                    region: Some("us-east-1".to_string()),
-                    enable_path_style_access: Some(true),
-                },
-            }),
-            snapshot,
-        )
-        .expect("rebuild");
+        let rebuilt = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot)
+            .expect("rebuild");
 
         assert!(
             !rebuilt
