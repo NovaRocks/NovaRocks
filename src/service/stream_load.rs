@@ -1127,7 +1127,7 @@ pub(crate) fn handle_stream_load(
             strip_outer_array: options.strip_outer_array,
             payload: body.clone(),
         };
-        match engine.stream_load_local_table(request) {
+        match engine.stream_load_managed_lake_table(request) {
             Ok(result) => {
                 stats.number_total_rows = result.loaded_rows;
                 stats.number_loaded_rows = result.loaded_rows;

@@ -41,7 +41,6 @@ pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_
 
 pub(crate) use self::local::insert::{build_local_insert_batch, reorder_insert_rows};
 use self::local::parquet::{cast_batch_to_schema, read_local_parquet_data, write_parquet_to_path};
-use self::local::stream_load::stream_load_local_table;
 use self::local::{LocalTableSemantics, ensure_dual_table};
 #[cfg(test)]
 use self::sqlparse::expr::sql_type_to_arrow_type;
@@ -59,6 +58,9 @@ use self::sqlparse::statement::{
     execute_truncate_table_statement, extract_table_names_from_query,
     extract_three_part_table_refs, looks_like_add_files, parse_add_files_sql,
     strip_catalog_from_three_part_names, try_parse_local_parquet_create_table,
+};
+use self::stream_load::{
+    parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -434,11 +436,11 @@ impl StandaloneNovaRocks {
         guard.get(&database_name, &table_name).is_ok()
     }
 
-    pub(crate) fn stream_load_local_table(
+    pub(crate) fn stream_load_managed_lake_table(
         &self,
         request: StandaloneStreamLoadRequest,
     ) -> Result<StandaloneStreamLoadResult, String> {
-        stream_load_local_table(&self.inner, request)
+        stream_load_managed_lake_table(&self.inner, request)
     }
 }
 
@@ -1990,6 +1992,79 @@ fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::Ex
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Managed-lake stream-load entrypoint
+// ---------------------------------------------------------------------------
+
+/// HTTP stream-load entrypoint for managed-lake tables. Parses CSV / JSON
+/// payloads via the neutral helpers in `engine::stream_load` and hands the
+/// resulting rows to `insert_into_managed_lake_table`, so every stream-load
+/// target goes through the same path as a plain `INSERT INTO ... VALUES`.
+fn stream_load_managed_lake_table(
+    state: &Arc<StandaloneState>,
+    request: StandaloneStreamLoadRequest,
+) -> Result<StandaloneStreamLoadResult, String> {
+    let database = normalize_identifier(&request.database)?;
+    let table = normalize_identifier(&request.table)?;
+    let is_managed = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock")
+        .contains_table(&database, &table)?;
+    if !is_managed {
+        return Err(format!(
+            "standalone stream load only supports managed-lake tables, got {}.{}",
+            database, table
+        ));
+    }
+
+    let table_def = {
+        let guard = state.catalog.read().expect("standalone catalog read lock");
+        guard.get(&database, &table)?
+    };
+    let insert_columns = parse_stream_load_columns(request.columns.as_deref(), &table_def)?;
+    let rows = match request.format_type {
+        TFileFormatType::FORMAT_JSON => parse_json_stream_load_rows(
+            &request.payload,
+            &insert_columns,
+            request.jsonpaths.as_deref(),
+            request.strip_outer_array.unwrap_or(false),
+        )?,
+        TFileFormatType::FORMAT_CSV_PLAIN => parse_csv_stream_load_rows(
+            &request.payload,
+            &insert_columns,
+            request.column_separator.as_deref(),
+            request.row_delimiter.as_deref(),
+            request.skip_header.unwrap_or(0),
+            request.trim_space.unwrap_or(false),
+            request.enclose,
+            request.escape,
+        )?,
+        other => {
+            return Err(format!(
+                "standalone stream load only supports CSV/JSON, got {:?}",
+                other
+            ));
+        }
+    };
+    let object_name = crate::sql::parser::ast::ObjectName {
+        parts: vec![database.clone(), table.clone()],
+    };
+    let loaded_rows = rows.len() as i64;
+    let loaded_bytes = request.payload.len() as i64;
+    super::lake::txn::insert_into_managed_lake_table(
+        state,
+        &object_name,
+        &insert_columns,
+        &crate::sql::parser::ast::InsertSource::Values(rows),
+        &database,
+    )?;
+    Ok(StandaloneStreamLoadResult {
+        loaded_rows,
+        loaded_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------
