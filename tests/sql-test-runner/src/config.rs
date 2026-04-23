@@ -35,6 +35,17 @@ pub fn strip_optional_quotes(raw: &str) -> String {
 }
 
 pub fn detect_default_config(base_dir: &Path) -> Option<PathBuf> {
+    // Prefer the managed-lake conf when present so every suite runs through
+    // the single remaining backend by default.
+    let managed_conf = base_dir
+        .join("tests")
+        .join("sql-test-runner")
+        .join("conf")
+        .join("standalone_managed_lake.conf");
+    if managed_conf.exists() {
+        return Some(managed_conf);
+    }
+
     let sr_conf = base_dir
         .join("tests")
         .join("sql-test-runner")

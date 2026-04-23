@@ -21,13 +21,14 @@ use crate::results::{
 use crate::runner::{error_message_matches, parse_selector_list, summarize_connection};
 use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
 use crate::types::*;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -193,6 +194,56 @@ fn query_order_sensitive(step: &SqlStep, default: bool) -> bool {
 
 fn query_float_epsilon(step: &SqlStep, default: Option<f64>) -> Option<f64> {
     step.meta.float_epsilon.or(default)
+}
+
+/// Best-effort TCP probe for a MinIO-style endpoint like `http://127.0.0.1:9000`.
+fn endpoint_reachable(endpoint: &str) -> bool {
+    let stripped = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let authority = stripped.split('/').next().unwrap_or(stripped);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) => return false,
+        },
+        None => {
+            let default_port = if endpoint.starts_with("https://") {
+                443
+            } else {
+                80
+            };
+            (authority, default_port)
+        }
+    };
+    let Ok(addr) = format!("{host}:{port}").parse() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+}
+
+/// When the runner config declares a managed-lake warehouse, fail fast if the
+/// object-store endpoint is not reachable. Without this probe, the first
+/// `CREATE TABLE` in a suite would timeout deep inside the standalone server.
+fn ensure_managed_lake_prereqs(runner_config: &RunnerConfig) -> Result<()> {
+    if !runner_config.values.contains_key("managed_lake_warehouse") {
+        return Ok(());
+    }
+    let endpoint = runner_config
+        .values
+        .get("oss_endpoint")
+        .cloned()
+        .unwrap_or_else(|| env_or_default("AWS_S3_ENDPOINT", "http://127.0.0.1:9000"));
+    if endpoint_reachable(&endpoint) {
+        return Ok(());
+    }
+    bail!(
+        "MinIO at {} is unreachable.\n\
+         hint: start it with:\n  \
+         mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &",
+        endpoint
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1469,7 @@ fn main() -> Result<()> {
     let base_dir = resolve_repo_root()?;
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let runner_config = load_runner_config(config_path.as_deref())?;
+    ensure_managed_lake_prereqs(&runner_config)?;
 
     let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
