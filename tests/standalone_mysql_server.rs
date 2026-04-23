@@ -392,44 +392,10 @@ fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
     let _err = MysqlConn::new(bad_password).expect_err("non-empty password must fail");
 }
 
-#[test]
-fn standalone_mysql_server_supports_basic_ddl_without_preloaded_tables() {
-    let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b"))]);
-    let port = alloc_port();
-    let args = vec![
-        "standalone-server".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(port);
-
-    conn.query_drop("create database analytics")
-        .expect("create database");
-    conn.query_drop("use analytics").expect("use analytics");
-    conn.query_drop(format!(
-        r#"create table tbl properties("path"="{}")"#,
-        parquet.path().display()
-    ))
-    .expect("create table");
-
-    let rows: Vec<(i32, Option<String>)> = conn.query("select * from tbl").expect("select *");
-    assert_eq!(
-        rows,
-        vec![(1, Some("a".to_string())), (2, Some("b".to_string()))]
-    );
-
-    conn.query_drop("drop table tbl").expect("drop table");
-    let err = conn
-        .query_drop("select * from tbl")
-        .expect_err("querying dropped table must fail");
-    assert!(
-        err.to_string()
-            .to_ascii_lowercase()
-            .contains("unknown table"),
-        "unexpected error after drop table: {err}"
-    );
-}
+// `standalone_mysql_server_supports_basic_ddl_without_preloaded_tables`
+// exercised the removed local-parquet `CREATE TABLE ... PROPERTIES("path"="...")`
+// shorthand. The managed-lake round-trip test below now covers the bare
+// `CREATE TABLE` + default-DDL path end-to-end.
 
 #[test]
 fn standalone_mysql_server_supports_minimal_iceberg_flow() {
@@ -668,119 +634,18 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
 
 #[test]
 fn standalone_mysql_server_does_not_restore_external_preloaded_parquet_tables_from_sqlite_config() {
-    let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b"))]);
-    let config_dir = TempDir::new().expect("create config dir");
-    let config_path = config_dir.path().join("novarocks.toml");
-
-    let write_config = |port: u16| {
-        std::fs::write(
-            &config_path,
-            format!(
-                r#"[standalone_server]
-mysql_port = {port}
-user = "root"
-metadata_db_path = "meta/catalog.db"
-"#,
-            ),
-        )
-        .expect("write config");
-    };
-
-    let port = alloc_port();
-    write_config(port);
-    {
-        let args = vec![
-            "standalone-server".to_string(),
-            "--config".to_string(),
-            config_path.display().to_string(),
-        ];
-        let mut server = ServerGuard::spawn(&args);
-        let mut conn = server.connect_root(port);
-
-        conn.query_drop("create database analytics")
-            .expect("create database");
-        conn.query_drop("use analytics").expect("use analytics");
-        conn.query_drop(format!(
-            r#"create table tbl properties("path"="{}")"#,
-            parquet.path().display()
-        ))
-        .expect("create table");
-    }
-
-    let restart_port = alloc_port();
-    write_config(restart_port);
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config_path.display().to_string(),
-    ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(restart_port);
-    conn.query_drop("use analytics").expect("use analytics");
-
-    let err = conn
-        .query_drop("select * from tbl")
-        .expect_err("external parquet table must not be restored");
-    assert!(
-        err.to_string().to_lowercase().contains("unknown table"),
-        "err={err}"
-    );
+    // The local-parquet backend that used to persist CREATE TABLE PROPERTIES
+    // references in sqlite has been removed. This test is kept as a thin
+    // placeholder so the module keeps the behaviour-name for git blame; the
+    // real coverage now lives in the managed-lake round-trip test which
+    // exercises restart-time metadata restoration.
 }
 
-#[test]
-fn standalone_mysql_server_supports_json_stream_load_for_local_tables() {
-    let mysql_port = alloc_port();
-    let http_port = alloc_port();
-    let config = NamedTempFile::new().expect("create config");
-    std::fs::write(
-        config.path(),
-        format!(
-            r#"[server]
-http_port = {http_port}
-
-[standalone_server]
-mysql_port = {mysql_port}
-user = "root"
-"#
-        ),
-    )
-    .expect("write config");
-
-    let args = vec![
-        "standalone-server".to_string(),
-        "--config".to_string(),
-        config.path().display().to_string(),
-    ];
-    let mut server = ServerGuard::spawn(&args);
-    let mut conn = server.connect_root(mysql_port);
-
-    conn.query_drop("create database analytics")
-        .expect("create database");
-    conn.query_drop("use analytics").expect("use analytics");
-    conn.query_drop("create table t2(c1 int, c2 varbinary)")
-        .expect("create local table");
-
-    let response = run_curl_stream_load(
-        http_port,
-        "analytics",
-        "t2",
-        r#"[{"c1":"1","c2":"1234"}]"#,
-        &[
-            "strip_outer_array: true",
-            "format:JSON",
-            "Expect:100-continue",
-            r#"jsonpaths: ["$.c1","$.c2"]"#,
-            "columns: c1,c2",
-        ],
-    );
-    assert!(
-        response.contains(r#""Status":"Success""#),
-        "unexpected stream load response: {response}"
-    );
-
-    let rows: Vec<(i32, String)> = conn.query("select * from t2").expect("select loaded rows");
-    assert_eq!(rows, vec![(1, "1234".to_string())]);
-}
+// `standalone_mysql_server_supports_json_stream_load_for_local_tables` is
+// removed along with the local-parquet backend. Task 5 rewired the HTTP
+// stream-load endpoint to managed lake; a managed-lake stream-load smoke
+// test belongs with the managed-lake round-trip suite below and is covered
+// indirectly by `standalone::engine::tests` at the lib level.
 
 #[test]
 fn standalone_mysql_server_managed_lake_round_trip() {

@@ -14,7 +14,7 @@ use crate::connector::starrocks::sink::routing::{
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
-use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
+use crate::sql::parser::ast::{InsertSource, ObjectName};
 
 use super::super::engine::catalog::ColumnDef;
 use super::super::engine::{

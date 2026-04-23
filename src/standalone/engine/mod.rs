@@ -18,8 +18,7 @@ use crate::plan_nodes::TFileFormatType;
 use crate::runtime::global_async_runtime::data_block_on;
 
 use self::catalog::{
-    DEFAULT_DATABASE, InMemoryCatalog, TableDef, TableStorage, build_parquet_table,
-    normalize_identifier,
+    DEFAULT_DATABASE, InMemoryCatalog, TableStorage, build_parquet_table, normalize_identifier,
 };
 use super::iceberg::{
     IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
@@ -40,13 +39,15 @@ pub(crate) mod parquet;
 pub(crate) mod sqlparse;
 pub(crate) mod stream_load;
 
-pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_name};
+pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
 use self::parquet::write_parquet_to_path;
+use self::sqlparse::expr::canonicalize_sql_for_match;
 #[cfg(test)]
 use self::sqlparse::expr::sql_type_to_arrow_type;
-use self::sqlparse::expr::{canonicalize_sql_for_match, sqlparser_expr_to_literal};
+#[cfg(test)]
+use self::sqlparse::expr::sqlparser_expr_to_literal;
 pub(crate) use self::sqlparse::generate_series::insert_generate_series_rows_local;
 use self::sqlparse::materialized_view::{
     looks_like_show_alter_materialized_view, materialized_view_key,
