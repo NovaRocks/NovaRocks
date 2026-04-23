@@ -13,10 +13,10 @@ use super::super::engine::{StandaloneState, StatementResult};
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
 use super::config::ManagedLakeConfig;
 use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
-    StageManagedTruncateRequest, StagedManagedTruncate, StoredManagedColumn, StoredManagedDatabase,
-    StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
-    StoredManagedTablet, StoredManagedTxn,
+    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
+    ManagedTxnState, StageManagedTruncateRequest, StagedManagedTruncate, StoredManagedColumn,
+    StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+    StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
 };
 
 /// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
@@ -150,6 +150,7 @@ pub(crate) fn create_managed_table(
         bucket_num: defaults.bucket_num,
         current_schema_id: schema_id,
         state: ManagedTableState::Active,
+        kind: ManagedTableKind::Table,
     });
     snapshot.schemas.push(StoredManagedSchema {
         schema_id,
@@ -1128,9 +1129,9 @@ mod tests {
     use crate::standalone::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
     use crate::standalone::lake::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
-        ManagedTableState, ManagedTxnState, SqliteMetadataStore, StoredManagedColumn,
-        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-        StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
+        ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
+        StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
+        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
     use crate::standalone::lake::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_table_in_catalog,
@@ -1207,6 +1208,7 @@ mod tests {
                 bucket_num: 1,
                 current_schema_id: 100,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -1263,6 +1265,7 @@ mod tests {
                 updated_at_ms: 0,
             }],
             erase_jobs: Vec::new(),
+            materialized_views: Vec::new(),
         }
     }
 

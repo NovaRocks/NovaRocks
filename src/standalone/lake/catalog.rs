@@ -20,9 +20,9 @@ use super::super::engine::catalog::{
 };
 use super::config::ManagedLakeConfig;
 use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
-    SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
-    StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
+    ManagedTxnState, SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex,
+    StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -708,6 +708,7 @@ mod tests {
                 bucket_num: 2,
                 current_schema_id: 30,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             },
             schema: StoredManagedSchema {
                 schema_id: 30,
@@ -918,6 +919,7 @@ mod tests {
                 bucket_num: 1,
                 current_schema_id: 100,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -938,6 +940,7 @@ mod tests {
             tablets: Vec::new(),
             txns: Vec::new(),
             erase_jobs: Vec::new(),
+            materialized_views: Vec::new(),
         }
     }
 

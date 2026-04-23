@@ -122,10 +122,10 @@ mod tests {
     use super::super::config::ManagedLakeConfig;
     use super::super::store::{
         ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
-        ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
-        SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
-        StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
-        StoredManagedTxn,
+        ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
+        ManagedTxnState, SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob,
+        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
+        StoredManagedTablet, StoredManagedTxn,
     };
     use super::run_erase_jobs_once_with;
 
@@ -180,6 +180,7 @@ mod tests {
                 bucket_num: 1,
                 current_schema_id: 100,
                 state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -271,6 +272,7 @@ mod tests {
                 updated_at_ms: 0,
                 last_error: None,
             }],
+            materialized_views: Vec::new(),
         };
         let (_dir, store) = test_store_with_snapshot(snapshot);
 
@@ -317,6 +319,7 @@ mod tests {
                 bucket_num: 1,
                 current_schema_id: 100,
                 state: ManagedTableState::Dropping,
+                kind: ManagedTableKind::Table,
             }],
             schemas: vec![StoredManagedSchema {
                 schema_id: 100,
@@ -368,6 +371,7 @@ mod tests {
                 updated_at_ms: 0,
                 last_error: None,
             }],
+            materialized_views: Vec::new(),
         };
         let (_dir, store) = test_store_with_snapshot(snapshot);
 

@@ -3092,8 +3092,8 @@ enable_path_style_access = true
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
         use crate::standalone::lake::store::{
             ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
-            ManagedPartitionState, ManagedSnapshot, ManagedTableState, SqliteMetadataStore,
-            StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
+            ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
+            SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
             StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
         };
 
@@ -3142,6 +3142,7 @@ enable_path_style_access = true
                     bucket_num: 1,
                     current_schema_id: 100,
                     state: ManagedTableState::Dropping,
+                    kind: ManagedTableKind::Table,
                 }],
                 schemas: vec![StoredManagedSchema {
                     schema_id: 100,
@@ -3184,6 +3185,7 @@ enable_path_style_access = true
                     updated_at_ms: 0,
                     last_error: None,
                 }],
+                materialized_views: Vec::new(),
             })
             .expect("persist snapshot");
 
