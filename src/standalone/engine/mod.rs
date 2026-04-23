@@ -35,6 +35,7 @@ pub(crate) mod iceberg_glue;
 pub(crate) mod local;
 pub(crate) mod name_resolve;
 pub(crate) mod sqlparse;
+pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_name};
 
