@@ -428,6 +428,17 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "percentile_hash" | "percentile_empty" => DataType::Binary,
         "percentile_approx_raw" => DataType::Float64,
         "__array_struct_subfield" => DataType::Null,
+        "__array_element_at" => match arg_types.first() {
+            Some(DataType::List(item)) => item.data_type().clone(),
+            _ => DataType::Null,
+        },
+        "__map_element_at" => match arg_types.first() {
+            Some(DataType::Map(entries, _)) => match entries.data_type() {
+                DataType::Struct(fields) if fields.len() == 2 => fields[1].data_type().clone(),
+                _ => DataType::Null,
+            },
+            _ => DataType::Null,
+        },
 
         // Default for unknown functions -> Utf8 (permissive)
         _ => DataType::Utf8,

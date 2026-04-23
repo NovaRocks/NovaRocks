@@ -63,6 +63,21 @@ impl ManagedLakeCatalog {
         Ok(self.tables_by_name.contains_key(&(db, table)))
     }
 
+    /// Return the original (already-normalized) table names of all managed
+    /// tables registered under `database_name`. Empty if the database has no
+    /// managed tables or does not exist.
+    pub(crate) fn list_tables_in_database(
+        &self,
+        database_name: &str,
+    ) -> Result<Vec<String>, String> {
+        let db = normalize_identifier(database_name)?;
+        Ok(self
+            .tables_by_name
+            .keys()
+            .filter_map(|(d, t)| (d == &db).then(|| t.clone()))
+            .collect())
+    }
+
     /// Bump the visible_version/next_version for `partition_id` in both the
     /// raw snapshot and the cached table runtime. Returns the table id that
     /// owns the partition so the caller can re-register the logical layout.

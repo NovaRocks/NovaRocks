@@ -1094,9 +1094,10 @@ pub(crate) fn lower_function_call(
                             }
                             let value_type = fields[1].data_type();
                             if value_type != &data_type {
-                                return Err(
-                                    "element_at return type must match map value type".to_string()
-                                );
+                                return Err(format!(
+                                    "element_at return type must match map value type: expected {:?}, got {:?}",
+                                    value_type, data_type
+                                ));
                             }
                         }
                         _ => return Err("element_at expects MAP as first argument".to_string()),

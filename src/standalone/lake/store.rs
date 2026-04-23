@@ -1344,12 +1344,28 @@ impl SqliteMetadataStore {
     }
 
     fn connection(&self) -> Result<Connection, String> {
-        Connection::open(&self.path).map_err(|e| {
+        let conn = Connection::open(&self.path).map_err(|e| {
             format!(
                 "open standalone metadata db {} failed: {e}",
                 self.path.display()
             )
-        })
+        })?;
+        // SQLite default busy_timeout = 0 returns SQLITE_BUSY immediately on
+        // any write contention. Under the sql-tests runner's concurrent
+        // execution this shows up as "database is locked" even though the
+        // file is in WAL mode. Wait up to 10 s for the writer lock before
+        // giving up, which is cheap when there's no contention and
+        // essentially always wins for the short metadata transactions here.
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(|e| format!("set busy_timeout on standalone metadata db failed: {e}"))?;
+        // journal_mode=WAL is a one-shot pragma on the database file itself
+        // (persisted after the first successful call in init_schema). Issue
+        // it again on fresh connections as a belt-and-braces guard so any
+        // connection opened before init runs — or against an older db
+        // created with a different journal mode — still gets WAL semantics.
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| format!("set journal_mode=WAL on standalone metadata db failed: {e}"))?;
+        Ok(conn)
     }
 
     fn init_schema(&self) -> Result<(), String> {

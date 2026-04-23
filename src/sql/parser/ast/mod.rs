@@ -59,6 +59,11 @@ pub(crate) enum InsertSource {
     Values(Vec<Vec<Literal>>),
     SelectLiteralRow(Vec<Literal>),
     GenerateSeriesSelect(GenerateSeriesSelect),
+    /// `a UNION ALL b` and chains thereof. Each sub-source is evaluated in
+    /// order and their rows are concatenated. UNION (distinct) is not
+    /// supported: INSERT-level deduplication would need table-side semantics
+    /// we don't want to replicate at the parser layer.
+    UnionAll(Vec<InsertSource>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

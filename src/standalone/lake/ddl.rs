@@ -75,12 +75,21 @@ pub(crate) fn create_managed_table(
     let mut snapshot = guard.snapshot.clone();
     initialize_global_meta_if_needed(&mut snapshot, &managed_config);
     let database = find_or_create_database(&mut snapshot, &resolved.database);
+    // DROP TABLE leaves the old row in the `tables` rel with state=DROPPING so
+    // an async erase worker can clean it up. The table is considered non-Active
+    // (so `contains_table()` returns false above), but the row still occupies
+    // `(db_id, name)`. Without removing it here the subsequent
+    // `replace_managed_snapshot` would hit the UNIQUE constraint when it
+    // re-inserts both the old and the new row. Reclaim the name synchronously
+    // by dropping the DROPPING entry and its per-schema/column rows, since we
+    // don't rely on the async erase worker in standalone mode.
+    reclaim_dropping_table_for_reuse(&mut snapshot, database.db_id, &resolved.table)?;
     let table_id = alloc_id(&mut snapshot.global.next_table_id);
     let schema_id = table_id;
     let partition_id = alloc_id(&mut snapshot.global.next_partition_id);
     let index_id = alloc_id(&mut snapshot.global.next_index_id);
 
-    let request_schema = build_tablet_schema(columns, &defaults.key_desc)?;
+    let request_schema = build_tablet_schema(columns, &defaults.key_desc, schema_id)?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
     for bucket_seq in 0..defaults.bucket_num {
@@ -349,6 +358,43 @@ pub(crate) fn drop_managed_table(
     Ok(StatementResult::Ok)
 }
 
+/// Remove the persisted `databases` entry for `database_name` after all of
+/// its tables have been cascaded through `drop_managed_table`. This frees
+/// the `db_id` so the next `CREATE DATABASE` allocates a fresh id, letting
+/// `CREATE TABLE` on the same name succeed without colliding with the old
+/// `(db_id, name)` UNIQUE rows left behind by tables still in the
+/// `DROPPING` state (the erase worker cleans those asynchronously).
+pub(crate) fn drop_managed_database_entry(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+) -> Result<(), String> {
+    let managed_config = state
+        .managed_lake_config
+        .clone()
+        .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
+    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
+        "managed standalone DROP DATABASE requires sqlite metadata store".to_string()
+    })?;
+
+    let normalized = normalize_identifier(database_name)?;
+    let mut guard = state
+        .managed_lake
+        .write()
+        .expect("standalone managed lake write lock");
+    let mut snapshot = guard.snapshot.clone();
+    let before = snapshot.databases.len();
+    snapshot
+        .databases
+        .retain(|db| normalize_identifier(&db.name).ok().as_deref() != Some(&normalized));
+    if snapshot.databases.len() == before {
+        return Ok(());
+    }
+    metadata_store.replace_managed_snapshot(&snapshot)?;
+    let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot)?;
+    *guard = rebuilt;
+    Ok(())
+}
+
 pub(crate) fn truncate_managed_table(
     state: &Arc<StandaloneState>,
     database_name: &str,
@@ -496,6 +542,65 @@ fn initialize_global_meta_if_needed(snapshot: &mut ManagedSnapshot, config: &Man
     }
 }
 
+/// If the snapshot has a `tables` row with `state=DROPPING` at
+/// `(db_id, name)`, drop it (and its associated schema / column / partition /
+/// index / tablet / erase_job / txn rows) so a subsequent ACTIVE insert doesn't
+/// trip the `UNIQUE(db_id, name)` constraint during snapshot replay.
+fn reclaim_dropping_table_for_reuse(
+    snapshot: &mut ManagedSnapshot,
+    db_id: i64,
+    table_name: &str,
+) -> Result<(), String> {
+    let target = normalize_identifier(table_name)?;
+    let stale_ids: Vec<i64> = snapshot
+        .tables
+        .iter()
+        .filter(|tbl| {
+            tbl.db_id == db_id
+                && tbl.state == ManagedTableState::Dropping
+                && normalize_identifier(&tbl.name).ok().as_deref() == Some(target.as_str())
+        })
+        .map(|tbl| tbl.table_id)
+        .collect();
+    if stale_ids.is_empty() {
+        return Ok(());
+    }
+    let stale_set: HashSet<i64> = stale_ids.iter().copied().collect();
+    snapshot.tables.retain(|tbl| !stale_set.contains(&tbl.table_id));
+    let stale_partition_ids: HashSet<i64> = snapshot
+        .partitions
+        .iter()
+        .filter(|p| stale_set.contains(&p.table_id))
+        .map(|p| p.partition_id)
+        .collect();
+    snapshot
+        .partitions
+        .retain(|p| !stale_set.contains(&p.table_id));
+    snapshot
+        .indexes
+        .retain(|i| !stale_set.contains(&i.table_id));
+    snapshot
+        .tablets
+        .retain(|t| !stale_partition_ids.contains(&t.partition_id));
+    snapshot.txns.retain(|t| !stale_set.contains(&t.table_id));
+    let stale_schema_ids: HashSet<i64> = snapshot
+        .schemas
+        .iter()
+        .filter(|s| stale_set.contains(&s.table_id))
+        .map(|s| s.schema_id)
+        .collect();
+    snapshot
+        .schemas
+        .retain(|s| !stale_set.contains(&s.table_id));
+    snapshot
+        .columns
+        .retain(|c| !stale_schema_ids.contains(&c.schema_id));
+    snapshot
+        .erase_jobs
+        .retain(|j| !stale_set.contains(&j.table_id));
+    Ok(())
+}
+
 fn find_or_create_database(
     snapshot: &mut ManagedSnapshot,
     database_name: &str,
@@ -604,6 +709,7 @@ fn request_schema_from_runtime(
             kind: parse_keys_type(&runtime.table.keys_type)?,
             columns: key_columns,
         },
+        runtime.table.current_schema_id,
     )
 }
 
@@ -646,6 +752,7 @@ fn build_create_tablet_request(
 fn build_tablet_schema(
     columns: &[TableColumnDef],
     key_desc: &TableKeyDesc,
+    schema_id: i64,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
     let key_columns = key_desc
         .columns
@@ -669,10 +776,38 @@ fn build_tablet_schema(
         if is_key {
             key_indices.push(idx as i32);
         }
+        let complex = is_complex_type(&column.data_type);
+        if complex && is_key {
+            return Err(format!(
+                "managed standalone CREATE TABLE key column `{normalized}` cannot be a complex type ({:?})",
+                column.data_type
+            ));
+        }
+        let (column_type, type_desc) = if complex {
+            (None, Some(sql_type_to_ttype_desc(&column.data_type)?))
+        } else {
+            (Some(sql_type_to_tcolumn_type(&column.data_type)?), None)
+        };
+        // StarRocks value-column aggregation semantics by keys_type:
+        //   DUP_KEYS     -> aggregation_type is unused (column is just stored)
+        //   UNIQUE_KEYS  -> value columns default to REPLACE
+        //   AGG_KEYS     -> value columns need an explicit per-column aggregation,
+        //                    which we do not parse yet; fail earlier in the caller.
+        let aggregation_type = if is_key {
+            None
+        } else {
+            match key_desc.kind {
+                TableKeyKind::Duplicate => None,
+                TableKeyKind::Unique | TableKeyKind::Primary => {
+                    Some(crate::types::TAggregationType::REPLACE)
+                }
+                TableKeyKind::Aggregate => None,
+            }
+        };
         thrift_columns.push(crate::descriptors::TColumn {
             column_name: normalized,
-            column_type: Some(sql_type_to_tcolumn_type(&column.data_type)?),
-            aggregation_type: None,
+            column_type,
+            aggregation_type,
             is_key: Some(is_key),
             is_allow_null: Some(column.nullable),
             default_value: None,
@@ -684,7 +819,7 @@ fn build_tablet_schema(
             has_bitmap_index: Some(false),
             agg_state_desc: None,
             index_len: index_length_for_sql_type(&column.data_type),
-            type_desc: None,
+            type_desc,
         });
     }
     if key_columns.is_empty() {
@@ -727,13 +862,20 @@ fn build_tablet_schema(
         bloom_filter_fpp: None,
         indexes: None,
         is_in_memory: Some(false),
-        id: Some(1),
+        id: Some(schema_id),
         sort_key_idxes: Some(key_indices.clone()),
         sort_key_unique_ids: Some(key_indices),
         schema_version: Some(0),
         compression_type: Some(crate::types::TCompressionType::LZ4_FRAME),
         compression_level: None,
     })
+}
+
+fn is_complex_type(data_type: &SqlType) -> bool {
+    matches!(
+        data_type,
+        SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_)
+    )
 }
 
 fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumnType, String> {
@@ -761,17 +903,16 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
             Some(i32::from(*precision)),
             Some(i32::from(*scale)),
         ),
-        SqlType::Array(_) => {
-            return Err("managed standalone CREATE TABLE does not support ARRAY yet".to_string());
-        }
-        SqlType::Binary => {
-            return Err("managed standalone CREATE TABLE does not support BINARY yet".to_string());
-        }
-        SqlType::Map(_, _) => {
-            return Err("managed standalone CREATE TABLE does not support MAP yet".to_string());
-        }
-        SqlType::Struct(_) => {
-            return Err("managed standalone CREATE TABLE does not support STRUCT yet".to_string());
+        SqlType::Binary => (
+            crate::types::TPrimitiveType::VARBINARY,
+            Some(65_533),
+            None,
+            None,
+        ),
+        SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) => {
+            return Err(format!(
+                "sql_type_to_tcolumn_type called on complex type {data_type:?}; callers must use sql_type_to_ttype_desc instead"
+            ));
         }
     };
     Ok(crate::types::TColumnType {
@@ -781,6 +922,80 @@ fn sql_type_to_tcolumn_type(data_type: &SqlType) -> Result<crate::types::TColumn
         precision,
         scale,
     })
+}
+
+/// Build a flat DFS list of `TTypeNode` that describes `data_type`.
+/// Handles nested ARRAY/MAP/STRUCT so they round-trip through the
+/// `create_tablet` protobuf path (`build_create_tablet_column_pb_from_type_desc`).
+fn sql_type_to_ttype_desc(data_type: &SqlType) -> Result<crate::types::TTypeDesc, String> {
+    let mut nodes = Vec::new();
+    append_sql_type_nodes(data_type, &mut nodes)?;
+    Ok(crate::types::TTypeDesc { types: Some(nodes) })
+}
+
+fn append_sql_type_nodes(
+    data_type: &SqlType,
+    nodes: &mut Vec<crate::types::TTypeNode>,
+) -> Result<(), String> {
+    match data_type {
+        SqlType::Array(element) => {
+            nodes.push(crate::types::TTypeNode {
+                type_: crate::types::TTypeNodeType::ARRAY,
+                scalar_type: None,
+                is_named: None,
+                struct_fields: None,
+            });
+            append_sql_type_nodes(element, nodes)
+        }
+        SqlType::Map(key, value) => {
+            nodes.push(crate::types::TTypeNode {
+                type_: crate::types::TTypeNodeType::MAP,
+                scalar_type: None,
+                is_named: None,
+                struct_fields: None,
+            });
+            append_sql_type_nodes(key, nodes)?;
+            append_sql_type_nodes(value, nodes)
+        }
+        SqlType::Struct(fields) => {
+            let struct_fields = fields
+                .iter()
+                .map(|(name, _)| {
+                    crate::types::TStructField::new(
+                        Some(name.clone()),
+                        None::<String>,
+                        None::<i32>,
+                        None::<String>,
+                    )
+                })
+                .collect();
+            nodes.push(crate::types::TTypeNode {
+                type_: crate::types::TTypeNodeType::STRUCT,
+                scalar_type: None,
+                is_named: None,
+                struct_fields: Some(struct_fields),
+            });
+            for (_, field_type) in fields {
+                append_sql_type_nodes(field_type, nodes)?;
+            }
+            Ok(())
+        }
+        _ => {
+            let scalar = sql_type_to_tcolumn_type(data_type)?;
+            nodes.push(crate::types::TTypeNode {
+                type_: crate::types::TTypeNodeType::SCALAR,
+                scalar_type: Some(crate::types::TScalarType {
+                    type_: scalar.type_,
+                    len: scalar.len,
+                    precision: scalar.precision,
+                    scale: scalar.scale,
+                }),
+                is_named: None,
+                struct_fields: None,
+            });
+            Ok(())
+        }
+    }
 }
 
 fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
@@ -961,6 +1176,7 @@ mod tests {
                 kind: TableKeyKind::Duplicate,
                 columns: vec!["k1".to_string()],
             },
+            100,
         )
         .expect("build request schema");
         let tablet_schema_pb =

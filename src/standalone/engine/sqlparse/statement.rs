@@ -32,32 +32,19 @@ use crate::standalone::iceberg::{
     namespace_exists as iceberg_namespace_exists,
 };
 use crate::standalone::lake::ddl::{
-    create_managed_table, drop_managed_table as drop_managed_lake_table,
+    create_managed_table, drop_managed_database_entry,
+    drop_managed_table as drop_managed_lake_table,
     truncate_managed_table as truncate_managed_lake_table,
 };
 
 use super::expr::{sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
 use super::generate_series::{insert_generate_series_rows, parse_generate_series_function_expr};
 
-/// Convert a sqlparser INSERT AST to our custom InsertStmt.
-/// Used for Iceberg tables which need the custom AST's InsertSource types.
-pub(crate) fn convert_sqlparser_insert_to_custom(
-    insert: &sqlparser::ast::Insert,
-) -> Result<crate::sql::parser::ast::InsertStmt, String> {
+fn convert_set_expr_to_insert_source(
+    body: &sqlparser::ast::SetExpr,
+) -> Result<InsertSource, String> {
     use sqlparser::ast as sqlast;
-
-    let table = match &insert.table {
-        sqlast::TableObject::TableName(name) => {
-            crate::sql::parser::dialect::convert_object_name(name.clone())?
-        }
-        other => return Err(format!("unsupported INSERT target: {other}")),
-    };
-    let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
-    let source_query = insert
-        .source
-        .as_ref()
-        .ok_or_else(|| "INSERT requires a source".to_string())?;
-    let source = match source_query.body.as_ref() {
+    match body {
         sqlast::SetExpr::Values(values) => {
             let mut rows = Vec::new();
             for row in &values.rows {
@@ -67,11 +54,10 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
                     .collect::<Result<_, _>>()?;
                 rows.push(literal_row);
             }
-            InsertSource::Values(rows)
+            Ok(InsertSource::Values(rows))
         }
         sqlast::SetExpr::Select(select) => {
             if select.from.is_empty() {
-                // Literal SELECT row (e.g., INSERT INTO t SELECT 1, 'a')
                 let row: Vec<Literal> = select
                     .projection
                     .iter()
@@ -80,9 +66,8 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
                         _ => Err("INSERT SELECT source only supports unnamed expressions".into()),
                     })
                     .collect::<Result<_, _>>()?;
-                InsertSource::SelectLiteralRow(row)
+                Ok(InsertSource::SelectLiteralRow(row))
             } else if select.from.len() == 1 {
-                // Possible TABLE(generate_series(...)) source
                 let table_with_joins = &select.from[0];
                 if table_with_joins.joins.is_empty() {
                     if let sqlparser::ast::TableFactor::TableFunction {
@@ -108,25 +93,94 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
                                 }
                             })
                             .collect::<Result<_, _>>()?;
-                        InsertSource::GenerateSeriesSelect(GenerateSeriesSelect {
+                        Ok(InsertSource::GenerateSeriesSelect(GenerateSeriesSelect {
                             column_name,
                             start,
                             end,
                             step,
                             projection,
-                        })
+                        }))
                     } else {
-                        return Err("unsupported INSERT SELECT source".into());
+                        Err("unsupported INSERT SELECT source".into())
                     }
                 } else {
-                    return Err("INSERT SELECT with joins is not supported in this path".into());
+                    Err("INSERT SELECT with joins is not supported in this path".into())
                 }
             } else {
-                return Err("INSERT SELECT with multiple tables is not supported".into());
+                Err("INSERT SELECT with multiple tables is not supported".into())
             }
         }
-        _ => return Err("unsupported INSERT source".into()),
+        sqlast::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            // Only UNION ALL is handled at this layer. UNION (distinct) would
+            // need output-level dedup with the target schema's types, which we
+            // don't have at parse time.
+            if !matches!(op, sqlast::SetOperator::Union) {
+                return Err("INSERT SELECT set operation is only UNION ALL here".into());
+            }
+            if !matches!(
+                set_quantifier,
+                sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName
+            ) {
+                return Err(
+                    "INSERT SELECT UNION requires UNION ALL (UNION/UNION DISTINCT unsupported)"
+                        .into(),
+                );
+            }
+            let mut parts = Vec::new();
+            flatten_union_all(left, &mut parts)?;
+            flatten_union_all(right, &mut parts)?;
+            Ok(InsertSource::UnionAll(parts))
+        }
+        sqlast::SetExpr::Query(query) => convert_set_expr_to_insert_source(query.body.as_ref()),
+        _ => Err("unsupported INSERT source".into()),
+    }
+}
+
+fn flatten_union_all(
+    body: &sqlparser::ast::SetExpr,
+    out: &mut Vec<InsertSource>,
+) -> Result<(), String> {
+    use sqlparser::ast as sqlast;
+    if let sqlast::SetExpr::SetOperation {
+        op: sqlast::SetOperator::Union,
+        set_quantifier: sqlast::SetQuantifier::All | sqlast::SetQuantifier::AllByName,
+        left,
+        right,
+    } = body
+    {
+        flatten_union_all(left, out)?;
+        flatten_union_all(right, out)?;
+        Ok(())
+    } else {
+        out.push(convert_set_expr_to_insert_source(body)?);
+        Ok(())
+    }
+}
+
+/// Convert a sqlparser INSERT AST to our custom InsertStmt.
+/// Used for Iceberg tables which need the custom AST's InsertSource types.
+pub(crate) fn convert_sqlparser_insert_to_custom(
+    insert: &sqlparser::ast::Insert,
+) -> Result<crate::sql::parser::ast::InsertStmt, String> {
+    use sqlparser::ast as sqlast;
+
+    let table = match &insert.table {
+        sqlast::TableObject::TableName(name) => {
+            crate::sql::parser::dialect::convert_object_name(name.clone())?
+        }
+        other => return Err(format!("unsupported INSERT target: {other}")),
     };
+    let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+    let source_query = insert
+        .source
+        .as_ref()
+        .ok_or_else(|| "INSERT requires a source".to_string())?;
+    let source = convert_set_expr_to_insert_source(source_query.body.as_ref())?;
     Ok(crate::sql::parser::ast::InsertStmt {
         table,
         columns,
@@ -252,11 +306,35 @@ pub(crate) fn execute_drop_database_statement(
     force: bool,
 ) -> Result<StatementResult, String> {
     if current_catalog.is_none() && name.parts.len() == 1 {
+        let db_name = name.leaf();
+        // With `FORCE`, cascade-drop every managed-lake table in this
+        // database before we tear down the in-memory catalog entry.
+        // Otherwise the managed catalog / sqlite / object store still hold
+        // those tables, and the next `CREATE DATABASE`+`CREATE TABLE`
+        // against the same name trips "table already exists".
+        if force {
+            let managed_tables = state
+                .managed_lake
+                .read()
+                .expect("standalone managed lake read lock")
+                .list_tables_in_database(db_name)
+                .unwrap_or_default();
+            for table_name in managed_tables {
+                drop_managed_lake_table(state, db_name, &table_name)?;
+            }
+            // Remove the persisted `databases` row too, so a follow-up
+            // `CREATE DATABASE <same>` gets a fresh `db_id` and the next
+            // `CREATE TABLE <same>` doesn't collide with the DROPPING
+            // tables the erase worker hasn't cleaned yet.
+            if state.managed_lake_config.is_some() {
+                drop_managed_database_entry(state, db_name)?;
+            }
+        }
         let mut guard = state
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        match guard.drop_database(name.leaf()) {
+        match guard.drop_database(db_name) {
             Ok(()) => {
                 drop(guard);
                 return Ok(StatementResult::Ok);
@@ -434,6 +512,20 @@ pub(crate) fn execute_insert_statement(
                 columns,
                 &loaded.columns,
             )?;
+        }
+        InsertSource::UnionAll(parts) => {
+            // Iceberg expects a single insert per call; split into independent
+            // inserts so each part writes its own append.
+            for part in parts {
+                execute_insert_statement(
+                    state,
+                    name,
+                    columns,
+                    part,
+                    current_catalog,
+                    current_database,
+                )?;
+            }
         }
     }
     Ok(StatementResult::Ok)

@@ -17,7 +17,9 @@
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, Int32Builder, LargeBinaryArray, LargeStringArray, StringArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Int8Array, Int16Array, Int32Array, Int32Builder,
+    Int64Array, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
 use std::sync::Arc;
@@ -85,11 +87,17 @@ pub fn eval_murmur_hash3_32(
                     }
                     seed = murmur_hash3_32(arr.value(row), seed);
                 }
-                other => {
-                    return Err(format!(
-                        "murmur_hash3_32 expects VARCHAR/VARBINARY input, got {:?}",
-                        other
-                    ));
+                // StarRocks coerces non-VARCHAR inputs to their textual form
+                // via `ColumnViewer<TYPE_VARCHAR>`; mirror that so callers like
+                // `murmur_hash3_32(ifnull(int_col, 0))` hash the value's decimal
+                // representation rather than failing.
+                _ => {
+                    if let Some(s) = try_stringify_scalar(input, row)? {
+                        seed = murmur_hash3_32(s.as_bytes(), seed);
+                    } else {
+                        has_null = true;
+                        break;
+                    }
                 }
             }
         }
@@ -101,6 +109,64 @@ pub fn eval_murmur_hash3_32(
     }
 
     Ok(Arc::new(builder.finish()) as ArrayRef)
+}
+
+/// Best-effort StarRocks-compatible `ColumnViewer<TYPE_VARCHAR>` on an arbitrary
+/// scalar input array. Returns `None` when the row is NULL. Returns an error
+/// for aggregate/nested types that StarRocks itself doesn't hash directly.
+fn try_stringify_scalar(input: &ArrayRef, row: usize) -> Result<Option<String>, String> {
+    if input.is_null(row) {
+        return Ok(None);
+    }
+    macro_rules! cast {
+        ($t:ty) => {{
+            let arr = input
+                .as_any()
+                .downcast_ref::<$t>()
+                .ok_or_else(|| format!("downcast {} failed", stringify!($t)))?;
+            Ok(Some(arr.value(row).to_string()))
+        }};
+    }
+    match input.data_type() {
+        DataType::Int8 => cast!(Int8Array),
+        DataType::Int16 => cast!(Int16Array),
+        DataType::Int32 => cast!(Int32Array),
+        DataType::Int64 => cast!(Int64Array),
+        DataType::UInt8 => cast!(UInt8Array),
+        DataType::UInt16 => cast!(UInt16Array),
+        DataType::UInt32 => cast!(UInt32Array),
+        DataType::UInt64 => cast!(UInt64Array),
+        DataType::Boolean => {
+            let arr = input
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| "downcast BooleanArray failed".to_string())?;
+            // StarRocks casts BOOLEAN → VARCHAR as "1"/"0".
+            Ok(Some(if arr.value(row) { "1" } else { "0" }.to_string()))
+        }
+        _ => {
+            // Fall back to arrow's cast-to-string formatter for everything else
+            // (Decimal, Float, Date, Timestamp, ...). StarRocks hashes these via
+            // the VARCHAR viewer, which produces the same lexical form.
+            use arrow::compute::kernels::cast::{CastOptions, cast_with_options};
+            use arrow::util::display::FormatOptions;
+            let opts = CastOptions {
+                safe: false,
+                format_options: FormatOptions::default(),
+            };
+            let casted = cast_with_options(input.as_ref(), &DataType::Utf8, &opts)
+                .map_err(|e| format!("cast to Utf8 failed for murmur_hash3_32: {e}"))?;
+            let arr = casted
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "cast result is not StringArray".to_string())?;
+            if arr.is_null(row) {
+                Ok(None)
+            } else {
+                Ok(Some(arr.value(row).to_string()))
+            }
+        }
+    }
 }
 
 fn murmur_hash3_32(data: &[u8], seed: u32) -> u32 {

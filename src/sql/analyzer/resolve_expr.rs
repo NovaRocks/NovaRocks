@@ -916,6 +916,28 @@ impl<'a> super::AnalyzerContext<'a> {
             "approx_count_distinct_hll_sketch" => "ds_hll_count_distinct".to_string(),
             other => other.to_string(),
         };
+        // Route explicit `element_at(container, key)` calls to the right typed
+        // subscript function. The subscript-syntax path already does this, but
+        // direct function-call syntax bypasses it.
+        let mut name = name;
+        if name == "element_at" {
+            // Analyze the first argument lazily to learn its type.
+            let first_arg_ty = match &func.args {
+                sqlast::FunctionArguments::List(list) => list.args.first().and_then(|arg| {
+                    if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) = arg {
+                        self.analyze_expr(e, scope).ok().map(|t| t.data_type)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+            match first_arg_ty {
+                Some(DataType::Map(_, _)) => name = "__map_element_at".to_string(),
+                Some(DataType::List(_)) => name = "__array_element_at".to_string(),
+                _ => {}
+            }
+        }
 
         // Check for DISTINCT
         let is_distinct = matches!(

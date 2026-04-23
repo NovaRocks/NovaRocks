@@ -26,6 +26,31 @@ use super::catalog::register_managed_table_in_catalog;
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
 /// control plane, route rows across tablets, append native-format rowsets,
 /// then publish_version and advance the visible partition version.
+/// Expand an `InsertSource` into a flat `Vec<Vec<Literal>>` ready to pass to
+/// `build_local_insert_batch`. Recursively unfolds UNION ALL chunks.
+fn materialize_insert_rows(
+    source: &InsertSource,
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+) -> Result<Vec<Vec<crate::sql::parser::ast::Literal>>, String> {
+    match source {
+        InsertSource::Values(rows) => reorder_insert_rows(rows, insert_columns, target_columns),
+        InsertSource::SelectLiteralRow(row) => {
+            reorder_insert_rows(std::slice::from_ref(row), insert_columns, target_columns)
+        }
+        InsertSource::GenerateSeriesSelect(gen_source) => {
+            insert_generate_series_rows_local(gen_source, insert_columns, target_columns)
+        }
+        InsertSource::UnionAll(parts) => {
+            let mut out = Vec::new();
+            for part in parts {
+                out.extend(materialize_insert_rows(part, insert_columns, target_columns)?);
+            }
+            Ok(out)
+        }
+    }
+}
+
 pub(crate) fn insert_into_managed_lake_table(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
@@ -36,15 +61,7 @@ pub(crate) fn insert_into_managed_lake_table(
     let resolved = resolve_managed_name(name, current_database)?;
     let plan = load_insert_plan(state, &resolved)?;
 
-    let rows = match source {
-        InsertSource::Values(rows) => reorder_insert_rows(rows, insert_columns, &plan.columns)?,
-        InsertSource::SelectLiteralRow(row) => {
-            reorder_insert_rows(std::slice::from_ref(row), insert_columns, &plan.columns)?
-        }
-        InsertSource::GenerateSeriesSelect(gen_source) => {
-            insert_generate_series_rows_local(gen_source, insert_columns, &plan.columns)?
-        }
-    };
+    let rows = materialize_insert_rows(source, insert_columns, &plan.columns)?;
     if rows.is_empty() {
         return Ok(StatementResult::Ok);
     }
@@ -60,18 +77,21 @@ pub(crate) fn insert_into_managed_lake_table(
         metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
 
     let write_outcome = write_routed_chunks(state, &plan, &chunk, prepared.txn_id);
-    if let Err(err) = write_outcome {
-        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
-            return Err(format!(
-                "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
-            ));
+    let written_tablet_ids = match write_outcome {
+        Ok(ids) => ids,
+        Err(err) => {
+            if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+                return Err(format!(
+                    "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
+                ));
+            }
+            return Err(err);
         }
-        return Err(err);
-    }
+    };
 
     metadata_store.mark_txn_written(prepared.txn_id)?;
 
-    publish_managed_txn(&plan, &prepared).map_err(|err| {
+    publish_managed_txn(&plan, &prepared, &written_tablet_ids).map_err(|err| {
         if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
             return format!(
                 "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
@@ -228,7 +248,7 @@ fn write_routed_chunks(
     plan: &ManagedInsertPlan,
     chunk: &Chunk,
     txn_id: i64,
-) -> Result<(), String> {
+) -> Result<Vec<i64>, String> {
     let tablet_ids = plan
         .tablets
         .iter()
@@ -255,6 +275,7 @@ fn write_routed_chunks(
         .ok_or_else(|| "standalone managed lake config is missing during insert".to_string())?
         .clone();
 
+    let mut written_tablet_ids = Vec::new();
     for (tablet_idx, row_indices) in routed.per_tablet.iter().enumerate() {
         if row_indices.is_empty() {
             continue;
@@ -283,8 +304,9 @@ fn write_routed_chunks(
             plan.partition_id,
             None,
         )?;
+        written_tablet_ids.push(tablet.tablet_id);
     }
-    Ok(())
+    Ok(written_tablet_ids)
 }
 
 fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> {
@@ -310,14 +332,42 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
 fn publish_managed_txn(
     plan: &ManagedInsertPlan,
     prepared: &super::store::PreparedManagedTxn,
+    written_tablet_ids: &[i64],
 ) -> Result<(), String> {
-    publish_tablets_at_version(
-        plan.tablets.iter().map(|tablet| tablet.tablet_id).collect(),
-        prepared.txn_id,
-        prepared.base_version,
-        prepared.commit_version,
-    )
+    // Publish all tablets that actually have a txn log at this version.
+    if !written_tablet_ids.is_empty() {
+        publish_tablets_at_version(
+            written_tablet_ids.to_vec(),
+            prepared.txn_id,
+            prepared.base_version,
+            prepared.commit_version,
+        )?;
+    }
+
+    // For tablets that received no rows, publish via the empty-txnlog path so
+    // their metadata still advances to the new version. This matches StarRocks
+    // BE's handling of bucket-hash inserts that only touch a subset of tablets.
+    let written: std::collections::HashSet<i64> = written_tablet_ids.iter().copied().collect();
+    let empty_tablet_ids: Vec<i64> = plan
+        .tablets
+        .iter()
+        .map(|tablet| tablet.tablet_id)
+        .filter(|tablet_id| !written.contains(tablet_id))
+        .collect();
+    if !empty_tablet_ids.is_empty() {
+        // StarRocks treats txn_id=-1 as the empty-txnlog sentinel; BE bumps the
+        // tablet's metadata to new_version without applying any rowset.
+        publish_tablets_at_version(
+            empty_tablet_ids,
+            EMPTY_TXNLOG_TXN_ID,
+            prepared.base_version,
+            prepared.commit_version,
+        )?;
+    }
+    Ok(())
 }
+
+const EMPTY_TXNLOG_TXN_ID: i64 = -1;
 
 /// Drive `publish_version` for a specific txn against the given tablet ids.
 /// Also used by restart recovery to finish a `WRITTEN` txn whose rowsets are
