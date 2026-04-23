@@ -162,6 +162,54 @@ fn flatten_union_all(
     }
 }
 
+/// Decide whether an INSERT's source Query should be executed via the full
+/// plan pipeline (returning `InsertSource::FromQuery`) instead of being
+/// collapsed into literal rows or a generate_series short-form.
+///
+/// We route via the full pipeline whenever the Query carries clauses the
+/// literal fast path can't represent (WITH/ORDER BY/LIMIT/FETCH/locks), or
+/// when the body is a SELECT that reads from at least one real relation
+/// (i.e. something other than `TABLE(generate_series(...))`).
+fn should_route_insert_via_from_query(query: &sqlparser::ast::Query) -> bool {
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+    {
+        return true;
+    }
+    body_reads_from_real_relation(query.body.as_ref())
+}
+
+fn body_reads_from_real_relation(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast as sqlast;
+    match body {
+        sqlast::SetExpr::Select(select) => {
+            if select.from.is_empty() {
+                return false;
+            }
+            for table_with_joins in &select.from {
+                if !table_with_joins.joins.is_empty() {
+                    return true;
+                }
+                match &table_with_joins.relation {
+                    sqlast::TableFactor::TableFunction { .. } => {
+                        // generate_series is handled by the literal fast path.
+                    }
+                    _ => return true,
+                }
+            }
+            false
+        }
+        sqlast::SetExpr::Query(inner) => should_route_insert_via_from_query(inner.as_ref()),
+        sqlast::SetExpr::SetOperation { left, right, .. } => {
+            body_reads_from_real_relation(left) || body_reads_from_real_relation(right)
+        }
+        _ => false,
+    }
+}
+
 /// Convert a sqlparser INSERT AST to our custom InsertStmt.
 /// Used for Iceberg tables which need the custom AST's InsertSource types.
 pub(crate) fn convert_sqlparser_insert_to_custom(
@@ -180,7 +228,17 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
         .source
         .as_ref()
         .ok_or_else(|| "INSERT requires a source".to_string())?;
-    let source = convert_set_expr_to_insert_source(source_query.body.as_ref())?;
+    // If the body is a SELECT that reads from a real relation (not a
+    // generate_series table function), or carries a WITH/ORDER BY/LIMIT that
+    // the literal fast-path can't express, hand the whole Query to the
+    // analyzer/planner/pipeline stack via `FromQuery`. This keeps the INSERT
+    // entry point aligned with how StarRocks wraps INSERT ... SELECT as a
+    // normal plan with a sink, rather than evaluating SELECT here.
+    let source = if should_route_insert_via_from_query(source_query) {
+        crate::sql::parser::ast::InsertSource::FromQuery(source_query.clone())
+    } else {
+        convert_set_expr_to_insert_source(source_query.body.as_ref())?
+    };
     Ok(crate::sql::parser::ast::InsertStmt {
         table,
         columns,
@@ -526,6 +584,12 @@ pub(crate) fn execute_insert_statement(
                     current_database,
                 )?;
             }
+        }
+        InsertSource::FromQuery(_) => {
+            // Plan-pipeline INSERT ... SELECT is only implemented for
+            // managed-lake tables today; iceberg writes still go through the
+            // literal/generate_series fast paths.
+            return Err("unsupported INSERT SELECT source for iceberg table".into());
         }
     }
     Ok(StatementResult::Ok)

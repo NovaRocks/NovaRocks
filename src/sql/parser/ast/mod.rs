@@ -64,6 +64,11 @@ pub(crate) enum InsertSource {
     /// supported: INSERT-level deduplication would need table-side semantics
     /// we don't want to replicate at the parser layer.
     UnionAll(Vec<InsertSource>),
+    /// A full SELECT query that cannot be collapsed into literal rows or a
+    /// generate_series short-form. Carrying the raw sqlparser AST lets us
+    /// hand the SELECT back to the normal analyzer/planner/pipeline stack at
+    /// execution time instead of evaluating it in the parser layer.
+    FromQuery(Box<sqlparser::ast::Query>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

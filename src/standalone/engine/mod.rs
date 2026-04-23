@@ -1424,7 +1424,7 @@ fn explain_query(
     build_string_query_result("Explain String", lines)
 }
 
-fn execute_query(
+pub(crate) fn execute_query(
     query: &sqlparser::ast::Query,
     catalog: &InMemoryCatalog,
     current_database: &str,

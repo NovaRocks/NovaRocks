@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::UInt32Array;
+use arrow::array::{ArrayRef, UInt32Array, new_null_array};
+use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
@@ -13,13 +15,14 @@ use crate::connector::starrocks::sink::routing::{
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
+use crate::runtime::query_result::QueryResult;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
 
-use super::super::engine::catalog::ColumnDef;
+use super::super::engine::catalog::{ColumnDef, normalize_identifier};
 use super::super::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
-    insert_generate_series_rows_local, reorder_insert_rows,
+    execute_query, insert_generate_series_rows_local, reorder_insert_rows,
 };
 use super::catalog::register_managed_table_in_catalog;
 
@@ -44,10 +47,20 @@ fn materialize_insert_rows(
         InsertSource::UnionAll(parts) => {
             let mut out = Vec::new();
             for part in parts {
-                out.extend(materialize_insert_rows(part, insert_columns, target_columns)?);
+                out.extend(materialize_insert_rows(
+                    part,
+                    insert_columns,
+                    target_columns,
+                )?);
             }
             Ok(out)
         }
+        // FromQuery is handled separately at the INSERT entry point: it
+        // drives the plan pipeline instead of producing literal rows here.
+        InsertSource::FromQuery(_) => Err(
+            "InsertSource::FromQuery must be dispatched via insert_from_query_into_managed_lake"
+                .to_string(),
+        ),
     }
 }
 
@@ -60,6 +73,15 @@ pub(crate) fn insert_into_managed_lake_table(
 ) -> Result<StatementResult, String> {
     let resolved = resolve_managed_name(name, current_database)?;
     let plan = load_insert_plan(state, &resolved)?;
+
+    // INSERT ... SELECT from a real relation cannot be reduced to literal
+    // rows in the parser. Dispatch it through the plan/pipeline executor to
+    // stay aligned with how StarRocks wraps INSERT-SELECT (a normal SELECT
+    // plan plus a table-writing sink), then hand the materialised result to
+    // the same txn/write/publish sequence used by VALUES INSERT.
+    if let InsertSource::FromQuery(query) = source {
+        return insert_from_query_into_managed_lake(state, &resolved, &plan, insert_columns, query);
+    }
 
     let rows = materialize_insert_rows(source, insert_columns, &plan.columns)?;
     if rows.is_empty() {
@@ -422,6 +444,232 @@ fn commit_catalog_visible_version(
         .expect("standalone catalog write lock");
     register_managed_table_in_catalog(&mut catalog, &runtime)?;
     Ok(())
+}
+
+/// Plan-pipeline path for `INSERT INTO <managed_lake_table> SELECT ...`.
+///
+/// Matches the StarRocks FE shape of INSERT-SELECT: the SELECT is analyzed,
+/// planned, optimised and executed through the normal query stack; the
+/// collected output is projected/cast to the target table's column layout
+/// and then handed to the managed-lake txn path that `VALUES` INSERT uses.
+///
+/// The output is materialised into a single Arrow batch before writing.
+/// That is fine for the current target workload (INSERT ... SELECT of up to
+/// a few hundred thousand rows) but is explicitly a single-node limitation
+/// — a true streaming `ManagedLakeSink` operator will be needed once the
+/// pipeline needs to run across multiple BEs.
+fn insert_from_query_into_managed_lake(
+    state: &Arc<StandaloneState>,
+    resolved: &ResolvedLocalTableName,
+    plan: &ManagedInsertPlan,
+    insert_columns: &[String],
+    query: &sqlparser::ast::Query,
+) -> Result<StatementResult, String> {
+    // Resolve SELECT against the target table's database so unqualified
+    // references in the SELECT pick up the right schema; matches the INSERT
+    // target namespace established by `resolve_managed_name`.
+    let query_result = {
+        let catalog = state.catalog.read().expect("standalone catalog read lock");
+        execute_query(
+            query,
+            &catalog,
+            &resolved.database,
+            state.exchange_port,
+            None,
+        )?
+    };
+
+    let aligned = align_query_result_to_target(&query_result, insert_columns, &plan.columns)?;
+    if aligned.num_rows() == 0 {
+        return Ok(StatementResult::Ok);
+    }
+    let chunk = build_chunk_for_insert(aligned, plan.columns.len())?;
+
+    let metadata_store = state
+        .metadata_store
+        .as_ref()
+        .ok_or_else(|| "managed lake insert requires sqlite metadata store".to_string())?;
+    let prepared =
+        metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
+
+    let write_outcome = write_routed_chunks(state, plan, &chunk, prepared.txn_id);
+    let written_tablet_ids = match write_outcome {
+        Ok(ids) => ids,
+        Err(err) => {
+            if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+                return Err(format!(
+                    "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
+                ));
+            }
+            return Err(err);
+        }
+    };
+
+    metadata_store.mark_txn_written(prepared.txn_id)?;
+
+    publish_managed_txn(plan, &prepared, &written_tablet_ids).map_err(|err| {
+        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+            return format!(
+                "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
+            );
+        }
+        format!("managed-lake publish failed: {err}")
+    })?;
+
+    metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
+
+    commit_catalog_visible_version(state, plan, prepared.commit_version)?;
+
+    Ok(StatementResult::Ok)
+}
+
+/// Project/cast the SELECT output into the target table's schema and
+/// concatenate all chunks into a single Arrow batch. Any target column that
+/// the INSERT doesn't mention is filled with NULLs; all other columns are
+/// placed in target order and cast to the target column's Arrow data type.
+fn align_query_result_to_target(
+    result: &QueryResult,
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+) -> Result<RecordBatch, String> {
+    let mapping =
+        build_target_column_mapping(insert_columns, target_columns, result.columns.len())?;
+
+    let target_schema = Arc::new(Schema::new(
+        target_columns
+            .iter()
+            .map(|c| {
+                Field::new(
+                    &c.name,
+                    crate::standalone::engine::parquet::normalize_map_entries_nullability(
+                        &c.data_type,
+                    ),
+                    c.nullable,
+                )
+            })
+            .collect::<Vec<_>>(),
+    ));
+
+    let column_count = target_columns.len();
+    let mut per_target_columns: Vec<Vec<ArrayRef>> = vec![Vec::new(); column_count];
+    let mut total_rows = 0_usize;
+    for chunk in &result.chunks {
+        let batch = &chunk.batch;
+        if batch.num_columns() < result.columns.len() {
+            return Err(format!(
+                "INSERT SELECT chunk has {} columns but query returns {}",
+                batch.num_columns(),
+                result.columns.len()
+            ));
+        }
+        let chunk_rows = batch.num_rows();
+        total_rows += chunk_rows;
+        for (target_idx, source_idx) in mapping.iter().enumerate() {
+            let target_column = &target_columns[target_idx];
+            let target_type = crate::standalone::engine::parquet::normalize_map_entries_nullability(
+                &target_column.data_type,
+            );
+            let array: ArrayRef = match source_idx {
+                Some(idx) => {
+                    let src = batch.column(*idx);
+                    if src.data_type() == &target_type {
+                        src.clone()
+                    } else {
+                        arrow::compute::cast(src.as_ref(), &target_type).map_err(|e| {
+                            format!(
+                                "INSERT SELECT cannot cast column `{}` from {:?} to {:?}: {}",
+                                target_column.name,
+                                src.data_type(),
+                                target_type,
+                                e
+                            )
+                        })?
+                    }
+                }
+                None => new_null_array(&target_type, chunk_rows),
+            };
+            per_target_columns[target_idx].push(array);
+        }
+    }
+
+    let mut final_columns: Vec<ArrayRef> = Vec::with_capacity(column_count);
+    for (target_idx, arrays) in per_target_columns.into_iter().enumerate() {
+        let target_column = &target_columns[target_idx];
+        let target_type = crate::standalone::engine::parquet::normalize_map_entries_nullability(
+            &target_column.data_type,
+        );
+        let merged: ArrayRef = if arrays.is_empty() {
+            new_null_array(&target_type, 0)
+        } else if arrays.len() == 1 {
+            arrays.into_iter().next().unwrap()
+        } else {
+            let refs: Vec<&dyn arrow::array::Array> = arrays.iter().map(|a| a.as_ref()).collect();
+            arrow::compute::concat(&refs).map_err(|e| {
+                format!(
+                    "INSERT SELECT failed to concat chunks for column `{}`: {e}",
+                    target_column.name
+                )
+            })?
+        };
+        final_columns.push(merged);
+    }
+
+    if total_rows == 0 {
+        return RecordBatch::try_new(target_schema, final_columns)
+            .map_err(|e| format!("build empty INSERT SELECT batch failed: {e}"));
+    }
+
+    RecordBatch::try_new(target_schema, final_columns)
+        .map_err(|e| format!("build INSERT SELECT batch failed: {e}"))
+}
+
+/// Produce a `target_index -> Option<source_index>` mapping. `insert_columns`
+/// is the user-declared INSERT column list (possibly empty for positional
+/// INSERT); `source_column_count` is the arity of the SELECT output.
+fn build_target_column_mapping(
+    insert_columns: &[String],
+    target_columns: &[ColumnDef],
+    source_column_count: usize,
+) -> Result<Vec<Option<usize>>, String> {
+    if insert_columns.is_empty() {
+        if source_column_count != target_columns.len() {
+            return Err(format!(
+                "INSERT SELECT column count mismatch: target has {} columns, SELECT produces {}",
+                target_columns.len(),
+                source_column_count
+            ));
+        }
+        return Ok((0..target_columns.len()).map(Some).collect());
+    }
+
+    if insert_columns.len() != source_column_count {
+        return Err(format!(
+            "INSERT SELECT column count mismatch: INSERT lists {} columns, SELECT produces {}",
+            insert_columns.len(),
+            source_column_count
+        ));
+    }
+
+    let mut insert_index_by_name: HashMap<String, usize> =
+        HashMap::with_capacity(insert_columns.len());
+    for (idx, column) in insert_columns.iter().enumerate() {
+        let key = normalize_identifier(column)?;
+        if insert_index_by_name.insert(key, idx).is_some() {
+            return Err(format!("duplicate INSERT column `{column}`"));
+        }
+    }
+
+    let mut mapping = Vec::with_capacity(target_columns.len());
+    for column in target_columns {
+        let key = normalize_identifier(&column.name)?;
+        mapping.push(insert_index_by_name.remove(&key));
+    }
+    if let Some((name, _)) = insert_index_by_name.into_iter().next() {
+        return Err(format!(
+            "unknown INSERT column `{name}` not found in target table"
+        ));
+    }
+    Ok(mapping)
 }
 
 fn resolve_managed_name(
