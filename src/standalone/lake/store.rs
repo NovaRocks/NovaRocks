@@ -1373,7 +1373,7 @@ impl SqliteMetadataStore {
         let current_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| format!("read standalone metadata schema version failed: {e}"))?;
-        if current_version != 0 && current_version != 3 {
+        if current_version != 0 && current_version != 4 {
             return Err(format!(
                 "unsupported standalone metadata schema version {current_version}; delete the metadata db and reopen"
             ));
@@ -1409,6 +1409,8 @@ impl SqliteMetadataStore {
                 bucket_num INTEGER NOT NULL,
                 current_schema_id INTEGER NOT NULL,
                 state TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'TABLE'
+                    CHECK (kind IN ('TABLE', 'MATERIALIZED_VIEW')),
                 UNIQUE(db_id, name)
             );
             CREATE TABLE IF NOT EXISTS table_schemas (
@@ -1468,6 +1470,17 @@ impl SqliteMetadataStore {
                 updated_at_ms INTEGER NOT NULL,
                 last_error TEXT
             );
+            CREATE TABLE IF NOT EXISTS materialized_views (
+                mv_id INTEGER PRIMARY KEY REFERENCES tables(table_id),
+                select_sql TEXT NOT NULL,
+                refresh_mode TEXT NOT NULL DEFAULT 'DEFERRED_MANUAL'
+                    CHECK (refresh_mode IN ('DEFERRED_MANUAL')),
+                base_table_refs_json TEXT NOT NULL,
+                last_refresh_ms INTEGER,
+                last_refresh_rows INTEGER,
+                last_refresh_snapshots_json TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS iceberg_catalogs (
                 name TEXT PRIMARY KEY,
                 properties_json TEXT NOT NULL
@@ -1483,7 +1496,7 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
@@ -2474,5 +2487,74 @@ mod tests {
         assert_eq!(loaded.managed.tablets[0].partition_id, 21);
         assert_eq!(loaded.managed.txns.len(), 1);
         assert_eq!(loaded.managed.txns[0].partition_id, 21);
+    }
+
+    #[test]
+    fn init_schema_v4_creates_tables_with_kind_and_materialized_views_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
+            .expect("open fresh store");
+        let conn = store.connection().expect("connection");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 4);
+
+        // `tables` must have the new `kind` column with the expected default and check.
+        let kind_col_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tables') WHERE name = 'kind'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma_table_info tables");
+        assert_eq!(kind_col_exists, 1);
+
+        // `materialized_views` must exist with mv_id primary key and the declared columns.
+        let mv_cols: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info('materialized_views') ORDER BY cid")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect");
+            rows
+        };
+        let names: Vec<&str> = mv_cols.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "mv_id",
+                "select_sql",
+                "refresh_mode",
+                "base_table_refs_json",
+                "last_refresh_ms",
+                "last_refresh_rows",
+                "last_refresh_snapshots_json",
+                "created_at_ms",
+            ],
+        );
+    }
+
+    #[test]
+    fn init_schema_rejects_pre_v4_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch("PRAGMA user_version = 3;")
+                .expect("set old version");
+        }
+        let err = SqliteMetadataStore::open(&path).expect_err("open on v3 must fail");
+        assert!(err.contains("schema version 3"), "err={err}");
     }
 }
