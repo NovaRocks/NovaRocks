@@ -217,8 +217,128 @@ pub(crate) fn parse_create_database_name(parser: &mut Parser<'_>) -> Result<Obje
 /// StarRocks-specific syntax compatible with the sqlparser crate.
 pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_set_user_variables(sql)?;
+    let sql = rewrite_from_dual(&sql)?;
     let sql = normalize_function_syntax(&sql)?;
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+/// Strip a bare `FROM dual` so the managed-lake path doesn't need a real
+/// `dual` table. Only rewrites when the `FROM dual` appears at top-level
+/// with nothing meaningful after it (end of string, `;`, or a comment).
+/// Anything else (WHERE/GROUP/HAVING/LIMIT/ORDER/JOIN) is left untouched
+/// so downstream parsing reports the familiar "unknown table" error.
+fn rewrite_from_dual(sql: &str) -> Result<String, String> {
+    let bytes = sql.as_bytes();
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => single_quote = true,
+            b'"' => double_quote = true,
+            b'`' => backtick = true,
+            b'/' if bytes.get(idx + 1) == Some(&b'*') => {
+                let comment_end = sql[idx + 2..]
+                    .find("*/")
+                    .map(|offset| idx + 2 + offset)
+                    .ok_or_else(|| "unterminated comment in SQL".to_string())?;
+                idx = comment_end + 2;
+                continue;
+            }
+            b'-' if bytes.get(idx + 1) == Some(&b'-') => {
+                let line_end = sql[idx..]
+                    .find('\n')
+                    .map(|offset| idx + offset)
+                    .unwrap_or(sql.len());
+                idx = line_end;
+                continue;
+            }
+            _ if starts_with_keyword(bytes, idx, "from")
+                && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+                && !is_identifier_byte(bytes.get(idx + "from".len()).copied()) =>
+            {
+                let dual_start = skip_ascii_whitespace(bytes, idx + "from".len());
+                if dual_start == idx + "from".len() {
+                    idx += 1;
+                    continue;
+                }
+                let dual_end = dual_start + "dual".len();
+                if !starts_with_keyword(bytes, dual_start, "dual")
+                    || is_identifier_byte(bytes.get(dual_end).copied())
+                {
+                    idx += 1;
+                    continue;
+                }
+                let suffix_start = skip_ascii_whitespace(bytes, dual_end);
+                if !matches_from_dual_suffix(bytes, suffix_start) {
+                    idx += 1;
+                    continue;
+                }
+
+                let prefix_end = trim_trailing_ascii_whitespace(sql, idx);
+                let mut rewritten = String::with_capacity(sql.len());
+                rewritten.push_str(&sql[..prefix_end]);
+                if suffix_start < sql.len()
+                    && starts_with_comment(bytes, suffix_start)
+                    && prefix_end > 0
+                {
+                    rewritten.push(' ');
+                }
+                rewritten.push_str(&sql[suffix_start..]);
+                return Ok(rewritten);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    Ok(sql.to_string())
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut idx: usize) -> usize {
+    while bytes.get(idx).is_some_and(u8::is_ascii_whitespace) {
+        idx += 1;
+    }
+    idx
+}
+
+fn trim_trailing_ascii_whitespace(sql: &str, mut end: usize) -> usize {
+    let bytes = sql.as_bytes();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    end
+}
+
+fn starts_with_comment(bytes: &[u8], idx: usize) -> bool {
+    bytes.get(idx) == Some(&b'/') && bytes.get(idx + 1) == Some(&b'*')
+        || bytes.get(idx) == Some(&b'-') && bytes.get(idx + 1) == Some(&b'-')
+}
+
+fn matches_from_dual_suffix(bytes: &[u8], idx: usize) -> bool {
+    idx >= bytes.len() || bytes.get(idx) == Some(&b';') || starts_with_comment(bytes, idx)
 }
 
 fn rewrite_set_user_variables(sql: &str) -> Result<String, String> {
@@ -1218,5 +1338,26 @@ mod tests {
             super::normalize_for_raw_parse("SELECT group_concat(name ORDER BY 1 SEPARATOR '|')")
                 .expect("normalize should succeed");
         assert_eq!(normalized, "SELECT group_concat(name, '|' ORDER BY 1)");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_strips_bare_from_dual() {
+        let normalized =
+            super::normalize_for_raw_parse("SELECT 1 FROM dual").expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT 1");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_strips_from_dual_with_trailing_semicolon() {
+        let normalized = super::normalize_for_raw_parse("SELECT now() FROM dual;")
+            .expect("normalize should succeed");
+        assert_eq!(normalized, "SELECT now();");
+    }
+
+    #[test]
+    fn normalize_for_raw_parse_keeps_from_dual_with_where_clause() {
+        let normalized = super::normalize_for_raw_parse("SELECT 1 FROM dual WHERE 1 = 1")
+            .expect("normalize should succeed");
+        assert!(normalized.contains("FROM dual"));
     }
 }
