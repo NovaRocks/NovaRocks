@@ -19,6 +19,13 @@ use super::store::{
     StoredManagedTablet, StoredManagedTxn,
 };
 
+/// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
+const DEFAULT_MANAGED_BUCKET_COUNT: u32 = 1;
+/// Mirrors StarRocks `SHORTKEY_MAX_COLUMN_COUNT`: at most 3 columns in the short-key.
+const SHORT_KEY_MAX_COLUMN_COUNT: usize = 3;
+/// Mirrors StarRocks `SHORTKEY_MAXSIZE_BYTES`: at most 36 bytes in the short-key.
+const SHORT_KEY_MAX_SIZE_BYTES: usize = 36;
+
 pub(crate) fn create_managed_table(
     state: &StandaloneState,
     name: &ObjectName,
@@ -44,25 +51,8 @@ pub(crate) fn create_managed_table(
         .managed_lake_config
         .clone()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
-    let key_desc = key_desc.ok_or_else(|| {
-        format!(
-            "managed standalone CREATE TABLE requires an explicit key description: {}.{}",
-            resolved.database, resolved.table
-        )
-    })?;
-    let bucket_num = i64::from(bucket_count.ok_or_else(|| {
-        format!(
-            "managed standalone CREATE TABLE requires DISTRIBUTED BY ... BUCKETS <n>: {}.{}",
-            resolved.database, resolved.table
-        )
-    })?);
-    if bucket_num <= 0 {
-        return Err(format!(
-            "managed standalone CREATE TABLE requires BUCKETS > 0: {}.{}",
-            resolved.database, resolved.table
-        ));
-    }
-    if key_desc.kind == TableKeyKind::Aggregate {
+    let defaults = resolve_managed_create_defaults(columns, key_desc, bucket_count)?;
+    if defaults.key_desc.kind == TableKeyKind::Aggregate {
         return Err(
             "managed standalone CREATE TABLE does not support AGGREGATE KEY yet".to_string(),
         );
@@ -90,10 +80,10 @@ pub(crate) fn create_managed_table(
     let partition_id = alloc_id(&mut snapshot.global.next_partition_id);
     let index_id = alloc_id(&mut snapshot.global.next_index_id);
 
-    let request_schema = build_tablet_schema(columns, key_desc)?;
+    let request_schema = build_tablet_schema(columns, &defaults.key_desc)?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
-    for bucket_seq in 0..bucket_num {
+    for bucket_seq in 0..defaults.bucket_num {
         let tablet_id = alloc_id(&mut snapshot.global.next_tablet_id);
         let tablet_root_path =
             managed_config.tablet_root_path(database.db_id, table_id, partition_id);
@@ -147,8 +137,8 @@ pub(crate) fn create_managed_table(
         table_id,
         db_id: database.db_id,
         name: resolved.table.clone(),
-        keys_type: keys_type_name(key_desc.kind).to_string(),
-        bucket_num,
+        keys_type: keys_type_name(defaults.key_desc.kind).to_string(),
+        bucket_num: defaults.bucket_num,
         current_schema_id: schema_id,
         state: ManagedTableState::Active,
     });
@@ -213,6 +203,104 @@ pub(crate) fn create_managed_table(
         .expect("standalone catalog write lock");
     register_managed_table_in_catalog(&mut catalog, &runtime)?;
     Ok(StatementResult::Ok)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManagedCreateDefaults {
+    key_desc: TableKeyDesc,
+    bucket_num: i64,
+}
+
+/// Resolve StarRocks-style defaults for `CREATE TABLE` on managed lake:
+/// - KEY description defaults to DUP KEY on leading non-float columns (short-key rules).
+/// - BUCKETS defaults to 1.
+fn resolve_managed_create_defaults(
+    columns: &[TableColumnDef],
+    key_desc: Option<&TableKeyDesc>,
+    bucket_count: Option<u32>,
+) -> Result<ManagedCreateDefaults, String> {
+    let key_desc = match key_desc {
+        Some(key_desc) => key_desc.clone(),
+        None => TableKeyDesc {
+            kind: TableKeyKind::Duplicate,
+            columns: choose_default_dup_key_columns(columns)?,
+        },
+    };
+    let bucket_num = i64::from(bucket_count.unwrap_or(DEFAULT_MANAGED_BUCKET_COUNT));
+    if bucket_num <= 0 {
+        return Err("managed standalone CREATE TABLE requires BUCKETS > 0".to_string());
+    }
+    Ok(ManagedCreateDefaults {
+        key_desc,
+        bucket_num,
+    })
+}
+
+/// Mirrors StarRocks `CreateTableAnalyzer.chooseKeysType` short-key selection:
+/// take leading columns, skip FLOAT/DOUBLE/complex types, stop at first string
+/// column (include it and stop), stop once column/byte limits reached. If no
+/// keyable column is found, return an error matching StarRocks' wording.
+fn choose_default_dup_key_columns(columns: &[TableColumnDef]) -> Result<Vec<String>, String> {
+    if columns.is_empty() {
+        return Err("managed standalone CREATE TABLE requires at least one column".to_string());
+    }
+
+    let mut key_columns = Vec::new();
+    let mut key_size = 0usize;
+    for column in columns {
+        key_size += short_key_index_size(&column.data_type);
+        if key_columns.len() >= SHORT_KEY_MAX_COLUMN_COUNT || key_size > SHORT_KEY_MAX_SIZE_BYTES {
+            if key_columns.is_empty() && is_string_family(&column.data_type) {
+                key_columns.push(column.name.clone());
+            }
+            break;
+        }
+        if !key_eligible_type(&column.data_type) {
+            break;
+        }
+        key_columns.push(column.name.clone());
+        if is_string_family(&column.data_type) {
+            break;
+        }
+    }
+
+    if key_columns.is_empty() {
+        return Err(format!(
+            "managed standalone CREATE TABLE data type of first column `{}` cannot be a key column",
+            columns[0].name
+        ));
+    }
+    Ok(key_columns)
+}
+
+fn key_eligible_type(data_type: &SqlType) -> bool {
+    !matches!(
+        data_type,
+        SqlType::Float
+            | SqlType::Double
+            | SqlType::Binary
+            | SqlType::Array(_)
+            | SqlType::Map(_, _)
+            | SqlType::Struct(_)
+    )
+}
+
+fn short_key_index_size(data_type: &SqlType) -> usize {
+    match data_type {
+        SqlType::Boolean | SqlType::TinyInt => 1,
+        SqlType::SmallInt => 2,
+        SqlType::Int | SqlType::Date => 4,
+        SqlType::BigInt | SqlType::DateTime | SqlType::Time => 8,
+        SqlType::LargeInt | SqlType::Decimal { .. } => 16,
+        SqlType::String | SqlType::Binary => 20,
+        SqlType::Float => 4,
+        SqlType::Double => 8,
+        SqlType::Array(_) | SqlType::Map(_, _) | SqlType::Struct(_) => SHORT_KEY_MAX_SIZE_BYTES + 1,
+    }
+}
+
+fn is_string_family(data_type: &SqlType) -> bool {
+    matches!(data_type, SqlType::String)
 }
 
 pub(crate) fn drop_managed_table(
@@ -833,7 +921,10 @@ mod tests {
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_table_in_catalog,
     };
 
-    use super::{build_tablet_schema, drop_managed_table, truncate_managed_table_with_hooks};
+    use super::{
+        build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,
+        resolve_managed_create_defaults, truncate_managed_table_with_hooks,
+    };
 
     fn test_managed_config() -> ManagedLakeConfig {
         ManagedLakeConfig {
@@ -1103,5 +1194,135 @@ mod tests {
             persisted.managed.erase_jobs[0].root_path,
             "s3://test/warehouse/db_1/table_10/partition_20"
         );
+    }
+
+    #[test]
+    fn create_managed_table_defaults_dup_key_first_non_float_column() {
+        // Bare `CREATE TABLE t (k BIGINT, v STRING)` should default to
+        // DUP KEY (k, v) (string column included, then stop) and 1 bucket.
+        let defaults = resolve_managed_create_defaults(
+            &[
+                TableColumnDef {
+                    name: "k".to_string(),
+                    data_type: SqlType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                },
+                TableColumnDef {
+                    name: "v".to_string(),
+                    data_type: SqlType::String,
+                    nullable: true,
+                    aggregation: None,
+                },
+            ],
+            None,
+            None,
+        )
+        .expect("resolve defaults");
+
+        assert_eq!(
+            defaults.key_desc,
+            TableKeyDesc {
+                kind: TableKeyKind::Duplicate,
+                columns: vec!["k".to_string(), "v".to_string()],
+            }
+        );
+        assert_eq!(defaults.bucket_num, 1);
+    }
+
+    #[test]
+    fn create_managed_table_defaults_skip_float_as_leading_key() {
+        // CREATE TABLE t (f FLOAT, k INT, v STRING). No explicit KEY — FLOAT
+        // is not key-eligible and must fail with the StarRocks-style error.
+        let err = choose_default_dup_key_columns(&[
+            TableColumnDef {
+                name: "f".to_string(),
+                data_type: SqlType::Float,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "k".to_string(),
+                data_type: SqlType::Int,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "v".to_string(),
+                data_type: SqlType::String,
+                nullable: true,
+                aggregation: None,
+            },
+        ])
+        .expect_err("float first column should fail");
+
+        assert!(err.contains("first column `f` cannot be a key column"));
+    }
+
+    #[test]
+    fn create_managed_table_defaults_short_key_length_cap() {
+        // Five BIGINT columns (8 bytes each) — short-key caps at 3 columns.
+        let keys = choose_default_dup_key_columns(&[
+            TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "k2".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "k3".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "k4".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "k5".to_string(),
+                data_type: SqlType::BigInt,
+                nullable: false,
+                aggregation: None,
+            },
+        ])
+        .expect("choose keys");
+
+        assert_eq!(
+            keys,
+            vec!["k1".to_string(), "k2".to_string(), "k3".to_string()]
+        );
+    }
+
+    #[test]
+    fn create_managed_table_defaults_first_column_must_be_keyable() {
+        // CREATE TABLE t (d DOUBLE, v INT) with no explicit KEY — DOUBLE is not
+        // key-eligible, so the first-column check should fail with the StarRocks
+        // "data type of first column cannot be a key column" error.
+        let err = choose_default_dup_key_columns(&[
+            TableColumnDef {
+                name: "d".to_string(),
+                data_type: SqlType::Double,
+                nullable: false,
+                aggregation: None,
+            },
+            TableColumnDef {
+                name: "v".to_string(),
+                data_type: SqlType::Int,
+                nullable: false,
+                aggregation: None,
+            },
+        ])
+        .expect_err("double first column should fail");
+
+        assert!(err.contains("first column `d` cannot be a key column"));
     }
 }
