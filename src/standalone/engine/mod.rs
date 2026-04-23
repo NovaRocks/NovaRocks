@@ -31,16 +31,18 @@ use super::lake::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
 
+pub(crate) mod aggregate;
 pub(crate) mod iceberg_glue;
 pub(crate) mod local;
 pub(crate) mod name_resolve;
+pub(crate) mod parquet;
 pub(crate) mod sqlparse;
 pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::{ResolvedLocalTableName, resolve_local_table_name};
 
 pub(crate) use self::local::insert::{build_local_insert_batch, reorder_insert_rows};
-use self::local::parquet::write_parquet_to_path;
+use self::parquet::write_parquet_to_path;
 #[cfg(test)]
 use self::sqlparse::expr::sql_type_to_arrow_type;
 use self::sqlparse::expr::{canonicalize_sql_for_match, sqlparser_expr_to_literal};
@@ -2239,7 +2241,7 @@ enable_path_style_access = true
             true,
         )]));
 
-        let casted = super::local::parquet::cast_batch_to_schema(&source_batch, &target_schema)
+        let casted = super::parquet::cast_batch_to_schema(&source_batch, &target_schema)
             .expect("cast batch");
         let casted_schema = casted.schema();
         let DataType::Map(entries_field, _) = casted_schema.field(0).data_type() else {
@@ -2284,9 +2286,9 @@ enable_path_style_access = true
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("map_round_trip.parquet");
 
-        super::local::parquet::write_parquet_to_path(&path, &batch).expect("write local parquet");
-        let round_tripped = super::local::parquet::read_local_parquet_data(&path, &columns)
-            .expect("read local parquet");
+        super::parquet::write_parquet_to_path(&path, &batch).expect("write local parquet");
+        let round_tripped =
+            super::parquet::read_local_parquet_data(&path, &columns).expect("read local parquet");
         let map = round_tripped
             .column(0)
             .as_any()

@@ -1,21 +1,15 @@
-//! Local (in-memory + parquet-on-disk) table subsystem.
+//! Shared catalog utilities and Arrow row-build helpers that used to live
+//! alongside the now-removed parquet backend.
 //!
-//! Owns the in-memory catalog (`InMemoryCatalog`), the `LocalTableSemantics`
-//! book-keeping for aggregate/primary-key tables, parquet I/O, the insert
-//! path, stream load, and aggregate merge — everything that lives on disk as
-//! a parquet file plus the in-memory catalog metadata pointing at it.
+//! Task 8 in `docs/superpowers/plans/2026-04-22-delete-local-tables.md`
+//! promotes the remaining A-tier items (`InMemoryCatalog`,
+//! `normalize_identifier`, etc.) out of this directory entirely.
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
 
 use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow::array::ArrayRef;
-use arrow::datatypes::{Field, Schema};
-use arrow::record_batch::RecordBatch;
-
-use crate::sql::parser::ast::{ColumnAggregation, ObjectName, TableColumnDef, TableKeyDesc};
 
 // Re-export from sql::catalog so existing `crate::standalone::engine::local::*`
 // paths and the old `crate::standalone::catalog::*` alias continue to work.
@@ -23,12 +17,7 @@ pub use crate::sql::catalog::{
     CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
 };
 
-use super::sqlparse::expr::sql_type_to_arrow_type;
-
-pub(crate) mod aggregate;
 pub(crate) mod insert;
-pub(crate) mod parquet;
-pub(crate) mod stream_load;
 
 #[derive(Clone, Debug)]
 struct DatabaseDef {

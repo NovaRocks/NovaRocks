@@ -1,9 +1,9 @@
-//! Local-table INSERT path: reorder/validate inbound rows, build Arrow
-//! arrays from `Literal` rows, and append to the parquet file on disk.
+//! Row-reorder + Arrow-batch builder helpers shared across INSERT backends.
 //!
-//! Covers both `INSERT VALUES` and `INSERT SELECT`/`GenerateSeriesSelect`
-//! sources — the SELECT-side fragment has already been lowered to a
-//! `Vec<Literal>` row by the time we get here.
+//! `reorder_insert_rows` maps user-supplied `Literal` rows onto the target
+//! table's column order, filling missing columns with NULL. `build_local_insert_batch`
+//! then materialises the reordered rows into an Arrow `RecordBatch` with the
+//! types the managed-lake write path expects.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,18 +12,13 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use super::{ColumnDef, TableDef, TableStorage, normalize_identifier};
-use crate::sql::parser::ast::{InsertSource, Literal};
+use super::{ColumnDef, normalize_identifier};
+use crate::sql::parser::ast::Literal;
+use crate::standalone::engine::parquet::{
+    normalize_map_entries_nullability, parse_date_string_to_days, parse_datetime_string_to_micros,
+};
 use crate::standalone::engine::sqlparse::expr::{
     latin1_string_to_bytes, literal_to_i128_for_integer,
-};
-use crate::standalone::engine::{
-    ResolvedLocalTableName, StandaloneState, insert_generate_series_rows_local,
-};
-
-use super::parquet::{
-    normalize_map_entries_nullability, parse_date_string_to_days, parse_datetime_string_to_micros,
-    read_local_parquet_data, write_parquet_to_path,
 };
 
 pub(crate) fn reorder_insert_rows(
@@ -87,73 +82,6 @@ fn reorder_insert_row(
         }
     }
     Ok(reordered)
-}
-
-/// Insert rows into a local parquet table.
-pub(crate) fn insert_into_local_table(
-    state: &Arc<StandaloneState>,
-    resolved: &ResolvedLocalTableName,
-    table_def: &TableDef,
-    insert_columns: &[String],
-    source: &InsertSource,
-) -> Result<crate::standalone::engine::StatementResult, String> {
-    use crate::standalone::engine::StatementResult;
-
-    let rows = match source {
-        InsertSource::Values(rows) => {
-            reorder_insert_rows(rows, insert_columns, &table_def.columns)?
-        }
-        InsertSource::SelectLiteralRow(row) => reorder_insert_rows(
-            std::slice::from_ref(row),
-            insert_columns,
-            &table_def.columns,
-        )?,
-        InsertSource::GenerateSeriesSelect(gen_source) => {
-            insert_generate_series_rows_local(gen_source, insert_columns, &table_def.columns)?
-        }
-    };
-
-    let path = match &table_def.storage {
-        TableStorage::LocalParquetFile { path } => path.clone(),
-        TableStorage::S3ParquetFiles { .. } => {
-            return Err("INSERT into S3 tables is not supported".to_string());
-        }
-    };
-
-    // Read existing data if any
-    let existing_batch = read_local_parquet_data(&path, &table_def.columns)?;
-
-    // Build new batch from inserted rows
-    let new_batch = build_local_insert_batch(&table_def.columns, &rows)?;
-
-    // Concatenate existing and new
-    let combined = if existing_batch.num_rows() > 0 {
-        arrow::compute::concat_batches(
-            &new_batch.schema(),
-            [&existing_batch, &new_batch].iter().copied(),
-        )
-        .map_err(|e| format!("concat local table batches failed: {e}"))?
-    } else {
-        new_batch
-    };
-    // Write back
-    write_parquet_to_path(&path, &combined)?;
-
-    // Re-register table in catalog to update metadata
-    let table_def_updated = TableDef {
-        name: table_def.name.clone(),
-        columns: table_def.columns.clone(),
-        storage: TableStorage::LocalParquetFile { path: path.clone() },
-    };
-    let mut guard = state
-        .catalog
-        .write()
-        .expect("standalone catalog write lock");
-    // Drop and re-register to allow re-reading
-    let _ = guard.drop_table(&resolved.database, &resolved.table);
-    guard.register(&resolved.database, table_def_updated)?;
-
-    Ok(StatementResult::Ok)
 }
 
 /// Build a RecordBatch from literal value rows for a local table.

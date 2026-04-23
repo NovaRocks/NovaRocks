@@ -13,7 +13,7 @@ use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use super::ColumnDef;
+use crate::sql::catalog::ColumnDef;
 use crate::standalone::engine::iceberg_glue::concat_or_empty_batches;
 
 pub(crate) fn read_local_parquet_data(

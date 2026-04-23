@@ -1,14 +1,16 @@
-//! Aggregate-table row merging for `INSERT` into local aggregate tables.
+//! Aggregate-table row merging.
 //!
-//! Duplicate key rows are collapsed per `ColumnAggregation` (SUM/MIN/MAX/REPLACE)
-//! before being handed to the parquet writer.
+//! Collapses duplicate-key rows per `ColumnAggregation` (SUM / MIN / MAX /
+//! REPLACE) before handing the merged rows back to the caller. Used by the
+//! iceberg insert path for aggregate-keyed tables.
 
 use std::collections::HashMap;
 
 use arrow::record_batch::RecordBatch;
 
-use super::{ColumnDef, normalize_identifier};
+use crate::sql::catalog::ColumnDef;
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
+use crate::standalone::engine::local::normalize_identifier;
 use crate::standalone::engine::sqlparse::expr::{
     LiteralKey, compare_literals, literal_from_batch, literal_to_key,
 };
