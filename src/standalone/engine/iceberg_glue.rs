@@ -13,7 +13,7 @@ use futures::TryStreamExt;
 
 use crate::standalone::engine::aggregate::merge_aggregate_table_rows_if_needed;
 use crate::standalone::engine::block_on_standalone_async;
-use crate::standalone::engine::local::{ColumnDef, normalize_identifier};
+use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::standalone::iceberg::{IcebergLoadedTable, build_insert_batch};
 
 pub(crate) fn load_full_iceberg_batch(loaded: &IcebergLoadedTable) -> Result<RecordBatch, String> {

@@ -12,14 +12,12 @@ use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
-use super::{ColumnDef, normalize_identifier};
-use crate::sql::parser::ast::Literal;
-use crate::standalone::engine::parquet::{
+use super::catalog::{ColumnDef, normalize_identifier};
+use super::parquet::{
     normalize_map_entries_nullability, parse_date_string_to_days, parse_datetime_string_to_micros,
 };
-use crate::standalone::engine::sqlparse::expr::{
-    latin1_string_to_bytes, literal_to_i128_for_integer,
-};
+use super::sqlparse::expr::{latin1_string_to_bytes, literal_to_i128_for_integer};
+use crate::sql::parser::ast::Literal;
 
 pub(crate) fn reorder_insert_rows(
     rows: &[Vec<Literal>],

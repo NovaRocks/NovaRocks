@@ -1,9 +1,10 @@
-//! Shared catalog utilities and Arrow row-build helpers that used to live
-//! alongside the now-removed parquet backend.
+//! In-memory database/table catalog and shared catalog utilities.
 //!
-//! Task 8 in `docs/superpowers/plans/2026-04-22-delete-local-tables.md`
-//! promotes the remaining A-tier items (`InMemoryCatalog`,
-//! `normalize_identifier`, etc.) out of this directory entirely.
+//! Holds the logical `InMemoryCatalog` (databases -> tables + physical
+//! layouts), the `normalize_identifier` helper used across the SQL and
+//! engine layers, and `build_parquet_table` for registering external
+//! parquet files. Everything here is backend-agnostic — the managed-lake
+//! and iceberg subsystems both query this catalog for table metadata.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,13 +12,12 @@ use std::path::Path;
 
 use ::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-// Re-export from sql::catalog so existing `crate::standalone::engine::local::*`
-// paths and the old `crate::standalone::catalog::*` alias continue to work.
+// Re-export from sql::catalog so callers can use either
+// `crate::standalone::engine::catalog::*` or `crate::sql::catalog::*`
+// interchangeably without double-defining the types.
 pub use crate::sql::catalog::{
     CatalogProvider, ColumnDef, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
 };
-
-pub(crate) mod insert;
 
 #[derive(Clone, Debug)]
 struct DatabaseDef {

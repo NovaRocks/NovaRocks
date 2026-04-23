@@ -15,7 +15,8 @@ use std::sync::Arc;
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
 };
-use crate::standalone::engine::local::{insert::reorder_insert_rows, normalize_identifier};
+use crate::standalone::engine::catalog::normalize_identifier;
+use crate::standalone::engine::insert::reorder_insert_rows;
 use crate::standalone::engine::name_resolve::{
     resolve_iceberg_namespace_name, resolve_iceberg_table_name, resolve_local_table_name,
 };

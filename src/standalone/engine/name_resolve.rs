@@ -8,7 +8,7 @@
 //! hard error rather than guessing.
 
 use crate::sql::parser::ast::ObjectName;
-use crate::standalone::engine::local::normalize_identifier;
+use crate::standalone::engine::catalog::normalize_identifier;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedLocalTableName {

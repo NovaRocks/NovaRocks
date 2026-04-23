@@ -10,7 +10,7 @@ use arrow::record_batch::RecordBatch;
 
 use crate::sql::catalog::ColumnDef;
 use crate::sql::parser::ast::{ColumnAggregation, Literal, TableKeyDesc, TableKeyKind};
-use crate::standalone::engine::local::normalize_identifier;
+use crate::standalone::engine::catalog::normalize_identifier;
 use crate::standalone::engine::sqlparse::expr::{
     LiteralKey, compare_literals, literal_from_batch, literal_to_key,
 };

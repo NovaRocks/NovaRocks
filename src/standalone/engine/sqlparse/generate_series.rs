@@ -8,7 +8,7 @@
 use sqlparser::ast as sqlast;
 
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
-use crate::standalone::engine::local::{ColumnDef, normalize_identifier};
+use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::standalone::engine::reorder_insert_rows;
 use crate::standalone::iceberg::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
 

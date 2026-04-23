@@ -32,7 +32,7 @@ use tokio::runtime::Handle;
 
 use crate::runtime::global_async_runtime::data_block_on;
 
-use super::super::engine::local::{ColumnDef, normalize_identifier};
+use super::super::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
 #[derive(Default)]

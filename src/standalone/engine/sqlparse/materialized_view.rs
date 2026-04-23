@@ -5,7 +5,7 @@
 //! the full sqlparser pipeline) so the standalone engine can route MV
 //! statements to its own handlers.
 
-use crate::standalone::engine::local::normalize_identifier;
+use crate::standalone::engine::catalog::normalize_identifier;
 
 use super::expr::{canonicalize_sql_for_match, strip_optional_identifier_quotes};
 
