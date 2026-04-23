@@ -4,6 +4,11 @@ pub(crate) mod ast;
 pub(crate) mod dialect;
 mod raw;
 
+use sqlparser::parser::Parser;
+
+use crate::sql::parser::ast::Statement;
+use crate::sql::parser::dialect::StarRocksDialect;
+
 /// Parse SQL into a raw sqlparser AST (no custom AST conversion).
 /// Used by the standalone ThriftPlanBuilder.
 pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
@@ -12,6 +17,26 @@ pub(crate) fn parse_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, Stri
 
 pub(crate) fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Statement, String> {
     raw::parse_normalized_sql_raw(sql)
+}
+
+/// Parse SQL through the custom StarRocks dialect into a `Vec<Statement>`.
+///
+/// Phase 1 only recognizes materialized-view DDL (CREATE/DROP/REFRESH/SHOW
+/// MATERIALIZED VIEW[S]). All other statements return an explicit error so
+/// callers know to fall back to `parse_sql_raw` for the legacy path.
+pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
+    let normalized = dialect::normalize_for_raw_parse(sql)?;
+    let sr_dialect = StarRocksDialect;
+    let mut parser = Parser::new(&sr_dialect)
+        .try_with_sql(&normalized)
+        .map_err(|e| e.to_string())?;
+
+    if dialect::materialized_view::looks_like_create_materialized_view(&parser) {
+        let stmt = dialect::materialized_view::parse_create_materialized_view(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+
+    Err("parse_sql: only materialized-view DDL is recognized in Phase 1".to_string())
 }
 
 #[cfg(test)]

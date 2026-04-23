@@ -47,6 +47,52 @@ pub(crate) struct DropTableStmt {
     pub force: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MaterializedViewDistribution {
+    pub hash_columns: Vec<String>,
+    pub bucket_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CreateMaterializedViewStmt {
+    pub name: ObjectName,
+    pub if_not_exists: bool,
+    pub distribution: Option<MaterializedViewDistribution>,
+    pub refresh_manual_explicit: bool,
+    /// Raw SQL text of the SELECT body after `AS`. Produced by re-serializing
+    /// the parsed `sqlparser::ast::Query`; used for storage and for
+    /// re-parsing on every REFRESH in Phase 1.
+    pub select_sql: String,
+    pub select_query: sqlparser::ast::Query,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropMaterializedViewStmt {
+    pub name: ObjectName,
+    pub if_exists: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RefreshMaterializedViewStmt {
+    pub name: ObjectName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShowMaterializedViewsStmt {
+    pub database: Option<String>,
+}
+
+/// Top-level statement variants produced by the custom dialect `parse_sql`
+/// entry point. Phase 1 only covers materialized-view DDL; other statements
+/// still flow through the legacy `parse_sql_raw` path.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Statement {
+    CreateMaterializedView(CreateMaterializedViewStmt),
+    DropMaterializedView(DropMaterializedViewStmt),
+    RefreshMaterializedView(RefreshMaterializedViewStmt),
+    ShowMaterializedViews(ShowMaterializedViewsStmt),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct InsertStmt {
     pub table: ObjectName,
