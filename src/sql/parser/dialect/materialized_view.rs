@@ -11,7 +11,8 @@ use sqlparser::tokenizer::Token;
 
 use super::{convert_object_name, peek_word_eq};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, MaterializedViewDistribution, Statement,
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution,
+    RefreshMaterializedViewStmt, ShowMaterializedViewsStmt, Statement,
 };
 
 /// Check if the current position looks like `CREATE MATERIALIZED VIEW ...`.
@@ -202,6 +203,130 @@ fn parse_and_drop_properties(parser: &mut Parser<'_>) -> Result<(), String> {
     Ok(())
 }
 
+/// Check if the current position looks like `DROP MATERIALIZED VIEW ...`.
+/// The parser is not advanced.
+pub(crate) fn looks_like_drop_materialized_view(parser: &Parser<'_>) -> bool {
+    parser.peek_keyword(Keyword::DROP)
+        && peek_word_eq(parser, 1, "MATERIALIZED")
+        && peek_word_eq(parser, 2, "VIEW")
+}
+
+/// Parse `DROP MATERIALIZED VIEW [IF EXISTS] <name>`.
+///
+/// Rejects `FORCE` explicitly so users pasting StarRocks DDL get a clear
+/// error instead of silently dropping a MV with a modifier we don't honor.
+pub(crate) fn parse_drop_materialized_view(parser: &mut Parser<'_>) -> Result<Statement, String> {
+    parser
+        .expect_keyword(Keyword::DROP)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::MATERIALIZED)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::VIEW)
+        .map_err(|e| e.to_string())?;
+
+    let if_exists = parser.parse_keywords(&[Keyword::IF, Keyword::EXISTS]);
+    let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
+
+    if parser.parse_keyword(Keyword::FORCE) {
+        return Err("DROP MATERIALIZED VIEW ... FORCE is not supported".to_string());
+    }
+
+    Ok(Statement::DropMaterializedView(DropMaterializedViewStmt {
+        name,
+        if_exists,
+    }))
+}
+
+/// Check if the current position looks like `REFRESH MATERIALIZED VIEW ...`.
+/// The parser is not advanced.
+pub(crate) fn looks_like_refresh_materialized_view(parser: &Parser<'_>) -> bool {
+    parser.peek_keyword(Keyword::REFRESH)
+        && peek_word_eq(parser, 1, "MATERIALIZED")
+        && peek_word_eq(parser, 2, "VIEW")
+}
+
+/// Parse `REFRESH MATERIALIZED VIEW <name>`.
+///
+/// Rejects `PARTITION START(...) END(...)` and `WITH {SYNC|ASYNC} MODE`
+/// because Phase 1 only supports whole-MV synchronous refresh.
+pub(crate) fn parse_refresh_materialized_view(
+    parser: &mut Parser<'_>,
+) -> Result<Statement, String> {
+    parser
+        .expect_keyword(Keyword::REFRESH)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::MATERIALIZED)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::VIEW)
+        .map_err(|e| e.to_string())?;
+
+    let name = convert_object_name(parser.parse_object_name(false).map_err(|e| e.to_string())?)?;
+
+    if parser.parse_keyword(Keyword::PARTITION) {
+        return Err(
+            "REFRESH MATERIALIZED VIEW ... PARTITION START(...) END(...) is not supported yet"
+                .to_string(),
+        );
+    }
+    if parser.parse_keyword(Keyword::WITH) {
+        return Err(
+            "REFRESH MATERIALIZED VIEW ... WITH {SYNC|ASYNC} MODE is not supported yet".to_string(),
+        );
+    }
+
+    Ok(Statement::RefreshMaterializedView(
+        RefreshMaterializedViewStmt { name },
+    ))
+}
+
+/// Check if the current position looks like `SHOW MATERIALIZED VIEWS ...`.
+/// The parser is not advanced.
+pub(crate) fn looks_like_show_materialized_views(parser: &Parser<'_>) -> bool {
+    parser.peek_keyword(Keyword::SHOW)
+        && peek_word_eq(parser, 1, "MATERIALIZED")
+        && peek_word_eq(parser, 2, "VIEWS")
+}
+
+/// Parse `SHOW MATERIALIZED VIEWS [FROM <db>]`.
+///
+/// Rejects `LIKE '...'` and `WHERE ...` so the Phase 1 output schema stays
+/// predictable; clients that need filtering can do it client-side.
+pub(crate) fn parse_show_materialized_views(parser: &mut Parser<'_>) -> Result<Statement, String> {
+    parser
+        .expect_keyword(Keyword::SHOW)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::MATERIALIZED)
+        .map_err(|e| e.to_string())?;
+    parser
+        .expect_keyword(Keyword::VIEWS)
+        .map_err(|e| e.to_string())?;
+
+    let database = if parser.parse_keyword(Keyword::FROM) {
+        let ident = parser
+            .parse_identifier()
+            .map_err(|e| format!("parse database name after FROM: {e}"))?;
+        Some(ident.value)
+    } else {
+        None
+    };
+
+    if parser.parse_keyword(Keyword::LIKE) {
+        return Err("SHOW MATERIALIZED VIEWS LIKE '...' is not supported yet".to_string());
+    }
+    if parser.parse_keyword(Keyword::WHERE) {
+        return Err("SHOW MATERIALIZED VIEWS WHERE ... is not supported yet".to_string());
+    }
+
+    Ok(Statement::ShowMaterializedViews(
+        ShowMaterializedViewsStmt { database },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::sql::parser::ast::Statement;
@@ -334,6 +459,96 @@ mod tests {
         assert!(
             err.to_lowercase().contains("distributed by"),
             "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_drop_mv_with_if_exists() {
+        let stmt = parse_one("DROP MATERIALIZED VIEW IF EXISTS analytics.mv1");
+        let drop = match stmt {
+            Statement::DropMaterializedView(d) => d,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert!(drop.if_exists);
+        assert_eq!(drop.name.parts, vec!["analytics", "mv1"]);
+    }
+
+    #[test]
+    fn parse_drop_mv_rejects_force() {
+        let err = crate::sql::parser::parse_sql("DROP MATERIALIZED VIEW mv1 FORCE")
+            .expect_err("should reject");
+        assert!(err.to_lowercase().contains("force"), "err={err}");
+    }
+
+    #[test]
+    fn parse_refresh_mv() {
+        let stmt = parse_one("REFRESH MATERIALIZED VIEW analytics.mv1");
+        match stmt {
+            Statement::RefreshMaterializedView(r) => {
+                assert_eq!(r.name.parts, vec!["analytics", "mv1"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_mv_rejects_partition_range() {
+        let err = crate::sql::parser::parse_sql(
+            "REFRESH MATERIALIZED VIEW mv1 PARTITION START ('2024-01-01') END ('2024-02-01')",
+        )
+        .expect_err("should reject");
+        assert!(
+            err.to_lowercase().contains("partition")
+                || err.to_lowercase().contains("not supported"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn parse_refresh_mv_rejects_async_modifier() {
+        let err = crate::sql::parser::parse_sql("REFRESH MATERIALIZED VIEW mv1 WITH ASYNC MODE")
+            .expect_err("should reject");
+        assert!(
+            err.to_lowercase().contains("async") || err.to_lowercase().contains("not supported"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn parse_show_materialized_views_no_filters() {
+        let stmt = parse_one("SHOW MATERIALIZED VIEWS");
+        match stmt {
+            Statement::ShowMaterializedViews(s) => assert!(s.database.is_none()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_show_materialized_views_from_db() {
+        let stmt = parse_one("SHOW MATERIALIZED VIEWS FROM analytics");
+        match stmt {
+            Statement::ShowMaterializedViews(s) => {
+                assert_eq!(s.database, Some("analytics".to_string()))
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_show_materialized_views_rejects_like_and_where() {
+        let err_like = crate::sql::parser::parse_sql("SHOW MATERIALIZED VIEWS LIKE '%mv%'")
+            .expect_err("should reject LIKE");
+        assert!(
+            err_like.to_lowercase().contains("like")
+                || err_like.to_lowercase().contains("not supported"),
+            "err={err_like}"
+        );
+        let err_where = crate::sql::parser::parse_sql("SHOW MATERIALIZED VIEWS WHERE name = 'mv1'")
+            .expect_err("should reject WHERE");
+        assert!(
+            err_where.to_lowercase().contains("where")
+                || err_where.to_lowercase().contains("not supported"),
+            "err={err_where}"
         );
     }
 }

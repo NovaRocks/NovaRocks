@@ -31,8 +31,25 @@ pub(crate) fn parse_sql(sql: &str) -> Result<Vec<Statement>, String> {
         .try_with_sql(&normalized)
         .map_err(|e| e.to_string())?;
 
+    // MV probes MUST come BEFORE any generic CREATE TABLE / DROP TABLE /
+    // SHOW TABLES / REFRESH dispatch we may add later: the `MATERIALIZED`
+    // token is what distinguishes these from their plain-table counterparts,
+    // and the generic paths would happily swallow `CREATE MATERIALIZED VIEW`
+    // as a failed `CREATE TABLE`. Keep these four probes first.
     if dialect::materialized_view::looks_like_create_materialized_view(&parser) {
         let stmt = dialect::materialized_view::parse_create_materialized_view(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::materialized_view::looks_like_drop_materialized_view(&parser) {
+        let stmt = dialect::materialized_view::parse_drop_materialized_view(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::materialized_view::looks_like_refresh_materialized_view(&parser) {
+        let stmt = dialect::materialized_view::parse_refresh_materialized_view(&mut parser)?;
+        return Ok(vec![stmt]);
+    }
+    if dialect::materialized_view::looks_like_show_materialized_views(&parser) {
+        let stmt = dialect::materialized_view::parse_show_materialized_views(&mut parser)?;
         return Ok(vec![stmt]);
     }
 
