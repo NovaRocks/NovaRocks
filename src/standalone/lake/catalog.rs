@@ -246,9 +246,14 @@ impl ManagedLakeCatalog {
                 .remove(&table.table_id)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|partition| partition.state == ManagedPartitionState::Active)
+                .filter(|partition| {
+                    matches!(
+                        partition.state,
+                        ManagedPartitionState::Active | ManagedPartitionState::Creating
+                    )
+                })
                 .collect::<Vec<_>>();
-            let active_partition_ids = partitions
+            let live_partition_ids = partitions
                 .iter()
                 .map(|partition| partition.partition_id)
                 .collect::<HashSet<_>>();
@@ -257,11 +262,13 @@ impl ManagedLakeCatalog {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|index| {
-                    index.state == ManagedIndexState::Active
-                        && active_partition_ids.contains(&index.partition_id)
+                    matches!(
+                        index.state,
+                        ManagedIndexState::Active | ManagedIndexState::Creating
+                    ) && live_partition_ids.contains(&index.partition_id)
                 })
                 .collect::<Vec<_>>();
-            let active_index_ids = indexes
+            let live_index_ids = indexes
                 .iter()
                 .map(|index| index.index_id)
                 .collect::<HashSet<_>>();
@@ -282,8 +289,8 @@ impl ManagedLakeCatalog {
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|tablet| {
-                            active_partition_ids.contains(&tablet.partition_id)
-                                && active_index_ids.contains(&tablet.index_id)
+                            live_partition_ids.contains(&tablet.partition_id)
+                                && live_index_ids.contains(&tablet.index_id)
                         })
                         .collect(),
                 },
@@ -1002,8 +1009,8 @@ mod tests {
         snapshot.tables[0].state = ManagedTableState::Dropping;
         snapshot.partitions[0].state = ManagedPartitionState::Retired;
 
-        let rebuilt = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot)
-            .expect("rebuild");
+        let rebuilt =
+            ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot).expect("rebuild");
 
         assert!(
             !rebuilt
@@ -1137,8 +1144,8 @@ mod tests {
         assert_eq!(runtime.table.kind, ManagedTableKind::Table);
 
         snapshot.tables[0].kind = ManagedTableKind::MaterializedView;
-        let rebuilt_mv = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot)
-            .expect("rebuild mv");
+        let rebuilt_mv =
+            ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot).expect("rebuild mv");
         let runtime_mv = rebuilt_mv
             .table("analytics", "orders")
             .expect("runtime")

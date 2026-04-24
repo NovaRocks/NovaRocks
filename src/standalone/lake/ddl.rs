@@ -531,7 +531,10 @@ where
     Ok(StatementResult::Ok)
 }
 
-fn initialize_global_meta_if_needed(snapshot: &mut ManagedSnapshot, config: &ManagedLakeConfig) {
+pub(crate) fn initialize_global_meta_if_needed(
+    snapshot: &mut ManagedSnapshot,
+    config: &ManagedLakeConfig,
+) {
     if snapshot.global == Default::default() {
         snapshot.global.warehouse_uri = config.warehouse_uri.clone();
         snapshot.global.next_db_id = 1;
@@ -547,7 +550,7 @@ fn initialize_global_meta_if_needed(snapshot: &mut ManagedSnapshot, config: &Man
 /// `(db_id, name)`, drop it (and its associated schema / column / partition /
 /// index / tablet / erase_job / txn rows) so a subsequent ACTIVE insert doesn't
 /// trip the `UNIQUE(db_id, name)` constraint during snapshot replay.
-fn reclaim_dropping_table_for_reuse(
+pub(crate) fn reclaim_dropping_table_for_reuse(
     snapshot: &mut ManagedSnapshot,
     db_id: i64,
     table_name: &str,
@@ -567,7 +570,9 @@ fn reclaim_dropping_table_for_reuse(
         return Ok(());
     }
     let stale_set: HashSet<i64> = stale_ids.iter().copied().collect();
-    snapshot.tables.retain(|tbl| !stale_set.contains(&tbl.table_id));
+    snapshot
+        .tables
+        .retain(|tbl| !stale_set.contains(&tbl.table_id));
     let stale_partition_ids: HashSet<i64> = snapshot
         .partitions
         .iter()
@@ -677,6 +682,40 @@ fn bootstrap_truncated_partition(
     Ok(())
 }
 
+pub(crate) fn bootstrap_empty_partition_for_tablets(
+    runtime: &ManagedTableRuntime,
+    managed_config: &ManagedLakeConfig,
+    partition_id: i64,
+    tablet_ids: &[i64],
+) -> Result<(), String> {
+    let request_schema = request_schema_from_runtime(runtime)?;
+    let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
+    let tablet_root_path =
+        managed_config.tablet_root_path(runtime.table.db_id, runtime.table.table_id, partition_id);
+    for tablet_id in tablet_ids {
+        let request = build_create_tablet_request(
+            *tablet_id,
+            runtime.table.table_id,
+            partition_id,
+            request_schema.clone(),
+        );
+        create_lake_tablet_from_req(&request, &tablet_root_path, Some(managed_config.s3.clone()))?;
+        let runtime_schema = get_tablet_runtime(*tablet_id)?.schema;
+        let loaded = load_tablet_snapshot(
+            *tablet_id,
+            1,
+            &tablet_root_path,
+            Some(&object_store_profile),
+        )?;
+        if loaded.tablet_schema != runtime_schema {
+            return Err(format!(
+                "managed bootstrap schema mismatch after bootstrap: tablet_id={tablet_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn request_schema_from_runtime(
     runtime: &ManagedTableRuntime,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
@@ -714,7 +753,7 @@ fn request_schema_from_runtime(
     )
 }
 
-fn build_create_tablet_request(
+pub(crate) fn build_create_tablet_request(
     tablet_id: i64,
     table_id: i64,
     partition_id: i64,
@@ -750,7 +789,7 @@ fn build_create_tablet_request(
     }
 }
 
-fn build_tablet_schema(
+pub(crate) fn build_tablet_schema(
     columns: &[TableColumnDef],
     key_desc: &TableKeyDesc,
     schema_id: i64,
@@ -1019,7 +1058,7 @@ fn index_length_for_sql_type(data_type: &SqlType) -> Option<i32> {
     }
 }
 
-fn logical_type_name(data_type: &SqlType) -> String {
+pub(crate) fn logical_type_name(data_type: &SqlType) -> String {
     match data_type {
         SqlType::TinyInt => "TINYINT".to_string(),
         SqlType::SmallInt => "SMALLINT".to_string(),
@@ -1056,7 +1095,7 @@ fn to_keys_type(kind: TableKeyKind) -> crate::types::TKeysType {
     }
 }
 
-fn keys_type_name(kind: TableKeyKind) -> &'static str {
+pub(crate) fn keys_type_name(kind: TableKeyKind) -> &'static str {
     match kind {
         TableKeyKind::Duplicate => "DUP_KEYS",
         TableKeyKind::Unique => "UNIQUE_KEYS",
