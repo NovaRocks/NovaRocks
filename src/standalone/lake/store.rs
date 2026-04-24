@@ -269,6 +269,13 @@ pub(crate) struct ActivateMvRefreshRequest {
     pub snapshots: std::collections::BTreeMap<String, i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpdateMvRefreshMetadataRequest {
+    pub table_id: i64,
+    pub last_refresh_rows: i64,
+    pub snapshots: std::collections::BTreeMap<String, i64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ManagedTableState {
     Creating,
@@ -1307,6 +1314,21 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    pub(crate) fn update_mv_refresh_metadata(
+        &self,
+        req: UpdateMvRefreshMetadataRequest,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin update_mv_refresh_metadata transaction failed: {e}"))?;
+        update_mv_refresh_metadata_in_tx(&tx, &req)
+            .map_err(|e| format!("update mv refresh metadata failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit update_mv_refresh_metadata failed: {e}"))?;
+        Ok(())
+    }
+
     pub(crate) fn enqueue_erase_job_for_partition_root(
         &self,
         table_id: i64,
@@ -1422,6 +1444,42 @@ impl SqliteMetadataStore {
         .map_err(|e| format!("advance partition version failed: {e}"))?;
         tx.commit()
             .map_err(|e| format!("commit mark_txn_visible failed: {e}"))?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_txn_visible_with_mv_refresh_metadata(
+        &self,
+        txn_id: i64,
+        commit_version: i64,
+        req: UpdateMvRefreshMetadataRequest,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn.unchecked_transaction().map_err(|e| {
+            format!("begin mark_txn_visible_with_mv_refresh_metadata transaction failed: {e}")
+        })?;
+        let partition_id: i64 = tx
+            .query_row(
+                "SELECT partition_id FROM txns WHERE txn_id = ?1",
+                params![txn_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load partition for txn {txn_id} failed: {e}"))?;
+        tx.execute(
+            "UPDATE txns SET state = 'VISIBLE', updated_at_ms = strftime('%s','now') * 1000
+             WHERE txn_id = ?1",
+            params![txn_id],
+        )
+        .map_err(|e| format!("mark txn visible failed: {e}"))?;
+        tx.execute(
+            "UPDATE partitions SET visible_version = ?1, next_version = ?2
+             WHERE partition_id = ?3",
+            params![commit_version, commit_version + 1, partition_id],
+        )
+        .map_err(|e| format!("advance partition version failed: {e}"))?;
+        update_mv_refresh_metadata_in_tx(&tx, &req)
+            .map_err(|e| format!("update mv refresh metadata failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit mark_txn_visible_with_mv_refresh_metadata failed: {e}"))?;
         Ok(())
     }
 
@@ -2275,6 +2333,37 @@ impl SqliteMetadataStore {
     }
 }
 
+fn update_mv_refresh_metadata_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    req: &UpdateMvRefreshMetadataRequest,
+) -> Result<(), String> {
+    let snapshots_json = if req.snapshots.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&req.snapshots)
+                .map_err(|e| format!("serialize mv refresh snapshots failed: {e}"))?,
+        )
+    };
+    let changed = tx
+        .execute(
+            "UPDATE materialized_views
+             SET last_refresh_ms = strftime('%s','now') * 1000,
+                 last_refresh_rows = ?1,
+                 last_refresh_snapshots_json = ?2
+             WHERE mv_id = ?3",
+            params![req.last_refresh_rows, snapshots_json, req.table_id],
+        )
+        .map_err(|e| format!("update materialized_view last_refresh fields failed: {e}"))?;
+    if changed != 1 {
+        return Err(format!(
+            "materialized view {} metadata row not found",
+            req.table_id
+        ));
+    }
+    Ok(())
+}
+
 fn json_to_sql_error(err: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(err))
 }
@@ -2318,7 +2407,7 @@ mod tests {
         StageManagedTruncateRequest, StageMvRefreshRequest, StoredManagedColumn,
         StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex, StoredManagedPartition,
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
-        StoredMaterializedView,
+        StoredMaterializedView, UpdateMvRefreshMetadataRequest,
     };
 
     #[test]
@@ -2592,6 +2681,97 @@ mod tests {
             .expect("partition row");
         assert_eq!(partition.visible_version, 2);
         assert_eq!(partition.next_version, 3);
+    }
+
+    #[test]
+    fn update_mv_refresh_metadata_only_updates_last_refresh_fields() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let mut snapshot = store.load_snapshot().expect("load").managed;
+        snapshot.tables[0].kind = ManagedTableKind::MaterializedView;
+        snapshot.materialized_views.push(StoredMaterializedView {
+            mv_id: 10,
+            select_sql: "select k1 from ice.ns.orders".to_string(),
+            refresh_mode: ManagedMvRefreshMode::DeferredManual,
+            base_table_refs: vec![IcebergTableRef {
+                catalog: "ice".to_string(),
+                namespace: "ns".to_string(),
+                table: "orders".to_string(),
+            }],
+            last_refresh_ms: None,
+            last_refresh_rows: Some(3),
+            last_refresh_snapshots: std::collections::BTreeMap::new(),
+            created_at_ms: 1,
+        });
+        store.replace_managed_snapshot(&snapshot).expect("persist");
+
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert("ice.ns.orders".to_string(), 88);
+        store
+            .update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
+                table_id: 10,
+                last_refresh_rows: 3,
+                snapshots: snapshots.clone(),
+            })
+            .expect("update metadata");
+
+        let loaded = store.load_snapshot().expect("reload").managed;
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv");
+        assert_eq!(mv.last_refresh_rows, Some(3));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
+        assert!(mv.last_refresh_ms.is_some());
+    }
+
+    #[test]
+    fn mark_txn_visible_with_mv_refresh_metadata_is_atomic() {
+        let (_dir, store) = bootstrapped_store_for_txn();
+        let mut snapshot = store.load_snapshot().expect("load").managed;
+        snapshot.tables[0].kind = ManagedTableKind::MaterializedView;
+        snapshot.materialized_views.push(StoredMaterializedView {
+            mv_id: 10,
+            select_sql: "select k1 from ice.ns.orders".to_string(),
+            refresh_mode: ManagedMvRefreshMode::DeferredManual,
+            base_table_refs: vec![],
+            last_refresh_ms: Some(1),
+            last_refresh_rows: Some(2),
+            last_refresh_snapshots: std::collections::BTreeMap::new(),
+            created_at_ms: 1,
+        });
+        store.replace_managed_snapshot(&snapshot).expect("persist");
+        let prepared = store.prepare_txn(10, 20, 1).expect("prepare");
+        store.mark_txn_written(prepared.txn_id).expect("written");
+
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert("ice.ns.orders".to_string(), 99);
+        store
+            .mark_txn_visible_with_mv_refresh_metadata(
+                prepared.txn_id,
+                prepared.commit_version,
+                UpdateMvRefreshMetadataRequest {
+                    table_id: 10,
+                    last_refresh_rows: 4,
+                    snapshots: snapshots.clone(),
+                },
+            )
+            .expect("visible with metadata");
+
+        let loaded = store.load_snapshot().expect("reload").managed;
+        let partition = loaded
+            .partitions
+            .iter()
+            .find(|p| p.partition_id == 20)
+            .expect("partition");
+        assert_eq!(partition.visible_version, 2);
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv");
+        assert_eq!(mv.last_refresh_rows, Some(4));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
     }
 
     #[test]
