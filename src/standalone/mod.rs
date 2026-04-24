@@ -12,6 +12,7 @@ pub use engine::{
     StandaloneManagedTableInfo, StandaloneManagedTabletInfo, StandaloneNovaRocks,
     StandaloneOptions, StandaloneSession,
 };
+pub(crate) use engine::catalog::normalize_identifier;
 pub use server::{StandaloneServerOptions, StandaloneTableConfig, run_standalone_server};
 
 fn stream_load_engine_cell() -> &'static OnceLock<StandaloneNovaRocks> {

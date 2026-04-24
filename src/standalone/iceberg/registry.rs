@@ -155,7 +155,7 @@ pub(crate) fn namespace_exists(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for namespace check: {e}"))?;
-        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
+        let (_, root_prefix) = crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
@@ -199,7 +199,7 @@ pub(crate) fn list_tables(
     if let Some(s3_config) = &entry.s3_config {
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for list tables: {e}"))?;
-        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
+        let (_, root_prefix) = crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let ns_prefix = format!("{}/{}/", root_prefix.trim_end_matches('/'), ns_name);
         block_on_iceberg(async {
@@ -324,7 +324,7 @@ pub(crate) fn load_table(
         // S3 path: discover metadata from S3 directly
         let op = crate::fs::object_store::build_oss_operator(s3_config)
             .map_err(|e| format!("build S3 operator for load_table: {e}"))?;
-        let (_, root_prefix) = super::add_files::parse_s3_path(&entry.warehouse_uri)
+        let (_, root_prefix) = crate::connector::iceberg::catalog::add_files::parse_s3_path(&entry.warehouse_uri)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let meta_prefix = format!(
             "{}/{}/{}/metadata/",
@@ -895,7 +895,7 @@ fn build_catalog_entry(
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
         })?;
-        let (bucket, _root_prefix) = super::add_files::parse_s3_path(&raw_warehouse)
+        let (bucket, _root_prefix) = crate::connector::iceberg::catalog::add_files::parse_s3_path(&raw_warehouse)
             .map_err(|e| format!("parse warehouse URI: {e}"))?;
         let cfg = crate::fs::object_store::ObjectStoreConfig {
             endpoint: s3_factory.endpoint.clone(),

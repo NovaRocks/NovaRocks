@@ -1,7 +1,7 @@
 use crate::common::app_config::StandaloneManagedLakeConfig as AppManagedLakeConfig;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
-use super::super::iceberg::add_files::parse_s3_path;
+use crate::connector::iceberg::catalog::add_files::parse_s3_path;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedLakeConfig {

@@ -4,5 +4,6 @@
 //!
 //! Files will be added incrementally by the next tasks in this plan.
 
+pub(crate) mod add_files;
 pub(crate) mod hadoop_catalog;
 pub(crate) mod s3_storage;
