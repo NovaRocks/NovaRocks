@@ -960,11 +960,70 @@ fn normalize_incremental_mv_base_ref(
     ))
 }
 
+fn extract_three_part_table_ref_occurrences(
+    query: &sqlparser::ast::Query,
+) -> Vec<(String, String, String)> {
+    let mut refs = Vec::new();
+    extract_three_part_ref_occurrences_from_set_expr(query.body.as_ref(), &mut refs);
+    refs
+}
+
+fn extract_three_part_ref_occurrences_from_set_expr(
+    expr: &sqlparser::ast::SetExpr,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &select.from {
+                extract_three_part_ref_occurrences_from_factor(&from.relation, refs);
+                for join in &from.joins {
+                    extract_three_part_ref_occurrences_from_factor(&join.relation, refs);
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            extract_three_part_ref_occurrences_from_set_expr(left, refs);
+            extract_three_part_ref_occurrences_from_set_expr(right, refs);
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            extract_three_part_ref_occurrences_from_set_expr(query.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
+fn extract_three_part_ref_occurrences_from_factor(
+    factor: &sqlparser::ast::TableFactor,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if parts.len() == 3 {
+                refs.push((parts[0].clone(), parts[1].clone(), parts[2].clone()));
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            extract_three_part_ref_occurrences_from_set_expr(subquery.body.as_ref(), refs);
+        }
+        _ => {}
+    }
+}
+
 fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
     base_ref: &crate::standalone::lake::store::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
-    let refs = extract_three_part_table_refs(query);
+    let refs = extract_three_part_table_ref_occurrences(query);
     if refs.len() != 1 {
         return Err(format!(
             "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got {}",
@@ -2979,6 +3038,21 @@ enable_path_style_access = true
             vec![],
         )
         .expect_err("multiple base refs must fail");
+        assert!(
+            err.contains(
+                "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got 2"
+            ),
+            "err={err}"
+        );
+
+        let err = super::execute_query_for_mv_incremental_refresh(
+            &state,
+            "default",
+            "select * from ice.db1.tbl t join ice.db1.tbl u on t.id = u.id",
+            &base_ref,
+            vec![],
+        )
+        .expect_err("repeated base ref must fail");
         assert!(
             err.contains(
                 "incremental MV refresh stored SQL must reference exactly one 3-part Iceberg table, got 2"
