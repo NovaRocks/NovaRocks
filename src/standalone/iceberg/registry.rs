@@ -808,8 +808,12 @@ pub(crate) fn extract_data_files_with_stats(
                             stats_map.insert(
                                 col_name.clone(),
                                 crate::sql::catalog::IcebergColumnStats {
-                                    null_count: null_counts.get(&fid).map(|&v| v as i64),
-                                    column_size: col_sizes.get(&fid).map(|&v| v as i64),
+                                    null_count: null_counts
+                                        .get(&fid)
+                                        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX)),
+                                    column_size: col_sizes
+                                        .get(&fid)
+                                        .map(|&v| i64::try_from(v).unwrap_or(i64::MAX)),
                                     lower_bound: lb,
                                     upper_bound: ub,
                                 },
