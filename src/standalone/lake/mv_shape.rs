@@ -12,6 +12,7 @@ pub(crate) fn classify_incremental_mv_query(
         return Err(projection_filter_error());
     };
     reject_unsupported_select_clauses(select)?;
+    reject_match_against_before_from_shape_check(select)?;
 
     let [from] = select.from.as_slice() else {
         return Err(single_base_table_error());
@@ -122,6 +123,46 @@ fn reject_unsupported_select_item_expr(item: &sqlparser::ast::SelectItem) -> Res
     }
 }
 
+fn reject_match_against_before_from_shape_check(
+    select: &sqlparser::ast::Select,
+) -> Result<(), String> {
+    for item in &select.projection {
+        match item {
+            sqlparser::ast::SelectItem::UnnamedExpr(expr)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                if contains_match_against(expr) {
+                    return Err(projection_filter_error());
+                }
+            }
+            sqlparser::ast::SelectItem::QualifiedWildcard(
+                sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
+                _,
+            ) => {
+                if contains_match_against(expr) {
+                    return Err(projection_filter_error());
+                }
+            }
+            sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+            | sqlparser::ast::SelectItem::Wildcard(_) => {}
+        }
+    }
+    if let Some(selection) = &select.selection
+        && contains_match_against(selection)
+    {
+        return Err(projection_filter_error());
+    }
+    Ok(())
+}
+
+fn contains_match_against(expr: &sqlparser::ast::Expr) -> bool {
+    matches!(expr, sqlparser::ast::Expr::MatchAgainst { .. })
+        || matches!(
+            expr,
+            sqlparser::ast::Expr::Function(function)
+                if function.name.to_string().eq_ignore_ascii_case("match")
+        )
+}
+
 fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
     use sqlparser::ast::Expr;
 
@@ -131,7 +172,8 @@ fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
         | Expr::InSubquery { .. }
         | Expr::GroupingSets(_)
         | Expr::Cube(_)
-        | Expr::Rollup(_) => return Err(projection_filter_error()),
+        | Expr::Rollup(_)
+        | Expr::MatchAgainst { .. } => return Err(projection_filter_error()),
         Expr::Function(function) => reject_unsupported_function(function)?,
         Expr::CompoundFieldAccess { root, access_chain } => {
             reject_unsupported_expr(root)?;
@@ -297,7 +339,6 @@ fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
         | Expr::CompoundIdentifier(_)
         | Expr::Value(_)
         | Expr::TypedString(_)
-        | Expr::MatchAgainst { .. }
         | Expr::Wildcard(_)
         | Expr::QualifiedWildcard(_, _) => {}
     }
@@ -377,6 +418,9 @@ fn reject_unsupported_function_arguments(
         sqlparser::ast::FunctionArguments::None => Ok(()),
         sqlparser::ast::FunctionArguments::Subquery(_) => Err(projection_filter_error()),
         sqlparser::ast::FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() {
+                return Err(projection_filter_error());
+            }
             for arg in &list.args {
                 reject_unsupported_function_arg(arg)?;
             }
@@ -412,7 +456,13 @@ fn reject_unsupported_function_arg_clause(
         }
         sqlparser::ast::FunctionArgumentClause::Limit(expr) => reject_unsupported_expr(expr),
         sqlparser::ast::FunctionArgumentClause::Having(bound) => reject_unsupported_expr(&bound.1),
-        _ => Ok(()),
+        sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(_)
+        | sqlparser::ast::FunctionArgumentClause::OnOverflow(_)
+        | sqlparser::ast::FunctionArgumentClause::Separator(_)
+        | sqlparser::ast::FunctionArgumentClause::JsonNullClause(_)
+        | sqlparser::ast::FunctionArgumentClause::JsonReturningClause(_) => {
+            Err(projection_filter_error())
+        }
     }
 }
 
@@ -600,7 +650,7 @@ mod tests {
         let err = classify_sql(sql).expect_err("query should be rejected");
         assert!(
             err.contains(needle),
-            "expected error to contain `{needle}`, got `{err}`"
+            "expected error to contain `{needle}` for `{sql}`, got `{err}`"
         );
     }
 
@@ -705,9 +755,23 @@ mod tests {
             "select sleep(1) from ice.ns.orders",
             "select current_user() from ice.ns.orders",
             "select database() from ice.ns.orders",
+            "select version() from ice.ns.orders",
+            "select user() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "projection/filter");
         }
+    }
+
+    #[test]
+    fn rejects_unsupported_function_arguments_and_match_against() {
+        assert_rejects_with(
+            "select abs(distinct v2) from ice.ns.orders",
+            "projection/filter",
+        );
+        assert_rejects_with(
+            "select match(k1) against ('x') from ice.ns.orders",
+            "projection/filter",
+        );
     }
 
     #[test]
