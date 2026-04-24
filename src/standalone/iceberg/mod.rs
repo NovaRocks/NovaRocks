@@ -1,7 +1,6 @@
 //! Iceberg catalog subsystem.
 
 pub(crate) mod add_files;
-pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
 
 // Preserve the surface that callers previously got from

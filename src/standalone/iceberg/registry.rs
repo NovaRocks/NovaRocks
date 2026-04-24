@@ -952,7 +952,7 @@ fn build_catalog_entry(
 /// convention (`v{N}.metadata.json` + `version-hint.text`).
 pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
-) -> Result<super::hadoop_catalog::HadoopFileSystemCatalog, String> {
+) -> Result<crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
         let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
             &entry.properties,
@@ -966,7 +966,7 @@ pub(crate) fn build_hadoop_catalog(
         Arc::new(iceberg::io::LocalFsStorageFactory)
     };
     let file_io = iceberg::io::FileIOBuilder::new(storage_factory).build();
-    Ok(super::hadoop_catalog::HadoopFileSystemCatalog::new(
+    Ok(crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog::new(
         file_io,
         entry.warehouse_uri.clone(),
     ))
