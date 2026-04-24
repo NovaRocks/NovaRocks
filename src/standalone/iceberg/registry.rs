@@ -684,7 +684,7 @@ pub(crate) fn plan_append_delta(
                     added_files.push((
                         df.file_path().to_string(),
                         i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
-                        Some(df.record_count() as i64),
+                        Some(i64::try_from(df.record_count()).unwrap_or(i64::MAX)),
                     ));
                 }
             }
@@ -1910,6 +1910,12 @@ mod phase2_delta_tests {
                 .iter()
                 .all(|(_, _, rows)| rows.unwrap_or_default() > 0)
         );
+        let returned_rows: i64 = delta
+            .added_files
+            .iter()
+            .map(|(_, _, rows)| rows.unwrap_or_default())
+            .sum();
+        assert_eq!(returned_rows, 1);
     }
 
     #[test]
