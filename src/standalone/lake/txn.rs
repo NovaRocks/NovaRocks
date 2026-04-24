@@ -676,42 +676,12 @@ fn insert_from_query_into_managed_lake(
     }
     let chunk = build_chunk_for_insert(aligned, plan.columns.len())?;
 
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "managed lake insert requires sqlite metadata store".to_string())?;
-    let prepared =
-        metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
-
-    let mut next_file_seq = 0_u64;
-    let write_outcome =
-        write_routed_chunks(state, plan, &chunk, prepared.txn_id, &mut next_file_seq);
-    let written_tablet_ids = match write_outcome {
-        Ok(ids) => ids,
-        Err(err) => {
-            if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
-                return Err(format!(
-                    "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
-                ));
-            }
-            return Err(err);
-        }
-    };
-
-    metadata_store.mark_txn_written(prepared.txn_id)?;
-
-    publish_managed_txn(plan, &prepared, &written_tablet_ids).map_err(|err| {
-        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
-            return format!(
-                "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
-            );
-        }
-        format!("managed-lake publish failed: {err}")
-    })?;
-
-    metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
-
-    commit_catalog_visible_version(state, plan, prepared.commit_version)?;
+    write_chunks_into_managed_partition_inner(
+        state,
+        plan.clone(),
+        &[chunk],
+        VisibleCommitAction::Plain,
+    )?;
 
     Ok(StatementResult::Ok)
 }
