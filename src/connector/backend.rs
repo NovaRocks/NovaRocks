@@ -22,7 +22,7 @@ use crate::sql::parser::ast::{
 /// backends ignore fields that don't apply to them (e.g. `bucket_count` is
 /// managed-lake-only).
 #[derive(Clone, Debug)]
-pub struct CreateTableRequest {
+pub(crate) struct CreateTableRequest {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -36,7 +36,7 @@ pub struct CreateTableRequest {
 /// the subset of table shape the engine layer needs in order to plan INSERTs
 /// and to register the table with the in-memory logical catalog.
 #[derive(Clone, Debug)]
-pub struct ResolvedTable {
+pub(crate) struct ResolvedTable {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -47,7 +47,7 @@ pub struct ResolvedTable {
 
 /// Catalog-plane operations: create/drop namespace, create/drop/load/list
 /// tables. Implemented once per catalog type (iceberg, managed-lake, ...).
-pub trait CatalogBackend: Send + Sync {
+pub(crate) trait CatalogBackend: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn namespace_exists(&self, catalog: &str, namespace: &str) -> Result<bool, String>;
@@ -75,7 +75,7 @@ pub trait CatalogBackend: Send + Sync {
 /// is eager (whole-table load) because both current backends use it to
 /// register iceberg bases for MV refresh and for small-table quick paths.
 /// A streaming variant is a future extension.
-pub trait TableSource: Send + Sync {
+pub(crate) trait TableSource: Send + Sync {
     fn name(&self) -> &'static str;
     fn load_full(&self, table: &ResolvedTable) -> Result<RecordBatch, String>;
 
@@ -88,18 +88,10 @@ pub trait TableSource: Send + Sync {
 /// Write-side: append rows or RecordBatches to a table. The INSERT
 /// orchestration layer (`insert_flow.rs`, Phase 3) chooses between the two
 /// depending on whether the source is literal VALUES or a pipeline result.
-pub trait TableSink: Send + Sync {
+pub(crate) trait TableSink: Send + Sync {
     fn name(&self) -> &'static str;
-    fn append_rows(
-        &self,
-        table: &ResolvedTable,
-        rows: &[Vec<Literal>],
-    ) -> Result<(), String>;
-    fn append_batch(
-        &self,
-        table: &ResolvedTable,
-        batch: RecordBatch,
-    ) -> Result<(), String>;
+    fn append_rows(&self, table: &ResolvedTable, rows: &[Vec<Literal>]) -> Result<(), String>;
+    fn append_batch(&self, table: &ResolvedTable, batch: RecordBatch) -> Result<(), String>;
 
     /// Whether this sink supports INSERT SELECT from a pipeline plan. If
     /// false, the engine falls back to VALUES / generate_series fast paths
@@ -111,10 +103,18 @@ pub trait TableSink: Send + Sync {
 /// Materialized-view backend: CREATE / DROP / REFRESH / SHOW. Today only
 /// managed-lake implements this; iceberg returns `unsupported`. Future
 /// backends (e.g. iceberg-as-MV-target) plug in here.
-pub trait MvBackend: Send + Sync {
+pub(crate) trait MvBackend: Send + Sync {
     fn name(&self) -> &'static str;
-    fn create_mv(&self, stmt: &CreateMaterializedViewStmt, current_database: &str) -> Result<(), String>;
-    fn drop_mv(&self, stmt: &DropMaterializedViewStmt, current_database: &str) -> Result<(), String>;
+    fn create_mv(
+        &self,
+        stmt: &CreateMaterializedViewStmt,
+        current_database: &str,
+    ) -> Result<(), String>;
+    fn drop_mv(
+        &self,
+        stmt: &DropMaterializedViewStmt,
+        current_database: &str,
+    ) -> Result<(), String>;
     fn refresh_mv(
         &self,
         stmt: &RefreshMaterializedViewStmt,
@@ -126,20 +126,36 @@ pub trait MvBackend: Send + Sync {
 
 /// Trivial "null object" MV backend used by connectors that don't support
 /// materialized views. Every method returns a typed error.
-pub struct NoMvBackend(pub &'static str);
+pub(crate) struct NoMvBackend(pub(crate) &'static str);
 impl MvBackend for NoMvBackend {
-    fn name(&self) -> &'static str { self.0 }
+    fn name(&self) -> &'static str {
+        self.0
+    }
     fn create_mv(&self, _: &CreateMaterializedViewStmt, _: &str) -> Result<(), String> {
-        Err(format!("connector {} does not support materialized views", self.0))
+        Err(format!(
+            "connector {} does not support materialized views",
+            self.0
+        ))
     }
     fn drop_mv(&self, _: &DropMaterializedViewStmt, _: &str) -> Result<(), String> {
-        Err(format!("connector {} does not support materialized views", self.0))
+        Err(format!(
+            "connector {} does not support materialized views",
+            self.0
+        ))
     }
     fn refresh_mv(&self, _: &RefreshMaterializedViewStmt, _: &str) -> Result<(), String> {
-        Err(format!("connector {} does not support materialized views", self.0))
+        Err(format!(
+            "connector {} does not support materialized views",
+            self.0
+        ))
     }
     fn list_mvs(&self, _: &ShowMaterializedViewsStmt) -> Result<QueryResult, String> {
-        Err(format!("connector {} does not support materialized views", self.0))
+        Err(format!(
+            "connector {} does not support materialized views",
+            self.0
+        ))
     }
-    fn supports_incremental_refresh(&self) -> bool { false }
+    fn supports_incremental_refresh(&self) -> bool {
+        false
+    }
 }

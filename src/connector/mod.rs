@@ -14,14 +14,14 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-pub mod backend;
+pub(crate) mod backend;
 pub mod hdfs;
 pub mod iceberg;
 pub mod jdbc;
 pub mod schema;
 pub mod starrocks;
 
-pub use backend::{
+pub(crate) use backend::{
     CatalogBackend, CreateTableRequest, MvBackend, NoMvBackend, ResolvedTable, TableSink,
     TableSource,
 };
