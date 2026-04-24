@@ -347,6 +347,7 @@ fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<()
     if is_aggregate_function(&function_name)
         || is_window_only_function(&function_name)
         || is_grouping_function(&function_name)
+        || is_unsafe_scalar_function(&function_name)
         || function.over.is_some()
     {
         return Err(projection_filter_error());
@@ -462,6 +463,13 @@ fn is_window_only_function(name: &str) -> bool {
 
 fn is_grouping_function(name: &str) -> bool {
     matches!(name, "grouping" | "grouping_id")
+}
+
+fn is_unsafe_scalar_function(name: &str) -> bool {
+    matches!(
+        name,
+        "sleep" | "version" | "database" | "current_user" | "user"
+    )
 }
 
 fn is_aggregate_function(name: &str) -> bool {
@@ -660,8 +668,15 @@ mod tests {
         for sql in [
             "select row_number() from ice.ns.orders",
             "select rank() from ice.ns.orders",
+            "select dense_rank() from ice.ns.orders",
+            "select cume_dist() from ice.ns.orders",
+            "select percent_rank() from ice.ns.orders",
+            "select ntile(4) from ice.ns.orders",
             "select lag(k1) from ice.ns.orders",
+            "select lead(k1) from ice.ns.orders",
             "select first_value(k1) from ice.ns.orders",
+            "select last_value(k1) from ice.ns.orders",
+            "select session_number() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "projection/filter");
         }
@@ -682,6 +697,17 @@ mod tests {
             "select grouping_id(k1) from ice.ns.orders",
             "projection/filter",
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_scalar_functions() {
+        for sql in [
+            "select sleep(1) from ice.ns.orders",
+            "select current_user() from ice.ns.orders",
+            "select database() from ice.ns.orders",
+        ] {
+            assert_rejects_with(sql, "projection/filter");
+        }
     }
 
     #[test]
