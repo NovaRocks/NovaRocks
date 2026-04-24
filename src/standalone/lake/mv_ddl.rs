@@ -87,6 +87,7 @@ pub(crate) fn create_mv(
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
+    validate_incremental_create_shape(stmt)?;
     {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
         if !catalog.database_exists(&db_name)? {
@@ -274,6 +275,11 @@ pub(crate) fn create_mv(
         .expect("standalone catalog write lock");
     register_managed_table_in_catalog(&mut catalog, &runtime)?;
     Ok(StatementResult::Ok)
+}
+
+fn validate_incremental_create_shape(stmt: &CreateMaterializedViewStmt) -> Result<(), String> {
+    crate::standalone::lake::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+    Ok(())
 }
 
 pub(crate) fn drop_mv(
@@ -777,6 +783,14 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    fn parse_create_mv(sql: &str) -> crate::sql::parser::ast::CreateMaterializedViewStmt {
+        let stmt = crate::sql::parser::parse_sql(sql).expect("parse").remove(0);
+        let crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) = stmt else {
+            panic!("not create mv");
+        };
+        stmt
+    }
+
     #[test]
     fn extract_base_table_refs_rejects_non_iceberg_tables() {
         let err = extract_base_table_refs(&[ResolvedTableRef::ManagedLake {
@@ -804,5 +818,24 @@ mod tests {
         .expect("ok");
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].fqn(), "iceberg_cat.ns.orders");
+    }
+
+    #[test]
+    fn create_mv_shape_accepts_projection_filter() {
+        let stmt = parse_create_mv(
+            "create materialized view mv1 distributed by hash(k1) buckets 2 \
+             as select k1, v2 from ice.ns.orders where v2 > 10",
+        );
+        super::validate_incremental_create_shape(&stmt).expect("shape ok");
+    }
+
+    #[test]
+    fn create_mv_shape_rejects_aggregation() {
+        let stmt = parse_create_mv(
+            "create materialized view mv1 distributed by hash(k1) buckets 2 \
+             as select k1, sum(v2) from ice.ns.orders group by k1",
+        );
+        let err = super::validate_incremental_create_shape(&stmt).expect_err("agg rejected");
+        assert!(err.contains("projection/filter"), "err={err}");
     }
 }
