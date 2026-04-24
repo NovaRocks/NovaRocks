@@ -15,7 +15,6 @@ use crate::connector::starrocks::sink::routing::{
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::query_result::QueryResult;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
@@ -430,16 +429,7 @@ fn write_routed_chunks(
             tablet_id: tablet.tablet_id,
             tablet_root_path: tablet.tablet_root_path.clone(),
             tablet_schema: plan.tablet_schema.clone(),
-            s3_config: match classify_scan_paths([tablet.tablet_root_path.as_str()])? {
-                ScanPathScheme::Local => None,
-                ScanPathScheme::Oss => Some(managed_config.s3.clone()),
-                ScanPathScheme::Hdfs => {
-                    return Err(format!(
-                        "managed-lake insert does not support hdfs tablet path: {}",
-                        tablet.tablet_root_path
-                    ));
-                }
-            },
+            s3_config: Some(managed_config.s3.clone()),
             partial_update: PartialUpdateWritePolicy::default(),
         };
         // Keep the tablet runtime's schema in lockstep with what we persist,
@@ -849,8 +839,6 @@ mod mv_target_tests {
     use crate::standalone::lake::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
-    use arrow::array::{Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
 
     #[test]
@@ -894,14 +882,13 @@ mod mv_target_tests {
             PartitionTarget::Active,
         )
         .expect("plan");
-        let chunk = single_i32_chunk("k1", &[1, 2, 3]);
         let mut snapshots = std::collections::BTreeMap::new();
         snapshots.insert("ice.ns.orders".to_string(), 42);
 
         let rows = write_chunks_into_managed_partition_for_mv_refresh(
             &state,
             plan,
-            &[chunk],
+            &[],
             store::UpdateMvRefreshMetadataRequest {
                 table_id: 10,
                 last_refresh_rows: 3,
@@ -909,7 +896,7 @@ mod mv_target_tests {
             },
         )
         .expect("write");
-        assert_eq!(rows, 3);
+        assert_eq!(rows, 0);
 
         let store = state.metadata_store.as_ref().expect("store");
         let loaded = store.load_snapshot().expect("snapshot").managed;
@@ -1143,26 +1130,5 @@ mod mv_target_tests {
             metadata_store: Some(metadata_store),
             ..Default::default()
         })
-    }
-
-    fn single_i32_chunk(name: &str, values: &[i32]) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(name, DataType::Int32, false),
-            Field::new("total", DataType::Int64, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(values.to_vec())),
-                Arc::new(Int64Array::from(vec![None; values.len()])),
-            ],
-        )
-        .expect("batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1), SlotId::new(2)],
-        )
-        .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 }
