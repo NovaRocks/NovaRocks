@@ -12,6 +12,17 @@
 
 use std::sync::Arc;
 
+use crate::connector::iceberg::catalog::{
+    create_namespace as create_iceberg_namespace, create_table as create_iceberg_table,
+    drop_namespace as drop_iceberg_namespace, drop_table as drop_iceberg_table,
+    insert_rows as insert_iceberg_rows, list_tables as list_iceberg_tables,
+    namespace_exists as iceberg_namespace_exists,
+};
+use crate::connector::starrocks::managed::ddl::{
+    create_managed_table, drop_managed_database_entry,
+    drop_managed_table as drop_managed_lake_table,
+    truncate_managed_table as truncate_managed_lake_table,
+};
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
 };
@@ -24,17 +35,6 @@ use crate::standalone::engine::{
     StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
-};
-use crate::connector::iceberg::catalog::{
-    create_namespace as create_iceberg_namespace, create_table as create_iceberg_table,
-    drop_namespace as drop_iceberg_namespace, drop_table as drop_iceberg_table,
-    insert_rows as insert_iceberg_rows, list_tables as list_iceberg_tables,
-    namespace_exists as iceberg_namespace_exists,
-};
-use crate::connector::starrocks::managed::ddl::{
-    create_managed_table, drop_managed_database_entry,
-    drop_managed_table as drop_managed_lake_table,
-    truncate_managed_table as truncate_managed_lake_table,
 };
 
 use super::expr::{sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
@@ -550,8 +550,11 @@ pub(crate) fn execute_insert_statement(
         .read()
         .expect("standalone iceberg catalog read lock");
     let entry = guard.get(&resolved.catalog)?;
-    let loaded =
-        crate::connector::iceberg::catalog::load_table(&entry, &resolved.namespace, &resolved.table)?;
+    let loaded = crate::connector::iceberg::catalog::load_table(
+        &entry,
+        &resolved.namespace,
+        &resolved.table,
+    )?;
     match source {
         InsertSource::Values(rows) => {
             let rows = reorder_insert_rows(rows, columns, &loaded.columns)?;

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
@@ -8,9 +9,10 @@ use crate::standalone::engine::{
     QueryResult, StandaloneState, StatementResult, execute_query_for_mv_incremental_refresh,
     execute_query_for_mv_refresh, record_batch_to_chunk,
 };
-use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
 
-use crate::connector::starrocks::managed::catalog::{ManagedLakeCatalog, register_managed_tables_in_catalog};
+use crate::connector::starrocks::managed::catalog::{
+    ManagedLakeCatalog, register_managed_tables_in_catalog,
+};
 use crate::connector::starrocks::managed::ddl::bootstrap_empty_partition_for_tablets;
 use crate::connector::starrocks::managed::store::{
     ActivateMvRefreshRequest, IcebergTableRef, ManagedPartitionState, ManagedTableKind,
@@ -544,8 +546,6 @@ fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String,
 mod tests {
     use super::*;
 
-    use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::standalone::engine::catalog::InMemoryCatalog;
     use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
     use crate::connector::starrocks::managed::ManagedLakeConfig;
     use crate::connector::starrocks::managed::store::{
@@ -554,6 +554,8 @@ mod tests {
         StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
         StoredMaterializedView,
     };
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::standalone::engine::catalog::InMemoryCatalog;
     use std::sync::RwLock;
 
     #[test]

@@ -7,10 +7,10 @@
 
 use sqlparser::ast as sqlast;
 
+use crate::connector::iceberg::catalog::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
 use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::standalone::engine::reorder_insert_rows;
-use crate::connector::iceberg::catalog::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
 
 use super::expr::{cast_literal, eval_literal_arithmetic, sqlparser_expr_to_literal};
 

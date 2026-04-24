@@ -22,12 +22,12 @@ use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
 
+use super::catalog::register_managed_table_in_catalog;
 use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::standalone::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     execute_query, insert_generate_series_rows_local, reorder_insert_rows,
 };
-use super::catalog::register_managed_table_in_catalog;
 
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
 /// control plane, route rows across tablets, append native-format rowsets,
@@ -864,13 +864,6 @@ mod mv_target_tests {
         TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
-    use crate::formats::starrocks::writer::bundle_meta::{
-        empty_tablet_metadata, write_bundle_meta_file,
-    };
-    use crate::formats::starrocks::writer::layout::txn_log_file_path;
-    use crate::runtime::starlet_shard_registry::S3StoreConfig;
-    use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
-    use crate::standalone::engine::catalog::InMemoryCatalog;
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
         ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
@@ -880,6 +873,13 @@ mod mv_target_tests {
     use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
+    use crate::formats::starrocks::writer::bundle_meta::{
+        empty_tablet_metadata, write_bundle_meta_file,
+    };
+    use crate::formats::starrocks::writer::layout::txn_log_file_path;
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
+    use crate::standalone::engine::catalog::InMemoryCatalog;
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;

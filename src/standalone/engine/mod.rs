@@ -23,7 +23,9 @@ use crate::connector::iceberg::catalog::{
     namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-use crate::connector::starrocks::managed::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
+use crate::connector::starrocks::managed::store::{
+    MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable,
+};
 use crate::connector::starrocks::managed::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
@@ -636,8 +638,12 @@ impl StandaloneSession {
             .expect("iceberg catalog read lock");
         let entry = guard.get(&catalog_name)?;
         drop(guard);
-        let count =
-            crate::connector::iceberg::catalog::add_files::add_files(&entry, &namespace, &table_name, &s3_path)?;
+        let count = crate::connector::iceberg::catalog::add_files::add_files(
+            &entry,
+            &namespace,
+            &table_name,
+            &s3_path,
+        )?;
         let msg = format!("Added {count} file(s)");
         build_string_query_result("status", vec![msg]).map(StatementResult::Query)
     }
@@ -744,7 +750,11 @@ pub(crate) fn dispatch_statement(
             crate::connector::starrocks::managed::mv_ddl::drop_mv(state, current_database, &stmt)
         }
         crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) => {
-            crate::connector::starrocks::managed::mv_refresh::refresh_mv(state, current_database, &stmt)
+            crate::connector::starrocks::managed::mv_refresh::refresh_mv(
+                state,
+                current_database,
+                &stmt,
+            )
         }
         crate::sql::parser::ast::Statement::ShowMaterializedViews(stmt) => {
             crate::connector::starrocks::managed::mv_ddl::list_mvs(state, &stmt)
@@ -900,10 +910,11 @@ fn register_iceberg_tables_for_query_impl(
             }
         }
 
-        let loaded = match crate::connector::iceberg::catalog::load_table(&entry, &namespace, &table_name) {
-            Ok(loaded) => loaded,
-            Err(_) => continue,
-        };
+        let loaded =
+            match crate::connector::iceberg::catalog::load_table(&entry, &namespace, &table_name) {
+                Ok(loaded) => loaded,
+                Err(_) => continue,
+            };
 
         let data_files = crate::connector::iceberg::catalog::extract_data_files(&loaded.table)?;
         register_loaded_iceberg_table_with_files(
@@ -1204,26 +1215,30 @@ fn restore_managed_lake(
         return Ok(());
     };
     let mut managed = snapshot.managed.clone();
-    crate::connector::starrocks::managed::reconcile_on_open(store, &mut managed, |snapshot, txn| {
-        let tablet_ids = snapshot
-            .tablets
-            .iter()
-            .filter(|tablet| {
-                snapshot.indexes.iter().any(|index| {
-                    index.index_id == tablet.index_id
-                        && index.table_id == txn.table_id
-                        && index.partition_id == txn.partition_id
+    crate::connector::starrocks::managed::reconcile_on_open(
+        store,
+        &mut managed,
+        |snapshot, txn| {
+            let tablet_ids = snapshot
+                .tablets
+                .iter()
+                .filter(|tablet| {
+                    snapshot.indexes.iter().any(|index| {
+                        index.index_id == tablet.index_id
+                            && index.table_id == txn.table_id
+                            && index.partition_id == txn.partition_id
+                    })
                 })
-            })
-            .map(|tablet| tablet.tablet_id)
-            .collect::<Vec<_>>();
-        crate::connector::starrocks::managed::txn::publish_tablets_at_version(
-            tablet_ids,
-            txn.txn_id,
-            txn.base_version,
-            txn.commit_version,
-        )
-    })?;
+                .map(|tablet| tablet.tablet_id)
+                .collect::<Vec<_>>();
+            crate::connector::starrocks::managed::txn::publish_tablets_at_version(
+                tablet_ids,
+                txn.txn_id,
+                txn.base_version,
+                txn.commit_version,
+            )
+        },
+    )?;
     let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), managed)?;
     {
         let mut catalog = state
@@ -2905,8 +2920,8 @@ enable_path_style_access = true
                 .expect("iceberg registry read lock");
             registry.get("ice").expect("load iceberg catalog entry")
         };
-        let first_loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl").expect("load first table");
+        let first_loaded = crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl")
+            .expect("load first table");
         let previous_snapshot_id = first_loaded
             .table
             .metadata()
@@ -3099,8 +3114,8 @@ enable_path_style_access = true
                 .expect("iceberg registry read lock");
             registry.get("ice").expect("load iceberg catalog entry")
         };
-        let first_loaded =
-            crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl").expect("load first table");
+        let first_loaded = crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl")
+            .expect("load first table");
         let previous_snapshot_id = first_loaded
             .table
             .metadata()

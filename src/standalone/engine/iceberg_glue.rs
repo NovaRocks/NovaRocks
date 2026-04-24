@@ -11,10 +11,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::TryStreamExt;
 
+use crate::connector::iceberg::catalog::{IcebergLoadedTable, build_insert_batch};
 use crate::standalone::engine::aggregate::merge_aggregate_table_rows_if_needed;
 use crate::standalone::engine::block_on_standalone_async;
 use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
-use crate::connector::iceberg::catalog::{IcebergLoadedTable, build_insert_batch};
 
 pub(crate) fn load_full_iceberg_batch(loaded: &IcebergLoadedTable) -> Result<RecordBatch, String> {
     let batches = block_on_standalone_async(async {

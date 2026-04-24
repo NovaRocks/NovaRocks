@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod jvm;
 pub mod catalog;
+mod jvm;
 pub mod metadata;
 pub mod position_delete;
 pub mod schema;

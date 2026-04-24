@@ -20,8 +20,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use prost::Message;
 
-use crate::standalone::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
-use crate::connector::starrocks::managed::catalog::{ManagedLakeCatalog, register_managed_table_in_catalog};
+use crate::connector::starrocks::managed::catalog::{
+    ManagedLakeCatalog, register_managed_table_in_catalog,
+};
 use crate::connector::starrocks::managed::ddl::{
     build_create_tablet_request, build_tablet_schema, initialize_global_meta_if_needed,
     keys_type_name, logical_type_name, reclaim_dropping_table_for_reuse,
@@ -32,6 +33,7 @@ use crate::connector::starrocks::managed::store::{
     StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
     StoredManagedTxn, StoredMaterializedView,
 };
+use crate::standalone::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 /// Resolved base-table reference as the MV analyzer stage returns it.
 /// Only the `Iceberg` variant is allowed; anything else fails validation.
