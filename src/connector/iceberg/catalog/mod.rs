@@ -3,3 +3,5 @@
 //! during the standalone/connector decoupling refactor (2026-04-24).
 //!
 //! Files will be added incrementally by the next tasks in this plan.
+
+pub(crate) mod s3_storage;

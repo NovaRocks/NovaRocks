@@ -361,7 +361,7 @@ pub(crate) fn load_table(
             format!("{warehouse_trimmed}/{ns_name}/{tbl_name}/metadata/{metadata_file_name}");
 
         let storage_factory =
-            super::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
+            crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(&entry.properties)
                 .ok_or_else(|| "missing S3 properties for FileIO".to_string())?;
         let file_io = iceberg::io::FileIOBuilder::new(Arc::new(storage_factory)).build();
 
@@ -890,7 +890,7 @@ fn build_catalog_entry(
         || raw_warehouse.starts_with("oss://");
 
     let (warehouse_uri, warehouse_path, s3_config) = if is_s3 {
-        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(properties)
+        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(properties)
             .ok_or_else(|| {
             "S3 iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
@@ -954,7 +954,7 @@ pub(crate) fn build_hadoop_catalog(
     entry: &IcebergCatalogEntry,
 ) -> Result<super::hadoop_catalog::HadoopFileSystemCatalog, String> {
     let storage_factory: Arc<dyn iceberg::io::StorageFactory> = if entry.is_s3() {
-        let s3_factory = super::s3_storage::S3StorageFactory::from_catalog_properties(
+        let s3_factory = crate::connector::iceberg::catalog::s3_storage::S3StorageFactory::from_catalog_properties(
             &entry.properties,
         )
         .ok_or_else(|| {

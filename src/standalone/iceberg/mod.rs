@@ -3,7 +3,6 @@
 pub(crate) mod add_files;
 pub(crate) mod hadoop_catalog;
 pub(crate) mod registry;
-pub(crate) mod s3_storage;
 
 // Preserve the surface that callers previously got from
 // `crate::standalone::iceberg::*` (when iceberg.rs was a flat file).
