@@ -839,7 +839,10 @@ mod mv_target_tests {
     use crate::standalone::lake::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
+    use arrow::array::{Int32Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn write_chunks_into_managed_partition_routes_rows_to_staged_tablets() {
@@ -870,7 +873,7 @@ mod mv_target_tests {
     }
 
     #[test]
-    fn write_chunks_into_managed_partition_for_mv_refresh_updates_metadata_atomically() {
+    fn mv_refresh_noop_chunks_updates_metadata_atomically() {
         let _guard = lock_runtime_test_state();
         let state = seed_state_with_active_mv();
         let plan = load_insert_plan(
@@ -909,28 +912,107 @@ mod mv_target_tests {
         assert_eq!(mv.last_refresh_snapshots, snapshots);
     }
 
+    #[test]
+    fn mv_refresh_writes_chunks_when_object_store_available() {
+        let Some(config) = maybe_object_store_config() else {
+            return;
+        };
+        let _guard = lock_runtime_test_state();
+        let Some(state) = seed_state_with_active_mv_on_object_store(config) else {
+            return;
+        };
+        let plan = load_insert_plan(
+            &state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("plan");
+        let chunk = single_i32_chunk("k1", &[1, 2, 3]);
+        let mut snapshots = std::collections::BTreeMap::new();
+        snapshots.insert("ice.ns.orders".to_string(), 42);
+
+        let rows = write_chunks_into_managed_partition_for_mv_refresh(
+            &state,
+            plan,
+            &[chunk],
+            store::UpdateMvRefreshMetadataRequest {
+                table_id: 10,
+                last_refresh_rows: 3,
+                snapshots: snapshots.clone(),
+            },
+        )
+        .expect("write");
+        assert_eq!(rows, 3);
+
+        let store = state.metadata_store.as_ref().expect("store");
+        let loaded = store.load_snapshot().expect("snapshot").managed;
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv");
+        assert_eq!(mv.last_refresh_rows, Some(3));
+        assert_eq!(mv.last_refresh_snapshots, snapshots);
+    }
+
     fn seed_state_with_staged_mv() -> Arc<StandaloneState> {
-        seed_state_with_mv_fixture(false)
+        seed_state_with_mv_fixture(false, MvFixtureStorage::Local).expect("local fixture")
     }
 
     fn seed_state_with_active_mv() -> Arc<StandaloneState> {
-        seed_state_with_mv_fixture(true)
+        seed_state_with_mv_fixture(true, MvFixtureStorage::Local).expect("local fixture")
     }
 
-    fn seed_state_with_mv_fixture(active_mv_metadata: bool) -> Arc<StandaloneState> {
-        let root = tempfile::tempdir().expect("tempdir").keep();
-        let root = root.to_string_lossy().to_string();
-        let config = ManagedLakeConfig {
-            warehouse_uri: root.clone(),
-            s3: S3StoreConfig {
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                bucket: "bucket".to_string(),
-                root: "warehouse".to_string(),
-                access_key_id: "ak".to_string(),
-                access_key_secret: "sk".to_string(),
-                region: None,
-                enable_path_style_access: Some(true),
-            },
+    fn seed_state_with_active_mv_on_object_store(
+        config: ManagedLakeConfig,
+    ) -> Option<Arc<StandaloneState>> {
+        seed_state_with_mv_fixture(true, MvFixtureStorage::ObjectStore(config))
+    }
+
+    enum MvFixtureStorage {
+        Local,
+        ObjectStore(ManagedLakeConfig),
+    }
+
+    fn seed_state_with_mv_fixture(
+        active_mv_metadata: bool,
+        storage: MvFixtureStorage,
+    ) -> Option<Arc<StandaloneState>> {
+        let metadata_root = tempfile::tempdir().expect("tempdir").keep();
+        let metadata_root = metadata_root.to_string_lossy().to_string();
+        let (config, active_tablet_root, staged_tablet_root, tablet_s3_config) = match storage {
+            MvFixtureStorage::Local => {
+                let config = ManagedLakeConfig {
+                    warehouse_uri: metadata_root.clone(),
+                    s3: S3StoreConfig {
+                        endpoint: "http://127.0.0.1:9000".to_string(),
+                        bucket: "bucket".to_string(),
+                        root: "warehouse".to_string(),
+                        access_key_id: "ak".to_string(),
+                        access_key_secret: "sk".to_string(),
+                        region: None,
+                        enable_path_style_access: Some(true),
+                    },
+                };
+                (
+                    config,
+                    format!("{metadata_root}/db_1/table_10/partition_20"),
+                    format!("{metadata_root}/db_1/table_10/partition_21"),
+                    None,
+                )
+            }
+            MvFixtureStorage::ObjectStore(config) => {
+                let root = config.warehouse_uri.trim_end_matches('/').to_string();
+                (
+                    config.clone(),
+                    format!("{root}/db_1/table_10/partition_20"),
+                    format!("{root}/db_1/table_10/partition_21"),
+                    Some(config.s3.clone()),
+                )
+            }
         };
 
         let tablet_schema = TabletSchemaPb {
@@ -964,8 +1046,6 @@ mod mv_target_tests {
             ..Default::default()
         };
 
-        let active_tablet_root = format!("{root}/db_1/table_10/partition_20");
-        let staged_tablet_root = format!("{root}/db_1/table_10/partition_21");
         let snapshot = ManagedSnapshot {
             global: ManagedGlobalMeta {
                 warehouse_uri: config.warehouse_uri.clone(),
@@ -1088,7 +1168,8 @@ mod mv_target_tests {
         };
 
         let metadata_store =
-            SqliteMetadataStore::open(format!("{root}/standalone.sqlite")).expect("open store");
+            SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
+                .expect("open store");
         metadata_store
             .replace_managed_snapshot(&snapshot)
             .expect("persist snapshot");
@@ -1099,20 +1180,24 @@ mod mv_target_tests {
             tablet_id: 40,
             tablet_root_path: active_tablet_root,
             tablet_schema: tablet_schema.clone(),
-            s3_config: None,
+            s3_config: tablet_s3_config,
             partial_update: Default::default(),
         };
         register_tablet_runtime(&runtime_ctx).expect("register runtime");
         let mut base_meta = empty_tablet_metadata(40);
         base_meta.version = Some(1);
-        write_bundle_meta_file(
+        if let Err(err) = write_bundle_meta_file(
             &runtime_ctx.tablet_root_path,
             runtime_ctx.tablet_id,
             1,
             &runtime_ctx.tablet_schema,
             &base_meta,
-        )
-        .expect("write base metadata");
+        ) {
+            eprintln!(
+                "skipping mv object-store chunk write test: write base tablet metadata failed: {err}"
+            );
+            return None;
+        }
 
         let managed =
             ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild managed");
@@ -1123,12 +1208,108 @@ mod mv_target_tests {
         register_managed_tables_in_catalog(&mut catalog, &managed)
             .expect("register managed tables");
 
-        Arc::new(StandaloneState {
+        Some(Arc::new(StandaloneState {
             catalog: std::sync::RwLock::new(catalog),
             managed_lake: std::sync::RwLock::new(managed),
             managed_lake_config: Some(config),
             metadata_store: Some(metadata_store),
             ..Default::default()
+        }))
+    }
+
+    fn maybe_object_store_config() -> Option<ManagedLakeConfig> {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        if !managed_lake_endpoint_reachable(&endpoint) {
+            eprintln!(
+                "skipping mv object-store chunk write test: object store endpoint is unreachable: {endpoint}"
+            );
+            return None;
+        }
+
+        let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("MINIO_ROOT_USER"))
+            .unwrap_or_else(|_| "admin".to_string());
+        let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
+            .unwrap_or_else(|_| "admin123".to_string());
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let root_prefix =
+            std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+        let run_id = format!(
+            "mv_task4_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let root = if root_prefix.trim_matches('/').is_empty() {
+            run_id
+        } else {
+            format!("{}/{}", root_prefix.trim_matches('/'), run_id)
+        };
+        Some(ManagedLakeConfig {
+            warehouse_uri: format!("s3://{bucket}/{root}"),
+            s3: S3StoreConfig {
+                endpoint,
+                bucket,
+                root,
+                access_key_id,
+                access_key_secret,
+                region: None,
+                enable_path_style_access: Some(true),
+            },
         })
+    }
+
+    fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+        let stripped = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(endpoint);
+        let authority = stripped.split('/').next().unwrap_or(stripped);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => match port.parse::<u16>() {
+                Ok(port) => (host, port),
+                Err(_) => return false,
+            },
+            None => {
+                let default_port = if endpoint.starts_with("https://") {
+                    443
+                } else {
+                    80
+                };
+                (authority, default_port)
+            }
+        };
+        std::net::TcpStream::connect_timeout(
+            &format!("{host}:{port}")
+                .parse()
+                .expect("managed lake endpoint socket addr"),
+            Duration::from_secs(1),
+        )
+        .is_ok()
+    }
+
+    fn single_i32_chunk(name: &str, values: &[i32]) -> Chunk {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(name, DataType::Int32, false),
+            Field::new("total", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(values.to_vec())),
+                Arc::new(Int64Array::from(vec![None; values.len()])),
+            ],
+        )
+        .expect("batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 }
