@@ -31,7 +31,7 @@ use crate::standalone::iceberg::{
     insert_rows as insert_iceberg_rows, list_tables as list_iceberg_tables,
     namespace_exists as iceberg_namespace_exists,
 };
-use crate::standalone::lake::ddl::{
+use crate::connector::starrocks::managed::ddl::{
     create_managed_table, drop_managed_database_entry,
     drop_managed_table as drop_managed_lake_table,
     truncate_managed_table as truncate_managed_lake_table,
@@ -533,7 +533,7 @@ pub(crate) fn execute_insert_statement(
                 .expect("standalone managed lake read lock")
                 .contains_table(&resolved.database, &resolved.table)?
             {
-                return crate::standalone::lake::txn::insert_into_managed_lake_table(
+                return crate::connector::starrocks::managed::txn::insert_into_managed_lake_table(
                     state,
                     name,
                     columns,

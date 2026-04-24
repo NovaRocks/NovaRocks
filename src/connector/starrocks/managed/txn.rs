@@ -22,8 +22,8 @@ use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
 
-use super::super::engine::catalog::{ColumnDef, normalize_identifier};
-use super::super::engine::{
+use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::standalone::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
     execute_query, insert_generate_series_rows_local, reorder_insert_rows,
 };
@@ -839,7 +839,7 @@ fn resolve_managed_name(
     name: &ObjectName,
     current_database: &str,
 ) -> Result<ResolvedLocalTableName, String> {
-    use super::super::engine::catalog::normalize_identifier;
+    use crate::standalone::engine::catalog::normalize_identifier;
     match name.parts.as_slice() {
         [table] => Ok(ResolvedLocalTableName {
             database: normalize_identifier(current_database)?,
@@ -871,13 +871,13 @@ mod mv_target_tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::standalone::engine::catalog::InMemoryCatalog;
-    use crate::standalone::lake::store::{
+    use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
         ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
         StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
         StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
-    use crate::standalone::lake::{
+    use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
     };
     use arrow::array::{Int32Array, Int64Array};
@@ -1186,14 +1186,14 @@ mod mv_target_tests {
                 tablet_schema_pb: tablet_schema.encode_to_vec(),
             }],
             columns: vec![
-                crate::standalone::lake::store::StoredManagedColumn {
+                crate::connector::starrocks::managed::store::StoredManagedColumn {
                     schema_id: 100,
                     ordinal: 0,
                     column_name: "k1".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
                 },
-                crate::standalone::lake::store::StoredManagedColumn {
+                crate::connector::starrocks::managed::store::StoredManagedColumn {
                     schema_id: 100,
                     ordinal: 1,
                     column_name: "total".to_string(),

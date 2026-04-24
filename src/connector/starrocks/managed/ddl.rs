@@ -8,8 +8,8 @@ use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
-use super::super::engine::catalog::normalize_identifier;
-use super::super::engine::{StandaloneState, StatementResult};
+use crate::standalone::engine::catalog::normalize_identifier;
+use crate::standalone::engine::{StandaloneState, StatementResult};
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use super::store::{
@@ -1166,13 +1166,13 @@ mod tests {
     use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
     use crate::standalone::engine::StandaloneState;
     use crate::standalone::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
-    use crate::standalone::lake::store::{
+    use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
         StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
-    use crate::standalone::lake::{
+    use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_table_in_catalog,
     };
 

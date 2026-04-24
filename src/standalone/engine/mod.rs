@@ -23,8 +23,8 @@ use super::iceberg::{
     namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-use super::lake::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
-use super::lake::{
+use crate::connector::starrocks::managed::store::{MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable};
+use crate::connector::starrocks::managed::{
     ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
 
@@ -951,7 +951,7 @@ pub(crate) fn execute_query_for_mv_refresh(
 }
 
 fn normalize_incremental_mv_base_ref(
-    base_ref: &crate::standalone::lake::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     Ok((
         normalize_identifier(&base_ref.catalog)?,
@@ -1021,7 +1021,7 @@ fn extract_three_part_ref_occurrences_from_factor(
 
 fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
-    base_ref: &crate::standalone::lake::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     let refs = extract_three_part_table_ref_occurrences(query);
     if refs.len() != 1 {
@@ -1059,7 +1059,7 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
     state: &Arc<StandaloneState>,
     current_database: &str,
     sql: &str,
-    base_ref: &crate::standalone::lake::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     delta_files: Vec<(String, i64, Option<i64>)>,
 ) -> Result<QueryResult, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
@@ -1217,7 +1217,7 @@ fn restore_managed_lake(
             })
             .map(|tablet| tablet.tablet_id)
             .collect::<Vec<_>>();
-        super::lake::txn::publish_tablets_at_version(
+        crate::connector::starrocks::managed::txn::publish_tablets_at_version(
             tablet_ids,
             txn.txn_id,
             txn.base_version,
@@ -1819,7 +1819,7 @@ fn stream_load_managed_lake_table(
     };
     let loaded_rows = rows.len() as i64;
     let loaded_bytes = request.payload.len() as i64;
-    super::lake::txn::insert_into_managed_lake_table(
+    crate::connector::starrocks::managed::txn::insert_into_managed_lake_table(
         state,
         &object_name,
         &insert_columns,
@@ -2931,7 +2931,7 @@ enable_path_style_access = true
             &engine.inner,
             "default",
             "select id, name from ice.db1.tbl order by id",
-            &crate::standalone::lake::store::IcebergTableRef {
+            &crate::connector::starrocks::managed::store::IcebergTableRef {
                 catalog: "ice".to_string(),
                 namespace: "db1".to_string(),
                 table: "tbl".to_string(),
@@ -2992,7 +2992,7 @@ enable_path_style_access = true
             &engine.inner,
             "default",
             "select id, name from ice.db1.tbl",
-            &crate::standalone::lake::store::IcebergTableRef {
+            &crate::connector::starrocks::managed::store::IcebergTableRef {
                 catalog: "ice".to_string(),
                 namespace: "db1".to_string(),
                 table: "other".to_string(),
@@ -3009,7 +3009,7 @@ enable_path_style_access = true
     #[test]
     fn execute_mv_incremental_refresh_rejects_zero_or_multiple_base_refs() {
         let state = Arc::new(StandaloneState::default());
-        let base_ref = crate::standalone::lake::store::IcebergTableRef {
+        let base_ref = crate::connector::starrocks::managed::store::IcebergTableRef {
             catalog: "ice".to_string(),
             namespace: "db1".to_string(),
             table: "tbl".to_string(),
@@ -3131,7 +3131,7 @@ enable_path_style_access = true
             &engine.inner,
             "default",
             "select id, name from ice.db1.tbl",
-            &crate::standalone::lake::store::IcebergTableRef {
+            &crate::connector::starrocks::managed::store::IcebergTableRef {
                 catalog: "ice".to_string(),
                 namespace: "db1".to_string(),
                 table: "tbl".to_string(),
@@ -3311,7 +3311,7 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_reopen_cleans_incomplete_managed_truncate_stage_partition() {
-        use crate::standalone::lake::store::{
+        use crate::connector::starrocks::managed::store::{
             ManagedIndexState, ManagedPartitionState, SqliteMetadataStore, StoredManagedIndex,
             StoredManagedPartition, StoredManagedTablet,
         };
@@ -3449,7 +3449,7 @@ enable_path_style_access = true
 
     #[test]
     fn embedded_session_open_starts_erase_worker_for_pending_jobs() {
-        use crate::standalone::lake::store::{
+        use crate::connector::starrocks::managed::store::{
             ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
             ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
             SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,

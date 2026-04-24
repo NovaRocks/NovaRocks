@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::standalone::engine::StandaloneState;
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
-use crate::standalone::lake::store::{ManagedEraseJobKind, SqliteMetadataStore};
+use crate::connector::starrocks::managed::store::{ManagedEraseJobKind, SqliteMetadataStore};
 use crate::fs::oss::{oss_block_on, resolve_oss_operator_and_path_with_config};
 use crate::novarocks_logging::warn;
 
@@ -120,7 +120,7 @@ mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
     use crate::connector::starrocks::managed::config::ManagedLakeConfig;
-    use crate::standalone::lake::store::{
+    use crate::connector::starrocks::managed::store::{
         ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
         ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
         ManagedTxnState, SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob,

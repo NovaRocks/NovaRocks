@@ -14,7 +14,7 @@ use crate::connector::starrocks::lake::context::{
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
-use super::super::engine::catalog::{
+use crate::standalone::engine::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     normalize_identifier,
 };
@@ -916,7 +916,7 @@ mod tests {
     }
 
     fn snapshot_seed() -> ManagedSnapshot {
-        use crate::standalone::lake::store::{
+        use crate::connector::starrocks::managed::store::{
             ManagedGlobalMeta, StoredManagedDatabase, StoredManagedPartition,
         };
         ManagedSnapshot {
@@ -1071,7 +1071,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_aborts_prepared_txns_without_replay() {
-        use crate::standalone::lake::store::StoredManagedTxn;
+        use crate::connector::starrocks::managed::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 90,
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn reconcile_on_open_replays_written_txns_and_advances_partition() {
-        use crate::standalone::lake::store::StoredManagedTxn;
+        use crate::connector::starrocks::managed::store::StoredManagedTxn;
         let mut snapshot = snapshot_seed();
         snapshot.txns.push(StoredManagedTxn {
             txn_id: 91,

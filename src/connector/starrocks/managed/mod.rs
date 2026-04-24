@@ -6,7 +6,15 @@
 //!
 //! Files will be added incrementally by the next tasks in this plan.
 
+pub(crate) mod catalog;
 pub(crate) mod config;
+pub(crate) mod ddl;
 pub(crate) mod erase;
+pub(crate) mod store;
+pub(crate) mod txn;
 
+pub(crate) use catalog::{
+    ManagedLakeCatalog, reconcile_on_open, register_managed_table_in_catalog,
+    register_managed_tables_in_catalog, runtime_registered,
+};
 pub(crate) use config::ManagedLakeConfig;

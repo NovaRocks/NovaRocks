@@ -10,13 +10,13 @@ use crate::standalone::engine::{
 };
 use crate::standalone::iceberg::{load_table, plan_append_delta};
 
-use super::catalog::{ManagedLakeCatalog, register_managed_tables_in_catalog};
-use super::ddl::bootstrap_empty_partition_for_tablets;
-use super::store::{
+use crate::connector::starrocks::managed::catalog::{ManagedLakeCatalog, register_managed_tables_in_catalog};
+use crate::connector::starrocks::managed::ddl::bootstrap_empty_partition_for_tablets;
+use crate::connector::starrocks::managed::store::{
     ActivateMvRefreshRequest, IcebergTableRef, ManagedPartitionState, ManagedTableKind,
     StageMvRefreshRequest, StagedMvRefresh, UpdateMvRefreshMetadataRequest,
 };
-use super::txn::{
+use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, write_chunks_into_managed_partition,
     write_chunks_into_managed_partition_for_mv_refresh,
 };
@@ -445,7 +445,7 @@ fn collect_current_snapshots(
 
 fn collect_current_snapshots_or_cleanup_staged_partition(
     state: &Arc<StandaloneState>,
-    metadata_store: &super::store::SqliteMetadataStore,
+    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
     staged: &StagedMvRefresh,
     refs: &[IcebergTableRef],
@@ -477,7 +477,7 @@ fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String>
 
 fn cleanup_staged_partition(
     state: &Arc<StandaloneState>,
-    metadata_store: &super::store::SqliteMetadataStore,
+    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
     staged: &StagedMvRefresh,
     enqueue_erase_job: bool,
@@ -548,7 +548,7 @@ mod tests {
     use crate::standalone::engine::catalog::InMemoryCatalog;
     use crate::standalone::iceberg::IcebergCatalogRegistry;
     use crate::connector::starrocks::managed::ManagedLakeConfig;
-    use crate::standalone::lake::store::{
+    use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, SqliteMetadataStore, StoredManagedDatabase,
         StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,

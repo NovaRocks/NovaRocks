@@ -20,13 +20,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use prost::Message;
 
-use super::super::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
-use super::catalog::{ManagedLakeCatalog, register_managed_table_in_catalog};
-use super::ddl::{
+use crate::standalone::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
+use crate::connector::starrocks::managed::catalog::{ManagedLakeCatalog, register_managed_table_in_catalog};
+use crate::connector::starrocks::managed::ddl::{
     build_create_tablet_request, build_tablet_schema, initialize_global_meta_if_needed,
     keys_type_name, logical_type_name, reclaim_dropping_table_for_reuse,
 };
-use super::store::{
+use crate::connector::starrocks::managed::store::{
     IcebergTableRef, ManagedMvRefreshMode, ManagedPartitionState, ManagedTableKind,
     ManagedTableState, ManagedTxnState, StoredManagedColumn, StoredManagedIndex,
     StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
@@ -237,7 +237,7 @@ pub(crate) fn create_mv(
         table_id,
         partition_id,
         index_type: "BASE".to_string(),
-        state: super::store::ManagedIndexState::Active,
+        state: crate::connector::starrocks::managed::store::ManagedIndexState::Active,
     });
     snapshot.tablets.extend(tablets);
     let txn_id = alloc_id(&mut snapshot.global.next_txn_id);
@@ -319,7 +319,7 @@ pub(crate) fn drop_mv(
             "`{db_name}.{mv_name}` is not a materialized view; use DROP TABLE instead"
         ));
     }
-    super::ddl::drop_managed_table(state, &db_name, &mv_name)?;
+    crate::connector::starrocks::managed::ddl::drop_managed_table(state, &db_name, &mv_name)?;
     Ok(StatementResult::Ok)
 }
 
@@ -753,9 +753,9 @@ fn alloc_id(next_id: &mut i64) -> i64 {
 }
 
 fn find_or_create_managed_database(
-    snapshot: &mut super::store::ManagedSnapshot,
+    snapshot: &mut crate::connector::starrocks::managed::store::ManagedSnapshot,
     database_name: &str,
-) -> super::store::StoredManagedDatabase {
+) -> crate::connector::starrocks::managed::store::StoredManagedDatabase {
     if let Some(found) = snapshot
         .databases
         .iter()
@@ -764,7 +764,7 @@ fn find_or_create_managed_database(
     {
         return found;
     }
-    let database = super::store::StoredManagedDatabase {
+    let database = crate::connector::starrocks::managed::store::StoredManagedDatabase {
         db_id: alloc_id(&mut snapshot.global.next_db_id),
         name: database_name.to_string(),
     };
