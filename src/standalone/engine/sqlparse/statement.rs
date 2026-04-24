@@ -25,7 +25,7 @@ use crate::standalone::engine::{
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
     persist_iceberg_namespace_if_needed, persist_iceberg_table_if_needed,
 };
-use crate::standalone::iceberg::{
+use crate::connector::iceberg::catalog::{
     create_namespace as create_iceberg_namespace, create_table as create_iceberg_table,
     drop_namespace as drop_iceberg_namespace, drop_table as drop_iceberg_table,
     insert_rows as insert_iceberg_rows, list_tables as list_iceberg_tables,
@@ -551,7 +551,7 @@ pub(crate) fn execute_insert_statement(
         .expect("standalone iceberg catalog read lock");
     let entry = guard.get(&resolved.catalog)?;
     let loaded =
-        crate::standalone::iceberg::load_table(&entry, &resolved.namespace, &resolved.table)?;
+        crate::connector::iceberg::catalog::load_table(&entry, &resolved.namespace, &resolved.table)?;
     match source {
         InsertSource::Values(rows) => {
             let rows = reorder_insert_rows(rows, columns, &loaded.columns)?;

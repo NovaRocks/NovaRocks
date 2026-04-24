@@ -1,4 +1,4 @@
-//! Glue between the iceberg catalog (`crate::standalone::iceberg`) and the
+//! Glue between the iceberg catalog (`crate::connector::iceberg::catalog`) and the
 //! standalone query path: load an iceberg table as a single RecordBatch,
 //! apply aggregate-table semantics if needed, and normalize the inbound
 //! batch schema so it matches the table's declared column ordering.
@@ -14,7 +14,7 @@ use futures::TryStreamExt;
 use crate::standalone::engine::aggregate::merge_aggregate_table_rows_if_needed;
 use crate::standalone::engine::block_on_standalone_async;
 use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
-use crate::standalone::iceberg::{IcebergLoadedTable, build_insert_batch};
+use crate::connector::iceberg::catalog::{IcebergLoadedTable, build_insert_batch};
 
 pub(crate) fn load_full_iceberg_batch(loaded: &IcebergLoadedTable) -> Result<RecordBatch, String> {
     let batches = block_on_standalone_async(async {

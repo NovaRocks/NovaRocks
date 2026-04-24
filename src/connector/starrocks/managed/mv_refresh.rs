@@ -8,7 +8,7 @@ use crate::standalone::engine::{
     QueryResult, StandaloneState, StatementResult, execute_query_for_mv_incremental_refresh,
     execute_query_for_mv_refresh, record_batch_to_chunk,
 };
-use crate::standalone::iceberg::{load_table, plan_append_delta};
+use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
 
 use crate::connector::starrocks::managed::catalog::{ManagedLakeCatalog, register_managed_tables_in_catalog};
 use crate::connector::starrocks::managed::ddl::bootstrap_empty_partition_for_tablets;
@@ -407,7 +407,7 @@ fn normalize_three_part_base_table(
 fn load_current_iceberg_base_table(
     state: &Arc<StandaloneState>,
     table_ref: &IcebergTableRef,
-) -> Result<crate::standalone::iceberg::IcebergLoadedTable, String> {
+) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
     let entry = {
         let registry = state
             .iceberg_catalogs
@@ -546,7 +546,7 @@ mod tests {
 
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::standalone::engine::catalog::InMemoryCatalog;
-    use crate::standalone::iceberg::IcebergCatalogRegistry;
+    use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
     use crate::connector::starrocks::managed::ManagedLakeConfig;
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,

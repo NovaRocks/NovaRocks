@@ -11,7 +11,7 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
 use crate::fs::object_store::{ObjectStoreConfig, build_oss_operator};
 use crate::standalone::engine::catalog::normalize_identifier;
-use crate::standalone::iceberg::registry::{
+use crate::connector::iceberg::catalog::registry::{
     IcebergCatalogEntry, block_on_iceberg, build_hadoop_catalog, load_table,
 };
 

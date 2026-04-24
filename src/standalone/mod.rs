@@ -1,8 +1,6 @@
 use std::sync::OnceLock;
 
 pub(crate) mod engine;
-pub(crate) mod iceberg;
-pub(crate) mod lake;
 mod server;
 
 pub use crate::runtime::query_result::{QueryResult, QueryResultColumn};

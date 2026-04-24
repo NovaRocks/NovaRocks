@@ -18,7 +18,7 @@ use crate::runtime::global_async_runtime::data_block_on;
 use self::catalog::{
     DEFAULT_DATABASE, InMemoryCatalog, TableStorage, build_parquet_table, normalize_identifier,
 };
-use super::iceberg::{
+use crate::connector::iceberg::catalog::{
     IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
     namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
@@ -738,16 +738,16 @@ pub(crate) fn dispatch_statement(
 ) -> Result<StatementResult, String> {
     match statement {
         crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) => {
-            super::lake::mv_ddl::create_mv(state, current_database, &stmt)
+            crate::connector::starrocks::managed::mv_ddl::create_mv(state, current_database, &stmt)
         }
         crate::sql::parser::ast::Statement::DropMaterializedView(stmt) => {
-            super::lake::mv_ddl::drop_mv(state, current_database, &stmt)
+            crate::connector::starrocks::managed::mv_ddl::drop_mv(state, current_database, &stmt)
         }
         crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) => {
-            super::lake::mv_refresh::refresh_mv(state, current_database, &stmt)
+            crate::connector::starrocks::managed::mv_refresh::refresh_mv(state, current_database, &stmt)
         }
         crate::sql::parser::ast::Statement::ShowMaterializedViews(stmt) => {
-            super::lake::mv_ddl::list_mvs(state, &stmt)
+            crate::connector::starrocks::managed::mv_ddl::list_mvs(state, &stmt)
         }
     }
 }
@@ -802,10 +802,10 @@ fn register_empty_iceberg_table(
 }
 
 fn build_iceberg_table_def_with_files(
-    entry: &crate::standalone::iceberg::IcebergCatalogEntry,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     namespace: &str,
     table_name: &str,
-    loaded: crate::standalone::iceberg::IcebergLoadedTable,
+    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
     data_files: Vec<(String, i64, Option<i64>)>,
 ) -> Result<crate::sql::catalog::TableDef, String> {
     let storage = if entry.is_s3() {
@@ -840,10 +840,10 @@ fn build_iceberg_table_def_with_files(
 
 fn register_loaded_iceberg_table_with_files(
     state: &Arc<StandaloneState>,
-    entry: &crate::standalone::iceberg::IcebergCatalogEntry,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     namespace: &str,
     table_name: &str,
-    loaded: crate::standalone::iceberg::IcebergLoadedTable,
+    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
     data_files: Vec<(String, i64, Option<i64>)>,
 ) -> Result<(), String> {
     let table_def =
@@ -900,12 +900,12 @@ fn register_iceberg_tables_for_query_impl(
             }
         }
 
-        let loaded = match super::iceberg::load_table(&entry, &namespace, &table_name) {
+        let loaded = match crate::connector::iceberg::catalog::load_table(&entry, &namespace, &table_name) {
             Ok(loaded) => loaded,
             Err(_) => continue,
         };
 
-        let data_files = super::iceberg::extract_data_files(&loaded.table)?;
+        let data_files = crate::connector::iceberg::catalog::extract_data_files(&loaded.table)?;
         register_loaded_iceberg_table_with_files(
             state,
             &entry,
@@ -1083,7 +1083,7 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
         );
     }
 
-    let loaded = super::iceberg::load_table(&entry, &namespace, &table_name)?;
+    let loaded = crate::connector::iceberg::catalog::load_table(&entry, &namespace, &table_name)?;
     let table_def =
         build_iceberg_table_def_with_files(&entry, &namespace, &table_name, loaded, delta_files)?;
     let mut incremental_catalog = InMemoryCatalog::default();
@@ -1204,7 +1204,7 @@ fn restore_managed_lake(
         return Ok(());
     };
     let mut managed = snapshot.managed.clone();
-    super::lake::reconcile_on_open(store, &mut managed, |snapshot, txn| {
+    crate::connector::starrocks::managed::reconcile_on_open(store, &mut managed, |snapshot, txn| {
         let tablet_ids = snapshot
             .tablets
             .iter()
@@ -2906,7 +2906,7 @@ enable_path_style_access = true
             registry.get("ice").expect("load iceberg catalog entry")
         };
         let first_loaded =
-            crate::standalone::iceberg::load_table(&entry, "db1", "tbl").expect("load first table");
+            crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl").expect("load first table");
         let previous_snapshot_id = first_loaded
             .table
             .metadata()
@@ -2919,9 +2919,9 @@ enable_path_style_access = true
             .expect("insert second iceberg row");
         assert!(matches!(second_insert, StatementResult::Ok));
 
-        let second_loaded = crate::standalone::iceberg::load_table(&entry, "db1", "tbl")
+        let second_loaded = crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl")
             .expect("load second table");
-        let delta = crate::standalone::iceberg::plan_append_delta(
+        let delta = crate::connector::iceberg::catalog::plan_append_delta(
             &second_loaded.table,
             previous_snapshot_id,
         )
@@ -3100,7 +3100,7 @@ enable_path_style_access = true
             registry.get("ice").expect("load iceberg catalog entry")
         };
         let first_loaded =
-            crate::standalone::iceberg::load_table(&entry, "db1", "tbl").expect("load first table");
+            crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl").expect("load first table");
         let previous_snapshot_id = first_loaded
             .table
             .metadata()
@@ -3113,9 +3113,9 @@ enable_path_style_access = true
             .expect("insert second iceberg row");
         assert!(matches!(second_insert, StatementResult::Ok));
 
-        let second_loaded = crate::standalone::iceberg::load_table(&entry, "db1", "tbl")
+        let second_loaded = crate::connector::iceberg::catalog::load_table(&entry, "db1", "tbl")
             .expect("load second table");
-        let mut delta_files = crate::standalone::iceberg::plan_append_delta(
+        let mut delta_files = crate::connector::iceberg::catalog::plan_append_delta(
             &second_loaded.table,
             previous_snapshot_id,
         )
