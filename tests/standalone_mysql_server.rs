@@ -872,6 +872,141 @@ fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
 }
 
 #[test]
+fn standalone_mysql_server_mv_incremental_refresh_noops_when_snapshot_unchanged() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_noop");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
+        .expect("create iceberg orders");
+    conn.query_drop("insert into ice.ns.orders values (1, 10), (2, 20)")
+        .expect("seed iceberg rows");
+
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create materialized view orders_mv \
+         distributed by hash(k1) buckets 2 \
+         as select k1, v2 from ice.ns.orders where v2 >= 10",
+    )
+    .expect("create mv");
+
+    conn.query_drop("refresh materialized view orders_mv")
+        .expect("first refresh mv");
+    conn.query_drop("refresh materialized view orders_mv")
+        .expect("second refresh mv without base append");
+
+    let rows: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from orders_mv order by k1")
+        .expect("select after unchanged-snapshot refresh");
+    assert_eq!(rows, vec![(Some(1), Some(10)), (Some(2), Some(20))]);
+}
+
+#[test]
+fn standalone_mysql_server_mv_incremental_refresh_appends_only_new_rows() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_append");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
+        .expect("create iceberg orders");
+    conn.query_drop("insert into ice.ns.orders values (1, 10), (2, 20)")
+        .expect("seed iceberg rows");
+
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create materialized view orders_mv \
+         distributed by hash(k1) buckets 2 \
+         as select k1, v2 from ice.ns.orders where v2 >= 20",
+    )
+    .expect("create mv");
+
+    conn.query_drop("refresh materialized view orders_mv")
+        .expect("first refresh mv");
+    conn.query_drop("insert into ice.ns.orders values (3, 30), (4, 5)")
+        .expect("append iceberg rows");
+    conn.query_drop("refresh materialized view orders_mv")
+        .expect("second refresh mv");
+
+    let rows: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from orders_mv order by k1")
+        .expect("select after incremental append refresh");
+    assert_eq!(rows, vec![(Some(2), Some(20)), (Some(3), Some(30))]);
+}
+
+#[test]
+fn standalone_mysql_server_mv_incremental_rejects_aggregate_definition() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_incremental_aggregate");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
+        .expect("create iceberg orders");
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+
+    let err = conn
+        .query_drop(
+            "create materialized view orders_mv \
+             distributed by hash(k1) buckets 2 \
+             as select k1, sum(v2) total from ice.ns.orders group by k1",
+        )
+        .expect_err("aggregate MV definition should be rejected");
+    assert!(
+        err.to_string()
+            .to_ascii_lowercase()
+            .contains("projection/filter"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     let port = alloc_port();
     let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
