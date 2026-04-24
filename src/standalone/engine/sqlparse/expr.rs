@@ -104,6 +104,29 @@ pub(crate) fn sqlparser_expr_to_custom_expr(expr: &sqlparser::ast::Expr) -> Resu
             inner,
         )?)?)),
         sqlast::Expr::Nested(inner) => sqlparser_expr_to_custom_expr(inner),
+        // An array literal like `[1, 2, 3]` has no natural non-constant lowering
+        // in this path (we don't run through the pipeline scalar-eval machinery
+        // here), so fold it to a Literal::Array if every element is itself a
+        // literal-convertible expression; otherwise fail fast with a clear error.
+        sqlast::Expr::Array(_) => Ok(Expr::Literal(sqlparser_expr_to_literal(expr)?)),
+        // Function calls: try constant-folding via the INSERT-VALUES literal
+        // helper first (covers `row(...)`, `map(...)`, fully-constant
+        // `to_binary(...)`, etc.). If folding fails (e.g. args reference a
+        // column), fall back to a ScalarFunction node that the row-wise
+        // evaluator can dispatch on.
+        sqlast::Expr::Function(func) => {
+            if let Ok(lit) = sqlparser_function_to_literal(func) {
+                return Ok(Expr::Literal(lit));
+            }
+            let name = func.name.to_string().to_ascii_lowercase();
+            let args = function_expr_args(&func.args)?
+                .into_iter()
+                .map(sqlparser_expr_to_custom_expr)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Expr::ScalarFunction(
+                crate::sql::parser::ast::ScalarFunctionExpr { name, args },
+            ))
+        }
         other => Err(format!("unsupported expression: {other}")),
     }
 }
@@ -996,5 +1019,77 @@ pub(crate) fn parse_prop_string_or_ident(
         Token::Word(w) => Ok(w.value),
         Token::Number(n, _) => Ok(n),
         other => Err(format!("expected string or identifier, got {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::parser::ast::{Expr, Literal};
+    use crate::sql::parser::dialect::StarRocksDialect;
+
+    fn parse_expr(sql: &str) -> sqlparser::ast::Expr {
+        let mut parser = sqlparser::parser::Parser::new(&StarRocksDialect)
+            .try_with_sql(sql)
+            .expect("build parser");
+        parser.parse_expr().expect("parse expression")
+    }
+
+    #[test]
+    fn scalar_function_falls_back_when_literal_fold_fails() {
+        // `concat` is not a constant-foldable function in `sqlparser_function_to_literal`,
+        // so we expect a ScalarFunction node preserving the nested column ref and the
+        // CAST around it.
+        let raw = parse_expr("concat('value_', CAST(generate_series AS VARCHAR))");
+        let converted = sqlparser_expr_to_custom_expr(&raw).expect("convert");
+        match converted {
+            Expr::ScalarFunction(func) => {
+                assert_eq!(func.name, "concat");
+                assert_eq!(func.args.len(), 2);
+                assert!(
+                    matches!(func.args[0], Expr::Literal(Literal::String(ref s)) if s == "value_")
+                );
+                assert!(matches!(func.args[1], Expr::Cast { .. }));
+            }
+            other => panic!("expected ScalarFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn to_binary_with_column_ref_lowers_to_nested_scalar_function() {
+        // The outer to_binary cannot literal-fold because the inner concat references
+        // `generate_series`; expect nested ScalarFunction(to_binary -> ScalarFunction(concat)).
+        let raw =
+            parse_expr("to_binary(concat('value_', CAST(generate_series AS VARCHAR)), 'utf8')");
+        let converted = sqlparser_expr_to_custom_expr(&raw).expect("convert");
+        let Expr::ScalarFunction(outer) = converted else {
+            panic!("expected outer ScalarFunction");
+        };
+        assert_eq!(outer.name, "to_binary");
+        assert_eq!(outer.args.len(), 2);
+        assert!(matches!(outer.args[0], Expr::ScalarFunction(ref f) if f.name == "concat"));
+        assert!(matches!(outer.args[1], Expr::Literal(Literal::String(ref s)) if s == "utf8"));
+    }
+
+    #[test]
+    fn constant_function_call_folds_to_literal() {
+        // `row(100, 100)` and `map(1, 5.5)` should constant-fold through
+        // `sqlparser_function_to_literal` when used as SELECT projections.
+        let row = sqlparser_expr_to_custom_expr(&parse_expr("row(100, 100)")).expect("row");
+        assert!(matches!(row, Expr::Literal(Literal::Struct(ref v)) if v.len() == 2));
+
+        let map = sqlparser_expr_to_custom_expr(&parse_expr("map(1, 5.5)")).expect("map");
+        assert!(matches!(map, Expr::Literal(Literal::Map(ref v)) if v.len() == 1));
+    }
+
+    #[test]
+    fn array_literal_folds_to_literal_array() {
+        let arr = sqlparser_expr_to_custom_expr(&parse_expr("[1, 2, 3]")).expect("array");
+        let Expr::Literal(Literal::Array(items)) = arr else {
+            panic!("expected Literal::Array");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], Literal::Int(1)));
+        assert!(matches!(items[2], Literal::Int(3)));
     }
 }
