@@ -549,7 +549,7 @@ pub(crate) fn extract_data_files(
                 (
                     t.data_file_path.clone(),
                     i64::try_from(t.file_size_in_bytes).unwrap_or(i64::MAX),
-                    t.record_count.map(|c| c as i64),
+                    t.record_count.map(|c| i64::try_from(c).unwrap_or(i64::MAX)),
                 )
             })
             .collect())
@@ -773,7 +773,7 @@ pub(crate) fn extract_data_files_with_stats(
 
                 let path = df.file_path().to_string();
                 let size = i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX);
-                let record_count = Some(df.record_count() as i64);
+                let record_count = Some(i64::try_from(df.record_count()).unwrap_or(i64::MAX));
 
                 // Build per-column stats.
                 let null_counts = df.null_value_counts();
