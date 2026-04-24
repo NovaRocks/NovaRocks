@@ -148,12 +148,14 @@ fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
         | Expr::IsNotNull(value)
         | Expr::IsUnknown(value)
         | Expr::IsNotUnknown(value)
-        | Expr::IsDistinctFrom(value, _)
-        | Expr::IsNotDistinctFrom(value, _)
         | Expr::Nested(value)
         | Expr::OuterJoin(value)
         | Expr::Prior(value) => {
             reject_unsupported_expr(value)?;
+        }
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            reject_unsupported_expr(left)?;
+            reject_unsupported_expr(right)?;
         }
         Expr::IsNormalized { expr, .. } | Expr::UnaryOp { expr, .. } => {
             reject_unsupported_expr(expr)?;
@@ -443,6 +445,7 @@ fn is_aggregate_function(name: &str) -> bool {
         name,
         "sum"
             | "count"
+            | "count_distinct"
             | "avg"
             | "min"
             | "max"
@@ -603,6 +606,7 @@ mod tests {
         for sql in [
             "select approx_count_distinct(k1) from ice.ns.orders",
             "select bitmap_union(k1) from ice.ns.orders",
+            "select count_distinct(k1) from ice.ns.orders",
             "select hll_union(k1) from ice.ns.orders",
             "select percentile_approx(v2, 0.5) from ice.ns.orders",
             "select max_by_v2(k1, v2) from ice.ns.orders",
@@ -643,12 +647,28 @@ mod tests {
         );
         for sql in [
             "select current_date from ice.ns.orders",
+            "select current_time from ice.ns.orders",
+            "select curtime() from ice.ns.orders",
+            "select localtime from ice.ns.orders",
             "select localtimestamp from ice.ns.orders",
+            "select utc_time() from ice.ns.orders",
             "select utc_timestamp() from ice.ns.orders",
             "select unix_timestamp() from ice.ns.orders",
         ] {
             assert_rejects_with(sql, "non-deterministic");
         }
+    }
+
+    #[test]
+    fn rejects_non_deterministic_is_distinct_from_rhs() {
+        assert_rejects_with(
+            "select k1 from ice.ns.orders where k1 is distinct from now()",
+            "non-deterministic",
+        );
+        assert_rejects_with(
+            "select k1 from ice.ns.orders where k1 is not distinct from current_timestamp",
+            "non-deterministic",
+        );
     }
 
     #[test]
