@@ -17,7 +17,7 @@ use super::store::{
     StageMvRefreshRequest, StagedMvRefresh, UpdateMvRefreshMetadataRequest,
 };
 use super::txn::{
-    PartitionTarget, load_insert_plan, write_chunks_into_managed_partition,
+    MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, write_chunks_into_managed_partition,
     write_chunks_into_managed_partition_for_mv_refresh,
 };
 
@@ -146,25 +146,18 @@ pub(crate) fn refresh_mv(
                 },
                 PartitionTarget::Active,
             )?;
-            let rows_to_append = chunks_row_count(&chunks)?;
             let previous_rows = mv_row.last_refresh_rows.unwrap_or(0);
-            let new_total_rows = previous_rows.checked_add(rows_to_append).ok_or_else(|| {
-                format!(
-                    "materialized view {db_name}.{mv_name} refresh row count overflow: {previous_rows} + {rows_to_append}"
-                )
-            })?;
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            let rows_written = write_chunks_into_managed_partition_for_mv_refresh(
+            write_chunks_into_managed_partition_for_mv_refresh(
                 state,
                 plan,
                 &chunks,
-                UpdateMvRefreshMetadataRequest {
+                MvRefreshWriteMetadata {
                     table_id: runtime.table.table_id,
-                    last_refresh_rows: new_total_rows,
+                    previous_refresh_rows: previous_rows,
                     snapshots,
                 },
             )?;
-            validate_incremental_rows_written(&db_name, &mv_name, rows_to_append, rows_written)?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
         }
@@ -431,15 +424,6 @@ fn single_snapshot_map(table_ref: &IcebergTableRef, snapshot_id: i64) -> BTreeMa
     snapshots
 }
 
-fn chunks_row_count(chunks: &[Chunk]) -> Result<i64, String> {
-    chunks.iter().try_fold(0_i64, |acc, chunk| {
-        let rows = i64::try_from(chunk.len())
-            .map_err(|_| "materialized view refresh chunk row count overflow".to_string())?;
-        acc.checked_add(rows)
-            .ok_or_else(|| "materialized view refresh chunk row count overflow".to_string())
-    })
-}
-
 fn collect_current_snapshots(
     state: &Arc<StandaloneState>,
     refs: &[IcebergTableRef],
@@ -479,20 +463,6 @@ fn collect_current_snapshots_or_cleanup_staged_partition(
             Err(format!("mv refresh snapshot collection failed: {err}"))
         }
     }
-}
-
-fn validate_incremental_rows_written(
-    database: &str,
-    mv_name: &str,
-    expected_rows: i64,
-    rows_written: i64,
-) -> Result<(), String> {
-    if rows_written != expected_rows {
-        return Err(format!(
-            "materialized view {database}.{mv_name} incremental refresh row count mismatch: expected {expected_rows}, wrote {rows_written}"
-        ));
-    }
-    Ok(())
 }
 
 fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
@@ -689,15 +659,6 @@ mod tests {
             .find(|job| job.partition_id == Some(staged.partition_id))
             .expect("staged partition erase job");
         assert_eq!(erase_job.table_id, 10);
-    }
-
-    #[test]
-    fn validate_incremental_rows_written_rejects_writer_mismatch() {
-        let err = validate_incremental_rows_written("analytics", "orders_mv", 3, 2)
-            .expect_err("mismatch should fail");
-        assert!(err.contains("analytics.orders_mv"), "err={err}");
-        assert!(err.contains("expected 3"), "err={err}");
-        assert!(err.contains("wrote 2"), "err={err}");
     }
 
     #[test]

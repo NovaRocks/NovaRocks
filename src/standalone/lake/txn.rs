@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt32Array, new_null_array};
@@ -120,6 +120,13 @@ pub(crate) struct ManagedInsertPlan {
 pub(crate) struct ManagedInsertTablet {
     pub(crate) tablet_id: i64,
     pub(crate) tablet_root_path: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MvRefreshWriteMetadata {
+    pub(crate) table_id: i64,
+    pub(crate) previous_refresh_rows: i64,
+    pub(crate) snapshots: BTreeMap<String, i64>,
 }
 
 pub(crate) fn load_insert_plan(
@@ -263,7 +270,7 @@ pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh(
     state: &Arc<StandaloneState>,
     plan: ManagedInsertPlan,
     chunks: &[Chunk],
-    metadata: super::store::UpdateMvRefreshMetadataRequest,
+    metadata: MvRefreshWriteMetadata,
 ) -> Result<i64, String> {
     write_chunks_into_managed_partition_inner(
         state,
@@ -275,7 +282,7 @@ pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh(
 
 enum VisibleCommitAction {
     Plain,
-    MvRefresh(super::store::UpdateMvRefreshMetadataRequest),
+    MvRefresh(MvRefreshWriteMetadata),
 }
 
 fn write_chunks_into_managed_partition_inner(
@@ -284,6 +291,7 @@ fn write_chunks_into_managed_partition_inner(
     chunks: &[Chunk],
     commit_action: VisibleCommitAction,
 ) -> Result<i64, String> {
+    let total_rows = chunks_total_rows(chunks)?;
     let metadata_store = state
         .metadata_store
         .as_ref()
@@ -292,10 +300,8 @@ fn write_chunks_into_managed_partition_inner(
         metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
 
     let mut written_tablet_ids = Vec::new();
-    let mut total_rows = 0_i64;
     let mut next_file_seq = 0_u64;
     for chunk in chunks {
-        total_rows += chunk.len() as i64;
         let write_outcome =
             write_routed_chunks(state, &plan, chunk, prepared.txn_id, &mut next_file_seq);
         let chunk_written_ids = match write_outcome {
@@ -331,16 +337,38 @@ fn write_chunks_into_managed_partition_inner(
             metadata_store.mark_txn_visible(prepared.txn_id, prepared.commit_version)?;
         }
         VisibleCommitAction::MvRefresh(metadata) => {
+            let last_refresh_rows = metadata
+                .previous_refresh_rows
+                .checked_add(total_rows)
+                .ok_or_else(|| {
+                    format!(
+                        "managed-lake mv refresh row count overflow: {} + {}",
+                        metadata.previous_refresh_rows, total_rows
+                    )
+                })?;
             metadata_store.mark_txn_visible_with_mv_refresh_metadata(
                 prepared.txn_id,
                 prepared.commit_version,
-                metadata,
+                super::store::UpdateMvRefreshMetadataRequest {
+                    table_id: metadata.table_id,
+                    last_refresh_rows,
+                    snapshots: metadata.snapshots,
+                },
             )?;
         }
     }
     commit_catalog_visible_version(state, &plan, prepared.commit_version)?;
 
     Ok(total_rows)
+}
+
+fn chunks_total_rows(chunks: &[Chunk]) -> Result<i64, String> {
+    chunks.iter().try_fold(0_i64, |acc, chunk| {
+        let rows = i64::try_from(chunk.len())
+            .map_err(|_| "managed-lake chunk row count overflow".to_string())?;
+        acc.checked_add(rows)
+            .ok_or_else(|| "managed-lake chunk row count overflow".to_string())
+    })
 }
 
 fn derive_column_defs(
@@ -829,7 +857,6 @@ mod mv_target_tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::standalone::engine::catalog::InMemoryCatalog;
-    use crate::standalone::lake::store;
     use crate::standalone::lake::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
         ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
@@ -893,9 +920,9 @@ mod mv_target_tests {
             &fixture.state,
             plan,
             &[],
-            store::UpdateMvRefreshMetadataRequest {
+            MvRefreshWriteMetadata {
                 table_id: 10,
-                last_refresh_rows: 3,
+                previous_refresh_rows: 3,
                 snapshots: snapshots.clone(),
             },
         )
@@ -938,9 +965,9 @@ mod mv_target_tests {
             &fixture.state,
             plan,
             &[chunk],
-            store::UpdateMvRefreshMetadataRequest {
+            MvRefreshWriteMetadata {
                 table_id: 10,
-                last_refresh_rows: 3,
+                previous_refresh_rows: 7,
                 snapshots: snapshots.clone(),
             },
         )
@@ -954,7 +981,7 @@ mod mv_target_tests {
             .iter()
             .find(|mv| mv.mv_id == 10)
             .expect("mv");
-        assert_eq!(mv.last_refresh_rows, Some(3));
+        assert_eq!(mv.last_refresh_rows, Some(10));
         assert_eq!(mv.last_refresh_snapshots, snapshots);
     }
 
