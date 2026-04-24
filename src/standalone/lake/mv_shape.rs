@@ -344,7 +344,11 @@ fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<()
                 .to_string(),
         );
     }
-    if is_aggregate_function(&function_name) || function.over.is_some() {
+    if is_aggregate_function(&function_name)
+        || is_window_only_function(&function_name)
+        || is_grouping_function(&function_name)
+        || function.over.is_some()
+    {
         return Err(projection_filter_error());
     }
     if function.within_group.is_empty()
@@ -436,6 +440,28 @@ fn function_argument_count(args: &sqlparser::ast::FunctionArguments) -> Option<u
         sqlparser::ast::FunctionArguments::List(list) => Some(list.args.len()),
         sqlparser::ast::FunctionArguments::Subquery(_) => None,
     }
+}
+
+fn is_window_only_function(name: &str) -> bool {
+    // Keep in sync with sql::analyzer::functions::is_window_only_function.
+    matches!(
+        name,
+        "row_number"
+            | "rank"
+            | "dense_rank"
+            | "cume_dist"
+            | "percent_rank"
+            | "ntile"
+            | "lag"
+            | "lead"
+            | "first_value"
+            | "last_value"
+            | "session_number"
+    )
+}
+
+fn is_grouping_function(name: &str) -> bool {
+    matches!(name, "grouping" | "grouping_id")
 }
 
 fn is_aggregate_function(name: &str) -> bool {
@@ -631,9 +657,29 @@ mod tests {
             "select k1, row_number() over (partition by k1) from ice.ns.orders",
             "projection/filter",
         );
+        for sql in [
+            "select row_number() from ice.ns.orders",
+            "select rank() from ice.ns.orders",
+            "select lag(k1) from ice.ns.orders",
+            "select first_value(k1) from ice.ns.orders",
+        ] {
+            assert_rejects_with(sql, "projection/filter");
+        }
         assert_rejects_with("select k1 from ice.ns.orders limit 1", "projection/filter");
         assert_rejects_with(
             "select k1 from (select k1 from ice.ns.orders) t",
+            "projection/filter",
+        );
+    }
+
+    #[test]
+    fn rejects_grouping_functions() {
+        assert_rejects_with(
+            "select grouping(k1) from ice.ns.orders",
+            "projection/filter",
+        );
+        assert_rejects_with(
+            "select grouping_id(k1) from ice.ns.orders",
             "projection/filter",
         );
     }
