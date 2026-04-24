@@ -278,7 +278,7 @@ pub(crate) fn create_mv(
 }
 
 fn validate_incremental_create_shape(stmt: &CreateMaterializedViewStmt) -> Result<(), String> {
-    crate::standalone::lake::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+    super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
     Ok(())
 }
 

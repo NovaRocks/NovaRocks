@@ -10,6 +10,9 @@ pub(crate) mod catalog;
 pub(crate) mod config;
 pub(crate) mod ddl;
 pub(crate) mod erase;
+pub(crate) mod mv_ddl;
+pub(crate) mod mv_refresh;
+pub(crate) mod mv_shape;
 pub(crate) mod store;
 pub(crate) mod txn;
 
