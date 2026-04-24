@@ -5,3 +5,8 @@
 //! refactor (2026-04-24).
 //!
 //! Files will be added incrementally by the next tasks in this plan.
+
+pub(crate) mod config;
+pub(crate) mod erase;
+
+pub(crate) use config::ManagedLakeConfig;

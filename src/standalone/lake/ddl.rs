@@ -11,7 +11,7 @@ use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc,
 use super::super::engine::catalog::normalize_identifier;
 use super::super::engine::{StandaloneState, StatementResult};
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
-use super::config::ManagedLakeConfig;
+use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
     ManagedTxnState, StageManagedTruncateRequest, StagedManagedTruncate, StoredManagedColumn,

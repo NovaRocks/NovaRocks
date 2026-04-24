@@ -547,7 +547,7 @@ mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::standalone::engine::catalog::InMemoryCatalog;
     use crate::standalone::iceberg::IcebergCatalogRegistry;
-    use crate::standalone::lake::ManagedLakeConfig;
+    use crate::connector::starrocks::managed::ManagedLakeConfig;
     use crate::standalone::lake::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, SqliteMetadataStore, StoredManagedDatabase,

@@ -240,7 +240,7 @@ impl StandaloneNovaRocks {
         });
         restore_metadata_if_needed(&inner)?;
         if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
-            super::lake::erase::spawn_erase_worker(Arc::clone(&inner));
+            crate::connector::starrocks::managed::erase::spawn_erase_worker(Arc::clone(&inner));
         }
         Ok(Self { inner })
     }

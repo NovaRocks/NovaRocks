@@ -18,7 +18,7 @@ use super::super::engine::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
     normalize_identifier,
 };
-use super::config::ManagedLakeConfig;
+use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use super::store::{
     ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
     ManagedTxnState, SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex,

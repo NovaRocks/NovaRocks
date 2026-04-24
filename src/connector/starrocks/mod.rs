@@ -1,5 +1,6 @@
 pub mod fe_v2_meta;
 pub mod lake;
+pub mod managed;
 mod object_store_profile;
 pub mod scan;
 pub mod sink;
