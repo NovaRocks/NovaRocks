@@ -557,6 +557,142 @@ pub(crate) fn extract_data_files(
     .map_err(|e| format!("extract data files runtime: {e}"))?
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IcebergAppendDelta {
+    pub previous_snapshot_id: i64,
+    pub current_snapshot_id: i64,
+    pub added_files: Vec<(String, i64, Option<i64>)>,
+}
+
+pub(crate) fn plan_append_delta(
+    table: &iceberg::table::Table,
+    previous_snapshot_id: i64,
+) -> Result<IcebergAppendDelta, String> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus, Operation};
+
+    let metadata = table.metadata();
+    let current_snapshot = metadata
+        .current_snapshot()
+        .ok_or_else(|| "no current snapshot for iceberg append delta".to_string())?;
+    let current_snapshot_id = current_snapshot.snapshot_id();
+
+    if current_snapshot_id == previous_snapshot_id {
+        return Ok(IcebergAppendDelta {
+            previous_snapshot_id,
+            current_snapshot_id,
+            added_files: vec![],
+        });
+    }
+
+    let mut snapshot_ids = Vec::new();
+    let mut cursor = current_snapshot_id;
+    let found_previous = loop {
+        if cursor == previous_snapshot_id {
+            break true;
+        }
+
+        let snapshot = metadata
+            .snapshot_by_id(cursor)
+            .ok_or_else(|| format!("snapshot {cursor} not found in iceberg metadata"))?;
+        let operation = &snapshot.summary().operation;
+        if operation != &Operation::Append {
+            return Err(format!(
+                "iceberg append delta supports only append snapshots; snapshot {} has operation {}",
+                snapshot.snapshot_id(),
+                operation.as_str()
+            ));
+        }
+        snapshot_ids.push(snapshot.snapshot_id());
+
+        let Some(parent_snapshot_id) = snapshot.parent_snapshot_id() else {
+            break false;
+        };
+        cursor = parent_snapshot_id;
+    };
+
+    if !found_previous {
+        return Err(format!(
+            "snapshot {previous_snapshot_id} is not an ancestor of current snapshot {current_snapshot_id}"
+        ));
+    }
+
+    snapshot_ids.reverse();
+    let file_io = table.file_io();
+
+    let added_files = block_on_iceberg(async {
+        let mut added_files = Vec::new();
+
+        for snapshot_id in snapshot_ids {
+            let snapshot = metadata
+                .snapshot_by_id(snapshot_id)
+                .ok_or_else(|| format!("snapshot {snapshot_id} not found in iceberg metadata"))?;
+            let manifest_list = snapshot
+                .load_manifest_list(file_io, metadata)
+                .await
+                .map_err(|e| format!("load manifest list for snapshot {snapshot_id}: {e}"))?;
+
+            for manifest_file in manifest_list.entries() {
+                if manifest_file.added_snapshot_id != snapshot_id {
+                    continue;
+                }
+                if manifest_file.content == ManifestContentType::Deletes {
+                    return Err(format!(
+                        "iceberg append delta does not support delete manifests in snapshot {snapshot_id}: {}",
+                        manifest_file.manifest_path
+                    ));
+                }
+                if manifest_file.content != ManifestContentType::Data {
+                    continue;
+                }
+
+                let manifest = manifest_file
+                    .load_manifest(file_io)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "load data manifest {} for snapshot {snapshot_id}: {e}",
+                            manifest_file.manifest_path
+                        )
+                    })?;
+
+                for entry in manifest.entries() {
+                    if entry.status == ManifestStatus::Deleted {
+                        return Err(format!(
+                            "iceberg append delta does not support deleted manifest entries in snapshot {snapshot_id}: {}",
+                            entry.data_file().file_path()
+                        ));
+                    }
+                    if entry.status != ManifestStatus::Added {
+                        continue;
+                    }
+                    if entry.snapshot_id() != Some(snapshot_id) {
+                        continue;
+                    }
+
+                    let df = entry.data_file();
+                    if df.content_type() != DataContentType::Data {
+                        continue;
+                    }
+                    added_files.push((
+                        df.file_path().to_string(),
+                        i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
+                        Some(df.record_count() as i64),
+                    ));
+                }
+            }
+        }
+
+        Ok(added_files)
+    })
+    .map_err(|e| format!("plan iceberg append delta runtime: {e}"))??;
+
+    Ok(IcebergAppendDelta {
+        previous_snapshot_id,
+        current_snapshot_id,
+        added_files,
+    })
+}
+
 /// Result of extracting data files with column-level statistics from Iceberg manifests.
 pub(crate) struct DataFileWithStats {
     pub path: String,
@@ -1696,4 +1832,75 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
         .signed_duration_since(epoch)
         .num_microseconds()
         .ok_or_else(|| format!("DATETIME literal `{value}` is out of range"))
+}
+
+#[cfg(test)]
+mod phase2_delta_tests {
+    use super::*;
+
+    fn test_hadoop_catalog_entry(catalog_name: &str, warehouse_uri: &str) -> IcebergCatalogEntry {
+        build_catalog_entry(
+            catalog_name,
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse_uri.to_string(),
+                ),
+            ],
+        )
+        .expect("catalog entry")
+    }
+
+    #[test]
+    fn plan_append_delta_collects_files_after_previous_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+            }],
+            None,
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load first");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load second");
+        let delta = plan_append_delta(&loaded.table, previous).expect("delta");
+        assert_eq!(delta.previous_snapshot_id, previous);
+        assert_eq!(
+            delta.current_snapshot_id,
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id()
+        );
+        assert!(!delta.added_files.is_empty());
+        assert!(
+            delta
+                .added_files
+                .iter()
+                .all(|(_, _, rows)| rows.unwrap_or_default() > 0)
+        );
+    }
 }
