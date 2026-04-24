@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, UInt32Array, new_null_array};
@@ -9,13 +9,16 @@ use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
 };
+use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
 use crate::connector::starrocks::lake::{append_lake_txn_log_with_chunk_rowset, publish_version};
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
+use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::query_result::QueryResult;
+use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, ObjectName};
 
@@ -321,9 +324,21 @@ fn write_chunks_into_managed_partition_inner(
     written_tablet_ids.sort_unstable();
     written_tablet_ids.dedup();
 
+    let written: HashSet<i64> = written_tablet_ids.iter().copied().collect();
+    if let Err(err) =
+        append_empty_txn_logs_for_unwritten_tablets(state, &plan, prepared.txn_id, &written)
+    {
+        if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
+            return Err(format!(
+                "managed-lake write failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
+            ));
+        }
+        return Err(err);
+    }
+
     metadata_store.mark_txn_written(prepared.txn_id)?;
 
-    publish_managed_txn(&plan, &prepared, &written_tablet_ids).map_err(|err| {
+    publish_managed_txn(&plan, &prepared).map_err(|err| {
         if let Err(abort_err) = metadata_store.mark_txn_aborted(prepared.txn_id) {
             return format!(
                 "managed-lake publish failed: {err}; additionally mark_txn_aborted failed: {abort_err}"
@@ -457,7 +472,7 @@ fn write_routed_chunks(
             tablet_id: tablet.tablet_id,
             tablet_root_path: tablet.tablet_root_path.clone(),
             tablet_schema: plan.tablet_schema.clone(),
-            s3_config: Some(managed_config.s3.clone()),
+            s3_config: s3_config_for_tablet_path(&tablet.tablet_root_path, &managed_config.s3)?,
             partial_update: PartialUpdateWritePolicy::default(),
         };
         // Keep the tablet runtime's schema in lockstep with what we persist,
@@ -503,34 +518,19 @@ fn take_chunk_rows(chunk: &Chunk, row_indices: &[u32]) -> Result<Chunk, String> 
 fn publish_managed_txn(
     plan: &ManagedInsertPlan,
     prepared: &super::store::PreparedManagedTxn,
-    written_tablet_ids: &[i64],
 ) -> Result<(), String> {
-    // Publish all tablets that actually have a txn log at this version.
-    if !written_tablet_ids.is_empty() {
-        publish_tablets_at_version(
-            written_tablet_ids.to_vec(),
-            prepared.txn_id,
-            prepared.base_version,
-            prepared.commit_version,
-        )?;
-    }
-
-    // For tablets that received no rows, publish via the empty-txnlog path so
-    // their metadata still advances to the new version. This matches StarRocks
-    // BE's handling of bucket-hash inserts that only touch a subset of tablets.
-    let written: std::collections::HashSet<i64> = written_tablet_ids.iter().copied().collect();
-    let empty_tablet_ids: Vec<i64> = plan
+    // Publish the whole partition in one batch. Splitting written and empty
+    // tablets into separate publish calls can make the second bundle write
+    // synthesize siblings from the old base version and overwrite rowsets.
+    let tablet_ids = plan
         .tablets
         .iter()
         .map(|tablet| tablet.tablet_id)
-        .filter(|tablet_id| !written.contains(tablet_id))
-        .collect();
-    if !empty_tablet_ids.is_empty() {
-        // StarRocks treats txn_id=-1 as the empty-txnlog sentinel; BE bumps the
-        // tablet's metadata to new_version without applying any rowset.
+        .collect::<Vec<_>>();
+    if !tablet_ids.is_empty() {
         publish_tablets_at_version(
-            empty_tablet_ids,
-            EMPTY_TXNLOG_TXN_ID,
+            tablet_ids,
+            prepared.txn_id,
             prepared.base_version,
             prepared.commit_version,
         )?;
@@ -538,7 +538,49 @@ fn publish_managed_txn(
     Ok(())
 }
 
-const EMPTY_TXNLOG_TXN_ID: i64 = -1;
+fn append_empty_txn_logs_for_unwritten_tablets(
+    state: &Arc<StandaloneState>,
+    plan: &ManagedInsertPlan,
+    txn_id: i64,
+    written_tablet_ids: &HashSet<i64>,
+) -> Result<(), String> {
+    let managed_config = state
+        .managed_lake_config
+        .as_ref()
+        .ok_or_else(|| "standalone managed lake config is missing during insert".to_string())?
+        .clone();
+
+    for tablet in &plan.tablets {
+        if written_tablet_ids.contains(&tablet.tablet_id) {
+            continue;
+        }
+        let write_ctx = TabletWriteContext {
+            db_id: plan.db_id,
+            table_id: plan.table_id,
+            tablet_id: tablet.tablet_id,
+            tablet_root_path: tablet.tablet_root_path.clone(),
+            tablet_schema: plan.tablet_schema.clone(),
+            s3_config: s3_config_for_tablet_path(&tablet.tablet_root_path, &managed_config.s3)?,
+            partial_update: PartialUpdateWritePolicy::default(),
+        };
+        update_tablet_runtime_schema(tablet.tablet_id, &plan.tablet_schema)?;
+        append_lake_txn_log_empty_rowset(&write_ctx, txn_id, plan.partition_id, None)?;
+    }
+    Ok(())
+}
+
+fn s3_config_for_tablet_path(
+    tablet_root_path: &str,
+    managed_s3: &S3StoreConfig,
+) -> Result<Option<S3StoreConfig>, String> {
+    match classify_scan_paths([tablet_root_path])? {
+        ScanPathScheme::Local => Ok(None),
+        ScanPathScheme::Oss => Ok(Some(managed_s3.clone())),
+        ScanPathScheme::Hdfs => Err(format!(
+            "managed-lake write does not support hdfs tablet path yet: {tablet_root_path}"
+        )),
+    }
+}
 
 /// Drive `publish_version` for a specific txn against the given tablet ids.
 /// Also used by restart recovery to finish a `WRITTEN` txn whose rowsets are
@@ -851,9 +893,11 @@ mod mv_target_tests {
     use crate::connector::starrocks::lake::context::{
         TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
+    use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
     use crate::formats::starrocks::writer::bundle_meta::{
         empty_tablet_metadata, write_bundle_meta_file,
     };
+    use crate::formats::starrocks::writer::layout::txn_log_file_path;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::service::grpc_client::proto::starrocks::{ColumnPb, KeysType, TabletSchemaPb};
     use crate::standalone::engine::catalog::InMemoryCatalog;
@@ -938,6 +982,68 @@ mod mv_target_tests {
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(3));
         assert_eq!(mv.last_refresh_snapshots, snapshots);
+    }
+
+    #[test]
+    fn mv_refresh_write_phase_persists_empty_logs_for_unwritten_tablets() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_active_mv();
+        let plan = load_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("plan");
+        assert_eq!(plan.tablets.len(), 2);
+
+        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
+        let prepared = metadata_store
+            .prepare_txn(plan.table_id, plan.partition_id, plan.base_version)
+            .expect("prepare txn");
+        let chunk = single_i32_chunk("k1", &[1]);
+        let mut next_file_seq = 0_u64;
+        let mut written_tablet_ids = write_routed_chunks(
+            &fixture.state,
+            &plan,
+            &chunk,
+            prepared.txn_id,
+            &mut next_file_seq,
+        )
+        .expect("write routed chunk");
+        written_tablet_ids.sort_unstable();
+        written_tablet_ids.dedup();
+        assert_eq!(written_tablet_ids.len(), 1);
+
+        let written = written_tablet_ids.iter().copied().collect::<HashSet<_>>();
+        append_empty_txn_logs_for_unwritten_tablets(
+            &fixture.state,
+            &plan,
+            prepared.txn_id,
+            &written,
+        )
+        .expect("append empty logs");
+
+        let mut row_counts = Vec::new();
+        for tablet in &plan.tablets {
+            let log_path =
+                txn_log_file_path(&tablet.tablet_root_path, tablet.tablet_id, prepared.txn_id)
+                    .expect("txn log path");
+            let log = read_txn_log_if_exists(&log_path)
+                .expect("read txn log")
+                .expect("txn log exists before written boundary");
+            let rows = log
+                .op_write
+                .as_ref()
+                .and_then(|op| op.rowset.as_ref())
+                .and_then(|rowset| rowset.num_rows)
+                .unwrap_or(-1);
+            row_counts.push(rows);
+        }
+        row_counts.sort_unstable();
+        assert_eq!(row_counts, vec![0, 1]);
     }
 
     #[test]
@@ -1086,7 +1192,7 @@ mod mv_target_tests {
                 next_table_id: 11,
                 next_partition_id: 22,
                 next_index_id: 32,
-                next_tablet_id: 43,
+                next_tablet_id: 44,
                 next_txn_id: 100,
             },
             databases: vec![StoredManagedDatabase {
@@ -1168,6 +1274,13 @@ mod mv_target_tests {
                     tablet_root_path: active_tablet_root.clone(),
                 },
                 StoredManagedTablet {
+                    tablet_id: 43,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 1,
+                    tablet_root_path: active_tablet_root.clone(),
+                },
+                StoredManagedTablet {
                     tablet_id: 41,
                     partition_id: 21,
                     index_id: 31,
@@ -1207,27 +1320,29 @@ mod mv_target_tests {
             .replace_managed_snapshot(&snapshot)
             .map_err(|e| format!("persist snapshot failed: {e}"))?;
 
-        let runtime_ctx = TabletWriteContext {
-            db_id: 1,
-            table_id: 10,
-            tablet_id: 40,
-            tablet_root_path: active_tablet_root,
-            tablet_schema: tablet_schema.clone(),
-            s3_config: tablet_s3_config,
-            partial_update: Default::default(),
-        };
-        register_tablet_runtime(&runtime_ctx)
-            .map_err(|e| format!("register runtime failed: {e}"))?;
-        let mut base_meta = empty_tablet_metadata(40);
-        base_meta.version = Some(1);
-        write_bundle_meta_file(
-            &runtime_ctx.tablet_root_path,
-            runtime_ctx.tablet_id,
-            1,
-            &runtime_ctx.tablet_schema,
-            &base_meta,
-        )
-        .map_err(|e| format!("write base tablet metadata failed: {e}"))?;
+        for tablet_id in [40_i64, 43_i64] {
+            let runtime_ctx = TabletWriteContext {
+                db_id: 1,
+                table_id: 10,
+                tablet_id,
+                tablet_root_path: active_tablet_root.clone(),
+                tablet_schema: tablet_schema.clone(),
+                s3_config: tablet_s3_config.clone(),
+                partial_update: Default::default(),
+            };
+            register_tablet_runtime(&runtime_ctx)
+                .map_err(|e| format!("register runtime failed: {e}"))?;
+            let mut base_meta = empty_tablet_metadata(tablet_id);
+            base_meta.version = Some(1);
+            write_bundle_meta_file(
+                &runtime_ctx.tablet_root_path,
+                runtime_ctx.tablet_id,
+                1,
+                &runtime_ctx.tablet_schema,
+                &base_meta,
+            )
+            .map_err(|e| format!("write base tablet metadata failed: {e}"))?;
+        }
 
         let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)
             .map_err(|e| format!("rebuild managed failed: {e}"))?;
