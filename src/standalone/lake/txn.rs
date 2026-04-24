@@ -574,7 +574,9 @@ fn insert_from_query_into_managed_lake(
     let prepared =
         metadata_store.prepare_txn(plan.table_id, plan.partition_id, plan.base_version)?;
 
-    let write_outcome = write_routed_chunks(state, plan, &chunk, prepared.txn_id);
+    let mut next_file_seq = 0_u64;
+    let write_outcome =
+        write_routed_chunks(state, plan, &chunk, prepared.txn_id, &mut next_file_seq);
     let written_tablet_ids = match write_outcome {
         Ok(ids) => ids,
         Err(err) => {
