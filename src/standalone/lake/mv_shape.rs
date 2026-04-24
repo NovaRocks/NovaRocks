@@ -389,6 +389,8 @@ fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<()
         || is_window_only_function(&function_name)
         || is_grouping_function(&function_name)
         || is_unsafe_scalar_function(&function_name)
+        || function.uses_odbc_syntax
+        || function.null_treatment.is_some()
         || function.over.is_some()
     {
         return Err(projection_filter_error());
@@ -421,11 +423,11 @@ fn reject_unsupported_function_arguments(
             if list.duplicate_treatment.is_some() {
                 return Err(projection_filter_error());
             }
+            if !list.clauses.is_empty() {
+                return Err(projection_filter_error());
+            }
             for arg in &list.args {
                 reject_unsupported_function_arg(arg)?;
-            }
-            for clause in &list.clauses {
-                reject_unsupported_function_arg_clause(clause)?;
             }
             Ok(())
         }
@@ -441,28 +443,6 @@ fn reject_unsupported_function_arg(arg: &sqlparser::ast::FunctionArg) -> Result<
             sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_)
             | sqlparser::ast::FunctionArgExpr::Wildcard => Ok(()),
         },
-    }
-}
-
-fn reject_unsupported_function_arg_clause(
-    clause: &sqlparser::ast::FunctionArgumentClause,
-) -> Result<(), String> {
-    match clause {
-        sqlparser::ast::FunctionArgumentClause::OrderBy(order_by_exprs) => {
-            for order_by in order_by_exprs {
-                reject_unsupported_expr(&order_by.expr)?;
-            }
-            Ok(())
-        }
-        sqlparser::ast::FunctionArgumentClause::Limit(expr) => reject_unsupported_expr(expr),
-        sqlparser::ast::FunctionArgumentClause::Having(bound) => reject_unsupported_expr(&bound.1),
-        sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(_)
-        | sqlparser::ast::FunctionArgumentClause::OnOverflow(_)
-        | sqlparser::ast::FunctionArgumentClause::Separator(_)
-        | sqlparser::ast::FunctionArgumentClause::JsonNullClause(_)
-        | sqlparser::ast::FunctionArgumentClause::JsonReturningClause(_) => {
-            Err(projection_filter_error())
-        }
     }
 }
 
@@ -766,6 +746,22 @@ mod tests {
     fn rejects_unsupported_function_arguments_and_match_against() {
         assert_rejects_with(
             "select abs(distinct v2) from ice.ns.orders",
+            "projection/filter",
+        );
+        assert_rejects_with(
+            "select abs(k1) ignore nulls from ice.ns.orders",
+            "projection/filter",
+        );
+        assert_rejects_with(
+            "select {fn abs(k1)} from ice.ns.orders",
+            "projection/filter",
+        );
+        assert_rejects_with(
+            "select lower(k1 order by v2) from ice.ns.orders",
+            "projection/filter",
+        );
+        assert_rejects_with(
+            "select lower(k1 limit 1) from ice.ns.orders",
             "projection/filter",
         );
         assert_rejects_with(
