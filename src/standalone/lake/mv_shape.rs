@@ -99,78 +99,340 @@ fn reject_unsupported_select_clauses(select: &sqlparser::ast::Select) -> Result<
 fn reject_unsupported_projection_filter_exprs(
     select: &sqlparser::ast::Select,
 ) -> Result<(), String> {
-    let mut rendered_exprs: Vec<String> = select
-        .projection
-        .iter()
-        .map(|item| item.to_string().to_ascii_lowercase())
-        .collect();
-    if let Some(selection) = &select.selection {
-        rendered_exprs.push(selection.to_string().to_ascii_lowercase());
+    for item in &select.projection {
+        reject_unsupported_select_item_expr(item)?;
     }
-
-    for expr in rendered_exprs {
-        if contains_non_deterministic_function(&expr) {
-            return Err(
-                "incremental MV projection/filter query contains non-deterministic function"
-                    .to_string(),
-            );
-        }
-        if contains_unsupported_projection_filter_expr(&expr) {
-            return Err(projection_filter_error());
-        }
+    if let Some(selection) = &select.selection {
+        reject_unsupported_expr(selection)?;
     }
     Ok(())
 }
 
-fn contains_non_deterministic_function(expr: &str) -> bool {
-    contains_function_call(expr, "now")
-        || contains_function_call(expr, "current_timestamp")
-        || contains_query_keyword(expr, "current_timestamp")
-        || contains_function_call(expr, "random")
-        || contains_function_call(expr, "rand")
-        || contains_function_call(expr, "uuid")
-}
-
-fn contains_unsupported_projection_filter_expr(expr: &str) -> bool {
-    contains_query_keyword(expr, "select")
-        || contains_query_keyword(expr, "over")
-        || ["sum", "count", "avg", "min", "max"]
-            .iter()
-            .any(|name| contains_function_call(expr, name))
-}
-
-fn contains_function_call(expr: &str, name: &str) -> bool {
-    let mut rest = expr;
-    while let Some(pos) = rest.find(name) {
-        let before = rest[..pos].chars().next_back();
-        let after = rest[pos + name.len()..].chars().next();
-        let has_boundary_before = before.is_none_or(|ch| !is_identifier_char(ch));
-        let has_call_after = after.is_some_and(|ch| ch == '(' || !is_identifier_char(ch));
-        if has_boundary_before && has_call_after {
-            return true;
+fn reject_unsupported_select_item_expr(item: &sqlparser::ast::SelectItem) -> Result<(), String> {
+    match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(expr)
+        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => reject_unsupported_expr(expr),
+        sqlparser::ast::SelectItem::QualifiedWildcard(kind, _) => {
+            if let sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr) = kind {
+                reject_unsupported_expr(expr)?;
+            }
+            Ok(())
         }
-        rest = &rest[pos + name.len()..];
+        sqlparser::ast::SelectItem::Wildcard(_) => Ok(()),
     }
-    false
 }
 
-fn contains_query_keyword(expr: &str, keyword: &str) -> bool {
-    let mut rest = expr;
-    while let Some(pos) = rest.find(keyword) {
-        let before = rest[..pos].chars().next_back();
-        let after = rest[pos + keyword.len()..].chars().next();
-        if before.is_none_or(|ch| !is_identifier_char(ch))
-            && after.is_none_or(|ch| !is_identifier_char(ch))
-        {
-            return true;
+fn reject_unsupported_expr(expr: &sqlparser::ast::Expr) -> Result<(), String> {
+    use sqlparser::ast::Expr;
+
+    match expr {
+        Expr::Subquery(_)
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::GroupingSets(_)
+        | Expr::Cube(_)
+        | Expr::Rollup(_) => return Err(projection_filter_error()),
+        Expr::Function(function) => reject_unsupported_function(function)?,
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            reject_unsupported_expr(root)?;
+            for access in access_chain {
+                reject_unsupported_access_expr(access)?;
+            }
         }
-        rest = &rest[pos + keyword.len()..];
+        Expr::JsonAccess { value, .. }
+        | Expr::IsFalse(value)
+        | Expr::IsNotFalse(value)
+        | Expr::IsTrue(value)
+        | Expr::IsNotTrue(value)
+        | Expr::IsNull(value)
+        | Expr::IsNotNull(value)
+        | Expr::IsUnknown(value)
+        | Expr::IsNotUnknown(value)
+        | Expr::IsDistinctFrom(value, _)
+        | Expr::IsNotDistinctFrom(value, _)
+        | Expr::Nested(value)
+        | Expr::OuterJoin(value)
+        | Expr::Prior(value) => {
+            reject_unsupported_expr(value)?;
+        }
+        Expr::IsNormalized { expr, .. } | Expr::UnaryOp { expr, .. } => {
+            reject_unsupported_expr(expr)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_exprs(list)?;
+        }
+        Expr::InUnnest {
+            expr, array_expr, ..
+        } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_expr(array_expr)?;
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_expr(low)?;
+            reject_unsupported_expr(high)?;
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            reject_unsupported_expr(left)?;
+            reject_unsupported_expr(right)?;
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_expr(pattern)?;
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            reject_unsupported_expr(left)?;
+            reject_unsupported_expr(right)?;
+        }
+        Expr::Convert { expr, styles, .. } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_exprs(styles)?;
+        }
+        Expr::Cast { expr, .. } => reject_unsupported_expr(expr)?,
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            reject_unsupported_expr(timestamp)?;
+            reject_unsupported_expr(time_zone)?;
+        }
+        Expr::Extract { expr, .. } => reject_unsupported_expr(expr)?,
+        Expr::Ceil { expr, .. } | Expr::Floor { expr, .. } => reject_unsupported_expr(expr)?,
+        Expr::Position { expr, r#in } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_expr(r#in)?;
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            reject_unsupported_expr(expr)?;
+            if let Some(substring_from) = substring_from {
+                reject_unsupported_expr(substring_from)?;
+            }
+            if let Some(substring_for) = substring_for {
+                reject_unsupported_expr(substring_for)?;
+            }
+        }
+        Expr::Trim {
+            expr,
+            trim_what,
+            trim_characters,
+            ..
+        } => {
+            reject_unsupported_expr(expr)?;
+            if let Some(trim_what) = trim_what {
+                reject_unsupported_expr(trim_what)?;
+            }
+            if let Some(trim_characters) = trim_characters {
+                reject_unsupported_exprs(trim_characters)?;
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            reject_unsupported_expr(expr)?;
+            reject_unsupported_expr(overlay_what)?;
+            reject_unsupported_expr(overlay_from)?;
+            if let Some(overlay_for) = overlay_for {
+                reject_unsupported_expr(overlay_for)?;
+            }
+        }
+        Expr::Collate { expr, .. } | Expr::Prefixed { value: expr, .. } => {
+            reject_unsupported_expr(expr)?;
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                reject_unsupported_expr(operand)?;
+            }
+            for condition in conditions {
+                reject_unsupported_expr(&condition.condition)?;
+                reject_unsupported_expr(&condition.result)?;
+            }
+            if let Some(else_result) = else_result {
+                reject_unsupported_expr(else_result)?;
+            }
+        }
+        Expr::Tuple(values) | Expr::Array(sqlparser::ast::Array { elem: values, .. }) => {
+            reject_unsupported_exprs(values)?;
+        }
+        Expr::Struct { values, .. } => reject_unsupported_exprs(values)?,
+        Expr::Named { expr, .. } => reject_unsupported_expr(expr)?,
+        Expr::Dictionary(fields) => {
+            for field in fields {
+                reject_unsupported_expr(&field.value)?;
+            }
+        }
+        Expr::Map(map) => {
+            for entry in &map.entries {
+                reject_unsupported_expr(&entry.key)?;
+                reject_unsupported_expr(&entry.value)?;
+            }
+        }
+        Expr::Interval(interval) => reject_unsupported_expr(&interval.value)?,
+        Expr::Lambda(lambda) => reject_unsupported_expr(&lambda.body)?,
+        Expr::MemberOf(member_of) => {
+            reject_unsupported_expr(&member_of.value)?;
+            reject_unsupported_expr(&member_of.array)?;
+        }
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString(_)
+        | Expr::MatchAgainst { .. }
+        | Expr::Wildcard(_)
+        | Expr::QualifiedWildcard(_, _) => {}
     }
-    false
+    Ok(())
 }
 
-fn is_identifier_char(ch: char) -> bool {
-    ch == '_' || ch.is_ascii_alphanumeric()
+fn reject_unsupported_exprs(exprs: &[sqlparser::ast::Expr]) -> Result<(), String> {
+    for expr in exprs {
+        reject_unsupported_expr(expr)?;
+    }
+    Ok(())
+}
+
+fn reject_unsupported_access_expr(access: &sqlparser::ast::AccessExpr) -> Result<(), String> {
+    match access {
+        sqlparser::ast::AccessExpr::Dot(expr) => reject_unsupported_expr(expr),
+        sqlparser::ast::AccessExpr::Subscript(subscript) => match subscript {
+            sqlparser::ast::Subscript::Index { index } => reject_unsupported_expr(index),
+            sqlparser::ast::Subscript::Slice {
+                lower_bound,
+                upper_bound,
+                stride,
+            } => {
+                if let Some(lower_bound) = lower_bound {
+                    reject_unsupported_expr(lower_bound)?;
+                }
+                if let Some(upper_bound) = upper_bound {
+                    reject_unsupported_expr(upper_bound)?;
+                }
+                if let Some(stride) = stride {
+                    reject_unsupported_expr(stride)?;
+                }
+                Ok(())
+            }
+        },
+    }
+}
+
+fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<(), String> {
+    let function_name = function.name.to_string().to_ascii_lowercase();
+    if is_non_deterministic_function(&function_name) {
+        return Err(
+            "incremental MV projection/filter query contains non-deterministic function"
+                .to_string(),
+        );
+    }
+    if is_aggregate_function(&function_name) || function.over.is_some() {
+        return Err(projection_filter_error());
+    }
+    if function.within_group.is_empty()
+        && function.filter.is_none()
+        && matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+    {
+        reject_unsupported_function_arguments(&function.args)?;
+        return Ok(());
+    }
+
+    if let Some(filter) = &function.filter {
+        reject_unsupported_expr(filter)?;
+    }
+    for order_by in &function.within_group {
+        reject_unsupported_expr(&order_by.expr)?;
+    }
+    reject_unsupported_function_arguments(&function.parameters)?;
+    reject_unsupported_function_arguments(&function.args)
+}
+
+fn reject_unsupported_function_arguments(
+    args: &sqlparser::ast::FunctionArguments,
+) -> Result<(), String> {
+    match args {
+        sqlparser::ast::FunctionArguments::None => Ok(()),
+        sqlparser::ast::FunctionArguments::Subquery(_) => Err(projection_filter_error()),
+        sqlparser::ast::FunctionArguments::List(list) => {
+            for arg in &list.args {
+                reject_unsupported_function_arg(arg)?;
+            }
+            for clause in &list.clauses {
+                reject_unsupported_function_arg_clause(clause)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn reject_unsupported_function_arg(arg: &sqlparser::ast::FunctionArg) -> Result<(), String> {
+    match arg {
+        sqlparser::ast::FunctionArg::Named { arg, .. }
+        | sqlparser::ast::FunctionArg::ExprNamed { arg, .. }
+        | sqlparser::ast::FunctionArg::Unnamed(arg) => match arg {
+            sqlparser::ast::FunctionArgExpr::Expr(expr) => reject_unsupported_expr(expr),
+            sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_)
+            | sqlparser::ast::FunctionArgExpr::Wildcard => Ok(()),
+        },
+    }
+}
+
+fn reject_unsupported_function_arg_clause(
+    clause: &sqlparser::ast::FunctionArgumentClause,
+) -> Result<(), String> {
+    match clause {
+        sqlparser::ast::FunctionArgumentClause::OrderBy(order_by_exprs) => {
+            for order_by in order_by_exprs {
+                reject_unsupported_expr(&order_by.expr)?;
+            }
+            Ok(())
+        }
+        sqlparser::ast::FunctionArgumentClause::Limit(expr) => reject_unsupported_expr(expr),
+        sqlparser::ast::FunctionArgumentClause::Having(bound) => reject_unsupported_expr(&bound.1),
+        _ => Ok(()),
+    }
+}
+
+fn is_non_deterministic_function(name: &str) -> bool {
+    matches!(
+        name,
+        "now" | "current_timestamp" | "random" | "rand" | "uuid"
+    )
+}
+
+fn is_aggregate_function(name: &str) -> bool {
+    matches!(
+        name,
+        "sum"
+            | "count"
+            | "avg"
+            | "min"
+            | "max"
+            | "array_agg"
+            | "group_concat"
+            | "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
+    )
 }
 
 fn is_empty_group_by(group_by: &sqlparser::ast::GroupByExpr) -> bool {
@@ -233,6 +495,13 @@ mod tests {
     }
 
     #[test]
+    fn accepts_projection_filter_string_literals_containing_keywords() {
+        classify_sql("select 'select' from ice.ns.orders").expect("query should be accepted");
+        classify_sql("select k1 from ice.ns.orders where k1 = 'over'")
+            .expect("query should be accepted");
+    }
+
+    #[test]
     fn rejects_multi_table_join() {
         assert_rejects_with(
             "select o.k1 from ice.ns.orders o join ice.ns.items i on o.k1 = i.k1",
@@ -244,6 +513,11 @@ mod tests {
     fn rejects_aggregation() {
         assert_rejects_with(
             "select k1, sum(v2) from ice.ns.orders group by k1",
+            "projection/filter",
+        );
+        assert_rejects_with("select stddev(v2) from ice.ns.orders", "projection/filter");
+        assert_rejects_with(
+            "select array_agg(k1) from ice.ns.orders",
             "projection/filter",
         );
     }
