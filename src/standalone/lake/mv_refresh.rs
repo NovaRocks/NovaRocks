@@ -550,6 +550,19 @@ mod tests {
     }
 
     #[test]
+    fn choose_refresh_strategy_rejects_unreachable_previous_snapshot() {
+        let err = choose_refresh_strategy(Some(10), None).expect_err("strategy should fail");
+        assert!(
+            err.contains("10"),
+            "expected error to contain previous snapshot id, got `{err}`"
+        );
+        assert!(
+            err.contains("no longer reachable"),
+            "expected error to describe unreachable snapshot, got `{err}`"
+        );
+    }
+
+    #[test]
     fn refresh_mv_full_cleans_staged_partition_when_executor_fails() {
         // Covered by integration-style engine/mysql tests once mv refresh is wired.
         // Keep this module-level smoke test minimal so the file always participates
