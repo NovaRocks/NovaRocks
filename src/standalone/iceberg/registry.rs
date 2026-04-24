@@ -584,6 +584,12 @@ pub(crate) fn plan_append_delta(
         });
     }
 
+    if metadata.snapshot_by_id(previous_snapshot_id).is_none() {
+        return Err(format!(
+            "snapshot {previous_snapshot_id} is not an ancestor of current snapshot {current_snapshot_id}"
+        ));
+    }
+
     let mut snapshot_ids = Vec::new();
     let mut cursor = current_snapshot_id;
     let found_previous = loop {
@@ -591,9 +597,11 @@ pub(crate) fn plan_append_delta(
             break true;
         }
 
-        let snapshot = metadata
-            .snapshot_by_id(cursor)
-            .ok_or_else(|| format!("snapshot {cursor} not found in iceberg metadata"))?;
+        let snapshot = metadata.snapshot_by_id(cursor).ok_or_else(|| {
+            format!(
+                "snapshot {previous_snapshot_id} is not an ancestor of current snapshot {current_snapshot_id}: missing lineage snapshot {cursor}"
+            )
+        })?;
         let operation = &snapshot.summary().operation;
         if operation != &Operation::Append {
             return Err(format!(
@@ -1902,5 +1910,66 @@ mod phase2_delta_tests {
                 .iter()
                 .all(|(_, _, rows)| rows.unwrap_or_default() > 0)
         );
+    }
+
+    #[test]
+    fn plan_append_delta_rejects_missing_previous_snapshot_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+            }],
+            None,
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load first");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load second");
+        assert_eq!(
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .parent_snapshot_id(),
+            Some(previous)
+        );
+
+        let pruned_metadata = loaded
+            .table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .remove_snapshots(&[previous])
+            .build()
+            .expect("pruned metadata")
+            .metadata;
+        let pruned_table = iceberg::table::Table::builder()
+            .file_io(loaded.table.file_io().clone())
+            .metadata(std::sync::Arc::new(pruned_metadata))
+            .identifier(loaded.table.identifier().clone())
+            .build()
+            .expect("pruned table");
+
+        let err = plan_append_delta(&pruned_table, previous).expect_err("delta should fail");
+        assert!(err.contains("not an ancestor"), "unexpected error: {err}");
     }
 }
