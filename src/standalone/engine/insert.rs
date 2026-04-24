@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use super::catalog::{ColumnDef, normalize_identifier};
@@ -113,7 +113,11 @@ pub(crate) fn build_local_insert_batch(
     let mut arrays = Vec::with_capacity(columns.len());
     for (idx, column) in columns.iter().enumerate() {
         let values: Vec<&Literal> = rows.iter().map(|row| &row[idx]).collect();
-        arrays.push(build_local_literal_array(&column.data_type, &values)?);
+        arrays.push(build_local_literal_array(
+            &column.data_type,
+            &values,
+            column.nullable,
+        )?);
     }
 
     RecordBatch::try_new(schema, arrays)
@@ -121,9 +125,15 @@ pub(crate) fn build_local_insert_batch(
 }
 
 /// Build an Arrow array from literal values for local table insertion.
+///
+/// `nullable` models the target column/field nullability and is used to mirror
+/// StarRocks' assignment semantics: overflowing a narrow integer literal into
+/// a nullable target produces NULL, while overflow on a NOT NULL target fails
+/// fast with an error.
 fn build_local_literal_array(
     data_type: &DataType,
     values: &[&Literal],
+    nullable: bool,
 ) -> Result<ArrayRef, String> {
     use arrow::array::*;
     use arrow_buffer::{NullBufferBuilder, OffsetBuffer};
@@ -137,9 +147,13 @@ fn build_local_literal_array(
                     Literal::Null => Ok(None),
                     _ => {
                         literal_to_i128_for_integer(literal, "TINYINT")?.map_or(Ok(None), |value| {
-                            i8::try_from(value)
-                                .map(Some)
-                                .map_err(|_| format!("literal {value} is out of range for TINYINT"))
+                            match i8::try_from(value) {
+                                Ok(v) => Ok(Some(v)),
+                                Err(_) if nullable => Ok(None),
+                                Err(_) => {
+                                    Err(format!("literal {value} is out of range for TINYINT"))
+                                }
+                            }
                         })
                     }
                 })
@@ -152,10 +166,10 @@ fn build_local_literal_array(
                     Literal::Null => Ok(None),
                     _ => literal_to_i128_for_integer(literal, "SMALLINT")?.map_or(
                         Ok(None),
-                        |value| {
-                            i16::try_from(value).map(Some).map_err(|_| {
-                                format!("literal {value} is out of range for SMALLINT")
-                            })
+                        |value| match i16::try_from(value) {
+                            Ok(v) => Ok(Some(v)),
+                            Err(_) if nullable => Ok(None),
+                            Err(_) => Err(format!("literal {value} is out of range for SMALLINT")),
                         },
                     ),
                 })
@@ -167,9 +181,11 @@ fn build_local_literal_array(
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
                     _ => literal_to_i128_for_integer(literal, "INT")?.map_or(Ok(None), |value| {
-                        i32::try_from(value)
-                            .map(Some)
-                            .map_err(|_| format!("literal {value} is out of range for INT"))
+                        match i32::try_from(value) {
+                            Ok(v) => Ok(Some(v)),
+                            Err(_) if nullable => Ok(None),
+                            Err(_) => Err(format!("literal {value} is out of range for INT")),
+                        }
                     }),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -181,9 +197,13 @@ fn build_local_literal_array(
                     Literal::Null => Ok(None),
                     _ => {
                         literal_to_i128_for_integer(literal, "BIGINT")?.map_or(Ok(None), |value| {
-                            i64::try_from(value)
-                                .map(Some)
-                                .map_err(|_| format!("literal {value} is out of range for BIGINT"))
+                            match i64::try_from(value) {
+                                Ok(v) => Ok(Some(v)),
+                                Err(_) if nullable => Ok(None),
+                                Err(_) => {
+                                    Err(format!("literal {value} is out of range for BIGINT"))
+                                }
+                            }
                         })
                     }
                 })
@@ -301,6 +321,10 @@ fn build_local_literal_array(
                 .map(|literal| match literal {
                     Literal::Null => Ok(None),
                     Literal::Date(v) | Literal::String(v) => parse_date_string_to_days(v).map(Some),
+                    // Non-temporal literals cannot be parsed as DATE; mirror
+                    // StarRocks' cast-to-date semantic by yielding NULL for
+                    // nullable columns instead of failing fast.
+                    _ if nullable => Ok(None),
                     other => Err(format!("literal {:?} is not valid for DATE", other)),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -314,6 +338,7 @@ fn build_local_literal_array(
                         Literal::String(v) | Literal::Date(v) => {
                             parse_datetime_string_to_micros(v).map(Some)
                         }
+                        _ if nullable => Ok(None),
                         other => Err(format!("literal {:?} is not valid for DATETIME", other)),
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -350,7 +375,8 @@ fn build_local_literal_array(
                 }
             }
 
-            let values = build_local_literal_array(field.data_type(), &flattened)?;
+            let values =
+                build_local_literal_array(field.data_type(), &flattened, field.is_nullable())?;
             Ok(Arc::new(ListArray::new(
                 field.clone(),
                 OffsetBuffer::new(offsets.into()),
@@ -396,7 +422,7 @@ fn build_local_literal_array(
                 .enumerate()
                 .map(|(idx, field)| {
                     let refs = child_values[idx].iter().collect::<Vec<_>>();
-                    build_local_literal_array(field.data_type(), &refs)
+                    build_local_literal_array(field.data_type(), &refs, field.is_nullable())
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(Arc::new(StructArray::new(
@@ -425,6 +451,10 @@ fn build_local_literal_array(
             let mut flattened_values = Vec::new();
             offsets.push(0_i32);
 
+            // Arrow's Map layout requires `entries.key` to be non-nullable.
+            // Drop map entries whose key literal is NULL so we do not have to
+            // widen the field and produce an array that violates the schema
+            // the catalog advertises.
             for literal in values {
                 match literal {
                     Literal::Null => {
@@ -433,6 +463,9 @@ fn build_local_literal_array(
                     Literal::Map(items) => {
                         map_nulls.append(true);
                         for (key, value) in items {
+                            if matches!(key, Literal::Null) {
+                                continue;
+                            }
                             flattened_keys.push(key.clone());
                             flattened_values.push(value.clone());
                         }
@@ -453,28 +486,20 @@ fn build_local_literal_array(
 
             let key_refs = flattened_keys.iter().collect::<Vec<_>>();
             let value_refs = flattened_values.iter().collect::<Vec<_>>();
-            let key_array = build_local_literal_array(entry_fields[0].data_type(), &key_refs)?;
-            let value_array = build_local_literal_array(entry_fields[1].data_type(), &value_refs)?;
-            let entries_fields = if key_array.null_count() > 0 && !entry_fields[0].is_nullable() {
-                let mut adjusted = entry_fields.iter().cloned().collect::<Vec<_>>();
-                adjusted[0] = Arc::new(Field::new(
-                    entry_fields[0].name(),
-                    entry_fields[0].data_type().clone(),
-                    true,
-                ));
-                Fields::from(adjusted)
-            } else {
-                entry_fields.clone()
-            };
+            let key_array = build_local_literal_array(
+                entry_fields[0].data_type(),
+                &key_refs,
+                entry_fields[0].is_nullable(),
+            )?;
+            let value_array = build_local_literal_array(
+                entry_fields[1].data_type(),
+                &value_refs,
+                entry_fields[1].is_nullable(),
+            )?;
             let entries =
-                StructArray::new(entries_fields.clone(), vec![key_array, value_array], None);
-            let entries_field = Arc::new(Field::new(
-                entries_field.name(),
-                DataType::Struct(entries_fields),
-                false,
-            ));
+                StructArray::new(entry_fields.clone(), vec![key_array, value_array], None);
             Ok(Arc::new(MapArray::new(
-                entries_field,
+                entries_field.clone(),
                 OffsetBuffer::new(offsets.into()),
                 entries,
                 map_nulls.finish(),

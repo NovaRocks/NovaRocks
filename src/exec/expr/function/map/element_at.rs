@@ -66,6 +66,26 @@ pub fn eval_element_at(
     let values = map.values();
     let offsets = map.value_offsets();
 
+    // Short-circuit when the underlying entries are empty: every lookup
+    // yields NULL (or errors if the caller requested strict bounds-checking
+    // and there is any non-null row). Avoiding arrow's `take` here side-steps
+    // a known panic in `take_fixed_size_binary` when the underlying values
+    // are length 0 — it reads `values.value(0)` even for indices flagged as
+    // null.
+    if values.is_empty() {
+        if let Some(flags) = check_arr {
+            for row in 0..map.len() {
+                let check_idx = super::common::row_index(row, flags.len());
+                let strict = !flags.is_null(check_idx) && flags.value(check_idx);
+                if strict && !map.is_null(row) {
+                    return Err("Key not present in map".to_string());
+                }
+            }
+        }
+        let out = arrow::array::new_null_array(values.data_type(), map.len());
+        return super::common::cast_output(out, arena.data_type(expr), "element_at");
+    }
+
     let mut indices = Vec::with_capacity(map.len());
     for row in 0..map.len() {
         let key_idx = super::common::row_index(row, key_arr.len());
@@ -112,6 +132,27 @@ pub fn eval_element_at(
     }
 
     let indices = UInt32Array::from(indices);
+    // arrow's `take_fixed_size_binary` does not honour the indices array null
+    // bitmap: it dereferences the placeholder slot (0) for null indices even
+    // when `values` is non-nullable. Merge the indices null bitmap into the
+    // output so LARGEINT lookups return NULL rather than the value at slot 0.
     let out = take(values.as_ref(), &indices, None).map_err(|e| e.to_string())?;
+    let out = apply_indices_nulls(&out, &indices);
     super::common::cast_output(out, arena.data_type(expr), "element_at")
+}
+
+fn apply_indices_nulls(out: &ArrayRef, indices: &UInt32Array) -> ArrayRef {
+    let Some(idx_nulls) = indices.nulls() else {
+        return out.clone();
+    };
+    if idx_nulls.null_count() == 0 {
+        return out.clone();
+    }
+    let combined_nulls = match out.nulls() {
+        Some(existing) => arrow_buffer::NullBuffer::union(Some(existing), Some(idx_nulls))
+            .expect("combined null buffer is always Some"),
+        None => idx_nulls.clone(),
+    };
+    let data = out.to_data().into_builder().nulls(Some(combined_nulls));
+    arrow::array::make_array(unsafe { data.build_unchecked() })
 }

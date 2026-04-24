@@ -2029,30 +2029,33 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn build_local_insert_batch_accepts_null_map_keys() {
+    fn build_local_insert_batch_drops_null_map_keys() {
         use crate::sql::catalog::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
+        // Arrow's Map layout requires `entries.key` to be non-nullable; map
+        // literals with NULL keys must drop those kv-pairs so that the output
+        // array matches the catalog schema.
         let entries_field = Arc::new(Field::new(
             "entries",
             DataType::Struct(
                 vec![
-                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("key", DataType::Int32, false)),
                     Arc::new(Field::new("value", DataType::Utf8, true)),
                 ]
                 .into(),
             ),
-            true,
+            false,
         ));
         let columns = vec![ColumnDef {
             name: "m".to_string(),
             data_type: DataType::Map(entries_field, false),
             nullable: true,
         }];
-        let rows = vec![vec![Literal::Map(vec![(
-            Literal::Null,
-            Literal::String("v".to_string()),
-        )])]];
+        let rows = vec![vec![Literal::Map(vec![
+            (Literal::Null, Literal::String("dropped".to_string())),
+            (Literal::Int(7), Literal::String("kept".to_string())),
+        ])]];
 
         let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
         let map = batch
@@ -2060,12 +2063,17 @@ enable_path_style_access = true
             .as_any()
             .downcast_ref::<arrow::array::MapArray>()
             .expect("map array");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.value_length(0), 1);
         let entries = map.entries();
         let keys = entries
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("key array");
+        assert_eq!(keys.null_count(), 0);
+        assert_eq!(keys.value(0), 7);
+
         let schema = batch.schema();
         let DataType::Map(entries_field, _) = schema.field(0).data_type() else {
             panic!("expected map field");
@@ -2073,9 +2081,7 @@ enable_path_style_access = true
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
             panic!("expected struct entries");
         };
-
-        assert!(keys.is_null(0));
-        assert!(entry_fields[0].is_nullable());
+        assert!(!entry_fields[0].is_nullable());
     }
 
     #[test]
@@ -2140,15 +2146,18 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn local_parquet_round_trip_preserves_nullable_map_keys() {
+    fn local_parquet_round_trip_drops_null_map_keys() {
         use crate::sql::catalog::ColumnDef;
         use crate::sql::parser::ast::Literal;
 
+        // Arrow's Map layout requires non-null keys; when a literal carries a
+        // NULL key, the insert path drops the kv-pair and the resulting
+        // parquet round trip must preserve that (no null keys).
         let entries_field = Arc::new(Field::new(
             "entries",
             DataType::Struct(
                 vec![
-                    Arc::new(Field::new("key", DataType::Int32, true)),
+                    Arc::new(Field::new("key", DataType::Int32, false)),
                     Arc::new(Field::new("value", DataType::Utf8, true)),
                 ]
                 .into(),
@@ -2160,10 +2169,10 @@ enable_path_style_access = true
             data_type: DataType::Map(entries_field, false),
             nullable: true,
         }];
-        let rows = vec![vec![Literal::Map(vec![(
-            Literal::Null,
-            Literal::String("v".to_string()),
-        )])]];
+        let rows = vec![vec![Literal::Map(vec![
+            (Literal::Null, Literal::String("dropped".to_string())),
+            (Literal::Int(5), Literal::String("kept".to_string())),
+        ])]];
         let batch = super::build_local_insert_batch(&columns, &rows).expect("build local batch");
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("map_round_trip.parquet");
@@ -2176,14 +2185,17 @@ enable_path_style_access = true
             .as_any()
             .downcast_ref::<arrow::array::MapArray>()
             .expect("map array");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.value_length(0), 1);
         let entries = map.entries();
         let keys = entries
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
             .expect("key array");
+        assert_eq!(keys.null_count(), 0);
+        assert_eq!(keys.value(0), 5);
 
-        assert!(keys.is_null(0));
         let round_schema = round_tripped.schema();
         let DataType::Map(entries_field, _) = round_schema.field(0).data_type() else {
             panic!("expected map field");
@@ -2191,7 +2203,7 @@ enable_path_style_access = true
         let DataType::Struct(entry_fields) = entries_field.data_type() else {
             panic!("expected struct entries");
         };
-        assert!(entry_fields[0].is_nullable());
+        assert!(!entry_fields[0].is_nullable());
     }
 
     #[test]
