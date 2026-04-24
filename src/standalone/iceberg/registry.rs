@@ -640,9 +640,6 @@ pub(crate) fn plan_append_delta(
                 .map_err(|e| format!("load manifest list for snapshot {snapshot_id}: {e}"))?;
 
             for manifest_file in manifest_list.entries() {
-                if manifest_file.added_snapshot_id != snapshot_id {
-                    continue;
-                }
                 if manifest_file.content == ManifestContentType::Deletes {
                     return Err(format!(
                         "iceberg append delta does not support delete manifests in snapshot {snapshot_id}: {}",
@@ -650,6 +647,9 @@ pub(crate) fn plan_append_delta(
                     ));
                 }
                 if manifest_file.content != ManifestContentType::Data {
+                    continue;
+                }
+                if manifest_file.added_snapshot_id != snapshot_id {
                     continue;
                 }
 
