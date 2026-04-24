@@ -336,7 +336,7 @@ fn reject_unsupported_access_expr(access: &sqlparser::ast::AccessExpr) -> Result
 
 fn reject_unsupported_function(function: &sqlparser::ast::Function) -> Result<(), String> {
     let function_name = function.name.to_string().to_ascii_lowercase();
-    if is_non_deterministic_function(&function_name) {
+    if is_non_deterministic_function(&function_name, &function.args) {
         return Err(
             "incremental MV projection/filter query contains non-deterministic function"
                 .to_string(),
@@ -409,14 +409,36 @@ fn reject_unsupported_function_arg_clause(
     }
 }
 
-fn is_non_deterministic_function(name: &str) -> bool {
+fn is_non_deterministic_function(name: &str, args: &sqlparser::ast::FunctionArguments) -> bool {
     matches!(
         name,
-        "now" | "current_timestamp" | "random" | "rand" | "uuid"
-    )
+        "now"
+            | "current_timestamp"
+            | "localtime"
+            | "localtimestamp"
+            | "utc_timestamp"
+            | "current_date"
+            | "curdate"
+            | "current_time"
+            | "curtime"
+            | "utc_time"
+            | "random"
+            | "rand"
+            | "uuid"
+    ) || (name == "unix_timestamp" && function_argument_count(args) == Some(0))
+}
+
+fn function_argument_count(args: &sqlparser::ast::FunctionArguments) -> Option<usize> {
+    match args {
+        sqlparser::ast::FunctionArguments::None => Some(0),
+        sqlparser::ast::FunctionArguments::List(list) => Some(list.args.len()),
+        sqlparser::ast::FunctionArguments::Subquery(_) => None,
+    }
 }
 
 fn is_aggregate_function(name: &str) -> bool {
+    // Keep in sync with sql::analyzer::functions::is_aggregate_function and
+    // exec::expr::agg::functions::resolve_by_func aliases.
     matches!(
         name,
         "sum"
@@ -424,14 +446,72 @@ fn is_aggregate_function(name: &str) -> bool {
             | "avg"
             | "min"
             | "max"
+            | "count_if"
+            | "any_value"
             | "array_agg"
             | "group_concat"
+            | "string_agg"
+            | "bitmap_agg"
+            | "bitmap_union"
+            | "bitmap_union_count"
+            | "bitmap_union_int"
+            | "multi_distinct_count"
+            | "array_agg_distinct"
+            | "array_unique_agg"
+            | "sum_map"
+            | "map_agg"
+            | "percentile_approx"
+            | "percentile_approx_weighted"
+            | "percentile_cont"
+            | "percentile_disc"
+            | "percentile_disc_lc"
+            | "percentile_union"
+            | "approx_count_distinct"
+            | "approx_count_distinct_hll_sketch"
+            | "approx_top_k"
+            | "ds_hll_accumulate"
+            | "ds_hll_combine"
+            | "ds_hll_estimate"
+            | "ds_hll_count_distinct"
+            | "ds_hll_count_distinct_union"
+            | "ds_hll_count_distinct_merge"
+            | "hll_union"
+            | "hll_union_agg"
+            | "hll_raw_agg"
+            | "hll_raw"
+            | "hll_cardinality"
+            | "ndv"
             | "stddev"
             | "stddev_samp"
             | "stddev_pop"
             | "variance"
+            | "variance_samp"
+            | "variance_pop"
             | "var_samp"
             | "var_pop"
+            | "std"
+            | "covar_samp"
+            | "covar_pop"
+            | "corr"
+            | "max_by"
+            | "min_by"
+            | "max_by_v2"
+            | "min_by_v2"
+            | "multi_distinct_sum"
+            | "retention"
+            | "window_funnel"
+            | "histogram"
+            | "histogram_hll_ndv"
+            | "mann_whitney_u_test"
+            | "dict_merge"
+            | "ds_theta_count_distinct"
+            | "bool_or"
+            | "bool_and"
+            | "boolor_agg"
+            | "booland_agg"
+            | "every"
+            | "min_n"
+            | "max_n"
     )
 }
 
@@ -440,7 +520,7 @@ fn is_empty_group_by(group_by: &sqlparser::ast::GroupByExpr) -> bool {
         sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
             exprs.is_empty() && modifiers.is_empty()
         }
-        sqlparser::ast::GroupByExpr::All(modifiers) => modifiers.is_empty(),
+        sqlparser::ast::GroupByExpr::All(_) => false,
     }
 }
 
@@ -520,6 +600,24 @@ mod tests {
             "select array_agg(k1) from ice.ns.orders",
             "projection/filter",
         );
+        for sql in [
+            "select approx_count_distinct(k1) from ice.ns.orders",
+            "select bitmap_union(k1) from ice.ns.orders",
+            "select hll_union(k1) from ice.ns.orders",
+            "select percentile_approx(v2, 0.5) from ice.ns.orders",
+            "select max_by_v2(k1, v2) from ice.ns.orders",
+            "select multi_distinct_sum(v2) from ice.ns.orders",
+        ] {
+            assert_rejects_with(sql, "projection/filter");
+        }
+    }
+
+    #[test]
+    fn rejects_group_by_all() {
+        assert_rejects_with(
+            "select k1 from ice.ns.orders group by all",
+            "projection/filter",
+        );
     }
 
     #[test]
@@ -543,5 +641,19 @@ mod tests {
             "select k1, current_timestamp from ice.ns.orders",
             "non-deterministic",
         );
+        for sql in [
+            "select current_date from ice.ns.orders",
+            "select localtimestamp from ice.ns.orders",
+            "select utc_timestamp() from ice.ns.orders",
+            "select unix_timestamp() from ice.ns.orders",
+        ] {
+            assert_rejects_with(sql, "non-deterministic");
+        }
+    }
+
+    #[test]
+    fn accepts_unix_timestamp_with_argument() {
+        classify_sql("select unix_timestamp(k1) from ice.ns.orders")
+            .expect("query should be accepted");
     }
 }
