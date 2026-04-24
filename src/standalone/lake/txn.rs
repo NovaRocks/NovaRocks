@@ -842,14 +842,15 @@ mod mv_target_tests {
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use prost::Message;
+    use std::net::ToSocketAddrs;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn write_chunks_into_managed_partition_routes_rows_to_staged_tablets() {
         let _guard = lock_runtime_test_state();
-        let state = seed_state_with_staged_mv();
+        let fixture = seed_state_with_staged_mv();
         let plan = load_insert_plan(
-            &state,
+            &fixture.state,
             &ResolvedLocalTableName {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
@@ -875,9 +876,9 @@ mod mv_target_tests {
     #[test]
     fn mv_refresh_noop_chunks_updates_metadata_atomically() {
         let _guard = lock_runtime_test_state();
-        let state = seed_state_with_active_mv();
+        let fixture = seed_state_with_active_mv();
         let plan = load_insert_plan(
-            &state,
+            &fixture.state,
             &ResolvedLocalTableName {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
@@ -889,7 +890,7 @@ mod mv_target_tests {
         snapshots.insert("ice.ns.orders".to_string(), 42);
 
         let rows = write_chunks_into_managed_partition_for_mv_refresh(
-            &state,
+            &fixture.state,
             plan,
             &[],
             store::UpdateMvRefreshMetadataRequest {
@@ -901,7 +902,7 @@ mod mv_target_tests {
         .expect("write");
         assert_eq!(rows, 0);
 
-        let store = state.metadata_store.as_ref().expect("store");
+        let store = fixture.state.metadata_store.as_ref().expect("store");
         let loaded = store.load_snapshot().expect("snapshot").managed;
         let mv = loaded
             .materialized_views
@@ -918,11 +919,10 @@ mod mv_target_tests {
             return;
         };
         let _guard = lock_runtime_test_state();
-        let Some(state) = seed_state_with_active_mv_on_object_store(config) else {
-            return;
-        };
+        let fixture =
+            seed_state_with_active_mv_on_object_store(config).expect("object-store fixture");
         let plan = load_insert_plan(
-            &state,
+            &fixture.state,
             &ResolvedLocalTableName {
                 database: "analytics".to_string(),
                 table: "orders_mv".to_string(),
@@ -935,7 +935,7 @@ mod mv_target_tests {
         snapshots.insert("ice.ns.orders".to_string(), 42);
 
         let rows = write_chunks_into_managed_partition_for_mv_refresh(
-            &state,
+            &fixture.state,
             plan,
             &[chunk],
             store::UpdateMvRefreshMetadataRequest {
@@ -947,7 +947,7 @@ mod mv_target_tests {
         .expect("write");
         assert_eq!(rows, 3);
 
-        let store = state.metadata_store.as_ref().expect("store");
+        let store = fixture.state.metadata_store.as_ref().expect("store");
         let loaded = store.load_snapshot().expect("snapshot").managed;
         let mv = loaded
             .materialized_views
@@ -958,17 +958,22 @@ mod mv_target_tests {
         assert_eq!(mv.last_refresh_snapshots, snapshots);
     }
 
-    fn seed_state_with_staged_mv() -> Arc<StandaloneState> {
+    struct MvTestFixture {
+        state: Arc<StandaloneState>,
+        _metadata_dir: tempfile::TempDir,
+    }
+
+    fn seed_state_with_staged_mv() -> MvTestFixture {
         seed_state_with_mv_fixture(false, MvFixtureStorage::Local).expect("local fixture")
     }
 
-    fn seed_state_with_active_mv() -> Arc<StandaloneState> {
+    fn seed_state_with_active_mv() -> MvTestFixture {
         seed_state_with_mv_fixture(true, MvFixtureStorage::Local).expect("local fixture")
     }
 
     fn seed_state_with_active_mv_on_object_store(
         config: ManagedLakeConfig,
-    ) -> Option<Arc<StandaloneState>> {
+    ) -> Result<MvTestFixture, String> {
         seed_state_with_mv_fixture(true, MvFixtureStorage::ObjectStore(config))
     }
 
@@ -980,9 +985,10 @@ mod mv_target_tests {
     fn seed_state_with_mv_fixture(
         active_mv_metadata: bool,
         storage: MvFixtureStorage,
-    ) -> Option<Arc<StandaloneState>> {
-        let metadata_root = tempfile::tempdir().expect("tempdir").keep();
-        let metadata_root = metadata_root.to_string_lossy().to_string();
+    ) -> Result<MvTestFixture, String> {
+        let metadata_dir =
+            tempfile::tempdir().map_err(|e| format!("create tempdir failed: {e}"))?;
+        let metadata_root = metadata_dir.path().to_string_lossy().to_string();
         let (config, active_tablet_root, staged_tablet_root, tablet_s3_config) = match storage {
             MvFixtureStorage::Local => {
                 let config = ManagedLakeConfig {
@@ -1169,10 +1175,10 @@ mod mv_target_tests {
 
         let metadata_store =
             SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
-                .expect("open store");
+                .map_err(|e| format!("open store failed: {e}"))?;
         metadata_store
             .replace_managed_snapshot(&snapshot)
-            .expect("persist snapshot");
+            .map_err(|e| format!("persist snapshot failed: {e}"))?;
 
         let runtime_ctx = TabletWriteContext {
             db_id: 1,
@@ -1183,38 +1189,38 @@ mod mv_target_tests {
             s3_config: tablet_s3_config,
             partial_update: Default::default(),
         };
-        register_tablet_runtime(&runtime_ctx).expect("register runtime");
+        register_tablet_runtime(&runtime_ctx)
+            .map_err(|e| format!("register runtime failed: {e}"))?;
         let mut base_meta = empty_tablet_metadata(40);
         base_meta.version = Some(1);
-        if let Err(err) = write_bundle_meta_file(
+        write_bundle_meta_file(
             &runtime_ctx.tablet_root_path,
             runtime_ctx.tablet_id,
             1,
             &runtime_ctx.tablet_schema,
             &base_meta,
-        ) {
-            eprintln!(
-                "skipping mv object-store chunk write test: write base tablet metadata failed: {err}"
-            );
-            return None;
-        }
+        )
+        .map_err(|e| format!("write base tablet metadata failed: {e}"))?;
 
-        let managed =
-            ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild managed");
+        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)
+            .map_err(|e| format!("rebuild managed failed: {e}"))?;
         let mut catalog = InMemoryCatalog::default();
         catalog
             .create_database("analytics")
-            .expect("create analytics");
+            .map_err(|e| format!("create analytics failed: {e}"))?;
         register_managed_tables_in_catalog(&mut catalog, &managed)
-            .expect("register managed tables");
+            .map_err(|e| format!("register managed tables failed: {e}"))?;
 
-        Some(Arc::new(StandaloneState {
-            catalog: std::sync::RwLock::new(catalog),
-            managed_lake: std::sync::RwLock::new(managed),
-            managed_lake_config: Some(config),
-            metadata_store: Some(metadata_store),
-            ..Default::default()
-        }))
+        Ok(MvTestFixture {
+            state: Arc::new(StandaloneState {
+                catalog: std::sync::RwLock::new(catalog),
+                managed_lake: std::sync::RwLock::new(managed),
+                managed_lake_config: Some(config),
+                metadata_store: Some(metadata_store),
+                ..Default::default()
+            }),
+            _metadata_dir: metadata_dir,
+        })
     }
 
     fn maybe_object_store_config() -> Option<ManagedLakeConfig> {
@@ -1283,13 +1289,12 @@ mod mv_target_tests {
                 (authority, default_port)
             }
         };
-        std::net::TcpStream::connect_timeout(
-            &format!("{host}:{port}")
-                .parse()
-                .expect("managed lake endpoint socket addr"),
-            Duration::from_secs(1),
-        )
-        .is_ok()
+        let Ok(addrs) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        addrs
+            .into_iter()
+            .any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok())
     }
 
     fn single_i32_chunk(name: &str, values: &[i32]) -> Chunk {
