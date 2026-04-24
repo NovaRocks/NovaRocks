@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::exec::chunk::Chunk;
@@ -62,6 +62,7 @@ pub(crate) fn refresh_mv(
         .metadata_store
         .as_ref()
         .ok_or_else(|| "managed lake mv refresh requires sqlite metadata store".to_string())?;
+    let _refresh_guard = acquire_mv_refresh_lock()?;
 
     let runtime = {
         let managed = state
@@ -153,7 +154,7 @@ pub(crate) fn refresh_mv(
                 )
             })?;
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
-            write_chunks_into_managed_partition_for_mv_refresh(
+            let rows_written = write_chunks_into_managed_partition_for_mv_refresh(
                 state,
                 plan,
                 &chunks,
@@ -163,6 +164,7 @@ pub(crate) fn refresh_mv(
                     snapshots,
                 },
             )?;
+            validate_incremental_rows_written(&db_name, &mv_name, rows_to_append, rows_written)?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
         }
@@ -293,7 +295,13 @@ where
         }
     };
 
-    let snapshots = collect_current_snapshots(state, &mv_row.base_table_refs)?;
+    let snapshots = collect_current_snapshots_or_cleanup_staged_partition(
+        state,
+        metadata_store,
+        runtime.table.table_id,
+        &staged,
+        &mv_row.base_table_refs,
+    )?;
     if let Err(err) = metadata_store.activate_mv_refresh_partition(ActivateMvRefreshRequest {
         table_id: runtime.table.table_id,
         old_partition_id: active_partition.partition_id,
@@ -451,6 +459,52 @@ fn collect_current_snapshots(
     Ok(snapshots)
 }
 
+fn collect_current_snapshots_or_cleanup_staged_partition(
+    state: &Arc<StandaloneState>,
+    metadata_store: &super::store::SqliteMetadataStore,
+    table_id: i64,
+    staged: &StagedMvRefresh,
+    refs: &[IcebergTableRef],
+) -> Result<BTreeMap<String, i64>, String> {
+    match collect_current_snapshots(state, refs) {
+        Ok(snapshots) => Ok(snapshots),
+        Err(err) => {
+            if let Err(cleanup_err) =
+                cleanup_staged_partition(state, metadata_store, table_id, staged, true)
+            {
+                return Err(format!(
+                    "mv refresh snapshot collection failed: {err}; cleanup failed: {cleanup_err}"
+                ));
+            }
+            Err(format!("mv refresh snapshot collection failed: {err}"))
+        }
+    }
+}
+
+fn validate_incremental_rows_written(
+    database: &str,
+    mv_name: &str,
+    expected_rows: i64,
+    rows_written: i64,
+) -> Result<(), String> {
+    if rows_written != expected_rows {
+        return Err(format!(
+            "materialized view {database}.{mv_name} incremental refresh row count mismatch: expected {expected_rows}, wrote {rows_written}"
+        ));
+    }
+    Ok(())
+}
+
+fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
+    static MV_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    lock_mv_refresh_mutex(MV_REFRESH_LOCK.get_or_init(|| Mutex::new(())))
+}
+
+fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String> {
+    lock.lock()
+        .map_err(|_| "materialized view refresh lock poisoned".to_string())
+}
+
 fn cleanup_staged_partition(
     state: &Arc<StandaloneState>,
     metadata_store: &super::store::SqliteMetadataStore,
@@ -520,6 +574,18 @@ fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String,
 mod tests {
     use super::*;
 
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::standalone::engine::catalog::InMemoryCatalog;
+    use crate::standalone::iceberg::IcebergCatalogRegistry;
+    use crate::standalone::lake::ManagedLakeConfig;
+    use crate::standalone::lake::store::{
+        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,
+        ManagedTableKind, ManagedTableState, SqliteMetadataStore, StoredManagedDatabase,
+        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
+        StoredMaterializedView,
+    };
+    use std::sync::RwLock;
+
     #[test]
     fn choose_refresh_strategy_without_previous_snapshot_uses_full_refresh() {
         let strategy = choose_refresh_strategy(None, Some(10)).expect("strategy");
@@ -568,5 +634,173 @@ mod tests {
         // Keep this module-level smoke test minimal so the file always participates
         // in compilation even when object-store-backed test infra is unavailable.
         let _ = std::any::type_name::<MvRefreshContext>();
+    }
+
+    #[test]
+    fn collect_current_snapshots_cleans_staged_partition_on_failure() {
+        let (_dir, store) = seed_mv_refresh_store();
+        let config = test_managed_config();
+        let snapshot = store.load_snapshot().expect("load snapshot").managed;
+        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild");
+        let state = Arc::new(StandaloneState {
+            catalog: RwLock::new(InMemoryCatalog::default()),
+            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            managed_lake: RwLock::new(managed),
+            managed_lake_config: Some(config),
+            metadata_store: Some(store.clone()),
+            exchange_port: 0,
+            #[cfg(test)]
+            _test_guard: None,
+        });
+        let staged = store
+            .stage_mv_refresh_partition(StageMvRefreshRequest {
+                table_id: 10,
+                db_id: 1,
+                bucket_num: 2,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://test/warehouse".to_string(),
+            })
+            .expect("stage");
+        let refs = vec![IcebergTableRef {
+            catalog: "missing_catalog".to_string(),
+            namespace: "ns".to_string(),
+            table: "orders".to_string(),
+        }];
+
+        let err = collect_current_snapshots_or_cleanup_staged_partition(
+            &state, &store, 10, &staged, &refs,
+        )
+        .expect_err("snapshot collection should fail");
+
+        assert!(
+            err.contains("mv refresh snapshot collection failed"),
+            "err={err}"
+        );
+        let loaded = store.load_snapshot().expect("reload").managed;
+        assert!(
+            !loaded
+                .partitions
+                .iter()
+                .any(|partition| partition.partition_id == staged.partition_id)
+        );
+        let erase_job = loaded
+            .erase_jobs
+            .iter()
+            .find(|job| job.partition_id == Some(staged.partition_id))
+            .expect("staged partition erase job");
+        assert_eq!(erase_job.table_id, 10);
+    }
+
+    #[test]
+    fn validate_incremental_rows_written_rejects_writer_mismatch() {
+        let err = validate_incremental_rows_written("analytics", "orders_mv", 3, 2)
+            .expect_err("mismatch should fail");
+        assert!(err.contains("analytics.orders_mv"), "err={err}");
+        assert!(err.contains("expected 3"), "err={err}");
+        assert!(err.contains("wrote 2"), "err={err}");
+    }
+
+    #[test]
+    fn lock_mv_refresh_mutex_reports_poisoned_lock() {
+        let lock = Box::leak(Box::new(std::sync::Mutex::new(())));
+        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _hook_guard = PANIC_HOOK_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("panic hook lock");
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poison_result = std::panic::catch_unwind(|| {
+            let _guard = lock.lock().expect("lock");
+            panic!("poison test lock");
+        });
+        std::panic::set_hook(old_hook);
+        assert!(poison_result.is_err());
+
+        let err = lock_mv_refresh_mutex(lock).expect_err("poisoned lock should fail");
+        assert!(err.contains("poisoned"), "err={err}");
+    }
+
+    fn seed_mv_refresh_store() -> (tempfile::TempDir, SqliteMetadataStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let mut snapshot = ManagedSnapshot::default();
+        snapshot.global = ManagedGlobalMeta {
+            warehouse_uri: "s3://test/warehouse".to_string(),
+            next_db_id: 2,
+            next_table_id: 11,
+            next_partition_id: 21,
+            next_index_id: 31,
+            next_tablet_id: 41,
+            next_txn_id: 1,
+        };
+        snapshot.databases.push(StoredManagedDatabase {
+            db_id: 1,
+            name: "analytics".to_string(),
+        });
+        snapshot.tables.push(StoredManagedTable {
+            table_id: 10,
+            db_id: 1,
+            name: "orders_mv".to_string(),
+            keys_type: "DUP_KEYS".to_string(),
+            bucket_num: 2,
+            current_schema_id: 100,
+            state: ManagedTableState::Active,
+            kind: ManagedTableKind::MaterializedView,
+        });
+        snapshot.schemas.push(StoredManagedSchema {
+            schema_id: 100,
+            table_id: 10,
+            schema_version: 0,
+            tablet_schema_pb: vec![],
+        });
+        snapshot.partitions.push(StoredManagedPartition {
+            partition_id: 20,
+            table_id: 10,
+            name: "p0".to_string(),
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Active,
+        });
+        snapshot.indexes.push(StoredManagedIndex {
+            index_id: 30,
+            table_id: 10,
+            partition_id: 20,
+            index_type: "BASE".to_string(),
+            state: ManagedIndexState::Active,
+        });
+        snapshot.materialized_views.push(StoredMaterializedView {
+            mv_id: 10,
+            select_sql: "SELECT k1 FROM missing_catalog.ns.orders".to_string(),
+            refresh_mode: ManagedMvRefreshMode::DeferredManual,
+            base_table_refs: vec![IcebergTableRef {
+                catalog: "missing_catalog".to_string(),
+                namespace: "ns".to_string(),
+                table: "orders".to_string(),
+            }],
+            last_refresh_ms: None,
+            last_refresh_rows: None,
+            last_refresh_snapshots: BTreeMap::new(),
+            created_at_ms: 1,
+        });
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+        (dir, store)
+    }
+
+    fn test_managed_config() -> ManagedLakeConfig {
+        ManagedLakeConfig {
+            warehouse_uri: "s3://test/warehouse".to_string(),
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                root: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+        }
     }
 }
