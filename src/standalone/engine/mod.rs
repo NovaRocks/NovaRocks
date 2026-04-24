@@ -758,6 +758,25 @@ pub(crate) fn register_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
+    register_iceberg_tables_for_query_impl(state, current_catalog, current_database, query, false)
+}
+
+fn refresh_iceberg_tables_for_query(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+) -> Result<(), String> {
+    register_iceberg_tables_for_query_impl(state, current_catalog, current_database, query, true)
+}
+
+fn register_iceberg_tables_for_query_impl(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &sqlparser::ast::Query,
+    force_refresh: bool,
+) -> Result<(), String> {
     let mut targets = if let Some(catalog_name) = current_catalog {
         extract_table_names_from_query(query)
             .into_iter()
@@ -788,7 +807,7 @@ pub(crate) fn register_iceberg_tables_for_query(
             Err(_) => continue,
         };
 
-        {
+        if !force_refresh {
             let local = state.catalog.read().expect("catalog read lock");
             if local.get(&namespace, &table_name).is_ok() {
                 continue;
@@ -857,12 +876,10 @@ pub(crate) fn register_iceberg_tables_for_query(
             storage,
         };
         let mut guard = state.catalog.write().expect("catalog write lock");
-        if guard.get(&namespace, &table_name).is_err() {
-            guard.create_database(&namespace).ok();
-            guard
-                .register(&namespace, table_def)
-                .map_err(|e| format!("register iceberg table: {e}"))?;
-        }
+        guard.create_database(&namespace).ok();
+        guard
+            .register(&namespace, table_def)
+            .map_err(|e| format!("register iceberg table: {e}"))?;
     }
 
     Ok(())
@@ -882,7 +899,7 @@ pub(crate) fn execute_query_for_mv_refresh(
 
     let three_parts = extract_three_part_table_refs(&query);
     if !three_parts.is_empty() {
-        register_iceberg_tables_for_query(state, None, current_database, &query)?;
+        refresh_iceberg_tables_for_query(state, None, current_database, &query)?;
     }
 
     let mut executable = query.as_ref().clone();

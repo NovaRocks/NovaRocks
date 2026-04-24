@@ -278,6 +278,55 @@ enable_path_style_access = true
     Some((config_dir, config_path))
 }
 
+fn metadata_db_path_for_managed_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .expect("managed config path has parent")
+        .join("meta")
+        .join("catalog.db")
+}
+
+fn s3_test_value(primary: &str, fallback_env: &str, default: &str) -> String {
+    std::env::var(primary)
+        .or_else(|_| std::env::var(fallback_env))
+        .unwrap_or_else(|_| default.to_string())
+}
+
+fn unique_iceberg_warehouse(prefix: &str) -> String {
+    let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+    let root_prefix =
+        std::env::var("AWS_S3_ROOT").unwrap_or_else(|_| "codex-managed-lake-tests".to_string());
+    let run_id = format!(
+        "{}_{}_{}",
+        prefix,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let root_prefix = root_prefix.trim_matches('/');
+    if root_prefix.is_empty() {
+        format!("s3://{bucket}/{run_id}")
+    } else {
+        format!("s3://{bucket}/{root_prefix}/{run_id}")
+    }
+}
+
+fn create_s3_iceberg_catalog_sql(catalog_name: &str, warehouse_uri: &str) -> String {
+    let endpoint =
+        std::env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+    let access_key_id = s3_test_value("AWS_S3_ACCESS_KEY_ID", "MINIO_ROOT_USER", "admin");
+    let access_key_secret = s3_test_value(
+        "AWS_S3_SECRET_ACCESS_KEY",
+        "MINIO_ROOT_PASSWORD",
+        "admin123",
+    );
+    format!(
+        r#"create external catalog {catalog_name} properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{warehouse_uri}","aws.s3.endpoint"="{endpoint}","aws.s3.access_key"="{access_key_id}","aws.s3.secret_key"="{access_key_secret}","aws.s3.enable_path_style_access"="true")"#
+    )
+}
+
 #[test]
 fn standalone_mysql_server_accepts_queries_and_session_noops() {
     let parquet = write_parquet_file(&[(1, Some("a")), (2, Some("b")), (3, None)]);
@@ -708,4 +757,342 @@ fn standalone_mysql_server_managed_lake_round_trip() {
             .contains("unknown table"),
         "unexpected error after managed drop: {err}"
     );
+}
+
+#[test]
+fn standalone_mysql_server_mv_create_and_manual_refresh_round_trip() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_happy");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
+        .expect("create iceberg orders");
+    conn.query_drop("insert into ice.ns.orders values (1, 10), (2, 20), (3, 50)")
+        .expect("seed iceberg rows");
+    let base_rows: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from ice.ns.orders order by k1")
+        .expect("select base rows");
+    assert_eq!(
+        base_rows,
+        vec![
+            (Some(1), Some(10)),
+            (Some(2), Some(20)),
+            (Some(3), Some(50)),
+        ]
+    );
+
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create materialized view orders_mv \
+         distributed by hash(k1) buckets 2 \
+         as select k1, v2 from ice.ns.orders",
+    )
+    .expect("create mv");
+
+    let pre_rows: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from orders_mv")
+        .expect("select before refresh");
+    assert!(pre_rows.is_empty(), "pre-refresh rows: {pre_rows:?}");
+
+    conn.query_drop("refresh materialized view orders_mv")
+        .expect("refresh mv");
+    let rows: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from orders_mv order by k1")
+        .expect("select after refresh");
+    assert_eq!(
+        rows,
+        vec![
+            (Some(1), Some(10)),
+            (Some(2), Some(20)),
+            (Some(3), Some(50)),
+        ]
+    );
+
+    conn.query_drop("insert into ice.ns.orders values (4, 70)")
+        .expect("second iceberg write");
+    let stable: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from orders_mv order by k1")
+        .expect("select post-write pre-refresh");
+    assert_eq!(
+        stable,
+        vec![
+            (Some(1), Some(10)),
+            (Some(2), Some(20)),
+            (Some(3), Some(50)),
+        ],
+        "MV should not see new rows until the next REFRESH"
+    );
+
+    conn.query_drop("refresh materialized view orders_mv")
+        .expect("second refresh mv");
+    let post: Vec<(Option<i32>, Option<i64>)> = conn
+        .query("select k1, v2 from orders_mv order by k1")
+        .expect("select after second refresh");
+    assert_eq!(
+        post,
+        vec![
+            (Some(1), Some(10)),
+            (Some(2), Some(20)),
+            (Some(3), Some(50)),
+            (Some(4), Some(70)),
+        ]
+    );
+
+    conn.query_drop("drop materialized view orders_mv")
+        .expect("drop mv");
+    let err = conn
+        .query::<(i32,), _>("select k1 from orders_mv")
+        .expect_err("query after drop should fail");
+    assert!(
+        err.to_string()
+            .to_ascii_lowercase()
+            .contains("unknown table")
+            || err
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("does not exist"),
+        "unexpected error after mv drop: {err}"
+    );
+}
+
+#[test]
+fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_show");
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+        .expect("create iceberg catalog");
+    conn.query_drop("create database ice.ns")
+        .expect("create iceberg namespace");
+    conn.query_drop("create table ice.ns.orders (k1 int, v2 bigint)")
+        .expect("create iceberg orders");
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create materialized view orders_mv \
+         distributed by hash(k1) buckets 2 \
+         as select k1 from ice.ns.orders",
+    )
+    .expect("create mv");
+
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        String,
+    )> = conn
+        .query("show materialized views from analytics")
+        .expect("show mvs");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.0, "orders_mv");
+    assert_eq!(row.1, "analytics");
+    assert_eq!(row.2, "DEFERRED_MANUAL");
+    assert_eq!(row.3, None);
+    assert_eq!(row.4, None);
+    assert_eq!(row.5, "ice.ns.orders");
+    assert!(row.6.to_ascii_lowercase().contains("select"));
+}
+
+#[test]
+fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    let mut server = ServerGuard::spawn(&args);
+    let mut conn = server.connect_root(port);
+
+    conn.query_drop("create database analytics")
+        .expect("create analytics db");
+    conn.query_drop("use analytics").expect("use analytics");
+    conn.query_drop(
+        "create table base_table (k1 int, v2 bigint) \
+         duplicate key(k1) distributed by hash(k1) buckets 2",
+    )
+    .expect("create managed table");
+
+    let err = conn
+        .query_drop(
+            "create materialized view mv1 \
+             distributed by hash(k1) buckets 2 \
+             as select k1 from base_table",
+        )
+        .expect_err("should reject non-Iceberg base table");
+    assert!(
+        err.to_string().to_ascii_lowercase().contains("iceberg"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
+    use rusqlite::{Connection as SqliteConn, params};
+
+    let port = alloc_port();
+    let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
+        return;
+    };
+    let iceberg_warehouse = unique_iceberg_warehouse("mv_reopen");
+    let metadata_db_path = metadata_db_path_for_managed_config(&config_path);
+
+    let args = vec![
+        "standalone-server".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+    ];
+    {
+        let mut server = ServerGuard::spawn(&args);
+        let mut conn = server.connect_root(port);
+        conn.query_drop(create_s3_iceberg_catalog_sql("ice", &iceberg_warehouse))
+            .expect("create iceberg catalog");
+        conn.query_drop("create database ice.ns")
+            .expect("create iceberg namespace");
+        conn.query_drop("create table ice.ns.orders (k1 int)")
+            .expect("create iceberg orders");
+        conn.query_drop("insert into ice.ns.orders values (1), (2)")
+            .expect("seed iceberg rows");
+        conn.query_drop("create database analytics")
+            .expect("create analytics db");
+        conn.query_drop("use analytics").expect("use analytics");
+        conn.query_drop(
+            "create materialized view orders_mv \
+             distributed by hash(k1) buckets 1 \
+             as select k1 from ice.ns.orders",
+        )
+        .expect("create mv");
+        conn.query_drop("refresh materialized view orders_mv")
+            .expect("first refresh");
+    }
+
+    {
+        let sqlite = SqliteConn::open(&metadata_db_path).expect("sqlite open");
+        let (table_id, db_id, warehouse_uri, partition_id, index_id, tablet_id): (
+            i64,
+            i64,
+            String,
+            i64,
+            i64,
+            i64,
+        ) = sqlite
+            .query_row(
+                "SELECT t.table_id,
+                        t.db_id,
+                        g.warehouse_uri,
+                        g.next_partition_id,
+                        g.next_index_id,
+                        g.next_tablet_id
+                 FROM tables t, global_meta g
+                 WHERE t.name = 'orders_mv'
+                   AND t.kind = 'MATERIALIZED_VIEW'
+                   AND g.singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("mv metadata");
+        sqlite
+            .execute(
+                "UPDATE global_meta
+                 SET next_partition_id = ?1,
+                     next_index_id = ?2,
+                     next_tablet_id = ?3
+                 WHERE singleton = 1",
+                params![partition_id + 1, index_id + 1, tablet_id + 1],
+            )
+            .expect("bump ids");
+        sqlite
+            .execute(
+                "INSERT INTO partitions(partition_id, table_id, name, visible_version, next_version, state)
+                 VALUES (?1, ?2, 'p0', 1, 2, 'CREATING')",
+                params![partition_id, table_id],
+            )
+            .expect("inject creating partition");
+        sqlite
+            .execute(
+                "INSERT INTO indexes(index_id, table_id, partition_id, index_type, state)
+                 VALUES (?1, ?2, ?3, 'BASE', 'CREATING')",
+                params![index_id, table_id, partition_id],
+            )
+            .expect("inject creating index");
+        let root_path = format!(
+            "{}/db_{}/table_{}/partition_{}",
+            warehouse_uri.trim_end_matches('/'),
+            db_id,
+            table_id,
+            partition_id
+        );
+        sqlite
+            .execute(
+                "INSERT INTO tablets(tablet_id, partition_id, index_id, bucket_seq, tablet_root_path)
+                 VALUES (?1, ?2, ?3, 0, ?4)",
+                params![tablet_id, partition_id, index_id, root_path],
+            )
+            .expect("inject creating tablet");
+    }
+
+    {
+        let mut server = ServerGuard::spawn(&args);
+        let mut conn = server.connect_root(port);
+        conn.query_drop("use analytics").expect("use analytics");
+        let rows: Vec<(Option<i32>,)> = conn
+            .query("select k1 from orders_mv order by k1")
+            .expect("select after reopen");
+        assert_eq!(rows, vec![(Some(1),), (Some(2),)]);
+
+        let sqlite = SqliteConn::open(&metadata_db_path).expect("sqlite reopen");
+        let creating_count: i64 = sqlite
+            .query_row(
+                "SELECT COUNT(*) FROM partitions WHERE state = 'CREATING'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count creating partitions");
+        assert_eq!(creating_count, 0);
+    }
 }

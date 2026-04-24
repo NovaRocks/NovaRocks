@@ -247,9 +247,11 @@ pub(crate) fn write_chunks_into_managed_partition(
 
     let mut written_tablet_ids = Vec::new();
     let mut total_rows = 0_i64;
+    let mut next_file_seq = 0_u64;
     for chunk in chunks {
         total_rows += chunk.len() as i64;
-        let write_outcome = write_routed_chunks(state, &plan, chunk, prepared.txn_id);
+        let write_outcome =
+            write_routed_chunks(state, &plan, chunk, prepared.txn_id, &mut next_file_seq);
         let chunk_written_ids = match write_outcome {
             Ok(ids) => ids,
             Err(err) => {
@@ -329,6 +331,7 @@ fn write_routed_chunks(
     plan: &ManagedInsertPlan,
     chunk: &Chunk,
     txn_id: i64,
+    next_file_seq: &mut u64,
 ) -> Result<Vec<i64>, String> {
     let tablet_ids = plan
         .tablets
@@ -375,12 +378,14 @@ fn write_routed_chunks(
         // Keep the tablet runtime's schema in lockstep with what we persist,
         // so concurrent readers/writers see the same logical shape.
         update_tablet_runtime_schema(tablet.tablet_id, &plan.tablet_schema)?;
+        let file_seq = *next_file_seq;
+        *next_file_seq = file_seq.saturating_add(1);
         append_lake_txn_log_with_chunk_rowset(
             &write_ctx,
             &routed_chunk,
             txn_id,
             0,
-            tablet_idx as u64,
+            file_seq,
             StarRocksWriteFormat::Native,
             plan.partition_id,
             None,

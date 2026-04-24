@@ -84,6 +84,17 @@ where
         warehouse_uri: managed_config.warehouse_uri.clone(),
     })?;
 
+    if let Err(err) = refresh_managed_catalog(state) {
+        cleanup_staged_partition(
+            state,
+            metadata_store,
+            runtime.table.table_id,
+            &staged,
+            false,
+        )?;
+        return Err(format!("mv refresh catalog refresh failed: {err}"));
+    }
+
     if let Err(err) = bootstrap_empty_partition_for_tablets(
         &runtime,
         &managed_config,
@@ -99,8 +110,6 @@ where
         )?;
         return Err(format!("mv refresh bootstrap failed: {err}"));
     }
-
-    refresh_managed_catalog(state)?;
 
     let chunks = match executor(MvRefreshContext {
         state: Arc::clone(state),

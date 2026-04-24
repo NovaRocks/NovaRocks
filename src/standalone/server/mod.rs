@@ -402,6 +402,8 @@ fn is_materialized_view_management_statement(query: &str) -> bool {
     lower.starts_with("create materialized view ")
         || lower.starts_with("drop materialized view ")
         || lower.starts_with("refresh materialized view ")
+        || lower == "show materialized views"
+        || lower.starts_with("show materialized views ")
         || lower.starts_with("show alter materialized view ")
 }
 
