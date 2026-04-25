@@ -20,7 +20,7 @@ use crate::fs::path::{ScanPathScheme, classify_scan_paths};
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
-use crate::sql::parser::ast::{InsertSource, ObjectName};
+use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
 use super::catalog::register_managed_table_in_catalog;
 use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
@@ -95,6 +95,45 @@ pub(crate) fn insert_into_managed_lake_table(
     let chunk = build_chunk_for_insert(batch, plan.columns.len())?;
     write_chunks_into_managed_partition(state, plan, &[chunk])?;
     Ok(StatementResult::Ok)
+}
+
+pub(crate) fn insert_rows_into_managed_lake_table(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    rows: &[Vec<Literal>],
+) -> Result<(), String> {
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database)?,
+        table: normalize_identifier(table)?,
+    };
+    let plan = load_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let batch = build_local_insert_batch(&plan.columns, rows)?;
+    let chunk = build_chunk_for_insert(batch, plan.columns.len())?;
+    write_chunks_into_managed_partition(state, plan, &[chunk])?;
+    Ok(())
+}
+
+pub(crate) fn insert_batch_into_managed_lake_table(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    table: &str,
+    batch: RecordBatch,
+) -> Result<(), String> {
+    let resolved = ResolvedLocalTableName {
+        database: normalize_identifier(database)?,
+        table: normalize_identifier(table)?,
+    };
+    let plan = load_insert_plan(state, &resolved, PartitionTarget::Active)?;
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let chunk = build_chunk_for_insert(batch, plan.columns.len())?;
+    write_chunks_into_managed_partition(state, plan, &[chunk])?;
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
