@@ -3660,7 +3660,9 @@ enable_path_style_access = true
         )
         .expect_err("refresh should fail without managed lake config");
         assert!(
-            err.contains("managed lake config is missing") || err.contains("materialized view"),
+            err.contains("managed lake config is missing")
+                || err.contains("sqlite metadata store")
+                || err.contains("materialized view"),
             "unexpected dispatch error: {err}"
         );
     }

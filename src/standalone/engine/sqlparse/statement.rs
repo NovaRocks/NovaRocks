@@ -13,14 +13,12 @@
 use std::sync::Arc;
 
 use crate::connector::iceberg::catalog::{
-    create_namespace as create_iceberg_namespace, create_table as create_iceberg_table,
-    drop_namespace as drop_iceberg_namespace, drop_table as drop_iceberg_table,
-    insert_rows as insert_iceberg_rows, list_tables as list_iceberg_tables,
-    namespace_exists as iceberg_namespace_exists,
+    create_namespace as create_iceberg_namespace, drop_namespace as drop_iceberg_namespace,
+    drop_table as drop_iceberg_table, insert_rows as insert_iceberg_rows,
+    list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
 };
 use crate::connector::starrocks::managed::ddl::{
-    create_managed_table, drop_managed_database_entry,
-    drop_managed_table as drop_managed_lake_table,
+    drop_managed_database_entry, drop_managed_table as drop_managed_lake_table,
     truncate_managed_table as truncate_managed_lake_table,
 };
 use crate::sql::parser::ast::{
@@ -289,48 +287,44 @@ pub(crate) fn execute_create_table_statement(
             bucket_count,
             properties,
         } => {
-            // Two-part (or one-part) names in the default catalog land on
-            // managed lake. The local parquet backend has been removed, so a
-            // missing managed-lake config is a hard error rather than a
-            // silent fallback.
-            if current_catalog.is_none() && stmt.name.parts.len() <= 2 {
-                if state.managed_lake_config.is_none() {
-                    return Err(
-                        "managed lake is not configured; set `warehouse_uri` to run CREATE TABLE"
-                            .to_string(),
-                    );
-                }
-                return create_managed_table(
-                    state.as_ref(),
-                    &stmt.name,
-                    current_database,
-                    &columns,
-                    key_desc.as_ref(),
-                    bucket_count,
+            if current_catalog.is_none()
+                && stmt.name.parts.len() <= 2
+                && state.managed_lake_config.is_none()
+            {
+                return Err(
+                    "managed lake is not configured; set `warehouse_uri` to run CREATE TABLE"
+                        .to_string(),
                 );
             }
 
-            let resolved =
-                resolve_iceberg_table_name(stmt.name, current_catalog, current_database)?;
-            let guard = state
-                .iceberg_catalogs
-                .read()
-                .expect("standalone iceberg catalog read lock");
-            let entry = guard.get(&resolved.catalog)?;
-            create_iceberg_table(
-                &entry,
-                &resolved.namespace,
-                &resolved.table,
-                &columns,
-                key_desc.as_ref(),
-                &properties,
-            )?;
-            persist_iceberg_table_if_needed(
+            let target = crate::standalone::engine::backend_resolver::resolve_table_target(
                 state,
-                &resolved.catalog,
-                &resolved.namespace,
-                &resolved.table,
+                &stmt.name,
+                current_catalog,
+                current_database,
             )?;
+            let backend = state
+                .connectors
+                .read()
+                .expect("connector registry read")
+                .catalog_backend(target.backend_name)?;
+            backend.create_table(crate::connector::backend::CreateTableRequest {
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+                columns,
+                key_desc,
+                bucket_count,
+                properties,
+            })?;
+            if target.backend_name == "iceberg" {
+                persist_iceberg_table_if_needed(
+                    state,
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
+                )?;
+            }
             Ok(StatementResult::Ok)
         }
     }
