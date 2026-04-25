@@ -41,6 +41,9 @@ pub use iceberg::IcebergMetadataScanConfig;
 pub use jdbc::JdbcScanConfig;
 pub use starrocks::{LakeScanSchemaMeta, StarRocksScanConfig, StarRocksScanOp, StarRocksScanRange};
 
+#[cfg(test)]
+mod backend_test;
+
 #[derive(Clone, Debug)]
 pub enum ScanConfig {
     Jdbc(JdbcScanConfig),
