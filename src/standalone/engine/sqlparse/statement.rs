@@ -441,48 +441,58 @@ pub(crate) fn execute_drop_table_statement(
     if_exists: bool,
     _force: bool,
 ) -> Result<StatementResult, String> {
-    if current_catalog.is_none() && name.parts.len() <= 2 {
-        let resolved = resolve_local_table_name(name, current_database)?;
-        if state
-            .managed_lake
-            .read()
-            .expect("standalone managed lake read lock")
-            .contains_table(&resolved.database, &resolved.table)?
-        {
-            return drop_managed_lake_table(state, &resolved.database, &resolved.table);
+    let target = match crate::standalone::engine::backend_resolver::resolve_table_target(
+        state,
+        name,
+        current_catalog,
+        current_database,
+    ) {
+        Ok(target) => target,
+        Err(_) if current_catalog.is_none() && name.parts.len() <= 2 => {
+            // External parquet tables registered through the embedding API are
+            // still catalog-only entries. Dropping them does not involve a
+            // connector backend.
+            return drop_local_catalog_table(state, name, current_database, if_exists);
         }
-        // Not a managed table: still allow dropping a logical entry from the
-        // in-memory catalog (used during iceberg materialization); otherwise
-        // honour IF EXISTS.
-        let mut guard = state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        match guard.drop_table(&resolved.database, &resolved.table) {
-            Ok(()) => Ok(StatementResult::Ok),
-            Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
-            Err(err) => Err(err),
-        }
-    } else {
-        let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
-        let guard = state
-            .iceberg_catalogs
-            .read()
-            .expect("standalone iceberg catalog read lock");
-        let entry = guard.get(&resolved.catalog)?;
-        match drop_iceberg_table(&entry, &resolved.namespace, &resolved.table) {
-            Ok(()) => {
+        Err(err) => return Err(err),
+    };
+    let backend = state
+        .connectors
+        .read()
+        .expect("connector registry read")
+        .catalog_backend(target.backend_name)?;
+    match backend.drop_table(&target.catalog, &target.namespace, &target.table, if_exists) {
+        Ok(()) => {
+            if target.backend_name == "iceberg" {
                 delete_iceberg_table_if_needed(
                     state,
-                    &resolved.catalog,
-                    &resolved.namespace,
-                    &resolved.table,
+                    &target.catalog,
+                    &target.namespace,
+                    &target.table,
                 )?;
-                Ok(StatementResult::Ok)
             }
-            Err(err) if if_exists && err.contains("table") => Ok(StatementResult::Ok),
-            Err(err) => Err(err),
+            Ok(StatementResult::Ok)
         }
+        Err(err) if if_exists && err.contains("table") => Ok(StatementResult::Ok),
+        Err(err) => Err(err),
+    }
+}
+
+fn drop_local_catalog_table(
+    state: &Arc<StandaloneState>,
+    name: &ObjectName,
+    current_database: &str,
+    if_exists: bool,
+) -> Result<StatementResult, String> {
+    let resolved = resolve_local_table_name(name, current_database)?;
+    let mut guard = state
+        .catalog
+        .write()
+        .expect("standalone catalog write lock");
+    match guard.drop_table(&resolved.database, &resolved.table) {
+        Ok(()) => Ok(StatementResult::Ok),
+        Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
+        Err(err) => Err(err),
     }
 }
 
