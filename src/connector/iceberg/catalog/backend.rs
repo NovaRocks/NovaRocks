@@ -46,8 +46,14 @@ impl CatalogBackend for IcebergCatalogBackend {
         reg_create_namespace(&self.entry(catalog)?, namespace)
     }
 
-    fn drop_namespace(&self, catalog: &str, namespace: &str, _force: bool) -> Result<(), String> {
-        reg_drop_namespace(&self.entry(catalog)?, namespace)
+    fn drop_namespace(&self, catalog: &str, namespace: &str, force: bool) -> Result<(), String> {
+        let entry = self.entry(catalog)?;
+        if force {
+            for table in reg_list_tables(&entry, namespace)? {
+                reg_drop_table(&entry, namespace, &table)?;
+            }
+        }
+        reg_drop_namespace(&entry, namespace)
     }
 
     fn create_table(&self, req: CreateTableRequest) -> Result<(), String> {

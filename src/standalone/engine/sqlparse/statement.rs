@@ -12,22 +12,15 @@
 
 use std::sync::Arc;
 
-use crate::connector::iceberg::catalog::{
-    create_namespace as create_iceberg_namespace, drop_namespace as drop_iceberg_namespace,
-    drop_table as drop_iceberg_table, insert_rows as insert_iceberg_rows,
-    list_tables as list_iceberg_tables, namespace_exists as iceberg_namespace_exists,
-};
-use crate::connector::starrocks::managed::ddl::{
-    drop_managed_database_entry, drop_managed_table as drop_managed_lake_table,
-    truncate_managed_table as truncate_managed_lake_table,
-};
+use crate::connector::iceberg::catalog::insert_rows as insert_iceberg_rows;
+use crate::connector::starrocks::managed::ddl::truncate_managed_table as truncate_managed_lake_table;
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
 };
 use crate::standalone::engine::catalog::normalize_identifier;
 use crate::standalone::engine::insert::reorder_insert_rows;
 use crate::standalone::engine::name_resolve::{
-    resolve_iceberg_namespace_name, resolve_iceberg_table_name, resolve_local_table_name,
+    resolve_iceberg_table_name, resolve_local_table_name,
 };
 use crate::standalone::engine::{
     StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
@@ -253,24 +246,20 @@ pub(crate) fn execute_create_database_statement(
     name: &ObjectName,
     current_catalog: Option<&str>,
 ) -> Result<StatementResult, String> {
-    if current_catalog.is_none() && name.parts.len() == 1 {
-        let mut guard = state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        guard.create_database(name.leaf())?;
-        drop(guard);
-        return Ok(StatementResult::Ok);
-    }
-
-    let resolved = resolve_iceberg_namespace_name(name.clone(), current_catalog)?;
-    let guard = state
-        .iceberg_catalogs
+    let target = crate::standalone::engine::backend_resolver::resolve_namespace_target(
+        state,
+        name,
+        current_catalog,
+    )?;
+    let backend = state
+        .connectors
         .read()
-        .expect("standalone iceberg catalog read lock");
-    let entry = guard.get(&resolved.catalog)?;
-    create_iceberg_namespace(&entry, &resolved.namespace)?;
-    persist_iceberg_namespace_if_needed(state, &resolved.catalog, &resolved.namespace)?;
+        .expect("connector registry read")
+        .catalog_backend(target.backend_name)?;
+    backend.create_namespace(&target.catalog, &target.namespace)?;
+    if target.backend_name == "iceberg" {
+        persist_iceberg_namespace_if_needed(state, &target.catalog, &target.namespace)?;
+    }
     Ok(StatementResult::Ok)
 }
 
@@ -357,78 +346,36 @@ pub(crate) fn execute_drop_database_statement(
     if_exists: bool,
     force: bool,
 ) -> Result<StatementResult, String> {
-    if current_catalog.is_none() && name.parts.len() == 1 {
-        let db_name = name.leaf();
-        // With `FORCE`, cascade-drop every managed-lake table in this
-        // database before we tear down the in-memory catalog entry.
-        // Otherwise the managed catalog / sqlite / object store still hold
-        // those tables, and the next `CREATE DATABASE`+`CREATE TABLE`
-        // against the same name trips "table already exists".
-        if force {
-            let managed_tables = state
-                .managed_lake
-                .read()
-                .expect("standalone managed lake read lock")
-                .list_tables_in_database(db_name)
-                .unwrap_or_default();
-            for table_name in managed_tables {
-                drop_managed_lake_table(state, db_name, &table_name)?;
-            }
-            // Remove the persisted `databases` row too, so a follow-up
-            // `CREATE DATABASE <same>` gets a fresh `db_id` and the next
-            // `CREATE TABLE <same>` doesn't collide with the DROPPING
-            // tables the erase worker hasn't cleaned yet.
-            if state.managed_lake_config.is_some() {
-                drop_managed_database_entry(state, db_name)?;
-            }
-        }
-        let mut guard = state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        match guard.drop_database(db_name) {
-            Ok(()) => {
-                drop(guard);
-                return Ok(StatementResult::Ok);
-            }
-            Err(err) if if_exists && err.contains("unknown database") => {
-                return Ok(StatementResult::Ok);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    let resolved = resolve_iceberg_namespace_name(name.clone(), current_catalog)?;
-    let guard = state
-        .iceberg_catalogs
+    let target = crate::standalone::engine::backend_resolver::resolve_namespace_target(
+        state,
+        name,
+        current_catalog,
+    )?;
+    let backend = state
+        .connectors
         .read()
-        .expect("standalone iceberg catalog read lock");
-    let entry = guard.get(&resolved.catalog)?;
-    let namespace_exists = iceberg_namespace_exists(&entry, &resolved.namespace)?;
-    if !namespace_exists {
+        .expect("connector registry read")
+        .catalog_backend(target.backend_name)?;
+    if target.backend_name == "iceberg"
+        && !backend.namespace_exists(&target.catalog, &target.namespace)?
+    {
         return if if_exists {
             Ok(StatementResult::Ok)
         } else {
             Err(format!("unknown database `{}`", name.parts.join(".")))
         };
     }
-    if force {
-        for table_name in list_iceberg_tables(&entry, &resolved.namespace)? {
-            drop_iceberg_table(&entry, &resolved.namespace, &table_name)?;
-            delete_iceberg_table_if_needed(
-                state,
-                &resolved.catalog,
-                &resolved.namespace,
-                &table_name,
-            )?;
-        }
-    }
-    match drop_iceberg_namespace(&entry, &resolved.namespace) {
+    match backend.drop_namespace(&target.catalog, &target.namespace, force) {
         Ok(()) => {
-            delete_iceberg_namespace_if_needed(state, &resolved.catalog, &resolved.namespace)?;
+            if target.backend_name == "iceberg" {
+                delete_iceberg_namespace_if_needed(state, &target.catalog, &target.namespace)?;
+            }
             Ok(StatementResult::Ok)
         }
-        Err(err) if if_exists && err.contains("namespace") => Ok(StatementResult::Ok),
+        Err(err) if if_exists && err.contains("unknown") => Ok(StatementResult::Ok),
+        Err(err) if if_exists && target.backend_name == "iceberg" && err.contains("namespace") => {
+            Ok(StatementResult::Ok)
+        }
         Err(err) => Err(err),
     }
 }
