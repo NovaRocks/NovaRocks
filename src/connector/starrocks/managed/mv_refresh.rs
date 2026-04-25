@@ -616,8 +616,9 @@ mod tests {
         let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild");
         let state = Arc::new(StandaloneState {
             catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             managed_lake: RwLock::new(managed),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
             metadata_store: Some(store.clone()),
             exchange_port: 0,

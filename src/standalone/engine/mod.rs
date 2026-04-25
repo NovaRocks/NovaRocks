@@ -148,8 +148,9 @@ pub(crate) fn build_string_query_result(
 
 pub(crate) struct StandaloneState {
     pub(crate) catalog: RwLock<InMemoryCatalog>,
-    pub(crate) iceberg_catalogs: RwLock<IcebergCatalogRegistry>,
+    pub(crate) iceberg_catalogs: Arc<RwLock<IcebergCatalogRegistry>>,
     pub(crate) managed_lake: RwLock<ManagedLakeCatalog>,
+    pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
     pub(crate) metadata_store: Option<SqliteMetadataStore>,
     pub(crate) exchange_port: u16,
@@ -161,8 +162,9 @@ impl Default for StandaloneState {
     fn default() -> Self {
         Self {
             catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: RwLock::new(IcebergCatalogRegistry::default()),
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
             managed_lake: RwLock::new(ManagedLakeCatalog::default()),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: None,
             metadata_store: None,
             exchange_port: 0,
@@ -240,6 +242,7 @@ impl StandaloneNovaRocks {
             _test_guard,
             ..Default::default()
         });
+        register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
         if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
             crate::connector::starrocks::managed::erase::spawn_erase_worker(Arc::clone(&inner));
@@ -394,6 +397,38 @@ impl StandaloneNovaRocks {
     ) -> Result<StandaloneStreamLoadResult, String> {
         stream_load_managed_lake_table(&self.inner, request)
     }
+}
+
+fn register_connector_backends(state: &Arc<StandaloneState>) {
+    let mut connectors = state
+        .connectors
+        .write()
+        .expect("standalone connector registry write lock");
+    let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
+    connectors.register_catalog_backend(Arc::new(
+        crate::connector::iceberg::catalog::IcebergCatalogBackend::new(Arc::clone(
+            &iceberg_catalogs,
+        )),
+    ));
+    connectors.register_table_source(Arc::new(
+        crate::connector::iceberg::catalog::IcebergTableSource::new(Arc::clone(&iceberg_catalogs)),
+    ));
+    connectors.register_table_sink(Arc::new(
+        crate::connector::iceberg::catalog::IcebergTableSink::new(iceberg_catalogs),
+    ));
+
+    connectors.register_catalog_backend(Arc::new(
+        crate::connector::starrocks::managed::ManagedLakeBackend::new(state),
+    ));
+    connectors.register_table_source(Arc::new(
+        crate::connector::starrocks::managed::ManagedLakeTableSource::new(state),
+    ));
+    connectors.register_table_sink(Arc::new(
+        crate::connector::starrocks::managed::ManagedLakeTableSink::new(state),
+    ));
+    connectors.register_mv_backend(Arc::new(
+        crate::connector::starrocks::managed::ManagedLakeMvBackend::new(state),
+    ));
 }
 
 impl StandaloneSession {
