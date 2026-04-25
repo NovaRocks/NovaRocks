@@ -35,6 +35,7 @@ pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod iceberg_glue;
 pub(crate) mod insert;
+pub(crate) mod insert_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod sqlparse;

@@ -166,6 +166,6 @@ impl TableSink for IcebergTableSink {
     }
 
     fn supports_pipeline_insert(&self) -> bool {
-        true
+        false
     }
 }

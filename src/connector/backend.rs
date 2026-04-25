@@ -93,10 +93,9 @@ pub(crate) trait TableSink: Send + Sync {
     fn append_rows(&self, table: &ResolvedTable, rows: &[Vec<Literal>]) -> Result<(), String>;
     fn append_batch(&self, table: &ResolvedTable, batch: RecordBatch) -> Result<(), String>;
 
-    /// Whether this sink supports INSERT SELECT from a pipeline plan. If
-    /// false, the engine falls back to VALUES / generate_series fast paths
-    /// only. (Iceberg sink is pipeline-capable via `IcebergTableSinkFactory`;
-    /// the managed-lake sink goes through `txn::insert_into_managed_lake_table`.)
+    /// Whether this trait path supports INSERT SELECT materialized as a
+    /// RecordBatch. FE-driven Iceberg pipeline sinks use
+    /// `IcebergTableSinkFactory` directly and do not go through this trait.
     fn supports_pipeline_insert(&self) -> bool;
 }
 

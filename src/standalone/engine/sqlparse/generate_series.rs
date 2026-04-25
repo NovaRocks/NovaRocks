@@ -5,10 +5,15 @@
 //! and evaluate projection expressions row-by-row without going through the
 //! full pipeline executor.
 
+use std::sync::Arc;
+
 use sqlparser::ast as sqlast;
 
+use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
+use crate::standalone::engine::StandaloneState;
+use crate::standalone::engine::backend_resolver::TargetBackend;
 use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::standalone::engine::reorder_insert_rows;
 
@@ -118,6 +123,45 @@ pub(crate) fn insert_generate_series_rows_local(
         current = current.saturating_add(source.step);
     }
     Ok(rows)
+}
+
+pub(crate) fn insert_generate_series_rows_by_backend(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+    resolved: &ResolvedTable,
+    source: &GenerateSeriesSelect,
+    insert_columns: &[String],
+) -> Result<(), String> {
+    match target.backend_name {
+        "iceberg" => {
+            let guard = state
+                .iceberg_catalogs
+                .read()
+                .expect("standalone iceberg catalog read lock");
+            let entry = guard.get(&target.catalog)?;
+            insert_generate_series_rows(
+                &entry,
+                &target.namespace,
+                &target.table,
+                source,
+                insert_columns,
+                &resolved.columns,
+            )
+        }
+        "managed" => {
+            let rows =
+                insert_generate_series_rows_local(source, insert_columns, &resolved.columns)?;
+            let sink = state
+                .connectors
+                .read()
+                .expect("connector registry read")
+                .table_sink(target.backend_name)?;
+            sink.append_rows(resolved, &rows)
+        }
+        other => Err(format!(
+            "unsupported generate_series insert backend: {other}"
+        )),
+    }
 }
 
 fn evaluate_generate_series_row(

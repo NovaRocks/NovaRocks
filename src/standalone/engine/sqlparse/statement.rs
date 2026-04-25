@@ -12,16 +12,12 @@
 
 use std::sync::Arc;
 
-use crate::connector::iceberg::catalog::insert_rows as insert_iceberg_rows;
 use crate::connector::starrocks::managed::ddl::truncate_managed_table as truncate_managed_lake_table;
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
 };
 use crate::standalone::engine::catalog::normalize_identifier;
-use crate::standalone::engine::insert::reorder_insert_rows;
-use crate::standalone::engine::name_resolve::{
-    resolve_iceberg_table_name, resolve_local_table_name,
-};
+use crate::standalone::engine::name_resolve::resolve_local_table_name;
 use crate::standalone::engine::{
     StandaloneState, StatementResult, delete_iceberg_catalog_if_needed,
     delete_iceberg_namespace_if_needed, delete_iceberg_table_if_needed,
@@ -29,7 +25,7 @@ use crate::standalone::engine::{
 };
 
 use super::expr::{sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
-use super::generate_series::{insert_generate_series_rows, parse_generate_series_function_expr};
+use super::generate_series::parse_generate_series_function_expr;
 
 fn convert_set_expr_to_insert_source(
     body: &sqlparser::ast::SetExpr,
@@ -388,7 +384,7 @@ pub(crate) fn execute_drop_table_statement(
     if_exists: bool,
     _force: bool,
 ) -> Result<StatementResult, String> {
-    let target = match crate::standalone::engine::backend_resolver::resolve_table_target(
+    let target = match crate::standalone::engine::backend_resolver::resolve_existing_table_target(
         state,
         name,
         current_catalog,
@@ -475,78 +471,14 @@ pub(crate) fn execute_insert_statement(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
-    // Two-part names in the default catalog route to managed lake.
-    if current_catalog.is_none() && name.parts.len() <= 2 {
-        if let Ok(resolved) = resolve_local_table_name(name, current_database) {
-            if state
-                .managed_lake
-                .read()
-                .expect("standalone managed lake read lock")
-                .contains_table(&resolved.database, &resolved.table)?
-            {
-                return crate::connector::starrocks::managed::txn::insert_into_managed_lake_table(
-                    state,
-                    name,
-                    columns,
-                    source,
-                    current_database,
-                );
-            }
-        }
-    }
-
-    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
-    let guard = state
-        .iceberg_catalogs
-        .read()
-        .expect("standalone iceberg catalog read lock");
-    let entry = guard.get(&resolved.catalog)?;
-    let loaded = crate::connector::iceberg::catalog::load_table(
-        &entry,
-        &resolved.namespace,
-        &resolved.table,
-    )?;
-    match source {
-        InsertSource::Values(rows) => {
-            let rows = reorder_insert_rows(rows, columns, &loaded.columns)?;
-            insert_iceberg_rows(&entry, &resolved.namespace, &resolved.table, &rows)?;
-        }
-        InsertSource::SelectLiteralRow(row) => {
-            let rows = reorder_insert_rows(std::slice::from_ref(row), columns, &loaded.columns)?;
-            insert_iceberg_rows(&entry, &resolved.namespace, &resolved.table, &rows)?;
-        }
-        InsertSource::GenerateSeriesSelect(source) => {
-            insert_generate_series_rows(
-                &entry,
-                &resolved.namespace,
-                &resolved.table,
-                source,
-                columns,
-                &loaded.columns,
-            )?;
-        }
-        InsertSource::UnionAll(parts) => {
-            // Iceberg expects a single insert per call; split into independent
-            // inserts so each part writes its own append.
-            for part in parts {
-                execute_insert_statement(
-                    state,
-                    name,
-                    columns,
-                    part,
-                    current_catalog,
-                    current_database,
-                )?;
-            }
-        }
-        InsertSource::FromQuery(_) => {
-            // Plan-pipeline INSERT ... SELECT is only implemented for
-            // managed-lake tables today; iceberg writes still go through the
-            // literal/generate_series fast paths.
-            return Err("unsupported INSERT SELECT source for iceberg table".into());
-        }
-    }
-    Ok(StatementResult::Ok)
+    crate::standalone::engine::insert_flow::run_insert(
+        state,
+        name,
+        columns,
+        source,
+        current_catalog,
+        current_database,
+    )
 }
 
 // ---------------------------------------------------------------------------

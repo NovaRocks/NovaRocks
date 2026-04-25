@@ -52,6 +52,38 @@ pub(crate) fn resolve_table_target(
     })
 }
 
+pub(crate) fn resolve_existing_table_target(
+    state: &Arc<StandaloneState>,
+    name: &ObjectName,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<TargetBackend, String> {
+    if current_catalog.is_none() && name.parts.len() <= 2 {
+        let resolved = resolve_local_table_name(name, current_database)?;
+        let managed_exists = state
+            .managed_lake
+            .read()
+            .expect("standalone managed lake read lock")
+            .contains_table(&resolved.database, &resolved.table)?;
+        if managed_exists {
+            return Ok(TargetBackend {
+                backend_name: "managed",
+                catalog: String::new(),
+                namespace: resolved.database,
+                table: resolved.table,
+            });
+        }
+    }
+
+    let resolved = resolve_iceberg_table_name(name.clone(), current_catalog, current_database)?;
+    Ok(TargetBackend {
+        backend_name: "iceberg",
+        catalog: resolved.catalog,
+        namespace: resolved.namespace,
+        table: resolved.table,
+    })
+}
+
 pub(crate) fn resolve_namespace_target(
     state: &Arc<StandaloneState>,
     name: &ObjectName,
