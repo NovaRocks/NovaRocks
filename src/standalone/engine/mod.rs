@@ -848,6 +848,16 @@ fn build_iceberg_table_def_with_files(
     })
 }
 
+pub(crate) fn build_iceberg_table_def_with_files_public(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    namespace: &str,
+    table_name: &str,
+    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
+    data_files: Vec<(String, i64, Option<i64>)>,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    build_iceberg_table_def_with_files(entry, namespace, table_name, loaded, data_files)
+}
+
 fn register_loaded_iceberg_table_with_files(
     state: &Arc<StandaloneState>,
     entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
