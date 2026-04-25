@@ -31,6 +31,7 @@ use crate::connector::starrocks::managed::{
 };
 
 pub(crate) mod aggregate;
+pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
 pub(crate) mod iceberg_glue;
 pub(crate) mod insert;
