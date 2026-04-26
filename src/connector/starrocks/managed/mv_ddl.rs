@@ -26,11 +26,12 @@ use crate::connector::starrocks::managed::catalog::{
     ManagedLakeCatalog, register_managed_table_in_catalog,
 };
 use crate::connector::starrocks::managed::ddl::{
-    build_create_tablet_request, build_tablet_schema, initialize_global_meta_if_needed,
-    keys_type_name, managed_physical_column, patch_tablet_schema_column_flags,
-    reclaim_dropping_table_for_reuse, stored_columns_from_physical_columns,
-    table_columns_from_physical_columns,
+    ManagedPhysicalColumn, build_create_tablet_request, build_tablet_schema,
+    initialize_global_meta_if_needed, keys_type_name, managed_physical_column,
+    patch_tablet_schema_column_flags, reclaim_dropping_table_for_reuse,
+    stored_columns_from_physical_columns, table_columns_from_physical_columns,
 };
+use crate::connector::starrocks::managed::mv_shape::{AggregateMvShape, IncrementalMvShape};
 use crate::connector::starrocks::managed::store::{
     IcebergTableRef, ManagedMvRefreshMode, ManagedPartitionState, ManagedTableKind,
     ManagedTableState, ManagedTxnState, StoredManagedIndex, StoredManagedPartition,
@@ -93,7 +94,6 @@ pub(crate) fn create_mv(
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    validate_incremental_create_shape(stmt)?;
     {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
         if !catalog.database_exists(&db_name)? {
@@ -127,20 +127,14 @@ pub(crate) fn create_mv(
         "DISTRIBUTED BY HASH(...) BUCKETS n is required (BUCKETS <n> is mandatory in phase 1)"
             .to_string()
     })?;
-    validate_distribution_columns(distribution, &analysis.output_columns)?;
-
-    let table_columns = analysis
-        .output_columns
-        .iter()
-        .map(output_column_to_table_column)
-        .collect::<Result<Vec<_>, _>>()?;
-    if table_columns.is_empty() {
+    if analysis.output_columns.is_empty() {
         return Err("materialized view SELECT must produce at least one column".to_string());
     }
-    let key_desc = TableKeyDesc {
-        kind: TableKeyKind::Duplicate,
-        columns: distribution.hash_columns.clone(),
-    };
+    let mv_shape = super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+    let storage_layout =
+        build_mv_storage_layout(&mv_shape, distribution, &analysis.output_columns)?;
+    let key_desc = storage_layout.key_desc;
+    let physical_columns = storage_layout.physical_columns;
 
     let mut managed = state
         .managed_lake
@@ -169,26 +163,8 @@ pub(crate) fn create_mv(
         return Err("CREATE MATERIALIZED VIEW requires BUCKETS > 0".to_string());
     }
 
-    let key_column_set = key_desc
-        .columns
-        .iter()
-        .map(|column| normalize_identifier(column))
-        .collect::<Result<HashSet<_>, _>>()?;
-    let physical_columns = table_columns
-        .iter()
-        .map(|column| {
-            let column_name = normalize_identifier(&column.name)?;
-            Ok(managed_physical_column(
-                column.name.clone(),
-                column.data_type.clone(),
-                column.nullable,
-                true,
-                key_column_set.contains(&column_name),
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let request_columns = table_columns_from_physical_columns(&physical_columns);
-    let request_schema = build_tablet_schema(&request_columns, &key_desc, schema_id)?;
+    let table_columns = table_columns_from_physical_columns(&physical_columns);
+    let request_schema = build_tablet_schema(&table_columns, &key_desc, schema_id)?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
     for bucket_seq in 0..bucket_num {
@@ -298,8 +274,78 @@ pub(crate) fn create_mv(
     Ok(StatementResult::Ok)
 }
 
-fn validate_incremental_create_shape(stmt: &CreateMaterializedViewStmt) -> Result<(), String> {
-    super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+#[derive(Clone, Debug)]
+struct MvStorageLayout {
+    key_desc: TableKeyDesc,
+    physical_columns: Vec<ManagedPhysicalColumn>,
+}
+
+fn build_mv_storage_layout(
+    mv_shape: &IncrementalMvShape,
+    distribution: &MaterializedViewDistribution,
+    output_columns: &[OutputColumn],
+) -> Result<MvStorageLayout, String> {
+    match mv_shape {
+        IncrementalMvShape::ProjectionFilter(_) => {
+            validate_distribution_columns(distribution, output_columns)?;
+            let table_columns = output_columns
+                .iter()
+                .map(output_column_to_table_column)
+                .collect::<Result<Vec<_>, _>>()?;
+            let key_desc = TableKeyDesc {
+                kind: TableKeyKind::Duplicate,
+                columns: distribution.hash_columns.clone(),
+            };
+            let key_column_set = key_desc
+                .columns
+                .iter()
+                .map(|column| normalize_identifier(column))
+                .collect::<Result<HashSet<_>, _>>()?;
+            let physical_columns = table_columns
+                .iter()
+                .map(|column| {
+                    let column_name = normalize_identifier(&column.name)?;
+                    Ok(managed_physical_column(
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                        true,
+                        key_column_set.contains(&column_name),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(MvStorageLayout {
+                key_desc,
+                physical_columns,
+            })
+        }
+        IncrementalMvShape::Aggregate(shape) => {
+            validate_aggregate_distribution_columns(distribution, shape)?;
+            let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, output_columns)?;
+            validate_unique_aggregate_physical_column_names(&layout.physical_columns)?;
+            Ok(MvStorageLayout {
+                key_desc: TableKeyDesc {
+                    kind: TableKeyKind::Primary,
+                    columns: vec![super::mv_agg_state::ROW_ID_COLUMN.to_string()],
+                },
+                physical_columns: layout.physical_columns,
+            })
+        }
+    }
+}
+
+fn validate_unique_aggregate_physical_column_names(
+    physical_columns: &[ManagedPhysicalColumn],
+) -> Result<(), String> {
+    let mut names = HashSet::with_capacity(physical_columns.len());
+    for column in physical_columns {
+        let normalized = normalize_identifier(&column.column.name)?;
+        if !names.insert(normalized.clone()) {
+            return Err(format!(
+                "aggregate MV physical column name collision: hidden column name collision or duplicate physical column `{normalized}`"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -461,6 +507,26 @@ fn validate_distribution_columns(
         if !exists {
             return Err(format!(
                 "DISTRIBUTED BY column `{column}` not in MV output schema"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_aggregate_distribution_columns(
+    distribution: &MaterializedViewDistribution,
+    shape: &AggregateMvShape,
+) -> Result<(), String> {
+    let group_key_outputs = shape
+        .group_keys
+        .iter()
+        .map(|group_key| normalize_identifier(&group_key.output_name))
+        .collect::<Result<HashSet<_>, _>>()?;
+    for column in &distribution.hash_columns {
+        let normalized = normalize_identifier(column)?;
+        if !group_key_outputs.contains(&normalized) {
+            return Err(format!(
+                "aggregate MV distribution column `{column}` must be a GROUP BY key output column; DISTRIBUTED BY HASH for aggregate MV can only reference GROUP BY keys"
             ));
         }
     }
@@ -803,6 +869,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::starrocks::managed::catalog::ManagedTableRuntime;
+    use crate::standalone::engine::catalog::InMemoryCatalog;
 
     fn parse_create_mv(sql: &str) -> crate::sql::parser::ast::CreateMaterializedViewStmt {
         let stmt = crate::sql::parser::parse_sql(sql).expect("parse").remove(0);
@@ -847,7 +915,8 @@ mod tests {
             "create materialized view mv1 distributed by hash(k1) buckets 2 \
              as select k1, v2 from ice.ns.orders where v2 > 10",
         );
-        super::validate_incremental_create_shape(&stmt).expect("shape ok");
+        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("shape ok");
     }
 
     #[test]
@@ -856,7 +925,167 @@ mod tests {
             "create materialized view mv1 distributed by hash(k1) buckets 2 \
              as select k1, avg(v2) from ice.ns.orders group by k1",
         );
-        let err = super::validate_incremental_create_shape(&stmt).expect_err("agg rejected");
+        let err = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect_err("agg rejected");
         assert!(err.contains("incremental aggregate MV"), "err={err}");
+    }
+
+    #[test]
+    fn aggregate_mv_physical_schema_has_hidden_row_id_and_state_columns() {
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW analytics.orders_mv
+DISTRIBUTED BY HASH(k1) BUCKETS 2
+AS SELECT k1, count(*) AS c, sum(v2) AS s
+FROM ice.ns.orders
+GROUP BY k1",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("aggregate shape");
+        let output_columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ];
+        let distribution = stmt.distribution.as_ref().expect("distribution");
+        let storage_layout =
+            build_mv_storage_layout(&mv_shape, distribution, &output_columns).expect("layout");
+
+        assert_eq!(storage_layout.key_desc.kind, TableKeyKind::Primary);
+        assert_eq!(
+            storage_layout.key_desc.columns,
+            vec![super::super::mv_agg_state::ROW_ID_COLUMN.to_string()]
+        );
+        let table_columns = table_columns_from_physical_columns(&storage_layout.physical_columns);
+        let request_schema = build_tablet_schema(&table_columns, &storage_layout.key_desc, 10)
+            .expect("request schema");
+        assert_eq!(
+            request_schema.keys_type,
+            crate::types::TKeysType::PRIMARY_KEYS
+        );
+        let mut tablet_schema =
+            crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+                &request_schema,
+            )
+            .expect("tablet schema pb");
+        patch_tablet_schema_column_flags(&mut tablet_schema, &storage_layout.physical_columns)
+            .expect("patch flags");
+        let stored_columns = stored_columns_from_physical_columns(
+            10,
+            &storage_layout.key_desc,
+            &storage_layout.physical_columns,
+        );
+
+        let runtime = ManagedTableRuntime {
+            database_name: "analytics".to_string(),
+            table: StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders_mv".to_string(),
+                keys_type: keys_type_name(storage_layout.key_desc.kind).to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::MaterializedView,
+            },
+            tablet_schema,
+            columns: stored_columns,
+            partitions: Vec::new(),
+            indexes: Vec::new(),
+            tablets: Vec::new(),
+        };
+        assert_eq!(runtime.table.keys_type, "PRIMARY_KEYS");
+        assert_eq!(
+            runtime.tablet_schema.column[0].name.as_deref(),
+            Some(super::super::mv_agg_state::ROW_ID_COLUMN)
+        );
+        assert_eq!(runtime.tablet_schema.column[0].is_key, Some(true));
+        assert_eq!(runtime.tablet_schema.column[0].visible, Some(false));
+        let state_column = runtime
+            .tablet_schema
+            .column
+            .iter()
+            .find(|column| column.name.as_deref() == Some("__agg_state_c"))
+            .expect("count state column");
+        assert_eq!(state_column.visible, Some(false));
+
+        let mut catalog = InMemoryCatalog::default();
+        catalog
+            .create_database("analytics")
+            .expect("create database");
+        register_managed_table_in_catalog(&mut catalog, &runtime).expect("register mv");
+        let public_table = catalog.get("analytics", "orders_mv").expect("public table");
+        let public_column_names = public_table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(public_column_names, vec!["k1", "c", "s"]);
+        assert!(!public_column_names.contains(&super::super::mv_agg_state::ROW_ID_COLUMN));
+        assert!(!public_column_names.contains(&"__agg_state_c"));
+    }
+
+    #[test]
+    fn aggregate_mv_distribution_rejects_non_group_key_output() {
+        let stmt = parse_create_mv(
+            "create materialized view analytics.orders_mv distributed by hash(c) buckets 2 \
+             as select k1, count(*) as c from ice.ns.orders group by k1",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("aggregate shape");
+        let IncrementalMvShape::Aggregate(shape) = mv_shape else {
+            panic!("expected aggregate shape");
+        };
+        let err = validate_aggregate_distribution_columns(
+            stmt.distribution.as_ref().expect("distribution"),
+            &shape,
+        )
+        .expect_err("non-group key distribution should fail");
+        assert!(err.contains("aggregate MV distribution"), "err={err}");
+        assert!(err.contains("GROUP BY key"), "err={err}");
+    }
+
+    #[test]
+    fn aggregate_mv_physical_schema_rejects_hidden_name_collision() {
+        let stmt = parse_create_mv(
+            "create materialized view analytics.orders_mv distributed by hash(__agg_state_c) buckets 2 \
+             as select k1 as __agg_state_c, count(*) as c from ice.ns.orders group by k1",
+        );
+        let mv_shape = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("aggregate shape");
+        let output_columns = vec![
+            OutputColumn {
+                name: "__agg_state_c".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+        ];
+        let err = build_mv_storage_layout(
+            &mv_shape,
+            stmt.distribution.as_ref().expect("distribution"),
+            &output_columns,
+        )
+        .expect_err("hidden physical column collision should fail");
+        assert!(
+            err.contains("aggregate MV physical column name collision"),
+            "err={err}"
+        );
+        assert!(err.contains("hidden column name collision"), "err={err}");
     }
 }
