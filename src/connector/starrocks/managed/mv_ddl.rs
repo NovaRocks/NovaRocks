@@ -851,12 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn create_mv_shape_rejects_aggregation() {
+    fn create_mv_shape_rejects_unsupported_aggregation() {
         let stmt = parse_create_mv(
             "create materialized view mv1 distributed by hash(k1) buckets 2 \
-             as select k1, sum(v2) from ice.ns.orders group by k1",
+             as select k1, avg(v2) from ice.ns.orders group by k1",
         );
         let err = super::validate_incremental_create_shape(&stmt).expect_err("agg rejected");
-        assert!(err.contains("projection/filter"), "err={err}");
+        assert!(err.contains("incremental aggregate MV"), "err={err}");
     }
 }

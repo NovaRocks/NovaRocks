@@ -96,7 +96,7 @@ pub(crate) fn refresh_mv(
                 .to_string(),
         );
     };
-    validate_incremental_mv_base_ref(&mv_shape.base_table, base_ref)?;
+    validate_incremental_mv_base_ref(mv_shape.base_table(), base_ref)?;
 
     let loaded = load_current_iceberg_base_table(state, base_ref)?;
     let current_snapshot_id = loaded

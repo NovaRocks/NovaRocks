@@ -1,11 +1,77 @@
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IncrementalMvShape {
+pub(crate) enum IncrementalMvShape {
+    ProjectionFilter(ProjectionFilterMvShape),
+    Aggregate(AggregateMvShape),
+}
+
+impl IncrementalMvShape {
+    pub(crate) fn base_table(&self) -> &sqlparser::ast::ObjectName {
+        match self {
+            IncrementalMvShape::ProjectionFilter(shape) => &shape.base_table,
+            IncrementalMvShape::Aggregate(shape) => &shape.base_table,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectionFilterMvShape {
     pub(crate) base_table: sqlparser::ast::ObjectName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AggregateMvShape {
+    pub(crate) base_table: sqlparser::ast::ObjectName,
+    pub(crate) group_keys: Vec<GroupKeyShape>,
+    pub(crate) aggregates: Vec<AggregateCallShape>,
+    pub(crate) visible_outputs: Vec<VisibleAggregateOutput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GroupKeyShape {
+    pub(crate) output_name: String,
+    pub(crate) expr: sqlparser::ast::Expr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AggregateCallShape {
+    pub(crate) output_name: String,
+    pub(crate) function: AggregateFunctionKind,
+    pub(crate) input: AggregateInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateFunctionKind {
+    Count,
+    Sum,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AggregateInput {
+    Star,
+    Expr(sqlparser::ast::Expr),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VisibleAggregateOutput {
+    GroupKey(usize),
+    Aggregate(usize),
 }
 
 pub(crate) fn classify_incremental_mv_query(
     query: &sqlparser::ast::Query,
 ) -> Result<IncrementalMvShape, String> {
+    match classify_aggregate_mv_query(query) {
+        Ok(shape) => return Ok(IncrementalMvShape::Aggregate(shape)),
+        Err(err) if is_probably_aggregate_query(query) => return Err(err),
+        Err(_) => {}
+    }
+
+    classify_projection_filter_mv_query(query).map(IncrementalMvShape::ProjectionFilter)
+}
+
+fn classify_projection_filter_mv_query(
+    query: &sqlparser::ast::Query,
+) -> Result<ProjectionFilterMvShape, String> {
     reject_unsupported_query_clauses(query)?;
 
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -14,47 +80,77 @@ pub(crate) fn classify_incremental_mv_query(
     reject_unsupported_select_clauses(select)?;
     reject_match_against_before_from_shape_check(select)?;
 
-    let [from] = select.from.as_slice() else {
-        return Err(single_base_table_error());
-    };
-    if !from.joins.is_empty() {
-        return Err(single_base_table_error());
-    }
-
-    let sqlparser::ast::TableFactor::Table {
-        name,
-        args,
-        with_hints,
-        version,
-        with_ordinality,
-        partitions,
-        json_path,
-        sample,
-        index_hints,
-        ..
-    } = &from.relation
-    else {
-        return Err(projection_filter_error());
-    };
-    if args.is_some()
-        || !with_hints.is_empty()
-        || version.is_some()
-        || *with_ordinality
-        || !partitions.is_empty()
-        || json_path.is_some()
-        || sample.is_some()
-        || !index_hints.is_empty()
-    {
-        return Err(single_base_table_error());
-    }
-    if !is_three_part_object_name(name) {
-        return Err(single_base_table_error());
-    }
-
+    let base_table =
+        extract_single_base_table(select, projection_filter_error, single_base_table_error)?;
     reject_unsupported_projection_filter_exprs(select)?;
 
-    Ok(IncrementalMvShape {
-        base_table: name.clone(),
+    Ok(ProjectionFilterMvShape { base_table })
+}
+
+fn classify_aggregate_mv_query(query: &sqlparser::ast::Query) -> Result<AggregateMvShape, String> {
+    reject_unsupported_query_clauses(query).map_err(|_| aggregate_error())?;
+
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(aggregate_error());
+    };
+    reject_unsupported_aggregate_select_clauses(select)?;
+
+    let base_table = extract_single_base_table(select, aggregate_error, aggregate_error)?;
+    if let Some(selection) = &select.selection {
+        reject_unsupported_expr(selection).map_err(aggregate_expr_error)?;
+    }
+
+    let group_by_exprs = aggregate_group_by_exprs(&select.group_by)?;
+    for expr in group_by_exprs {
+        reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    }
+
+    let mut group_keys = group_by_exprs
+        .iter()
+        .cloned()
+        .map(|expr| GroupKeyShape {
+            output_name: String::new(),
+            expr,
+        })
+        .collect::<Vec<_>>();
+    let mut aggregates = Vec::new();
+    let mut visible_outputs = Vec::with_capacity(select.projection.len());
+    let mut projected_group_keys = vec![false; group_keys.len()];
+
+    for item in &select.projection {
+        let (expr, output_name) = projection_expr_and_output_name(item)?;
+        if let Some(group_key_index) = group_keys
+            .iter()
+            .position(|group_key| group_key.expr == *expr)
+        {
+            if group_keys[group_key_index].output_name.is_empty() {
+                group_keys[group_key_index].output_name = output_name;
+            }
+            projected_group_keys[group_key_index] = true;
+            visible_outputs.push(VisibleAggregateOutput::GroupKey(group_key_index));
+            continue;
+        }
+
+        let aggregate = classify_aggregate_call(expr, output_name)?;
+        let aggregate_index = aggregates.len();
+        aggregates.push(aggregate);
+        visible_outputs.push(VisibleAggregateOutput::Aggregate(aggregate_index));
+    }
+
+    if projected_group_keys.iter().any(|projected| !projected) {
+        return Err(
+            "incremental aggregate MV projection must include every GROUP BY key".to_string(),
+        );
+    }
+    if aggregates.is_empty() {
+        return Err("incremental aggregate MV requires at least one aggregate output".to_string());
+    }
+
+    Ok(AggregateMvShape {
+        base_table,
+        group_keys,
+        aggregates,
+        visible_outputs,
     })
 }
 
@@ -95,6 +191,316 @@ fn reject_unsupported_select_clauses(select: &sqlparser::ast::Select) -> Result<
         return Err(projection_filter_error());
     }
     Ok(())
+}
+
+fn reject_unsupported_aggregate_select_clauses(
+    select: &sqlparser::ast::Select,
+) -> Result<(), String> {
+    if select.optimizer_hint.is_some()
+        || select.distinct.is_some()
+        || select.select_modifiers.is_some()
+        || select.top.is_some()
+        || select.exclude.is_some()
+        || select.into.is_some()
+        || !select.lateral_views.is_empty()
+        || select.prewhere.is_some()
+        || !select.connect_by.is_empty()
+        || !select.cluster_by.is_empty()
+        || !select.distribute_by.is_empty()
+        || !select.sort_by.is_empty()
+        || select.having.is_some()
+        || !select.named_window.is_empty()
+        || select.qualify.is_some()
+        || select.value_table_mode.is_some()
+    {
+        return Err(aggregate_error());
+    }
+    Ok(())
+}
+
+fn extract_single_base_table(
+    select: &sqlparser::ast::Select,
+    shape_error: fn() -> String,
+    single_table_error: fn() -> String,
+) -> Result<sqlparser::ast::ObjectName, String> {
+    let [from] = select.from.as_slice() else {
+        return Err(single_table_error());
+    };
+    if !from.joins.is_empty() {
+        return Err(single_table_error());
+    }
+
+    let sqlparser::ast::TableFactor::Table {
+        name,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+        ..
+    } = &from.relation
+    else {
+        return Err(shape_error());
+    };
+    if args.is_some()
+        || !with_hints.is_empty()
+        || version.is_some()
+        || *with_ordinality
+        || !partitions.is_empty()
+        || json_path.is_some()
+        || sample.is_some()
+        || !index_hints.is_empty()
+    {
+        return Err(single_table_error());
+    }
+    if !is_three_part_object_name(name) {
+        return Err(single_table_error());
+    }
+    Ok(name.clone())
+}
+
+fn aggregate_group_by_exprs(
+    group_by: &sqlparser::ast::GroupByExpr,
+) -> Result<&[sqlparser::ast::Expr], String> {
+    match group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, modifiers) => {
+            if exprs.is_empty() {
+                return Err("incremental aggregate MV requires a non-empty GROUP BY".to_string());
+            }
+            if !modifiers.is_empty() {
+                return Err("incremental aggregate MV does not support GROUP BY modifiers".to_string());
+            }
+            Ok(exprs)
+        }
+        sqlparser::ast::GroupByExpr::All(_) => Err(
+            "incremental aggregate MV requires an explicit non-empty GROUP BY; GROUP BY ALL is unsupported"
+                .to_string(),
+        ),
+    }
+}
+
+fn projection_expr_and_output_name(
+    item: &sqlparser::ast::SelectItem,
+) -> Result<(&sqlparser::ast::Expr, String), String> {
+    match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(expr) => Ok((expr, expr.to_string())),
+        sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
+            Ok((expr, alias.value.clone()))
+        }
+        sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+        | sqlparser::ast::SelectItem::Wildcard(_) => Err(
+            "incremental aggregate MV projection can only contain expressions or aliases"
+                .to_string(),
+        ),
+    }
+}
+
+fn classify_aggregate_call(
+    expr: &sqlparser::ast::Expr,
+    output_name: String,
+) -> Result<AggregateCallShape, String> {
+    let sqlparser::ast::Expr::Function(function) = expr else {
+        return Err(
+            "incremental aggregate MV scalar projection must be a GROUP BY key or aggregate call"
+                .to_string(),
+        );
+    };
+    if function.name.0.len() != 1
+        || !matches!(
+            function.name.0.first(),
+            Some(sqlparser::ast::ObjectNamePart::Identifier(_))
+        )
+        || function.uses_odbc_syntax
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || function.filter.is_some()
+        || !function.within_group.is_empty()
+        || !matches!(function.parameters, sqlparser::ast::FunctionArguments::None)
+    {
+        return Err(aggregate_error());
+    }
+
+    let sqlparser::ast::FunctionArguments::List(args) = &function.args else {
+        return Err(aggregate_error());
+    };
+    if args.duplicate_treatment.is_some() || !args.clauses.is_empty() {
+        return Err(aggregate_error());
+    }
+
+    let function_name = function.name.to_string().to_ascii_lowercase();
+    let (function, input) = match function_name.as_str() {
+        "count" => classify_count_input(&args.args)?,
+        "sum" => (AggregateFunctionKind::Sum, classify_sum_input(&args.args)?),
+        _ => return Err(aggregate_error()),
+    };
+
+    Ok(AggregateCallShape {
+        output_name,
+        function,
+        input,
+    })
+}
+
+fn classify_count_input(
+    args: &[sqlparser::ast::FunctionArg],
+) -> Result<(AggregateFunctionKind, AggregateInput), String> {
+    let [arg] = args else {
+        return Err(aggregate_error());
+    };
+    match simple_aggregate_arg_expr(arg)? {
+        sqlparser::ast::FunctionArgExpr::Wildcard => {
+            Ok((AggregateFunctionKind::Count, AggregateInput::Star))
+        }
+        sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+            reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+            Ok((
+                AggregateFunctionKind::Count,
+                AggregateInput::Expr(expr.clone()),
+            ))
+        }
+        sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => Err(aggregate_error()),
+    }
+}
+
+fn classify_sum_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
+    let [arg] = args else {
+        return Err(aggregate_error());
+    };
+    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+        return Err(aggregate_error());
+    };
+    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(expr.clone()))
+}
+
+fn simple_aggregate_arg_expr(
+    arg: &sqlparser::ast::FunctionArg,
+) -> Result<&sqlparser::ast::FunctionArgExpr, String> {
+    match arg {
+        sqlparser::ast::FunctionArg::Unnamed(arg) => Ok(arg),
+        sqlparser::ast::FunctionArg::Named { .. }
+        | sqlparser::ast::FunctionArg::ExprNamed { .. } => Err(aggregate_error()),
+    }
+}
+
+fn is_probably_aggregate_query(query: &sqlparser::ast::Query) -> bool {
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    !is_empty_group_by(&select.group_by)
+        || select.having.is_some()
+        || select
+            .projection
+            .iter()
+            .any(select_item_contains_aggregate_function)
+}
+
+fn select_item_contains_aggregate_function(item: &sqlparser::ast::SelectItem) -> bool {
+    match item {
+        sqlparser::ast::SelectItem::UnnamedExpr(expr)
+        | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+            expr_contains_aggregate_function(expr)
+        }
+        sqlparser::ast::SelectItem::QualifiedWildcard(
+            sqlparser::ast::SelectItemQualifiedWildcardKind::Expr(expr),
+            _,
+        ) => expr_contains_aggregate_function(expr),
+        sqlparser::ast::SelectItem::QualifiedWildcard(_, _)
+        | sqlparser::ast::SelectItem::Wildcard(_) => false,
+    }
+}
+
+fn expr_contains_aggregate_function(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+
+    match expr {
+        Expr::Function(function) => {
+            let name = function.name.to_string().to_ascii_lowercase();
+            is_aggregate_function(&name)
+                || function_args_contain_aggregate_function(&function.parameters)
+                || function_args_contain_aggregate_function(&function.args)
+                || function
+                    .filter
+                    .as_ref()
+                    .is_some_and(|filter| expr_contains_aggregate_function(filter))
+                || function
+                    .within_group
+                    .iter()
+                    .any(|order_by| expr_contains_aggregate_function(&order_by.expr))
+        }
+        Expr::BinaryOp { left, right, .. }
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. }
+        | Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right) => {
+            expr_contains_aggregate_function(left) || expr_contains_aggregate_function(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNormalized { expr, .. }
+        | Expr::Nested(expr)
+        | Expr::OuterJoin(expr)
+        | Expr::Prior(expr)
+        | Expr::Cast { expr, .. }
+        | Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Prefixed { value: expr, .. }
+        | Expr::Named { expr, .. } => expr_contains_aggregate_function(expr),
+        Expr::InList { expr, list, .. } => {
+            expr_contains_aggregate_function(expr)
+                || list.iter().any(expr_contains_aggregate_function)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_aggregate_function(expr)
+                || expr_contains_aggregate_function(low)
+                || expr_contains_aggregate_function(high)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|operand| expr_contains_aggregate_function(operand))
+                || conditions.iter().any(|condition| {
+                    expr_contains_aggregate_function(&condition.condition)
+                        || expr_contains_aggregate_function(&condition.result)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|else_result| expr_contains_aggregate_function(else_result))
+        }
+        Expr::Tuple(values)
+        | Expr::Array(sqlparser::ast::Array { elem: values, .. })
+        | Expr::Struct { values, .. } => values.iter().any(expr_contains_aggregate_function),
+        _ => false,
+    }
+}
+
+fn function_args_contain_aggregate_function(args: &sqlparser::ast::FunctionArguments) -> bool {
+    match args {
+        sqlparser::ast::FunctionArguments::None
+        | sqlparser::ast::FunctionArguments::Subquery(_) => false,
+        sqlparser::ast::FunctionArguments::List(list) => list.args.iter().any(|arg| match arg {
+            sqlparser::ast::FunctionArg::Named { arg, .. }
+            | sqlparser::ast::FunctionArg::ExprNamed { arg, .. }
+            | sqlparser::ast::FunctionArg::Unnamed(arg) => match arg {
+                sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                    expr_contains_aggregate_function(expr)
+                }
+                sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_)
+                | sqlparser::ast::FunctionArgExpr::Wildcard => false,
+            },
+        }),
+    }
 }
 
 fn reject_unsupported_projection_filter_exprs(
@@ -607,6 +1013,14 @@ fn projection_filter_error() -> String {
     "incremental MV query must be a projection/filter SELECT".to_string()
 }
 
+fn aggregate_error() -> String {
+    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum aggregate outputs".to_string()
+}
+
+fn aggregate_expr_error(_err: String) -> String {
+    "incremental aggregate MV query contains an unsupported expression".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,7 +1052,75 @@ mod tests {
     fn accepts_single_table_projection_filter() {
         let shape = classify_sql("select k1, v2 + 1 as v3 from ice.ns.orders where v2 > 10")
             .expect("query should be accepted");
+        assert_eq!(shape.base_table().to_string(), "ice.ns.orders");
+        let IncrementalMvShape::ProjectionFilter(shape) = shape else {
+            panic!("expected projection/filter shape");
+        };
         assert_eq!(shape.base_table.to_string(), "ice.ns.orders");
+    }
+
+    #[test]
+    fn accepts_single_table_count_sum_group_by() {
+        let shape = classify_sql(
+            "select k1, count(*) as c, count(v2) as cv, sum(v2) as s \
+             from ice.ns.orders where v2 > 0 group by k1",
+        )
+        .expect("query should be accepted");
+        assert_eq!(shape.base_table().to_string(), "ice.ns.orders");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        assert_eq!(shape.base_table.to_string(), "ice.ns.orders");
+        assert_eq!(shape.group_keys.len(), 1);
+        assert_eq!(shape.group_keys[0].output_name, "k1");
+        assert_eq!(shape.group_keys[0].expr.to_string(), "k1");
+        assert_eq!(shape.aggregates.len(), 3);
+        assert_eq!(shape.aggregates[0].output_name, "c");
+        assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Count);
+        assert_eq!(shape.aggregates[0].input, AggregateInput::Star);
+        assert_eq!(shape.aggregates[1].output_name, "cv");
+        assert_eq!(shape.aggregates[1].function, AggregateFunctionKind::Count);
+        assert_eq!(
+            shape.aggregates[1].input,
+            AggregateInput::Expr(sqlparser::ast::Expr::Identifier("v2".into()))
+        );
+        assert_eq!(shape.aggregates[2].output_name, "s");
+        assert_eq!(shape.aggregates[2].function, AggregateFunctionKind::Sum);
+        assert_eq!(
+            shape.aggregates[2].input,
+            AggregateInput::Expr(sqlparser::ast::Expr::Identifier("v2".into()))
+        );
+        assert_eq!(
+            shape.visible_outputs,
+            vec![
+                VisibleAggregateOutput::GroupKey(0),
+                VisibleAggregateOutput::Aggregate(0),
+                VisibleAggregateOutput::Aggregate(1),
+                VisibleAggregateOutput::Aggregate(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_scalar_aggregate_without_group_by() {
+        assert_rejects_with(
+            "select count(*) as c from ice.ns.orders",
+            "non-empty GROUP BY",
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_aggregate_functions() {
+        for sql in [
+            "select k1, avg(v2) from ice.ns.orders group by k1",
+            "select k1, min(v2) from ice.ns.orders group by k1",
+            "select k1, count(distinct v2) from ice.ns.orders group by k1",
+            "select k1, sum(v2) filter (where v2 > 0) from ice.ns.orders group by k1",
+            "select k1, sum(v2 order by k1) from ice.ns.orders group by k1",
+            "select k1, sum(v2) over (partition by k1) from ice.ns.orders group by k1",
+        ] {
+            assert_rejects_with(sql, "incremental aggregate MV");
+        }
     }
 
     #[test]
@@ -659,13 +1141,12 @@ mod tests {
     #[test]
     fn rejects_aggregation() {
         assert_rejects_with(
-            "select k1, sum(v2) from ice.ns.orders group by k1",
-            "projection/filter",
+            "select stddev(v2) from ice.ns.orders",
+            "incremental aggregate MV",
         );
-        assert_rejects_with("select stddev(v2) from ice.ns.orders", "projection/filter");
         assert_rejects_with(
             "select array_agg(k1) from ice.ns.orders",
-            "projection/filter",
+            "incremental aggregate MV",
         );
         for sql in [
             "select approx_count_distinct(k1) from ice.ns.orders",
@@ -676,7 +1157,7 @@ mod tests {
             "select max_by_v2(k1, v2) from ice.ns.orders",
             "select multi_distinct_sum(v2) from ice.ns.orders",
         ] {
-            assert_rejects_with(sql, "projection/filter");
+            assert_rejects_with(sql, "incremental aggregate MV");
         }
     }
 
@@ -684,7 +1165,7 @@ mod tests {
     fn rejects_group_by_all() {
         assert_rejects_with(
             "select k1 from ice.ns.orders group by all",
-            "projection/filter",
+            "non-empty GROUP BY",
         );
     }
 
