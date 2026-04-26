@@ -62,12 +62,11 @@ fn test_cancel_with_invalid_query_id() {
     // Test cancel with a non-existent query ID
     // This should not panic, even if the query doesn't exist
     let query_id = test_query_id();
-    let result = internal_service::cancel(query_id);
+    internal_service::cancel(query_id);
 
     // Cancel should not fail even if query doesn't exist
     // The exact behavior depends on implementation
     // For now, we just verify it doesn't panic
-    let _ = result;
 }
 
 #[test]

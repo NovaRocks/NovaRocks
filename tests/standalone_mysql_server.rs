@@ -166,6 +166,7 @@ fn assert_hadoop_catalog_metadata_compat(
     );
 }
 
+#[allow(dead_code)]
 fn run_curl_stream_load(
     http_port: u16,
     db: &str,
@@ -1044,7 +1045,7 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
     )
     .expect("create mv");
 
-    let rows: Vec<(
+    type MvShowRow = (
         String,
         String,
         String,
@@ -1052,7 +1053,8 @@ fn standalone_mysql_server_mv_show_output_matches_expected_columns() {
         Option<String>,
         String,
         String,
-    )> = conn
+    );
+    let rows: Vec<MvShowRow> = conn
         .query("show materialized views from analytics")
         .expect("show mvs");
     assert_eq!(rows.len(), 1);

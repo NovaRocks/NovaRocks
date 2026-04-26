@@ -39,10 +39,10 @@ fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>
     let input1 = Arc::new(Int64Array::from(part1)) as ArrayRef;
     let input2 = Arc::new(Int64Array::from(part2)) as ArrayRef;
 
-    let arrays1 = vec![Some(Arc::clone(&input1))];
-    let arrays2 = vec![Some(Arc::clone(&input2))];
+    let arrays1 = [Some(Arc::clone(&input1))];
+    let arrays2 = [Some(Arc::clone(&input2))];
     let input_types = vec![Some(DataType::Int64)];
-    let kernels = agg::build_kernel_set(&[func.clone()], &input_types).unwrap();
+    let kernels = agg::build_kernel_set(std::slice::from_ref(&func), &input_types).unwrap();
     let kernel = &kernels.entries[0];
 
     let mut arena = agg::AggStateArena::new(64 * 1024);
@@ -76,7 +76,7 @@ fn run_two_phase_i64(name: &str, part1: Vec<Option<i64>>, part2: Vec<Option<i64>
     let base_final = arena.alloc(kernels_merge.layout.total_size, kernel_merge.state_align());
     kernel_merge.init_state(base_final);
 
-    let merge_input = vec![Some(Arc::new(intermediate.clone()) as ArrayRef)];
+    let merge_input = [Some(Arc::new(intermediate.clone()) as ArrayRef)];
     let merge_view = kernel_merge.build_merge_view(&merge_input[0]).unwrap();
     let merge_state_ptrs = vec![base_final; intermediate.len()];
     kernel_merge
@@ -157,7 +157,7 @@ fn test_sum_bool_counts_true_as_one() {
         None,
         Some(true),
     ])) as ArrayRef;
-    let arrays = vec![Some(Arc::clone(&input))];
+    let arrays = [Some(Arc::clone(&input))];
     let input_types = vec![Some(DataType::Boolean)];
     let kernels = agg::build_kernel_set(&[func], &input_types).expect("build kernels");
     let kernel = &kernels.entries[0];
@@ -192,7 +192,7 @@ fn test_sum_bool_null_when_all_null() {
     };
 
     let input = Arc::new(BooleanArray::from(vec![None, None])) as ArrayRef;
-    let arrays = vec![Some(Arc::clone(&input))];
+    let arrays = [Some(Arc::clone(&input))];
     let input_types = vec![Some(DataType::Boolean)];
     let kernels = agg::build_kernel_set(&[func], &input_types).expect("build kernels");
     let kernel = &kernels.entries[0];

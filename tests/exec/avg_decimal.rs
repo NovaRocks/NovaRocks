@@ -43,7 +43,7 @@ fn test_avg_decimal_round_half_up_positive() {
         }),
     };
 
-    let arrays = vec![Some(input.clone())];
+    let arrays = [Some(input.clone())];
     let input_types = vec![Some(input.data_type().clone())];
     let kernels = agg::build_kernel_set(&[func], &input_types).unwrap();
 
@@ -84,7 +84,7 @@ fn test_avg_decimal_round_half_up_negative() {
         }),
     };
 
-    let arrays = vec![Some(input.clone())];
+    let arrays = [Some(input.clone())];
     let input_types = vec![Some(input.data_type().clone())];
     let kernels = agg::build_kernel_set(&[func], &input_types).unwrap();
 

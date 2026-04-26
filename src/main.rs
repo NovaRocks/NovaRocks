@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#![allow(clippy::zombie_processes)]
+
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -679,7 +681,7 @@ fn main() {
                 );
             }
 
-            let log_level_num = match cfg.log_level.as_str() {
+            let _log_level_num = match cfg.log_level.as_str() {
                 "trace" | "debug" => 0,
                 "info" => 0,
                 "warn" => 1,
