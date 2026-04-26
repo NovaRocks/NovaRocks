@@ -517,6 +517,9 @@ fn managed_table_def(runtime: &ManagedTableRuntime) -> Result<TableDef, String> 
     let schema_columns = visible_tablet_columns_by_name(&runtime.tablet_schema)?;
     let mut columns = Vec::with_capacity(runtime.columns.len());
     for column in &runtime.columns {
+        if !column.visible {
+            continue;
+        }
         let schema_column = schema_columns.get(&column.column_name).ok_or_else(|| {
             format!(
                 "managed table {}.{} is missing schema metadata for column `{}`",
@@ -740,6 +743,14 @@ mod tests {
                         }],
                         ..Default::default()
                     },
+                    ColumnPb {
+                        unique_id: 3,
+                        name: Some("__hidden".to_string()),
+                        r#type: "BIGINT".to_string(),
+                        is_nullable: Some(true),
+                        visible: Some(false),
+                        ..Default::default()
+                    },
                 ],
                 ..Default::default()
             },
@@ -750,6 +761,8 @@ mod tests {
                     column_name: "id".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
+                    visible: true,
+                    is_key: false,
                 },
                 StoredManagedColumn {
                     schema_id: 30,
@@ -757,6 +770,17 @@ mod tests {
                     column_name: "items".to_string(),
                     logical_type: "ARRAY<STRING>".to_string(),
                     nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+                StoredManagedColumn {
+                    schema_id: 30,
+                    ordinal: 2,
+                    column_name: "__hidden".to_string(),
+                    logical_type: "BIGINT".to_string(),
+                    nullable: true,
+                    visible: false,
+                    is_key: false,
                 },
             ],
             partitions: vec![

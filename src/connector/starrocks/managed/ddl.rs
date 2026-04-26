@@ -90,6 +90,12 @@ pub(crate) fn create_managed_table(
     let index_id = alloc_id(&mut snapshot.global.next_index_id);
 
     let request_schema = build_tablet_schema(columns, &defaults.key_desc, schema_id)?;
+    let key_column_set = defaults
+        .key_desc
+        .columns
+        .iter()
+        .map(|column| normalize_identifier(column))
+        .collect::<Result<HashSet<_>, _>>()?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
     for bucket_seq in 0..defaults.bucket_num {
@@ -163,13 +169,16 @@ pub(crate) fn create_managed_table(
     snapshot
         .columns
         .extend(columns.iter().enumerate().map(|(ordinal, column)| {
+            let column_name = normalize_identifier(&column.name)
+                .unwrap_or_else(|_| column.name.to_ascii_lowercase());
             StoredManagedColumn {
                 schema_id,
                 ordinal: ordinal as i64,
-                column_name: normalize_identifier(&column.name)
-                    .unwrap_or_else(|_| column.name.to_ascii_lowercase()),
+                is_key: key_column_set.contains(&column_name),
+                column_name,
                 logical_type: logical_type_name(&column.data_type),
                 nullable: column.nullable,
+                visible: true,
             }
         }));
     snapshot.partitions.push(StoredManagedPartition {
@@ -732,17 +741,11 @@ fn request_schema_from_runtime(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let key_columns = runtime
-        .tablet_schema
-        .column
+        .columns
         .iter()
-        .filter(|column| column.visible != Some(false) && column.is_key.unwrap_or(false))
-        .map(|column| {
-            column
-                .name
-                .clone()
-                .ok_or_else(|| "managed tablet schema key column missing name".to_string())
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .filter(|column| column.is_key)
+        .map(|column| column.column_name.clone())
+        .collect::<Vec<_>>();
     build_tablet_schema(
         &columns,
         &TableKeyDesc {
@@ -1162,7 +1165,9 @@ mod tests {
 
     use prost::Message;
 
-    use crate::connector::starrocks::managed::catalog::register_managed_table_in_catalog;
+    use crate::connector::starrocks::managed::catalog::{
+        ManagedTableRuntime, register_managed_table_in_catalog,
+    };
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
@@ -1177,7 +1182,8 @@ mod tests {
 
     use super::{
         build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,
-        resolve_managed_create_defaults, truncate_managed_table_with_hooks,
+        request_schema_from_runtime, resolve_managed_create_defaults,
+        truncate_managed_table_with_hooks,
     };
 
     fn test_managed_config() -> ManagedLakeConfig {
@@ -1261,6 +1267,8 @@ mod tests {
                     column_name: "k1".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
+                    visible: true,
+                    is_key: true,
                 },
                 StoredManagedColumn {
                     schema_id: 100,
@@ -1268,6 +1276,8 @@ mod tests {
                     column_name: "v1".to_string(),
                     logical_type: "STRING".to_string(),
                     nullable: true,
+                    visible: true,
+                    is_key: false,
                 },
             ],
             partitions: vec![StoredManagedPartition {
@@ -1451,6 +1461,56 @@ mod tests {
             persisted.managed.erase_jobs[0].root_path,
             "s3://test/warehouse/db_1/table_10/partition_20"
         );
+    }
+
+    #[test]
+    fn request_schema_from_runtime_uses_stored_key_flags_for_physical_columns() {
+        let runtime = ManagedTableRuntime {
+            database_name: DEFAULT_DATABASE.to_string(),
+            table: StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 100,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
+            },
+            tablet_schema: Default::default(),
+            columns: vec![
+                StoredManagedColumn {
+                    schema_id: 100,
+                    ordinal: 0,
+                    column_name: "k1".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                },
+                StoredManagedColumn {
+                    schema_id: 100,
+                    ordinal: 1,
+                    column_name: "__hidden".to_string(),
+                    logical_type: "BIGINT".to_string(),
+                    nullable: true,
+                    visible: false,
+                    is_key: false,
+                },
+            ],
+            partitions: Vec::new(),
+            indexes: Vec::new(),
+            tablets: Vec::new(),
+        };
+
+        let request_schema = request_schema_from_runtime(&runtime).expect("request schema");
+
+        assert_eq!(request_schema.columns.len(), 2);
+        assert_eq!(request_schema.columns[0].column_name, "k1");
+        assert_eq!(request_schema.columns[0].is_key, Some(true));
+        assert_eq!(request_schema.columns[1].column_name, "__hidden");
+        assert_eq!(request_schema.columns[1].is_key, Some(false));
+        assert_eq!(request_schema.short_key_column_count, 1);
     }
 
     #[test]

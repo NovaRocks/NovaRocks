@@ -2,6 +2,7 @@
 //!
 //! REFRESH lives in `mv_refresh.rs` because it needs the query executor.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -166,6 +167,11 @@ pub(crate) fn create_mv(
     }
 
     let request_schema = build_tablet_schema(&table_columns, &key_desc, schema_id)?;
+    let key_column_set = key_desc
+        .columns
+        .iter()
+        .map(|column| normalize_identifier(column))
+        .collect::<Result<HashSet<_>, _>>()?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
     for bucket_seq in 0..bucket_num {
@@ -217,13 +223,16 @@ pub(crate) fn create_mv(
     snapshot
         .columns
         .extend(table_columns.iter().enumerate().map(|(ordinal, column)| {
+            let column_name = normalize_identifier(&column.name)
+                .unwrap_or_else(|_| column.name.to_ascii_lowercase());
             StoredManagedColumn {
                 schema_id,
                 ordinal: ordinal as i64,
-                column_name: normalize_identifier(&column.name)
-                    .unwrap_or_else(|_| column.name.to_ascii_lowercase()),
+                is_key: key_column_set.contains(&column_name),
+                column_name,
                 logical_type: logical_type_name(&column.data_type),
                 nullable: column.nullable,
+                visible: true,
             }
         }));
     snapshot.partitions.push(StoredManagedPartition {

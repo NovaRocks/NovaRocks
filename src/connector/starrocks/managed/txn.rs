@@ -1232,6 +1232,8 @@ mod mv_target_tests {
                     column_name: "k1".to_string(),
                     logical_type: "INT".to_string(),
                     nullable: false,
+                    visible: true,
+                    is_key: false,
                 },
                 crate::connector::starrocks::managed::store::StoredManagedColumn {
                     schema_id: 100,
@@ -1239,6 +1241,8 @@ mod mv_target_tests {
                     column_name: "total".to_string(),
                     logical_type: "BIGINT".to_string(),
                     nullable: true,
+                    visible: true,
+                    is_key: false,
                 },
             ],
             partitions: vec![

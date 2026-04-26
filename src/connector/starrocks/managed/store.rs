@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use prost::Message;
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[derive(Clone, Debug)]
@@ -161,6 +162,8 @@ pub(crate) struct StoredManagedColumn {
     pub column_name: String,
     pub logical_type: String,
     pub nullable: bool,
+    pub visible: bool,
+    pub is_key: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -670,14 +673,18 @@ impl SqliteMetadataStore {
                         ordinal,
                         column_name,
                         logical_type,
-                        nullable
-                    ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        nullable,
+                        visible,
+                        is_key
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         column.schema_id,
                         column.ordinal,
                         column.column_name,
                         column.logical_type,
                         bool_to_sql_int(column.nullable),
+                        bool_to_sql_int(column.visible),
+                        bool_to_sql_int(column.is_key),
                     ],
                 )
                 .map_err(|e| format!("persist managed column failed: {e}"))?;
@@ -1821,10 +1828,13 @@ impl SqliteMetadataStore {
         let current_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| format!("read standalone metadata schema version failed: {e}"))?;
-        if current_version != 0 && current_version != 4 {
+        if current_version != 0 && current_version != 4 && current_version != 5 {
             return Err(format!(
                 "unsupported standalone metadata schema version {current_version}; delete the metadata db and reopen"
             ));
+        }
+        if current_version == 4 {
+            migrate_schema_v4_to_v5(&conn)?;
         }
         conn.execute_batch(
             "
@@ -1873,6 +1883,8 @@ impl SqliteMetadataStore {
                 column_name TEXT NOT NULL,
                 logical_type TEXT NOT NULL,
                 nullable INTEGER NOT NULL,
+                visible INTEGER NOT NULL DEFAULT 1,
+                is_key INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (schema_id, ordinal)
             );
             CREATE TABLE IF NOT EXISTS partitions (
@@ -1944,7 +1956,7 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 4;
+            PRAGMA user_version = 5;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
@@ -2060,7 +2072,7 @@ impl SqliteMetadataStore {
         let columns = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT schema_id, ordinal, column_name, logical_type, nullable
+                    "SELECT schema_id, ordinal, column_name, logical_type, nullable, visible, is_key
                      FROM table_columns
                      ORDER BY schema_id, ordinal",
                 )
@@ -2073,6 +2085,8 @@ impl SqliteMetadataStore {
                         column_name: row.get(2)?,
                         logical_type: row.get(3)?,
                         nullable: row.get::<_, i64>(4)? != 0,
+                        visible: row.get::<_, i64>(5)? != 0,
+                        is_key: row.get::<_, i64>(6)? != 0,
                     })
                 })
                 .map_err(|e| format!("query managed columns failed: {e}"))?;
@@ -2359,6 +2373,154 @@ fn bool_to_sql_int(value: bool) -> i64 {
     if value { 1 } else { 0 }
 }
 
+fn migrate_schema_v4_to_v5(conn: &Connection) -> Result<(), String> {
+    if !table_column_exists(conn, "table_columns", "visible")? {
+        conn.execute_batch(
+            "ALTER TABLE table_columns ADD COLUMN visible INTEGER NOT NULL DEFAULT 1;",
+        )
+        .map_err(|e| {
+            format!("migrate standalone metadata schema v4 to v5 failed adding visible: {e}")
+        })?;
+    }
+    if !table_column_exists(conn, "table_columns", "is_key")? {
+        conn.execute_batch(
+            "ALTER TABLE table_columns ADD COLUMN is_key INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| {
+            format!("migrate standalone metadata schema v4 to v5 failed adding is_key: {e}")
+        })?;
+    }
+    backfill_table_column_flags_from_tablet_schema(conn)?;
+    if !table_column_exists(conn, "table_columns", "visible")?
+        || !table_column_exists(conn, "table_columns", "is_key")?
+    {
+        return Err(
+            "migrate standalone metadata schema v4 to v5 failed: table_columns flags are missing"
+                .to_string(),
+        );
+    }
+    conn.execute_batch("PRAGMA user_version = 5;")
+        .map_err(|e| {
+            format!("migrate standalone metadata schema v4 to v5 failed setting version: {e}")
+        })?;
+    Ok(())
+}
+
+fn table_column_exists(
+    conn: &Connection,
+    table_name: &str,
+    column_name: &str,
+) -> Result<bool, String> {
+    let sql = format!("SELECT COUNT(*) FROM pragma_table_info('{table_name}') WHERE name = ?1");
+    let count: i64 = conn
+        .query_row(&sql, params![column_name], |row| row.get(0))
+        .map_err(|e| {
+            format!("query sqlite column metadata failed for {table_name}.{column_name}: {e}")
+        })?;
+    Ok(count > 0)
+}
+
+fn backfill_table_column_flags_from_tablet_schema(conn: &Connection) -> Result<(), String> {
+    use crate::service::grpc_client::proto::starrocks::TabletSchemaPb;
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    struct ColumnFlags {
+        name: Option<String>,
+        visible: bool,
+        is_key: bool,
+    }
+
+    let schemas = {
+        let mut stmt = conn
+            .prepare("SELECT schema_id, tablet_schema_pb FROM table_schemas")
+            .map_err(|e| format!("prepare managed schema migration query failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("query managed schema migration rows failed: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read managed schema migration rows failed: {e}"))?
+    };
+
+    let mut columns_by_schema = HashMap::<i64, Vec<ColumnFlags>>::new();
+    for (schema_id, payload) in schemas {
+        let schema = TabletSchemaPb::decode(payload.as_slice()).map_err(|e| {
+            format!(
+                "decode managed tablet_schema_pb during v4 to v5 migration failed for schema_id={schema_id}: {e}"
+            )
+        })?;
+        columns_by_schema.insert(
+            schema_id,
+            schema
+                .column
+                .into_iter()
+                .map(|column| ColumnFlags {
+                    name: column.name,
+                    visible: column.visible.unwrap_or(true),
+                    is_key: column.is_key.unwrap_or(false),
+                })
+                .collect(),
+        );
+    }
+
+    let stored_columns = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT schema_id, ordinal, column_name FROM table_columns ORDER BY schema_id, ordinal",
+            )
+            .map_err(|e| format!("prepare managed column migration query failed: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("query managed column migration rows failed: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read managed column migration rows failed: {e}"))?
+    };
+
+    for (schema_id, ordinal, column_name) in stored_columns {
+        let matched = columns_by_schema.get(&schema_id).and_then(|columns| {
+            columns
+                .iter()
+                .find(|schema_column| {
+                    schema_column.name.as_deref().is_some_and(|name| {
+                        name == column_name || name.eq_ignore_ascii_case(&column_name)
+                    })
+                })
+                .or_else(|| {
+                    usize::try_from(ordinal)
+                        .ok()
+                        .and_then(|idx| columns.get(idx))
+                })
+        });
+        let visible = matched.map(|column| column.visible).unwrap_or(true);
+        let is_key = matched.map(|column| column.is_key).unwrap_or(false);
+        conn.execute(
+            "UPDATE table_columns
+             SET visible = ?1, is_key = ?2
+             WHERE schema_id = ?3 AND ordinal = ?4",
+            params![
+                bool_to_sql_int(visible),
+                bool_to_sql_int(is_key),
+                schema_id,
+                ordinal
+            ],
+        )
+        .map_err(|e| {
+            format!(
+                "backfill managed column flags failed for schema_id={schema_id}, ordinal={ordinal}: {e}"
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn query_single_text_column<P>(
     conn: &Connection,
     sql: &str,
@@ -2379,6 +2541,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
+    use prost::Message;
+
     use super::{
         ActivateMvRefreshRequest, IcebergTableRef, ManagedEraseJobKind, ManagedEraseJobState,
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
@@ -2431,6 +2596,8 @@ mod tests {
                 column_name: "k1".to_string(),
                 logical_type: "INT".to_string(),
                 nullable: false,
+                visible: true,
+                is_key: false,
             }],
             partitions: vec![StoredManagedPartition {
                 partition_id: 20,
@@ -2976,6 +3143,8 @@ mod tests {
             column_name: "k1".to_string(),
             logical_type: "INT".to_string(),
             nullable: false,
+            visible: true,
+            is_key: false,
         });
         snapshot.partitions[0].state = ManagedPartitionState::Retired;
         snapshot.indexes.push(StoredManagedIndex {
@@ -3119,7 +3288,7 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_v4_creates_tables_with_kind_and_materialized_views_table() {
+    fn init_schema_v5_creates_tables_with_kind_and_materialized_views_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
             .expect("open fresh store");
@@ -3128,7 +3297,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // `tables` must have the new `kind` column with the expected default and check.
         let kind_col_exists: i64 = conn
@@ -3173,6 +3342,201 @@ mod tests {
     }
 
     #[test]
+    fn init_schema_v5_creates_table_column_flags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
+            .expect("open fresh store");
+        let conn = store.connection().expect("connection");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 5);
+
+        let cols: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, type, \"notnull\"
+                 FROM pragma_table_info('table_columns')
+                 WHERE name IN ('visible', 'is_key')
+                 ORDER BY cid",
+                )
+                .expect("prepare");
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+        };
+        assert_eq!(
+            cols,
+            vec![
+                ("visible".to_string(), "INTEGER".to_string(), 1),
+                ("is_key".to_string(), "INTEGER".to_string(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn init_schema_migrates_v4_table_column_flags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            let schema_pb = TabletSchemaPb {
+                column: vec![
+                    ColumnPb {
+                        name: Some("K1".to_string()),
+                        r#type: "INT".to_string(),
+                        is_key: Some(true),
+                        visible: Some(true),
+                        ..Default::default()
+                    },
+                    ColumnPb {
+                        name: Some("v1".to_string()),
+                        r#type: "BIGINT".to_string(),
+                        is_key: Some(false),
+                        visible: Some(true),
+                        ..Default::default()
+                    },
+                    ColumnPb {
+                        name: Some("__hidden".to_string()),
+                        r#type: "BIGINT".to_string(),
+                        is_key: Some(false),
+                        visible: Some(false),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            };
+            conn.execute_batch(
+                "
+            CREATE TABLE global_meta (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                warehouse_uri TEXT NOT NULL,
+                next_db_id INTEGER NOT NULL,
+                next_table_id INTEGER NOT NULL,
+                next_partition_id INTEGER NOT NULL,
+                next_index_id INTEGER NOT NULL,
+                next_tablet_id INTEGER NOT NULL,
+                next_txn_id INTEGER NOT NULL
+            );
+            CREATE TABLE table_schemas (
+                schema_id INTEGER PRIMARY KEY,
+                table_id INTEGER NOT NULL,
+                schema_version INTEGER NOT NULL,
+                tablet_schema_pb BLOB NOT NULL
+            );
+            CREATE TABLE table_columns (
+                schema_id INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                column_name TEXT NOT NULL,
+                logical_type TEXT NOT NULL,
+                nullable INTEGER NOT NULL,
+                visible INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (schema_id, ordinal)
+            );
+            PRAGMA user_version = 4;
+            ",
+            )
+            .expect("seed v4");
+            conn.execute(
+                "INSERT INTO global_meta(
+                    singleton,
+                    warehouse_uri,
+                    next_db_id,
+                    next_table_id,
+                    next_partition_id,
+                    next_index_id,
+                    next_tablet_id,
+                    next_txn_id
+                ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "s3://bucket/warehouse",
+                    2_i64,
+                    11_i64,
+                    21_i64,
+                    31_i64,
+                    41_i64,
+                    51_i64
+                ],
+            )
+            .expect("seed global meta");
+            conn.execute(
+                "INSERT INTO table_schemas(schema_id, table_id, schema_version, tablet_schema_pb)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![100_i64, 10_i64, 1_i64, schema_pb.encode_to_vec()],
+            )
+            .expect("seed schema pb");
+            conn.execute(
+                "INSERT INTO table_columns(schema_id, ordinal, column_name, logical_type, nullable)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![100_i64, 0_i64, "k1", "INT", 0_i64],
+            )
+            .expect("seed key column");
+            conn.execute(
+                "INSERT INTO table_columns(schema_id, ordinal, column_name, logical_type, nullable)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![100_i64, 1_i64, "v1", "BIGINT", 1_i64],
+            )
+            .expect("seed value column");
+            conn.execute(
+                "INSERT INTO table_columns(schema_id, ordinal, column_name, logical_type, nullable)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![100_i64, 2_i64, "__hidden", "BIGINT", 1_i64],
+            )
+            .expect("seed hidden column");
+        }
+
+        let store = SqliteMetadataStore::open(&path).expect("open migrates v4");
+        let conn = store.connection().expect("connection");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 5);
+
+        let visible_col_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('table_columns') WHERE name = 'visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("visible column");
+        let is_key_col_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('table_columns') WHERE name = 'is_key'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("is_key column");
+        assert_eq!(visible_col_exists, 1);
+        assert_eq!(is_key_col_exists, 1);
+
+        let snapshot = store.load_snapshot().expect("load migrated snapshot");
+        let key_column = snapshot
+            .managed
+            .columns
+            .iter()
+            .find(|column| column.column_name == "k1")
+            .expect("key column");
+        assert!(key_column.visible);
+        assert!(key_column.is_key);
+        let hidden_column = snapshot
+            .managed
+            .columns
+            .iter()
+            .find(|column| column.column_name == "__hidden")
+            .expect("hidden column");
+        assert!(!hidden_column.visible);
+        assert!(!hidden_column.is_key);
+    }
+
+    #[test]
     fn init_schema_rejects_pre_v4_database() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("old.sqlite");
@@ -3191,6 +3555,26 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
+        let tablet_schema_pb = TabletSchemaPb {
+            column: vec![
+                ColumnPb {
+                    name: Some("k1".to_string()),
+                    r#type: "INT".to_string(),
+                    is_key: Some(true),
+                    visible: Some(true),
+                    ..Default::default()
+                },
+                ColumnPb {
+                    name: Some("__hidden".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    visible: Some(false),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+        .encode_to_vec();
 
         let snapshot = ManagedSnapshot {
             global: ManagedGlobalMeta {
@@ -3216,8 +3600,32 @@ mod tests {
                 state: ManagedTableState::Active,
                 kind: ManagedTableKind::MaterializedView,
             }],
-            schemas: vec![],
-            columns: vec![],
+            schemas: vec![StoredManagedSchema {
+                schema_id: 10,
+                table_id: 10,
+                schema_version: 0,
+                tablet_schema_pb,
+            }],
+            columns: vec![
+                StoredManagedColumn {
+                    schema_id: 10,
+                    ordinal: 0,
+                    column_name: "k1".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                },
+                StoredManagedColumn {
+                    schema_id: 10,
+                    ordinal: 1,
+                    column_name: "__hidden".to_string(),
+                    logical_type: "BIGINT".to_string(),
+                    nullable: true,
+                    visible: false,
+                    is_key: false,
+                },
+            ],
             partitions: vec![StoredManagedPartition {
                 partition_id: 20,
                 table_id: 10,
