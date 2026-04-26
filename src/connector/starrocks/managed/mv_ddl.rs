@@ -597,7 +597,7 @@ fn output_column_to_table_column(column: &OutputColumn) -> Result<TableColumnDef
     })
 }
 
-fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
+pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlType, String> {
     match data_type {
         DataType::Boolean => Ok(SqlType::Boolean),
         DataType::Int8 => Ok(SqlType::TinyInt),
