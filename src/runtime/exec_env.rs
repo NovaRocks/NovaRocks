@@ -14,9 +14,9 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-/// Utilities for deriving execution parameters from request values.
-///
-/// This mirrors StarRocks BE `ExecEnv` helpers like `calc_pipeline_dop()`.
+//! Utilities for deriving execution parameters from request values.
+//!
+//! This mirrors StarRocks BE `ExecEnv` helpers like `calc_pipeline_dop()`.
 
 /// Calculate pipeline degree-of-parallelism (DOP) for a fragment instance.
 ///

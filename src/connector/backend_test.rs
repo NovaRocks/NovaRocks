@@ -3,9 +3,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::connector::ConnectorRegistry;
-    use crate::connector::backend::{
-        CatalogBackend, CreateTableRequest, MvBackend, NoMvBackend, ResolvedTable,
-    };
+    use crate::connector::backend::{CatalogBackend, CreateTableRequest, ResolvedTable};
 
     struct DummyCatalog;
 
@@ -53,10 +51,6 @@ mod tests {
         ) -> Result<ResolvedTable, String> {
             Err("dummy".to_string())
         }
-
-        fn list_tables(&self, _catalog: &str, _namespace: &str) -> Result<Vec<String>, String> {
-            Ok(vec![])
-        }
     }
 
     #[test]
@@ -67,13 +61,5 @@ mod tests {
         let backend = registry.catalog_backend("dummy").expect("resolve backend");
         assert_eq!(backend.name(), "dummy");
         assert!(registry.catalog_backend("missing").is_err());
-    }
-
-    #[test]
-    fn no_mv_backend_returns_unsupported() {
-        let mv = NoMvBackend("hdfs");
-
-        assert_eq!(mv.name(), "hdfs");
-        assert!(!mv.supports_incremental_refresh());
     }
 }

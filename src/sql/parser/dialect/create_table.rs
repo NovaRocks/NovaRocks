@@ -462,12 +462,8 @@ mod tests {
             )
             .expect("parser");
         let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
-        match stmt.kind {
-            CreateTableKind::Iceberg { bucket_count, .. } => {
-                assert_eq!(bucket_count, Some(3));
-            }
-            other => panic!("unexpected create table kind: {other:?}"),
-        }
+        let CreateTableKind::Iceberg { bucket_count, .. } = stmt.kind;
+        assert_eq!(bucket_count, Some(3));
     }
 
     #[test]
@@ -479,13 +475,9 @@ mod tests {
             )
             .expect("parser");
         let stmt = parse_create_table_statement(&mut parser).expect("create table stmt");
-        match stmt.kind {
-            CreateTableKind::Iceberg { columns, .. } => {
-                assert_eq!(columns.len(), 2);
-                assert!(!columns[0].nullable);
-                assert!(columns[1].nullable);
-            }
-            other => panic!("unexpected create table kind: {other:?}"),
-        }
+        let CreateTableKind::Iceberg { columns, .. } = stmt.kind;
+        assert_eq!(columns.len(), 2);
+        assert!(!columns[0].nullable);
+        assert!(columns[1].nullable);
     }
 }

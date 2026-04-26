@@ -1162,15 +1162,14 @@ mod tests {
 
     use prost::Message;
 
+    use crate::connector::starrocks::managed::catalog::register_managed_table_in_catalog;
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
         StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
         StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
-    use crate::connector::starrocks::managed::{
-        ManagedLakeCatalog, ManagedLakeConfig, register_managed_table_in_catalog,
-    };
+    use crate::connector::starrocks::managed::{ManagedLakeCatalog, ManagedLakeConfig};
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::parser::ast::{SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
     use crate::standalone::engine::StandaloneState;

@@ -118,18 +118,7 @@ impl CatalogBackend for ManagedLakeBackend {
             namespace: database.to_string(),
             table: table.to_string(),
             columns: table_def.columns,
-            logical_types: Default::default(),
-            key_desc: None,
         })
-    }
-
-    fn list_tables(&self, _catalog: &str, database: &str) -> Result<Vec<String>, String> {
-        let state = self.state()?;
-        state
-            .managed_lake
-            .read()
-            .expect("standalone managed lake read lock")
-            .list_tables_in_database(database)
     }
 }
 
@@ -148,13 +137,6 @@ impl ManagedLakeTableSource {
 impl TableSource for ManagedLakeTableSource {
     fn name(&self) -> &'static str {
         "managed"
-    }
-
-    fn load_full(&self, _table: &ResolvedTable) -> Result<RecordBatch, String> {
-        Err(
-            "managed-lake TableSource::load_full is not used; scans go through the pipeline"
-                .to_string(),
-        )
     }
 
     fn build_table_def(&self, _table: &ResolvedTable) -> Result<TableDef, String> {
@@ -257,9 +239,5 @@ impl MvBackend for ManagedLakeMvBackend {
             StatementResult::Query(query) => Ok(query),
             StatementResult::Ok => Err("list_mvs returned Ok; expected query result".to_string()),
         }
-    }
-
-    fn supports_incremental_refresh(&self) -> bool {
-        true
     }
 }

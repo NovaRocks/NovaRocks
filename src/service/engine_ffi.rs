@@ -17,11 +17,13 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::common::thrift::thrift_serialize_result_batch;
-use crate::connector::starrocks::lake::{
-    abort_compaction as lake_abort_compaction, abort_txn as lake_abort_txn,
-    compact as lake_compact, delete_data as lake_delete_data, delete_tablet as lake_delete_tablet,
-    drop_table as lake_drop_table, get_tablet_stats as lake_get_tablet_stats,
-    publish_log_version as lake_publish_log_version,
+use crate::connector::starrocks::lake::compaction::{
+    abort_compaction as lake_abort_compaction, compact as lake_compact,
+};
+use crate::connector::starrocks::lake::transactions::{
+    abort_txn as lake_abort_txn, delete_data as lake_delete_data,
+    delete_tablet as lake_delete_tablet, drop_table as lake_drop_table,
+    get_tablet_stats as lake_get_tablet_stats, publish_log_version as lake_publish_log_version,
     publish_log_version_batch as lake_publish_log_version_batch,
     publish_version as lake_publish_version, vacuum as lake_vacuum,
 };

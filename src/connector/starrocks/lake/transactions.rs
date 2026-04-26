@@ -3084,7 +3084,7 @@ fn is_missing_tablet_page_in_bundle_error(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::{Arc, MutexGuard};
+    use std::sync::Arc;
 
     use arrow::array::{Int8Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -3115,7 +3115,6 @@ mod tests {
         DATA_DIR, bundle_meta_file_path, combined_txn_log_file_path, initial_meta_file_path,
         join_tablet_path, txn_log_file_path, txn_log_file_path_with_load_id, txn_vlog_file_path,
     };
-    use crate::runtime::starlet_shard_registry;
     use crate::service::grpc_client::proto::starrocks::{
         AbortTxnRequest, ColumnPb, CombinedTxnLogPb, DeleteTabletRequest, DelvecMetadataPb,
         DropTableRequest, FileMetaPb, KeysType, PUniqueId, PublishLogVersionBatchRequest,

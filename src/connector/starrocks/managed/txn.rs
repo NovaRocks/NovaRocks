@@ -6,11 +6,12 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
+use crate::connector::starrocks::lake::append_lake_txn_log_with_chunk_rowset;
 use crate::connector::starrocks::lake::context::{
     PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
 };
+use crate::connector::starrocks::lake::transactions::publish_version;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
-use crate::connector::starrocks::lake::{append_lake_txn_log_with_chunk_rowset, publish_version};
 use crate::connector::starrocks::sink::routing::{
     build_unpartitioned_hash_routing, route_chunk_rows,
 };

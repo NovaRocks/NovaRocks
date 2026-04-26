@@ -12,7 +12,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
@@ -42,7 +41,6 @@ pub(crate) struct IcebergCatalogRegistry {
 
 #[derive(Clone)]
 pub(crate) struct IcebergCatalogEntry {
-    pub(crate) name: String,
     pub(crate) warehouse_uri: String,
     pub(crate) properties: Vec<(String, String)>,
     s3_config: Option<crate::fs::object_store::ObjectStoreConfig>,
@@ -460,6 +458,7 @@ pub(crate) fn insert_rows(
     rows: &[Vec<Literal>],
 ) -> Result<(), String> {
     let loaded = load_table(entry, namespace_name, table_name)?;
+    reject_unsupported_iceberg_table_semantics(&loaded)?;
     let batch = build_insert_batch(&loaded, rows)?;
 
     let catalog = build_hadoop_catalog(entry)?;
@@ -530,34 +529,19 @@ pub(crate) fn insert_rows(
     Ok(())
 }
 
-/// Extract data file paths, sizes, and row counts from an Iceberg table via scan planning.
-pub(crate) fn extract_data_files(
-    table: &iceberg::table::Table,
-) -> Result<Vec<(String, i64, Option<i64>)>, String> {
-    block_on_iceberg(async {
-        let scan = table
-            .scan()
-            .build()
-            .map_err(|e| format!("build scan: {e}"))?;
-        let tasks: Vec<_> = scan
-            .plan_files()
-            .await
-            .map_err(|e| format!("plan files: {e}"))?
-            .try_collect()
-            .await
-            .map_err(|e| format!("collect tasks: {e}"))?;
-        Ok(tasks
-            .iter()
-            .map(|t| {
-                (
-                    t.data_file_path.clone(),
-                    i64::try_from(t.file_size_in_bytes).unwrap_or(i64::MAX),
-                    t.record_count.map(|c| i64::try_from(c).unwrap_or(i64::MAX)),
-                )
-            })
-            .collect())
-    })
-    .map_err(|e| format!("extract data files runtime: {e}"))?
+fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Result<(), String> {
+    if let Some(key_desc) = loaded.key_desc.as_ref()
+        && key_desc.kind != TableKeyKind::Duplicate
+    {
+        return Err(format!(
+            "iceberg INSERT does not support {:?} key table semantics",
+            key_desc.kind
+        ));
+    }
+    if !loaded.column_aggregations.is_empty() {
+        return Err("iceberg INSERT does not support aggregate column semantics".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -941,7 +925,6 @@ fn build_catalog_entry(
     );
 
     let entry = IcebergCatalogEntry {
-        name: catalog_name.to_string(),
         warehouse_uri,
         properties: sorted_properties(&props),
         s3_config,

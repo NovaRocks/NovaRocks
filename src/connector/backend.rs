@@ -7,15 +7,13 @@
 //! can program against `dyn CatalogBackend` without knowing which concrete
 //! connector fulfils the request.
 
-use std::collections::HashMap;
-
 use arrow::record_batch::RecordBatch;
 
 use crate::runtime::query_result::QueryResult;
 use crate::sql::catalog::{ColumnDef, TableDef};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, Literal, RefreshMaterializedViewStmt,
-    ShowMaterializedViewsStmt, SqlType, TableColumnDef, TableKeyDesc,
+    ShowMaterializedViewsStmt, TableColumnDef, TableKeyDesc,
 };
 
 /// Request to create a table. Unified shape across all catalog backends;
@@ -41,11 +39,9 @@ pub(crate) struct ResolvedTable {
     pub namespace: String,
     pub table: String,
     pub columns: Vec<ColumnDef>,
-    pub logical_types: HashMap<String, SqlType>,
-    pub key_desc: Option<TableKeyDesc>,
 }
 
-/// Catalog-plane operations: create/drop namespace, create/drop/load/list
+/// Catalog-plane operations: create/drop namespace and create/drop/load
 /// tables. Implemented once per catalog type (iceberg, managed-lake, ...).
 pub(crate) trait CatalogBackend: Send + Sync {
     fn name(&self) -> &'static str;
@@ -68,16 +64,12 @@ pub(crate) trait CatalogBackend: Send + Sync {
         namespace: &str,
         table: &str,
     ) -> Result<ResolvedTable, String>;
-    fn list_tables(&self, catalog: &str, namespace: &str) -> Result<Vec<String>, String>;
 }
 
-/// Scan-side: materialize a table into Arrow `RecordBatch`es. For now this
-/// is eager (whole-table load) because both current backends use it to
-/// register iceberg bases for MV refresh and for small-table quick paths.
-/// A streaming variant is a future extension.
+/// Scan-side metadata conversion used to register external connector tables
+/// into the in-memory logical catalog before planning.
 pub(crate) trait TableSource: Send + Sync {
     fn name(&self) -> &'static str;
-    fn load_full(&self, table: &ResolvedTable) -> Result<RecordBatch, String>;
 
     /// Build a `TableDef` suitable for registration in the in-memory logical
     /// catalog. Different backends pick different `TableStorage` variants
@@ -100,8 +92,8 @@ pub(crate) trait TableSink: Send + Sync {
 }
 
 /// Materialized-view backend: CREATE / DROP / REFRESH / SHOW. Today only
-/// managed-lake implements this; iceberg returns `unsupported`. Future
-/// backends (e.g. iceberg-as-MV-target) plug in here.
+/// managed-lake implements this. Future backends (e.g. iceberg-as-MV-target)
+/// plug in here.
 pub(crate) trait MvBackend: Send + Sync {
     fn name(&self) -> &'static str;
     fn create_mv(
@@ -120,41 +112,4 @@ pub(crate) trait MvBackend: Send + Sync {
         current_database: &str,
     ) -> Result<(), String>;
     fn list_mvs(&self, stmt: &ShowMaterializedViewsStmt) -> Result<QueryResult, String>;
-    fn supports_incremental_refresh(&self) -> bool;
-}
-
-/// Trivial "null object" MV backend used by connectors that don't support
-/// materialized views. Every method returns a typed error.
-pub(crate) struct NoMvBackend(pub(crate) &'static str);
-impl MvBackend for NoMvBackend {
-    fn name(&self) -> &'static str {
-        self.0
-    }
-    fn create_mv(&self, _: &CreateMaterializedViewStmt, _: &str) -> Result<(), String> {
-        Err(format!(
-            "connector {} does not support materialized views",
-            self.0
-        ))
-    }
-    fn drop_mv(&self, _: &DropMaterializedViewStmt, _: &str) -> Result<(), String> {
-        Err(format!(
-            "connector {} does not support materialized views",
-            self.0
-        ))
-    }
-    fn refresh_mv(&self, _: &RefreshMaterializedViewStmt, _: &str) -> Result<(), String> {
-        Err(format!(
-            "connector {} does not support materialized views",
-            self.0
-        ))
-    }
-    fn list_mvs(&self, _: &ShowMaterializedViewsStmt) -> Result<QueryResult, String> {
-        Err(format!(
-            "connector {} does not support materialized views",
-            self.0
-        ))
-    }
-    fn supports_incremental_refresh(&self) -> bool {
-        false
-    }
 }

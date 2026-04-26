@@ -1924,21 +1924,6 @@ fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
     }
 }
 
-fn cast_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
-    if expr.data_type == *target || expr.data_type == DataType::Null {
-        return expr;
-    }
-    let nullable = expr.nullable;
-    TypedExpr {
-        kind: ExprKind::Cast {
-            expr: Box::new(expr),
-            target: target.clone(),
-        },
-        data_type: target.clone(),
-        nullable,
-    }
-}
-
 fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
     if expr.data_type == *target {
         return expr;

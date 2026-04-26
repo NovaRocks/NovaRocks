@@ -565,27 +565,6 @@ impl SqliteMetadataStore {
         })
     }
 
-    pub(crate) fn upsert_local_database(&self, database_name: &str) -> Result<(), String> {
-        let conn = self.connection()?;
-        conn.execute(
-            "INSERT INTO local_databases(name) VALUES (?1)
-             ON CONFLICT(name) DO NOTHING",
-            params![database_name],
-        )
-        .map_err(|e| format!("persist local database failed: {e}"))?;
-        Ok(())
-    }
-
-    pub(crate) fn delete_local_database(&self, database_name: &str) -> Result<(), String> {
-        let conn = self.connection()?;
-        conn.execute(
-            "DELETE FROM local_databases WHERE name = ?1",
-            params![database_name],
-        )
-        .map_err(|e| format!("delete local database metadata failed: {e}"))?;
-        Ok(())
-    }
-
     pub(crate) fn replace_managed_snapshot(
         &self,
         snapshot: &ManagedSnapshot,

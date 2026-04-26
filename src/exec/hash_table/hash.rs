@@ -16,10 +16,7 @@
 // under the License.
 use std::hash::{BuildHasher, Hash, Hasher};
 
-pub(crate) fn make_hash<Q: ?Sized, S: BuildHasher>(build_hasher: &S, value: &Q) -> u64
-where
-    Q: Hash,
-{
+pub(crate) fn make_hash<Q: ?Sized + Hash, S: BuildHasher>(build_hasher: &S, value: &Q) -> u64 {
     let mut hasher = build_hasher.build_hasher();
     value.hash(&mut hasher);
     hasher.finish()

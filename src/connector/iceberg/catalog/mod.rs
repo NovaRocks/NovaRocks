@@ -14,7 +14,6 @@ pub(crate) use backend::{
     IcebergCatalogBackend, IcebergTableSink, IcebergTableSource, build_iceberg_table_def_with_files,
 };
 pub(crate) use registry::{
-    IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, build_insert_batch,
-    create_namespace, insert_rows, load_table, namespace_exists, plan_append_delta,
-    register_existing_table,
+    IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace, insert_rows,
+    load_table, namespace_exists, plan_append_delta, register_existing_table,
 };
