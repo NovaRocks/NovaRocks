@@ -48,7 +48,7 @@ pub(crate) enum AggregateFunctionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateInput {
     Star,
-    Expr(sqlparser::ast::Expr),
+    Expr(Box<sqlparser::ast::Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -358,7 +358,7 @@ fn classify_count_input(
             reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
             Ok((
                 AggregateFunctionKind::Count,
-                AggregateInput::Expr(expr.clone()),
+                AggregateInput::Expr(Box::new(expr.clone())),
             ))
         }
         sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => Err(aggregate_error()),
@@ -373,7 +373,7 @@ fn classify_sum_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateI
         return Err(aggregate_error());
     };
     reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
-    Ok(AggregateInput::Expr(expr.clone()))
+    Ok(AggregateInput::Expr(Box::new(expr.clone())))
 }
 
 fn simple_aggregate_arg_expr(
@@ -1082,13 +1082,13 @@ mod tests {
         assert_eq!(shape.aggregates[1].function, AggregateFunctionKind::Count);
         assert_eq!(
             shape.aggregates[1].input,
-            AggregateInput::Expr(sqlparser::ast::Expr::Identifier("v2".into()))
+            AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v2".into())))
         );
         assert_eq!(shape.aggregates[2].output_name, "s");
         assert_eq!(shape.aggregates[2].function, AggregateFunctionKind::Sum);
         assert_eq!(
             shape.aggregates[2].input,
-            AggregateInput::Expr(sqlparser::ast::Expr::Identifier("v2".into()))
+            AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v2".into())))
         );
         assert_eq!(
             shape.visible_outputs,
