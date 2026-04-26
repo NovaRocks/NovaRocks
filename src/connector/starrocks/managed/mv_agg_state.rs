@@ -15,7 +15,7 @@ use arrow::record_batch::RecordBatch;
 use crate::connector::starrocks::managed::ddl::{ManagedPhysicalColumn, managed_physical_column};
 use crate::connector::starrocks::managed::mv_ddl;
 use crate::connector::starrocks::managed::mv_shape::{
-    AggregateFunctionKind, AggregateMvShape, VisibleAggregateOutput,
+    AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
@@ -52,6 +52,7 @@ pub(crate) struct AggregateStateColumn {
     pub(crate) nullable: bool,
     pub(crate) visible_source_index: usize,
     pub(crate) function: AggregateFunctionKind,
+    pub(crate) count_star: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -134,6 +135,7 @@ pub(crate) fn build_aggregate_mv_layout(
             nullable: visible.nullable,
             visible_source_index,
             function: aggregate.function,
+            count_star: matches!(aggregate.input, AggregateInput::Star),
         });
     }
 
@@ -504,7 +506,12 @@ fn validate_loaded_physical_row(
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let state_value = &state_values[state_index];
         if state_column.function == AggregateFunctionKind::Count {
-            validate_loaded_count_state(state_value, &state_column.name, row_id)?;
+            validate_loaded_count_state(
+                state_value,
+                &state_column.name,
+                row_id,
+                state_column.count_star,
+            )?;
         }
         let visible_value =
             visible_values
@@ -543,9 +550,14 @@ fn validate_loaded_count_state(
     state_value: &Option<AggScalarValue>,
     state_name: &str,
     row_id: &str,
+    count_star: bool,
 ) -> Result<(), String> {
     match state_value {
         Some(AggScalarValue::Int64(v)) if *v > 0 => Ok(()),
+        Some(AggScalarValue::Int64(0)) if !count_star => Ok(()),
+        Some(AggScalarValue::Int64(v)) if !count_star => Err(format!(
+            "aggregate MV state corruption: COUNT state column `{state_name}` must be non-negative for row id `{row_id}`, got {v}"
+        )),
         Some(AggScalarValue::Int64(v)) => Err(format!(
             "aggregate MV state corruption: COUNT state column `{state_name}` must be positive for row id `{row_id}`, got {v}"
         )),
@@ -796,6 +808,17 @@ mod tests {
         shape
     }
 
+    fn count_expr_shape() -> AggregateMvShape {
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, count(v1) as c from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
             crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
@@ -835,6 +858,21 @@ mod tests {
             },
             OutputColumn {
                 name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+        ]
+    }
+
+    fn count_expr_output_columns() -> Vec<OutputColumn> {
+        vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
             },
@@ -886,6 +924,20 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from(c)),
                 Arc::new(Int64Array::from(k1)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    fn count_expr_result_batch(k1: Vec<i64>, c: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int64, false),
+                Field::new("c", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(k1)),
+                Arc::new(Int64Array::from(c)),
             ],
         )
         .expect("batch")
@@ -1194,6 +1246,35 @@ mod tests {
         assert!(err.contains("corruption"), "err={err}");
         assert!(err.contains("COUNT"), "err={err}");
         assert!(err.contains("state"), "err={err}");
+    }
+
+    #[test]
+    fn load_allows_zero_count_expr_state() {
+        let layout = build_aggregate_mv_layout(&count_expr_shape(), &count_expr_output_columns())
+            .expect("layout");
+        let chunks = materialize_aggregate_result_chunks(
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![
+                    record_batch_to_chunk(count_expr_result_batch(vec![1], vec![0]))
+                        .expect("chunk"),
+                ],
+            },
+            &layout,
+        )
+        .expect("physical");
+
+        let rows = load_aggregate_physical_rows(&chunks, &layout).expect("loaded");
+
+        let row = rows.values().next().expect("row");
+        assert!(matches!(
+            row.visible_values[1],
+            Some(AggScalarValue::Int64(0))
+        ));
+        assert!(matches!(
+            row.state_values[0],
+            Some(AggScalarValue::Int64(0))
+        ));
     }
 
     #[test]
