@@ -5,9 +5,11 @@ use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
+use crate::standalone::engine::mv_flow::{
+    execute_query_for_mv_incremental_refresh, execute_query_for_mv_refresh,
+};
 use crate::standalone::engine::{
-    QueryResult, StandaloneState, StatementResult, execute_query_for_mv_incremental_refresh,
-    execute_query_for_mv_refresh, record_batch_to_chunk,
+    QueryResult, StandaloneState, StatementResult, record_batch_to_chunk,
 };
 
 use crate::connector::starrocks::managed::catalog::{

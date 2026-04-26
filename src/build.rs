@@ -62,10 +62,10 @@ fn resolve_thirdparty_install_root(root: &Path) -> Result<PathBuf, String> {
 
 fn find_cxx_runtime(lib_name: &str) -> Option<PathBuf> {
     let mut candidates: Vec<String> = Vec::new();
-    if let Ok(cxx) = env::var("CXX") {
-        if !cxx.trim().is_empty() {
-            candidates.push(cxx);
-        }
+    if let Ok(cxx) = env::var("CXX")
+        && !cxx.trim().is_empty()
+    {
+        candidates.push(cxx);
     }
     candidates.push("g++".to_string());
     candidates.push("c++".to_string());
@@ -93,22 +93,22 @@ fn find_cxx_runtime(lib_name: &str) -> Option<PathBuf> {
 }
 
 fn resolve_thirdparty_root(manifest_dir: &Path) -> Result<PathBuf, String> {
-    if let Ok(raw) = env::var("STARROCKS_THIRDPARTY") {
-        if !raw.trim().is_empty() {
-            let configured = PathBuf::from(raw.trim());
-            let resolved = if configured.is_absolute() {
-                configured
-            } else {
-                manifest_dir.join(configured)
-            };
-            if resolved.is_dir() {
-                return Ok(resolved);
-            }
-            return Err(format!(
-                "invalid STARROCKS_THIRDPARTY: '{}' (expected a thirdparty root directory)",
-                resolved.display()
-            ));
+    if let Ok(raw) = env::var("STARROCKS_THIRDPARTY")
+        && !raw.trim().is_empty()
+    {
+        let configured = PathBuf::from(raw.trim());
+        let resolved = if configured.is_absolute() {
+            configured
+        } else {
+            manifest_dir.join(configured)
+        };
+        if resolved.is_dir() {
+            return Ok(resolved);
         }
+        return Err(format!(
+            "invalid STARROCKS_THIRDPARTY: '{}' (expected a thirdparty root directory)",
+            resolved.display()
+        ));
     }
 
     let default_root = manifest_dir.join("thirdparty");
@@ -224,12 +224,7 @@ fn configure_embedded_jvm_linking(manifest_dir: &Path, out_dir: &Path) -> Result
         server_lib_dir.display()
     );
     println!("cargo:rustc-link-lib=dylib=jvm");
-    if target.contains("apple") || target.contains("darwin") {
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,{}",
-            server_lib_dir.display()
-        );
-    } else if target.contains("linux") {
+    if target.contains("apple") || target.contains("darwin") || target.contains("linux") {
         println!(
             "cargo:rustc-link-arg=-Wl,-rpath,{}",
             server_lib_dir.display()
@@ -321,11 +316,11 @@ fn main() {
 
     let manifest_dir =
         std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    if embedded_jvm_feature_enabled() {
-        if let Err(e) = configure_embedded_jvm_linking(&manifest_dir, &out_dir) {
-            eprintln!("Error: {e}");
-            panic!("embedded iceberg bridge setup failed");
-        }
+    if embedded_jvm_feature_enabled()
+        && let Err(e) = configure_embedded_jvm_linking(&manifest_dir, &out_dir)
+    {
+        eprintln!("Error: {e}");
+        panic!("embedded iceberg bridge setup failed");
     }
     let compat = compat_feature_enabled();
 

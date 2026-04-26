@@ -10,7 +10,7 @@ use std::sync::Arc;
 use sqlparser::ast as sqlast;
 
 use crate::connector::backend::ResolvedTable;
-use crate::connector::iceberg::catalog::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
+use crate::connector::{IcebergCatalogEntry, insert_iceberg_rows};
 use crate::sql::parser::ast::{Expr, GenerateSeriesSelect, Literal};
 use crate::standalone::engine::StandaloneState;
 use crate::standalone::engine::backend_resolver::TargetBackend;

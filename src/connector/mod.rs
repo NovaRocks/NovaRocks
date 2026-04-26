@@ -22,6 +22,30 @@ pub mod schema;
 pub mod starrocks;
 
 pub(crate) use backend::{CatalogBackend, MvBackend, TableSink, TableSource};
+pub(crate) use iceberg::catalog::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
+pub(crate) use iceberg::catalog::{
+    IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
+    namespace_exists as iceberg_namespace_exists,
+    register_existing_table as register_existing_iceberg_table,
+};
+#[cfg(test)]
+pub(crate) use iceberg::catalog::{
+    load_table as load_iceberg_table, plan_append_delta as plan_iceberg_append_delta,
+};
+pub(crate) use starrocks::managed::ddl::truncate_managed_table;
+pub(crate) use starrocks::managed::erase::spawn_erase_worker as spawn_managed_erase_worker;
+#[cfg(test)]
+pub(crate) use starrocks::managed::store::IcebergTableRef;
+pub(crate) use starrocks::managed::store::{
+    MetadataSnapshot, SqliteMetadataStore, StoredIcebergTable,
+};
+pub(crate) use starrocks::managed::txn::{
+    insert_into_managed_lake_table, publish_tablets_at_version,
+};
+pub(crate) use starrocks::managed::{
+    ManagedLakeCatalog, ManagedLakeConfig, reconcile_on_open as reconcile_managed_on_open,
+    register_managed_tables_in_catalog, runtime_registered,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -132,6 +156,37 @@ impl ConnectorRegistry {
         };
         connector.create_scan_node(cfg)
     }
+}
+
+pub(crate) fn register_standalone_backends(
+    state: &Arc<crate::standalone::engine::StandaloneState>,
+) {
+    let mut connectors = state
+        .connectors
+        .write()
+        .expect("standalone connector registry write lock");
+    let iceberg_catalogs = Arc::clone(&state.iceberg_catalogs);
+    connectors.register_catalog_backend(Arc::new(iceberg::catalog::IcebergCatalogBackend::new(
+        Arc::clone(&iceberg_catalogs),
+    )));
+    connectors.register_table_source(Arc::new(iceberg::catalog::IcebergTableSource::new(
+        Arc::clone(&iceberg_catalogs),
+    )));
+    connectors.register_table_sink(Arc::new(iceberg::catalog::IcebergTableSink::new(
+        iceberg_catalogs,
+    )));
+
+    connectors
+        .register_catalog_backend(Arc::new(starrocks::managed::ManagedLakeBackend::new(state)));
+    connectors.register_table_source(Arc::new(starrocks::managed::ManagedLakeTableSource::new(
+        state,
+    )));
+    connectors.register_table_sink(Arc::new(starrocks::managed::ManagedLakeTableSink::new(
+        state,
+    )));
+    connectors.register_mv_backend(Arc::new(starrocks::managed::ManagedLakeMvBackend::new(
+        state,
+    )));
 }
 
 impl Default for ConnectorRegistry {

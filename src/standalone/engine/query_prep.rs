@@ -6,10 +6,62 @@ use std::sync::Arc;
 use crate::sql::catalog::TableDef;
 use crate::sql::parser::ast::ObjectName;
 use crate::standalone::engine::StandaloneState;
+use crate::standalone::engine::StatementResult;
 use crate::standalone::engine::backend_resolver::resolve_table_target;
+use crate::standalone::engine::build_string_query_result;
 use crate::standalone::engine::sqlparse::statement::{
-    extract_table_names_from_query, extract_three_part_table_refs,
+    extract_table_names_from_query, extract_three_part_table_refs, parse_add_files_sql,
 };
+
+pub(crate) fn add_files(
+    state: &Arc<StandaloneState>,
+    sql: &str,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> Result<StatementResult, String> {
+    let (table_parts, s3_path) = parse_add_files_sql(sql)?;
+
+    let (catalog_name, namespace, table_name) = match table_parts.len() {
+        1 => {
+            let cat =
+                current_catalog.ok_or("ADD FILES requires a catalog context (use SET catalog)")?;
+            (
+                cat.to_string(),
+                current_database.to_string(),
+                table_parts[0].clone(),
+            )
+        }
+        2 => {
+            let cat = current_catalog.ok_or("ADD FILES requires a catalog context")?;
+            (
+                cat.to_string(),
+                table_parts[0].clone(),
+                table_parts[1].clone(),
+            )
+        }
+        3 => (
+            table_parts[0].clone(),
+            table_parts[1].clone(),
+            table_parts[2].clone(),
+        ),
+        _ => return Err("invalid table name in ADD FILES".to_string()),
+    };
+
+    let guard = state
+        .iceberg_catalogs
+        .read()
+        .expect("iceberg catalog read lock");
+    let entry = guard.get(&catalog_name)?;
+    drop(guard);
+    let count = crate::connector::iceberg::catalog::add_files::add_files(
+        &entry,
+        &namespace,
+        &table_name,
+        &s3_path,
+    )?;
+    let msg = format!("Added {count} file(s)");
+    build_string_query_result("status", vec![msg]).map(StatementResult::Query)
+}
 
 pub(crate) fn register_external_tables_for_query(
     state: &Arc<StandaloneState>,

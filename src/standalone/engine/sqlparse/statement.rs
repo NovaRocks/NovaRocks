@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use crate::connector::starrocks::managed::ddl::truncate_managed_table as truncate_managed_lake_table;
+use crate::connector::truncate_managed_table as truncate_managed_lake_table;
 use crate::sql::parser::ast::{
     CreateTableKind, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
 };
