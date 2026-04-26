@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
+use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::parser::ast::{ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
 
@@ -25,6 +26,85 @@ const DEFAULT_MANAGED_BUCKET_COUNT: u32 = 1;
 const SHORT_KEY_MAX_COLUMN_COUNT: usize = 3;
 /// Mirrors StarRocks `SHORTKEY_MAXSIZE_BYTES`: at most 36 bytes in the short-key.
 const SHORT_KEY_MAX_SIZE_BYTES: usize = 36;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManagedPhysicalColumn {
+    pub(crate) column: TableColumnDef,
+    pub(crate) visible: bool,
+    pub(crate) is_key: bool,
+}
+
+pub(crate) fn managed_physical_column(
+    name: String,
+    data_type: SqlType,
+    nullable: bool,
+    visible: bool,
+    is_key: bool,
+) -> ManagedPhysicalColumn {
+    ManagedPhysicalColumn {
+        column: TableColumnDef {
+            name,
+            data_type,
+            nullable,
+            aggregation: None,
+        },
+        visible,
+        is_key,
+    }
+}
+
+pub(crate) fn table_columns_from_physical_columns(
+    columns: &[ManagedPhysicalColumn],
+) -> Vec<TableColumnDef> {
+    columns.iter().map(|column| column.column.clone()).collect()
+}
+
+pub(crate) fn stored_columns_from_physical_columns(
+    schema_id: i64,
+    key_desc: &TableKeyDesc,
+    columns: &[ManagedPhysicalColumn],
+) -> Vec<StoredManagedColumn> {
+    let key_column_set = key_desc
+        .columns
+        .iter()
+        .map(|column| normalize_identifier(column).unwrap_or_else(|_| column.to_ascii_lowercase()))
+        .collect::<HashSet<_>>();
+    columns
+        .iter()
+        .enumerate()
+        .map(|(ordinal, physical)| {
+            let column_name = normalize_identifier(&physical.column.name)
+                .unwrap_or_else(|_| physical.column.name.to_ascii_lowercase());
+            StoredManagedColumn {
+                schema_id,
+                ordinal: ordinal as i64,
+                is_key: physical.is_key || key_column_set.contains(&column_name),
+                column_name,
+                logical_type: logical_type_name(&physical.column.data_type),
+                nullable: physical.column.nullable,
+                visible: physical.visible,
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn patch_tablet_schema_column_flags(
+    schema: &mut crate::service::grpc_client::proto::starrocks::TabletSchemaPb,
+    columns: &[ManagedPhysicalColumn],
+) -> Result<(), String> {
+    if schema.column.len() != columns.len() {
+        return Err(format!(
+            "managed tablet schema column count mismatch: schema_columns={} physical_columns={}",
+            schema.column.len(),
+            columns.len()
+        ));
+    }
+    for (schema_column, physical_column) in schema.column.iter_mut().zip(columns.iter()) {
+        schema_column.visible = Some(physical_column.visible);
+        schema_column.is_key = Some(physical_column.is_key);
+    }
+    Ok(())
+}
 
 pub(crate) fn create_managed_table(
     state: &StandaloneState,
@@ -89,13 +169,25 @@ pub(crate) fn create_managed_table(
     let partition_id = alloc_id(&mut snapshot.global.next_partition_id);
     let index_id = alloc_id(&mut snapshot.global.next_index_id);
 
-    let request_schema = build_tablet_schema(columns, &defaults.key_desc, schema_id)?;
     let key_column_set = defaults
         .key_desc
         .columns
         .iter()
         .map(|column| normalize_identifier(column))
         .collect::<Result<HashSet<_>, _>>()?;
+    let physical_columns = columns
+        .iter()
+        .map(|column| {
+            let column_name = normalize_identifier(&column.name)?;
+            Ok(ManagedPhysicalColumn {
+                column: column.clone(),
+                visible: true,
+                is_key: key_column_set.contains(&column_name),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let request_columns = table_columns_from_physical_columns(&physical_columns);
+    let request_schema = build_tablet_schema(&request_columns, &defaults.key_desc, schema_id)?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
     for bucket_seq in 0..defaults.bucket_num {
@@ -130,7 +222,12 @@ pub(crate) fn create_managed_table(
             flat_json_config: None,
             compaction_strategy: None,
         };
-        create_lake_tablet_from_req(&request, &tablet_root_path, Some(managed_config.s3.clone()))?;
+        create_lake_tablet_from_req_with_schema_patch(
+            &request,
+            &tablet_root_path,
+            Some(managed_config.s3.clone()),
+            |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
+        )?;
         let runtime_schema = get_tablet_runtime(tablet_id)?.schema;
         let loaded =
             load_tablet_snapshot(tablet_id, 1, &tablet_root_path, Some(&object_store_profile))?;
@@ -168,19 +265,11 @@ pub(crate) fn create_managed_table(
     });
     snapshot
         .columns
-        .extend(columns.iter().enumerate().map(|(ordinal, column)| {
-            let column_name = normalize_identifier(&column.name)
-                .unwrap_or_else(|_| column.name.to_ascii_lowercase());
-            StoredManagedColumn {
-                schema_id,
-                ordinal: ordinal as i64,
-                is_key: key_column_set.contains(&column_name),
-                column_name,
-                logical_type: logical_type_name(&column.data_type),
-                nullable: column.nullable,
-                visible: true,
-            }
-        }));
+        .extend(stored_columns_from_physical_columns(
+            schema_id,
+            &defaults.key_desc,
+            &physical_columns,
+        ));
     snapshot.partitions.push(StoredManagedPartition {
         partition_id,
         table_id,
@@ -1182,8 +1271,9 @@ mod tests {
 
     use super::{
         build_tablet_schema, choose_default_dup_key_columns, drop_managed_table,
-        request_schema_from_runtime, resolve_managed_create_defaults,
-        truncate_managed_table_with_hooks,
+        managed_physical_column, patch_tablet_schema_column_flags, request_schema_from_runtime,
+        resolve_managed_create_defaults, stored_columns_from_physical_columns,
+        table_columns_from_physical_columns, truncate_managed_table_with_hooks,
     };
 
     fn test_managed_config() -> ManagedLakeConfig {
@@ -1511,6 +1601,68 @@ mod tests {
         assert_eq!(request_schema.columns[1].column_name, "__hidden");
         assert_eq!(request_schema.columns[1].is_key, Some(false));
         assert_eq!(request_schema.short_key_column_count, 1);
+    }
+
+    #[test]
+    fn physical_column_helpers_preserve_visibility_and_key_flags() {
+        let physical_columns = vec![
+            managed_physical_column("k1".to_string(), SqlType::Int, false, true, false),
+            managed_physical_column("__sum_v1".to_string(), SqlType::BigInt, true, false, false),
+        ];
+        let key_desc = TableKeyDesc {
+            kind: TableKeyKind::Duplicate,
+            columns: vec!["k1".to_string()],
+        };
+
+        let table_columns = table_columns_from_physical_columns(&physical_columns);
+        assert_eq!(table_columns.len(), 2);
+        assert_eq!(table_columns[1].name, "__sum_v1");
+
+        let stored = stored_columns_from_physical_columns(100, &key_desc, &physical_columns);
+        assert_eq!(stored.len(), 2);
+        assert!(stored[0].is_key, "key_desc should mark k1 as key");
+        assert!(stored[0].visible);
+        assert!(!stored[1].is_key);
+        assert!(!stored[1].visible);
+
+        let patch_columns = vec![
+            managed_physical_column("k1".to_string(), SqlType::Int, false, true, true),
+            managed_physical_column("__sum_v1".to_string(), SqlType::BigInt, true, false, false),
+        ];
+        let mut tablet_schema = crate::service::grpc_client::proto::starrocks::TabletSchemaPb {
+            column: vec![
+                crate::service::grpc_client::proto::starrocks::ColumnPb::default(),
+                crate::service::grpc_client::proto::starrocks::ColumnPb::default(),
+            ],
+            ..Default::default()
+        };
+        patch_tablet_schema_column_flags(&mut tablet_schema, &patch_columns)
+            .expect("patch tablet schema flags");
+
+        assert_eq!(tablet_schema.column[0].visible, Some(true));
+        assert_eq!(tablet_schema.column[0].is_key, Some(true));
+        assert_eq!(tablet_schema.column[1].visible, Some(false));
+        assert_eq!(tablet_schema.column[1].is_key, Some(false));
+    }
+
+    #[test]
+    fn patch_tablet_schema_column_flags_rejects_column_count_mismatch() {
+        let patch_columns = vec![managed_physical_column(
+            "k1".to_string(),
+            SqlType::Int,
+            false,
+            true,
+            true,
+        )];
+        let mut tablet_schema = crate::service::grpc_client::proto::starrocks::TabletSchemaPb {
+            column: Vec::new(),
+            ..Default::default()
+        };
+
+        let err = patch_tablet_schema_column_flags(&mut tablet_schema, &patch_columns)
+            .expect_err("column count mismatch should fail");
+
+        assert!(err.contains("managed tablet schema column count mismatch"));
     }
 
     #[test]

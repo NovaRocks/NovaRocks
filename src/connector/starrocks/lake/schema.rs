@@ -197,6 +197,18 @@ pub(crate) fn create_lake_tablet_from_req(
     tablet_root_path: &str,
     s3_config: Option<S3StoreConfig>,
 ) -> Result<(), String> {
+    create_lake_tablet_from_req_with_schema_patch(request, tablet_root_path, s3_config, |_| Ok(()))
+}
+
+pub(crate) fn create_lake_tablet_from_req_with_schema_patch<P>(
+    request: &crate::agent_service::TCreateTabletReq,
+    tablet_root_path: &str,
+    s3_config: Option<S3StoreConfig>,
+    patch: P,
+) -> Result<(), String>
+where
+    P: FnOnce(&mut TabletSchemaPb) -> Result<(), String>,
+{
     let tablet_id = request.tablet_id;
     if tablet_id <= 0 {
         return Err(format!(
@@ -204,7 +216,8 @@ pub(crate) fn create_lake_tablet_from_req(
         ));
     }
 
-    let tablet_schema = build_create_tablet_schema(request)?;
+    let mut tablet_schema = build_create_tablet_schema(request)?;
+    patch(&mut tablet_schema)?;
     let runtime_ctx = TabletWriteContext {
         db_id: 0,
         table_id: request.table_id.unwrap_or(0),

@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
+use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
@@ -26,13 +27,15 @@ use crate::connector::starrocks::managed::catalog::{
 };
 use crate::connector::starrocks::managed::ddl::{
     build_create_tablet_request, build_tablet_schema, initialize_global_meta_if_needed,
-    keys_type_name, logical_type_name, reclaim_dropping_table_for_reuse,
+    keys_type_name, managed_physical_column, patch_tablet_schema_column_flags,
+    reclaim_dropping_table_for_reuse, stored_columns_from_physical_columns,
+    table_columns_from_physical_columns,
 };
 use crate::connector::starrocks::managed::store::{
     IcebergTableRef, ManagedMvRefreshMode, ManagedPartitionState, ManagedTableKind,
-    ManagedTableState, ManagedTxnState, StoredManagedColumn, StoredManagedIndex,
-    StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
-    StoredManagedTxn, StoredMaterializedView,
+    ManagedTableState, ManagedTxnState, StoredManagedIndex, StoredManagedPartition,
+    StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
+    StoredMaterializedView,
 };
 use crate::standalone::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
@@ -166,12 +169,26 @@ pub(crate) fn create_mv(
         return Err("CREATE MATERIALIZED VIEW requires BUCKETS > 0".to_string());
     }
 
-    let request_schema = build_tablet_schema(&table_columns, &key_desc, schema_id)?;
     let key_column_set = key_desc
         .columns
         .iter()
         .map(|column| normalize_identifier(column))
         .collect::<Result<HashSet<_>, _>>()?;
+    let physical_columns = table_columns
+        .iter()
+        .map(|column| {
+            let column_name = normalize_identifier(&column.name)?;
+            Ok(managed_physical_column(
+                column.name.clone(),
+                column.data_type.clone(),
+                column.nullable,
+                true,
+                key_column_set.contains(&column_name),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let request_columns = table_columns_from_physical_columns(&physical_columns);
+    let request_schema = build_tablet_schema(&request_columns, &key_desc, schema_id)?;
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
     let mut tablets = Vec::new();
     for bucket_seq in 0..bucket_num {
@@ -180,10 +197,11 @@ pub(crate) fn create_mv(
             managed_config.tablet_root_path(database.db_id, table_id, partition_id);
         let request =
             build_create_tablet_request(tablet_id, table_id, partition_id, request_schema.clone());
-        crate::connector::starrocks::lake::schema::create_lake_tablet_from_req(
+        create_lake_tablet_from_req_with_schema_patch(
             &request,
             &tablet_root_path,
             Some(managed_config.s3.clone()),
+            |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
         )?;
         let runtime_schema = get_tablet_runtime(tablet_id)?.schema;
         let loaded =
@@ -222,19 +240,11 @@ pub(crate) fn create_mv(
     });
     snapshot
         .columns
-        .extend(table_columns.iter().enumerate().map(|(ordinal, column)| {
-            let column_name = normalize_identifier(&column.name)
-                .unwrap_or_else(|_| column.name.to_ascii_lowercase());
-            StoredManagedColumn {
-                schema_id,
-                ordinal: ordinal as i64,
-                is_key: key_column_set.contains(&column_name),
-                column_name,
-                logical_type: logical_type_name(&column.data_type),
-                nullable: column.nullable,
-                visible: true,
-            }
-        }));
+        .extend(stored_columns_from_physical_columns(
+            schema_id,
+            &key_desc,
+            &physical_columns,
+        ));
     snapshot.partitions.push(StoredManagedPartition {
         partition_id,
         table_id,
