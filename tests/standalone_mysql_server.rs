@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,17 +49,23 @@ fn alloc_port() -> u16 {
 
 struct ServerGuard {
     child: Child,
+    _lock: MutexGuard<'static, ()>,
 }
+
+static STANDALONE_SERVER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 impl ServerGuard {
     fn spawn(args: &[String]) -> Self {
+        let lock = STANDALONE_SERVER_TEST_LOCK
+            .lock()
+            .expect("standalone server test lock");
         let child = Command::new(env!("CARGO_BIN_EXE_novarocks"))
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn standalone-server");
-        Self { child }
+        Self { child, _lock: lock }
     }
 
     fn connect_root(&mut self, port: u16) -> MysqlConn {
@@ -417,8 +423,8 @@ fn standalone_mysql_server_rejects_wrong_auth_and_unsupported_sql() {
     let mut conn = server.connect_root(port);
 
     let err = conn
-        .query_drop("show tables")
-        .expect_err("show tables must fail");
+        .query_drop("grant select on tbl to root")
+        .expect_err("grant must fail");
     let err_text = err.to_string();
     assert!(
         err_text.to_ascii_lowercase().contains("unsupported"),
