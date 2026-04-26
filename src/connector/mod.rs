@@ -21,10 +21,7 @@ pub mod jdbc;
 pub mod schema;
 pub mod starrocks;
 
-pub(crate) use backend::{
-    CatalogBackend, CreateTableRequest, MvBackend, NoMvBackend, ResolvedTable, TableSink,
-    TableSource,
-};
+pub(crate) use backend::{CatalogBackend, MvBackend, TableSink, TableSource};
 
 use std::collections::HashMap;
 use std::sync::Arc;
