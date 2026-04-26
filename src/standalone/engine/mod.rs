@@ -38,13 +38,13 @@ pub(crate) mod insert_flow;
 pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
+pub(crate) mod query_prep;
 pub(crate) mod sqlparse;
 pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
-use self::parquet::write_parquet_to_path;
 #[cfg(test)]
 use self::sqlparse::expr::sql_type_to_arrow_type;
 #[cfg(test)]
@@ -54,9 +54,8 @@ use self::sqlparse::statement::{
     convert_sqlparser_insert_to_custom, execute_create_database_statement,
     execute_create_table_statement, execute_drop_catalog_statement,
     execute_drop_database_statement, execute_drop_table_statement, execute_insert_statement,
-    execute_truncate_table_statement, extract_table_names_from_query,
-    extract_three_part_table_refs, looks_like_add_files, parse_add_files_sql,
-    strip_catalog_from_three_part_names,
+    execute_truncate_table_statement, extract_three_part_table_refs, looks_like_add_files,
+    parse_add_files_sql, strip_catalog_from_three_part_names,
 };
 use self::stream_load::{
     parse_csv_stream_load_rows, parse_json_stream_load_rows, parse_stream_load_columns,
@@ -803,7 +802,12 @@ pub(crate) fn register_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    register_iceberg_tables_for_query_impl(state, current_catalog, current_database, query, false)
+    crate::standalone::engine::query_prep::register_external_tables_for_query(
+        state,
+        current_catalog,
+        current_database,
+        query,
+    )
 }
 
 fn refresh_iceberg_tables_for_query(
@@ -812,167 +816,12 @@ fn refresh_iceberg_tables_for_query(
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<(), String> {
-    register_iceberg_tables_for_query_impl(state, current_catalog, current_database, query, true)
-}
-
-fn register_empty_iceberg_table(
-    namespace: &str,
-    table_name: &str,
-    columns: &[crate::sql::catalog::ColumnDef],
-) -> Result<TableStorage, String> {
-    let dir = std::env::temp_dir().join("novarocks_iceberg_empty");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create empty dir: {e}"))?;
-    let path = dir.join(format!("{}_{}.parquet", namespace, table_name));
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(
-        columns
-            .iter()
-            .map(|column| {
-                arrow::datatypes::Field::new(
-                    &column.name,
-                    column.data_type.clone(),
-                    column.nullable,
-                )
-            })
-            .collect::<Vec<_>>(),
-    ));
-    let empty_arrays: Vec<arrow::array::ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|field| arrow::array::new_empty_array(field.data_type()))
-        .collect();
-    let empty_batch = RecordBatch::try_new(schema, empty_arrays)
-        .map_err(|e| format!("build empty batch: {e}"))?;
-    write_parquet_to_path(&path, &empty_batch)?;
-    Ok(TableStorage::LocalParquetFile { path })
-}
-
-fn build_iceberg_table_def_with_files(
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
-    data_files: Vec<(String, i64, Option<i64>)>,
-) -> Result<crate::sql::catalog::TableDef, String> {
-    let storage = if entry.is_s3() {
-        let cloud_properties = entry.cloud_properties_map();
-        crate::sql::catalog::TableStorage::S3ParquetFiles {
-            files: data_files
-                .into_iter()
-                .map(|(path, size, row_count)| crate::sql::catalog::S3FileInfo {
-                    path,
-                    size,
-                    row_count,
-                    column_stats: None,
-                })
-                .collect(),
-            cloud_properties,
-        }
-    } else if let Some((first_path, _, _)) = data_files.first() {
-        let local_path = first_path.strip_prefix("file://").unwrap_or(first_path);
-        crate::sql::catalog::TableStorage::LocalParquetFile {
-            path: std::path::PathBuf::from(local_path),
-        }
-    } else {
-        register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
-    };
-
-    Ok(crate::sql::catalog::TableDef {
-        name: table_name.to_string(),
-        columns: loaded.columns,
-        storage,
-    })
-}
-
-pub(crate) fn build_iceberg_table_def_with_files_public(
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
-    data_files: Vec<(String, i64, Option<i64>)>,
-) -> Result<crate::sql::catalog::TableDef, String> {
-    build_iceberg_table_def_with_files(entry, namespace, table_name, loaded, data_files)
-}
-
-fn register_loaded_iceberg_table_with_files(
-    state: &Arc<StandaloneState>,
-    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
-    namespace: &str,
-    table_name: &str,
-    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
-    data_files: Vec<(String, i64, Option<i64>)>,
-) -> Result<(), String> {
-    let table_def =
-        build_iceberg_table_def_with_files(entry, namespace, table_name, loaded, data_files)?;
-    let mut guard = state.catalog.write().expect("catalog write lock");
-    guard.create_database(namespace).ok();
-    guard
-        .register(namespace, table_def)
-        .map_err(|e| format!("register iceberg table: {e}"))?;
-    Ok(())
-}
-
-fn register_iceberg_tables_for_query_impl(
-    state: &Arc<StandaloneState>,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &sqlparser::ast::Query,
-    force_refresh: bool,
-) -> Result<(), String> {
-    let mut targets = if let Some(catalog_name) = current_catalog {
-        extract_table_names_from_query(query)
-            .into_iter()
-            .map(|table_name| {
-                (
-                    catalog_name.to_string(),
-                    current_database.to_string(),
-                    table_name,
-                )
-            })
-            .collect::<Vec<_>>()
-    } else {
-        extract_three_part_table_refs(query)
-    };
-    if targets.is_empty() {
-        return Ok(());
-    }
-    targets.sort();
-    targets.dedup();
-
-    let iceberg_guard = state
-        .iceberg_catalogs
-        .read()
-        .expect("iceberg catalog read lock");
-    for (catalog_name, namespace, table_name) in targets {
-        let entry = match iceberg_guard.get(&catalog_name) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-
-        if !force_refresh {
-            let local = state.catalog.read().expect("catalog read lock");
-            if local.get(&namespace, &table_name).is_ok() {
-                continue;
-            }
-        }
-
-        let loaded =
-            match crate::connector::iceberg::catalog::load_table(&entry, &namespace, &table_name) {
-                Ok(loaded) => loaded,
-                Err(_) => continue,
-            };
-
-        let data_files = crate::connector::iceberg::catalog::extract_data_files(&loaded.table)?;
-        register_loaded_iceberg_table_with_files(
-            state,
-            &entry,
-            &namespace,
-            &table_name,
-            loaded,
-            data_files,
-        )?;
-    }
-
-    Ok(())
+    crate::standalone::engine::query_prep::refresh_external_tables_for_query(
+        state,
+        current_catalog,
+        current_database,
+        query,
+    )
 }
 
 pub(crate) fn execute_query_for_mv_refresh(
@@ -1126,22 +975,26 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
     };
 
     let (catalog_name, namespace, table_name) = validate_incremental_mv_base_ref(&query, base_ref)?;
-    let entry = {
+    let is_s3 = {
         let registry = state
             .iceberg_catalogs
             .read()
             .expect("iceberg registry read lock");
-        registry.get(&catalog_name)?
+        registry.get(&catalog_name)?.is_s3()
     };
-    if !entry.is_s3() && delta_files.len() > 1 {
+    if !is_s3 && delta_files.len() > 1 {
         return Err(
             "incremental MV refresh over local iceberg supports at most one delta file".to_string(),
         );
     }
 
-    let loaded = crate::connector::iceberg::catalog::load_table(&entry, &namespace, &table_name)?;
-    let table_def =
-        build_iceberg_table_def_with_files(&entry, &namespace, &table_name, loaded, delta_files)?;
+    let table_def = crate::standalone::engine::query_prep::build_iceberg_table_def_with_files(
+        state,
+        &catalog_name,
+        &namespace,
+        &table_name,
+        delta_files,
+    )?;
     let mut incremental_catalog = InMemoryCatalog::default();
     incremental_catalog.create_database(&namespace)?;
     incremental_catalog

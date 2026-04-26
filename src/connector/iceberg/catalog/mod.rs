@@ -10,7 +10,9 @@ pub(crate) mod s3_storage;
 // Re-export the same surface the previous `standalone::iceberg::*` module
 // offered, so callers only need to update the module prefix, not each
 // imported symbol.
-pub(crate) use backend::{IcebergCatalogBackend, IcebergTableSink, IcebergTableSource};
+pub(crate) use backend::{
+    IcebergCatalogBackend, IcebergTableSink, IcebergTableSource, build_iceberg_table_def_with_files,
+};
 pub(crate) use registry::{
     DataFileWithStats, IcebergAppendDelta, IcebergCatalogEntry, IcebergCatalogRegistry,
     IcebergLoadedTable, block_on_iceberg, build_hadoop_catalog, build_insert_batch,

@@ -13,7 +13,7 @@ use crate::connector::backend::{
     CatalogBackend, CreateTableRequest, ResolvedTable, TableSink, TableSource,
 };
 use crate::connector::iceberg::catalog::{IcebergLoadedTable, build_insert_batch};
-use crate::sql::catalog::{ColumnDef, TableDef};
+use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
 use crate::sql::parser::ast::Literal;
 use crate::standalone::engine::aggregate::merge_aggregate_table_rows_if_needed;
 use crate::standalone::engine::block_on_standalone_async;
@@ -135,7 +135,7 @@ impl TableSource for IcebergTableSource {
         let entry = guard.get(&table.catalog)?;
         let loaded = reg_load_table(&entry, &table.namespace, &table.table)?;
         let data_files = super::registry::extract_data_files(&loaded.table)?;
-        crate::standalone::engine::build_iceberg_table_def_with_files_public(
+        build_iceberg_table_def_with_files(
             &entry,
             &table.namespace,
             &table.table,
@@ -143,6 +143,77 @@ impl TableSource for IcebergTableSource {
             data_files,
         )
     }
+}
+
+pub(crate) fn build_iceberg_table_def_with_files(
+    entry: &IcebergCatalogEntry,
+    namespace: &str,
+    table_name: &str,
+    loaded: IcebergLoadedTable,
+    data_files: Vec<(String, i64, Option<i64>)>,
+) -> Result<TableDef, String> {
+    let storage = if entry.is_s3() {
+        let cloud_properties = entry.cloud_properties_map();
+        TableStorage::S3ParquetFiles {
+            files: data_files
+                .into_iter()
+                .map(|(path, size, row_count)| S3FileInfo {
+                    path,
+                    size,
+                    row_count,
+                    column_stats: None,
+                })
+                .collect(),
+            cloud_properties,
+        }
+    } else if let Some((first_path, _, _)) = data_files.first() {
+        let local_path = first_path.strip_prefix("file://").unwrap_or(first_path);
+        TableStorage::LocalParquetFile {
+            path: std::path::PathBuf::from(local_path),
+        }
+    } else {
+        register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
+    };
+
+    Ok(TableDef {
+        name: table_name.to_string(),
+        columns: loaded.columns,
+        storage,
+    })
+}
+
+fn register_empty_iceberg_table(
+    namespace: &str,
+    table_name: &str,
+    columns: &[ColumnDef],
+) -> Result<TableStorage, String> {
+    let dir = std::env::temp_dir().join("novarocks_iceberg_empty");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create empty dir: {e}"))?;
+    let path = dir.join(format!("{}_{}.parquet", namespace, table_name));
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>(),
+    ));
+    let empty_arrays: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|field| arrow::array::new_empty_array(field.data_type()))
+        .collect();
+    let empty_batch = RecordBatch::try_new(Arc::clone(&schema), empty_arrays)
+        .map_err(|e| format!("build empty batch: {e}"))?;
+    let file =
+        std::fs::File::create(&path).map_err(|e| format!("create parquet file failed: {e}"))?;
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)
+        .map_err(|e| format!("create parquet writer failed: {e}"))?;
+    writer
+        .write(&empty_batch)
+        .map_err(|e| format!("write parquet batch failed: {e}"))?;
+    writer
+        .close()
+        .map_err(|e| format!("close parquet writer failed: {e}"))?;
+    Ok(TableStorage::LocalParquetFile { path })
 }
 
 pub(crate) struct IcebergTableSink {
