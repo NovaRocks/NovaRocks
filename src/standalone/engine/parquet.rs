@@ -14,7 +14,6 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::sql::catalog::ColumnDef;
-use crate::standalone::engine::iceberg_glue::concat_or_empty_batches;
 
 pub(crate) fn read_local_parquet_data(
     path: &Path,
@@ -42,6 +41,29 @@ pub(crate) fn read_local_parquet_data(
             .collect::<Vec<_>>(),
     ));
     cast_batch_to_schema(&batch, &target_schema)
+}
+
+fn concat_or_empty_batches(
+    columns: &[ColumnDef],
+    batches: Vec<RecordBatch>,
+) -> Result<RecordBatch, String> {
+    if let Some(first) = batches.first() {
+        arrow::compute::concat_batches(&first.schema(), batches.iter())
+            .map_err(|e| format!("concat standalone batches failed: {e}"))
+    } else {
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays = columns
+            .iter()
+            .map(|column| arrow::array::new_empty_array(&column.data_type))
+            .collect::<Vec<_>>();
+        RecordBatch::try_new(schema, arrays)
+            .map_err(|e| format!("build empty standalone batch failed: {e}"))
+    }
 }
 
 /// Normalize `Map` entries so that the `entries` struct field is non-nullable
