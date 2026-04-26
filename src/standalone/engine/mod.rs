@@ -36,6 +36,7 @@ pub(crate) mod catalog;
 pub(crate) mod iceberg_glue;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
+pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
 pub(crate) mod sqlparse;
@@ -779,22 +780,20 @@ pub(crate) fn dispatch_statement(
     current_database: &str,
     statement: crate::sql::parser::ast::Statement,
 ) -> Result<StatementResult, String> {
+    use crate::sql::parser::ast::Statement;
+
     match statement {
-        crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) => {
-            crate::connector::starrocks::managed::mv_ddl::create_mv(state, current_database, &stmt)
+        Statement::CreateMaterializedView(stmt) => {
+            crate::standalone::engine::mv_flow::create_mv(state, current_database, &stmt)
         }
-        crate::sql::parser::ast::Statement::DropMaterializedView(stmt) => {
-            crate::connector::starrocks::managed::mv_ddl::drop_mv(state, current_database, &stmt)
+        Statement::DropMaterializedView(stmt) => {
+            crate::standalone::engine::mv_flow::drop_mv(state, current_database, &stmt)
         }
-        crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) => {
-            crate::connector::starrocks::managed::mv_refresh::refresh_mv(
-                state,
-                current_database,
-                &stmt,
-            )
+        Statement::RefreshMaterializedView(stmt) => {
+            crate::standalone::engine::mv_flow::refresh_mv(state, current_database, &stmt)
         }
-        crate::sql::parser::ast::Statement::ShowMaterializedViews(stmt) => {
-            crate::connector::starrocks::managed::mv_ddl::list_mvs(state, &stmt)
+        Statement::ShowMaterializedViews(stmt) => {
+            crate::standalone::engine::mv_flow::list_mvs(state, &stmt)
         }
     }
 }
@@ -1902,7 +1901,7 @@ fn stream_load_managed_lake_table(
 mod tests {
     use super::{
         StandaloneNovaRocks, StandaloneOptions, StandaloneState, StatementResult,
-        dispatch_statement,
+        dispatch_statement, register_connector_backends,
     };
     use arrow::array::{
         Array, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
@@ -3648,6 +3647,7 @@ enable_path_style_access = true
     #[test]
     fn dispatch_statement_routes_materialized_view_ast_variants() {
         let state = Arc::new(StandaloneState::default());
+        register_connector_backends(&state);
         let err = dispatch_statement(
             &state,
             "analytics",
