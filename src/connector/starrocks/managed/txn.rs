@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, UInt32Array, new_null_array};
+use arrow::array::{new_null_array, ArrayRef, UInt32Array};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
 use crate::connector::starrocks::lake::append_lake_txn_log_with_chunk_rowset;
 use crate::connector::starrocks::lake::context::{
-    PartialUpdateWritePolicy, TabletWriteContext, update_tablet_runtime_schema,
+    update_tablet_runtime_schema, PartialUpdateWritePolicy, TabletWriteContext,
 };
 use crate::connector::starrocks::lake::transactions::publish_version;
 use crate::connector::starrocks::lake::txn_log::append_lake_txn_log_empty_rowset;
@@ -17,17 +17,17 @@ use crate::connector::starrocks::sink::routing::{
 };
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::formats::starrocks::writer::StarRocksWriteFormat;
-use crate::fs::path::{ScanPathScheme, classify_scan_paths};
+use crate::fs::path::{classify_scan_paths, ScanPathScheme};
 use crate::runtime::query_result::QueryResult;
 use crate::runtime::starlet_shard_registry::S3StoreConfig;
 use crate::service::grpc_client::proto::starrocks::{PublishVersionRequest, TabletSchemaPb};
 use crate::sql::parser::ast::{InsertSource, Literal, ObjectName};
 
 use super::catalog::register_managed_table_in_catalog;
-use crate::standalone::engine::catalog::{ColumnDef, normalize_identifier};
+use crate::standalone::engine::catalog::{normalize_identifier, ColumnDef};
 use crate::standalone::engine::{
-    ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
-    execute_query, insert_generate_series_rows_local, reorder_insert_rows,
+    build_local_insert_batch, execute_query, insert_generate_series_rows_local,
+    reorder_insert_rows, ResolvedLocalTableName, StandaloneState, StatementResult,
 };
 
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
@@ -159,6 +159,12 @@ pub(crate) struct ManagedInsertPlan {
     pub(crate) tablets: Vec<ManagedInsertTablet>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedInsertColumnMode {
+    VisibleOnly,
+    Physical,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedInsertTablet {
     pub(crate) tablet_id: i64,
@@ -176,6 +182,28 @@ pub(crate) fn load_insert_plan(
     state: &Arc<StandaloneState>,
     resolved: &ResolvedLocalTableName,
     target: PartitionTarget,
+) -> Result<ManagedInsertPlan, String> {
+    load_insert_plan_with_column_mode(
+        state,
+        resolved,
+        target,
+        ManagedInsertColumnMode::VisibleOnly,
+    )
+}
+
+pub(crate) fn load_physical_insert_plan(
+    state: &Arc<StandaloneState>,
+    resolved: &ResolvedLocalTableName,
+    target: PartitionTarget,
+) -> Result<ManagedInsertPlan, String> {
+    load_insert_plan_with_column_mode(state, resolved, target, ManagedInsertColumnMode::Physical)
+}
+
+fn load_insert_plan_with_column_mode(
+    state: &Arc<StandaloneState>,
+    resolved: &ResolvedLocalTableName,
+    target: PartitionTarget,
+    column_mode: ManagedInsertColumnMode,
 ) -> Result<ManagedInsertPlan, String> {
     let guard = state
         .managed_lake
@@ -274,9 +302,24 @@ pub(crate) fn load_insert_plan(
     }
     tablets.sort_by_key(|tablet| tablet.bucket_seq);
 
-    let columns = derive_column_defs(state, &resolved.database, &resolved.table)?;
-    let distributed_slot_ids = derive_distributed_slot_ids(&runtime.tablet_schema, &columns)?;
+    let columns = derive_column_defs_from_runtime(runtime, column_mode)?;
+    let distributed_slot_ids = derive_distributed_slot_ids(
+        &columns,
+        runtime
+            .columns
+            .iter()
+            .filter(|column| column_mode == ManagedInsertColumnMode::Physical || column.visible),
+    );
     if distributed_slot_ids.is_empty() {
+        if column_mode == ManagedInsertColumnMode::VisibleOnly
+            && has_persisted_key_columns(runtime)
+            && !selected_columns_include_persisted_key(&columns, runtime)
+        {
+            return Err(format!(
+                "managed table {}.{} distribution key columns are hidden in visible insert mode; use physical insert plan",
+                resolved.database, resolved.table
+            ));
+        }
         return Err(format!(
             "managed table {}.{} has no distribution key columns",
             resolved.database, resolved.table
@@ -426,35 +469,79 @@ fn chunks_total_rows(chunks: &[Chunk]) -> Result<i64, String> {
     })
 }
 
-fn derive_column_defs(
-    state: &Arc<StandaloneState>,
-    database: &str,
-    table: &str,
+fn derive_column_defs_from_runtime(
+    runtime: &super::catalog::ManagedTableRuntime,
+    mode: ManagedInsertColumnMode,
 ) -> Result<Vec<ColumnDef>, String> {
-    let catalog = state.catalog.read().expect("standalone catalog read lock");
-    Ok(catalog.get(database, table)?.columns)
+    runtime
+        .columns
+        .iter()
+        .filter(|column| mode == ManagedInsertColumnMode::Physical || column.visible)
+        .map(|column| {
+            let schema_column = runtime
+                .tablet_schema
+                .column
+                .iter()
+                .find(|schema_column| {
+                    schema_column
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&column.column_name))
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "managed table {}.{} is missing tablet schema column `{}`",
+                        runtime.database_name, runtime.table.name, column.column_name
+                    )
+                })?;
+            Ok(ColumnDef {
+                name: column.column_name.clone(),
+                data_type:
+                    crate::connector::starrocks::managed::catalog::arrow_type_from_tablet_column(
+                        schema_column,
+                    )?,
+                nullable: column.nullable,
+            })
+        })
+        .collect()
 }
 
-fn derive_distributed_slot_ids(
-    tablet_schema: &TabletSchemaPb,
+fn derive_distributed_slot_ids<'a>(
     columns: &[ColumnDef],
-) -> Result<Vec<SlotId>, String> {
+    stored_columns: impl IntoIterator<Item = &'a super::store::StoredManagedColumn>,
+) -> Vec<SlotId> {
     let mut slot_ids = Vec::new();
-    for column in &tablet_schema.column {
-        if column.is_key != Some(true) {
+    for column in stored_columns {
+        if !column.is_key {
             continue;
         }
-        let Some(name) = column.name.as_deref() else {
-            continue;
-        };
-        let lowered = name.to_ascii_lowercase();
-        let idx = columns
+        if let Some(idx) = columns
             .iter()
-            .position(|col| col.name.eq_ignore_ascii_case(&lowered))
-            .ok_or_else(|| format!("distribution key `{name}` not found in logical column list"))?;
-        slot_ids.push(SlotId::new(idx as u32 + 1));
+            .position(|col| col.name.eq_ignore_ascii_case(&column.column_name))
+        {
+            slot_ids.push(SlotId::new(idx as u32 + 1));
+        }
     }
-    Ok(slot_ids)
+    slot_ids
+}
+
+fn has_persisted_key_columns(runtime: &super::catalog::ManagedTableRuntime) -> bool {
+    runtime.columns.iter().any(|column| column.is_key)
+}
+
+fn selected_columns_include_persisted_key(
+    columns: &[ColumnDef],
+    runtime: &super::catalog::ManagedTableRuntime,
+) -> bool {
+    runtime
+        .columns
+        .iter()
+        .filter(|column| column.is_key)
+        .any(|key_column| {
+            columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(&key_column.column_name))
+        })
 }
 
 fn build_chunk_for_insert(batch: RecordBatch, num_columns: usize) -> Result<Chunk, String> {
@@ -901,7 +988,7 @@ mod mv_target_tests {
     use super::*;
 
     use crate::connector::starrocks::lake::context::{
-        TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
+        lock_runtime_test_state, register_tablet_runtime, TabletWriteContext,
     };
     use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
     use crate::connector::starrocks::managed::store::{
@@ -911,7 +998,7 @@ mod mv_target_tests {
         StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
     use crate::connector::starrocks::managed::{
-        ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
+        register_managed_tables_in_catalog, ManagedLakeCatalog, ManagedLakeConfig,
     };
     use crate::formats::starrocks::writer::bundle_meta::{
         empty_tablet_metadata, write_bundle_meta_file,
@@ -952,6 +1039,89 @@ mod mv_target_tests {
                 .collect::<Vec<_>>(),
             vec![41, 42],
         );
+    }
+
+    #[test]
+    fn insert_plan_column_modes_split_visible_and_physical_columns() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_hidden_physical_column_mv();
+        let resolved = ResolvedLocalTableName {
+            database: "analytics".to_string(),
+            table: "orders_mv".to_string(),
+        };
+
+        let visible_plan =
+            load_insert_plan(&fixture.state, &resolved, PartitionTarget::Active).expect("plan");
+        assert_eq!(
+            visible_plan
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k1", "total"],
+        );
+        assert_eq!(visible_plan.distributed_slot_ids, vec![SlotId::new(1)]);
+
+        let physical_plan =
+            load_physical_insert_plan(&fixture.state, &resolved, PartitionTarget::Active)
+                .expect("physical plan");
+        assert_eq!(
+            physical_plan
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k1", "total", "__nr_shadow_total"],
+        );
+        assert_eq!(
+            physical_plan.distributed_slot_ids,
+            vec![SlotId::new(1), SlotId::new(3)],
+        );
+
+        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
+        let prepared = metadata_store
+            .prepare_txn(
+                physical_plan.table_id,
+                physical_plan.partition_id,
+                physical_plan.base_version,
+            )
+            .expect("prepare txn");
+        let chunk = physical_hidden_key_chunk(&[1, 2, 3], &[101, 102, 103]);
+        let mut next_file_seq = 0_u64;
+        let written_tablet_ids = write_routed_chunks(
+            &fixture.state,
+            &physical_plan,
+            &chunk,
+            prepared.txn_id,
+            &mut next_file_seq,
+        )
+        .expect("write physical chunk");
+        assert!(!written_tablet_ids.is_empty());
+        assert!(written_tablet_ids
+            .iter()
+            .all(|tablet_id| *tablet_id == 40 || *tablet_id == 43));
+    }
+
+    #[test]
+    fn visible_insert_plan_reports_hidden_distribution_keys() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_hidden_only_key_mv();
+        let resolved = ResolvedLocalTableName {
+            database: "analytics".to_string(),
+            table: "orders_mv".to_string(),
+        };
+
+        let err =
+            load_insert_plan(&fixture.state, &resolved, PartitionTarget::Active).expect_err("err");
+        assert_eq!(
+            err,
+            "managed table analytics.orders_mv distribution key columns are hidden in visible insert mode; use physical insert plan",
+        );
+
+        let physical_plan =
+            load_physical_insert_plan(&fixture.state, &resolved, PartitionTarget::Active)
+                .expect("physical plan");
+        assert_eq!(physical_plan.distributed_slot_ids, vec![SlotId::new(3)]);
     }
 
     #[test]
@@ -1107,17 +1277,49 @@ mod mv_target_tests {
     }
 
     fn seed_state_with_staged_mv() -> MvTestFixture {
-        seed_state_with_mv_fixture(false, MvFixtureStorage::Local).expect("local fixture")
+        seed_state_with_mv_fixture(
+            false,
+            MvFixtureStorage::Local,
+            MvFixtureKeyLayout::VisibleOnly,
+        )
+        .expect("local fixture")
     }
 
     fn seed_state_with_active_mv() -> MvTestFixture {
-        seed_state_with_mv_fixture(true, MvFixtureStorage::Local).expect("local fixture")
+        seed_state_with_mv_fixture(
+            true,
+            MvFixtureStorage::Local,
+            MvFixtureKeyLayout::VisibleOnly,
+        )
+        .expect("local fixture")
+    }
+
+    fn seed_state_with_hidden_physical_column_mv() -> MvTestFixture {
+        seed_state_with_mv_fixture(
+            true,
+            MvFixtureStorage::Local,
+            MvFixtureKeyLayout::VisibleAndHidden,
+        )
+        .expect("local fixture")
+    }
+
+    fn seed_state_with_hidden_only_key_mv() -> MvTestFixture {
+        seed_state_with_mv_fixture(
+            true,
+            MvFixtureStorage::Local,
+            MvFixtureKeyLayout::HiddenOnly,
+        )
+        .expect("local fixture")
     }
 
     fn seed_state_with_active_mv_on_object_store(
         config: ManagedLakeConfig,
     ) -> Result<MvTestFixture, String> {
-        seed_state_with_mv_fixture(true, MvFixtureStorage::ObjectStore(config))
+        seed_state_with_mv_fixture(
+            true,
+            MvFixtureStorage::ObjectStore(config),
+            MvFixtureKeyLayout::VisibleOnly,
+        )
     }
 
     enum MvFixtureStorage {
@@ -1125,9 +1327,17 @@ mod mv_target_tests {
         ObjectStore(ManagedLakeConfig),
     }
 
+    #[derive(Clone, Copy)]
+    enum MvFixtureKeyLayout {
+        VisibleOnly,
+        VisibleAndHidden,
+        HiddenOnly,
+    }
+
     fn seed_state_with_mv_fixture(
         active_mv_metadata: bool,
         storage: MvFixtureStorage,
+        key_layout: MvFixtureKeyLayout,
     ) -> Result<MvTestFixture, String> {
         let metadata_dir =
             tempfile::tempdir().map_err(|e| format!("create tempdir failed: {e}"))?;
@@ -1164,7 +1374,7 @@ mod mv_target_tests {
             }
         };
 
-        let tablet_schema = TabletSchemaPb {
+        let mut tablet_schema = TabletSchemaPb {
             keys_type: Some(KeysType::DupKeys as i32),
             column: vec![
                 ColumnPb {
@@ -1194,6 +1404,63 @@ mod mv_target_tests {
             id: Some(100),
             ..Default::default()
         };
+        let include_hidden_physical_column = matches!(
+            key_layout,
+            MvFixtureKeyLayout::VisibleAndHidden | MvFixtureKeyLayout::HiddenOnly
+        );
+        let visible_key = matches!(
+            key_layout,
+            MvFixtureKeyLayout::VisibleOnly | MvFixtureKeyLayout::VisibleAndHidden
+        );
+        let hidden_key = include_hidden_physical_column;
+
+        if include_hidden_physical_column {
+            tablet_schema.column[0].is_key = Some(false);
+            tablet_schema.column.push(ColumnPb {
+                unique_id: 3,
+                name: Some("__nr_shadow_total".to_string()),
+                r#type: "BIGINT".to_string(),
+                is_nullable: Some(true),
+                is_key: Some(false),
+                visible: Some(false),
+                ..Default::default()
+            });
+            tablet_schema.next_column_unique_id = Some(4);
+        }
+
+        let mut columns = vec![
+            crate::connector::starrocks::managed::store::StoredManagedColumn {
+                schema_id: 100,
+                ordinal: 0,
+                column_name: "k1".to_string(),
+                logical_type: "INT".to_string(),
+                nullable: false,
+                visible: true,
+                is_key: visible_key,
+            },
+            crate::connector::starrocks::managed::store::StoredManagedColumn {
+                schema_id: 100,
+                ordinal: 1,
+                column_name: "total".to_string(),
+                logical_type: "BIGINT".to_string(),
+                nullable: true,
+                visible: true,
+                is_key: false,
+            },
+        ];
+        if include_hidden_physical_column {
+            columns.push(
+                crate::connector::starrocks::managed::store::StoredManagedColumn {
+                    schema_id: 100,
+                    ordinal: 2,
+                    column_name: "__nr_shadow_total".to_string(),
+                    logical_type: "BIGINT".to_string(),
+                    nullable: true,
+                    visible: false,
+                    is_key: hidden_key,
+                },
+            );
+        }
 
         let snapshot = ManagedSnapshot {
             global: ManagedGlobalMeta {
@@ -1225,26 +1492,7 @@ mod mv_target_tests {
                 schema_version: 0,
                 tablet_schema_pb: tablet_schema.encode_to_vec(),
             }],
-            columns: vec![
-                crate::connector::starrocks::managed::store::StoredManagedColumn {
-                    schema_id: 100,
-                    ordinal: 0,
-                    column_name: "k1".to_string(),
-                    logical_type: "INT".to_string(),
-                    nullable: false,
-                    visible: true,
-                    is_key: false,
-                },
-                crate::connector::starrocks::managed::store::StoredManagedColumn {
-                    schema_id: 100,
-                    ordinal: 1,
-                    column_name: "total".to_string(),
-                    logical_type: "BIGINT".to_string(),
-                    nullable: true,
-                    visible: true,
-                    is_key: false,
-                },
-            ],
+            columns,
             partitions: vec![
                 StoredManagedPartition {
                     partition_id: 20,
@@ -1469,6 +1717,30 @@ mod mv_target_tests {
         let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
             &[SlotId::new(1), SlotId::new(2)],
+        )
+        .expect("chunk schema");
+        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    }
+
+    fn physical_hidden_key_chunk(k1_values: &[i32], hidden_values: &[i64]) -> Chunk {
+        assert_eq!(k1_values.len(), hidden_values.len());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k1", DataType::Int32, false),
+            Field::new("total", DataType::Int64, true),
+            Field::new("__nr_shadow_total", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(k1_values.to_vec())),
+                Arc::new(Int64Array::from(vec![None; k1_values.len()])),
+                Arc::new(Int64Array::from(hidden_values.to_vec())),
+            ],
+        )
+        .expect("batch");
+        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
+            batch.schema().as_ref(),
+            &[SlotId::new(1), SlotId::new(2), SlotId::new(3)],
         )
         .expect("chunk schema");
         Chunk::new_with_chunk_schema(batch, chunk_schema)

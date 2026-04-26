@@ -601,7 +601,7 @@ fn visible_tablet_columns_by_name(
     Ok(columns)
 }
 
-fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> {
+pub(crate) fn arrow_type_from_tablet_column(column: &ColumnPb) -> Result<DataType, String> {
     let raw_type = column.r#type.trim().to_ascii_uppercase();
     let base_type = raw_type
         .split('(')
