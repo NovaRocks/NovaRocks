@@ -168,6 +168,19 @@ pub(crate) fn load_aggregate_physical_rows(
     Ok(rows)
 }
 
+pub(crate) fn build_old_state_map(
+    chunks: &[Chunk],
+    layout: &AggregateMvLayout,
+) -> Result<HashMap<String, AggregatePhysicalRow>, String> {
+    load_aggregate_physical_rows(chunks, layout).map_err(|err| {
+        if err.contains("duplicate row id") {
+            format!("active aggregate MV state corruption: duplicate active MV row id: {err}")
+        } else {
+            err
+        }
+    })
+}
+
 pub(crate) fn merge_aggregate_state_batches(
     old_rows: &HashMap<String, AggregatePhysicalRow>,
     delta_chunks: &[Chunk],
@@ -330,11 +343,7 @@ fn zero_base_row(delta: &AggregatePhysicalRow, layout: &AggregateMvLayout) -> Ag
     AggregatePhysicalRow {
         row_id: delta.row_id.clone(),
         visible_values: delta.visible_values.clone(),
-        state_values: layout
-            .state_columns
-            .iter()
-            .map(|state_column| zero_state_value(state_column))
-            .collect(),
+        state_values: layout.state_columns.iter().map(zero_state_value).collect(),
     }
 }
 

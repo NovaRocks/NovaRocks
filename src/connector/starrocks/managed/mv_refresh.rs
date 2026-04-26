@@ -26,7 +26,9 @@ use crate::connector::starrocks::managed::store::{
 };
 use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
-    write_chunks_into_managed_partition, write_chunks_into_managed_partition_for_mv_refresh,
+    write_chunks_into_managed_partition,
+    write_chunks_into_managed_partition_for_aggregate_mv_upsert,
+    write_chunks_into_managed_partition_for_mv_refresh,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,22 +167,45 @@ pub(crate) fn refresh_mv(
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
         },
+        |shape, previous_snapshot_id, current_snapshot_id| {
+            refresh_aggregate_mv_incremental(AggregateMvIncrementalRefreshContext {
+                state,
+                database: &db_name,
+                mv_name: &mv_name,
+                table_id: runtime.table.table_id,
+                select_sql: &mv_row.select_sql,
+                base_ref,
+                base_table: &loaded.table,
+                shape,
+                previous_snapshot_id,
+                current_snapshot_id,
+            })
+        },
     )
 }
 
-fn dispatch_mv_refresh_strategy<ProjectionFull, AggregateFull, NoOp, ProjectionIncremental>(
+fn dispatch_mv_refresh_strategy<
+    ProjectionFull,
+    AggregateFull,
+    NoOp,
+    ProjectionIncremental,
+    AggregateIncremental,
+>(
     mv_shape: &super::mv_shape::IncrementalMvShape,
     strategy: MvRefreshStrategy,
     projection_full: ProjectionFull,
     aggregate_full: AggregateFull,
     no_op: NoOp,
     projection_incremental: ProjectionIncremental,
+    aggregate_incremental: AggregateIncremental,
 ) -> Result<StatementResult, String>
 where
     ProjectionFull: FnOnce() -> Result<StatementResult, String>,
     AggregateFull: FnOnce(&super::mv_shape::AggregateMvShape) -> Result<StatementResult, String>,
     NoOp: FnOnce(i64) -> Result<StatementResult, String>,
     ProjectionIncremental: FnOnce(i64, i64) -> Result<StatementResult, String>,
+    AggregateIncremental:
+        FnOnce(&super::mv_shape::AggregateMvShape, i64, i64) -> Result<StatementResult, String>,
 {
     match (mv_shape, strategy) {
         (super::mv_shape::IncrementalMvShape::ProjectionFilter(_), MvRefreshStrategy::Full) => {
@@ -203,12 +228,12 @@ where
             },
         ) => projection_incremental(previous_snapshot_id, current_snapshot_id),
         (
-            super::mv_shape::IncrementalMvShape::Aggregate(_),
-            MvRefreshStrategy::Incremental { .. },
-        ) => Err(
-            "aggregate MV incremental refresh requires aggregate upsert merge path from Task 8"
-                .to_string(),
-        ),
+            super::mv_shape::IncrementalMvShape::Aggregate(shape),
+            MvRefreshStrategy::Incremental {
+                previous_snapshot_id,
+                current_snapshot_id,
+            },
+        ) => aggregate_incremental(shape, previous_snapshot_id, current_snapshot_id),
     }
 }
 
@@ -228,6 +253,69 @@ fn refresh_aggregate_mv_full(
         let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &output_columns)?;
         super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
     })
+}
+
+struct AggregateMvIncrementalRefreshContext<'a> {
+    state: &'a Arc<StandaloneState>,
+    database: &'a str,
+    mv_name: &'a str,
+    table_id: i64,
+    select_sql: &'a str,
+    base_ref: &'a IcebergTableRef,
+    base_table: &'a iceberg::table::Table,
+    shape: &'a super::mv_shape::AggregateMvShape,
+    previous_snapshot_id: i64,
+    current_snapshot_id: i64,
+}
+
+fn refresh_aggregate_mv_incremental(
+    ctx: AggregateMvIncrementalRefreshContext<'_>,
+) -> Result<StatementResult, String> {
+    let delta = plan_append_delta(ctx.base_table, ctx.previous_snapshot_id)?;
+    if delta.current_snapshot_id != ctx.current_snapshot_id {
+        return Err(format!(
+            "iceberg append delta current snapshot mismatch: expected {}, got {}",
+            ctx.current_snapshot_id, delta.current_snapshot_id
+        ));
+    }
+
+    let result = execute_query_for_mv_incremental_refresh(
+        ctx.state,
+        ctx.database,
+        ctx.select_sql,
+        ctx.base_ref,
+        delta.added_files,
+    )?;
+    let output_columns = result
+        .columns
+        .iter()
+        .map(query_result_column_to_output_column)
+        .collect::<Result<Vec<_>, String>>()?;
+    let layout = super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &output_columns)?;
+    let delta_chunks = super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)?;
+    let plan = load_physical_insert_plan(
+        ctx.state,
+        &crate::standalone::engine::ResolvedLocalTableName {
+            database: ctx.database.to_string(),
+            table: ctx.mv_name.to_string(),
+        },
+        PartitionTarget::Active,
+    )?;
+    let snapshots = single_snapshot_map(ctx.base_ref, ctx.current_snapshot_id);
+    write_chunks_into_managed_partition_for_aggregate_mv_upsert(
+        ctx.state,
+        plan,
+        &delta_chunks,
+        &layout,
+        MvRefreshWriteMetadata {
+            table_id: ctx.table_id,
+            // Upsert writes the full merged active aggregate state, not an append delta.
+            previous_refresh_rows: 0,
+            snapshots,
+        },
+    )?;
+    refresh_managed_catalog(ctx.state)?;
+    Ok(StatementResult::Ok)
 }
 
 pub(crate) fn refresh_mv_full_with_executor<F>(
@@ -775,6 +863,7 @@ mod tests {
             },
             |_| Err("no-op path should not run".to_string()),
             |_, _| Err("projection incremental path should not run".to_string()),
+            |_, _, _| Err("aggregate incremental path should not run".to_string()),
         );
 
         assert!(result.is_ok(), "result={result:?}");
