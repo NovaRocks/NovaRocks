@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
+use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::{ObjectName, RefreshMaterializedViewStmt};
@@ -13,16 +14,19 @@ use crate::standalone::engine::{
 };
 
 use crate::connector::starrocks::managed::catalog::{
-    ManagedLakeCatalog, register_managed_tables_in_catalog,
+    ManagedLakeCatalog, ManagedTableRuntime, register_managed_tables_in_catalog,
 };
-use crate::connector::starrocks::managed::ddl::bootstrap_empty_partition_for_tablets;
+use crate::connector::starrocks::managed::config::ManagedLakeConfig;
+use crate::connector::starrocks::managed::ddl::{
+    bootstrap_empty_partition_for_tablets, build_create_tablet_request, request_schema_from_runtime,
+};
 use crate::connector::starrocks::managed::store::{
     ActivateMvRefreshRequest, IcebergTableRef, ManagedPartitionState, ManagedTableKind,
     StageMvRefreshRequest, StagedMvRefresh, UpdateMvRefreshMetadataRequest,
 };
 use crate::connector::starrocks::managed::txn::{
-    MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, write_chunks_into_managed_partition,
-    write_chunks_into_managed_partition_for_mv_refresh,
+    MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
+    write_chunks_into_managed_partition, write_chunks_into_managed_partition_for_mv_refresh,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,13 +110,12 @@ pub(crate) fn refresh_mv(
         .map(|snapshot| snapshot.snapshot_id());
     let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
 
-    match choose_refresh_strategy(previous_snapshot_id, current_snapshot_id)? {
-        MvRefreshStrategy::Full => {
-            refresh_mv_full_with_executor(state, &db_name, &mv_name, run_mv_select_and_chunks)
-        }
-        MvRefreshStrategy::NoOp {
-            current_snapshot_id,
-        } => {
+    dispatch_mv_refresh_strategy(
+        &mv_shape,
+        choose_refresh_strategy(previous_snapshot_id, current_snapshot_id)?,
+        || refresh_mv_full_with_executor(state, &db_name, &mv_name, run_mv_select_and_chunks),
+        |shape| refresh_aggregate_mv_full(state, &db_name, &mv_name, shape),
+        |current_snapshot_id| {
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
             metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
                 table_id: runtime.table.table_id,
@@ -121,11 +124,8 @@ pub(crate) fn refresh_mv(
             })?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
-        }
-        MvRefreshStrategy::Incremental {
-            previous_snapshot_id,
-            current_snapshot_id,
-        } => {
+        },
+        |previous_snapshot_id, current_snapshot_id| {
             let delta = plan_append_delta(&loaded.table, previous_snapshot_id)?;
             if delta.current_snapshot_id != current_snapshot_id {
                 return Err(format!(
@@ -164,8 +164,70 @@ pub(crate) fn refresh_mv(
             )?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
+        },
+    )
+}
+
+fn dispatch_mv_refresh_strategy<ProjectionFull, AggregateFull, NoOp, ProjectionIncremental>(
+    mv_shape: &super::mv_shape::IncrementalMvShape,
+    strategy: MvRefreshStrategy,
+    projection_full: ProjectionFull,
+    aggregate_full: AggregateFull,
+    no_op: NoOp,
+    projection_incremental: ProjectionIncremental,
+) -> Result<StatementResult, String>
+where
+    ProjectionFull: FnOnce() -> Result<StatementResult, String>,
+    AggregateFull: FnOnce(&super::mv_shape::AggregateMvShape) -> Result<StatementResult, String>,
+    NoOp: FnOnce(i64) -> Result<StatementResult, String>,
+    ProjectionIncremental: FnOnce(i64, i64) -> Result<StatementResult, String>,
+{
+    match (mv_shape, strategy) {
+        (super::mv_shape::IncrementalMvShape::ProjectionFilter(_), MvRefreshStrategy::Full) => {
+            projection_full()
         }
+        (super::mv_shape::IncrementalMvShape::Aggregate(shape), MvRefreshStrategy::Full) => {
+            aggregate_full(shape)
+        }
+        (
+            _,
+            MvRefreshStrategy::NoOp {
+                current_snapshot_id,
+            },
+        ) => no_op(current_snapshot_id),
+        (
+            super::mv_shape::IncrementalMvShape::ProjectionFilter(_),
+            MvRefreshStrategy::Incremental {
+                previous_snapshot_id,
+                current_snapshot_id,
+            },
+        ) => projection_incremental(previous_snapshot_id, current_snapshot_id),
+        (
+            super::mv_shape::IncrementalMvShape::Aggregate(_),
+            MvRefreshStrategy::Incremental { .. },
+        ) => Err(
+            "aggregate MV incremental refresh requires aggregate upsert merge path from Task 8"
+                .to_string(),
+        ),
     }
+}
+
+fn refresh_aggregate_mv_full(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    mv_name: &str,
+    shape: &super::mv_shape::AggregateMvShape,
+) -> Result<StatementResult, String> {
+    refresh_mv_full_with_executor(state, database, mv_name, |ctx| {
+        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &ctx.select_sql)?;
+        let output_columns = result
+            .columns
+            .iter()
+            .map(query_result_column_to_output_column)
+            .collect::<Result<Vec<_>, String>>()?;
+        let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &output_columns)?;
+        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
+    })
 }
 
 pub(crate) fn refresh_mv_full_with_executor<F>(
@@ -237,7 +299,7 @@ where
         return Err(format!("mv refresh catalog refresh failed: {err}"));
     }
 
-    if let Err(err) = bootstrap_empty_partition_for_tablets(
+    if let Err(err) = bootstrap_mv_refresh_partition_for_tablets(
         &runtime,
         &managed_config,
         staged.partition_id,
@@ -265,7 +327,7 @@ where
         }
     };
 
-    let plan = match load_insert_plan(
+    let plan = match load_physical_insert_plan(
         state,
         &crate::standalone::engine::ResolvedLocalTableName {
             database: database.to_string(),
@@ -335,6 +397,66 @@ fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, String> {
         .into_iter()
         .map(|chunk| record_batch_to_chunk(chunk.batch))
         .collect()
+}
+
+fn query_result_column_to_output_column(
+    column: &crate::standalone::engine::QueryResultColumn,
+) -> Result<crate::sql::analysis::OutputColumn, String> {
+    Ok(crate::sql::analysis::OutputColumn {
+        name: column.name.clone(),
+        data_type: column.data_type.clone(),
+        nullable: column.nullable,
+    })
+}
+
+fn bootstrap_mv_refresh_partition_for_tablets(
+    runtime: &ManagedTableRuntime,
+    managed_config: &ManagedLakeConfig,
+    partition_id: i64,
+    tablet_ids: &[i64],
+) -> Result<(), String> {
+    if runtime.columns.iter().all(|column| column.visible) {
+        return bootstrap_empty_partition_for_tablets(
+            runtime,
+            managed_config,
+            partition_id,
+            tablet_ids,
+        );
+    }
+
+    let request_schema = request_schema_from_runtime(runtime)?;
+    let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
+    let tablet_root_path =
+        managed_config.tablet_root_path(runtime.table.db_id, runtime.table.table_id, partition_id);
+    for tablet_id in tablet_ids {
+        let request = build_create_tablet_request(
+            *tablet_id,
+            runtime.table.table_id,
+            partition_id,
+            request_schema.clone(),
+        );
+        crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch(
+            &request,
+            &tablet_root_path,
+            Some(managed_config.s3.clone()),
+            |schema| {
+                *schema = runtime.tablet_schema.clone();
+                Ok(())
+            },
+        )?;
+        let loaded = crate::formats::starrocks::metadata::load_tablet_snapshot(
+            *tablet_id,
+            1,
+            &tablet_root_path,
+            Some(&object_store_profile),
+        )?;
+        if loaded.tablet_schema != runtime.tablet_schema {
+            return Err(format!(
+                "managed bootstrap schema mismatch after bootstrap: tablet_id={tablet_id}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_incremental_mv_select(
@@ -549,16 +671,37 @@ mod tests {
     use super::*;
 
     use crate::connector::iceberg::catalog::IcebergCatalogRegistry;
+    use crate::connector::starrocks::ObjectStoreProfile;
+    use crate::connector::starrocks::lake::context::lock_runtime_test_state;
+    use crate::connector::starrocks::lake::schema::{
+        build_tablet_schema_pb_from_thrift, create_lake_tablet_from_req_with_schema_patch,
+    };
     use crate::connector::starrocks::managed::ManagedLakeConfig;
+    use crate::connector::starrocks::managed::ddl::{
+        build_create_tablet_request, build_tablet_schema, keys_type_name,
+        patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
+        table_columns_from_physical_columns,
+    };
     use crate::connector::starrocks::managed::store::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,
         ManagedTableKind, ManagedTableState, SqliteMetadataStore, StoredManagedDatabase,
         StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
-        StoredMaterializedView,
+        StoredManagedTablet, StoredMaterializedView,
     };
+    use crate::formats::starrocks::metadata::load_tablet_snapshot;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
+    use crate::sql::analysis::OutputColumn;
+    use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
     use crate::standalone::engine::catalog::InMemoryCatalog;
+    use crate::standalone::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use prost::Message;
+    use std::cell::Cell;
+    use std::net::ToSocketAddrs;
     use std::sync::RwLock;
+    use std::time::Duration;
 
     #[test]
     fn choose_refresh_strategy_without_previous_snapshot_uses_full_refresh() {
@@ -608,6 +751,152 @@ mod tests {
         // Keep this module-level smoke test minimal so the file always participates
         // in compilation even when object-store-backed test infra is unavailable.
         let _ = std::any::type_name::<MvRefreshContext>();
+    }
+
+    #[test]
+    fn refresh_mv_dispatches_aggregate_full_to_aggregate_executor() {
+        let mv_shape = super::super::mv_shape::IncrementalMvShape::Aggregate(
+            aggregate_mv_shape().expect("aggregate shape"),
+        );
+        let projection_full_called = Cell::new(false);
+        let aggregate_full_called = Cell::new(false);
+
+        let result = dispatch_mv_refresh_strategy(
+            &mv_shape,
+            MvRefreshStrategy::Full,
+            || {
+                projection_full_called.set(true);
+                Err("projection full executor should not run".to_string())
+            },
+            |shape| {
+                aggregate_full_called.set(true);
+                assert_eq!(shape.aggregates.len(), 2);
+                Ok(StatementResult::Ok)
+            },
+            |_| Err("no-op path should not run".to_string()),
+            |_, _| Err("projection incremental path should not run".to_string()),
+        );
+
+        assert!(result.is_ok(), "result={result:?}");
+        assert!(aggregate_full_called.get());
+        assert!(!projection_full_called.get());
+    }
+
+    #[test]
+    fn aggregate_full_refresh_executor_writes_physical_columns() {
+        let Some(config) = maybe_object_store_config_for_mv_refresh() else {
+            return;
+        };
+        let _guard = lock_runtime_test_state();
+        let (_dir, state, shape) = match seed_aggregate_mv_refresh_state(config) {
+            Ok(fixture) => fixture,
+            Err(err) if is_unavailable_object_store_error(&err) => {
+                eprintln!(
+                    "skipping aggregate MV full refresh writer test: object store is unavailable: {err}"
+                );
+                return;
+            }
+            Err(err) => panic!("aggregate mv fixture: {err}"),
+        };
+
+        let refresh_result =
+            refresh_mv_full_with_executor(&state, "analytics", "orders_mv", move |_ctx| {
+                let result = aggregate_visible_query_result()?;
+                let output_columns = result
+                    .columns
+                    .iter()
+                    .map(query_result_column_to_output_column)
+                    .collect::<Result<Vec<_>, String>>()?;
+                let layout =
+                    super::super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
+                let chunks = super::super::mv_agg_state::materialize_aggregate_result_chunks(
+                    result, &layout,
+                )?;
+                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks[0].batch.num_columns(), layout.physical_columns.len());
+                assert_eq!(
+                    chunks[0]
+                        .batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        "__row_id__",
+                        "k1",
+                        "c",
+                        "s",
+                        "__agg_state_c",
+                        "__agg_state_s"
+                    ]
+                );
+                Ok(chunks)
+            });
+        if let Err(err) = refresh_result {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV full refresh writer test: object store is unavailable: {err}"
+                );
+                return;
+            }
+            panic!("full refresh: {err}");
+        }
+
+        let metadata_store = state.metadata_store.as_ref().expect("store");
+        let snapshot = metadata_store.load_snapshot().expect("snapshot").managed;
+        let active_partition = snapshot
+            .partitions
+            .iter()
+            .find(|partition| {
+                partition.table_id == 10 && partition.state == ManagedPartitionState::Active
+            })
+            .expect("active partition");
+        assert_ne!(active_partition.partition_id, 20);
+        let active_tablets = snapshot
+            .tablets
+            .iter()
+            .filter(|tablet| tablet.partition_id == active_partition.partition_id)
+            .collect::<Vec<_>>();
+        assert_eq!(active_tablets.len(), 2);
+
+        let profile = ObjectStoreProfile::from_s3_store_config(
+            &state.managed_lake_config.as_ref().expect("config").s3,
+        )
+        .expect("object store profile");
+        let mut total_rows = 0_u64;
+        for tablet in active_tablets {
+            let loaded = load_tablet_snapshot(
+                tablet.tablet_id,
+                active_partition.visible_version,
+                &tablet.tablet_root_path,
+                Some(&profile),
+            )
+            .expect("active tablet snapshot");
+            let column_names = loaded
+                .tablet_schema
+                .column
+                .iter()
+                .map(|column| column.name.as_deref().unwrap_or(""))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                column_names,
+                vec![
+                    "__row_id__",
+                    "k1",
+                    "c",
+                    "s",
+                    "__agg_state_c",
+                    "__agg_state_s"
+                ]
+            );
+            assert_eq!(loaded.tablet_schema.column[0].visible, Some(false));
+            assert_eq!(loaded.tablet_schema.column[0].is_key, Some(true));
+            assert_eq!(loaded.tablet_schema.column[4].visible, Some(false));
+            assert_eq!(loaded.tablet_schema.column[5].visible, Some(false));
+            total_rows += loaded.total_num_rows;
+        }
+        assert_eq!(total_rows, 2);
     }
 
     #[test]
@@ -755,6 +1044,284 @@ mod tests {
             .replace_managed_snapshot(&snapshot)
             .expect("persist snapshot");
         (dir, store)
+    }
+
+    fn seed_aggregate_mv_refresh_state(
+        config: ManagedLakeConfig,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            Arc<StandaloneState>,
+            super::super::mv_shape::AggregateMvShape,
+        ),
+        String,
+    > {
+        let metadata_dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
+        let metadata_path = metadata_dir.path().join("standalone.sqlite");
+        let store = SqliteMetadataStore::open(&metadata_path)?;
+        let shape = aggregate_mv_shape()?;
+        let output_columns = aggregate_output_columns();
+        let layout =
+            super::super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
+        let key_desc = TableKeyDesc {
+            kind: TableKeyKind::Primary,
+            columns: vec![super::super::mv_agg_state::ROW_ID_COLUMN.to_string()],
+        };
+        let table_columns = table_columns_from_physical_columns(&layout.physical_columns);
+        let request_schema = build_tablet_schema(&table_columns, &key_desc, 100)?;
+        let mut tablet_schema = build_tablet_schema_pb_from_thrift(&request_schema)?;
+        patch_tablet_schema_column_flags(&mut tablet_schema, &layout.physical_columns)?;
+        let stored_columns =
+            stored_columns_from_physical_columns(100, &key_desc, &layout.physical_columns);
+        let active_root = config.tablet_root_path(1, 10, 20);
+        for tablet_id in [40_i64, 43_i64] {
+            let request = build_create_tablet_request(tablet_id, 10, 20, request_schema.clone());
+            create_lake_tablet_from_req_with_schema_patch(
+                &request,
+                &active_root,
+                Some(config.s3.clone()),
+                |schema| patch_tablet_schema_column_flags(schema, &layout.physical_columns),
+            )?;
+        }
+
+        let snapshot = ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: config.warehouse_uri.clone(),
+                next_db_id: 2,
+                next_table_id: 11,
+                next_partition_id: 21,
+                next_index_id: 31,
+                next_tablet_id: 41,
+                next_txn_id: 100,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders_mv".to_string(),
+                keys_type: keys_type_name(TableKeyKind::Primary).to_string(),
+                bucket_num: 2,
+                current_schema_id: 100,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::MaterializedView,
+            }],
+            schemas: vec![StoredManagedSchema {
+                schema_id: 100,
+                table_id: 10,
+                schema_version: 0,
+                tablet_schema_pb: tablet_schema.encode_to_vec(),
+            }],
+            columns: stored_columns,
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 1,
+                next_version: 2,
+                state: ManagedPartitionState::Active,
+            }],
+            indexes: vec![StoredManagedIndex {
+                index_id: 30,
+                table_id: 10,
+                partition_id: 20,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Active,
+            }],
+            tablets: vec![
+                StoredManagedTablet {
+                    tablet_id: 40,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 0,
+                    tablet_root_path: active_root.clone(),
+                },
+                StoredManagedTablet {
+                    tablet_id: 43,
+                    partition_id: 20,
+                    index_id: 30,
+                    bucket_seq: 1,
+                    tablet_root_path: active_root,
+                },
+            ],
+            txns: vec![],
+            erase_jobs: vec![],
+            materialized_views: vec![StoredMaterializedView {
+                mv_id: 10,
+                select_sql: aggregate_select_sql().to_string(),
+                refresh_mode: ManagedMvRefreshMode::DeferredManual,
+                base_table_refs: vec![],
+                last_refresh_ms: None,
+                last_refresh_rows: None,
+                last_refresh_snapshots: BTreeMap::new(),
+                created_at_ms: 1,
+            }],
+        };
+        store.replace_managed_snapshot(&snapshot)?;
+        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)?;
+        let mut catalog = InMemoryCatalog::default();
+        catalog.create_database("analytics")?;
+        register_managed_tables_in_catalog(&mut catalog, &managed)?;
+        let state = Arc::new(StandaloneState {
+            catalog: RwLock::new(catalog),
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            managed_lake: RwLock::new(managed),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
+            managed_lake_config: Some(config),
+            metadata_store: Some(store),
+            exchange_port: 0,
+            #[cfg(test)]
+            _test_guard: None,
+        });
+        Ok((metadata_dir, state, shape))
+    }
+
+    fn aggregate_select_sql() -> &'static str {
+        "SELECT k1, count(*) AS c, sum(v2) AS s FROM ice.ns.orders GROUP BY k1"
+    }
+
+    fn aggregate_mv_shape() -> Result<super::super::mv_shape::AggregateMvShape, String> {
+        let super::super::mv_shape::IncrementalMvShape::Aggregate(shape) =
+            validate_incremental_mv_select(aggregate_select_sql())?
+        else {
+            return Err("expected aggregate MV shape".to_string());
+        };
+        Ok(shape)
+    }
+
+    fn aggregate_output_columns() -> Vec<OutputColumn> {
+        vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "c".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ]
+    }
+
+    fn aggregate_visible_query_result() -> Result<QueryResult, String> {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int64, false),
+                Field::new("c", DataType::Int64, false),
+                Field::new("s", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(Int64Array::from(vec![3_i64, 4])),
+                Arc::new(Int64Array::from(vec![30_i64, 40])),
+            ],
+        )
+        .map_err(|e| format!("build aggregate visible batch failed: {e}"))?;
+        Ok(QueryResult {
+            columns: vec![
+                QueryResultColumn {
+                    name: "k1".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    logical_type: None,
+                },
+                QueryResultColumn {
+                    name: "c".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                    logical_type: None,
+                },
+                QueryResultColumn {
+                    name: "s".to_string(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                    logical_type: None,
+                },
+            ],
+            chunks: vec![record_batch_to_chunk(batch)?],
+        })
+    }
+
+    fn maybe_object_store_config_for_mv_refresh() -> Option<ManagedLakeConfig> {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        if !managed_lake_endpoint_reachable(&endpoint) {
+            eprintln!(
+                "skipping aggregate MV full refresh writer test: object store endpoint is unreachable: {endpoint}"
+            );
+            return None;
+        }
+        let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("MINIO_ROOT_USER"))
+            .unwrap_or_else(|_| "admin".to_string());
+        let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
+            .unwrap_or_else(|_| "admin123".to_string());
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let root = format!(
+            "novarocks-mv-refresh-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        Some(ManagedLakeConfig {
+            warehouse_uri: format!("s3://{bucket}/{root}"),
+            s3: S3StoreConfig {
+                endpoint,
+                bucket,
+                root,
+                access_key_id,
+                access_key_secret,
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+        })
+    }
+
+    fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
+        let stripped = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(endpoint);
+        let authority = stripped.split('/').next().unwrap_or(stripped);
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => match port.parse::<u16>() {
+                Ok(port) => (host, port),
+                Err(_) => return false,
+            },
+            None => {
+                let default_port = if endpoint.starts_with("https://") {
+                    443
+                } else {
+                    80
+                };
+                (authority, default_port)
+            }
+        };
+        let Ok(addrs) = (host, port).to_socket_addrs() else {
+            return false;
+        };
+        addrs
+            .into_iter()
+            .any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok())
+    }
+
+    fn is_unavailable_object_store_error(err: &str) -> bool {
+        err.contains("NoSuchBucket")
+            || err.contains("Connection refused")
+            || err.contains("connection refused")
+            || err.contains("deadline has elapsed")
+            || err.contains("timeout")
+            || err.contains("timed out")
     }
 
     fn test_managed_config() -> ManagedLakeConfig {

@@ -814,7 +814,7 @@ pub(crate) fn bootstrap_empty_partition_for_tablets(
     Ok(())
 }
 
-fn request_schema_from_runtime(
+pub(crate) fn request_schema_from_runtime(
     runtime: &ManagedTableRuntime,
 ) -> Result<crate::agent_service::TTabletSchema, String> {
     let columns = runtime
