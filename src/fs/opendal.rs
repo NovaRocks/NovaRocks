@@ -305,10 +305,7 @@ impl OpendalRangeReader {
             .block_on(op.stat(&path))
             .with_context(|| format!("opendal stat: {path}"))?;
         let len = meta.content_length();
-        let mtime = meta
-            .last_modified()
-            .map(|dt| dt.into_inner().as_second())
-            .map(|ts| ts as i64);
+        let mtime = meta.last_modified().map(|dt| dt.into_inner().as_second());
         Ok(Self {
             op,
             rt,
@@ -442,17 +439,14 @@ impl OpendalRangeReader {
             );
         }
         let data = data_result.map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "opendal read failed: path={} range={}..{} len={} err={}",
-                    self.identity.path(),
-                    start,
-                    end,
-                    length,
-                    e
-                ),
-            )
+            io::Error::other(format!(
+                "opendal read failed: path={} range={}..{} len={} err={}",
+                self.identity.path(),
+                start,
+                end,
+                length,
+                e
+            ))
         })?;
         if let Some(counters) = self.counters.as_ref() {
             counters.record_remote_read(length, io_ns, kind);

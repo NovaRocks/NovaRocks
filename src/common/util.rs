@@ -558,7 +558,7 @@ fn append_http_json_value_with_schema(
                 }
                 append_http_json_value_with_schema(
                     out,
-                    &values,
+                    values,
                     idx,
                     types::TPrimitiveType::INVALID_TYPE,
                     false,
@@ -584,7 +584,7 @@ fn append_http_json_value_with_schema(
                 }
                 append_http_json_value_with_schema(
                     out,
-                    &values,
+                    values,
                     idx,
                     types::TPrimitiveType::INVALID_TYPE,
                     false,
@@ -619,7 +619,7 @@ fn append_http_json_value_with_schema(
                 out.push(':');
                 append_http_json_value_with_schema(
                     out,
-                    &values,
+                    values,
                     entry_idx,
                     types::TPrimitiveType::INVALID_TYPE,
                     false,
@@ -643,7 +643,7 @@ fn append_http_json_value_with_schema(
                 out.push(':');
                 append_http_json_value_with_schema(
                     out,
-                    &arr.column(idx),
+                    arr.column(idx),
                     row,
                     types::TPrimitiveType::INVALID_TYPE,
                     false,
@@ -1023,13 +1023,13 @@ pub(crate) fn format_mysql_container_value_with_schema(
                 }
                 if item_schema.is_some_and(|schema| schema.json_semantic()) {
                     out.push_str(&format_mysql_container_json_value_with_schema(
-                        &values,
+                        values,
                         i,
                         item_schema,
                     )?);
                 } else {
                     out.push_str(&format_mysql_container_value_with_schema(
-                        &values,
+                        values,
                         i,
                         item_schema,
                     )?);
@@ -1055,13 +1055,13 @@ pub(crate) fn format_mysql_container_value_with_schema(
                 }
                 if item_schema.is_some_and(|schema| schema.json_semantic()) {
                     out.push_str(&format_mysql_container_json_value_with_schema(
-                        &values,
+                        values,
                         i,
                         item_schema,
                     )?);
                 } else {
                     out.push_str(&format_mysql_container_value_with_schema(
-                        &values,
+                        values,
                         i,
                         item_schema,
                     )?);
@@ -1403,7 +1403,7 @@ fn format_time_duration(unit: TimeUnit, value: i64) -> String {
         TimeUnit::Nanosecond => value / 1_000,
     };
     let sign = if total_micros < 0 { "-" } else { "" };
-    let abs = total_micros.unsigned_abs() as u64;
+    let abs = total_micros.unsigned_abs();
     let hour = abs / 3_600_000_000;
     let minute = (abs % 3_600_000_000) / 60_000_000;
     let second = (abs % 60_000_000) / 1_000_000;

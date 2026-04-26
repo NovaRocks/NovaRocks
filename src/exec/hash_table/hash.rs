@@ -14,12 +14,10 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 
 pub(crate) fn make_hash<Q: ?Sized + Hash, S: BuildHasher>(build_hasher: &S, value: &Q) -> u64 {
-    let mut hasher = build_hasher.build_hasher();
-    value.hash(&mut hasher);
-    hasher.finish()
+    build_hasher.hash_one(value)
 }
 
 pub(crate) fn seed_from_hasher<S: BuildHasher>(build_hasher: &S) -> u64 {

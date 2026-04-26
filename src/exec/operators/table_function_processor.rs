@@ -194,7 +194,7 @@ impl ProcessorOperator for TableFunctionProcessorOperator {
         }
 
         let output = self.build_output_chunk(&chunk)?;
-        if output.len() == 0 {
+        if output.is_empty() {
             self.emit_empty_once = true;
             self.output_chunk = None;
             self.output_offset = 0;
@@ -992,7 +992,7 @@ impl TableFunctionProcessorOperator {
                 values.data_type()
             ));
         }
-        let data_storage = vec![values.to_data()];
+        let data_storage = [values.to_data()];
         let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
         let mut mutable = MutableArrayData::new(data_refs, true, total_output_rows);
 
@@ -1049,7 +1049,7 @@ impl TableFunctionProcessorOperator {
                     values.data_type()
                 ));
             }
-            let data_storage = vec![values.to_data()];
+            let data_storage = [values.to_data()];
             let data_refs: Vec<&arrow_data::ArrayData> = data_storage.iter().collect();
             let mut mutable = MutableArrayData::new(data_refs, true, total_output_rows);
 
@@ -1108,7 +1108,7 @@ fn split_bitmap_values(values: &[u64], batch_size: usize) -> Vec<Vec<u64>> {
         return Vec::new();
     }
     let cardinality = values.len();
-    let split_num = cardinality / batch_size + usize::from(cardinality % batch_size != 0);
+    let split_num = cardinality / batch_size + usize::from(!cardinality.is_multiple_of(batch_size));
     if split_num <= 1 {
         return vec![values.to_vec()];
     }

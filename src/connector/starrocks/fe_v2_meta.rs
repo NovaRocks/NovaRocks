@@ -176,13 +176,12 @@ fn resolve_tablet_paths_for_refs(
     }
 
     let cache_key = table.cache_key();
-    if let Some(qid) = query_id {
-        if let Some(paths) = query_context_manager().lake_tablet_paths(qid, &cache_key) {
-            if paths_cover_refs(&paths, refs) {
-                cache_table_identity_names(table);
-                return Ok(select_paths_for_refs(paths, refs)?);
-            }
-        }
+    if let Some(qid) = query_id
+        && let Some(paths) = query_context_manager().lake_tablet_paths(qid, &cache_key)
+        && paths_cover_refs(&paths, refs)
+    {
+        cache_table_identity_names(table);
+        return select_paths_for_refs(paths, refs);
     }
 
     let requested_tablet_ids = refs.iter().map(|r| r.tablet_id).collect::<Vec<_>>();

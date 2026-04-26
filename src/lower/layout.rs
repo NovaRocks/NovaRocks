@@ -258,11 +258,11 @@ pub(crate) fn infer_tuple_slot_order(
                 }
             }
             data_sinks::TDataSinkType::SPLIT_DATA_STREAM_SINK => {
-                if let Some(sp) = sink.split_stream_sink.as_ref() {
-                    if let Some(sinks) = sp.sinks.as_ref() {
-                        for s in sinks {
-                            collect_partition_exprs(&s.output_partition, &mut out);
-                        }
+                if let Some(sp) = sink.split_stream_sink.as_ref()
+                    && let Some(sinks) = sp.sinks.as_ref()
+                {
+                    for s in sinks {
+                        collect_partition_exprs(&s.output_partition, &mut out);
                     }
                 }
             }
@@ -294,22 +294,22 @@ pub(crate) fn infer_tuple_slot_order(
             collect_exprs(&analytic.order_by_exprs, &mut out);
             collect_exprs(&analytic.analytic_functions, &mut out);
             if let Some(w) = analytic.window.as_ref() {
-                if let Some(b) = w.window_start.as_ref() {
-                    if let Some(pred) = b.range_offset_predicate.as_ref() {
-                        collect_expr(pred, &mut out);
-                    }
+                if let Some(b) = w.window_start.as_ref()
+                    && let Some(pred) = b.range_offset_predicate.as_ref()
+                {
+                    collect_expr(pred, &mut out);
                 }
-                if let Some(b) = w.window_end.as_ref() {
-                    if let Some(pred) = b.range_offset_predicate.as_ref() {
-                        collect_expr(pred, &mut out);
-                    }
+                if let Some(b) = w.window_end.as_ref()
+                    && let Some(pred) = b.range_offset_predicate.as_ref()
+                {
+                    collect_expr(pred, &mut out);
                 }
             }
         }
-        if let Some(exch) = n.exchange_node.as_ref() {
-            if let Some(info) = exch.sort_info.as_ref() {
-                collect_exprs(&info.ordering_exprs, &mut out);
-            }
+        if let Some(exch) = n.exchange_node.as_ref()
+            && let Some(info) = exch.sort_info.as_ref()
+        {
+            collect_exprs(&info.ordering_exprs, &mut out);
         }
         if let Some(agg) = n.agg_node.as_ref() {
             if let Some(g) = agg.grouping_exprs.as_ref() {
@@ -326,10 +326,10 @@ pub(crate) fn infer_tuple_slot_order(
                 collect_exprs(other, &mut out);
             }
         }
-        if let Some(nl) = n.nestloop_join_node.as_ref() {
-            if let Some(conj) = nl.join_conjuncts.as_ref() {
-                collect_exprs(conj, &mut out);
-            }
+        if let Some(nl) = n.nestloop_join_node.as_ref()
+            && let Some(conj) = nl.join_conjuncts.as_ref()
+        {
+            collect_exprs(conj, &mut out);
         }
     }
 
@@ -411,10 +411,10 @@ pub(crate) fn slot_display_name_from_desc(desc: &descriptors::TSlotDescriptor) -
     }
 }
 
-pub(crate) fn resolve_jdbc_table<'a>(
-    desc: &'a descriptors::TDescriptorTable,
+pub(crate) fn resolve_jdbc_table(
+    desc: &descriptors::TDescriptorTable,
     tuple_id: types::TTupleId,
-) -> Result<&'a descriptors::TJDBCTable, String> {
+) -> Result<&descriptors::TJDBCTable, String> {
     let tuple_desc = find_tuple_descriptor(desc, tuple_id)?;
     let table_id = tuple_desc
         .table_id
@@ -422,10 +422,10 @@ pub(crate) fn resolve_jdbc_table<'a>(
     resolve_jdbc_table_by_table_id(desc, table_id)
 }
 
-pub(crate) fn resolve_jdbc_table_by_table_id<'a>(
-    desc: &'a descriptors::TDescriptorTable,
+pub(crate) fn resolve_jdbc_table_by_table_id(
+    desc: &descriptors::TDescriptorTable,
     table_id: types::TTableId,
-) -> Result<&'a descriptors::TJDBCTable, String> {
+) -> Result<&descriptors::TJDBCTable, String> {
     let table_descs = desc
         .table_descriptors
         .as_ref()
@@ -501,10 +501,10 @@ pub(crate) fn resolve_jdbc_table_by_name<'a>(
         .ok_or_else(|| "matched table descriptor missing jdbc_table".to_string())
 }
 
-pub(crate) fn resolve_mysql_table<'a>(
-    desc: &'a descriptors::TDescriptorTable,
+pub(crate) fn resolve_mysql_table(
+    desc: &descriptors::TDescriptorTable,
     tuple_id: types::TTupleId,
-) -> Result<&'a descriptors::TMySQLTable, String> {
+) -> Result<&descriptors::TMySQLTable, String> {
     let tuple_desc = find_tuple_descriptor(desc, tuple_id)?;
     let table_id = tuple_desc
         .table_id
@@ -523,10 +523,10 @@ pub(crate) fn resolve_mysql_table<'a>(
         .ok_or_else(|| format!("table_id={table_id} is not a MySQL table"))
 }
 
-pub(crate) fn find_tuple_descriptor<'a>(
-    desc: &'a descriptors::TDescriptorTable,
+pub(crate) fn find_tuple_descriptor(
+    desc: &descriptors::TDescriptorTable,
     tuple_id: types::TTupleId,
-) -> Result<&'a descriptors::TTupleDescriptor, String> {
+) -> Result<&descriptors::TTupleDescriptor, String> {
     if let Some(td) = desc
         .tuple_descriptors
         .iter()
@@ -708,19 +708,19 @@ pub(crate) fn reorder_tuple_slots(
     }
 
     for (tuple_id, slots) in tuple_slots.iter_mut() {
-        if let Some(table_id) = tuple_to_table.get(tuple_id) {
-            if let Some(col_order) = table_columns.get(table_id) {
-                slots.sort_by_key(|sid| {
-                    if let Some(name) = slot_names.get(&(*tuple_id, *sid)) {
-                        col_order
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(name))
-                            .unwrap_or(usize::MAX)
-                    } else {
-                        usize::MAX
-                    }
-                });
-            }
+        if let Some(table_id) = tuple_to_table.get(tuple_id)
+            && let Some(col_order) = table_columns.get(table_id)
+        {
+            slots.sort_by_key(|sid| {
+                if let Some(name) = slot_names.get(&(*tuple_id, *sid)) {
+                    col_order
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(name))
+                        .unwrap_or(usize::MAX)
+                } else {
+                    usize::MAX
+                }
+            });
         }
     }
 }

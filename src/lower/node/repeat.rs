@@ -91,7 +91,7 @@ pub(crate) fn lower_repeat_node(
                         sid
                     ));
                 }
-                SlotId::try_from(*sid).map_err(Into::into)
+                SlotId::try_from(*sid)
             })
             .collect::<Result<HashSet<_>, String>>()?;
 

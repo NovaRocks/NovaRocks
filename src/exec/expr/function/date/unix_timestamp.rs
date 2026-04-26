@@ -30,7 +30,7 @@ pub fn eval_unix_timestamp(
     let mut out = Vec::with_capacity(len);
     if args.is_empty() {
         let now = datetime_from_local_now().and_utc().timestamp();
-        out.extend(std::iter::repeat(Some(now)).take(len));
+        out.extend(std::iter::repeat_n(Some(now), len));
     } else {
         let arr = arena.eval(args[0], chunk)?;
         let dts = extract_datetime_array(&arr)?;

@@ -300,7 +300,7 @@ fn run_send_task(task: ExchangeSendTask, inflight: Arc<AtomicUsize>, reserve_byt
         task.sequence,
         task.payload,
     );
-    let send_ns = send_start.elapsed().as_nanos() as u128;
+    let send_ns = send_start.elapsed().as_nanos();
 
     if let Some(profile) = task.profiles.as_ref() {
         profile

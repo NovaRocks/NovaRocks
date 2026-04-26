@@ -194,6 +194,10 @@ impl<'a> Utf8ArrayView<'a> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn new(array: &'a ArrayRef) -> Result<Self, String> {
         match array.data_type() {
             DataType::Utf8 => array

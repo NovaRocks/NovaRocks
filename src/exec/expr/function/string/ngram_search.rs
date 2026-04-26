@@ -37,10 +37,8 @@ fn normalize_ascii_case(input: &str, case_insensitive: bool) -> Vec<u8> {
 fn build_gram_count_map(bytes: &[u8], gram_num: usize) -> HashMap<Vec<u8>, u16> {
     let mut map = HashMap::new();
     for gram in bytes.windows(gram_num) {
-        let entry = map.entry(gram.to_vec()).or_insert(0);
-        if *entry < u16::MAX {
-            *entry += 1;
-        }
+        let entry = map.entry(gram.to_vec()).or_insert(0u16);
+        *entry = (*entry).saturating_add(1);
     }
     map
 }

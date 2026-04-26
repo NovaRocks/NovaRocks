@@ -442,14 +442,14 @@ fn finish_task_report_times_for_error(task_type: types::TTaskType, error: &str) 
 fn execute_backend_task(task: &agent_service::TAgentTaskRequest) -> Result<(), String> {
     match task.task_type {
         types::TTaskType::CREATE => {
-            execute_create_tablet_task(&task).map_err(|err| format!("create_tablet failed: {err}"))
+            execute_create_tablet_task(task).map_err(|err| format!("create_tablet failed: {err}"))
         }
         types::TTaskType::ALTER => {
-            execute_alter_task(&task).map_err(|err| format!("alter task failed: {err}"))
+            execute_alter_task(task).map_err(|err| format!("alter task failed: {err}"))
         }
-        types::TTaskType::UPDATE_TABLET_META_INFO => execute_update_tablet_meta_info_task(&task)
+        types::TTaskType::UPDATE_TABLET_META_INFO => execute_update_tablet_meta_info_task(task)
             .map_err(|err| format!("update_tablet_meta_info failed: {err}")),
-        types::TTaskType::DROP_AUTO_INCREMENT_MAP => execute_drop_auto_increment_map_task(&task)
+        types::TTaskType::DROP_AUTO_INCREMENT_MAP => execute_drop_auto_increment_map_task(task)
             .map_err(|err| format!("drop_auto_increment_map failed: {err}")),
         other => Err(format!(
             "unsupported backend task_type={other:?} in submit_tasks"

@@ -468,46 +468,44 @@ impl PipelineDriver {
             // blocking on a full sink when the driver has nothing to push.
             let has_buffered = self.edge_chunks.iter().any(|c| c.is_some());
 
-            if !has_buffered {
-                if let Some(source) = self.operators.first() {
-                    if !source.is_finished() {
-                        let Some(proc) = source.as_processor_ref() else {
-                            return self.finish_with_state(DriverState::Failed(
-                                "pipeline source missing processor operator".to_string(),
-                            ));
-                        };
-                        if !proc.has_output() {
-                            return self.block_or_fail(BlockedReason::InputEmpty);
-                        }
-                    }
+            if !has_buffered
+                && let Some(source) = self.operators.first()
+                && !source.is_finished()
+            {
+                let Some(proc) = source.as_processor_ref() else {
+                    return self.finish_with_state(DriverState::Failed(
+                        "pipeline source missing processor operator".to_string(),
+                    ));
+                };
+                if !proc.has_output() {
+                    return self.block_or_fail(BlockedReason::InputEmpty);
                 }
             }
 
-            if let Some(sink) = self.operators.last() {
-                if !sink.is_finished() {
-                    let Some(proc) = sink.as_processor_ref() else {
-                        return self.finish_with_state(DriverState::Failed(
-                            "pipeline sink missing processor operator".to_string(),
-                        ));
-                    };
-                    if !proc.need_input() {
-                        return self.block_or_fail(BlockedReason::OutputFull);
-                    }
+            if let Some(sink) = self.operators.last()
+                && !sink.is_finished()
+            {
+                let Some(proc) = sink.as_processor_ref() else {
+                    return self.finish_with_state(DriverState::Failed(
+                        "pipeline sink missing processor operator".to_string(),
+                    ));
+                };
+                if !proc.need_input() {
+                    return self.block_or_fail(BlockedReason::OutputFull);
                 }
             }
 
-            if has_buffered {
-                if let Some(source) = self.operators.first() {
-                    if !source.is_finished() {
-                        let Some(proc) = source.as_processor_ref() else {
-                            return self.finish_with_state(DriverState::Failed(
-                                "pipeline source missing processor operator".to_string(),
-                            ));
-                        };
-                        if !proc.has_output() {
-                            return self.block_or_fail(BlockedReason::InputEmpty);
-                        }
-                    }
+            if has_buffered
+                && let Some(source) = self.operators.first()
+                && !source.is_finished()
+            {
+                let Some(proc) = source.as_processor_ref() else {
+                    return self.finish_with_state(DriverState::Failed(
+                        "pipeline source missing processor operator".to_string(),
+                    ));
+                };
+                if !proc.has_output() {
+                    return self.block_or_fail(BlockedReason::InputEmpty);
                 }
             }
 

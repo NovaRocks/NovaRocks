@@ -209,7 +209,7 @@ mod tests {
         BoolOrAgg.drop_state(&spec, state.as_mut_ptr() as *mut u8);
 
         let out_arr = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out_arr.value(0), true);
+        assert!(out_arr.value(0));
     }
 
     #[test]

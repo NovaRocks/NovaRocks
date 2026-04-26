@@ -88,18 +88,18 @@ fn resolve_server_options(
     let mut user = ROOT_USER.to_string();
     let mut tables = BTreeMap::new();
 
-    if let Some(app_cfg) = file_cfg.as_ref() {
-        if let Some(standalone) = app_cfg.standalone_server.as_ref() {
-            mysql_port = standalone.mysql_port;
-            if standalone.user != ROOT_USER {
-                return Err(format!(
-                    "standalone server only supports user `{ROOT_USER}`, got `{}`",
-                    standalone.user
-                ));
-            }
-            user = standalone.user.clone();
-            merge_config_tables(&mut tables, standalone, &config_base_dir)?;
+    if let Some(app_cfg) = file_cfg.as_ref()
+        && let Some(standalone) = app_cfg.standalone_server.as_ref()
+    {
+        mysql_port = standalone.mysql_port;
+        if standalone.user != ROOT_USER {
+            return Err(format!(
+                "standalone server only supports user `{ROOT_USER}`, got `{}`",
+                standalone.user
+            ));
         }
+        user = standalone.user.clone();
+        merge_config_tables(&mut tables, standalone, &config_base_dir)?;
     }
 
     if let Some(port) = opts.mysql_port {
@@ -814,9 +814,7 @@ fn classify_query_error(err: &str) -> ErrorKind {
     let lower = err.to_ascii_lowercase();
     if lower.contains("database already exists") {
         ErrorKind::ER_DB_CREATE_EXISTS
-    } else if lower.contains("unknown database") {
-        ErrorKind::ER_BAD_DB_ERROR
-    } else if lower.contains("unknown catalog") {
+    } else if lower.contains("unknown database") || lower.contains("unknown catalog") {
         ErrorKind::ER_BAD_DB_ERROR
     } else if lower.contains("table already exists") {
         ErrorKind::ER_TABLE_EXISTS_ERROR

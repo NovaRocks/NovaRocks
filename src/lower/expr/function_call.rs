@@ -95,7 +95,7 @@ pub(crate) fn lower_function_call(
         let fe_addr =
             fe_addr.ok_or_else(|| "get_query_profile requires FE coord address".to_string())?;
         let arg = children
-            .get(0)
+            .first()
             .and_then(|id| arena.node(*id))
             .and_then(|node| match node {
                 ExprNode::Literal(LiteralValue::Utf8(s)) => Some(s.as_str()),
@@ -1136,7 +1136,7 @@ pub(crate) fn lower_function_call(
             } else if !matches!(data_type, DataType::Struct(_)) {
                 return Err(format!("{} must return STRUCT type", name));
             }
-            if name == "named_struct" && children.len() % 2 != 0 {
+            if name == "named_struct" && !children.len().is_multiple_of(2) {
                 return Err("named_struct expects an even number of arguments".to_string());
             }
         }
@@ -1399,16 +1399,15 @@ pub(crate) fn lower_function_call(
                 | function::FunctionKind::IcebergTransformMonth
                 | function::FunctionKind::IcebergTransformDay
                 | function::FunctionKind::IcebergTransformHour
-        ) {
-            if !matches!(data_type, DataType::Int64) {
-                return Err("iceberg transform year/month/day/hour must return BIGINT".to_string());
-            }
+        ) && !matches!(data_type, DataType::Int64)
+        {
+            return Err("iceberg transform year/month/day/hour must return BIGINT".to_string());
         }
 
-        if matches!(kind, function::FunctionKind::IcebergTransformBucket) {
-            if !matches!(data_type, DataType::Int32) {
-                return Err("iceberg transform bucket must return INT".to_string());
-            }
+        if matches!(kind, function::FunctionKind::IcebergTransformBucket)
+            && !matches!(data_type, DataType::Int32)
+        {
+            return Err("iceberg transform bucket must return INT".to_string());
         }
 
         if matches!(kind, function::FunctionKind::IcebergTransformTruncate) {

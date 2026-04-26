@@ -242,10 +242,10 @@ pub(crate) fn fetch_query_profile(
         })
         .map_err(|e| format!("getQueryProfile RPC failed: {e}"))?;
 
-    if let Some(status) = result.status {
-        if status.status_code != status_code::TStatusCode::OK {
-            return Err(format!("FE returned error: {:?}", status));
-        }
+    if let Some(status) = result.status
+        && status.status_code != status_code::TStatusCode::OK
+    {
+        return Err(format!("FE returned error: {:?}", status));
     }
     let payload = result
         .query_result
@@ -434,9 +434,7 @@ fn build_datacache_runtime_metrics() -> Option<data_cache::TDataCacheMetrics> {
 fn build_load_datacache_metrics(
     profile: Option<&runtime_profile::TRuntimeProfileTree>,
 ) -> Option<data_cache::TLoadDataCacheMetrics> {
-    let Some(profile) = profile else {
-        return None;
-    };
+    let profile = profile?;
     let read_bytes = sum_counter_from_profile_tree(profile, "DataCacheReadBytes");
     let read_time_ns = sum_counter_from_profile_tree(profile, "DataCacheReadTimer");
     let write_bytes = sum_counter_from_profile_tree(profile, "DataCacheWriteBytes");

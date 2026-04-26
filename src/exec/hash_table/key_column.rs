@@ -468,7 +468,7 @@ impl KeyColumn {
                             .ok_or_else(|| "group key index out of bounds".to_string())?;
                         Ok(data
                             .get(start..end)
-                            .map_or(false, |bytes| bytes == value.as_bytes()))
+                            .is_some_and(|bytes| bytes == value.as_bytes()))
                     }
                     None => Ok(!valid),
                 }
@@ -949,7 +949,7 @@ impl KeyColumn {
             KeyColumn::Date32 { .. } => DataType::Date32,
             KeyColumn::Timestamp { unit, tz, .. } => {
                 let tz_arc = tz.as_deref().map(Arc::<str>::from);
-                DataType::Timestamp(unit.clone(), tz_arc)
+                DataType::Timestamp(*unit, tz_arc)
             }
             KeyColumn::Decimal128 {
                 precision, scale, ..
@@ -985,7 +985,7 @@ impl KeyColumn {
             | KeyColumn::Decimal128 { nulls, .. }
             | KeyColumn::Decimal256 { nulls, .. }
             | KeyColumn::LargeIntBinary { nulls, .. }
-            | KeyColumn::Complex { nulls, .. } => nulls.iter().any(|valid| *valid == 0),
+            | KeyColumn::Complex { nulls, .. } => nulls.contains(&0),
             KeyColumn::ListUtf8 { values } => values.iter().any(|value| value.is_none()),
             KeyColumn::ListInt32 { values } => values.iter().any(|value| value.is_none()),
         }
@@ -1042,7 +1042,7 @@ pub(crate) fn key_column_from_type(data_type: &DataType) -> Result<KeyColumn, St
             Ok(KeyColumn::Timestamp {
                 values: Vec::new(),
                 nulls: Vec::new(),
-                unit: unit.clone(),
+                unit: *unit,
                 tz: tz_string,
             })
         }

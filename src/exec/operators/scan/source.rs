@@ -371,12 +371,11 @@ impl ScanSourceOperator {
                 }
             }
         }
-        if let Some(rf) = self.runtime_filter_probe.as_ref() {
-            if let Some(dep) = rf.dependency_or_timeout() {
-                if !dep.is_ready() {
-                    return;
-                }
-            }
+        if let Some(rf) = self.runtime_filter_probe.as_ref()
+            && let Some(dep) = rf.dependency_or_timeout()
+            && !dep.is_ready()
+        {
+            return;
         }
         if !self.async_state.has_capacity() {
             return;
@@ -478,13 +477,12 @@ impl ScanSourceOperator {
         if self.inflight_tasks.load(Ordering::Acquire) != 0 {
             return true;
         }
-        let has_pending = {
+        {
             let guard = self.async_runners.lock().expect("scan runner lock");
             guard
                 .iter()
                 .any(|runner| runner.pending_chunk.is_some() || runner.morsel_iter.is_some())
-        };
-        has_pending
+        }
     }
 
     fn try_acquire_inflight(&self, max_io_tasks: usize) -> bool {
@@ -693,15 +691,14 @@ impl ProcessorOperator for ScanSourceOperator {
             return Some(dep);
         }
         // 再等 RuntimeFilterHub 的依赖
-        if let Some(rf) = self.runtime_filter_probe.as_ref() {
-            if let Some(dep) = rf.dependency_or_timeout() {
-                if !dep.is_ready() {
-                    if !self.should_wait_runtime_filters() {
-                        return None;
-                    }
-                    return Some(dep);
-                }
+        if let Some(rf) = self.runtime_filter_probe.as_ref()
+            && let Some(dep) = rf.dependency_or_timeout()
+            && !dep.is_ready()
+        {
+            if !self.should_wait_runtime_filters() {
+                return None;
             }
+            return Some(dep);
         }
         None
     }
@@ -822,7 +819,7 @@ mod tests {
                     Ok(Some(chunk)) => {
                         let arr = chunk
                             .columns()
-                            .get(0)
+                            .first()
                             .expect("col0")
                             .as_any()
                             .downcast_ref::<Int32Array>()
@@ -976,7 +973,7 @@ mod tests {
         // Due to parallel execution, we may read up to limit + (DOP * rows_per_morsel) = 25 + 40 = 65.
         // Without early termination, we would read all 200 rows.
         assert!(
-            total_rows >= 25 && total_rows < 100,
+            (25..100).contains(&total_rows),
             "expected rows between 25 and 100 due to early termination (limit=25, dop=4), got {}. \
              Without early termination, would read all 200 rows.",
             total_rows

@@ -47,7 +47,7 @@ pub(crate) fn lower_jdbc_scan_node(
     };
     let tuple_id = jdbc
         .tuple_id
-        .or_else(|| node.row_tuples.get(0).copied())
+        .or_else(|| node.row_tuples.first().copied())
         .ok_or_else(|| "JDBC_SCAN_NODE missing tuple_id".to_string())?;
 
     let mut out_layout = crate::lower::layout::Layout {

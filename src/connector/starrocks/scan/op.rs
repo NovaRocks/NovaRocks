@@ -217,10 +217,10 @@ impl StarRocksScanIter {
     }
 
     fn close_scanner(&mut self) {
-        if let Some(scanner) = self.scanner.as_mut() {
-            if let Err(e) = scanner.close() {
-                warn!("failed to close starrocks scanner: {}", e);
-            }
+        if let Some(scanner) = self.scanner.as_mut()
+            && let Err(e) = scanner.close()
+        {
+            warn!("failed to close starrocks scanner: {}", e);
         }
         self.scanner = None;
     }
@@ -258,12 +258,12 @@ impl Iterator for StarRocksScanIter {
         if self.finished {
             return None;
         }
-        if let Some(remaining) = self.remaining_limit() {
-            if remaining == 0 {
-                self.finished = true;
-                self.close_scanner();
-                return None;
-            }
+        if let Some(remaining) = self.remaining_limit()
+            && remaining == 0
+        {
+            self.finished = true;
+            self.close_scanner();
+            return None;
         }
 
         loop {
@@ -308,14 +308,14 @@ impl Iterator for StarRocksScanIter {
                     let mut out_chunk = chunk;
                     let chunk_rows = rows;
                     let remaining = self.remaining_limit();
-                    if let Some(remaining) = remaining {
-                        if chunk_rows > remaining {
-                            out_chunk = out_chunk.slice(0, remaining);
-                            self.total_rows = self.total_rows.saturating_add(remaining);
-                            self.finished = true;
-                            self.close_scanner();
-                            return Some(Ok(out_chunk));
-                        }
+                    if let Some(remaining) = remaining
+                        && chunk_rows > remaining
+                    {
+                        out_chunk = out_chunk.slice(0, remaining);
+                        self.total_rows = self.total_rows.saturating_add(remaining);
+                        self.finished = true;
+                        self.close_scanner();
+                        return Some(Ok(out_chunk));
                     }
 
                     self.total_rows = self.total_rows.saturating_add(chunk_rows);

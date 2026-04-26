@@ -89,7 +89,7 @@ fn estimate_join_cost(
             let right_rows = right_stats.output_row_count.max(1.0);
 
             let build_cost = right_size;
-            let probe_penalty = (right_rows / 100_000.0).ln().max(1.0).min(12.0);
+            let probe_penalty = (right_rows / 100_000.0).ln().clamp(1.0, 12.0);
             let probe_cost = left_size * probe_penalty;
 
             CostEstimate {

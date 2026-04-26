@@ -204,7 +204,7 @@ fn apply_three_phase(
     global_aggs.extend(non_distinct.iter().cloned());
     let mut global_merge = Vec::with_capacity(1 + non_distinct.len());
     global_merge.push(false); // distinct agg is an update in the GLOBAL phase
-    global_merge.extend(std::iter::repeat(true).take(non_distinct.len()));
+    global_merge.extend(std::iter::repeat_n(true, non_distinct.len()));
 
     vec![NewExpr {
         op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -280,7 +280,7 @@ fn apply_four_phase(
     // DISTINCT_LOCAL: scalar; [count(x) update, non_distinct merge...].
     let mut dl_merge = Vec::with_capacity(1 + non_distinct.len());
     dl_merge.push(false);
-    dl_merge.extend(std::iter::repeat(true).take(non_distinct.len()));
+    dl_merge.extend(std::iter::repeat_n(true, non_distinct.len()));
     let dl_id = memo.next_expr_id();
     let dl = MExpr {
         id: dl_id,

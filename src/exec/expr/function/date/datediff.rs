@@ -120,9 +120,9 @@ fn years_diff_v2(lhs: NaiveDateTime, rhs: NaiveDateTime) -> i64 {
     } else if month1 == month2 {
         if last_day_of_month1 != last_day_of_month2 {
             if day1 > day2 {
-                if day2 != last_day_of_month2 {
-                    diff -= 1;
-                } else if day1 == last_day_of_month1 && us_of_day1 > us_of_day2 {
+                if day2 != last_day_of_month2
+                    || (day1 == last_day_of_month1 && us_of_day1 > us_of_day2)
+                {
                     diff -= 1;
                 }
             } else if day1 == day2 && day2 != last_day_of_month2 && us_of_day1 > us_of_day2 {
@@ -158,9 +158,7 @@ fn months_diff_v2(lhs: NaiveDateTime, rhs: NaiveDateTime) -> i64 {
     let mut diff = ((year2 - year1) as i64) * 12 + (month2 as i64 - month1 as i64);
 
     if day1 > day2 {
-        if day2 != last_day_of_month2 {
-            diff -= 1;
-        } else if day1 == last_day_of_month1 && us_of_day1 > us_of_day2 {
+        if day2 != last_day_of_month2 || (day1 == last_day_of_month1 && us_of_day1 > us_of_day2) {
             diff -= 1;
         }
     } else if day1 == day2 {
@@ -239,7 +237,7 @@ pub fn eval_datediff(
             (Some(x), Some(y)) => Some((x - y).num_days()),
             _ => None,
         };
-        out.push(v.map(|v| v as i64));
+        out.push(v);
     }
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
 }

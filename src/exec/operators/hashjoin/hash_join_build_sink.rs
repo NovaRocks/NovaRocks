@@ -477,10 +477,11 @@ impl HashJoinBuildSinkOperator {
         }
 
         let mut in_filters = Vec::new();
-        if self.build_row_count > 0 && self.build_row_count <= MAX_RUNTIME_IN_FILTER_CONDITIONS {
-            if let Some(filters) = self.runtime_in_filters.take() {
-                in_filters = filters.into_filters();
-            }
+        if self.build_row_count > 0
+            && self.build_row_count <= MAX_RUNTIME_IN_FILTER_CONDITIONS
+            && let Some(filters) = self.runtime_in_filters.take()
+        {
+            in_filters = filters.into_filters();
         }
 
         let membership_params = self.build_membership_filter_params()?;
@@ -663,7 +664,7 @@ impl HashJoinBuildSinkOperator {
                                 lo: query_id.lo,
                             }),
                             filter_id: Some(filter.filter_id()),
-                            finst_id: finst_id.clone(),
+                            finst_id,
                             build_be_number: Some(build_be_number),
                             data: Some(data.clone()),
                             ..Default::default()
@@ -702,7 +703,7 @@ impl HashJoinBuildSinkOperator {
                                 lo: query_id.lo,
                             }),
                             filter_id: Some(filter.filter_id()),
-                            finst_id: finst_id.clone(),
+                            finst_id,
                             data: Some(data.clone()),
                             ..Default::default()
                         };
@@ -720,14 +721,14 @@ impl HashJoinBuildSinkOperator {
                 }
             }
         }
-        if encoded_bytes > 0 {
-            if let Some(profile) = self.profiles.as_ref() {
-                profile.common.counter_add(
-                    "PartialRuntimeMembershipFilterBytes",
-                    metrics::TUnit::BYTES,
-                    encoded_bytes,
-                );
-            }
+        if encoded_bytes > 0
+            && let Some(profile) = self.profiles.as_ref()
+        {
+            profile.common.counter_add(
+                "PartialRuntimeMembershipFilterBytes",
+                metrics::TUnit::BYTES,
+                encoded_bytes,
+            );
         }
         Ok(())
     }
@@ -903,8 +904,8 @@ impl HashJoinBuildSinkOperator {
             let can_try_bitset = options.enable_join_runtime_bitset_filter
                 && total_rows <= options.global_runtime_filter_build_max_size
                 && param.join_mode() == 1;
-            if can_try_bitset {
-                if let Some(bitset) = maybe_build_runtime_bitset_filter(
+            if can_try_bitset
+                && let Some(bitset) = maybe_build_runtime_bitset_filter(
                     param.filter_id(),
                     param.slot_id(),
                     param.ltype(),
@@ -912,10 +913,10 @@ impl HashJoinBuildSinkOperator {
                     total_rows,
                     param.arrays(),
                     min_max.clone(),
-                )? {
-                    filters.push(RuntimeMembershipFilter::Bitset(bitset));
-                    continue;
-                }
+                )?
+            {
+                filters.push(RuntimeMembershipFilter::Bitset(bitset));
+                continue;
             }
             let mut bloom = RuntimeBloomFilter::with_capacity(
                 param.filter_id(),

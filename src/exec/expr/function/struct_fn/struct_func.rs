@@ -104,7 +104,7 @@ pub fn eval_named_struct(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if args.len() < 2 || args.len() % 2 != 0 {
+    if args.len() < 2 || !args.len().is_multiple_of(2) {
         return Err(format!(
             "named_struct expects an even number of arguments >= 2, got {}",
             args.len()

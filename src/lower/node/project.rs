@@ -166,7 +166,7 @@ pub(crate) fn lower_project_node(
         child.layout.index.keys().collect::<Vec<_>>()
     );
 
-    let output_tuple_id = node.row_tuples.get(0).copied().unwrap_or(0);
+    let output_tuple_id = node.row_tuples.first().copied().unwrap_or(0);
     if !out_layout.order.is_empty() && !output_slot_ids.is_empty() {
         let filtered: Vec<(types::TTupleId, types::TSlotId)> = out_layout
             .order

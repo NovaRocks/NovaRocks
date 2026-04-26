@@ -156,7 +156,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
     }
 
     fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if self.finished || chunk.len() == 0 {
+        if self.finished || chunk.is_empty() {
             return Ok(());
         }
 

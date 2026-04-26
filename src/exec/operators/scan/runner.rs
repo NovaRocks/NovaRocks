@@ -71,6 +71,8 @@ const SCAN_ASYNC_WAIT_INTERVAL: Duration = Duration::from_millis(10);
 const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
 const SCAN_TIME: &str = "ScanTime";
 
+type PositionedChunk = (Chunk, Option<Vec<i64>>);
+
 struct IoExecScope {
     state: Arc<ScanAsyncState>,
     profiles: Option<OperatorProfiles>,
@@ -79,14 +81,14 @@ struct IoExecScope {
 impl IoExecScope {
     fn new(state: Arc<ScanAsyncState>, profiles: Option<OperatorProfiles>) -> Self {
         let idle_ns = state.begin_io_task_exec();
-        if idle_ns > 0 {
-            if let Some(p) = profiles.as_ref() {
-                p.unique.counter_add(
-                    "IOTaskWaitTime",
-                    metrics::TUnit::TIME_NS,
-                    clamp_u128_to_i64(idle_ns),
-                );
-            }
+        if idle_ns > 0
+            && let Some(p) = profiles.as_ref()
+        {
+            p.unique.counter_add(
+                "IOTaskWaitTime",
+                metrics::TUnit::TIME_NS,
+                clamp_u128_to_i64(idle_ns),
+            );
         }
         Self { state, profiles }
     }
@@ -295,21 +297,21 @@ impl ScanAsyncRunner {
                 .add_counter(RUNTIME_IN_FILTER_NUM, metrics::TUnit::UNIT);
         }
         let snapshot = rf.snapshot();
-        if let Some(elapsed) = rf.mark_ready() {
-            if let Some(profile) = self.profiles.as_ref() {
-                let latency_ns = elapsed.as_nanos().min(i64::MAX as u128) as i64;
-                for filter in snapshot.in_filters() {
-                    let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                    profile
-                        .common
-                        .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
-                }
-                for filter in snapshot.membership_filters() {
-                    let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                    profile
-                        .common
-                        .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
-                }
+        if let Some(elapsed) = rf.mark_ready()
+            && let Some(profile) = self.profiles.as_ref()
+        {
+            let latency_ns = elapsed.as_nanos().min(i64::MAX as u128) as i64;
+            for filter in snapshot.in_filters() {
+                let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
+                profile
+                    .common
+                    .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+            }
+            for filter in snapshot.membership_filters() {
+                let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
+                profile
+                    .common
+                    .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
             }
         }
         self.log_runtime_filters_loaded(snapshot.in_filters(), snapshot.membership_filters());
@@ -404,36 +406,36 @@ impl ScanAsyncRunner {
                     let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
                         continue;
                     };
-                    if let Some(filtered) = self.apply_runtime_filters(chunk)? {
-                        if !filtered.is_empty() {
-                            // Check scan-level limit before returning chunk
-                            if let Some(limit) = self.scan.limit() {
-                                let rows = filtered.len();
-                                let prev_rows = dispatch.fetch_add_output_rows(rows);
-                                let total_rows = prev_rows + rows;
+                    if let Some(filtered) = self.apply_runtime_filters(chunk)?
+                        && !filtered.is_empty()
+                    {
+                        // Check scan-level limit before returning chunk
+                        if let Some(limit) = self.scan.limit() {
+                            let rows = filtered.len();
+                            let prev_rows = dispatch.fetch_add_output_rows(rows);
+                            let total_rows = prev_rows + rows;
 
-                                if prev_rows >= limit {
-                                    // Already exceeded limit, discard this chunk and stop
-                                    self.finished = true;
-                                    self.morsel_iter = None;
-                                    dispatch.set_reach_limit();
-                                    return Ok(None);
-                                }
+                            if prev_rows >= limit {
+                                // Already exceeded limit, discard this chunk and stop
+                                self.finished = true;
+                                self.morsel_iter = None;
+                                dispatch.set_reach_limit();
+                                return Ok(None);
+                            }
 
-                                if total_rows >= limit {
-                                    // Just exceeded limit, set flag to stop picking up new morsels
-                                    dispatch.set_reach_limit();
-                                    // Still return this chunk (will be truncated by LimitOperator)
-                                }
+                            if total_rows >= limit {
+                                // Just exceeded limit, set flag to stop picking up new morsels
+                                dispatch.set_reach_limit();
+                                // Still return this chunk (will be truncated by LimitOperator)
                             }
-                            if let Some(profile) = self.profiles.as_ref() {
-                                let rows = i64::try_from(filtered.len()).unwrap_or(i64::MAX);
-                                profile
-                                    .unique
-                                    .counter_add("RowsRead", metrics::TUnit::UNIT, rows);
-                            }
-                            return Ok(Some(filtered));
                         }
+                        if let Some(profile) = self.profiles.as_ref() {
+                            let rows = i64::try_from(filtered.len()).unwrap_or(i64::MAX);
+                            profile
+                                .unique
+                                .counter_add("RowsRead", metrics::TUnit::UNIT, rows);
+                        }
+                        return Ok(Some(filtered));
                     }
                     continue;
                 }
@@ -581,7 +583,7 @@ impl ScanAsyncRunner {
     fn apply_iceberg_position_delete_filter(
         &mut self,
         chunk: Chunk,
-    ) -> Result<Option<(Chunk, Option<Vec<i64>>)>, String> {
+    ) -> Result<Option<PositionedChunk>, String> {
         let row_count = chunk.len();
         if row_count == 0 {
             return Ok(Some((chunk, None)));
@@ -1044,7 +1046,9 @@ impl ScanAsyncRunner {
         self.rf_debug_counter = self.rf_debug_counter.wrapping_add(1);
         let version = rf.handle().version();
         if version != self.rf_debug_last_version
-            || self.rf_debug_counter % RUNTIME_FILTER_DEBUG_EVERY == 0
+            || self
+                .rf_debug_counter
+                .is_multiple_of(RUNTIME_FILTER_DEBUG_EVERY)
         {
             let node_id = self.scan.node_id().unwrap_or(-1);
             debug!(

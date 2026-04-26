@@ -43,7 +43,9 @@ static EVENT_SCHEDULER_MISSING_OBS_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static EVENT_SCHEDULER_BLOCKED_ADD_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_sample_log(counter: &AtomicU64) -> bool {
-    counter.fetch_add(1, Ordering::Relaxed) % EVENT_SCHEDULER_LOG_EVERY == 0
+    counter
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(EVENT_SCHEDULER_LOG_EVERY)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]

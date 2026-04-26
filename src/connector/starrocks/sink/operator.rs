@@ -140,15 +140,15 @@ impl OlapSinkFinalizeSharedState {
                 guard.entry(*tablet_id).or_insert_with(|| target.clone());
             }
         }
-        if !written_tablets.is_empty() {
-            if let Ok(mut guard) = self.written_tablets.lock() {
-                guard.extend(written_tablets.iter().copied());
-            }
+        if !written_tablets.is_empty()
+            && let Ok(mut guard) = self.written_tablets.lock()
+        {
+            guard.extend(written_tablets.iter().copied());
         }
-        if !dirty_partitions.is_empty() {
-            if let Ok(mut guard) = self.dirty_partitions.lock() {
-                guard.extend(dirty_partitions.iter().copied());
-            }
+        if !dirty_partitions.is_empty()
+            && let Ok(mut guard) = self.dirty_partitions.lock()
+        {
+            guard.extend(dirty_partitions.iter().copied());
         }
         if !tablet_commit_infos.is_empty()
             && let Ok(mut guard) = self.tablet_commit_infos.lock()
@@ -201,10 +201,10 @@ impl OlapSinkFinalizeSharedState {
     }
 
     fn record_error(&self, err: String) {
-        if let Ok(mut guard) = self.first_error.lock() {
-            if guard.is_none() {
-                *guard = Some(err);
-            }
+        if let Ok(mut guard) = self.first_error.lock()
+            && guard.is_none()
+        {
+            *guard = Some(err);
         }
     }
 
@@ -426,11 +426,11 @@ fn materialize_auto_increment_for_sink_batch(
     // pre-routing fill (fill_auto_increment_in_chunk_before_routing), so we
     // must NOT allocate again here.
     if auto_policy.null_expr_in_auto_increment {
-        for row_idx in 0..batch.num_rows() {
-            if !auto_column.is_null(row_idx) || rejected[row_idx] {
+        for (row_idx, is_rejected) in rejected.iter_mut().enumerate().take(batch.num_rows()) {
+            if !auto_column.is_null(row_idx) || *is_rejected {
                 continue;
             }
-            rejected[row_idx] = true;
+            *is_rejected = true;
             tracking_logs.push(format!(
                 "Error: NULL value in auto increment column '{}'. Row: {}",
                 auto_col_name,
@@ -755,11 +755,15 @@ fn filter_rows_for_tablet_schema(
                     .name()
                     .to_string()
             });
-        for row_idx in 0..materialized_batch.num_rows() {
-            if !column.is_null(row_idx) || rejected[row_idx] {
+        for (row_idx, is_rejected) in rejected
+            .iter_mut()
+            .enumerate()
+            .take(materialized_batch.num_rows())
+        {
+            if !column.is_null(row_idx) || *is_rejected {
                 continue;
             }
-            rejected[row_idx] = true;
+            *is_rejected = true;
             tracking_logs.push(format!(
                 "Error: NULL value in non-nullable column '{}'. Row: {}",
                 column_name,
@@ -1179,7 +1183,7 @@ impl OlapTableSinkOperator {
         std::thread::scope(|scope| {
             let mut handles = Vec::with_capacity(empty_targets.len());
             for (tablet_id, partition_id, context) in empty_targets {
-                let load_id = self.plan.load_id.clone();
+                let load_id = self.plan.load_id;
                 let txn_id = self.plan.txn_id;
                 handles.push(scope.spawn(move || -> Result<i64, String> {
                     append_lake_txn_log_empty_rowset(
@@ -1781,7 +1785,7 @@ impl OlapTableSinkOperator {
                     let mut plan_random_hash = chunk_random_hash_seed;
                     let routed = route_chunk_rows(
                         &index_plan.row_routing,
-                        &sink_chunk,
+                        sink_chunk,
                         &mut plan_random_hash,
                     )?;
                     if plan_idx == 0 {
@@ -1822,7 +1826,7 @@ impl OlapTableSinkOperator {
                         let routed_chunk = if row_indices.len() == sink_chunk.len() {
                             sink_chunk.clone()
                         } else {
-                            take_chunk_rows(&sink_chunk, &row_indices)?
+                            take_chunk_rows(sink_chunk, &row_indices)?
                         };
                         let Some(routed_chunk) = apply_index_where_clause(
                             &routed_chunk,
@@ -1895,18 +1899,12 @@ impl OlapTableSinkOperator {
                             let filtered_schema = routed_chunk.chunk_schema_ref();
                             Chunk::try_new_with_chunk_schema(filtered_batch.batch, filtered_schema)?
                         };
-                        if routed_chunk.len() == 0 {
+                        if routed_chunk.is_empty() {
                             continue;
                         }
-                        if !buffered_by_tablet.contains_key(&tablet_id) {
-                            buffered_by_tablet.insert(
-                                tablet_id,
-                                TabletBufferedState::new(
-                                    target.partition_id,
-                                    target.context.clone(),
-                                ),
-                            );
-                        }
+                        buffered_by_tablet.entry(tablet_id).or_insert_with(|| {
+                            TabletBufferedState::new(target.partition_id, target.context.clone())
+                        });
                         let buffer = buffered_by_tablet.get_mut(&tablet_id).ok_or_else(|| {
                             format!(
                                 "OLAP_TABLE_SINK tablet buffer missing after insert: tablet_id={}",

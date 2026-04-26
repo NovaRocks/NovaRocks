@@ -248,8 +248,8 @@ impl MannWhitneyState {
             }
             let adjusted = (left as f64 + right as f64 + 1.0) / 2.0;
             tie_num += count_equal.powi(3) - count_equal;
-            for idx in left..right {
-                if combined[idx].1 == 0 {
+            for (_, sample_id) in &combined[left..right] {
+                if *sample_id == 0 {
                     r1 += adjusted;
                 }
             }
@@ -455,26 +455,24 @@ impl AggregateFunction for MannWhitneyUTestAgg {
             if state.is_uninitialized() {
                 let mut alternative = TestingAlternative::TwoSided;
                 let mut continuity = 1;
-                if let Some(alt_arr) = alternative_arr {
-                    if !alt_arr.is_null(row) {
-                        let alt = alt_arr.value(row).to_lowercase();
-                        let parsed = TestingAlternative::from_str(&alt);
-                        if parsed == TestingAlternative::Unknown {
-                            return Err(format!("Logical Error: invalid alternative `{}`.", alt));
-                        }
-                        alternative = parsed;
+                if let Some(alt_arr) = alternative_arr
+                    && !alt_arr.is_null(row)
+                {
+                    let alt = alt_arr.value(row).to_lowercase();
+                    let parsed = TestingAlternative::from_str(&alt);
+                    if parsed == TestingAlternative::Unknown {
+                        return Err(format!("Logical Error: invalid alternative `{}`.", alt));
                     }
+                    alternative = parsed;
                 }
-                if let Some(cont_arr) = continuity_arr.as_ref() {
-                    if let Some(v) = cont_arr.value_at(row) {
-                        if v < 0 {
-                            return Err(
-                                "Logical Error: continuity_correction must be non-negative."
-                                    .to_string(),
-                            );
-                        }
-                        continuity = v;
+                if let Some(cont_arr) = continuity_arr.as_ref()
+                    && let Some(v) = cont_arr.value_at(row)
+                {
+                    if v < 0 {
+                        return Err("Logical Error: continuity_correction must be non-negative."
+                            .to_string());
                     }
+                    continuity = v;
                 }
                 state.init(alternative, continuity);
             }

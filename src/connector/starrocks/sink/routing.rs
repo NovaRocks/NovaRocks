@@ -264,11 +264,8 @@ fn build_row_routing_plan(
     let has_any_range_bound = routing_partitions.iter().any(|part| {
         part.start_keys
             .as_ref()
-            .map_or(false, |keys| !keys.is_empty())
-            || part
-                .end_keys
-                .as_ref()
-                .map_or(false, |keys| !keys.is_empty())
+            .is_some_and(|keys| !keys.is_empty())
+            || part.end_keys.as_ref().is_some_and(|keys| !keys.is_empty())
             || part.start_key.is_some()
             || part.end_key.is_some()
     });
@@ -277,7 +274,7 @@ fn build_row_routing_plan(
     } else if has_any_in_keys {
         if routing_partitions
             .iter()
-            .any(|part| !part.in_keys.as_ref().is_some_and(|v| !v.is_empty()))
+            .any(|part| part.in_keys.as_ref().is_none_or(|v| v.is_empty()))
         {
             return Err(
                 "OLAP_TABLE_SINK mixed list/range partitions are not supported in row routing"

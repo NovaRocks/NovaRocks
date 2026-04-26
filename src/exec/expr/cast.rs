@@ -1738,7 +1738,7 @@ fn cast_list_to_map(
     let values = if source.values().data_type() == target_entries.data_type() {
         source.values().clone()
     } else {
-        cast_with_special_rules(&source.values(), target_entries.data_type())?
+        cast_with_special_rules(source.values(), target_entries.data_type())?
     };
     let entries = values
         .as_any()
@@ -1993,7 +1993,7 @@ fn cast_with_special_rules_with_field_schema(
                 arrow::array::new_null_array(target_field.data_type(), list.values().len())
             } else {
                 cast_with_special_rules_with_field_schema(
-                    &list.values(),
+                    list.values(),
                     target_field.data_type(),
                     target_field_schema.and_then(ChunkFieldSchema::list_item),
                 )?
@@ -4038,11 +4038,11 @@ mod tests {
         let out = cast_utf8_to_boolean_array(&input);
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), true);
-        assert_eq!(out.value(2), false);
-        assert_eq!(out.value(3), false);
-        assert_eq!(out.value(4), true);
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(!out.value(2));
+        assert!(!out.value(3));
+        assert!(out.value(4));
         assert!(out.is_null(5));
         assert!(out.is_null(6));
         assert!(out.is_null(7));
@@ -4176,10 +4176,10 @@ mod tests {
 
         let bool_out = cast_with_special_rules(&arr, &DataType::Boolean).unwrap();
         let bool_out = bool_out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(bool_out.value(0), true);
-        assert_eq!(bool_out.value(1), false);
-        assert_eq!(bool_out.value(2), true);
-        assert_eq!(bool_out.value(3), true);
+        assert!(bool_out.value(0));
+        assert!(!bool_out.value(1));
+        assert!(bool_out.value(2));
+        assert!(bool_out.value(3));
         assert!(bool_out.is_null(4));
 
         let int_out = cast_with_special_rules(&arr, &DataType::Int64).unwrap();
@@ -4280,11 +4280,7 @@ mod tests {
 
     #[test]
     fn test_cast_float32_to_utf8_uses_compact_representation() {
-        let arr = Float32Array::from(vec![
-            Some(0.3690040111541748_f32),
-            Some(1.5_f32),
-            Some(-0.0),
-        ]);
+        let arr = Float32Array::from(vec![Some(0.369_004_f32), Some(1.5_f32), Some(-0.0)]);
         let out = cast_float32_to_utf8_array(&arr);
         let out = out.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(out.value(0), "0.369004");

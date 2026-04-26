@@ -551,7 +551,7 @@ fn broadcast_array(array: &ArrayRef, len: usize) -> Result<ArrayRef, String> {
     if array.len() == len {
         return Ok(array.clone());
     }
-    if array.len() == 0 {
+    if array.is_empty() {
         return Ok(new_empty_array(array.data_type()));
     }
     if array.len() != 1 {

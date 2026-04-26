@@ -766,7 +766,7 @@ fn scalar_from_array(array: &ArrayRef, row: usize) -> Result<Option<ArrayAggValu
             let values = arr.values();
             let mut out = Vec::with_capacity(end.saturating_sub(start));
             for idx in start..end {
-                out.push(scalar_from_array(&values, idx)?);
+                out.push(scalar_from_array(values, idx)?);
             }
             Ok(Some(ArrayAggValue::List(out)))
         }
@@ -1146,9 +1146,7 @@ fn build_scalar_array(
     }
 }
 
-fn merge_input_list_array<'a>(
-    array: &'a ArrayRef,
-) -> Result<(&'a ListArray, Option<&'a StructArray>), String> {
+fn merge_input_list_array(array: &ArrayRef) -> Result<(&ListArray, Option<&StructArray>), String> {
     if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
         return Ok((list, None));
     }
@@ -1287,25 +1285,24 @@ impl AggregateFunction for ArrayAggAgg {
         let AggInputView::Any(array) = input else {
             return Err("array_agg batch input type mismatch".to_string());
         };
-        if matches!(spec.kind, AggKind::ArrayUniqueAgg) {
-            if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
-                let values = list.values();
-                let offsets = list.value_offsets();
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if list.is_null(row) {
-                        continue;
-                    }
-                    let state =
-                        unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
-                    let start = offsets[row] as usize;
-                    let end = offsets[row + 1] as usize;
-                    for idx in start..end {
-                        let value = scalar_from_array(&values, idx)?;
-                        append_value(state, value, true);
-                    }
+        if matches!(spec.kind, AggKind::ArrayUniqueAgg)
+            && let Some(list) = array.as_any().downcast_ref::<ListArray>()
+        {
+            let values = list.values();
+            let offsets = list.value_offsets();
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if list.is_null(row) {
+                    continue;
                 }
-                return Ok(());
+                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut ArrayAggState) };
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                for idx in start..end {
+                    let value = scalar_from_array(values, idx)?;
+                    append_value(state, value, true);
+                }
             }
+            return Ok(());
         }
 
         let (value_array, wrapper_array) = unwrap_update_value_array(spec, array)?;
@@ -1354,7 +1351,7 @@ impl AggregateFunction for ArrayAggAgg {
             let end = first_offsets[row + 1] as usize;
             for idx in start..end {
                 if matches!(spec.kind, AggKind::ArrayUniqueAgg) {
-                    let value = scalar_from_array(&first_values, idx)?;
+                    let value = scalar_from_array(first_values, idx)?;
                     append_value(state, value, true);
                     continue;
                 }
@@ -1380,13 +1377,11 @@ impl AggregateFunction for ArrayAggAgg {
                                 col_idx
                             ));
                         }
-                        row_values.push(scalar_from_array(&list.values(), idx)?);
+                        row_values.push(scalar_from_array(list.values(), idx)?);
                     }
                     state.rows.push(row_values);
                 } else {
-                    state
-                        .rows
-                        .push(vec![scalar_from_array(&first_values, idx)?]);
+                    state.rows.push(vec![scalar_from_array(first_values, idx)?]);
                 }
             }
         }
@@ -1477,9 +1472,8 @@ impl AggregateFunction for ArrayAggAgg {
                     }
                     out_offsets.push(current as i32);
                     for row in rows {
-                        for col_idx in 0..fields.len() {
-                            flattened_by_col[col_idx]
-                                .push(row.get(col_idx).cloned().unwrap_or(None));
+                        for (col_idx, values) in flattened_by_col.iter_mut().enumerate() {
+                            values.push(row.get(col_idx).cloned().unwrap_or(None));
                         }
                     }
                 }

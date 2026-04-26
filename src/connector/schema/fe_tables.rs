@@ -1932,50 +1932,6 @@ fn put_f64(row: &mut SchemaRow, column: &str, value: Option<OrderedFloat<f64>>) 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_task_run_row_matches_starrocks_task_runs_layout() {
-        let info = frontend_service::TTaskRunInfo {
-            query_id: Some("query-1".to_string()),
-            task_name: Some("task-1".to_string()),
-            create_time: Some(1_700_000_000),
-            finish_time: Some(1_700_000_100),
-            state: Some("SUCCESS".to_string()),
-            database: Some("db1".to_string()),
-            definition: Some("submit task".to_string()),
-            expire_time: Some(1_700_000_200),
-            error_code: Some(0),
-            error_message: Some(String::new()),
-            progress: Some("100%".to_string()),
-            extra_message: Some("done".to_string()),
-            properties: Some("{\"k\":\"v\"}".to_string()),
-            catalog: Some("default_catalog".to_string()),
-            warehouse: Some("default_warehouse".to_string()),
-            job_id: Some("42".to_string()),
-            process_time: Some(1_700_000_300),
-        };
-
-        let row = build_task_run_row(&info);
-
-        assert_eq!(
-            row.get(&normalize_column_key("CATALOG")),
-            Some(&SchemaValue::Utf8("default_catalog".to_string()))
-        );
-        assert_eq!(
-            row.get(&normalize_column_key("WAREHOUSE")),
-            Some(&SchemaValue::Utf8("default_warehouse".to_string()))
-        );
-        assert_eq!(
-            row.get(&normalize_column_key("JOB_ID")),
-            Some(&SchemaValue::Int64(42))
-        );
-        assert!(row.contains_key(&normalize_column_key("PROCESS_TIME")));
-    }
-}
-
 fn put_f64_from_string(row: &mut SchemaRow, column: &str, value: Option<&str>) {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return;
@@ -2146,4 +2102,48 @@ fn normalize_dependency_object_type(value: &str) -> &str {
 
 fn extract_db_name_owned(full_name: &str) -> String {
     extract_db_name(full_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_task_run_row_matches_starrocks_task_runs_layout() {
+        let info = frontend_service::TTaskRunInfo {
+            query_id: Some("query-1".to_string()),
+            task_name: Some("task-1".to_string()),
+            create_time: Some(1_700_000_000),
+            finish_time: Some(1_700_000_100),
+            state: Some("SUCCESS".to_string()),
+            database: Some("db1".to_string()),
+            definition: Some("submit task".to_string()),
+            expire_time: Some(1_700_000_200),
+            error_code: Some(0),
+            error_message: Some(String::new()),
+            progress: Some("100%".to_string()),
+            extra_message: Some("done".to_string()),
+            properties: Some("{\"k\":\"v\"}".to_string()),
+            catalog: Some("default_catalog".to_string()),
+            warehouse: Some("default_warehouse".to_string()),
+            job_id: Some("42".to_string()),
+            process_time: Some(1_700_000_300),
+        };
+
+        let row = build_task_run_row(&info);
+
+        assert_eq!(
+            row.get(&normalize_column_key("CATALOG")),
+            Some(&SchemaValue::Utf8("default_catalog".to_string()))
+        );
+        assert_eq!(
+            row.get(&normalize_column_key("WAREHOUSE")),
+            Some(&SchemaValue::Utf8("default_warehouse".to_string()))
+        );
+        assert_eq!(
+            row.get(&normalize_column_key("JOB_ID")),
+            Some(&SchemaValue::Int64(42))
+        );
+        assert!(row.contains_key(&normalize_column_key("PROCESS_TIME")));
+    }
 }

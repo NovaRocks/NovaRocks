@@ -27,7 +27,7 @@ pub(crate) fn lower_map_expr(
     arena: &mut ExprArena,
     data_type: DataType,
 ) -> Result<ExprId, String> {
-    if children.len() % 2 != 0 {
+    if !children.len().is_multiple_of(2) {
         return Err(format!(
             "MAP_EXPR expects an even number of children, got {}",
             children.len()

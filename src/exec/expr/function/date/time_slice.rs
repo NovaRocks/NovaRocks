@@ -120,7 +120,7 @@ fn i64_at(values: &[Option<i64>], row: usize, len: usize) -> Option<i64> {
     values.get(idx).copied().flatten()
 }
 
-fn str_at<'a>(arr: &'a StringArray, row: usize, len: usize) -> Option<&'a str> {
+fn str_at(arr: &StringArray, row: usize, len: usize) -> Option<&str> {
     let idx = if arr.len() == 1 && len > 1 { 0 } else { row };
     if idx >= arr.len() || arr.is_null(idx) {
         None

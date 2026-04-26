@@ -141,7 +141,7 @@ fn build_timestamp_array(
     output_type: &DataType,
 ) -> Result<ArrayRef, String> {
     let (unit, tz) = match output_type {
-        DataType::Timestamp(unit, tz) => (unit.clone(), tz.as_deref().map(|s| s.to_string())),
+        DataType::Timestamp(unit, tz) => (*unit, tz.as_deref().map(|s| s.to_string())),
         other => {
             return Err(format!(
                 "from_unixtime unsupported output type: {:?}",
@@ -271,8 +271,8 @@ fn eval_from_unixtime_inner(
     let default_tz = default_time_zone(arena);
 
     let mut formatted = Vec::with_capacity(values.len());
-    for i in 0..values.len() {
-        let Some(raw_value) = values[i] else {
+    for (i, raw_value) in values.iter().copied().enumerate() {
+        let Some(raw_value) = raw_value else {
             formatted.push(None);
             continue;
         };

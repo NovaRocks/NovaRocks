@@ -313,7 +313,7 @@ impl RuntimeState {
         let opts = self.query_options.as_ref();
         let scan_wait = opts
             .and_then(|opts| opts.runtime_filter_scan_wait_time_ms)
-            .and_then(|v| (v >= 0).then_some(v as i64));
+            .and_then(|v| (v >= 0).then_some(v));
         let override_scan =
             config::runtime_filter_scan_wait_time_ms_override().and_then(|v| (v >= 0).then_some(v));
         let ms = override_scan.or(scan_wait)?;

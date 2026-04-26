@@ -347,10 +347,10 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
 
         for (idx, col) in op.table.columns.iter().enumerate() {
-            if let Some(ref req) = required {
-                if !req.contains(&col.name.to_lowercase()) {
-                    continue;
-                }
+            if let Some(ref req) = required
+                && !req.contains(&col.name.to_lowercase())
+            {
+                continue;
             }
             let slot_id = self.alloc_slot();
             self.desc_builder.add_slot(
@@ -1227,7 +1227,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Close the partial fragment with Unpartitioned/Gather sender into the merging exchange.
         let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
         let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
-        let exchange_partition_type = output_partition.type_.clone();
+        let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,
@@ -2167,7 +2167,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         } = child;
 
         let output_partition = self.build_output_partition(&op.spec, &scope)?;
-        let exchange_partition_type = output_partition.type_.clone();
+        let exchange_partition_type = output_partition.type_;
 
         self.completed_fragments.push(FragmentBuildResult {
             fragment_id: child_fragment_id,

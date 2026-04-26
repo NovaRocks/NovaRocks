@@ -1102,7 +1102,10 @@ fn synthetic_schema_type_from_output_arrow_type(
         DataType::Utf8 => Some((STARROCKS_TYPE_VARCHAR.to_string(), None, None)),
         DataType::Binary => Some((STARROCKS_TYPE_VARBINARY.to_string(), None, None)),
         DataType::Decimal128(precision, scale) => {
-            let p = u8::try_from(*precision).ok().filter(|v| *v > 0)?;
+            let p = *precision;
+            if p == 0 {
+                return None;
+            }
             let schema_type = if p <= 9 {
                 STARROCKS_TYPE_DECIMAL32
             } else if p <= 18 {
@@ -1113,7 +1116,10 @@ fn synthetic_schema_type_from_output_arrow_type(
             Some((schema_type.to_string(), Some(p), Some(*scale)))
         }
         DataType::Decimal256(precision, scale) => {
-            let p = u8::try_from(*precision).ok().filter(|v| *v > 0)?;
+            let p = *precision;
+            if p == 0 {
+                return None;
+            }
             Some((STARROCKS_TYPE_DECIMAL256.to_string(), Some(p), Some(*scale)))
         }
         DataType::List(_) => Some(("ARRAY".to_string(), None, None)),
@@ -1410,11 +1416,15 @@ fn align_struct_source_children<'a>(
                 .unwrap_or_else(|| field.name());
             let normalized_current_name = normalize_column_name(current_name);
             let mut found = None;
-            for source_idx in next_source_name_idx..source_col.children_columns.len() {
-                if matched_source_indexes[source_idx] {
+            for (source_idx, (matched, source_child)) in matched_source_indexes
+                .iter()
+                .zip(source_col.children_columns.iter())
+                .enumerate()
+                .skip(next_source_name_idx)
+            {
+                if *matched {
                     continue;
                 }
-                let source_child = &source_col.children_columns[source_idx];
                 let Some(source_name) = source_child
                     .name
                     .as_deref()
@@ -2028,20 +2038,19 @@ fn build_schema_column_plan(
                 .zip(schema_col.children_columns.iter())
                 .enumerate()
             {
-                if let Some(schema_child_name) = child_schema_col.name.as_deref() {
-                    if normalize_column_name(schema_child_name)
+                if let Some(schema_child_name) = child_schema_col.name.as_deref()
+                    && normalize_column_name(schema_child_name)
                         != normalize_column_name(field.name())
-                    {
-                        return Err(format!(
-                            "STRUCT field name mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, field_index={}, schema_field_name={}, output_field_name={}",
-                            tablet_id,
-                            version,
-                            output_path,
-                            idx,
-                            schema_child_name,
-                            field.name()
-                        ));
-                    }
+                {
+                    return Err(format!(
+                        "STRUCT field name mismatch in rust native starrocks reader: tablet_id={}, version={}, output_field={}, field_index={}, schema_field_name={}, output_field_name={}",
+                        tablet_id,
+                        version,
+                        output_path,
+                        idx,
+                        schema_child_name,
+                        field.name()
+                    ));
                 }
                 let (child_source_index, child_source_schema_col, child_source_lookup_attempted) =
                     source_children[idx];

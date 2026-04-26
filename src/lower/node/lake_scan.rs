@@ -301,15 +301,14 @@ pub(crate) fn lower_lake_scan_node(
                 internal_db_name = Some(candidate.to_string());
             }
         }
-        if internal_table_name.is_none() {
-            if let Some(name) = internal
+        if internal_table_name.is_none()
+            && let Some(name) = internal
                 .table_name
                 .as_deref()
                 .map(|v| v.trim())
                 .filter(|v| !v.is_empty())
-            {
-                internal_table_name = Some(name.to_string());
-            }
+        {
+            internal_table_name = Some(name.to_string());
         }
         let fill_data_cache = internal.fill_data_cache.unwrap_or(true);
         let skip_page_cache = internal.skip_page_cache.unwrap_or(false);
@@ -669,10 +668,12 @@ fn normalize_optional_table_name(name: &str, unknown_sentinel: &str) -> Option<S
     }
 }
 
+type ScanQueryGlobalDicts = HashMap<SlotId, Arc<HashMap<Vec<u8>, i32>>>;
+
 fn build_scan_query_global_dicts(
     output_slots: &[SlotId],
     query_global_dict_map: &QueryGlobalDictMap,
-) -> Result<HashMap<SlotId, Arc<HashMap<Vec<u8>, i32>>>, String> {
+) -> Result<ScanQueryGlobalDicts, String> {
     let mut out = HashMap::new();
     for slot_id in output_slots {
         let raw_slot_id = i32::try_from(slot_id.as_u32()).map_err(|_| {
@@ -686,13 +687,13 @@ fn build_scan_query_global_dicts(
         };
         let mut value_to_id = HashMap::with_capacity(dict_values.len());
         for (id, value) in dict_values.iter() {
-            if let Some(existing) = value_to_id.insert(value.clone(), *id) {
-                if existing != *id {
-                    return Err(format!(
-                        "query global dict has duplicated string with different ids: slot_id={}, existing_id={}, new_id={}",
-                        slot_id, existing, id
-                    ));
-                }
+            if let Some(existing) = value_to_id.insert(value.clone(), *id)
+                && existing != *id
+            {
+                return Err(format!(
+                    "query global dict has duplicated string with different ids: slot_id={}, existing_id={}, new_id={}",
+                    slot_id, existing, id
+                ));
             }
         }
         out.insert(*slot_id, Arc::new(value_to_id));

@@ -332,7 +332,7 @@ fn build_intermediate_binary_array(
         buf[..8].copy_from_slice(&state.mean.to_le_bytes());
         buf[8..16].copy_from_slice(&state.m2.to_le_bytes());
         buf[16..].copy_from_slice(&state.count.to_le_bytes());
-        builder.append_value(&buf);
+        builder.append_value(buf);
     }
     Ok(std::sync::Arc::new(builder.finish()))
 }

@@ -404,9 +404,7 @@ fn key_fingerprint(key: &AggScalarValue) -> Vec<u8> {
     }
 
     let mut out = Vec::new();
-    match key {
-        _ => encode_scalar(&mut out, key),
-    }
+    encode_scalar(&mut out, key);
     out
 }
 

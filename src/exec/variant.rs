@@ -164,10 +164,10 @@ impl VariantMetadata {
             if start + key_len > self.raw.len() {
                 return indexes;
             }
-            if let Ok(field_key) = std::str::from_utf8(&self.raw[start..start + key_len]) {
-                if field_key == key {
-                    indexes.push(i as u32);
-                }
+            if let Ok(field_key) = std::str::from_utf8(&self.raw[start..start + key_len])
+                && field_key == key
+            {
+                indexes.push(i as u32);
             }
             prev_key_offset = next_key_offset;
         }
@@ -1040,7 +1040,7 @@ fn load_metadata(variant: &[u8]) -> Result<&[u8], String> {
         return Err(format!("Unsupported variant version: {}", version));
     }
     let offset_size = 1 + ((header & OFFSET_SIZE_MASK) >> OFFSET_SIZE_SHIFT);
-    if offset_size < 1 || offset_size > 4 {
+    if !(1..=4).contains(&offset_size) {
         return Err(format!(
             "Invalid offset size in variant metadata: {}",
             offset_size
@@ -1081,8 +1081,8 @@ fn read_le_u32(data: &[u8], size: u8) -> Result<u32, String> {
         return Err("Not enough bytes to read value".to_string());
     }
     let mut out: u32 = 0;
-    for i in 0..(size as usize) {
-        out |= (data[i] as u32) << (8 * i);
+    for (i, byte) in data.iter().copied().enumerate().take(size as usize) {
+        out |= (byte as u32) << (8 * i);
     }
     Ok(out)
 }

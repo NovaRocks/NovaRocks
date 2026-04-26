@@ -580,12 +580,8 @@ impl SortProcessorOperator {
             let elapsed_ns = start.elapsed().as_nanos();
             let elapsed_ns = i64::try_from(elapsed_ns).unwrap_or(i64::MAX);
             profile.spill_time.add(elapsed_ns);
-            profile
-                .spill_rows
-                .add(i64::try_from(run_rows).unwrap_or(i64::MAX));
-            profile
-                .spill_bytes
-                .add(i64::try_from(run_bytes).unwrap_or(i64::MAX));
+            profile.spill_rows.add(run_rows);
+            profile.spill_bytes.add(run_bytes);
         }
         self.buffered.clear();
         self.buffered_bytes = 0;

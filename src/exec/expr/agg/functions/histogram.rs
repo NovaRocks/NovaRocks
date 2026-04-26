@@ -290,17 +290,17 @@ impl AggregateFunction for HistogramAgg {
                 }
             }
 
-            if let Some(estimator_arr) = estimator_arr {
-                if !estimator_arr.is_null(row) {
-                    let name = estimator_arr.value(row).to_string();
-                    let name = name.to_uppercase();
-                    if let Some(prev) = state.ndv_estimator.as_ref() {
-                        if prev != &name {
-                            return Err("histogram ndv estimator must be constant".to_string());
-                        }
-                    } else {
-                        state.ndv_estimator = Some(name);
+            if let Some(estimator_arr) = estimator_arr
+                && !estimator_arr.is_null(row)
+            {
+                let name = estimator_arr.value(row).to_string();
+                let name = name.to_uppercase();
+                if let Some(prev) = state.ndv_estimator.as_ref() {
+                    if prev != &name {
+                        return Err("histogram ndv estimator must be constant".to_string());
                     }
+                } else {
+                    state.ndv_estimator = Some(name);
                 }
             }
 
@@ -917,7 +917,7 @@ fn parse_histogram_hll_ndv_buckets(
     Ok(buckets)
 }
 
-fn json_bucket_field_as_str<'a>(value: &'a Value, index: usize) -> Result<&'a str, String> {
+fn json_bucket_field_as_str(value: &Value, index: usize) -> Result<&str, String> {
     value
         .as_str()
         .ok_or_else(|| format!("histogram_hll_ndv bucket field {index} must be string"))
@@ -1123,10 +1123,10 @@ fn parse_histogram_bucket_scalar(
             parse_histogram_bucket_timestamp(text, unit)?,
         )),
         DataType::Decimal128(precision, scale) => Ok(AggScalarValue::Decimal128(
-            parse_histogram_bucket_decimal(text, *precision, *scale as i8)?,
+            parse_histogram_bucket_decimal(text, *precision, *scale)?,
         )),
         DataType::Decimal256(precision, scale) => Ok(AggScalarValue::Decimal256(
-            parse_histogram_bucket_decimal256(text, *precision, *scale as i8)?,
+            parse_histogram_bucket_decimal256(text, *precision, *scale)?,
         )),
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => Ok(
             AggScalarValue::Decimal128(text.parse::<i128>().map_err(|e| {

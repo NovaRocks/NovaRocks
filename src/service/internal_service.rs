@@ -130,7 +130,7 @@ fn validate_destinations(
         validate_network_address(
             dest.brpc_server
                 .as_ref()
-                .or_else(|| dest.deprecated_server.as_ref()),
+                .or(dest.deprecated_server.as_ref()),
             "missing destination address",
             &format!("{field_name}[{idx}]"),
         )?;
@@ -145,42 +145,42 @@ fn validate_internal_addresses(
     if let Some(dests) = exec_params.destinations.as_ref() {
         validate_destinations(dests, "destinations")?;
     }
-    if let Some(params) = exec_params.runtime_filter_params.as_ref() {
-        if let Some(id_to_probers) = params.id_to_prober_params.as_ref() {
-            for (filter_id, probers) in id_to_probers {
-                for (idx, prober) in probers.iter().enumerate() {
-                    validate_network_address(
-                        prober.fragment_instance_address.as_ref(),
-                        "missing runtime filter prober address",
-                        &format!(
-                            "runtime_filter_params.id_to_prober_params[{filter_id}][{idx}].fragment_instance_address"
-                        ),
-                    )?;
-                }
+    if let Some(params) = exec_params.runtime_filter_params.as_ref()
+        && let Some(id_to_probers) = params.id_to_prober_params.as_ref()
+    {
+        for (filter_id, probers) in id_to_probers {
+            for (idx, prober) in probers.iter().enumerate() {
+                validate_network_address(
+                    prober.fragment_instance_address.as_ref(),
+                    "missing runtime filter prober address",
+                    &format!(
+                        "runtime_filter_params.id_to_prober_params[{filter_id}][{idx}].fragment_instance_address"
+                    ),
+                )?;
             }
         }
     }
     if let Some(fragment) = fragment {
         if let Some(plan) = fragment.plan.as_ref() {
             for node in &plan.nodes {
-                if let Some(fetch) = node.fetch_node.as_ref() {
-                    if let Some(nodes_info) = fetch.nodes_info.as_ref() {
-                        validate_nodes_info(nodes_info, "fetch.nodes_info")?;
-                    }
+                if let Some(fetch) = node.fetch_node.as_ref()
+                    && let Some(nodes_info) = fetch.nodes_info.as_ref()
+                {
+                    validate_nodes_info(nodes_info, "fetch.nodes_info")?;
                 }
-                if let Some(join) = node.hash_join_node.as_ref() {
-                    if let Some(filters) = join.build_runtime_filters.as_ref() {
-                        for (filter_idx, desc) in filters.iter().enumerate() {
-                            if let Some(merge_nodes) = desc.runtime_filter_merge_nodes.as_ref() {
-                                for (node_idx, addr) in merge_nodes.iter().enumerate() {
-                                    validate_network_address(
-                                        Some(addr),
-                                        "missing runtime filter merge address",
-                                        &format!(
-                                            "hash_join.build_runtime_filters[{filter_idx}].runtime_filter_merge_nodes[{node_idx}]"
-                                        ),
-                                    )?;
-                                }
+                if let Some(join) = node.hash_join_node.as_ref()
+                    && let Some(filters) = join.build_runtime_filters.as_ref()
+                {
+                    for (filter_idx, desc) in filters.iter().enumerate() {
+                        if let Some(merge_nodes) = desc.runtime_filter_merge_nodes.as_ref() {
+                            for (node_idx, addr) in merge_nodes.iter().enumerate() {
+                                validate_network_address(
+                                    Some(addr),
+                                    "missing runtime filter merge address",
+                                    &format!(
+                                        "hash_join.build_runtime_filters[{filter_idx}].runtime_filter_merge_nodes[{node_idx}]"
+                                    ),
+                                )?;
                             }
                         }
                     }
@@ -369,7 +369,7 @@ fn columns_for_output_exprs(
     for (col_idx, e) in output_exprs.iter().enumerate() {
         let root = e
             .nodes
-            .get(0)
+            .first()
             .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
         if root.node_type != exprs::TExprNodeType::SLOT_REF {
             return Err(format!(
@@ -396,7 +396,7 @@ fn primitives_for_output_exprs(
     for (col_idx, e) in output_exprs.iter().enumerate() {
         let root = e
             .nodes
-            .get(0)
+            .first()
             .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
         let primitive =
             primitive_type_from_desc(&root.type_).unwrap_or(types::TPrimitiveType::INVALID_TYPE);
@@ -424,7 +424,7 @@ fn field_schemas_for_output_exprs(
     for (col_idx, e) in output_exprs.iter().enumerate() {
         let root = e
             .nodes
-            .get(0)
+            .first()
             .ok_or_else(|| format!("output_exprs[{}] is empty", col_idx))?;
         out.push(ChunkFieldSchema::try_from_type_desc(
             format!("col_{col_idx}"),
@@ -578,7 +578,7 @@ fn field_optional_string(
 }
 
 fn normalize_hll_hex_payload(raw: &[u8]) -> Vec<u8> {
-    if raw.len() % 2 == 0 && raw.iter().all(|b| b.is_ascii_hexdigit()) {
+    if raw.len().is_multiple_of(2) && raw.iter().all(|b| b.is_ascii_hexdigit()) {
         return raw.to_vec();
     }
     hex::encode_upper(raw).into_bytes()
@@ -1161,13 +1161,14 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         let (delivery_expire, query_expire) = query_expire_durations(common_query_opts);
         let require_existing = common_desc_tbl.map(desc_tbl_is_cached).unwrap_or(false);
         mgr.ensure_context(query_id, require_existing, delivery_expire, query_expire)?;
-        if let Some(desc_tbl) = common_desc_tbl {
-            if !desc_tbl_is_cached(desc_tbl) && !is_desc_tbl_effectively_empty(desc_tbl) {
-                mgr.with_context_mut(query_id, |ctx| {
-                    ctx.desc_tbl = Some(desc_tbl.clone());
-                    Ok(())
-                })?;
-            }
+        if let Some(desc_tbl) = common_desc_tbl
+            && !desc_tbl_is_cached(desc_tbl)
+            && !is_desc_tbl_effectively_empty(desc_tbl)
+        {
+            mgr.with_context_mut(query_id, |ctx| {
+                ctx.desc_tbl = Some(desc_tbl.clone());
+                Ok(())
+            })?;
         }
     }
 
@@ -1335,10 +1336,11 @@ pub fn submit_exec_batch_plan_fragments(thrift_bytes: &[u8]) -> Result<usize, St
         created += 1;
     }
 
-    if !sender_counts_applied && !sender_counts.is_empty() {
-        if let Some(query_id) = query_id_for_batch {
-            mgr.update_exchange_sender_counts(query_id, sender_counts)?;
-        }
+    if !sender_counts_applied
+        && !sender_counts.is_empty()
+        && let Some(query_id) = query_id_for_batch
+    {
+        mgr.update_exchange_sender_counts(query_id, sender_counts)?;
     }
 
     if query_id_for_batch.is_none() {

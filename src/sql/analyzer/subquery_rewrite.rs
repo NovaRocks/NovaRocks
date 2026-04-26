@@ -462,14 +462,14 @@ impl<'a> AnalyzerContext<'a> {
         // extraction.  E.g. `(corr AND X) OR (corr AND Y)` → `corr AND (X OR Y)`
         // so the correlation predicate lands at the top-level AND and can be
         // extracted normally (matching StarRocks FE behaviour).
-        if let QueryBody::Select(ref mut sel) = resolved_sub.body {
-            if let Some(ref filter) = sel.filter {
-                sel.filter = Some(factor_common_correlation_from_or(
-                    filter,
-                    &inner_scope,
-                    scope,
-                ));
-            }
+        if let QueryBody::Select(ref mut sel) = resolved_sub.body
+            && let Some(ref filter) = sel.filter
+        {
+            sel.filter = Some(factor_common_correlation_from_or(
+                filter,
+                &inner_scope,
+                scope,
+            ));
         }
 
         // Detect correlation by examining the subquery's WHERE for predicates

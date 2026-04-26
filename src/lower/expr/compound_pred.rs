@@ -215,9 +215,9 @@ mod tests {
         let array = arena.eval(id, &chunk).expect("eval");
         let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(arr.len(), 4);
-        assert_eq!(arr.value(0), true);
-        assert_eq!(arr.value(1), false);
+        assert!(arr.value(0));
+        assert!(!arr.value(1));
         assert!(arr.is_null(2));
-        assert_eq!(arr.value(3), false);
+        assert!(!arr.value(3));
     }
 }

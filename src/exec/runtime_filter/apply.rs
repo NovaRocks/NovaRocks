@@ -110,16 +110,16 @@ pub(crate) fn filter_chunk_by_in_filters(
             continue;
         }
         let array = chunk.column_by_slot_id(filter.slot_id())?;
-        for row in 0..len {
-            if !keep[row] {
+        for (row, keep_row) in keep.iter_mut().enumerate().take(len) {
+            if !*keep_row {
                 continue;
             }
             if array.is_null(row) {
-                keep[row] = false;
+                *keep_row = false;
                 continue;
             }
             if !filter.contains(&array, row)? {
-                keep[row] = false;
+                *keep_row = false;
             }
         }
         if keep.iter().all(|v| !*v) {

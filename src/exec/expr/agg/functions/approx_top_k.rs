@@ -59,7 +59,7 @@ impl Default for ApproxTopKState {
 }
 
 fn default_counter_num(k: usize) -> usize {
-    (2 * k).max(100).min(MAX_COUNTER_NUM)
+    (2 * k).clamp(100, MAX_COUNTER_NUM)
 }
 
 fn clamp_k(v: i64) -> Option<usize> {
@@ -557,7 +557,7 @@ impl AggregateFunction for ApproxTopKAgg {
                 .types
                 .as_ref()
                 .and_then(|t| t.intermediate_type.clone())
-                .unwrap_or_else(|| DataType::Binary);
+                .unwrap_or(DataType::Binary);
             return Ok(AggSpec {
                 kind: AggKind::ApproxTopK,
                 output_type,
@@ -576,7 +576,7 @@ impl AggregateFunction for ApproxTopKAgg {
             .types
             .as_ref()
             .and_then(|t| t.intermediate_type.clone())
-            .unwrap_or_else(|| DataType::Binary);
+            .unwrap_or(DataType::Binary);
         let input_arg_type = match input_type {
             DataType::Struct(fields) => fields.first().map(|f| f.data_type().clone()),
             other => Some(other.clone()),

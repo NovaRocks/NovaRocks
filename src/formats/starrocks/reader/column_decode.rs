@@ -314,16 +314,16 @@ pub(super) fn decode_column_values_by_total_rows(
                 segment_path, output_name, total_num_values, decoded.num_values
             ));
         }
-        if let Some(flags) = decoded.null_flags.as_ref() {
-            if flags.len() != total_num_values {
-                return Err(format!(
-                    "decoded null flag count mismatch for single-page column: segment={}, output_column={}, expected_rows={}, actual_null_flags={}",
-                    segment_path,
-                    output_name,
-                    total_num_values,
-                    flags.len()
-                ));
-            }
+        if let Some(flags) = decoded.null_flags.as_ref()
+            && flags.len() != total_num_values
+        {
+            return Err(format!(
+                "decoded null flag count mismatch for single-page column: segment={}, output_column={}, expected_rows={}, actual_null_flags={}",
+                segment_path,
+                output_name,
+                total_num_values,
+                flags.len()
+            ));
         }
         return Ok(decoded);
     }

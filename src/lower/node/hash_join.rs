@@ -224,10 +224,10 @@ pub(crate) fn lower_hash_join_node(
         }
     }
     for key in probe_keys.iter().chain(build_keys.iter()) {
-        if let Some(dt) = arena.data_type(*key) {
-            if matches!(dt, DataType::LargeBinary) {
-                return Err("VARIANT is not supported in HASH_JOIN keys".to_string());
-            }
+        if let Some(dt) = arena.data_type(*key)
+            && matches!(dt, DataType::LargeBinary)
+        {
+            return Err("VARIANT is not supported in HASH_JOIN keys".to_string());
         }
     }
 
@@ -271,90 +271,89 @@ pub(crate) fn lower_hash_join_node(
         .build_runtime_filters
         .as_ref()
         .filter(|v| !v.is_empty())
-    {
-        if matches!(
+        && matches!(
             join_type,
             JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
-        ) {
-            if join.eq_join_conjuncts.is_empty() {
-                return Err("HASH_JOIN_NODE runtime filters require eq_join_conjuncts".to_string());
-            }
-            for desc in filters {
-                let filter_id = desc
-                    .filter_id
-                    .ok_or_else(|| "runtime filter missing filter_id".to_string())?;
-                let expr_order = desc
-                    .expr_order
-                    .ok_or_else(|| format!("runtime filter {} missing expr_order", filter_id))?
-                    as usize;
-                if expr_order >= join.eq_join_conjuncts.len() {
-                    return Err(format!(
-                        "runtime filter {} expr_order {} out of range (eq_join_conjuncts={})",
-                        filter_id,
-                        expr_order,
-                        join.eq_join_conjuncts.len()
-                    ));
-                }
-                if eq_null_safe.get(expr_order).copied().unwrap_or(false) {
-                    // Null-safe equality (`<=>`) must preserve NULL-key matches.
-                    // Runtime filters currently prune NULL probe rows, so skip building
-                    // runtime filters on null-safe join keys.
-                    continue;
-                }
-                if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER) {
-                    return Err(format!(
-                        "runtime filter {} has unsupported filter_type {:?}",
-                        filter_id, desc.filter_type
-                    ));
-                }
-                let build_key = build_keys
-                    .get(expr_order)
-                    .ok_or_else(|| "runtime filter build key missing".to_string())?;
-                let probe_key = probe_keys
-                    .get(expr_order)
-                    .ok_or_else(|| "runtime filter probe key missing".to_string())?;
-                let build_type = arena
-                    .data_type(*build_key)
-                    .ok_or_else(|| "runtime filter build key type missing".to_string())?;
-                let probe_type = arena
-                    .data_type(*probe_key)
-                    .ok_or_else(|| "runtime filter probe key type missing".to_string())?;
-                let supported = |t: &DataType| {
-                    matches!(
-                        t,
-                        DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Int64
-                            | DataType::Float32
-                            | DataType::Float64
-                            | DataType::Boolean
-                            | DataType::Utf8
-                            | DataType::Date32
-                            | DataType::Timestamp(_, _)
-                            | DataType::Decimal128(_, _)
-                    )
-                };
-                if !supported(build_type) || !supported(probe_type) {
-                    warn!(
-                        "skip runtime filter {} due to unsupported key types build={:?} probe={:?}",
-                        filter_id, build_type, probe_type
-                    );
-                    continue;
-                }
-                let Some(ExprNode::SlotId(probe_slot_id)) = arena.node(*probe_key) else {
-                    continue;
-                };
-                let merge_nodes = desc.runtime_filter_merge_nodes.clone().unwrap_or_default();
-                let has_remote_targets = desc.has_remote_targets.unwrap_or(false);
-                runtime_filters.push(JoinRuntimeFilterSpec {
+        )
+    {
+        if join.eq_join_conjuncts.is_empty() {
+            return Err("HASH_JOIN_NODE runtime filters require eq_join_conjuncts".to_string());
+        }
+        for desc in filters {
+            let filter_id = desc
+                .filter_id
+                .ok_or_else(|| "runtime filter missing filter_id".to_string())?;
+            let expr_order = desc
+                .expr_order
+                .ok_or_else(|| format!("runtime filter {} missing expr_order", filter_id))?
+                as usize;
+            if expr_order >= join.eq_join_conjuncts.len() {
+                return Err(format!(
+                    "runtime filter {} expr_order {} out of range (eq_join_conjuncts={})",
                     filter_id,
                     expr_order,
-                    probe_slot_id: *probe_slot_id,
-                    merge_nodes,
-                    has_remote_targets,
-                });
+                    join.eq_join_conjuncts.len()
+                ));
             }
+            if eq_null_safe.get(expr_order).copied().unwrap_or(false) {
+                // Null-safe equality (`<=>`) must preserve NULL-key matches.
+                // Runtime filters currently prune NULL probe rows, so skip building
+                // runtime filters on null-safe join keys.
+                continue;
+            }
+            if desc.filter_type != Some(runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER) {
+                return Err(format!(
+                    "runtime filter {} has unsupported filter_type {:?}",
+                    filter_id, desc.filter_type
+                ));
+            }
+            let build_key = build_keys
+                .get(expr_order)
+                .ok_or_else(|| "runtime filter build key missing".to_string())?;
+            let probe_key = probe_keys
+                .get(expr_order)
+                .ok_or_else(|| "runtime filter probe key missing".to_string())?;
+            let build_type = arena
+                .data_type(*build_key)
+                .ok_or_else(|| "runtime filter build key type missing".to_string())?;
+            let probe_type = arena
+                .data_type(*probe_key)
+                .ok_or_else(|| "runtime filter probe key type missing".to_string())?;
+            let supported = |t: &DataType| {
+                matches!(
+                    t,
+                    DataType::Int8
+                        | DataType::Int16
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Boolean
+                        | DataType::Utf8
+                        | DataType::Date32
+                        | DataType::Timestamp(_, _)
+                        | DataType::Decimal128(_, _)
+                )
+            };
+            if !supported(build_type) || !supported(probe_type) {
+                warn!(
+                    "skip runtime filter {} due to unsupported key types build={:?} probe={:?}",
+                    filter_id, build_type, probe_type
+                );
+                continue;
+            }
+            let Some(ExprNode::SlotId(probe_slot_id)) = arena.node(*probe_key) else {
+                continue;
+            };
+            let merge_nodes = desc.runtime_filter_merge_nodes.clone().unwrap_or_default();
+            let has_remote_targets = desc.has_remote_targets.unwrap_or(false);
+            runtime_filters.push(JoinRuntimeFilterSpec {
+                filter_id,
+                expr_order,
+                probe_slot_id: *probe_slot_id,
+                merge_nodes,
+                has_remote_targets,
+            });
         }
     }
 

@@ -38,16 +38,11 @@ pub(crate) enum AggMode {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(crate) enum TopNPhase {
     Partial,
+    #[default]
     Final,
-}
-
-impl Default for TopNPhase {
-    fn default() -> Self {
-        TopNPhase::Final
-    }
 }
 
 // ---------------------------------------------------------------------------

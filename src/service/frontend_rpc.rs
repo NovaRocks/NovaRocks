@@ -419,14 +419,8 @@ impl FrontendRpcManager {
         let addr: SocketAddr = format_addr(fe_addr)
             .parse()
             .map_err(|e| FrontendRpcError::application(format!("invalid FE address: {e}")))?;
-        let stream =
-            TcpStream::connect_timeout(&addr, self.settings.connect_timeout).map_err(|e| {
-                if e.raw_os_error() == Some(libc::EMFILE) {
-                    FrontendRpcError::transport(format!("connect FE failed: {e}"))
-                } else {
-                    FrontendRpcError::transport(format!("connect FE failed: {e}"))
-                }
-            })?;
+        let stream = TcpStream::connect_timeout(&addr, self.settings.connect_timeout)
+            .map_err(|e| FrontendRpcError::transport(format!("connect FE failed: {e}")))?;
         let _ = stream.set_read_timeout(Some(self.settings.rpc_timeout));
         let _ = stream.set_write_timeout(Some(self.settings.rpc_timeout));
         let _ = stream.set_nodelay(true);

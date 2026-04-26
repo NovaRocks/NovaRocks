@@ -270,7 +270,7 @@ impl RuntimeFilterHub {
                 .probe_specs_by_node
                 .lock()
                 .expect("runtime filter hub lock");
-            let entry = specs_guard.entry(node_id).or_insert_with(HashMap::new);
+            let entry = specs_guard.entry(node_id).or_default();
             for spec in specs {
                 if let Some(existing) = entry.get(&spec.filter_id) {
                     if *existing != spec.slot_id {
@@ -295,7 +295,7 @@ impl RuntimeFilterHub {
         {
             let mut targets_guard = self.probe_targets.lock().expect("runtime filter hub lock");
             for (&filter_id, &slot_id) in snapshot.iter() {
-                let targets = targets_guard.entry(filter_id).or_insert_with(Vec::new);
+                let targets = targets_guard.entry(filter_id).or_default();
                 if targets.iter().any(|t| t.node_id == node_id) {
                     continue;
                 }

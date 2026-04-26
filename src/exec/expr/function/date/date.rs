@@ -538,7 +538,7 @@ pub fn eval_to_tera_date(
     } else {
         let dates = extract_date_array(&value_arr)?;
         let mut out = Vec::with_capacity(dates.len());
-        for i in 0..dates.len() {
+        for (i, date) in dates.iter().enumerate() {
             if fmt_arr.is_null(i) {
                 out.push(None);
                 continue;
@@ -547,7 +547,7 @@ pub fn eval_to_tera_date(
             if !fmt_cache.contains_key(fmt) {
                 fmt_cache.insert(fmt.to_string(), compile_tera_format(fmt)?);
             }
-            out.push(dates[i].map(naive_to_date32));
+            out.push((*date).map(naive_to_date32));
         }
         out
     };
@@ -634,7 +634,7 @@ fn eval_timestamp_with_custom_format(
     } else {
         let dts = extract_datetime_array(&value_arr)?;
         let mut out = Vec::with_capacity(dts.len());
-        for i in 0..dts.len() {
+        for (i, dt) in dts.iter().enumerate() {
             if fmt_arr.is_null(i) {
                 out.push(None);
                 continue;
@@ -643,7 +643,7 @@ fn eval_timestamp_with_custom_format(
             if !fmt_cache.contains_key(fmt) {
                 fmt_cache.insert(fmt.to_string(), compile_fn(fmt)?);
             }
-            let ts = dts[i].and_then(|dt| to_timestamp_value(dt, &output_type).ok());
+            let ts = (*dt).and_then(|dt| to_timestamp_value(dt, &output_type).ok());
             out.push(ts);
         }
         out

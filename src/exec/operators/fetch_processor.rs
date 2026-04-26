@@ -39,8 +39,10 @@ use crate::exec::chunk::{Chunk, ChunkSchemaRef};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::row_position::RowPositionDescriptor;
+#[cfg(feature = "compat")]
+use crate::runtime::lookup::decode_column_ipc;
 use crate::runtime::lookup::{
-    decode_column_ipc, encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
+    encode_column_ipc, execute_lake_lookup_request, execute_lookup_request,
 };
 use crate::runtime::query_context::{QueryId, query_context_manager};
 use crate::runtime::runtime_state::RuntimeState;
@@ -272,13 +274,15 @@ impl FetchProcessor {
             .as_ref()
             .and_then(|info| find_node(info, backend_id))
             .ok_or_else(|| format!("node info not found for backend_id {}", backend_id))?;
-        let mut req = internal_proto::starrocks::PLookUpRequest::default();
-        req.query_id = Some(internal_proto::starrocks::PUniqueId {
-            hi: query_id.hi,
-            lo: query_id.lo,
-        });
-        req.lookup_node_id = Some(self.target_node_id);
-        req.request_tuple_id = Some(tuple_id);
+        let mut req = internal_proto::starrocks::PLookUpRequest {
+            query_id: Some(internal_proto::starrocks::PUniqueId {
+                hi: query_id.hi,
+                lo: query_id.lo,
+            }),
+            lookup_node_id: Some(self.target_node_id),
+            request_tuple_id: Some(tuple_id),
+            ..Default::default()
+        };
         for (slot_id, array) in request_columns {
             let data = encode_column_ipc(array)?;
             req.request_columns
@@ -290,38 +294,37 @@ impl FetchProcessor {
         }
         #[cfg(not(feature = "compat"))]
         {
-            return Err("lookup requires compat feature (brpc)".to_string());
+            let _ = (&node_info, req);
+            Err("lookup requires compat feature (brpc)".to_string())
         }
 
         #[cfg(feature = "compat")]
-        let resp = crate::service::internal_rpc_client::lookup(
-            &node_info.host,
-            node_info.async_internal_port as u16,
-            req,
-        )?;
-
-        #[cfg(not(feature = "compat"))]
-        #[allow(unreachable_code)]
-        let resp: internal_proto::starrocks::PLookUpResponse = unreachable!();
-        if let Some(status) = resp.status.as_ref() {
-            if status.status_code != 0 {
+        {
+            let resp = crate::service::internal_rpc_client::lookup(
+                &node_info.host,
+                node_info.async_internal_port as u16,
+                req,
+            )?;
+            if let Some(status) = resp.status.as_ref()
+                && status.status_code != 0
+            {
                 return Err(format!("lookup failed: {:?}", status.error_msgs));
             }
+            let mut out = Vec::new();
+            for col in resp.columns {
+                let Some(slot_id) = col.slot_id else {
+                    return Err("lookup response column missing slot_id".to_string());
+                };
+                let slot_id = SlotId::try_from(slot_id)?;
+                let data = col
+                    .data
+                    .as_ref()
+                    .ok_or_else(|| "lookup response column missing data".to_string())?;
+                let array = decode_column_ipc(data)?;
+                out.push((slot_id, array));
+            }
+            Ok(out)
         }
-        let mut out = Vec::new();
-        for col in resp.columns {
-            let Some(slot_id) = col.slot_id else {
-                return Err("lookup response column missing slot_id".to_string());
-            };
-            let slot_id = SlotId::try_from(slot_id)?;
-            let data = col
-                .data
-                .as_ref()
-                .ok_or_else(|| "lookup response column missing data".to_string())?;
-            let array = decode_column_ipc(data)?;
-            out.push((slot_id, array));
-        }
-        Ok(out)
     }
 }
 

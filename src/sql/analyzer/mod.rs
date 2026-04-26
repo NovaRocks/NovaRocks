@@ -1191,7 +1191,8 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 // All other items use the full scope (including outer for correlation)
                 _ => {
-                    let (mut p, mut o) = self.analyze_projection(&[item.clone()], expr_scope)?;
+                    let (mut p, mut o) =
+                        self.analyze_projection(std::slice::from_ref(item), expr_scope)?;
                     projection.append(&mut p);
                     output_columns.append(&mut o);
                 }
@@ -1341,31 +1342,31 @@ impl<'a> AnalyzerContext<'a> {
                     // Match ORDER BY expression text against SELECT item
                     // expressions (not aliases). This handles ORDER BY
                     // count(distinct x) matching SELECT count(distinct x) as y.
-                    if let QueryBody::Select(sel) = body {
-                        if let sqlast::SetExpr::Select(ast_sel) = query.body.as_ref() {
-                            for (ast_item, ir_item) in
-                                ast_sel.projection.iter().zip(sel.projection.iter())
-                            {
-                                let ast_expr_text = match ast_item {
-                                    sqlast::SelectItem::ExprWithAlias { expr, .. }
-                                    | sqlast::SelectItem::UnnamedExpr(expr) => {
-                                        format!("{expr}").to_lowercase()
-                                    }
-                                    _ => continue,
-                                };
-                                if ast_expr_text == ob_text
-                                    || ir_item.output_name.to_lowercase() == ob_text
-                                {
-                                    matched_alias = Some(TypedExpr {
-                                        kind: ExprKind::ColumnRef {
-                                            qualifier: None,
-                                            column: ir_item.output_name.clone(),
-                                        },
-                                        data_type: ir_item.expr.data_type.clone(),
-                                        nullable: ir_item.expr.nullable,
-                                    });
-                                    break;
+                    if let QueryBody::Select(sel) = body
+                        && let sqlast::SetExpr::Select(ast_sel) = query.body.as_ref()
+                    {
+                        for (ast_item, ir_item) in
+                            ast_sel.projection.iter().zip(sel.projection.iter())
+                        {
+                            let ast_expr_text = match ast_item {
+                                sqlast::SelectItem::ExprWithAlias { expr, .. }
+                                | sqlast::SelectItem::UnnamedExpr(expr) => {
+                                    format!("{expr}").to_lowercase()
                                 }
+                                _ => continue,
+                            };
+                            if ast_expr_text == ob_text
+                                || ir_item.output_name.to_lowercase() == ob_text
+                            {
+                                matched_alias = Some(TypedExpr {
+                                    kind: ExprKind::ColumnRef {
+                                        qualifier: None,
+                                        column: ir_item.output_name.clone(),
+                                    },
+                                    data_type: ir_item.expr.data_type.clone(),
+                                    nullable: ir_item.expr.nullable,
+                                });
+                                break;
                             }
                         }
                     }
@@ -1449,23 +1450,22 @@ fn replace_grouping_calls(
     match expr {
         sqlast::Expr::Function(func) => {
             let name = func.name.to_string().to_lowercase();
-            if name == "grouping" {
+            if name == "grouping"
+                && let sqlast::FunctionArguments::List(ref list) = func.args
+            {
                 // Extract the argument column name
-                if let sqlast::FunctionArguments::List(ref list) = func.args {
-                    if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
-                        arg_expr,
-                    ))) = list.args.first()
-                    {
-                        let arg_str = format!("{arg_expr}").to_lowercase();
-                        let value = if nulled_exprs.contains(&arg_str) {
-                            1i64
-                        } else {
-                            0i64
-                        };
-                        return sqlast::Expr::Value(
-                            sqlast::Value::Number(value.to_string(), false).into(),
-                        );
-                    }
+                if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(arg_expr))) =
+                    list.args.first()
+                {
+                    let arg_str = format!("{arg_expr}").to_lowercase();
+                    let value = if nulled_exprs.contains(&arg_str) {
+                        1i64
+                    } else {
+                        0i64
+                    };
+                    return sqlast::Expr::Value(
+                        sqlast::Value::Number(value.to_string(), false).into(),
+                    );
                 }
             }
             // Not a GROUPING() call — recurse into arguments
@@ -1504,7 +1504,7 @@ fn replace_grouping_calls(
             right: Box::new(replace_grouping_calls(right, nulled_exprs)),
         },
         sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
-            op: op.clone(),
+            op: *op,
             expr: Box::new(replace_grouping_calls(inner, nulled_exprs)),
         },
         sqlast::Expr::Nested(inner) => {
@@ -1578,27 +1578,27 @@ fn replace_grouping_calls_with_markers(
     match expr {
         sqlast::Expr::Function(func) => {
             let name = func.name.to_string().to_lowercase();
-            if matches!(name.as_str(), "grouping" | "grouping_id") {
-                if let sqlast::FunctionArguments::List(ref list) = func.args {
-                    let arg_cols: Vec<String> = list
-                        .args
-                        .iter()
-                        .filter_map(|a| match a {
-                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
-                                Some(format!("{e}").to_lowercase())
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    let idx = args.len();
-                    let virtual_name = format!("__grouping_fn_{idx}");
-                    args.push((virtual_name, arg_cols));
-                    let marker = *next_marker;
-                    *next_marker -= 1;
-                    return sqlast::Expr::Value(
-                        sqlast::Value::Number(marker.to_string(), false).into(),
-                    );
-                }
+            if matches!(name.as_str(), "grouping" | "grouping_id")
+                && let sqlast::FunctionArguments::List(ref list) = func.args
+            {
+                let arg_cols: Vec<String> = list
+                    .args
+                    .iter()
+                    .filter_map(|a| match a {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                            Some(format!("{e}").to_lowercase())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let idx = args.len();
+                let virtual_name = format!("__grouping_fn_{idx}");
+                args.push((virtual_name, arg_cols));
+                let marker = *next_marker;
+                *next_marker -= 1;
+                return sqlast::Expr::Value(
+                    sqlast::Value::Number(marker.to_string(), false).into(),
+                );
             }
             // Not a grouping pseudo-column — recurse into args and OVER clause
             let new_args = match &func.args {
@@ -1643,7 +1643,7 @@ fn replace_grouping_calls_with_markers(
             )),
         },
         sqlast::Expr::UnaryOp { op, expr: inner } => sqlast::Expr::UnaryOp {
-            op: op.clone(),
+            op: *op,
             expr: Box::new(replace_grouping_calls_with_markers(
                 inner,
                 args,
@@ -2436,13 +2436,13 @@ mod tests {
             } => {
                 operand
                     .as_ref()
-                    .map_or(false, |o| expr_has_placeholder_deep(o))
+                    .is_some_and(|o| expr_has_placeholder_deep(o))
                     || when_then
                         .iter()
                         .any(|(w, t)| expr_has_placeholder_deep(w) || expr_has_placeholder_deep(t))
                     || else_expr
                         .as_ref()
-                        .map_or(false, |e| expr_has_placeholder_deep(e))
+                        .is_some_and(|e| expr_has_placeholder_deep(e))
             }
             ExprKind::Between {
                 expr, low, high, ..

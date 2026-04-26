@@ -241,6 +241,12 @@ impl SpillChannelHandle {
     }
 }
 
+impl Default for SpillChannelHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct InflightGuard {
     channel: Arc<SpillChannel>,
 }

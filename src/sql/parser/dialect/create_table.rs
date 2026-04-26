@@ -386,14 +386,13 @@ fn skip_default_value(parser: &mut Parser<'_>) {
                 parser.next_token();
             }
             _ => {
-                if depth == 0 {
-                    if peek_word_eq(parser, 0, "COMMENT")
+                if depth == 0
+                    && (peek_word_eq(parser, 0, "COMMENT")
                         || peek_word_eq(parser, 0, "NOT")
                         || peek_word_eq(parser, 0, "NULL")
-                        || peek_word_eq(parser, 0, "AUTO_INCREMENT")
-                    {
-                        break;
-                    }
+                        || peek_word_eq(parser, 0, "AUTO_INCREMENT"))
+                {
+                    break;
                 }
                 parser.next_token();
             }

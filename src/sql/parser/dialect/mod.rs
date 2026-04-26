@@ -1179,7 +1179,7 @@ fn find_top_level_char(sql: &str, target: u8) -> Option<usize> {
     None
 }
 
-fn split_top_level_items<'a>(sql: &'a str, delimiter: u8) -> Vec<&'a str> {
+fn split_top_level_items(sql: &str, delimiter: u8) -> Vec<&str> {
     let bytes = sql.as_bytes();
     let mut out = Vec::new();
     let mut start = 0usize;

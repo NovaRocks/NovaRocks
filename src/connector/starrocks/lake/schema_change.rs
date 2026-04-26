@@ -1116,15 +1116,11 @@ fn resolve_source_column_index_by_name(
         .copied()
 }
 
-fn build_rollup_materialized_param_map<'a>(
-    request: &'a TAlterTabletReqV2,
-) -> Result<HashMap<String, &'a TAlterMaterializedViewParam>, String> {
+fn build_rollup_materialized_param_map(
+    request: &TAlterTabletReqV2,
+) -> Result<HashMap<String, &TAlterMaterializedViewParam>, String> {
     let mut out = HashMap::new();
-    let params = request
-        .materialized_view_params
-        .as_ref()
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+    let params = request.materialized_view_params.as_deref().unwrap_or(&[]);
     for (idx, param) in params.iter().enumerate() {
         let name = param.column_name.trim();
         if name.is_empty() {
@@ -1673,23 +1669,29 @@ mod tests {
     #[test]
     fn initial_empty_v1_metadata_without_schema_is_expected() {
         let _guard = lock_runtime_test_state();
-        let mut metadata = TabletMetadataPb::default();
-        metadata.id = Some(123);
-        metadata.version = Some(1);
+        let metadata = TabletMetadataPb {
+            id: Some(123),
+            version: Some(1),
+            ..Default::default()
+        };
         assert!(is_expected_initial_metadata_without_schema(&metadata, 1));
     }
 
     #[test]
     fn non_initial_or_non_empty_metadata_without_schema_is_not_expected() {
         let _guard = lock_runtime_test_state();
-        let mut metadata = TabletMetadataPb::default();
-        metadata.id = Some(123);
-        metadata.version = Some(2);
+        let metadata = TabletMetadataPb {
+            id: Some(123),
+            version: Some(2),
+            ..Default::default()
+        };
         assert!(!is_expected_initial_metadata_without_schema(&metadata, 2));
 
-        let mut metadata_with_rowset = TabletMetadataPb::default();
-        metadata_with_rowset.id = Some(123);
-        metadata_with_rowset.version = Some(1);
+        let mut metadata_with_rowset = TabletMetadataPb {
+            id: Some(123),
+            version: Some(1),
+            ..Default::default()
+        };
         metadata_with_rowset
             .rowsets
             .push(RowsetMetadataPb::default());
@@ -1764,12 +1766,16 @@ mod tests {
         let missing = TabletMetadataPb::default();
         assert!(should_patch_initial_metadata_schema(&missing, &target));
 
-        let mut mismatched = TabletMetadataPb::default();
-        mismatched.schema = Some(test_schema(7, vec![test_scalar_column(12, "v2", "INT")]));
+        let mismatched = TabletMetadataPb {
+            schema: Some(test_schema(7, vec![test_scalar_column(12, "v2", "INT")])),
+            ..Default::default()
+        };
         assert!(should_patch_initial_metadata_schema(&mismatched, &target));
 
-        let mut matched = TabletMetadataPb::default();
-        matched.schema = Some(target.clone());
+        let matched = TabletMetadataPb {
+            schema: Some(target.clone()),
+            ..Default::default()
+        };
         assert!(!should_patch_initial_metadata_schema(&matched, &target));
     }
 

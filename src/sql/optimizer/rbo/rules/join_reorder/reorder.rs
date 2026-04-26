@@ -436,7 +436,7 @@ fn extract_join_graph(plan: &LogicalPlan) -> Option<JoinGraph> {
     // to the relations they reference.
     let relation_columns: Vec<std::collections::HashSet<QualifiedRef>> = relations
         .iter()
-        .map(|r| collect_qualified_output_columns(r))
+        .map(collect_qualified_output_columns)
         .collect();
 
     // Pre-process: factor common equi-join conditions out of OR predicates
@@ -679,7 +679,7 @@ fn try_join_orientation(
 
     let dominated = best
         .as_ref()
-        .map_or(false, |b| b.cumulative_cost <= total_cost);
+        .is_some_and(|b| b.cumulative_cost <= total_cost);
     if !dominated {
         *best = Some(DpEntry {
             plan: join_plan,
@@ -1116,6 +1116,136 @@ fn next_k_subset(current: u32, universe: u32) -> Option<u32> {
         result |= 1 << bits[idx];
     }
     Some(result)
+}
+
+// ===========================================================================
+// OR-factoring helpers for join reorder
+// (moved from legacy predicate_pushdown.rs in Phase 3)
+// ===========================================================================
+
+/// Factor common equi-join conditions out of OR predicates for join reorder.
+///
+/// Extracts `col=col` equalities that appear in ALL OR branches so the
+/// join graph can see them as independent binary predicates.
+pub(super) fn factor_common_eq_from_or_for_reorder(
+    expr: &TypedExpr,
+) -> (Vec<TypedExpr>, Option<TypedExpr>) {
+    let empty = HashSet::new();
+    factor_common_eq_from_or_any_side(expr, &empty, &empty)
+}
+
+/// Like factor_common_eq_from_or but extracts ANY common col=col eq
+/// (not just cross-side). Same-side eqs will be pushed to children.
+fn factor_common_eq_from_or_any_side(
+    expr: &TypedExpr,
+    _left_cols: &HashSet<String>,
+    _right_cols: &HashSet<String>,
+) -> (Vec<TypedExpr>, Option<TypedExpr>) {
+    let branches = split_or_branches(expr);
+    if branches.len() < 2 {
+        return (vec![], None);
+    }
+    let branch_conjuncts: Vec<Vec<&TypedExpr>> =
+        branches.iter().map(|b| split_and_refs(b)).collect();
+
+    // Find col=col eqs common to ALL branches
+    let mut common_eqs: Vec<TypedExpr> = Vec::new();
+    if let Some(first) = branch_conjuncts.first() {
+        for candidate in first {
+            if !is_any_eq(candidate) {
+                continue;
+            }
+            let in_all = branch_conjuncts[1..]
+                .iter()
+                .all(|conjs| conjs.iter().any(|c| expr_eq(c, candidate)));
+            if in_all {
+                common_eqs.push((*candidate).clone());
+            }
+        }
+    }
+    if common_eqs.is_empty() {
+        return (vec![], None);
+    }
+
+    let mut new_branches: Vec<TypedExpr> = Vec::new();
+    for branch in &branch_conjuncts {
+        let remaining: Vec<TypedExpr> = branch
+            .iter()
+            .filter(|c| !common_eqs.iter().any(|eq| expr_eq(c, eq)))
+            .map(|c| (*c).clone())
+            .collect();
+        if remaining.is_empty() {
+            new_branches.push(TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::Literal(LiteralValue::Bool(true)),
+            });
+        } else {
+            new_branches.push(combine_and(remaining));
+        }
+    }
+    let or_rem = if new_branches
+        .iter()
+        .all(|b| matches!(b.kind, ExprKind::Literal(LiteralValue::Bool(true))))
+    {
+        None
+    } else {
+        let mut r = new_branches.remove(0);
+        for b in new_branches {
+            r = TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(r),
+                    op: BinOp::Or,
+                    right: Box::new(b),
+                },
+            };
+        }
+        Some(r)
+    };
+    (common_eqs, or_rem)
+}
+
+fn is_any_eq(expr: &TypedExpr) -> bool {
+    matches!(&expr.kind, ExprKind::BinaryOp { left, op: BinOp::Eq, right }
+        if matches!(left.kind, ExprKind::ColumnRef { .. }) && matches!(right.kind, ExprKind::ColumnRef { .. }))
+}
+
+fn split_or_branches(expr: &TypedExpr) -> Vec<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::Or,
+            right,
+        } => {
+            let mut v = split_or_branches(left);
+            v.extend(split_or_branches(right));
+            v
+        }
+        ExprKind::Nested(inner) => split_or_branches(inner),
+        _ => vec![expr],
+    }
+}
+
+fn split_and_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
+    match &expr.kind {
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let mut v = split_and_refs(left);
+            v.extend(split_and_refs(right));
+            v
+        }
+        ExprKind::Nested(inner) => split_and_refs(inner),
+        _ => vec![expr],
+    }
+}
+
+fn expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
+    format!("{:?}", a.kind) == format!("{:?}", b.kind)
 }
 
 #[cfg(test)]
@@ -1709,134 +1839,4 @@ mod tests {
         let result2 = find_connecting_predicates(&predicates, 0b01, 0b100);
         assert_eq!(result2.len(), 0);
     }
-}
-
-// ===========================================================================
-// OR-factoring helpers for join reorder
-// (moved from legacy predicate_pushdown.rs in Phase 3)
-// ===========================================================================
-
-/// Factor common equi-join conditions out of OR predicates for join reorder.
-///
-/// Extracts `col=col` equalities that appear in ALL OR branches so the
-/// join graph can see them as independent binary predicates.
-pub(super) fn factor_common_eq_from_or_for_reorder(
-    expr: &TypedExpr,
-) -> (Vec<TypedExpr>, Option<TypedExpr>) {
-    let empty = HashSet::new();
-    factor_common_eq_from_or_any_side(expr, &empty, &empty)
-}
-
-/// Like factor_common_eq_from_or but extracts ANY common col=col eq
-/// (not just cross-side). Same-side eqs will be pushed to children.
-fn factor_common_eq_from_or_any_side(
-    expr: &TypedExpr,
-    _left_cols: &HashSet<String>,
-    _right_cols: &HashSet<String>,
-) -> (Vec<TypedExpr>, Option<TypedExpr>) {
-    let branches = split_or_branches(expr);
-    if branches.len() < 2 {
-        return (vec![], None);
-    }
-    let branch_conjuncts: Vec<Vec<&TypedExpr>> =
-        branches.iter().map(|b| split_and_refs(b)).collect();
-
-    // Find col=col eqs common to ALL branches
-    let mut common_eqs: Vec<TypedExpr> = Vec::new();
-    if let Some(first) = branch_conjuncts.first() {
-        for candidate in first {
-            if !is_any_eq(candidate) {
-                continue;
-            }
-            let in_all = branch_conjuncts[1..]
-                .iter()
-                .all(|conjs| conjs.iter().any(|c| expr_eq(c, candidate)));
-            if in_all {
-                common_eqs.push((*candidate).clone());
-            }
-        }
-    }
-    if common_eqs.is_empty() {
-        return (vec![], None);
-    }
-
-    let mut new_branches: Vec<TypedExpr> = Vec::new();
-    for branch in &branch_conjuncts {
-        let remaining: Vec<TypedExpr> = branch
-            .iter()
-            .filter(|c| !common_eqs.iter().any(|eq| expr_eq(c, eq)))
-            .map(|c| (*c).clone())
-            .collect();
-        if remaining.is_empty() {
-            new_branches.push(TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
-                kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            });
-        } else {
-            new_branches.push(combine_and(remaining));
-        }
-    }
-    let or_rem = if new_branches
-        .iter()
-        .all(|b| matches!(b.kind, ExprKind::Literal(LiteralValue::Bool(true))))
-    {
-        None
-    } else {
-        let mut r = new_branches.remove(0);
-        for b in new_branches {
-            r = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(r),
-                    op: BinOp::Or,
-                    right: Box::new(b),
-                },
-            };
-        }
-        Some(r)
-    };
-    (common_eqs, or_rem)
-}
-
-fn is_any_eq(expr: &TypedExpr) -> bool {
-    matches!(&expr.kind, ExprKind::BinaryOp { left, op: BinOp::Eq, right }
-        if matches!(left.kind, ExprKind::ColumnRef { .. }) && matches!(right.kind, ExprKind::ColumnRef { .. }))
-}
-
-fn split_or_branches(expr: &TypedExpr) -> Vec<&TypedExpr> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::Or,
-            right,
-        } => {
-            let mut v = split_or_branches(left);
-            v.extend(split_or_branches(right));
-            v
-        }
-        ExprKind::Nested(inner) => split_or_branches(inner),
-        _ => vec![expr],
-    }
-}
-
-fn split_and_refs(expr: &TypedExpr) -> Vec<&TypedExpr> {
-    match &expr.kind {
-        ExprKind::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-        } => {
-            let mut v = split_and_refs(left);
-            v.extend(split_and_refs(right));
-            v
-        }
-        ExprKind::Nested(inner) => split_and_refs(inner),
-        _ => vec![expr],
-    }
-}
-
-fn expr_eq(a: &TypedExpr, b: &TypedExpr) -> bool {
-    format!("{:?}", a.kind) == format!("{:?}", b.kind)
 }

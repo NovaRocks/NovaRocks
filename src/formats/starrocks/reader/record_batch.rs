@@ -343,44 +343,42 @@ pub(super) fn build_dup_record_batch(
                     selected_rows_before_delete,
                     &segment.path,
                 )?
-            } else {
-                if let Some(column_meta) =
-                    find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id)
-                {
-                    if let Some(flat_projection) = projected.flat_json_projection.as_ref() {
-                        decode_flat_json_projection_array_for_selected_rows(
-                            &segment.path,
-                            &segment_bytes,
-                            column_meta,
-                            segment_schema,
-                            flat_projection,
-                            output_field.data_type(),
-                            &projected.output_name,
-                            &selected_ranges,
-                            full_segment_selected,
-                            segment_rows,
-                        )?
-                    } else {
-                        decode_column_array_for_selected_rows(
-                            &segment.path,
-                            &segment_bytes,
-                            column_meta,
-                            segment_schema,
-                            output_field.data_type(),
-                            &projected.output_name,
-                            &selected_ranges,
-                            full_segment_selected,
-                            segment_rows,
-                        )?
-                    }
-                } else {
-                    build_missing_projected_array(
-                        projected,
-                        output_field.data_type(),
-                        selected_rows_before_delete,
+            } else if let Some(column_meta) =
+                find_column_meta_by_unique_id(&footer.columns, projected.schema_unique_id)
+            {
+                if let Some(flat_projection) = projected.flat_json_projection.as_ref() {
+                    decode_flat_json_projection_array_for_selected_rows(
                         &segment.path,
+                        &segment_bytes,
+                        column_meta,
+                        segment_schema,
+                        flat_projection,
+                        output_field.data_type(),
+                        &projected.output_name,
+                        &selected_ranges,
+                        full_segment_selected,
+                        segment_rows,
+                    )?
+                } else {
+                    decode_column_array_for_selected_rows(
+                        &segment.path,
+                        &segment_bytes,
+                        column_meta,
+                        segment_schema,
+                        output_field.data_type(),
+                        &projected.output_name,
+                        &selected_ranges,
+                        full_segment_selected,
+                        segment_rows,
                     )?
                 }
+            } else {
+                build_missing_projected_array(
+                    projected,
+                    output_field.data_type(),
+                    selected_rows_before_delete,
+                    &segment.path,
+                )?
             };
             if array.len() != selected_rows_before_delete {
                 return Err(format!(
@@ -573,7 +571,7 @@ fn selected_ranges_for_segment(
         return Ok(Vec::new());
     }
 
-    let mut ranges = vec![0..segment_rows];
+    let mut ranges = std::iter::once(0..segment_rows).collect::<Vec<_>>();
     let mut used_page_pruning = false;
 
     for binding in bindings {
@@ -590,7 +588,7 @@ fn selected_ranges_for_segment(
     }
 
     if !used_page_pruning {
-        return Ok(vec![0..segment_rows]);
+        return Ok(std::iter::once(0..segment_rows).collect());
     }
 
     Ok(merge_ranges(ranges))
@@ -1059,16 +1057,16 @@ fn load_primary_delvec_bitmap_for_segment(
         )
     })?;
     let bytes = read_range_bytes(rt, op, rel_path, page.offset, end)?;
-    if let Some(expected_masked) = page.crc32c {
-        if page.crc32c_gen_version == Some(page.version) {
-            let expected = crc32c_unmask(expected_masked);
-            let actual = crc32c::crc32c(&bytes);
-            if expected != actual {
-                return Err(format!(
-                    "primary delvec crc32c mismatch: segment={}, delvec_version={}, expected={}, actual={}",
-                    segment_path, page.version, expected, actual
-                ));
-            }
+    if let Some(expected_masked) = page.crc32c
+        && page.crc32c_gen_version == Some(page.version)
+    {
+        let expected = crc32c_unmask(expected_masked);
+        let actual = crc32c::crc32c(&bytes);
+        if expected != actual {
+            return Err(format!(
+                "primary delvec crc32c mismatch: segment={}, delvec_version={}, expected={}, actual={}",
+                segment_path, page.version, expected, actual
+            ));
         }
     }
     decode_delvec_bitmap(&bytes, segment_path, page.version).map(Some)

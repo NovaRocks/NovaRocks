@@ -536,7 +536,7 @@ fn decode_fixed_column_payload<'a>(
             payload.len()
         ));
     }
-    if size % elem_width != 0 {
+    if !size.is_multiple_of(elem_width) {
         return Err(format!(
             "invalid {} delete payload element alignment: declared_size={} elem_width={}",
             type_name, size, elem_width
@@ -588,7 +588,7 @@ fn decode_binary_payload(payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             payload.len()
         ));
     }
-    if offsets_size % 4 != 0 {
+    if !offsets_size.is_multiple_of(4) {
         return Err(format!(
             "invalid binary delete payload offsets alignment: offsets_size={}",
             offsets_size

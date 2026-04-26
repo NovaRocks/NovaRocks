@@ -561,37 +561,35 @@ fn update_avg_decimal128(
     sum_scale: i8,
 ) -> Result<(), String> {
     match input {
-        AggInputView::Utf8(view) => match view {
-            Utf8ArrayView::Decimal128(arr, input_scale) => {
-                let scale_diff = sum_scale as i32 - *input_scale as i32;
-                let factor = if scale_diff == 0 {
-                    None
-                } else {
-                    Some(pow10_i128(scale_diff.abs() as usize)?)
-                };
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let mut value = arr.value(row);
-                    if let Some(factor) = factor {
-                        if scale_diff > 0 {
-                            value = value
-                                .checked_mul(factor)
-                                .ok_or_else(|| "decimal overflow".to_string())?;
-                        } else {
-                            value /= factor;
-                        }
-                    }
-                    let state =
-                        unsafe { &mut *((base as *mut u8).add(offset) as *mut AvgDecimal128State) };
-                    state.sum += value;
-                    state.count += 1;
+        AggInputView::Utf8(Utf8ArrayView::Decimal128(arr, input_scale)) => {
+            let scale_diff = sum_scale as i32 - *input_scale as i32;
+            let factor = if scale_diff == 0 {
+                None
+            } else {
+                Some(pow10_i128(scale_diff.unsigned_abs() as usize)?)
+            };
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if arr.is_null(row) {
+                    continue;
                 }
-                Ok(())
+                let mut value = arr.value(row);
+                if let Some(factor) = factor {
+                    if scale_diff > 0 {
+                        value = value
+                            .checked_mul(factor)
+                            .ok_or_else(|| "decimal overflow".to_string())?;
+                    } else {
+                        value /= factor;
+                    }
+                }
+                let state =
+                    unsafe { &mut *((base as *mut u8).add(offset) as *mut AvgDecimal128State) };
+                state.sum += value;
+                state.count += 1;
             }
-            _ => Err("avg decimal input type mismatch".to_string()),
-        },
+            Ok(())
+        }
+        AggInputView::Utf8(_) => Err("avg decimal input type mismatch".to_string()),
         _ => Err("avg decimal input type mismatch".to_string()),
     }
 }
@@ -619,7 +617,7 @@ fn update_avg_decimal256(
     let factor = if scale_diff == 0 {
         None
     } else {
-        Some(pow10_i256(scale_diff.abs() as usize)?)
+        Some(pow10_i256(scale_diff.unsigned_abs() as usize)?)
     };
     for (row, &base) in state_ptrs.iter().enumerate() {
         if arr.is_null(row) {
@@ -937,7 +935,7 @@ fn build_avg_intermediate_binary_array(
         let mut buf = [0u8; 16];
         buf[..8].copy_from_slice(&state.sum.to_le_bytes());
         buf[8..].copy_from_slice(&state.count.to_le_bytes());
-        builder.append_value(&buf);
+        builder.append_value(buf);
     }
     Ok(Arc::new(builder.finish()))
 }
@@ -958,7 +956,7 @@ fn build_avg_decimal_intermediate_array(
             let mut buf = [0u8; 24];
             buf[..16].copy_from_slice(&state.sum.to_le_bytes());
             buf[16..].copy_from_slice(&state.count.to_le_bytes());
-            builder.append_value(&buf);
+            builder.append_value(buf);
         }
         return Ok(Arc::new(builder.finish()));
     }
@@ -1025,7 +1023,7 @@ fn build_avg_decimal_array(
     let factor = if scale_diff == 0 {
         None
     } else {
-        Some(pow10_i128(scale_diff.abs() as usize)?)
+        Some(pow10_i128(scale_diff.unsigned_abs() as usize)?)
     };
     let mut values = Vec::with_capacity(group_states.len());
     for &base in group_states {
@@ -1071,7 +1069,7 @@ fn build_avg_decimal256_intermediate_array(
             let mut buf = [0u8; 40];
             buf[..32].copy_from_slice(&state.sum.to_le_bytes());
             buf[32..].copy_from_slice(&state.count.to_le_bytes());
-            builder.append_value(&buf);
+            builder.append_value(buf);
         }
         return Ok(Arc::new(builder.finish()));
     }
@@ -1138,7 +1136,7 @@ fn build_avg_decimal256_array(
     let factor = if scale_diff == 0 {
         None
     } else {
-        Some(pow10_i256(scale_diff.abs() as usize)?)
+        Some(pow10_i256(scale_diff.unsigned_abs() as usize)?)
     };
 
     let mut values = Vec::with_capacity(group_states.len());

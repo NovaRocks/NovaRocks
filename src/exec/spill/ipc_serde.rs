@@ -46,8 +46,12 @@ impl SpillCodec {
             SpillCodec::Zstd => 2,
         }
     }
+}
 
-    pub fn from_str(value: &str) -> Result<Self, String> {
+impl std::str::FromStr for SpillCodec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         let normalized = value.trim().to_ascii_lowercase();
         match normalized.as_str() {
             "none" => Ok(SpillCodec::None),

@@ -247,14 +247,14 @@ fn default_output_type(input_type: &DataType, input_is_intermediate: bool) -> Da
     if input_is_intermediate {
         return DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
     }
-    if let DataType::Struct(fields) = input_type {
-        if let Some(first) = fields.first() {
-            return DataType::List(Arc::new(Field::new(
-                "item",
-                first.data_type().clone(),
-                true,
-            )));
-        }
+    if let DataType::Struct(fields) = input_type
+        && let Some(first) = fields.first()
+    {
+        return DataType::List(Arc::new(Field::new(
+            "item",
+            first.data_type().clone(),
+            true,
+        )));
     }
     DataType::List(Arc::new(Field::new("item", input_type.clone(), true)))
 }

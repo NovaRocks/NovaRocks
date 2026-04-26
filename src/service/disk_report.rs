@@ -38,10 +38,11 @@ fn state() -> &'static Mutex<ReportState> {
 }
 
 fn default_storage_path() -> String {
-    if let Ok(path) = std::env::var("novarocks_STORAGE_PATH") {
-        if !path.trim().is_empty() && std::path::Path::new(&path).exists() {
-            return path;
-        }
+    if let Ok(path) = std::env::var("novarocks_STORAGE_PATH")
+        && !path.trim().is_empty()
+        && std::path::Path::new(&path).exists()
+    {
+        return path;
     }
     if let Ok(cwd) = std::env::current_dir() {
         let path = cwd.to_string_lossy().to_string();

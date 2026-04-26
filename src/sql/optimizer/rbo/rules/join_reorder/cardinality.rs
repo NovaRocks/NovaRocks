@@ -346,10 +346,10 @@ fn estimate_except(
 /// Get the NDV (number of distinct values) for an expression, looking up
 /// column stats if the expression is a simple column reference.
 fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
-    if let Some(name) = extract_column_name(expr) {
-        if let Some(cs) = column_stats.get(&name.to_lowercase()) {
-            return cs.distinct_values_count.max(1.0);
-        }
+    if let Some(name) = extract_column_name(expr)
+        && let Some(cs) = column_stats.get(&name.to_lowercase())
+    {
+        return cs.distinct_values_count.max(1.0);
     }
     // Default NDV for unknown expressions.
     10.0

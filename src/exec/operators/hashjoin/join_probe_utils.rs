@@ -96,7 +96,7 @@ pub(crate) fn keyed_join_chunk(
     let group_ids = match table.key_strategy() {
         GroupKeyStrategy::OneNumber => {
             let view = key_views
-                .get(0)
+                .first()
                 .ok_or_else(|| "join one number key view missing".to_string())?;
             let hashes = build_one_number_hashes(view, left_len, table.hash_seed())
                 .map_err(|e| e.to_string())?;
@@ -106,7 +106,7 @@ pub(crate) fn keyed_join_chunk(
         }
         GroupKeyStrategy::OneString => {
             let view = key_views
-                .get(0)
+                .first()
                 .ok_or_else(|| "join one string key view missing".to_string())?;
             let hashes = build_group_key_hashes(&key_views, left_len, table.hash_seed())
                 .map_err(|e| e.to_string())?;
@@ -261,7 +261,7 @@ pub(crate) fn lookup_group_ids(
     let group_ids = match table.key_strategy() {
         GroupKeyStrategy::OneNumber => {
             let view = key_views
-                .get(0)
+                .first()
                 .ok_or_else(|| "join one number key view missing".to_string())?;
             let hashes = build_one_number_hashes(view, probe_len, table.hash_seed())
                 .map_err(|e| e.to_string())?;
@@ -271,7 +271,7 @@ pub(crate) fn lookup_group_ids(
         }
         GroupKeyStrategy::OneString => {
             let view = key_views
-                .get(0)
+                .first()
                 .ok_or_else(|| "join one string key view missing".to_string())?;
             let hashes = build_group_key_hashes(&key_views, probe_len, table.hash_seed())
                 .map_err(|e| e.to_string())?;

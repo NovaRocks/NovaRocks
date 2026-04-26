@@ -275,7 +275,7 @@ impl KeyTable {
             table.find_or_find_insert_slot(
                 hash,
                 |entry| {
-                    let col = key_columns.get(0);
+                    let col = key_columns.first();
                     match col {
                         Some(col) => match col.value_equals(entry.group_id, view, row) {
                             Ok(equal) => equal,
@@ -562,7 +562,7 @@ impl KeyTable {
     ) -> Result<Option<usize>, String> {
         let mut error = None;
         let entry = self.one_number_table.get(hash, |entry| {
-            let col = self.key_columns.get(0);
+            let col = self.key_columns.first();
             match col {
                 Some(col) => match col.value_equals(entry.group_id, view, row) {
                     Ok(equal) => equal,

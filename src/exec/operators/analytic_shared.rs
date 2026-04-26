@@ -148,7 +148,7 @@ impl AnalyticSharedState {
                     chunk.transfer_to(tracker);
                 }
             }
-            guard.pending = outputs.into();
+            guard.pending = outputs;
             guard.computed = true;
         }
 
@@ -1052,7 +1052,7 @@ fn compute_first_last_value(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "first_value/last_value missing value argument".to_string())?;
 
     let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
@@ -1080,12 +1080,12 @@ fn compute_first_last_value(
             }
 
             let mut prev_idx = None;
-            for off in 0..part_len {
+            for (off, slot) in prev.iter_mut().enumerate().take(part_len) {
                 let row = *p_start + off;
                 if !value.is_null(row) {
                     prev_idx = Some(row);
                 }
-                prev[off] = prev_idx;
+                *slot = prev_idx;
             }
             (next, prev)
         } else {
@@ -1101,13 +1101,11 @@ fn compute_first_last_value(
                 } else {
                     next_non_null[frame_start - *p_start].and_then(|v| (v < frame_end).then_some(v))
                 }
+            } else if !ignore_nulls {
+                Some(frame_end - 1)
             } else {
-                if !ignore_nulls {
-                    Some(frame_end - 1)
-                } else {
-                    prev_non_null[frame_end - 1 - *p_start]
-                        .and_then(|v| (v >= frame_start).then_some(v))
-                }
+                prev_non_null[frame_end - 1 - *p_start]
+                    .and_then(|v| (v >= frame_start).then_some(v))
             };
             if let Some(i) = idx {
                 indices.append_value(i as u32);
@@ -1132,7 +1130,7 @@ fn compute_first_value_rewrite(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "first_value_rewrite missing value argument".to_string())?;
 
     let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
@@ -1161,12 +1159,12 @@ fn compute_first_value_rewrite(
             }
 
             let mut prev_idx = None;
-            for off in 0..part_len {
+            for (off, slot) in prev.iter_mut().enumerate().take(part_len) {
                 let row = *p_start + off;
                 if !value.is_null(row) {
                     prev_idx = Some(row);
                 }
-                prev[off] = prev_idx;
+                *slot = prev_idx;
             }
             (next, prev)
         } else {
@@ -1187,13 +1185,11 @@ fn compute_first_value_rewrite(
                 } else {
                     Some(*p_start)
                 }
+            } else if !ignore_nulls {
+                Some(frame_end - 1)
             } else {
-                if !ignore_nulls {
-                    Some(frame_end - 1)
-                } else {
-                    prev_non_null[frame_end - 1 - *p_start]
-                        .and_then(|v| (v >= frame_start).then_some(v))
-                }
+                prev_non_null[frame_end - 1 - *p_start]
+                    .and_then(|v| (v >= frame_start).then_some(v))
             };
             if let Some(i) = idx {
                 indices.append_value(i as u32);
@@ -1218,7 +1214,7 @@ fn compute_lead_lag(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "lead/lag missing value argument".to_string())?;
 
     let offset = if func.args.len() >= 2 {
@@ -1287,18 +1283,16 @@ fn compute_lead_lag(
             if ignore_nulls {
                 if offset == 0 {
                     found = Some(row);
-                } else {
-                    if let Some(off) = offset_usize {
-                        if is_lag {
-                            let count_before = prefix_non_null[row - *p_start];
-                            if count_before >= off {
-                                found = non_null_positions.get(count_before - off).copied();
-                            }
-                        } else {
-                            let start_rank = prefix_non_null[row - *p_start + 1];
-                            if let Some(target_rank) = start_rank.checked_add(off - 1) {
-                                found = non_null_positions.get(target_rank).copied();
-                            }
+                } else if let Some(off) = offset_usize {
+                    if is_lag {
+                        let count_before = prefix_non_null[row - *p_start];
+                        if count_before >= off {
+                            found = non_null_positions.get(count_before - off).copied();
+                        }
+                    } else {
+                        let start_rank = prefix_non_null[row - *p_start + 1];
+                        if let Some(target_rank) = start_rank.checked_add(off - 1) {
+                            found = non_null_positions.get(target_rank).copied();
                         }
                     }
                 }
@@ -1352,7 +1346,7 @@ fn compute_session_number(
     };
 
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "session_number missing value argument".to_string())?;
 
     let mut b = Int64Builder::with_capacity(total_rows);
@@ -1385,7 +1379,7 @@ fn compute_count(
     window: Option<&WindowFrame>,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
-    let value = args.get(0).cloned();
+    let value = args.first().cloned();
 
     let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
         .iter()
@@ -1429,7 +1423,7 @@ fn compute_sum(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "sum missing value argument".to_string())?;
     let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
         .iter()
@@ -1677,7 +1671,7 @@ fn compute_avg(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "avg missing value argument".to_string())?;
     let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
         .iter()
@@ -1894,7 +1888,7 @@ fn compute_variance_samp(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "variance_samp missing value argument".to_string())?;
     let peer_groups_by_partition: Vec<Vec<(usize, usize)>> = partitions
         .iter()
@@ -1960,7 +1954,7 @@ fn compute_bool_or(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .ok_or_else(|| "bool_or missing value argument".to_string())?;
     let value = value
         .as_any()
@@ -1999,7 +1993,7 @@ fn compute_covar_corr(
     kind: &str,
 ) -> Result<ArrayRef, String> {
     let x = args
-        .get(0)
+        .first()
         .ok_or_else(|| format!("{} missing first argument", kind))?;
     let y = args
         .get(1)
@@ -2277,6 +2271,8 @@ fn compare_window_array_agg_optional_values(
 const WINDOW_APPROX_TOP_K_DEFAULT_K: usize = 5;
 const WINDOW_APPROX_TOP_K_MAX_COUNTER_NUM: usize = 100_000;
 
+type ApproxTopKEntry = (Vec<u8>, (Option<AggScalarValue>, i64));
+
 fn compute_window_approx_top_k(
     _arena: &ExprArena,
     func: &WindowFunctionSpec,
@@ -2353,8 +2349,7 @@ fn compute_window_approx_top_k(
                 entry.1 += 1;
             }
 
-            let mut top_entries: Vec<(Vec<u8>, (Option<AggScalarValue>, i64))> =
-                freqs.into_iter().collect();
+            let mut top_entries: Vec<ApproxTopKEntry> = freqs.into_iter().collect();
             top_entries.sort_by(
                 |(left_key, (_, left_count)), (right_key, (_, right_count))| match right_count
                     .cmp(left_count)
@@ -2413,7 +2408,7 @@ fn compute_window_approx_top_k(
 }
 
 fn window_approx_top_k_default_counter_num(k: usize) -> usize {
-    (2 * k).max(100).min(WINDOW_APPROX_TOP_K_MAX_COUNTER_NUM)
+    (2 * k).clamp(100, WINDOW_APPROX_TOP_K_MAX_COUNTER_NUM)
 }
 
 fn window_approx_top_k_clamp_k(v: i64) -> Option<usize> {
@@ -2570,7 +2565,7 @@ fn compute_min_max(
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
     let value = args
-        .get(0)
+        .first()
         .cloned()
         .ok_or_else(|| "min/max missing value argument".to_string())?;
     let value = if value.data_type() == return_type {
@@ -2892,7 +2887,6 @@ fn rows_frame_bounds(
             if n < 0 {
                 return Err("window end PRECEDING offset must be non-negative".to_string());
             }
-            let n = n as i64;
             let v = (row as i64) - n + 1;
             if v <= part_start as i64 {
                 part_start
@@ -2922,39 +2916,6 @@ fn parse_int64_literal(arena: &ExprArena, id: ExprId) -> Result<i64, String> {
         ExprNode::Literal(LiteralValue::Int64(v)) => Ok(*v),
         ExprNode::Literal(LiteralValue::Int32(v)) => Ok(*v as i64),
         other => Err(format!("expected integer literal, got {:?}", other)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow::array::Int32Array;
-
-    #[test]
-    fn first_value_rewrite_fills_initial_rows() {
-        let values = Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef;
-        let order = Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef;
-
-        let partitions = vec![(0usize, 4usize)];
-        let window = WindowFrame {
-            window_type: WindowType::Rows,
-            start: None,
-            end: Some(WindowBoundary::Preceding(2)),
-        };
-
-        let out = compute_first_value_rewrite(
-            &[values.clone()],
-            &partitions,
-            &[order],
-            Some(&window),
-            false,
-            -1,
-            4,
-        )
-        .unwrap();
-        let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
-        let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
-        assert_eq!(actual, vec![10, 10, 10, 20]);
     }
 }
 
@@ -3048,5 +3009,38 @@ fn scalar_f64(array: &dyn Array, row: usize) -> Result<f64, String> {
         DataType::Int64 => scalar_i64(array, row).map(|v| v as f64),
         DataType::Int32 => scalar_i64(array, row).map(|v| v as f64),
         other => Err(format!("unsupported f64 scalar type: {:?}", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+
+    #[test]
+    fn first_value_rewrite_fills_initial_rows() {
+        let values = Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef;
+        let order = Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef;
+
+        let partitions = vec![(0usize, 4usize)];
+        let window = WindowFrame {
+            window_type: WindowType::Rows,
+            start: None,
+            end: Some(WindowBoundary::Preceding(2)),
+        };
+
+        let out = compute_first_value_rewrite(
+            std::slice::from_ref(&values),
+            &partitions,
+            &[order],
+            Some(&window),
+            false,
+            -1,
+            4,
+        )
+        .unwrap();
+        let out_arr = out.as_any().downcast_ref::<Int32Array>().unwrap();
+        let actual: Vec<i32> = (0..out_arr.len()).map(|i| out_arr.value(i)).collect();
+        assert_eq!(actual, vec![10, 10, 10, 20]);
     }
 }

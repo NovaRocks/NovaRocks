@@ -46,9 +46,7 @@ impl RewriteRule for PushSemiAntiRightOnlyCondition {
         let LogicalPlan::Join(join) = plan else {
             return None;
         };
-        let Some(ref condition) = join.condition else {
-            return None;
-        };
+        let condition = join.condition.as_ref()?;
 
         // Port of push_semi_condition_into_children logic (legacy lines 374-431).
         let conjuncts = split_and(condition.clone());

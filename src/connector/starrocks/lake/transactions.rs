@@ -1016,7 +1016,7 @@ fn append_delete_data_txn_log(
             rewrite_segments: Vec::new(),
             del_encryption_metas: Vec::new(),
             ssts: Vec::new(),
-            schema_key: Some(schema_key.clone()),
+            schema_key: Some(schema_key),
         });
         if let Some(existing_schema_key) = op_write.schema_key.as_ref()
             && existing_schema_key.schema_id.is_some()
@@ -1094,12 +1094,12 @@ fn resolve_delete_data_schema_key(
     if let Some(existing) = existing_schema_key
         && existing.schema_id.unwrap_or(0) > 0
     {
-        return Ok(existing.clone());
+        return Ok(*existing);
     }
     if let Some(request) = request_schema_key
         && request.schema_id.unwrap_or(0) > 0
     {
-        return Ok(request.clone());
+        return Ok(*request);
     }
     if let Ok(runtime) = get_tablet_runtime(tablet_id)
         && let Some(schema_id) = runtime.schema.id
@@ -1368,13 +1368,12 @@ pub(crate) fn vacuum(request: &VacuumRequest) -> Result<VacuumResponse, String> 
                                 .iter()
                                 .filter_map(|entry| entry.tablet_id)
                                 .any(|tablet_id| !target_set.contains(&tablet_id));
-                            if !contains_alive {
-                                if let Some(size) =
+                            if !contains_alive
+                                && let Some(size) =
                                     delete_file_with_stats(&path, s3_config.as_ref())?
-                                {
-                                    vacuumed_files = vacuumed_files.saturating_add(1);
-                                    vacuumed_file_size = vacuumed_file_size.saturating_add(size);
-                                }
+                            {
+                                vacuumed_files = vacuumed_files.saturating_add(1);
+                                vacuumed_file_size = vacuumed_file_size.saturating_add(size);
                             }
                         }
                         Err(err) => {
@@ -1390,15 +1389,15 @@ pub(crate) fn vacuum(request: &VacuumRequest) -> Result<VacuumResponse, String> 
     }
 
     let mut vacuumed_version = last_version_before_grace.unwrap_or(min_retain_version);
-    if !deleted_any_meta && blocked_by_shared_bundle {
-        if let Some(min_version) = tablet_infos
+    if !deleted_any_meta
+        && blocked_by_shared_bundle
+        && let Some(min_version) = tablet_infos
             .iter()
             .filter_map(|info| info.min_version)
             .filter(|v| *v > 0)
             .min()
-        {
-            vacuumed_version = min_version;
-        }
+    {
+        vacuumed_version = min_version;
     }
 
     let response_tablet_infos = tablet_infos
@@ -2731,7 +2730,7 @@ fn publish_one_tablet(
         &mut state,
         &runtime,
         base_version,
-        &txn_infos,
+        txn_infos,
         schema_change_alter_version,
     )?;
 
@@ -4850,14 +4849,11 @@ mod tests {
                 path
             );
         }
-        for version in [5_i64] {
-            let path =
-                txn_vlog_file_path(&root_str, tablet_id, version).expect("build kept txn vlog");
-            assert!(
-                std::path::Path::new(&path).exists(),
-                "recent txn vlog should be retained conservatively: {}",
-                path
-            );
-        }
+        let path = txn_vlog_file_path(&root_str, tablet_id, 5_i64).expect("build kept txn vlog");
+        assert!(
+            std::path::Path::new(&path).exists(),
+            "recent txn vlog should be retained conservatively: {}",
+            path
+        );
     }
 }

@@ -64,11 +64,15 @@ static EXCHANGE_NOT_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 static EXCHANGE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_log_exchange_not_ready() -> bool {
-    EXCHANGE_NOT_READY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) % EXCHANGE_NOT_READY_LOG_EVERY == 0
+    EXCHANGE_NOT_READY_LOG_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(EXCHANGE_NOT_READY_LOG_EVERY)
 }
 
 fn should_log_exchange_ready() -> bool {
-    EXCHANGE_READY_LOG_COUNT.fetch_add(1, Ordering::Relaxed) % EXCHANGE_READY_LOG_EVERY == 0
+    EXCHANGE_READY_LOG_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(EXCHANGE_READY_LOG_EVERY)
 }
 
 static CANCELED_KEYS: OnceLock<Mutex<HashMap<ExchangeKey, Instant>>> = OnceLock::new();
@@ -1084,15 +1088,14 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
     let mut buffer = Vec::new();
     let schema = merged_exchange_schema(chunks)?;
     let mut batches = Vec::with_capacity(chunks.len());
-    let writer_schema;
-    if schema.fields().is_empty() {
+    let writer_schema = if schema.fields().is_empty() {
         for chunk in chunks {
             batches.push(build_zero_column_marker_batch(chunk.len())?);
         }
-        writer_schema = batches
+        batches
             .first()
             .map(|batch| batch.schema())
-            .unwrap_or_else(|| Arc::new(Schema::empty()));
+            .unwrap_or_else(|| Arc::new(Schema::empty()))
     } else {
         for (i, chunk) in chunks.iter().enumerate() {
             if chunk.schema().as_ref() == schema.as_ref() {
@@ -1110,8 +1113,8 @@ fn encode_arrow_ipc_chunks(chunks: &[Chunk]) -> Result<Vec<u8>, String> {
                 )?;
             batches.push(normalized);
         }
-        writer_schema = schema;
-    }
+        schema
+    };
     let mut writer = StreamWriter::try_new(&mut buffer, &writer_schema)
         .map_err(|e| format!("failed to create Arrow IPC writer: {e}"))?;
 
@@ -1239,40 +1242,39 @@ fn chunk_schema_for_wire_meta(
             })?
         };
         let field = batch_schema.field(idx);
-        if let Some(type_desc) = expected_slot.type_desc() {
-            if let Some(expected_arrow_type) = arrow_type_from_desc(type_desc) {
-                if field.data_type() != &expected_arrow_type {
-                    // Allow a numeric type flowing where a Binary opaque slot is expected.
-                    // This occurs in PARTITION-TOP-N pre-aggregation: avg/hll/percentile
-                    // intermediate states are declared as VARBINARY in the FE slot descriptor,
-                    // but the pre-agg passthrough sends the raw numeric input column directly.
-                    // The analytic window operator accepts numeric inputs for these functions.
-                    use arrow::datatypes::DataType;
-                    let is_opaque_binary_expected = matches!(
-                        expected_arrow_type,
-                        DataType::Binary | DataType::LargeBinary
-                    );
-                    let is_numeric_actual = matches!(
-                        field.data_type(),
-                        DataType::Int8
-                            | DataType::Int16
-                            | DataType::Int32
-                            | DataType::Int64
-                            | DataType::Float32
-                            | DataType::Float64
-                    );
-                    let is_compatible_complex =
-                        is_compatible_exchange_arrow_type(&expected_arrow_type, field.data_type());
-                    if !(is_opaque_binary_expected && is_numeric_actual) && !is_compatible_complex {
-                        return Err(format!(
-                            "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?}",
-                            idx,
-                            slot_id,
-                            field.data_type(),
-                            expected_arrow_type
-                        ));
-                    }
-                }
+        if let Some(type_desc) = expected_slot.type_desc()
+            && let Some(expected_arrow_type) = arrow_type_from_desc(type_desc)
+            && field.data_type() != &expected_arrow_type
+        {
+            // Allow a numeric type flowing where a Binary opaque slot is expected.
+            // This occurs in PARTITION-TOP-N pre-aggregation: avg/hll/percentile
+            // intermediate states are declared as VARBINARY in the FE slot descriptor,
+            // but the pre-agg passthrough sends the raw numeric input column directly.
+            // The analytic window operator accepts numeric inputs for these functions.
+            use arrow::datatypes::DataType;
+            let is_opaque_binary_expected = matches!(
+                expected_arrow_type,
+                DataType::Binary | DataType::LargeBinary
+            );
+            let is_numeric_actual = matches!(
+                field.data_type(),
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+            );
+            let is_compatible_complex =
+                is_compatible_exchange_arrow_type(&expected_arrow_type, field.data_type());
+            if (!is_opaque_binary_expected || !is_numeric_actual) && !is_compatible_complex {
+                return Err(format!(
+                    "exchange decoded arrow type mismatch at index {} for slot {}: batch={:?} expected={:?}",
+                    idx,
+                    slot_id,
+                    field.data_type(),
+                    expected_arrow_type
+                ));
             }
         }
         // Use the expected schema's slot ID (not the wire ID) so the decoded

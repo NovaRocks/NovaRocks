@@ -64,9 +64,8 @@ pub fn eval_year(
                         let days_since_epoch = arr.value(i);
                         // Date32 represents days since 1970-01-01
                         // 719163 is the Julian day number for 1970-01-01
-                        let date =
-                            NaiveDate::from_num_days_from_ce_opt(719163 + days_since_epoch as i32)
-                                .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                        let date = NaiveDate::from_num_days_from_ce_opt(719163 + days_since_epoch)
+                            .unwrap_or_else(|| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
                         Some(date.year())
                     }
                 })

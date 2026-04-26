@@ -40,7 +40,7 @@ use crate::exec::chunk::Chunk;
 
 use super::min_max::RuntimeMinMaxFilter;
 
-const DEFAULT_L2_CACHE_SIZE: usize = 1 * 1024 * 1024;
+const DEFAULT_L2_CACHE_SIZE: usize = 1024 * 1024;
 const DEFAULT_L3_CACHE_SIZE: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -263,7 +263,7 @@ pub(crate) fn maybe_build_runtime_bitset_filter(
         Some(v) if v > 0 => v as u128,
         _ => return Ok(None),
     };
-    let bitset_bytes_u128 = (value_interval + 7) / 8;
+    let bitset_bytes_u128 = value_interval.div_ceil(8);
     let bitset_bytes = match usize::try_from(bitset_bytes_u128) {
         Ok(v) if v > 0 => v,
         _ => return Ok(None),
@@ -553,16 +553,16 @@ fn apply_bitset_filter(
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "runtime bitset filter type mismatch for Boolean".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = if arr.value(i) { 1 } else { 0 };
-                keep[i] = test_value(v);
+                *keep = test_value(v);
             }
         }
         DataType::Int8 => {
@@ -570,15 +570,15 @@ fn apply_bitset_filter(
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .ok_or_else(|| "runtime bitset filter type mismatch for Int8".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
-                keep[i] = test_value(arr.value(i) as i64);
+                *keep = test_value(arr.value(i) as i64);
             }
         }
         DataType::Int16 => {
@@ -586,15 +586,15 @@ fn apply_bitset_filter(
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .ok_or_else(|| "runtime bitset filter type mismatch for Int16".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
-                keep[i] = test_value(arr.value(i) as i64);
+                *keep = test_value(arr.value(i) as i64);
             }
         }
         DataType::Int32 => {
@@ -602,15 +602,15 @@ fn apply_bitset_filter(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| "runtime bitset filter type mismatch for Int32".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
-                keep[i] = test_value(arr.value(i) as i64);
+                *keep = test_value(arr.value(i) as i64);
             }
         }
         DataType::Int64 => {
@@ -618,15 +618,15 @@ fn apply_bitset_filter(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| "runtime bitset filter type mismatch for Int64".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
-                keep[i] = test_value(arr.value(i));
+                *keep = test_value(arr.value(i));
             }
         }
         DataType::Date32 => {
@@ -634,15 +634,15 @@ fn apply_bitset_filter(
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| "runtime bitset filter type mismatch for Date32".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
-                keep[i] = test_value(arr.value(i) as i64);
+                *keep = test_value(arr.value(i) as i64);
             }
         }
         DataType::Timestamp(unit, _) => match unit {
@@ -653,16 +653,16 @@ fn apply_bitset_filter(
                     .ok_or_else(|| {
                         "runtime bitset filter type mismatch for TimestampSecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i).saturating_mul(1_000_000);
-                    keep[i] = test_value(v);
+                    *keep = test_value(v);
                 }
             }
             arrow::datatypes::TimeUnit::Millisecond => {
@@ -672,16 +672,16 @@ fn apply_bitset_filter(
                     .ok_or_else(|| {
                         "runtime bitset filter type mismatch for TimestampMillisecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i).saturating_mul(1_000);
-                    keep[i] = test_value(v);
+                    *keep = test_value(v);
                 }
             }
             arrow::datatypes::TimeUnit::Microsecond => {
@@ -691,15 +691,15 @@ fn apply_bitset_filter(
                     .ok_or_else(|| {
                         "runtime bitset filter type mismatch for TimestampMicrosecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
-                    keep[i] = test_value(arr.value(i));
+                    *keep = test_value(arr.value(i));
                 }
             }
             arrow::datatypes::TimeUnit::Nanosecond => {
@@ -709,16 +709,16 @@ fn apply_bitset_filter(
                     .ok_or_else(|| {
                         "runtime bitset filter type mismatch for TimestampNanosecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i) / 1_000;
-                    keep[i] = test_value(v);
+                    *keep = test_value(v);
                 }
             }
         },

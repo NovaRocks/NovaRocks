@@ -418,95 +418,95 @@ impl RuntimeMinMaxFilter {
             t if t == TPrimitiveType::BOOLEAN => {
                 let (min, max) = self.bool_range()?;
                 let arr = as_array::<BooleanArray>(array, "Boolean")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
-                    if v < min || v > max {
-                        keep[i] = false;
+                    if (!v & min) || (v & !max) {
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::TINYINT => {
                 let (min, max) = self.i8_range()?;
                 let arr = as_array::<Int8Array>(array, "Int8")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::SMALLINT => {
                 let (min, max) = self.i16_range()?;
                 let arr = as_array::<Int16Array>(array, "Int16")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::INT => {
                 let (min, max) = self.i32_range()?;
                 let arr = as_array::<Int32Array>(array, "Int32")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::BIGINT => {
                 let (min, max) = self.i64_range()?;
                 let arr = as_array::<Int64Array>(array, "Int64")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
@@ -516,76 +516,76 @@ impl RuntimeMinMaxFilter {
                 if arr.value_length() != largeint::LARGEINT_BYTE_WIDTH {
                     return Err("runtime min/max type mismatch for FixedSizeBinary(16)".to_string());
                 }
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = largeint::i128_from_be_bytes(arr.value(i))?;
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::FLOAT => {
                 let (min, max) = self.f32_range()?;
                 let arr = as_array::<Float32Array>(array, "Float32")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v.is_nan() || v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::DOUBLE => {
                 let (min, max) = self.f64_range()?;
                 let arr = as_array::<Float64Array>(array, "Float64")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v.is_nan() || v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if t == TPrimitiveType::DATE => {
                 let (min, max) = self.date32_range()?;
                 let arr = as_array::<Date32Array>(array, "Date32")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
@@ -613,38 +613,38 @@ impl RuntimeMinMaxFilter {
                 let arr = as_array::<StringArray>(array, "Utf8")?;
                 let min_bytes = min.as_bytes();
                 let max_bytes = max.as_bytes();
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let bytes = arr.value(i).as_bytes();
                     if bytes < min_bytes || bytes > max_bytes {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }
             t if is_decimal_type(&t) => {
                 let (min, max) = self.decimal_range()?;
                 let arr = as_array::<Decimal128Array>(array, "Decimal128")?;
-                for i in 0..arr.len() {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(arr.len()) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
                         if check_null {
-                            keep[i] = has_null;
+                            *keep = has_null;
                         }
                         continue;
                     }
                     let v = arr.value(i);
                     if v < min || v > max {
-                        keep[i] = false;
+                        *keep = false;
                     }
                 }
             }

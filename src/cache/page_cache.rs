@@ -154,10 +154,10 @@ where
             }
         }
 
-        if self.size.saturating_add(charge) > self.capacity {
-            if !self.maybe_evict(charge, evict_probability) {
-                return false;
-            }
+        if self.size.saturating_add(charge) > self.capacity
+            && !self.maybe_evict(charge, evict_probability)
+        {
+            return false;
         }
 
         let entry = CacheEntry {

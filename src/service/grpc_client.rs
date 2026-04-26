@@ -140,13 +140,13 @@ pub fn transmit_runtime_filter(
             .max_decoding_message_size(64 * 1024 * 1024);
         match cli.transmit_runtime_filter(params).await {
             Ok(resp) => {
-                if let Some(status) = resp.get_ref().status.as_ref() {
-                    if status.status_code != 0 {
-                        error!(
-                            "runtime filter send failed: dest={}:{} code={} msgs={:?}",
-                            dest_host, port, status.status_code, status.error_msgs
-                        );
-                    }
+                if let Some(status) = resp.get_ref().status.as_ref()
+                    && status.status_code != 0
+                {
+                    error!(
+                        "runtime filter send failed: dest={}:{} code={} msgs={:?}",
+                        dest_host, port, status.status_code, status.error_msgs
+                    );
                 }
             }
             Err(e) => {

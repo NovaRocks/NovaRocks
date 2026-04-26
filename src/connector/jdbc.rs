@@ -110,9 +110,9 @@ fn scan_sqlite_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
     let mut row_count = 0usize;
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        for i in 0..col_count {
+        for (i, builder) in builders.iter_mut().enumerate().take(col_count) {
             let v = row.get_ref(i).map_err(|e| e.to_string())?;
-            append_sqlite_value(&mut builders[i], v)?;
+            append_sqlite_value(builder, v)?;
         }
         row_count += 1;
     }
@@ -157,9 +157,9 @@ fn scan_mysql_iter(cfg: &JdbcScanConfig) -> Result<BoxedExecIter, String> {
     let mut row_count = 0usize;
     for row_result in result {
         let row = row_result.map_err(|e| e.to_string())?;
-        for i in 0..col_count {
+        for (i, builder) in builders.iter_mut().enumerate().take(col_count) {
             let v = row.as_ref(i).cloned().unwrap_or(mysql::Value::NULL);
-            append_mysql_value(&mut builders[i], v)?;
+            append_mysql_value(builder, v)?;
         }
         row_count += 1;
     }

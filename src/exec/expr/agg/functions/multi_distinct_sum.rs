@@ -40,7 +40,7 @@ unsafe fn get_or_init_set<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
     let slot = set_slot(ptr);
     let raw = unsafe { *slot };
     if raw.is_null() {
-        let boxed: Box<DistinctSet> = Box::new(HashSet::new());
+        let boxed: Box<DistinctSet> = Box::default();
         let raw = Box::into_raw(boxed);
         unsafe {
             *slot = raw;
@@ -466,7 +466,7 @@ impl AggregateFunction for MultiDistinctSumAgg {
                 if set.is_empty() {
                     builder.append_null();
                 } else {
-                    builder.append_value(&serialize_set(set));
+                    builder.append_value(serialize_set(set));
                 }
             }
             return Ok(std::sync::Arc::new(builder.finish()));

@@ -421,7 +421,7 @@ impl AggregateProcessorOperator {
             self.ensure_scalar_group().map_err(|e| e.to_string())?;
             let state_ptr = *self
                 .group_states
-                .get(0)
+                .first()
                 .ok_or_else(|| "aggregate scalar state missing".to_string())?;
             self.state_ptrs.clear();
             self.state_ptrs.resize(num_rows, state_ptr);
@@ -473,7 +473,7 @@ impl AggregateProcessorOperator {
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
-                    for row in 0..num_rows {
+                    for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let row_bytes = if let Some(rows) = rows.as_ref() {
                             rows.row(row).data()
                         } else {
@@ -489,7 +489,7 @@ impl AggregateProcessorOperator {
                                 })?
                         };
                         let lookup = key_table
-                            .find_or_insert_from_row(&key_views, row, row_bytes, hashes[row])
+                            .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                             .map_err(|e| e.to_string())?;
                         self.ensure_group_state(&lookup)
                             .map_err(|e| e.to_string())?;
@@ -501,14 +501,14 @@ impl AggregateProcessorOperator {
                 }
                 GroupKeyStrategy::OneNumber => {
                     let view = key_views
-                        .get(0)
+                        .first()
                         .ok_or_else(|| "one number key view missing".to_string())?;
                     let hashes = key_table
                         .build_one_number_hashes(view, num_rows)
                         .map_err(|e| e.to_string())?;
-                    for row in 0..num_rows {
+                    for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let lookup = key_table
-                            .find_or_insert_one_number(view, row, hashes[row])
+                            .find_or_insert_one_number(view, row, hash)
                             .map_err(|e| e.to_string())?;
                         self.ensure_group_state(&lookup)
                             .map_err(|e| e.to_string())?;
@@ -517,7 +517,7 @@ impl AggregateProcessorOperator {
                 }
                 GroupKeyStrategy::OneString => {
                     let view = key_views
-                        .get(0)
+                        .first()
                         .ok_or_else(|| "one string key view missing".to_string())?;
                     let GroupKeyArrayView::Utf8(arr) = view else {
                         return Err("one string key expects Utf8 view".to_string());
@@ -525,15 +525,15 @@ impl AggregateProcessorOperator {
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
-                    for row in 0..num_rows {
+                    for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let lookup = if arr.is_null(row) {
                             key_table
-                                .find_or_insert_one_string(view, row, None, hashes[row])
+                                .find_or_insert_one_string(view, row, None, hash)
                                 .map_err(|e| e.to_string())?
                         } else {
                             let key = arr.value(row);
                             key_table
-                                .find_or_insert_one_string(view, row, Some(key), hashes[row])
+                                .find_or_insert_one_string(view, row, Some(key), hash)
                                 .map_err(|e| e.to_string())?
                         };
                         self.ensure_group_state(&lookup)
@@ -545,9 +545,9 @@ impl AggregateProcessorOperator {
                     let hashes = key_table
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
-                    for row in 0..num_rows {
+                    for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                         let lookup = key_table
-                            .find_or_insert_fixed_size(&key_views, row, hashes[row])
+                            .find_or_insert_fixed_size(&key_views, row, hash)
                             .map_err(|e| e.to_string())?;
                         self.ensure_group_state(&lookup)
                             .map_err(|e| e.to_string())?;
@@ -562,10 +562,16 @@ impl AggregateProcessorOperator {
                         .build_group_hashes(&key_views, num_rows)
                         .map_err(|e| e.to_string())?;
                     let mut rows_opt = None;
-                    for row in 0..num_rows {
-                        let lookup = if keys[row] {
+                    for (row, (key, hash)) in keys
+                        .iter()
+                        .copied()
+                        .zip(hashes.iter().copied())
+                        .enumerate()
+                        .take(num_rows)
+                    {
+                        let lookup = if key {
                             key_table
-                                .find_or_insert_compressed(&key_views, row, hashes[row])
+                                .find_or_insert_compressed(&key_views, row, hash)
                                 .map_err(|e| e.to_string())?
                         } else {
                             if rows_opt.is_none() {
@@ -578,7 +584,7 @@ impl AggregateProcessorOperator {
                             let rows = rows_opt.as_ref().expect("group rows");
                             let row_bytes = rows.row(row).data();
                             key_table
-                                .find_or_insert_from_row(&key_views, row, row_bytes, hashes[row])
+                                .find_or_insert_from_row(&key_views, row, row_bytes, hash)
                                 .map_err(|e| e.to_string())?
                         };
                         self.ensure_group_state(&lookup)
@@ -902,16 +908,15 @@ impl AggregateProcessorOperator {
             .ok_or_else(|| "aggregate kernels not initialized".to_string())?;
         self.validate_agg_array_types(&expected_agg_types, &kernels.entries, agg_arrays)?;
 
-        if let Some(table) = self.key_table.as_mut() {
-            if table.key_strategy() == GroupKeyStrategy::CompressedFixed
-                && table.compressed_ctx().is_none()
-            {
-                if group_arrays.first().map_or(0, |array| array.len()) == 0 {
-                    return Ok(());
-                }
-                let views = build_group_key_views(group_arrays)?;
-                table.ensure_compressed_ctx(&views)?;
+        if let Some(table) = self.key_table.as_mut()
+            && table.key_strategy() == GroupKeyStrategy::CompressedFixed
+            && table.compressed_ctx().is_none()
+        {
+            if group_arrays.first().map_or(0, |array| array.len()) == 0 {
+                return Ok(());
             }
+            let views = build_group_key_views(group_arrays)?;
+            table.ensure_compressed_ctx(&views)?;
         }
         self.data_initialized = true;
         Ok(())
@@ -1001,10 +1006,7 @@ impl AggregateProcessorOperator {
                     slot_schema.with_field_and_slot_id(*slot_id, field.as_ref().clone())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            return Chunk::try_new_with_chunk_schema(
-                batch,
-                Arc::new(ChunkSchema::try_new(slot_schemas)?),
-            );
+            Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::try_new(slot_schemas)?))
         }
     }
 
@@ -1035,14 +1037,14 @@ impl AggregateProcessorOperator {
                 //
                 // Prefer FE-provided type signature (TFunction.aggregate_fn.intermediate_type)
                 // when available to build the correct merge view and kernel spec.
-                if let Some(sig) = func.types.as_ref() {
-                    if let Some(intermediate) = sig.intermediate_type.as_ref() {
-                        if matches!(intermediate, DataType::Null) {
-                            return Err("aggregate intermediate type is null".to_string());
-                        }
-                        types.push(Some(intermediate.clone()));
-                        continue;
+                if let Some(sig) = func.types.as_ref()
+                    && let Some(intermediate) = sig.intermediate_type.as_ref()
+                {
+                    if matches!(intermediate, DataType::Null) {
+                        return Err("aggregate intermediate type is null".to_string());
                     }
+                    types.push(Some(intermediate.clone()));
+                    continue;
                 }
             }
             let data_type = match (func.name.as_str(), func.inputs.as_slice()) {

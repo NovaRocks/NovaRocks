@@ -53,7 +53,7 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| "LIST sort key is not ListArray".to_string())?;
-            let normalized_values = normalize_sort_key_array(&list.values())?;
+            let normalized_values = normalize_sort_key_array(list.values())?;
             if normalized_values.data_type() == list.values().data_type() {
                 return Ok(values.clone());
             }

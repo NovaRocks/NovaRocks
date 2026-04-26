@@ -54,14 +54,14 @@ fn eval_next_previous_day_inner(
         .ok_or_else(|| "next_day expects string".to_string())?;
     let mut out = Vec::with_capacity(dates.len());
     let func_name = if next { "next_day" } else { "previous_day" };
-    for i in 0..dates.len() {
+    for (i, date) in dates.iter().copied().enumerate() {
         if date_arr.is_null(i) || day_arr.is_null(i) {
             out.push(None);
             continue;
         }
         let target = day_arr.value(i);
         let target_weekday = parse_weekday_token(target, func_name)?;
-        let date = match dates[i] {
+        let date = match date {
             Some(d) => d,
             None => {
                 out.push(None);

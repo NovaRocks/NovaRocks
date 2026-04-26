@@ -55,7 +55,7 @@ pub(crate) fn pick_group_key_strategy(types: &[DataType]) -> GroupKeyStrategy {
 }
 
 pub(crate) fn can_apply_fixed_size_key(types: &[DataType]) -> bool {
-    let null_bytes = (types.len() + 7) / 8;
+    let null_bytes = types.len().div_ceil(8);
     let mut total = null_bytes;
     for data_type in types {
         let Some(width) = fixed_width_size(data_type) else {

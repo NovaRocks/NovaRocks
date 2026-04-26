@@ -174,7 +174,7 @@ pub fn write_struct_reply<T: TSerializable>(
     value: &T,
 ) -> thrift::Result<()> {
     o_prot.write_message_begin(&TMessageIdentifier::new(method, TMessageType::Reply, seq))?;
-    o_prot.write_struct_begin(&TStructIdentifier::new(&format!("{method}_result")))?;
+    o_prot.write_struct_begin(&TStructIdentifier::new(format!("{method}_result")))?;
     o_prot.write_field_begin(&TFieldIdentifier::new("success", TType::Struct, 0))?;
     value.write_to_out_protocol(o_prot)?;
     o_prot.write_field_end()?;

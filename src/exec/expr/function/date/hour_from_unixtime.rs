@@ -34,8 +34,8 @@ pub fn eval_hour_from_unixtime(
     let values = extract_i64_array(&arr, "hour_from_unixtime")?;
     let len = values.len();
     let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let Some(secs) = values[i] else {
+    for secs in values.iter().copied().take(len) {
+        let Some(secs) = secs else {
             out.push(None);
             continue;
         };

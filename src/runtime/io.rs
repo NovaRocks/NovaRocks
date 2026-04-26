@@ -107,6 +107,9 @@ pub struct IoExecutor {
     pool: ThreadPool,
 }
 
+type IoTask = Box<dyn FnOnce() + Send + 'static>;
+type SharedIoTask = Arc<Mutex<Option<IoTask>>>;
+
 impl IoExecutor {
     fn new(num_threads: usize) -> Self {
         let threads = num_threads.max(1);
@@ -124,11 +127,10 @@ impl IoExecutor {
             cancelled: Arc::clone(&cancelled),
         };
         let completion_clone = Arc::clone(&completion);
-        let task_cell: Arc<Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>> =
-            Arc::new(Mutex::new(Some(Box::new(move || {
-                task(ctx);
-                completion_clone.mark_done();
-            }))));
+        let task_cell: SharedIoTask = Arc::new(Mutex::new(Some(Box::new(move || {
+            task(ctx);
+            completion_clone.mark_done();
+        }))));
 
         // Avoid hidden thread spawning; queue all tasks in the executor.
         let runner = make_runner(task_cell);
@@ -140,9 +142,7 @@ impl IoExecutor {
     }
 }
 
-fn make_runner(
-    task_cell: Arc<Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>>,
-) -> impl FnOnce() + Send + 'static {
+fn make_runner(task_cell: SharedIoTask) -> impl FnOnce() + Send + 'static {
     move || {
         let task = {
             let mut guard = task_cell.lock().expect("io task cell lock");

@@ -417,7 +417,7 @@ impl AggregateFunction for CovarCorrAgg {
                                 buf[8..16].copy_from_slice(&state.mean_y.to_le_bytes());
                                 buf[16..24].copy_from_slice(&state.c2.to_le_bytes());
                                 buf[24..32].copy_from_slice(&state.count.to_le_bytes());
-                                builder.append_value(&buf);
+                                builder.append_value(buf);
                             }
                             AggKind::Corr => {
                                 let state = unsafe {
@@ -434,7 +434,7 @@ impl AggregateFunction for CovarCorrAgg {
                                 buf[24..32].copy_from_slice(&state.count.to_le_bytes());
                                 buf[32..40].copy_from_slice(&state.m2x.to_le_bytes());
                                 buf[40..48].copy_from_slice(&state.m2y.to_le_bytes());
-                                builder.append_value(&buf);
+                                builder.append_value(buf);
                             }
                             _ => return Err("covar/corr kind mismatch".to_string()),
                         }

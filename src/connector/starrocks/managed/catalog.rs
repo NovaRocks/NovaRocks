@@ -74,7 +74,8 @@ impl ManagedLakeCatalog {
         Ok(self
             .tables_by_name
             .keys()
-            .filter_map(|(d, t)| (d == &db).then(|| t.clone()))
+            .filter(|(d, _)| d == &db)
+            .map(|(_, t)| t.clone())
             .collect())
     }
 

@@ -689,7 +689,7 @@ impl RuntimeInFilterValues {
                 for v in values {
                     converted.push(map_unit(v)?);
                 }
-                Ok(min_max_i64(converted.into_iter()).map(|(min, max)| {
+                Ok(min_max_i64(converted).map(|(min, max)| {
                     (
                         MinMaxPredicateValue::DateTimeMicros(min),
                         MinMaxPredicateValue::DateTimeMicros(max),
@@ -1077,16 +1077,16 @@ impl RuntimeInFilter {
         }
         let len = chunk.len();
         let mut keep = vec![true; len];
-        for row in 0..len {
-            if !keep[row] {
+        for (row, keep_row) in keep.iter_mut().enumerate().take(len) {
+            if !*keep_row {
                 continue;
             }
             if array.is_null(row) {
-                keep[row] = false;
+                *keep_row = false;
                 continue;
             }
             if !self.values.contains(array, row)? {
-                keep[row] = false;
+                *keep_row = false;
             }
         }
         if keep.iter().all(|v| *v) {

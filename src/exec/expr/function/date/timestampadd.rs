@@ -45,12 +45,12 @@ pub fn eval_timestampadd(
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
     let mut out = Vec::with_capacity(dts.len());
-    for i in 0..dts.len() {
+    for (i, dt) in dts.iter().copied().enumerate() {
         if unit_arr.is_null(i) || interval_arr.is_null(i) {
             out.push(None);
             continue;
         }
-        let dt = match dts[i] {
+        let dt = match dt {
             Some(v) => v,
             None => {
                 out.push(None);

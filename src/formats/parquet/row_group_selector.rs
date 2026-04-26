@@ -125,22 +125,21 @@ fn should_read_row_group(
             }
         });
 
-        if let Some(chunk) = chunk {
-            if let Some(stats) = chunk.statistics() {
-                let satisfies = match pred {
-                    MinMaxPredicate::Le { value, .. } => check_min_satisfies_le(stats, value)?,
-                    MinMaxPredicate::Ge { value, .. } => check_max_satisfies_ge(stats, value)?,
-                    MinMaxPredicate::Lt { value, .. } => check_min_satisfies_lt(stats, value)?,
-                    MinMaxPredicate::Gt { value, .. } => check_max_satisfies_gt(stats, value)?,
-                    MinMaxPredicate::Eq { value, .. } => {
-                        check_max_satisfies_ge(stats, value)?
-                            && check_min_satisfies_le(stats, value)?
-                    }
-                };
-
-                if !satisfies {
-                    return Ok(false);
+        if let Some(chunk) = chunk
+            && let Some(stats) = chunk.statistics()
+        {
+            let satisfies = match pred {
+                MinMaxPredicate::Le { value, .. } => check_min_satisfies_le(stats, value)?,
+                MinMaxPredicate::Ge { value, .. } => check_max_satisfies_ge(stats, value)?,
+                MinMaxPredicate::Lt { value, .. } => check_min_satisfies_lt(stats, value)?,
+                MinMaxPredicate::Gt { value, .. } => check_max_satisfies_gt(stats, value)?,
+                MinMaxPredicate::Eq { value, .. } => {
+                    check_max_satisfies_ge(stats, value)? && check_min_satisfies_le(stats, value)?
                 }
+            };
+
+            if !satisfies {
+                return Ok(false);
             }
         }
     }
@@ -213,13 +212,12 @@ fn check_max_satisfies_ge(
             }
         }
         Statistics::FixedLenByteArray(s) => {
-            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
-                if let Some(max) = s
+            if let Some(v) = fixed_len_predicate_value_as_i128(value)
+                && let Some(max) = s
                     .max_opt()
                     .and_then(|max| decode_signed_be_i128(max.data()))
-                {
-                    return Ok(max >= v);
-                }
+            {
+                return Ok(max >= v);
             }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
@@ -300,13 +298,12 @@ fn check_min_satisfies_le(
             }
         }
         Statistics::FixedLenByteArray(s) => {
-            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
-                if let Some(min) = s
+            if let Some(v) = fixed_len_predicate_value_as_i128(value)
+                && let Some(min) = s
                     .min_opt()
                     .and_then(|min| decode_signed_be_i128(min.data()))
-                {
-                    return Ok(min <= v);
-                }
+            {
+                return Ok(min <= v);
             }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
@@ -371,7 +368,7 @@ fn check_max_satisfies_gt(
                 return Ok(true);
             };
             if let Some(max) = s.max_opt() {
-                Ok(*max > v)
+                Ok(*max & !v)
             } else {
                 Ok(true)
             }
@@ -387,13 +384,12 @@ fn check_max_satisfies_gt(
             }
         }
         Statistics::FixedLenByteArray(s) => {
-            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
-                if let Some(max) = s
+            if let Some(v) = fixed_len_predicate_value_as_i128(value)
+                && let Some(max) = s
                     .max_opt()
                     .and_then(|max| decode_signed_be_i128(max.data()))
-                {
-                    return Ok(max > v);
-                }
+            {
+                return Ok(max > v);
             }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);
@@ -458,7 +454,7 @@ fn check_min_satisfies_lt(
                 return Ok(true);
             };
             if let Some(min) = s.min_opt() {
-                Ok(*min < v)
+                Ok(!*min & v)
             } else {
                 Ok(true)
             }
@@ -474,13 +470,12 @@ fn check_min_satisfies_lt(
             }
         }
         Statistics::FixedLenByteArray(s) => {
-            if let Some(v) = fixed_len_predicate_value_as_i128(value) {
-                if let Some(min) = s
+            if let Some(v) = fixed_len_predicate_value_as_i128(value)
+                && let Some(min) = s
                     .min_opt()
                     .and_then(|min| decode_signed_be_i128(min.data()))
-                {
-                    return Ok(min < v);
-                }
+            {
+                return Ok(min < v);
             }
             let Some(v) = value.as_bytes() else {
                 return Ok(true);

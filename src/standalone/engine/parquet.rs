@@ -180,7 +180,7 @@ fn cast_list_struct_to_map_for_local_schema(
     let values = if list.values().data_type() == target_entries.data_type() {
         list.values().clone()
     } else {
-        crate::exec::expr::cast_with_special_rules(&list.values(), target_entries.data_type())?
+        crate::exec::expr::cast_with_special_rules(list.values(), target_entries.data_type())?
     };
     let entries = values
         .as_any()

@@ -129,21 +129,20 @@ pub(crate) fn lower_binary_pred(
     if !matches!(compare_type, DataType::LargeBinary) {
         for child in [&mut left, &mut right] {
             let child_expr = *child;
-            if let Some(child_type) = arena.data_type(child_expr) {
-                if child_type != &compare_type {
-                    let cast_expr =
-                        arena.push_typed(ExprNode::Cast(child_expr), compare_type.clone());
-                    *child = cast_expr;
-                }
+            if let Some(child_type) = arena.data_type(child_expr)
+                && child_type != &compare_type
+            {
+                let cast_expr = arena.push_typed(ExprNode::Cast(child_expr), compare_type.clone());
+                *child = cast_expr;
             }
         }
     }
 
     for child in [left, right] {
-        if let Some(dt) = arena.data_type(child) {
-            if matches!(dt, DataType::LargeBinary) {
-                return Err("VARIANT is not supported in comparison predicates".to_string());
-            }
+        if let Some(dt) = arena.data_type(child)
+            && matches!(dt, DataType::LargeBinary)
+        {
+            return Err("VARIANT is not supported in comparison predicates".to_string());
         }
     }
 

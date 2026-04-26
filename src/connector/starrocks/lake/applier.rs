@@ -406,7 +406,7 @@ fn apply_alter_metadata_log(
             metadata.compaction_strategy = Some(compaction_strategy);
         }
         if let Some(flat_json_config) = update_info.flat_json_config.as_ref() {
-            metadata.flat_json_config = Some(flat_json_config.clone());
+            metadata.flat_json_config = Some(*flat_json_config);
         }
         if let Some(tablet_schema) = update_info.tablet_schema.as_ref() {
             apply_tablet_schema_update(

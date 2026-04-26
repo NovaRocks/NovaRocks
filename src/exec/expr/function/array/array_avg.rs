@@ -238,7 +238,7 @@ pub fn eval_array_avg(
             if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let values = crate::common::largeint::as_fixed_size_binary_array(
-                &values,
+                values,
                 "array_avg LARGEINT values",
             )?;
             let mut converted = Vec::with_capacity(values.len());

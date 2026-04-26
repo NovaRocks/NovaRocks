@@ -115,7 +115,7 @@ pub(crate) fn bitshuffle_lz4_decompress(
     elem_size: usize,
     segment_path: &str,
 ) -> Result<Vec<u8>, String> {
-    if num_elements % 8 != 0 {
+    if !num_elements.is_multiple_of(8) {
         return Err(format!(
             "bitshuffle num_elements must be multiple of 8: segment={}, num_elements={}",
             segment_path, num_elements
@@ -272,7 +272,7 @@ fn bitunshuffle_scal(
     size: usize,
     elem_size: usize,
 ) -> Result<(), String> {
-    if size % 8 != 0 {
+    if !size.is_multiple_of(8) {
         return Err(format!(
             "bitunshuffle size must be multiple of 8: size={}",
             size
@@ -302,7 +302,7 @@ fn trans_byte_bitrow_scal(
     size: usize,
     elem_size: usize,
 ) -> Result<(), String> {
-    if size % 8 != 0 {
+    if !size.is_multiple_of(8) {
         return Err(format!(
             "trans_byte_bitrow size must be multiple of 8: size={}",
             size
@@ -327,7 +327,7 @@ fn shuffle_bit_eightelem_scal(
     size: usize,
     elem_size: usize,
 ) -> Result<(), String> {
-    if size % 8 != 0 {
+    if !size.is_multiple_of(8) {
         return Err(format!(
             "shuffle_bit_eightelem size must be multiple of 8: size={}",
             size

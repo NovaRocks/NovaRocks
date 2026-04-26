@@ -61,9 +61,9 @@ const LOCAL_EXCHANGE_NOTIFY_EVERY: u64 = 1;
 static LOCAL_EXCHANGE_NOTIFY_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_log_notify() -> bool {
-    LOCAL_EXCHANGE_NOTIFY_LOG_COUNT.fetch_add(1, Ordering::Relaxed)
-        % LOCAL_EXCHANGE_NOTIFY_LOG_EVERY
-        == 0
+    LOCAL_EXCHANGE_NOTIFY_LOG_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(LOCAL_EXCHANGE_NOTIFY_LOG_EVERY)
 }
 
 fn should_notify_on_push() -> bool {
@@ -266,10 +266,10 @@ impl LocalExchanger {
             self.maybe_schedule_spill_without_state();
             return false;
         }
-        if let Some(spill) = self.spill_state() {
-            if spill.spill_inflight.load(Ordering::Acquire) {
-                return false;
-            }
+        if let Some(spill) = self.spill_state()
+            && spill.spill_inflight.load(Ordering::Acquire)
+        {
+            return false;
         }
         true
     }
@@ -321,23 +321,23 @@ impl LocalExchanger {
     }
 
     pub(crate) fn source_observable(&self) -> Arc<Observable> {
-        if let Some(spill) = self.spill_state() {
-            if spill.restore_blocked.load(Ordering::Acquire) {
-                spill.channel.register_capacity_waiter();
-                spill.restore_blocked.store(false, Ordering::Release);
-                return spill.channel.capacity_observable();
-            }
+        if let Some(spill) = self.spill_state()
+            && spill.restore_blocked.load(Ordering::Acquire)
+        {
+            spill.channel.register_capacity_waiter();
+            spill.restore_blocked.store(false, Ordering::Release);
+            return spill.channel.capacity_observable();
         }
         Arc::clone(&self.source_observable)
     }
 
     pub(crate) fn sink_observable(&self) -> Arc<Observable> {
-        if let Some(spill) = self.spill_state() {
-            if spill.spill_blocked.load(Ordering::Acquire) {
-                spill.channel.register_capacity_waiter();
-                spill.spill_blocked.store(false, Ordering::Release);
-                return spill.channel.capacity_observable();
-            }
+        if let Some(spill) = self.spill_state()
+            && spill.spill_blocked.load(Ordering::Acquire)
+        {
+            spill.channel.register_capacity_waiter();
+            spill.spill_blocked.store(false, Ordering::Release);
+            return spill.channel.capacity_observable();
         }
         Arc::clone(&self.sink_observable)
     }
@@ -541,10 +541,10 @@ impl LocalExchanger {
         if buffered_bytes <= 0 {
             return false;
         }
-        if let Some(max_bytes) = spill.config.spill_operator_max_bytes {
-            if buffered_bytes > max_bytes {
-                return true;
-            }
+        if let Some(max_bytes) = spill.config.spill_operator_max_bytes
+            && buffered_bytes > max_bytes
+        {
+            return true;
         }
         let min_bytes = spill.config.spill_operator_min_bytes.unwrap_or(0);
         if buffered_bytes < min_bytes {

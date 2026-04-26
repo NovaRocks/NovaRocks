@@ -43,13 +43,13 @@ pub(crate) fn decode_binary_plain_values(
             .try_into()
             .map_err(|_| "decode binary plain num_values failed".to_string())?,
     ) as usize;
-    if let Some(expected) = expected_num_values {
-        if num_values != expected {
-            return Err(format!(
-                "binary plain page num_values mismatch: segment={}, expected_num_values={}, actual_num_values={}",
-                segment_path, expected, num_values
-            ));
-        }
+    if let Some(expected) = expected_num_values
+        && num_values != expected
+    {
+        return Err(format!(
+            "binary plain page num_values mismatch: segment={}, expected_num_values={}, actual_num_values={}",
+            segment_path, expected, num_values
+        ));
     }
     let offsets_bytes = num_values
         .checked_mul(4)

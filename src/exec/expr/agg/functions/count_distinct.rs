@@ -42,7 +42,7 @@ unsafe fn get_or_init_set<'a>(ptr: *mut u8) -> &'a mut DistinctSet {
     let slot = set_slot(ptr);
     let raw = unsafe { *slot };
     if raw.is_null() {
-        let boxed: Box<DistinctSet> = Box::new(HashSet::new());
+        let boxed: Box<DistinctSet> = Box::default();
         let raw = Box::into_raw(boxed);
         unsafe {
             *slot = raw;
@@ -657,7 +657,7 @@ impl AggregateFunction for CountDistinctAgg {
                 let ptr = unsafe { (base as *mut u8).add(offset) };
                 let raw = unsafe { *(ptr as *const *mut DistinctSet) };
                 if raw.is_null() {
-                    builder.append_value(&0u32.to_le_bytes());
+                    builder.append_value(0u32.to_le_bytes());
                 } else {
                     let set = unsafe { &*raw };
                     let bytes = serialize_set(set);
@@ -792,7 +792,7 @@ mod tests {
             assert_eq!(chunk.columns().len(), 2);
             let k_arr = chunk
                 .columns()
-                .get(0)
+                .first()
                 .expect("k column")
                 .as_any()
                 .downcast_ref::<Int32Array>()

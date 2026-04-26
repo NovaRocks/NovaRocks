@@ -552,10 +552,10 @@ pub(super) fn required_input_properties(
             let mut partition_cols = Vec::new();
             for we in &w.window_exprs {
                 for pbe in &we.partition_by {
-                    if let Some(col) = typed_expr_to_column_ref(pbe) {
-                        if !partition_cols.contains(&col) {
-                            partition_cols.push(col);
-                        }
+                    if let Some(col) = typed_expr_to_column_ref(pbe)
+                        && !partition_cols.contains(&col)
+                    {
+                        partition_cols.push(col);
                     }
                 }
             }

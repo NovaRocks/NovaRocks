@@ -361,24 +361,22 @@ fn update_sum_decimal128(
     input: &AggInputView,
 ) -> Result<(), String> {
     match input {
-        AggInputView::Utf8(view) => match view {
-            Utf8ArrayView::Decimal128(arr, _) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let state =
-                        unsafe { &mut *((base as *mut u8).add(offset) as *mut SumDecimal128State) };
-                    state.sum = state
-                        .sum
-                        .checked_add(i256::from_i128(arr.value(row)))
-                        .ok_or_else(|| "decimal overflow".to_string())?;
-                    state.has_value = true;
+        AggInputView::Utf8(Utf8ArrayView::Decimal128(arr, _)) => {
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if arr.is_null(row) {
+                    continue;
                 }
-                Ok(())
+                let state =
+                    unsafe { &mut *((base as *mut u8).add(offset) as *mut SumDecimal128State) };
+                state.sum = state
+                    .sum
+                    .checked_add(i256::from_i128(arr.value(row)))
+                    .ok_or_else(|| "decimal overflow".to_string())?;
+                state.has_value = true;
             }
-            _ => Err("sum decimal input type mismatch".to_string()),
-        },
+            Ok(())
+        }
+        AggInputView::Utf8(_) => Err("sum decimal input type mismatch".to_string()),
         _ => Err("sum decimal input type mismatch".to_string()),
     }
 }

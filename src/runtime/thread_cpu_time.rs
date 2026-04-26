@@ -36,7 +36,7 @@ pub fn current_thread_cpu_time_ns() -> Option<u128> {
         if ts.tv_sec < 0 || ts.tv_nsec < 0 {
             return None;
         }
-        return Some((ts.tv_sec as u128).saturating_mul(1_000_000_000) + ts.tv_nsec as u128);
+        Some((ts.tv_sec as u128).saturating_mul(1_000_000_000) + ts.tv_nsec as u128)
     }
 
     #[cfg(not(any(

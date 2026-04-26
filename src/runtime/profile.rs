@@ -436,16 +436,8 @@ impl RuntimeProfile {
             .unwrap_or_else(|e| e.into_inner());
         let entry = guard.get(name)?;
         let c = &entry.counter;
-        let min_value = c
-            .min_value
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let max_value = c
-            .max_value
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let min_value = *c.min_value.lock().unwrap_or_else(|e| e.into_inner());
+        let max_value = *c.max_value.lock().unwrap_or_else(|e| e.into_inner());
         Some(CounterSnapshot {
             name: c.name.clone(),
             parent_name: entry.parent_name.clone(),
@@ -467,16 +459,8 @@ impl RuntimeProfile {
             .values()
             .map(|entry| {
                 let c = &entry.counter;
-                let min_value = c
-                    .min_value
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                let max_value = c
-                    .max_value
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
+                let min_value = *c.min_value.lock().unwrap_or_else(|e| e.into_inner());
+                let max_value = *c.max_value.lock().unwrap_or_else(|e| e.into_inner());
                 CounterSnapshot {
                     name: c.name.clone(),
                     parent_name: entry.parent_name.clone(),
@@ -542,16 +526,8 @@ impl Counter {
     }
 
     fn to_thrift(&self) -> runtime_profile::TCounter {
-        let min_value = self
-            .min_value
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let max_value = self
-            .max_value
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let min_value = *self.min_value.lock().unwrap_or_else(|e| e.into_inner());
+        let max_value = *self.max_value.lock().unwrap_or_else(|e| e.into_inner());
         runtime_profile::TCounter::new(
             self.name.clone(),
             self.unit,

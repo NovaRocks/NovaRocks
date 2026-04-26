@@ -676,13 +676,13 @@ fn collect_segment_files(
                 None => None,
             };
             let bundle_file_offset = rowset.bundle_file_offsets.get(index).copied();
-            if let Some(offset) = bundle_file_offset {
-                if offset < 0 {
-                    return Err(format!(
-                        "invalid negative bundle_file_offset in rowset metadata: segment={}, offset={}",
-                        name, offset
-                    ));
-                }
+            if let Some(offset) = bundle_file_offset
+                && offset < 0
+            {
+                return Err(format!(
+                    "invalid negative bundle_file_offset in rowset metadata: segment={}, offset={}",
+                    name, offset
+                ));
             }
             let segment_size = rowset
                 .segment_size

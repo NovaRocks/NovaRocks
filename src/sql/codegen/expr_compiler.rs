@@ -92,7 +92,7 @@ impl<'a> ExprCompiler<'a> {
 
         let fn_arg_types: Vec<types::TTypeDesc> = arg_types
             .iter()
-            .map(|t| arrow_type_to_type_desc(t))
+            .map(arrow_type_to_type_desc)
             .collect::<Result<Vec<_>, _>>()?;
 
         self.nodes[parent_idx] = exprs::TExprNode {
@@ -214,7 +214,7 @@ impl<'a> ExprCompiler<'a> {
 
         let fn_arg_types: Vec<types::TTypeDesc> = arg_types
             .iter()
-            .map(|t| arrow_type_to_type_desc(t))
+            .map(arrow_type_to_type_desc)
             .collect::<Result<Vec<_>, _>>()?;
 
         self.nodes[parent_idx] = exprs::TExprNode {
@@ -1022,7 +1022,7 @@ impl<'a> ExprCompiler<'a> {
 
         let fn_arg_types: Vec<types::TTypeDesc> = arg_types
             .iter()
-            .map(|t| arrow_type_to_type_desc(t))
+            .map(arrow_type_to_type_desc)
             .collect::<Result<Vec<_>, _>>()?;
 
         self.nodes[parent_idx] = exprs::TExprNode {

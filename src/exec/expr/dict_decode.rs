@@ -299,7 +299,7 @@ fn decode_array_with_dict(
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| "dict decode failed to downcast List array".to_string())?;
             let decoded_values =
-                decode_array_with_dict(&list.values(), dict, output_item.data_type())?;
+                decode_array_with_dict(list.values(), dict, output_item.data_type())?;
             Ok(Arc::new(ListArray::new(
                 output_item.clone(),
                 list.offsets().clone(),
@@ -313,7 +313,7 @@ fn decode_array_with_dict(
                 .downcast_ref::<LargeListArray>()
                 .ok_or_else(|| "dict decode failed to downcast LargeList array".to_string())?;
             let decoded_values =
-                decode_array_with_dict(&list.values(), dict, output_item.data_type())?;
+                decode_array_with_dict(list.values(), dict, output_item.data_type())?;
             Ok(Arc::new(LargeListArray::new(
                 output_item.clone(),
                 list.offsets().clone(),

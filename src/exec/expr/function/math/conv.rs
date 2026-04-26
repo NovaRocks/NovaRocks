@@ -58,18 +58,20 @@ pub fn eval_conv(
 }
 
 fn convert_base(s: &str, from_base: i32, to_base: i32) -> Option<String> {
-    if from_base.abs() < 2 || from_base.abs() > 36 || to_base.abs() < 2 || to_base.abs() > 36 {
+    let from_base_abs = from_base.unsigned_abs();
+    let to_base_abs = to_base.unsigned_abs();
+    if !(2..=36).contains(&from_base_abs) || !(2..=36).contains(&to_base_abs) {
         return None;
     }
     let negative = s.starts_with('-');
     let num_str = s.trim_start_matches('-');
-    let value = i64::from_str_radix(num_str, from_base.abs() as u32).ok()?;
+    let value = i64::from_str_radix(num_str, from_base_abs).ok()?;
     let mut v = if negative { -value } else { value };
-    let mut out = if to_base.abs() == 10 {
+    let mut out = if to_base_abs == 10 {
         v.to_string()
     } else {
         let mut res = String::new();
-        let base = to_base.abs() as i64;
+        let base = i64::from(to_base_abs);
         if v == 0 {
             res.push('0');
         } else {

@@ -114,7 +114,7 @@ pub fn eval_array_expr(
     if num_elements == 0 {
         let mut offsets = Vec::with_capacity(num_rows + 1);
         offsets.push(0_i32);
-        offsets.extend(std::iter::repeat(0_i32).take(num_rows));
+        offsets.extend(std::iter::repeat_n(0_i32, num_rows));
         let values = new_empty_array(&element_type);
         let list = ListArray::new(field, OffsetBuffer::new(offsets.into()), values, None);
         return Ok(Arc::new(list));

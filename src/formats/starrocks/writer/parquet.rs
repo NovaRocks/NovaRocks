@@ -125,12 +125,12 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
     match scheme {
         ScanPathScheme::Local => {
             let file = fs::File::open(path).map_err(|e| format!("open parquet failed: {}", e))?;
-            let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
                 .map_err(|e| format!("create parquet reader failed: {}", e))?
                 .build()
                 .map_err(|e| format!("build parquet reader failed: {}", e))?;
             let mut out = Vec::new();
-            while let Some(batch) = reader.next() {
+            for batch in reader {
                 out.push(batch.map_err(|e| format!("read parquet batch failed: {}", e))?);
             }
             Ok(out)
@@ -140,12 +140,12 @@ pub fn read_parquet_file(path: &str) -> Result<Vec<RecordBatch>, String> {
             let (op, rel) = crate::fs::oss::resolve_oss_operator_and_path_with_config(path, &cfg)?;
             let read_result = crate::fs::oss::oss_block_on(op.read(&rel))?;
             let bytes = read_result.map_err(|e| format!("read parquet object failed: {}", e))?;
-            let mut reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())
                 .map_err(|e| format!("create parquet reader failed: {}", e))?
                 .build()
                 .map_err(|e| format!("build parquet reader failed: {}", e))?;
             let mut out = Vec::new();
-            while let Some(batch) = reader.next() {
+            for batch in reader {
                 out.push(batch.map_err(|e| format!("read parquet batch failed: {}", e))?);
             }
             Ok(out)
@@ -235,8 +235,8 @@ fn concat_batches(
             continue;
         }
         total_rows = total_rows.saturating_add(batch.num_rows());
-        for col_idx in 0..num_cols {
-            by_col[col_idx].push(batch.column(col_idx).clone());
+        for (col_idx, columns) in by_col.iter_mut().enumerate().take(num_cols) {
+            columns.push(batch.column(col_idx).clone());
         }
     }
     if total_rows == 0 {

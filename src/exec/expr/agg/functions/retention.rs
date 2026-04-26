@@ -152,10 +152,10 @@ impl AggregateFunction for RetentionAgg {
                 size = MAX_CONDITION_SIZE;
             }
             let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut u64) };
-            for i in 0..(size as usize) {
+            for (i, mask) in BOOL_VALUES.iter().copied().take(size as usize).enumerate() {
                 let idx = start + i;
                 if !bool_values.is_null(idx) && bool_values.value(idx) {
-                    *slot |= BOOL_VALUES[i];
+                    *slot |= mask;
                 }
             }
             *slot |= size;
@@ -199,11 +199,11 @@ impl AggregateFunction for RetentionAgg {
                 continue;
             }
             let first = (state & BOOL_VALUES[0]) != 0;
-            for idx in 0..size {
+            for (idx, mask) in BOOL_VALUES.iter().copied().take(size).enumerate() {
                 let value = if idx == 0 {
                     first
                 } else if first {
-                    (state & BOOL_VALUES[idx]) != 0
+                    (state & mask) != 0
                 } else {
                     false
                 };
@@ -291,8 +291,8 @@ mod tests {
         let start = out_arr.offsets()[0] as usize;
         let end = out_arr.offsets()[1] as usize;
         assert_eq!(end - start, 3);
-        assert_eq!(values.value(start), true);
-        assert_eq!(values.value(start + 1), false);
-        assert_eq!(values.value(start + 2), true);
+        assert!(values.value(start));
+        assert!(!values.value(start + 1));
+        assert!(values.value(start + 2));
     }
 }

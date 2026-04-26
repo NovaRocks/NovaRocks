@@ -153,7 +153,7 @@ fn apply_unweighted_quantiles(
         let values = list.values();
         let mut quantiles = Vec::with_capacity(end.saturating_sub(start));
         for (idx, value_row) in (start..end).enumerate() {
-            let Some(quantile) = numeric_value_at(&values, value_row, context)? else {
+            let Some(quantile) = numeric_value_at(values, value_row, context)? else {
                 return Err(format!(
                     "{context}: percentile array element[{idx}] cannot be null"
                 ));
@@ -193,7 +193,7 @@ fn apply_weighted_quantiles(
         let values = list.values();
         let mut quantiles = Vec::with_capacity(end.saturating_sub(start));
         for (idx, value_row) in (start..end).enumerate() {
-            let Some(quantile) = numeric_value_at(&values, value_row, context)? else {
+            let Some(quantile) = numeric_value_at(values, value_row, context)? else {
                 return Err(format!(
                     "{context}: percentile array element[{idx}] cannot be null"
                 ));

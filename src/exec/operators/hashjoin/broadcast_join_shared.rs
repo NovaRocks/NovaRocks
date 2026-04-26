@@ -122,10 +122,8 @@ impl BroadcastJoinSharedState {
         for (batch_idx, batch_flags) in local_flags.iter().enumerate() {
             if let Some(merged_batch) = merge.merged.get_mut(batch_idx) {
                 for (row_idx, &matched) in batch_flags.iter().enumerate() {
-                    if matched {
-                        if let Some(slot) = merged_batch.get_mut(row_idx) {
-                            *slot = true;
-                        }
+                    if matched && let Some(slot) = merged_batch.get_mut(row_idx) {
+                        *slot = true;
                     }
                 }
             }

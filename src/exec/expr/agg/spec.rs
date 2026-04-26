@@ -28,10 +28,8 @@ pub(super) fn build_spec_from_type(
 ) -> Result<AggSpec, String> {
     let mut spec = functions::build_spec_from_type(func, input_type, input_is_intermediate)?;
 
-    if !input_is_intermediate {
-        if let Some(data_type) = input_type {
-            spec.input_arg_type = Some(data_type.clone());
-        }
+    if !input_is_intermediate && let Some(data_type) = input_type {
+        spec.input_arg_type = Some(data_type.clone());
     }
 
     apply_type_signature(spec, func, input_is_intermediate)

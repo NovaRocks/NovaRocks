@@ -532,10 +532,8 @@ impl HashJoinProbeCore {
         batch_chunk_schema: &ChunkSchemaRef,
         count_right_rows: bool,
     ) -> Result<Option<Chunk>, String> {
-        if count_right_rows {
-            if let Some(batch) = right.as_ref() {
-                self.output_rows = self.output_rows.saturating_add(batch.num_rows() as u64);
-            }
+        if count_right_rows && let Some(batch) = right.as_ref() {
+            self.output_rows = self.output_rows.saturating_add(batch.num_rows() as u64);
         }
         match (left, right) {
             (None, None) => Ok(None),
@@ -791,12 +789,11 @@ impl HashJoinProbeCore {
                             .get(i)
                             .ok_or_else(|| "join build index out of bounds".to_string())?
                             as usize;
-                        if let Some(flags) = self.build_matched.as_mut() {
-                            if let Some(batch_flags) = flags.get_mut(batch_idx) {
-                                if build_row < batch_flags.len() {
-                                    batch_flags[build_row] = true;
-                                }
-                            }
+                        if let Some(flags) = self.build_matched.as_mut()
+                            && let Some(batch_flags) = flags.get_mut(batch_idx)
+                            && build_row < batch_flags.len()
+                        {
+                            batch_flags[build_row] = true;
                         }
                     }
                 }
@@ -1229,12 +1226,10 @@ impl HashJoinProbeCore {
                         let slot = batch_idx as usize;
                         if let Some(batch_flags) = flags.get_mut(slot) {
                             let row_idx = row_idx as usize;
-                            if row_idx < batch_flags.len() {
-                                if !batch_flags[row_idx] {
-                                    batch_flags[row_idx] = true;
-                                    if let Some(indices) = output_indices.as_mut() {
-                                        indices[slot].push(row_idx as u32);
-                                    }
+                            if row_idx < batch_flags.len() && !batch_flags[row_idx] {
+                                batch_flags[row_idx] = true;
+                                if let Some(indices) = output_indices.as_mut() {
+                                    indices[slot].push(row_idx as u32);
                                 }
                             }
                         }
@@ -1310,14 +1305,13 @@ impl HashJoinProbeCore {
                         .get(i)
                         .ok_or_else(|| "join build index out of bounds".to_string())?
                         as usize;
-                    if let Some(batch_flags) = flags.get_mut(batch_idx) {
-                        if build_row < batch_flags.len() {
-                            if !batch_flags[build_row] {
-                                batch_flags[build_row] = true;
-                                if let Some(indices) = output_indices.as_mut() {
-                                    indices[batch_idx].push(build_row as u32);
-                                }
-                            }
+                    if let Some(batch_flags) = flags.get_mut(batch_idx)
+                        && build_row < batch_flags.len()
+                        && !batch_flags[build_row]
+                    {
+                        batch_flags[build_row] = true;
+                        if let Some(indices) = output_indices.as_mut() {
+                            indices[batch_idx].push(build_row as u32);
                         }
                     }
                 }
@@ -1350,14 +1344,14 @@ impl HashJoinProbeCore {
             return Ok(matched);
         }
 
-        if let Some(filter) = probe_row_filter {
-            if filter.len() != probe.len() {
-                return Err(format!(
-                    "join residual probe row filter length mismatch: filter={} probe={}",
-                    filter.len(),
-                    probe.len()
-                ));
-            }
+        if let Some(filter) = probe_row_filter
+            && filter.len() != probe.len()
+        {
+            return Err(format!(
+                "join residual probe row filter length mismatch: filter={} probe={}",
+                filter.len(),
+                probe.len()
+            ));
         }
 
         let probe_rows = (0..probe.len())
@@ -1643,10 +1637,9 @@ impl HashJoinProbeCore {
         for chunk in chunks {
             if let Some(filtered) =
                 filters.filter_probe_chunk(&self.arena, &self.probe_keys, chunk)?
+                && !filtered.is_empty()
             {
-                if !filtered.is_empty() {
-                    out.push(filtered);
-                }
+                out.push(filtered);
             }
         }
         Ok(out)

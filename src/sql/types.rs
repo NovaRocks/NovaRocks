@@ -65,18 +65,18 @@ pub(crate) fn arithmetic_result_type_with_op(
     match (left, right) {
         // Decimal + Decimal -> Decimal (op-specific precision/scale)
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
-            decimal_arithmetic_result_type(*p1, *s1 as i8, *p2, *s2 as i8, op)
+            decimal_arithmetic_result_type(*p1, *s1, *p2, *s2, op)
         }
         // Decimal (left) op Integer (right) -> Decimal
         (
             DataType::Decimal128(p, s),
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
-        ) => decimal_arithmetic_result_type(*p, *s as i8, 19, 0, op),
+        ) => decimal_arithmetic_result_type(*p, *s, 19, 0, op),
         // Integer (left) op Decimal (right) -> Decimal
         (
             DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
             DataType::Decimal128(p, s),
-        ) => decimal_arithmetic_result_type(19, 0, *p, *s as i8, op),
+        ) => decimal_arithmetic_result_type(19, 0, *p, *s, op),
         // Decimal + Float -> Float64 (StarRocks FE: both sides promote to Double)
         (DataType::Decimal128(_, _), DataType::Float64 | DataType::Float32)
         | (DataType::Float64 | DataType::Float32, DataType::Decimal128(_, _)) => DataType::Float64,
@@ -128,8 +128,7 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
         // Decimal + Decimal -> wider Decimal
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
             let scale = (*s1).max(*s2);
-            let precision =
-                ((*p1 as i8 - *s1 as i8).max(*p2 as i8 - *s2 as i8) + scale as i8).min(38) as u8;
+            let precision = ((*p1 as i8 - *s1).max(*p2 as i8 - *s2) + scale).min(38) as u8;
             DataType::Decimal128(precision, scale)
         }
         // Decimal + Integer -> Decimal

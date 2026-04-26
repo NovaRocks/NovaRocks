@@ -213,13 +213,13 @@ fn push_predicates_through_join(predicate: TypedExpr, join: JoinNode) -> (Logica
         join.join_type,
         JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti
     ) {
-        remaining.extend(left_preds.drain(..));
+        remaining.append(&mut left_preds);
     }
 
     // For FULL OUTER joins, neither side can receive pushed predicates.
     if matches!(join.join_type, JoinKind::FullOuter) {
-        remaining.extend(left_preds.drain(..));
-        remaining.extend(right_preds.drain(..));
+        remaining.append(&mut left_preds);
+        remaining.append(&mut right_preds);
     }
 
     // Determine whether anything was actually pushed (after outer-join drain-back).

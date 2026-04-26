@@ -137,13 +137,13 @@ pub(crate) fn decode_data_page_values(
         ENCODING_BIT_SHUFFLE => {
             let (header_num_values, elem_size, payload) =
                 decode_bitshuffle_page_body(segment_path, value_body)?;
-            if let Some(expected_elem_size) = fixed_elem_size {
-                if elem_size != expected_elem_size {
-                    return Err(format!(
-                        "data page elem_size mismatch in bitshuffle payload: segment={}, expected_elem_size={}, actual_elem_size={}",
-                        segment_path, expected_elem_size, elem_size
-                    ));
-                }
+            if let Some(expected_elem_size) = fixed_elem_size
+                && elem_size != expected_elem_size
+            {
+                return Err(format!(
+                    "data page elem_size mismatch in bitshuffle payload: segment={}, expected_elem_size={}, actual_elem_size={}",
+                    segment_path, expected_elem_size, elem_size
+                ));
             }
             if header_num_values != num_values {
                 return Err(format!(

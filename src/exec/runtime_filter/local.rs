@@ -122,11 +122,11 @@ impl LocalRuntimeFilterSet {
             let arrays = [Arc::clone(array)];
             let views = build_group_key_views(&arrays)?;
             let hashes = build_group_key_hashes(&views, array.len(), self.hash_seed)?;
-            for row in 0..array.len() {
+            for (row, hash) in hashes.iter().copied().enumerate().take(array.len()) {
                 if row_has_null(&views, row) {
                     continue;
                 }
-                filter.hashes.insert(hashes[row]);
+                filter.hashes.insert(hash);
             }
         }
         Ok(())

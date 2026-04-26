@@ -1749,27 +1749,27 @@ fn handle_transaction_rollback(headers: &HttpHeaders, options: &LoadHeaderOption
     let requested_db = get_header(headers, "db").map(ToString::to_string);
     let requested_table = get_header(headers, "table").map(ToString::to_string);
     let result = with_txn_context_for_update(&label, |ctx| {
-        if let Some(db) = requested_db.as_deref() {
-            if ctx.db != db {
-                return Err(ApiError::new(
-                    TStatusCode::INVALID_ARGUMENT,
-                    format!(
-                        "request db `{db}` does not match transaction db `{}`",
-                        ctx.db
-                    ),
-                ));
-            }
+        if let Some(db) = requested_db.as_deref()
+            && ctx.db != db
+        {
+            return Err(ApiError::new(
+                TStatusCode::INVALID_ARGUMENT,
+                format!(
+                    "request db `{db}` does not match transaction db `{}`",
+                    ctx.db
+                ),
+            ));
         }
-        if let Some(table) = requested_table.as_deref() {
-            if ctx.table != table {
-                return Err(ApiError::new(
-                    TStatusCode::INVALID_ARGUMENT,
-                    format!(
-                        "request table `{table}` does not match transaction table `{}`",
-                        ctx.table
-                    ),
-                ));
-            }
+        if let Some(table) = requested_table.as_deref()
+            && ctx.table != table
+        {
+            return Err(ApiError::new(
+                TStatusCode::INVALID_ARGUMENT,
+                format!(
+                    "request table `{table}` does not match transaction table `{}`",
+                    ctx.table
+                ),
+            ));
         }
         let rollback_result = rollback_txn(
             &ctx.auth,

@@ -34,7 +34,7 @@ pub(crate) fn lower_case(
     let has_case_expr = case_expr.has_case_expr;
     let mut has_else_expr = case_expr.has_else_expr;
     let inferred_has_else = if has_case_expr {
-        children.len() % 2 == 0
+        children.len().is_multiple_of(2)
     } else {
         children.len() % 2 == 1
     };

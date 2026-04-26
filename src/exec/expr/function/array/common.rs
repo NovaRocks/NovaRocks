@@ -389,13 +389,8 @@ fn compare_list_values(
     let l_values = l.values();
     let r_values = r.values();
     for offset in 0..l_len {
-        if !compare_values_with_null(
-            &l_values,
-            l_start + offset,
-            &r_values,
-            r_start + offset,
-            true,
-        )? {
+        if !compare_values_with_null(l_values, l_start + offset, r_values, r_start + offset, true)?
+        {
             return Ok(false);
         }
     }
@@ -467,10 +462,10 @@ fn compare_map_values(
     for offset in 0..l_len {
         let li = l_start + offset;
         let ri = r_start + offset;
-        if !compare_values_with_null(&l_keys, li, &r_keys, ri, true)? {
+        if !compare_values_with_null(l_keys, li, r_keys, ri, true)? {
             return Ok(false);
         }
-        if !compare_values_with_null(&l_values, li, &r_values, ri, true)? {
+        if !compare_values_with_null(l_values, li, r_values, ri, true)? {
             return Ok(false);
         }
     }

@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn lock_mv_refresh_mutex_reports_poisoned_lock() {
-        let lock = Box::leak(Box::new(std::sync::Mutex::new(())));
+        let lock: &'static std::sync::Mutex<()> = Box::leak(Box::new(std::sync::Mutex::new(())));
         static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         let _hook_guard = PANIC_HOOK_LOCK
             .get_or_init(|| Mutex::new(()))
@@ -690,15 +690,17 @@ mod tests {
     fn seed_mv_refresh_store() -> (tempfile::TempDir, SqliteMetadataStore) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
-        let mut snapshot = ManagedSnapshot::default();
-        snapshot.global = ManagedGlobalMeta {
-            warehouse_uri: "s3://test/warehouse".to_string(),
-            next_db_id: 2,
-            next_table_id: 11,
-            next_partition_id: 21,
-            next_index_id: 31,
-            next_tablet_id: 41,
-            next_txn_id: 1,
+        let mut snapshot = ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: "s3://test/warehouse".to_string(),
+                next_db_id: 2,
+                next_table_id: 11,
+                next_partition_id: 21,
+                next_index_id: 31,
+                next_tablet_id: 41,
+                next_txn_id: 1,
+            },
+            ..Default::default()
         };
         snapshot.databases.push(StoredManagedDatabase {
             db_id: 1,

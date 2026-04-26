@@ -127,7 +127,7 @@ pub fn eval_array_position(
             } else {
                 let mut p = 0_i64;
                 for (idx, i) in (start..end).enumerate() {
-                    if super::common::compare_values_with_null(&values, i, &target_arr, 0, false)? {
+                    if super::common::compare_values_with_null(values, i, &target_arr, 0, false)? {
                         p = idx as i64 + 1;
                         break;
                     }
@@ -156,7 +156,7 @@ pub fn eval_array_position(
             let mut pos = 0_i64;
             for (idx, i) in (start..end).enumerate() {
                 if super::common::compare_values_with_null(
-                    &values,
+                    values,
                     i,
                     &target_arr,
                     target_idx,
@@ -197,7 +197,7 @@ pub fn eval_array_position(
 
         let mut pos = 0_i64;
         for (idx, i) in (start..end).enumerate() {
-            if super::common::compare_value_to_target(&values, i, &target_arr, row)? {
+            if super::common::compare_value_to_target(values, i, &target_arr, row)? {
                 pos = idx as i64 + 1;
                 break;
             }

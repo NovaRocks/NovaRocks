@@ -161,15 +161,15 @@ pub(crate) fn execute_plan_with_pipeline(
     };
 
     let completion = FragmentCompletion::new(all_drivers.len(), Arc::clone(&ctx));
-    if query_id.is_some() {
-        if let Some(finst_id) = finst_id {
-            query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion));
-        }
+    if query_id.is_some()
+        && let Some(finst_id) = finst_id
+    {
+        query_context_manager().register_fragment_completion(finst_id, Arc::clone(&completion));
     }
-    if let Some(query_id) = query_id {
-        if query_context_manager().is_query_canceled(query_id) {
-            completion.abort_from_query("query canceled".to_string());
-        }
+    if let Some(query_id) = query_id
+        && query_context_manager().is_query_canceled(query_id)
+    {
+        completion.abort_from_query("query canceled".to_string());
     }
     let mut tasks = Vec::with_capacity(all_drivers.len());
     for driver in all_drivers {
@@ -420,7 +420,7 @@ mod tests {
             }
             let a_arr = chunk
                 .columns()
-                .get(0)
+                .first()
                 .expect("a column")
                 .as_any()
                 .downcast_ref::<Int32Array>()
@@ -536,7 +536,7 @@ mod tests {
             }
             let a_arr = chunk
                 .columns()
-                .get(0)
+                .first()
                 .expect("a column")
                 .as_any()
                 .downcast_ref::<Int32Array>()
@@ -658,7 +658,7 @@ mod tests {
             }
             let a_arr = chunk
                 .columns()
-                .get(0)
+                .first()
                 .expect("a column")
                 .as_any()
                 .downcast_ref::<Int32Array>()
@@ -807,7 +807,7 @@ mod tests {
             }
             let k1 = chunk
                 .columns()
-                .get(0)
+                .first()
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Int32Array>()
@@ -980,7 +980,7 @@ mod tests {
             }
             let lk = chunk
                 .columns()
-                .get(0)
+                .first()
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Int32Array>()
@@ -1137,7 +1137,7 @@ mod tests {
             }
             let lk = chunk
                 .columns()
-                .get(0)
+                .first()
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Int32Array>()

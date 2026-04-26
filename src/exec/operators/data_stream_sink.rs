@@ -144,13 +144,13 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = if arr.value(i) { 1u8 } else { 0u8 };
-                        hash_values[i] ^= val as u64;
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= val as u64;
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -159,14 +159,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -175,14 +175,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -191,14 +191,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int16Array>()
                     .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -207,14 +207,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_bits().to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -223,14 +223,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Float32Array>()
                     .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_bits().to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -239,13 +239,13 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
-                        hash_values[i] ^= fnv_hash_value(val.as_bytes());
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(val.as_bytes());
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -254,21 +254,21 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Date32Array>()
                     .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
             DataType::Timestamp(unit, _tz) => {
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if array.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = match unit {
                             TimeUnit::Second => {
@@ -278,7 +278,7 @@ mod data_stream_sink_hash_partition {
                                     .ok_or_else(|| {
                                         "failed to downcast to TimestampSecondArray".to_string()
                                     })?;
-                                arr.value(i) as i64
+                                arr.value(i)
                             }
                             TimeUnit::Millisecond => {
                                 let arr = array
@@ -311,8 +311,8 @@ mod data_stream_sink_hash_partition {
                             }
                         };
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -321,14 +321,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -337,14 +337,14 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
                     .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -353,16 +353,16 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if arr.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let value = largeint::i128_from_be_bytes(arr.value(i)).map_err(|e| {
                             format!("hash_partition: decode LARGEINT failed at row {}: {}", i, e)
                         })?;
                         let bytes = value.to_le_bytes();
-                        hash_values[i] ^= fnv_hash_value(&bytes);
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= fnv_hash_value(&bytes);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -376,13 +376,13 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast list values to StringArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let row_hash = fnv_hash_list_utf8_row(list, values, i);
-                        hash_values[i] ^= row_hash;
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= row_hash;
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -396,13 +396,13 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .ok_or_else(|| "failed to downcast list values to Int32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let row_hash = fnv_hash_list_int32_row(list, values, i);
-                        hash_values[i] ^= row_hash;
-                        hash_values[i] = hash_values[i].wrapping_mul(FNV_PRIME);
+                        *hash_value ^= row_hash;
+                        *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
                 }
             }
@@ -456,10 +456,10 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = if arr.value(i) { 1u8 } else { 0u8 };
-                        hash_values[i] = crc32_hash_value(&[val]);
+                        *hash_value = crc32_hash_value(&[val]);
                     }
                 }
             }
@@ -468,11 +468,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -481,11 +481,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .ok_or_else(|| "failed to downcast to Int32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -494,11 +494,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int16Array>()
                     .ok_or_else(|| "failed to downcast to Int16Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -507,11 +507,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_bits().to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -520,11 +520,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Float32Array>()
                     .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_bits().to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -533,10 +533,10 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
-                        hash_values[i] = crc32_hash_value(val.as_bytes());
+                        *hash_value = crc32_hash_value(val.as_bytes());
                     }
                 }
             }
@@ -545,16 +545,16 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Date32Array>()
                     .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
             DataType::Timestamp(unit, _tz) => {
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !array.is_null(i) {
                         let val = match unit {
                             TimeUnit::Second => {
@@ -564,7 +564,7 @@ mod data_stream_sink_hash_partition {
                                     .ok_or_else(|| {
                                         "failed to downcast to TimestampSecondArray".to_string()
                                     })?;
-                                arr.value(i) as i64
+                                arr.value(i)
                             }
                             TimeUnit::Millisecond => {
                                 let arr = array
@@ -597,7 +597,7 @@ mod data_stream_sink_hash_partition {
                             }
                         };
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -606,11 +606,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Decimal128Array>()
                     .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -619,11 +619,11 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Decimal256Array>()
                     .ok_or_else(|| "failed to downcast to Decimal256Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
                         let bytes = val.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -632,13 +632,13 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let value = largeint::i128_from_be_bytes(arr.value(i)).map_err(|e| {
                             format!("hash_partition: decode LARGEINT failed at row {}: {}", i, e)
                         })?;
                         let bytes = value.to_le_bytes();
-                        hash_values[i] = crc32_hash_value(&bytes);
+                        *hash_value = crc32_hash_value(&bytes);
                     }
                 }
             }
@@ -652,7 +652,7 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .ok_or_else(|| "failed to downcast list values to StringArray".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
                         continue;
                     }
@@ -669,7 +669,7 @@ mod data_stream_sink_hash_partition {
                             encoded.extend_from_slice(values.value(idx).as_bytes());
                         }
                     }
-                    hash_values[i] = crc32_hash_value(&encoded);
+                    *hash_value = crc32_hash_value(&encoded);
                 }
             }
             DataType::List(field) if matches!(field.data_type(), DataType::Int32) => {
@@ -682,7 +682,7 @@ mod data_stream_sink_hash_partition {
                     .as_any()
                     .downcast_ref::<Int32Array>()
                     .ok_or_else(|| "failed to downcast list values to Int32Array".to_string())?;
-                for i in 0..len {
+                for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if list.is_null(i) {
                         continue;
                     }
@@ -699,7 +699,7 @@ mod data_stream_sink_hash_partition {
                             encoded.extend_from_slice(&values.value(idx).to_le_bytes());
                         }
                     }
-                    hash_values[i] = crc32_hash_value(&encoded);
+                    *hash_value = crc32_hash_value(&encoded);
                 }
             }
             DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _) => {
@@ -807,13 +807,12 @@ mod data_stream_sink_hash_partition {
 
         // Create chunks for each partition using Arrow take
         let mut partition_chunks = Vec::with_capacity(num_partitions);
-        for part_idx in 0..num_partitions {
-            if partition_row_indices[part_idx].is_empty() {
+        for rows in partition_row_indices.iter().take(num_partitions) {
+            if rows.is_empty() {
                 partition_chunks.push(Chunk::default());
             } else {
                 // Use Arrow take to select rows for this partition
-                let indices =
-                    arrow::array::UInt32Array::from(partition_row_indices[part_idx].clone());
+                let indices = arrow::array::UInt32Array::from(rows.clone());
                 let indices_ref = Arc::new(indices) as arrow::array::ArrayRef;
 
                 let mut new_columns = Vec::with_capacity(chunk.batch.num_columns());
@@ -920,7 +919,7 @@ impl OperatorFactory for DataStreamSinkFactory {
         let sender_id = self
             .exec_params
             .sender_id
-            .unwrap_or_else(|| (self.exec_params.fragment_instance_id.lo as i32) & 0x7fffffff);
+            .unwrap_or((self.exec_params.fragment_instance_id.lo as i32) & 0x7fffffff);
         let be_number = 0i32;
 
         if driver_id == 0 {
@@ -980,8 +979,7 @@ impl OperatorFactory for DataStreamSinkFactory {
                 .sink
                 .output_partition
                 .partition_exprs
-                .as_ref()
-                .map(|v| v.as_slice())
+                .as_deref()
                 .unwrap_or(&[]);
             match exprs
                 .iter()
@@ -999,11 +997,11 @@ impl OperatorFactory for DataStreamSinkFactory {
                 Ok(ids) => {
                     let mut has_variant = false;
                     for id in &ids {
-                        if let Some(dt) = arena.data_type(*id) {
-                            if matches!(dt, arrow::datatypes::DataType::LargeBinary) {
-                                has_variant = true;
-                                break;
-                            }
+                        if let Some(dt) = arena.data_type(*id)
+                            && matches!(dt, arrow::datatypes::DataType::LargeBinary)
+                        {
+                            has_variant = true;
+                            break;
                         }
                     }
                     if has_variant {
@@ -1354,11 +1352,7 @@ impl DataStreamSinkOperator {
     }
 
     fn destinations(&self) -> &[data_sinks::TPlanFragmentDestination] {
-        self.exec_params
-            .destinations
-            .as_ref()
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.exec_params.destinations.as_deref().unwrap_or(&[])
     }
 
     /// Returns true if the destination at index `i` is a pseudo (pruned-bucket) destination.
@@ -1410,13 +1404,11 @@ impl DataStreamSinkOperator {
 
                 // Create chunks for each partition using Arrow take
                 let mut per_dest_chunks: Vec<Vec<Chunk>> = Vec::with_capacity(n);
-                for part_idx in 0..n {
-                    if partition_row_indices[part_idx].is_empty() {
+                for row_indices in partition_row_indices.iter().take(n) {
+                    if row_indices.is_empty() {
                         per_dest_chunks.push(Vec::new());
                     } else {
-                        let indices = arrow::array::UInt32Array::from(
-                            partition_row_indices[part_idx].clone(),
-                        );
+                        let indices = arrow::array::UInt32Array::from(row_indices.clone());
                         let indices_ref = Arc::new(indices) as arrow::array::ArrayRef;
 
                         let mut new_columns = Vec::with_capacity(chunk.batch.num_columns());
@@ -1462,12 +1454,10 @@ impl DataStreamSinkOperator {
                 }
                 Ok(per_dest_chunks)
             }
-            other => {
-                return Err(format!(
-                    "unsupported DATA_STREAM_SINK partition type: {:?}",
-                    other
-                ));
-            }
+            other => Err(format!(
+                "unsupported DATA_STREAM_SINK partition type: {:?}",
+                other
+            )),
         }
     }
 
@@ -1484,7 +1474,7 @@ impl DataStreamSinkOperator {
         let addr = dest
             .brpc_server
             .as_ref()
-            .or_else(|| dest.deprecated_server.as_ref())
+            .or(dest.deprecated_server.as_ref())
             .ok_or_else(|| "missing destination brpc_server".to_string())?;
         let dest_finst_id = UniqueId {
             hi: dest.fragment_instance_id.hi,
@@ -1582,13 +1572,11 @@ impl DataStreamSinkOperator {
         let encode_start = std::time::Instant::now();
         let payload = exchange::encode_chunks(chunks, include_slot_ids)
             .map_err(|e| format!("failed to encode chunks: {e}"))?;
-        let encode_ns = encode_start.elapsed().as_nanos() as u128;
+        let encode_ns = encode_start.elapsed().as_nanos();
         let payload_bytes = payload.len();
         let payload_capacity_bytes = payload.capacity().max(payload_bytes);
-        if include_slot_ids {
-            if let Some(sent) = self.wire_meta_sent_per_dest.get_mut(dest_idx) {
-                *sent = true;
-            }
+        if include_slot_ids && let Some(sent) = self.wire_meta_sent_per_dest.get_mut(dest_idx) {
+            *sent = true;
         }
 
         if let Some(profile) = self.profiles.as_ref() {

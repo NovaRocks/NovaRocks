@@ -716,9 +716,9 @@ fn build_position_delete_output_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![file_path, pos]))
 }
 
-fn build_partition_exprs(
-    iceberg: &descriptors::TIcebergTable,
-) -> Result<(Vec<String>, Vec<String>, Vec<exprs::TExpr>), String> {
+type PartitionExprs = (Vec<String>, Vec<String>, Vec<exprs::TExpr>);
+
+fn build_partition_exprs(iceberg: &descriptors::TIcebergTable) -> Result<PartitionExprs, String> {
     let mut partition_column_names = Vec::new();
     let mut transform_exprs = Vec::new();
     let mut exprs = Vec::new();

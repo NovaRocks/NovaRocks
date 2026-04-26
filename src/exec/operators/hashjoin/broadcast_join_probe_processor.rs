@@ -359,10 +359,10 @@ impl BroadcastJoinProbeProcessorOperator {
                 probe_chunks.push(buffered);
             }
         }
-        if let Some(chunk) = chunk {
-            if !chunk.is_empty() {
-                probe_chunks.push(chunk);
-            }
+        if let Some(chunk) = chunk
+            && !chunk.is_empty()
+        {
+            probe_chunks.push(chunk);
         }
         probe_chunks
     }
@@ -440,7 +440,7 @@ mod tests {
     fn append_pairs(chunk: Chunk, pairs: &mut Vec<(i32, i32)>) {
         let left_arr = chunk
             .columns()
-            .get(0)
+            .first()
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()

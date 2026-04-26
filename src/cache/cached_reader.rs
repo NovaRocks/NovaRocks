@@ -312,22 +312,19 @@ impl CachedRead {
             return Ok(());
         }
 
-        if self.reader.enable_datacache {
-            if let Some(cache_stream) = self.reader.cache_stream() {
-                let block_size = cache_stream.block_size();
-                let block_id = self.pos / block_size;
-                let block_start = block_id * block_size;
-                let block_end = std::cmp::min(block_start + block_size, self.reader.file_len());
-                let read = self.reader.read_cached_block(
-                    &cache_stream,
-                    block_id,
-                    block_start,
-                    block_end,
-                )?;
-                self.buf = read.bytes;
-                self.buf_pos = (self.pos - block_start) as usize;
-                return Ok(());
-            }
+        if self.reader.enable_datacache
+            && let Some(cache_stream) = self.reader.cache_stream()
+        {
+            let block_size = cache_stream.block_size();
+            let block_id = self.pos / block_size;
+            let block_start = block_id * block_size;
+            let block_end = std::cmp::min(block_start + block_size, self.reader.file_len());
+            let read =
+                self.reader
+                    .read_cached_block(&cache_stream, block_id, block_start, block_end)?;
+            self.buf = read.bytes;
+            self.buf_pos = (self.pos - block_start) as usize;
+            return Ok(());
         }
 
         let remaining = self.reader.file_len() - self.pos;

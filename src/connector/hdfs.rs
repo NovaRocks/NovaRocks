@@ -289,13 +289,12 @@ impl ScanOp for HdfsScanOp {
 
     fn profile_name(&self) -> Option<String> {
         let prefix = "HDFS_SCAN";
-        if let Some(label) = self.cfg.profile_label.as_deref() {
-            if let Some(id) = label
+        if let Some(label) = self.cfg.profile_label.as_deref()
+            && let Some(id) = label
                 .strip_prefix("hdfs_scan_node_id=")
                 .and_then(|s| s.parse::<i32>().ok())
-            {
-                return Some(format!("{prefix} (id={id})"));
-            }
+        {
+            return Some(format!("{prefix} (id={id})"));
         }
         Some(prefix.to_string())
     }

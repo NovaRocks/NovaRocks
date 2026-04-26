@@ -102,14 +102,15 @@ impl FragmentCompletion {
         self.cv.notify_all();
         drop(st);
 
-        if notify_query && first {
-            if let Some(query_id) = self.fragment_ctx.query_id() {
-                let mgr = query_context_manager();
-                let finsts = mgr.cancel_query(query_id, err.clone());
-                for id in finsts {
-                    result_buffer::close_error(id, err.clone());
-                    exchange::cancel_fragment(id.hi, id.lo);
-                }
+        if notify_query
+            && first
+            && let Some(query_id) = self.fragment_ctx.query_id()
+        {
+            let mgr = query_context_manager();
+            let finsts = mgr.cancel_query(query_id, err.clone());
+            for id in finsts {
+                result_buffer::close_error(id, err.clone());
+                exchange::cancel_fragment(id.hi, id.lo);
             }
         }
     }

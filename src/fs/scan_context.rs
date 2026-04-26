@@ -82,7 +82,7 @@ impl FileScanContext {
 
         let ranges = ranges
             .into_iter()
-            .zip(resolved.paths.into_iter())
+            .zip(resolved.paths)
             .map(|(range, path)| FileScanRange { path, ..range })
             .collect::<Vec<_>>();
 

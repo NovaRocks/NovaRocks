@@ -266,10 +266,7 @@ fn pkdbg_enabled() -> bool {
 }
 
 fn preview_encoded_keys(keys: &[Vec<u8>], limit: usize) -> Vec<String> {
-    keys.iter()
-        .take(limit)
-        .map(|key| hex::encode(key))
-        .collect()
+    keys.iter().take(limit).map(hex::encode).collect()
 }
 
 fn build_primary_key_output_schema(tablet_schema: &TabletSchemaPb) -> Result<SchemaRef, String> {
@@ -911,16 +908,16 @@ fn load_segment_delvec_bitmap(
     }
     let payload = &bytes[offset_usize..end_usize];
 
-    if let Some(masked) = page.crc32c {
-        if page.crc32c_gen_version == Some(version) {
-            let expected = crc32c_unmask(masked);
-            let actual = crc32c::crc32c(payload);
-            if expected != actual {
-                return Err(format!(
-                    "delvec crc32c mismatch: segment_id={}, version={}, expected={}, actual={}",
-                    segment_id, version, expected, actual
-                ));
-            }
+    if let Some(masked) = page.crc32c
+        && page.crc32c_gen_version == Some(version)
+    {
+        let expected = crc32c_unmask(masked);
+        let actual = crc32c::crc32c(payload);
+        if expected != actual {
+            return Err(format!(
+                "delvec crc32c mismatch: segment_id={}, version={}, expected={}, actual={}",
+                segment_id, version, expected, actual
+            ));
         }
     }
 

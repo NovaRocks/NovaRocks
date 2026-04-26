@@ -415,7 +415,7 @@ fn encode_group_key_non_null_value(
                 .map_err(|_| "group key list length overflow".to_string())?;
             out.extend_from_slice(&len.to_le_bytes());
             for idx in start..end {
-                match encode_group_key_row(&values, idx)? {
+                match encode_group_key_row(values, idx)? {
                     None => out.push(0),
                     Some(encoded) => {
                         out.push(1);
@@ -899,6 +899,11 @@ pub(crate) fn build_group_key_hashes(
     Ok(hashes)
 }
 
+#[inline]
+fn combine_hash_at(hashes: &mut [u64], row: usize, value_hash: u64) {
+    hashes[row] = combine_hash(hashes[row], value_hash);
+}
+
 fn hash_column(
     view: &GroupKeyArrayView<'_>,
     num_rows: usize,
@@ -912,15 +917,15 @@ fn hash_column(
                 if arr.null_count() == 0 {
                     for (row, value) in arr.values().iter().enumerate() {
                         let value_hash = hash_u64_with_seed(seed, *value as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 } else {
                     for row in 0..num_rows {
                         if arr.is_null(row) {
-                            hashes[row] = combine_hash(hashes[row], null_hash);
+                            combine_hash_at(hashes, row, null_hash);
                         } else {
                             let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                            hashes[row] = combine_hash(hashes[row], value_hash);
+                            combine_hash_at(hashes, row, value_hash);
                         }
                     }
                 }
@@ -929,15 +934,15 @@ fn hash_column(
                 if arr.null_count() == 0 {
                     for (row, value) in arr.values().iter().enumerate() {
                         let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 } else {
                     for row in 0..num_rows {
                         if arr.is_null(row) {
-                            hashes[row] = combine_hash(hashes[row], null_hash);
+                            combine_hash_at(hashes, row, null_hash);
                         } else {
                             let value_hash = hash_u64_with_seed(seed, arr.value(row) as i64 as u64);
-                            hashes[row] = combine_hash(hashes[row], value_hash);
+                            combine_hash_at(hashes, row, value_hash);
                         }
                     }
                 }
@@ -946,15 +951,15 @@ fn hash_column(
                 if arr.null_count() == 0 {
                     for (row, value) in arr.values().iter().enumerate() {
                         let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 } else {
                     for row in 0..num_rows {
                         if arr.is_null(row) {
-                            hashes[row] = combine_hash(hashes[row], null_hash);
+                            combine_hash_at(hashes, row, null_hash);
                         } else {
                             let value_hash = hash_u64_with_seed(seed, arr.value(row) as i64 as u64);
-                            hashes[row] = combine_hash(hashes[row], value_hash);
+                            combine_hash_at(hashes, row, value_hash);
                         }
                     }
                 }
@@ -963,15 +968,15 @@ fn hash_column(
                 if arr.null_count() == 0 {
                     for (row, value) in arr.values().iter().enumerate() {
                         let value_hash = hash_u64_with_seed(seed, *value as i64 as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 } else {
                     for row in 0..num_rows {
                         if arr.is_null(row) {
-                            hashes[row] = combine_hash(hashes[row], null_hash);
+                            combine_hash_at(hashes, row, null_hash);
                         } else {
                             let value_hash = hash_u64_with_seed(seed, arr.value(row) as i64 as u64);
-                            hashes[row] = combine_hash(hashes[row], value_hash);
+                            combine_hash_at(hashes, row, value_hash);
                         }
                     }
                 }
@@ -983,16 +988,16 @@ fn hash_column(
                     for (row, value) in arr.values().iter().enumerate() {
                         let bits = canonical_f64_bits(*value);
                         let value_hash = hash_u64_with_seed(seed, bits);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 } else {
                     for row in 0..num_rows {
                         if arr.is_null(row) {
-                            hashes[row] = combine_hash(hashes[row], null_hash);
+                            combine_hash_at(hashes, row, null_hash);
                         } else {
                             let bits = canonical_f64_bits(arr.value(row));
                             let value_hash = hash_u64_with_seed(seed, bits);
-                            hashes[row] = combine_hash(hashes[row], value_hash);
+                            combine_hash_at(hashes, row, value_hash);
                         }
                     }
                 }
@@ -1002,16 +1007,16 @@ fn hash_column(
                     for (row, value) in arr.values().iter().enumerate() {
                         let bits = canonical_f32_bits(*value) as u64;
                         let value_hash = hash_u64_with_seed(seed, bits);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 } else {
                     for row in 0..num_rows {
                         if arr.is_null(row) {
-                            hashes[row] = combine_hash(hashes[row], null_hash);
+                            combine_hash_at(hashes, row, null_hash);
                         } else {
                             let bits = canonical_f32_bits(arr.value(row)) as u64;
                             let value_hash = hash_u64_with_seed(seed, bits);
-                            hashes[row] = combine_hash(hashes[row], value_hash);
+                            combine_hash_at(hashes, row, value_hash);
                         }
                     }
                 }
@@ -1022,16 +1027,16 @@ fn hash_column(
                 for row in 0..num_rows {
                     let value = if arr.value(row) { 1u64 } else { 0u64 };
                     let value_hash = hash_u64_with_seed(seed, value);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value = if arr.value(row) { 1u64 } else { 0u64 };
                         let value_hash = hash_u64_with_seed(seed, value);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1040,15 +1045,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for row in 0..num_rows {
                     let value_hash = hash_bytes_with_seed(seed, arr.value(row).as_bytes());
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_bytes_with_seed(seed, arr.value(row).as_bytes());
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1057,15 +1062,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1074,15 +1079,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1091,15 +1096,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1108,15 +1113,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1125,15 +1130,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_u64_with_seed(seed, *value as u64);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_u64_with_seed(seed, arr.value(row) as u64);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1142,15 +1147,15 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_i128_with_seed(seed, *value);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_i128_with_seed(seed, arr.value(row));
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1159,16 +1164,16 @@ fn hash_column(
             if arr.null_count() == 0 {
                 for (row, value) in arr.values().iter().enumerate() {
                     let value_hash = hash_bytes_with_seed(seed, value.to_string().as_bytes());
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if arr.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash =
                             hash_bytes_with_seed(seed, arr.value(row).to_string().as_bytes());
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1179,15 +1184,15 @@ fn hash_column(
                     let value = largeint_row_value(arr, row)?
                         .ok_or_else(|| "group key LARGEINT unexpected null".to_string())?;
                     let value_hash = hash_i128_with_seed(seed, value);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if let Some(value) = largeint_row_value(arr, row)? {
                         let value_hash = hash_i128_with_seed(seed, value);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     } else {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     }
                 }
             }
@@ -1196,15 +1201,15 @@ fn hash_column(
             if list.null_count() == 0 {
                 for row in 0..num_rows {
                     let value_hash = hash_list_utf8_row(list, values, row, seed);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if list.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_list_utf8_row(list, values, row, seed);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1213,15 +1218,15 @@ fn hash_column(
             if list.null_count() == 0 {
                 for row in 0..num_rows {
                     let value_hash = hash_list_int32_row(list, values, row, seed);
-                    hashes[row] = combine_hash(hashes[row], value_hash);
+                    combine_hash_at(hashes, row, value_hash);
                 }
             } else {
                 for row in 0..num_rows {
                     if list.is_null(row) {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     } else {
                         let value_hash = hash_list_int32_row(list, values, row, seed);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                 }
             }
@@ -1231,10 +1236,10 @@ fn hash_column(
                 match encode_group_key_row(array, row)? {
                     Some(encoded) => {
                         let value_hash = hash_bytes_with_seed(seed, &encoded);
-                        hashes[row] = combine_hash(hashes[row], value_hash);
+                        combine_hash_at(hashes, row, value_hash);
                     }
                     None => {
-                        hashes[row] = combine_hash(hashes[row], null_hash);
+                        combine_hash_at(hashes, row, null_hash);
                     }
                 }
             }

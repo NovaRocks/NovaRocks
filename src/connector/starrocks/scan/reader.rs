@@ -174,19 +174,19 @@ impl StarRocksNativeReader {
             &output_chunk_schema,
             &output_column_hints,
         )?;
-        if use_batch_cache {
-            if let Some(batch) = native_cache::native_batch_cache_get(
+        if use_batch_cache
+            && let Some(batch) = native_cache::native_batch_cache_get(
                 storage_path,
                 tablet_id,
                 version,
                 &output_schema_sig,
-            ) {
-                return Ok(Self {
-                    tablet_id,
-                    version,
-                    next_batch: Some(batch),
-                });
-            }
+            )
+        {
+            return Ok(Self {
+                tablet_id,
+                version,
+                next_batch: Some(batch),
+            });
         }
         eprintln!(
             "[DEBUG] starrocks native reader snapshot tablet_id={} requested_version={} metadata_path={} total_num_rows={} rowset_count={} segment_count={}",
@@ -825,6 +825,60 @@ fn encode_utf8_column_to_dict_ids(
     })
 }
 
+fn dict_scan_data_type_for_output(output_type: &DataType) -> Option<DataType> {
+    if is_integer_dict_code_type(output_type) {
+        return Some(DataType::Utf8);
+    }
+    match output_type {
+        DataType::List(item) => {
+            let scan_item = dict_scan_data_type_for_output(item.data_type())?;
+            Some(DataType::List(Arc::new(
+                item.as_ref().clone().with_data_type(scan_item),
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn encode_column_to_dict_ids(
+    array: &ArrayRef,
+    output_type: &DataType,
+    dict_map: &HashMap<Vec<u8>, i32>,
+    output_name: &str,
+    slot_id: SlotId,
+) -> Result<ArrayRef, String> {
+    if is_integer_dict_code_type(output_type) {
+        return encode_utf8_column_to_dict_ids(array, output_type, dict_map, output_name, slot_id);
+    }
+
+    match output_type {
+        DataType::List(output_item) => {
+            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
+                format!(
+                    "native starrocks dict encode expects ListArray for output column '{}' (slot_id={}), got {:?}",
+                    output_name,
+                    slot_id,
+                    array.data_type()
+                )
+            })?;
+            let encoded_values = encode_column_to_dict_ids(
+                &list.values().clone(),
+                output_item.data_type(),
+                dict_map,
+                output_name,
+                slot_id,
+            )?;
+            Ok(Arc::new(ListArray::new(
+                output_item.clone(),
+                list.offsets().clone(),
+                encoded_values,
+                list.nulls().cloned(),
+            )))
+        }
+        _ => Ok(array.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -914,59 +968,5 @@ mod tests {
         assert_eq!(values.value(0), 11);
         assert_eq!(values.value(1), 0);
         assert!(values.is_null(2));
-    }
-}
-
-fn dict_scan_data_type_for_output(output_type: &DataType) -> Option<DataType> {
-    if is_integer_dict_code_type(output_type) {
-        return Some(DataType::Utf8);
-    }
-    match output_type {
-        DataType::List(item) => {
-            let scan_item = dict_scan_data_type_for_output(item.data_type())?;
-            Some(DataType::List(Arc::new(
-                item.as_ref().clone().with_data_type(scan_item),
-            )))
-        }
-        _ => None,
-    }
-}
-
-fn encode_column_to_dict_ids(
-    array: &ArrayRef,
-    output_type: &DataType,
-    dict_map: &HashMap<Vec<u8>, i32>,
-    output_name: &str,
-    slot_id: SlotId,
-) -> Result<ArrayRef, String> {
-    if is_integer_dict_code_type(output_type) {
-        return encode_utf8_column_to_dict_ids(array, output_type, dict_map, output_name, slot_id);
-    }
-
-    match output_type {
-        DataType::List(output_item) => {
-            let list = array.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
-                format!(
-                    "native starrocks dict encode expects ListArray for output column '{}' (slot_id={}), got {:?}",
-                    output_name,
-                    slot_id,
-                    array.data_type()
-                )
-            })?;
-            let encoded_values = encode_column_to_dict_ids(
-                &list.values().clone(),
-                output_item.data_type(),
-                dict_map,
-                output_name,
-                slot_id,
-            )?;
-            Ok(Arc::new(ListArray::new(
-                output_item.clone(),
-                list.offsets().clone(),
-                encoded_values,
-                list.nulls().cloned(),
-            )))
-        }
-        _ => Ok(array.clone()),
     }
 }

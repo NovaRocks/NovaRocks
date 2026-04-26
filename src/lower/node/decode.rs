@@ -91,15 +91,15 @@ pub(crate) fn build_query_global_dict_map(
             // reuse source dictionary only when there is a single referenced slot.
             let mut referenced_slots = HashSet::new();
             for node in &expr.nodes {
-                if node.node_type == exprs::TExprNodeType::SLOT_REF {
-                    if let Some(slot_ref) = node.slot_ref.as_ref() {
-                        referenced_slots.insert(slot_ref.slot_id);
-                    }
+                if node.node_type == exprs::TExprNodeType::SLOT_REF
+                    && let Some(slot_ref) = node.slot_ref.as_ref()
+                {
+                    referenced_slots.insert(slot_ref.slot_id);
                 }
-                if node.node_type == exprs::TExprNodeType::PLACEHOLDER_EXPR {
-                    if let Some(slot_id) = node.vslot_ref.as_ref().and_then(|v| v.slot_id) {
-                        referenced_slots.insert(slot_id);
-                    }
+                if node.node_type == exprs::TExprNodeType::PLACEHOLDER_EXPR
+                    && let Some(slot_id) = node.vslot_ref.as_ref().and_then(|v| v.slot_id)
+                {
+                    referenced_slots.insert(slot_id);
                 }
             }
             if referenced_slots.len() != 1 {
@@ -189,22 +189,22 @@ fn collect_expr_slot_inputs(
             }
             continue;
         }
-        if node.node_type == exprs::TExprNodeType::SLOT_REF {
-            if let Some(slot_ref) = node.slot_ref.as_ref() {
-                let slot_id = slot_ref.slot_id;
-                let data_type = arrow_type_from_desc(&node.type_).unwrap_or(DataType::Int32);
-                match slot_inputs.get(&slot_id) {
-                    Some(existing) if existing != &data_type => {
-                        return Err(format!(
-                            "dict expr slot {} has conflicting types {:?} vs {:?}",
-                            slot_id, existing, data_type
-                        ));
-                    }
-                    None => {
-                        slot_inputs.insert(slot_id, data_type);
-                    }
-                    _ => {}
+        if node.node_type == exprs::TExprNodeType::SLOT_REF
+            && let Some(slot_ref) = node.slot_ref.as_ref()
+        {
+            let slot_id = slot_ref.slot_id;
+            let data_type = arrow_type_from_desc(&node.type_).unwrap_or(DataType::Int32);
+            match slot_inputs.get(&slot_id) {
+                Some(existing) if existing != &data_type => {
+                    return Err(format!(
+                        "dict expr slot {} has conflicting types {:?} vs {:?}",
+                        slot_id, existing, data_type
+                    ));
                 }
+                None => {
+                    slot_inputs.insert(slot_id, data_type);
+                }
+                _ => {}
             }
         }
     }

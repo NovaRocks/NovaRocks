@@ -381,7 +381,7 @@ pub fn eval_encode_fingerprint_sha256(
 
     let mut builder = BinaryBuilder::new();
     for digest in digests {
-        builder.append_value(digest.finalize().to_vec());
+        builder.append_value(digest.finalize());
     }
 
     let out = Arc::new(builder.finish()) as ArrayRef;

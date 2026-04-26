@@ -54,6 +54,12 @@ impl ResultSinkHandle {
     }
 }
 
+impl Default for ResultSinkHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Factory for result sinks that append output chunks to query result buffers.
 pub struct ResultSinkFactory {
     name: String,

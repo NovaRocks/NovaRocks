@@ -412,7 +412,7 @@ fn compare_list_rows_non_null(
     for idx in 0..min_len {
         let l_idx = left_start + idx;
         let r_idx = right_start + idx;
-        let ord = compare_value_recursive_in_list(&left_values, l_idx, &right_values, r_idx)?;
+        let ord = compare_value_recursive_in_list(left_values, l_idx, right_values, r_idx)?;
         if ord != Ordering::Equal {
             return Ok(ord);
         }
@@ -512,13 +512,12 @@ fn compare_map_rows_non_null(
     for idx in 0..min_len {
         let left_idx = left_start + idx;
         let right_idx = right_start + idx;
-        let key_ord =
-            compare_value_recursive_in_list(&left_keys, left_idx, &right_keys, right_idx)?;
+        let key_ord = compare_value_recursive_in_list(left_keys, left_idx, right_keys, right_idx)?;
         if key_ord != Ordering::Equal {
             return Ok(key_ord);
         }
         let value_ord =
-            compare_value_recursive_in_list(&left_values, left_idx, &right_values, right_idx)?;
+            compare_value_recursive_in_list(left_values, left_idx, right_values, right_idx)?;
         if value_ord != Ordering::Equal {
             return Ok(value_ord);
         }
@@ -621,7 +620,7 @@ fn eq_list_rows(
     for idx in 0..left_len {
         let l_idx = left_start + idx;
         let r_idx = right_start + idx;
-        match eq_value_recursive(&left_values, l_idx, &right_values, r_idx)? {
+        match eq_value_recursive(left_values, l_idx, right_values, r_idx)? {
             Some(true) => {}
             Some(false) => return Ok(Some(false)),
             None => has_unknown = true,
@@ -698,12 +697,12 @@ fn eq_map_rows(
     for idx in 0..left_len {
         let left_idx = left_start + idx;
         let right_idx = right_start + idx;
-        match eq_value_recursive(&left_keys, left_idx, &right_keys, right_idx)? {
+        match eq_value_recursive(left_keys, left_idx, right_keys, right_idx)? {
             Some(true) => {}
             Some(false) => return Ok(Some(false)),
             None => has_unknown = true,
         }
-        match eq_value_recursive(&left_values, left_idx, &right_values, right_idx)? {
+        match eq_value_recursive(left_values, left_idx, right_values, right_idx)? {
             Some(true) => {}
             Some(false) => return Ok(Some(false)),
             None => has_unknown = true,
@@ -800,7 +799,7 @@ fn eq_list_rows_null_safe(
     for idx in 0..left_len {
         let l_idx = left_start + idx;
         let r_idx = right_start + idx;
-        if !eq_value_recursive_null_safe(&left_values, l_idx, &right_values, r_idx)? {
+        if !eq_value_recursive_null_safe(left_values, l_idx, right_values, r_idx)? {
             return Ok(false);
         }
     }
@@ -865,10 +864,10 @@ fn eq_map_rows_null_safe(
     for idx in 0..left_len {
         let left_idx = left_start + idx;
         let right_idx = right_start + idx;
-        if !eq_value_recursive_null_safe(&left_keys, left_idx, &right_keys, right_idx)? {
+        if !eq_value_recursive_null_safe(left_keys, left_idx, right_keys, right_idx)? {
             return Ok(false);
         }
-        if !eq_value_recursive_null_safe(&left_values, left_idx, &right_values, right_idx)? {
+        if !eq_value_recursive_null_safe(left_values, left_idx, right_values, right_idx)? {
             return Ok(false);
         }
     }
@@ -1651,7 +1650,7 @@ mod tests {
         let result = eval_eq(&arena, lit5, lit5_dup, &chunk).unwrap();
         let result_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_arr.value(0), true);
+        assert!(result_arr.value(0));
     }
 
     #[test]
@@ -1665,7 +1664,7 @@ mod tests {
         let result = eval_ne(&arena, lit5, lit3, &chunk).unwrap();
         let result_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_arr.value(0), true);
+        assert!(result_arr.value(0));
     }
 
     #[test]
@@ -1682,10 +1681,10 @@ mod tests {
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert_eq!(out.len(), 4);
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), true);
-        assert_eq!(out.value(2), false);
-        assert_eq!(out.value(3), false);
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(!out.value(2));
+        assert!(!out.value(3));
         assert!(!out.is_null(0));
         assert!(!out.is_null(1));
         assert!(!out.is_null(2));
@@ -1703,7 +1702,7 @@ mod tests {
         let result = eval_lt(&arena, lit3, lit5, &chunk).unwrap();
         let result_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_arr.value(0), true);
+        assert!(result_arr.value(0));
     }
 
     #[test]
@@ -1717,7 +1716,7 @@ mod tests {
         let result = eval_gt(&arena, lit10, lit5, &chunk).unwrap();
         let result_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_arr.value(0), true);
+        assert!(result_arr.value(0));
     }
 
     #[test]
@@ -1736,7 +1735,7 @@ mod tests {
         let result = eval_and(&arena, gt_expr, lt_expr, &chunk).unwrap();
         let result_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_arr.value(0), true);
+        assert!(result_arr.value(0));
     }
 
     #[test]
@@ -1755,7 +1754,7 @@ mod tests {
         let result = eval_or(&arena, lt1_expr, lt2_expr, &chunk).unwrap();
         let result_arr = result.as_any().downcast_ref::<BooleanArray>().unwrap();
 
-        assert_eq!(result_arr.value(0), true);
+        assert!(result_arr.value(0));
     }
 
     #[test]
@@ -1772,12 +1771,12 @@ mod tests {
         let chunk = create_test_chunk_bool(vec![None], vec![Some(true)]);
         let out = arena.eval(or_expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
+        assert!(out.value(0));
 
         let chunk = create_test_chunk_bool(vec![None], vec![Some(false)]);
         let out = arena.eval(and_expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), false);
+        assert!(!out.value(0));
     }
 
     #[test]
@@ -1819,9 +1818,9 @@ mod tests {
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         // 1.23 > 0.99 => true
-        assert_eq!(out.value(0), true);
+        assert!(out.value(0));
         // 0.50 > 5.00 => false
-        assert_eq!(out.value(1), false);
+        assert!(!out.value(1));
     }
 
     #[test]
@@ -1860,7 +1859,7 @@ mod tests {
 
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
+        assert!(out.value(0));
     }
 
     #[test]
@@ -1884,8 +1883,8 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), false);
+        assert!(out.value(0));
+        assert!(!out.value(1));
         assert!(out.is_null(2));
     }
 
@@ -1911,7 +1910,7 @@ mod tests {
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.is_null(0));
-        assert_eq!(out.value(1), false);
+        assert!(!out.value(1));
         assert!(out.is_null(2));
     }
 
@@ -1940,11 +1939,11 @@ mod tests {
         let expr = arena.push_typed(ExprNode::EqForNull(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), true);
-        assert_eq!(out.value(2), true);
-        assert_eq!(out.value(3), false);
-        assert_eq!(out.value(4), false);
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(out.value(2));
+        assert!(!out.value(3));
+        assert!(!out.value(4));
     }
 
     #[test]
@@ -1969,7 +1968,7 @@ mod tests {
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
         assert!(out.is_null(0));
-        assert_eq!(out.value(1), true);
+        assert!(out.value(1));
         assert!(out.is_null(2));
     }
 
@@ -1992,8 +1991,8 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Gt(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), false);
+        assert!(out.value(0));
+        assert!(!out.value(1));
     }
 
     #[test]
@@ -2028,9 +2027,9 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), false);
-        assert_eq!(out.value(2), true);
+        assert!(out.value(0));
+        assert!(!out.value(1));
+        assert!(out.value(2));
     }
 
     #[test]
@@ -2056,8 +2055,8 @@ mod tests {
         let expr = arena.push_typed(ExprNode::Eq(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), false);
+        assert!(out.value(0));
+        assert!(!out.value(1));
         assert!(out.is_null(2));
     }
 
@@ -2084,8 +2083,8 @@ mod tests {
         let expr = arena.push_typed(ExprNode::EqForNull(l, r), DataType::Boolean);
         let out = arena.eval(expr, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), true);
-        assert_eq!(out.value(2), false);
+        assert!(out.value(0));
+        assert!(out.value(1));
+        assert!(!out.value(2));
     }
 }

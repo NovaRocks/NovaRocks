@@ -76,7 +76,7 @@ fn round_decimal(value: i128, original_scale: i8, target_scale: i8) -> Result<i1
 
     if scale_diff == 0 {
         // No rounding needed
-        return Ok(value);
+        Ok(value)
     } else if scale_diff > 0 {
         // Scale up: multiply by 10^scale_diff
         let factor = pow10_i128(scale_diff as usize)?;
@@ -195,7 +195,10 @@ pub fn eval_round(
         }
     } else {
         // Two arguments: round(x, d)
-        let decimals_arr = arena.eval(decimals_expr.unwrap(), chunk)?;
+        let Some(decimals_expr) = decimals_expr else {
+            return Err("round: missing decimal argument".to_string());
+        };
+        let decimals_arr = arena.eval(decimals_expr, chunk)?;
 
         // Get length from value_arr
         let len = value_arr.len();

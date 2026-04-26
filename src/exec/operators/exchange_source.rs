@@ -52,7 +52,7 @@ static EXCHANGE_SOURCE_READY_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn should_log_exchange_source_ready() -> bool {
     let count = EXCHANGE_SOURCE_READY_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    count % 1024 == 0
+    count.is_multiple_of(1024)
 }
 
 const JOIN_RUNTIME_FILTER_TIME: &str = "JoinRuntimeFilterTime";
@@ -284,19 +284,19 @@ impl ProcessorOperator for ExchangeSourceOperator {
         if self.finished {
             return false;
         }
-        if let Some(start) = self.start {
-            if start.elapsed() >= self.node.timeout {
-                if should_log_exchange_source_ready() {
-                    debug!(
-                        "ExchangeSource has_output due to timeout: finst={} node_id={} elapsed={:?} timeout={:?}",
-                        self.node.key.finst_uuid(),
-                        self.node.key.node_id,
-                        start.elapsed(),
-                        self.node.timeout
-                    );
-                }
-                return true;
+        if let Some(start) = self.start
+            && start.elapsed() >= self.node.timeout
+        {
+            if should_log_exchange_source_ready() {
+                debug!(
+                    "ExchangeSource has_output due to timeout: finst={} node_id={} elapsed={:?} timeout={:?}",
+                    self.node.key.finst_uuid(),
+                    self.node.key.node_id,
+                    start.elapsed(),
+                    self.node.timeout
+                );
             }
+            return true;
         }
         let Some(receiver) = self.receiver.as_ref() else {
             return false;
@@ -433,22 +433,21 @@ impl ProcessorOperator for ExchangeSourceOperator {
         if let Some(dep) = self.local_rf_dependency() {
             return Some(dep);
         }
-        if let Some(rf) = self.runtime_filter_probe.as_ref() {
-            if let Some(dep) = rf.dependency_or_timeout() {
-                if !dep.is_ready() {
-                    if self.finished {
-                        return None;
-                    }
-                    if let Some(receiver) = self.receiver.as_ref() {
-                        // If data is already available, let the driver consume it instead of
-                        // waiting on runtime filters.
-                        if receiver.has_output_or_finished(self.node.expected_senders) {
-                            return None;
-                        }
-                    }
-                    return Some(dep);
+        if let Some(rf) = self.runtime_filter_probe.as_ref()
+            && let Some(dep) = rf.dependency_or_timeout()
+            && !dep.is_ready()
+        {
+            if self.finished {
+                return None;
+            }
+            if let Some(receiver) = self.receiver.as_ref() {
+                // If data is already available, let the driver consume it instead of
+                // waiting on runtime filters.
+                if receiver.has_output_or_finished(self.node.expected_senders) {
+                    return None;
                 }
             }
+            return Some(dep);
         }
         None
     }
@@ -495,21 +494,21 @@ impl ExchangeSourceOperator {
                 .add_counter(RUNTIME_IN_FILTER_NUM, metrics::TUnit::UNIT);
         }
         let snapshot = rf.snapshot();
-        if let Some(elapsed) = rf.mark_ready() {
-            if let Some(profile) = self.profiles.as_ref() {
-                let latency_ns = elapsed.as_nanos().min(i64::MAX as u128) as i64;
-                for filter in snapshot.in_filters() {
-                    let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                    profile
-                        .common
-                        .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
-                }
-                for filter in snapshot.membership_filters() {
-                    let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
-                    profile
-                        .common
-                        .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
-                }
+        if let Some(elapsed) = rf.mark_ready()
+            && let Some(profile) = self.profiles.as_ref()
+        {
+            let latency_ns = elapsed.as_nanos().min(i64::MAX as u128) as i64;
+            for filter in snapshot.in_filters() {
+                let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
+                profile
+                    .common
+                    .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
+            }
+            for filter in snapshot.membership_filters() {
+                let name = format!("JoinRuntimeFilter/{}/latency", filter.filter_id());
+                profile
+                    .common
+                    .counter_set(&name, metrics::TUnit::TIME_NS, latency_ns);
             }
         }
         self.log_runtime_filters_loaded(snapshot.in_filters(), snapshot.membership_filters());
@@ -584,7 +583,9 @@ impl ExchangeSourceOperator {
         self.rf_debug_counter = self.rf_debug_counter.wrapping_add(1);
         let version = rf.probe.handle().version();
         if version != self.rf_debug_last_version
-            || self.rf_debug_counter % RUNTIME_FILTER_DEBUG_EVERY == 0
+            || self
+                .rf_debug_counter
+                .is_multiple_of(RUNTIME_FILTER_DEBUG_EVERY)
         {
             debug!(
                 "exchange runtime filter progress: node_id={} driver_id={} version={} in_filters={} membership_filters={} expected={} counter={}",

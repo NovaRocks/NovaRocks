@@ -272,10 +272,8 @@ pub(crate) fn infer_s3_config_for_path(path: &str) -> Option<S3StoreConfig> {
             Some(_) => has_conflict = true,
         }
     }
-    if !has_conflict {
-        if let Some(cfg) = unique_cfg {
-            return Some(cfg);
-        }
+    if !has_conflict && let Some(cfg) = unique_cfg {
+        return Some(cfg);
     }
     None
 }

@@ -124,12 +124,10 @@ fn resolve_node_data_type(node: &exprs::TExprNode) -> Option<DataType> {
     if matches!(
         node.node_type,
         exprs::TExprNodeType::FUNCTION_CALL | exprs::TExprNodeType::COMPUTE_FUNCTION_CALL
-    ) {
-        if let Some(output_type) = node.output_type.as_ref() {
-            if let Some(data_type) = arrow_type_from_primitive(output_type.type_) {
-                return Some(data_type);
-            }
-        }
+    ) && let Some(output_type) = node.output_type.as_ref()
+        && let Some(data_type) = arrow_type_from_primitive(output_type.type_)
+    {
+        return Some(data_type);
     }
     None
 }
@@ -147,8 +145,8 @@ fn merge_prefer_non_null_type(
 ) -> Option<DataType> {
     match (left, right) {
         (Some(l), Some(r)) if l == r => Some(l.clone()),
-        (Some(l), Some(r)) if matches!(l, DataType::Null) => Some(r.clone()),
-        (Some(l), Some(r)) if matches!(r, DataType::Null) => Some(l.clone()),
+        (Some(DataType::Null), Some(r)) => Some(r.clone()),
+        (Some(l), Some(DataType::Null)) => Some(l.clone()),
         (Some(l), Some(_)) => Some(l.clone()),
         (Some(l), None) => Some(l.clone()),
         (None, Some(r)) => Some(r.clone()),
@@ -252,20 +250,20 @@ fn lower_dict_expr_node(
         Some(ExprNode::SlotId(slot_id)) => Some(*slot_id),
         _ => None,
     };
-    if let Some(slot_id) = dict_slot_id {
-        if let Some(dict) = arena.query_global_dict(slot_id).cloned() {
-            let decoded_expr = arena.push_typed(
-                ExprNode::DictDecode {
-                    child: dict_child,
-                    dict,
-                },
-                DataType::Utf8,
-            );
-            let raw_slot_id = i32::try_from(slot_id.as_u32())
-                .map_err(|_| format!("slot id {} overflows i32", slot_id))?;
-            ctx.placeholder_overrides.insert(raw_slot_id, decoded_expr);
-            inserted_override = Some(raw_slot_id);
-        }
+    if let Some(slot_id) = dict_slot_id
+        && let Some(dict) = arena.query_global_dict(slot_id).cloned()
+    {
+        let decoded_expr = arena.push_typed(
+            ExprNode::DictDecode {
+                child: dict_child,
+                dict,
+            },
+            DataType::Utf8,
+        );
+        let raw_slot_id = i32::try_from(slot_id.as_u32())
+            .map_err(|_| format!("slot id {} overflows i32", slot_id))?;
+        ctx.placeholder_overrides.insert(raw_slot_id, decoded_expr);
+        inserted_override = Some(raw_slot_id);
     }
     let mut mapped_children = Vec::with_capacity((node.num_children - 1) as usize);
     for _ in 1..node.num_children {
@@ -434,34 +432,33 @@ fn lower_expr_node_impl(
         }
         // Slot reference
         t if t == exprs::TExprNodeType::SLOT_REF => {
-            if let Some(slot) = node.slot_ref.as_ref() {
-                if let Some(map) = ctx.map {
-                    if let Some(common_expr) = map.get(&slot.slot_id) {
-                        if let Some(cached) = ctx.cache.get(&slot.slot_id) {
-                            return Ok(*cached);
-                        }
-                        if ctx.stack.contains(&slot.slot_id) {
-                            return Err(format!(
-                                "common_slot_map contains a cycle at slot_id={}",
-                                slot.slot_id
-                            ));
-                        }
-                        ctx.stack.push(slot.slot_id);
-                        let mut sub_idx = 0usize;
-                        let lowered = lower_expr_node_impl(
-                            &common_expr.nodes,
-                            &mut sub_idx,
-                            arena,
-                            input_layout,
-                            last_query_id,
-                            fe_addr,
-                            ctx,
-                        )?;
-                        ctx.stack.pop();
-                        ctx.cache.insert(slot.slot_id, lowered);
-                        return Ok(lowered);
-                    }
+            if let Some(slot) = node.slot_ref.as_ref()
+                && let Some(map) = ctx.map
+                && let Some(common_expr) = map.get(&slot.slot_id)
+            {
+                if let Some(cached) = ctx.cache.get(&slot.slot_id) {
+                    return Ok(*cached);
                 }
+                if ctx.stack.contains(&slot.slot_id) {
+                    return Err(format!(
+                        "common_slot_map contains a cycle at slot_id={}",
+                        slot.slot_id
+                    ));
+                }
+                ctx.stack.push(slot.slot_id);
+                let mut sub_idx = 0usize;
+                let lowered = lower_expr_node_impl(
+                    &common_expr.nodes,
+                    &mut sub_idx,
+                    arena,
+                    input_layout,
+                    last_query_id,
+                    fe_addr,
+                    ctx,
+                )?;
+                ctx.stack.pop();
+                ctx.cache.insert(slot.slot_id, lowered);
+                return Ok(lowered);
             }
             lower_slot_ref(node, arena, input_layout, data_type)?
         }
@@ -725,6 +722,6 @@ mod tests {
 
         let out = arena.eval(lowered, &chunk).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), false);
+        assert!(!out.value(0));
     }
 }

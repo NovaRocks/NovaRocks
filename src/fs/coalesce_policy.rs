@@ -56,6 +56,12 @@ impl AdaptiveCoalesceController {
     }
 }
 
+impl Default for AdaptiveCoalesceController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::AdaptiveCoalesceController;

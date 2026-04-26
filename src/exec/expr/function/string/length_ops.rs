@@ -40,11 +40,7 @@ fn eval_char_length_impl(
             continue;
         }
         let s = s_arr.value(i);
-        let v = if utf8 {
-            s.chars().count()
-        } else {
-            s.as_bytes().len()
-        } as i64;
+        let v = if utf8 { s.chars().count() } else { s.len() } as i64;
         out.push(Some(v));
     }
     match arena

@@ -431,7 +431,7 @@ fn hash_complex_value_impl(
             end.saturating_sub(start).hash(hasher);
             let child_values = list.values();
             for i in start..end {
-                hash_complex_value_impl(&child_values, i, hasher)?;
+                hash_complex_value_impl(child_values, i, hasher)?;
             }
         }
         DataType::Struct(_) => {
@@ -456,8 +456,8 @@ fn hash_complex_value_impl(
             let keys = map.keys();
             let vals = map.values();
             for i in start..end {
-                hash_complex_value_impl(&keys, i, hasher)?;
-                hash_complex_value_impl(&vals, i, hasher)?;
+                hash_complex_value_impl(keys, i, hasher)?;
+                hash_complex_value_impl(vals, i, hasher)?;
             }
         }
         other => {

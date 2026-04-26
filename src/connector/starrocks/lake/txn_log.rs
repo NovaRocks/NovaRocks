@@ -176,7 +176,7 @@ fn append_lake_txn_log_with_rowset_impl(
                     rewrite_segments: Vec::new(),
                     del_encryption_metas: Vec::new(),
                     ssts: Vec::new(),
-                    schema_key: Some(schema_key.clone()),
+                    schema_key: Some(schema_key),
                 }),
                 op_compaction: None,
                 op_schema_change: None,
@@ -355,7 +355,7 @@ fn append_lake_txn_log_with_rowset_impl(
                         rewrite_segments: Vec::new(),
                         del_encryption_metas: Vec::new(),
                         ssts: Vec::new(),
-                        schema_key: Some(schema_key.clone()),
+                        schema_key: Some(schema_key),
                     }),
                     op_compaction: None,
                     op_schema_change: None,
@@ -507,7 +507,7 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
                     rewrite_segments: Vec::new(),
                     del_encryption_metas: Vec::new(),
                     ssts: Vec::new(),
-                    schema_key: Some(schema_key.clone()),
+                    schema_key: Some(schema_key),
                 }),
                 op_compaction: None,
                 op_schema_change: None,
@@ -544,7 +544,7 @@ pub(crate) fn append_lake_txn_log_empty_rowset(
                         rewrite_segments: Vec::new(),
                         del_encryption_metas: Vec::new(),
                         ssts: Vec::new(),
-                        schema_key: Some(schema_key.clone()),
+                        schema_key: Some(schema_key),
                     }),
                     op_compaction: None,
                     op_schema_change: None,
@@ -3068,7 +3068,7 @@ fn scalar_array_gt(left: &ArrayRef, right: &ArrayRef) -> Result<bool, String> {
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "downcast merge_condition right BOOLEAN failed".to_string())?;
-            Ok(left.value(0) > right.value(0))
+            Ok(left.value(0) & !right.value(0))
         }
         DataType::Int8 => {
             let left = left
@@ -3289,10 +3289,10 @@ fn resolve_batch_write_format(
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                return Err(format!(
+                Err(format!(
                     "native lake write does not support current schema columns: schema_id={:?}, unsupported=[{}]",
                     tablet_schema.id, unsupported_columns
-                ));
+                ))
             } else {
                 Ok(StarRocksWriteFormat::Native)
             }
@@ -3471,38 +3471,38 @@ fn filter_decimal_cast_overflow_rows(
         // matches the target (same precision and scale). In this case, values that exceed
         // the declared precision (but fit in i256) would not be detected by the cast-based
         // approach. Directly validate each non-null i256 value against the precision bound.
-        if precision > 38 {
-            if let Some(dec256) = source.as_any().downcast_ref::<Decimal256Array>() {
-                let max_unscaled = decimal256_max_unscaled(precision);
-                for row in 0..batch.num_rows() {
-                    if !dec256.is_null(row) {
-                        let val = dec256.value(row);
-                        let abs_val = val.wrapping_abs();
-                        if abs_val >= max_unscaled {
-                            rejected[row] = true;
-                        }
+        if precision > 38
+            && let Some(dec256) = source.as_any().downcast_ref::<Decimal256Array>()
+        {
+            let max_unscaled = decimal256_max_unscaled(precision);
+            for (row, is_rejected) in rejected.iter_mut().enumerate().take(batch.num_rows()) {
+                if !dec256.is_null(row) {
+                    let val = dec256.value(row);
+                    let abs_val = val.wrapping_abs();
+                    if abs_val >= max_unscaled {
+                        *is_rejected = true;
                     }
                 }
-                continue;
             }
+            continue;
         }
 
         // For DECIMAL128 columns, Arrow's cast is a no-op when source and target types match
         // (same precision and scale), so it cannot detect values that exceed the declared
         // precision.  Directly validate each non-null i128 value against the precision bound.
-        if precision <= 38 {
-            if let Some(dec128) = source.as_any().downcast_ref::<Decimal128Array>() {
-                let max_unscaled = pow10_i128(u32::from(precision)).unwrap_or(i128::MAX);
-                for row in 0..batch.num_rows() {
-                    if !dec128.is_null(row) {
-                        let abs_val = dec128.value(row).unsigned_abs();
-                        if abs_val >= max_unscaled as u128 {
-                            rejected[row] = true;
-                        }
+        if precision <= 38
+            && let Some(dec128) = source.as_any().downcast_ref::<Decimal128Array>()
+        {
+            let max_unscaled = pow10_i128(u32::from(precision)).unwrap_or(i128::MAX);
+            for (row, is_rejected) in rejected.iter_mut().enumerate().take(batch.num_rows()) {
+                if !dec128.is_null(row) {
+                    let abs_val = dec128.value(row).unsigned_abs();
+                    if abs_val >= max_unscaled as u128 {
+                        *is_rejected = true;
                     }
                 }
-                continue;
             }
+            continue;
         }
 
         let casted = cast(source.as_ref(), &target_type).map_err(|e| {
@@ -3515,9 +3515,9 @@ fn filter_decimal_cast_overflow_rows(
             )
         })?;
 
-        for row in 0..batch.num_rows() {
+        for (row, is_rejected) in rejected.iter_mut().enumerate().take(batch.num_rows()) {
             if !source.is_null(row) && casted.is_null(row) {
-                rejected[row] = true;
+                *is_rejected = true;
             }
         }
     }
@@ -3655,7 +3655,7 @@ fn upsert_write_rowset_in_txn_log(
                 tablet_id, txn_id, load_id.hi, load_id.lo, existing_load_id.hi, existing_load_id.lo
             ));
         }
-        txn_log.load_id = Some(load_id.clone());
+        txn_log.load_id = Some(*load_id);
     }
 
     let op_write = txn_log.op_write.get_or_insert_with(|| txn_log_pb::OpWrite {
@@ -3665,12 +3665,12 @@ fn upsert_write_rowset_in_txn_log(
         rewrite_segments: Vec::new(),
         del_encryption_metas: Vec::new(),
         ssts: Vec::new(),
-        schema_key: Some(expected_schema_key.clone()),
+        schema_key: Some(*expected_schema_key),
     });
     if let Some(existing_schema_key) = op_write.schema_key.as_ref() {
         ensure_table_schema_key_equals(existing_schema_key, expected_schema_key)?;
     } else {
-        op_write.schema_key = Some(expected_schema_key.clone());
+        op_write.schema_key = Some(*expected_schema_key);
     }
     match op_write.rowset.as_mut() {
         Some(existing_rowset) => merge_rowset_metadata(existing_rowset, incoming_rowset)?,
@@ -3923,9 +3923,7 @@ pub(crate) fn merge_rowset_metadata(
     }
 
     target.segments.extend(merged_incoming.segments);
-    target
-        .segment_size
-        .extend(merged_incoming.segment_size.into_iter());
+    target.segment_size.extend(merged_incoming.segment_size);
     target
         .segment_encryption_metas
         .extend(merged_incoming.segment_encryption_metas);

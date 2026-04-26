@@ -68,7 +68,7 @@ pub fn eval_array_repeat(
             )
         })?
     };
-    if values.is_empty() && chunk.len() > 0 {
+    if values.is_empty() && !chunk.is_empty() {
         values = new_null_array(&item_type, chunk.len());
     }
 

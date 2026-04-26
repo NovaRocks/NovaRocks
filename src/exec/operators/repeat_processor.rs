@@ -256,7 +256,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
                     gidx, self.repeat_idx
                 )
             })?;
-            let arr = Int64Array::from_iter(std::iter::repeat(Some(v)).take(num_rows));
+            let arr = Int64Array::from_iter(std::iter::repeat_n(Some(v), num_rows));
             columns.push(Arc::new(arr) as _);
         }
 

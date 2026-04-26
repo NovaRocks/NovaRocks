@@ -268,7 +268,7 @@ pub(crate) fn handle_lookup(
             response.status = Some(error_status("lookup request column missing slot_id"));
             return response;
         };
-        if col.data.as_ref().map_or(true, |data| data.is_empty()) {
+        if col.data.as_ref().is_none_or(|data| data.is_empty()) {
             response.status = Some(error_status(format!(
                 "lookup request column {} missing data",
                 slot_id

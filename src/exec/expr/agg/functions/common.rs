@@ -83,7 +83,7 @@ pub(in crate::exec::expr::agg) fn build_timestamp_array(
     output_type: &DataType,
 ) -> Result<ArrayRef, String> {
     let (unit, tz) = match output_type {
-        DataType::Timestamp(unit, tz) => (unit.clone(), tz.as_deref().map(|s| s.to_string())),
+        DataType::Timestamp(unit, tz) => (*unit, tz.as_deref().map(|s| s.to_string())),
         other => return Err(format!("timestamp output type mismatch: {:?}", other)),
     };
     let mut values = Vec::with_capacity(group_states.len());
@@ -393,7 +393,7 @@ pub(crate) fn scalar_from_array(
             let values = arr.values();
             let mut out = Vec::with_capacity(end.saturating_sub(start));
             for idx in start..end {
-                out.push(scalar_from_array(&values, idx)?);
+                out.push(scalar_from_array(values, idx)?);
             }
             Ok(Some(AggScalarValue::List(out)))
         }
@@ -427,8 +427,8 @@ pub(crate) fn scalar_from_array(
             let mut out = Vec::with_capacity(end.saturating_sub(start));
             for idx in start..end {
                 out.push((
-                    scalar_from_array(&keys, idx)?,
-                    scalar_from_array(&values, idx)?,
+                    scalar_from_array(keys, idx)?,
+                    scalar_from_array(values, idx)?,
                 ));
             }
             Ok(Some(AggScalarValue::Map(out)))
@@ -455,11 +455,11 @@ pub(in crate::exec::expr::agg) fn scalar_to_string(
             _ => Ok(v.to_string()),
         },
         AggScalarValue::Decimal128(v) => match data_type {
-            DataType::Decimal128(_, scale) => Ok(format_decimal(*v, *scale as i8)),
+            DataType::Decimal128(_, scale) => Ok(format_decimal(*v, *scale)),
             _ => Ok(v.to_string()),
         },
         AggScalarValue::Decimal256(v) => match data_type {
-            DataType::Decimal256(_, scale) => Ok(format_decimal256(*v, *scale as i8)),
+            DataType::Decimal256(_, scale) => Ok(format_decimal256(*v, *scale)),
             _ => Ok(v.to_string()),
         },
         AggScalarValue::Struct(items) => {

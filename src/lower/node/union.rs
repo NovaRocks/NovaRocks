@@ -51,9 +51,9 @@ pub(crate) fn lower_union_node(
         let tuple_id = un.tuple_id;
         let col_count = un
             .const_expr_lists
-            .get(0)
+            .first()
             .map(|r| r.len())
-            .or_else(|| un.result_expr_lists.get(0).map(|r| r.len()))
+            .or_else(|| un.result_expr_lists.first().map(|r| r.len()))
             .unwrap_or(0);
         out_layout = layout_from_slot_ids(tuple_id, (0..col_count).map(|i| i as types::TSlotId));
     }

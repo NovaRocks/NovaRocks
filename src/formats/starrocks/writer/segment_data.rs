@@ -1549,7 +1549,7 @@ fn encode_date_storage_from_unix_days(unix_days: i32) -> Result<i32, String> {
 fn encode_datetime_storage_from_unix_micros(unix_micros: i64) -> Result<i64, String> {
     let days_since_epoch = unix_micros.div_euclid(USECS_PER_DAY_I64);
     let micros_of_day = unix_micros.rem_euclid(USECS_PER_DAY_I64);
-    if micros_of_day < 0 || micros_of_day >= USECS_PER_DAY_I64 {
+    if !(0..USECS_PER_DAY_I64).contains(&micros_of_day) {
         return Err(format!(
             "invalid datetime micros-of-day after conversion: unix_micros={}, micros_of_day={}",
             unix_micros, micros_of_day
@@ -2918,7 +2918,7 @@ fn format_decimal_zone_map_value(unscaled: i128, scale: i8) -> Vec<u8> {
     let digits = unscaled.abs().to_string();
     if digits.len() <= scale_usize {
         let mut frac = String::with_capacity(scale_usize);
-        frac.extend(std::iter::repeat('0').take(scale_usize - digits.len()));
+        frac.extend(std::iter::repeat_n('0', scale_usize - digits.len()));
         frac.push_str(&digits);
         return format!("{sign}0.{frac}").into_bytes();
     }
@@ -2943,7 +2943,7 @@ fn format_decimal256_zone_map_value(unscaled: i256, scale: i8) -> Vec<u8> {
     let digits = abs.to_string();
     if digits.len() <= scale_usize {
         let mut frac = String::with_capacity(scale_usize);
-        frac.extend(std::iter::repeat('0').take(scale_usize - digits.len()));
+        frac.extend(std::iter::repeat_n('0', scale_usize - digits.len()));
         frac.push_str(&digits);
         return format!("{sign}0.{frac}").into_bytes();
     }
@@ -3313,7 +3313,7 @@ fn encode_native_data_page_for_column(
                         if let Some(flags) = null_flags.as_mut() {
                             flags.push(1);
                         }
-                        value_bytes.extend(std::iter::repeat(0_u8).take(fixed_width));
+                        value_bytes.extend(std::iter::repeat_n(0_u8, fixed_width));
                         continue;
                     }
                     if let Some(flags) = null_flags.as_mut() {
@@ -3367,7 +3367,7 @@ fn encode_native_data_page_for_column(
                         if let Some(flags) = null_flags.as_mut() {
                             flags.push(1);
                         }
-                        value_bytes.extend(std::iter::repeat(0_u8).take(fixed_width));
+                        value_bytes.extend(std::iter::repeat_n(0_u8, fixed_width));
                         continue;
                     }
                     if let Some(flags) = null_flags.as_mut() {
@@ -3682,7 +3682,7 @@ where
             if let Some(flags) = null_flags.as_mut() {
                 flags.push(1);
             }
-            value_bytes.extend(std::iter::repeat(0_u8).take(null_value_width));
+            value_bytes.extend(std::iter::repeat_n(0_u8, null_value_width));
             continue;
         }
         if let Some(flags) = null_flags.as_mut() {

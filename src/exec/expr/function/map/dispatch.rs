@@ -30,7 +30,7 @@ pub fn register(map: &mut HashMap<&'static str, crate::exec::expr::function::Fun
     for (name, canonical) in MAP_FUNCTIONS {
         map.insert(
             *name,
-            crate::exec::expr::function::FunctionKind::Map(*canonical),
+            crate::exec::expr::function::FunctionKind::Map(canonical),
         );
     }
 }

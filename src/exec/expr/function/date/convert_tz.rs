@@ -47,14 +47,14 @@ pub fn eval_convert_tz(
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
     let mut out = Vec::with_capacity(dts.len());
-    for i in 0..dts.len() {
+    for (i, dt) in dts.iter().copied().enumerate() {
         if from_arr.is_null(i) || to_arr.is_null(i) {
             out.push(None);
             continue;
         }
         let from = parse_tz(from_arr.value(i));
         let to = parse_tz(to_arr.value(i));
-        let v = match (dts[i], from, to) {
+        let v = match (dt, from, to) {
             (Some(dt), Some(f), Some(t)) => convert_tz_with_zone(dt, f, t)
                 .and_then(|ndt| to_timestamp_value(ndt, &output_type).ok()),
             _ => None,

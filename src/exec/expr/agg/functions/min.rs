@@ -40,8 +40,8 @@ fn min_spec_from_type(data_type: &DataType) -> Result<AggSpec, String> {
         DataType::Date32 => (AggKind::MinDate32, DataType::Date32, DataType::Date32),
         DataType::Timestamp(unit, tz) => (
             AggKind::MinTimestamp,
-            DataType::Timestamp(unit.clone(), tz.clone()),
-            DataType::Timestamp(unit.clone(), tz.clone()),
+            DataType::Timestamp(*unit, tz.clone()),
+            DataType::Timestamp(*unit, tz.clone()),
         ),
         DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => (
             AggKind::MinLargeInt,
@@ -363,7 +363,7 @@ fn update_min_bool(
                 if !view.is_null(row) {
                     let v = view.value(row);
                     let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut BoolState) };
-                    if !state.has_value || v < state.value {
+                    if !state.has_value || (!v & state.value) {
                         state.has_value = true;
                         state.value = v;
                     }
@@ -381,27 +381,25 @@ fn update_min_utf8(
     input: &AggInputView,
 ) -> Result<(), String> {
     match input {
-        AggInputView::Utf8(view) => match view {
-            Utf8ArrayView::Utf8(arr) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let v = arr.value(row);
-                    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut Utf8State) };
-                    match &state.value {
-                        None => state.value = Some(v.to_string()),
-                        Some(cur) => {
-                            if v < cur.as_str() {
-                                state.value = Some(v.to_string());
-                            }
+        AggInputView::Utf8(Utf8ArrayView::Utf8(arr)) => {
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if arr.is_null(row) {
+                    continue;
+                }
+                let v = arr.value(row);
+                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut Utf8State) };
+                match &state.value {
+                    None => state.value = Some(v.to_string()),
+                    Some(cur) => {
+                        if v < cur.as_str() {
+                            state.value = Some(v.to_string());
                         }
                     }
                 }
-                Ok(())
             }
-            _ => Err("min utf8 input type mismatch".to_string()),
-        },
+            Ok(())
+        }
+        AggInputView::Utf8(_) => Err("min utf8 input type mismatch".to_string()),
         _ => Err("min utf8 input type mismatch".to_string()),
     }
 }
@@ -412,23 +410,21 @@ fn update_min_date32(
     input: &AggInputView,
 ) -> Result<(), String> {
     match input {
-        AggInputView::Utf8(view) => match view {
-            Utf8ArrayView::Date32(arr) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let v = arr.value(row);
-                    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut I32State) };
-                    if !state.has_value || v < state.value {
-                        state.has_value = true;
-                        state.value = v;
-                    }
+        AggInputView::Utf8(Utf8ArrayView::Date32(arr)) => {
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if arr.is_null(row) {
+                    continue;
                 }
-                Ok(())
+                let v = arr.value(row);
+                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut I32State) };
+                if !state.has_value || v < state.value {
+                    state.has_value = true;
+                    state.value = v;
+                }
             }
-            _ => Err("min date32 input type mismatch".to_string()),
-        },
+            Ok(())
+        }
+        AggInputView::Utf8(_) => Err("min date32 input type mismatch".to_string()),
         _ => Err("min date32 input type mismatch".to_string()),
     }
 }
@@ -476,23 +472,21 @@ fn update_min_decimal128(
     input: &AggInputView,
 ) -> Result<(), String> {
     match input {
-        AggInputView::Utf8(view) => match view {
-            Utf8ArrayView::Decimal128(arr, _) => {
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let v = arr.value(row);
-                    let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut I128State) };
-                    if !state.has_value || v < state.value {
-                        state.has_value = true;
-                        state.value = v;
-                    }
+        AggInputView::Utf8(Utf8ArrayView::Decimal128(arr, _)) => {
+            for (row, &base) in state_ptrs.iter().enumerate() {
+                if arr.is_null(row) {
+                    continue;
                 }
-                Ok(())
+                let v = arr.value(row);
+                let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut I128State) };
+                if !state.has_value || v < state.value {
+                    state.has_value = true;
+                    state.value = v;
+                }
             }
-            _ => Err("min decimal input type mismatch".to_string()),
-        },
+            Ok(())
+        }
+        AggInputView::Utf8(_) => Err("min decimal input type mismatch".to_string()),
         _ => Err("min decimal input type mismatch".to_string()),
     }
 }

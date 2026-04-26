@@ -337,10 +337,10 @@ pub(crate) fn execute_lookup_request(
 
         let scan =
             FileScanContext::build(vec![scan_range.clone()], None, scan_cfg.oss_config.as_ref())?;
-        let mut iter = build_format_iter(scan, format, None, None, None)?;
+        let iter = build_format_iter(scan, format, None, None, None)?;
 
         let mut row_offset = 0i64;
-        while let Some(next) = iter.next() {
+        for next in iter {
             let chunk = next?;
             let row_count = chunk.len();
             if row_count == 0 {
@@ -397,7 +397,7 @@ pub(crate) fn execute_lookup_request(
         }
         response_indices[*req_pos] = resp_idx as u32;
     }
-    if response_indices.iter().any(|v| *v == u32::MAX) {
+    if response_indices.contains(&u32::MAX) {
         return Err("lookup response missing positions".to_string());
     }
     let response_indices_array = UInt32Array::from(response_indices);
@@ -560,10 +560,10 @@ pub(crate) fn execute_lake_lookup_request(
             index: range_idx,
             tablet_id: range.tablet_id,
         };
-        let mut iter = op.execute_iter(morsel, None, None)?;
+        let iter = op.execute_iter(morsel, None, None)?;
 
         let mut row_offset: i64 = 0;
-        while let Some(next) = iter.next() {
+        for next in iter {
             let chunk = next?;
             let row_count = chunk.len();
             if row_count == 0 {
@@ -624,7 +624,7 @@ pub(crate) fn execute_lake_lookup_request(
         }
         response_indices[*req_pos] = resp_idx as u32;
     }
-    if response_indices.iter().any(|v| *v == u32::MAX) {
+    if response_indices.contains(&u32::MAX) {
         return Err("lake lookup response missing positions".to_string());
     }
     let response_indices_array = UInt32Array::from(response_indices);

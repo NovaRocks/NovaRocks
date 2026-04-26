@@ -296,7 +296,6 @@ impl RetryInterceptor for ObjectStoreRetryInterceptor {
         let backoff_ms = clamp_u128_to_u64(dur.as_millis());
         let mut summary: Option<(u64, u64, u64, u64)> = None;
         let mut emit_detail = false;
-        let total_retries;
         let key = RetryWarningKey {
             endpoint: self.endpoint.clone(),
             bucket: self.bucket.clone(),
@@ -325,7 +324,7 @@ impl RetryInterceptor for ObjectStoreRetryInterceptor {
         window.retries_in_window = window.retries_in_window.saturating_add(1);
         window.backoff_ms_in_window = window.backoff_ms_in_window.saturating_add(backoff_ms);
         window.total_retries = window.total_retries.saturating_add(1);
-        total_retries = window.total_retries;
+        let total_retries = window.total_retries;
         if window.emitted_in_window < control.first_n {
             window.emitted_in_window += 1;
             emit_detail = true;
@@ -557,10 +556,10 @@ fn endpoint_host(endpoint: &str) -> String {
     if let Some((authority, _)) = view.split_once('/') {
         view = authority;
     }
-    if let Some(rest) = view.strip_prefix('[') {
-        if let Some((host, _)) = rest.split_once(']') {
-            return host.to_ascii_lowercase();
-        }
+    if let Some(rest) = view.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host.to_ascii_lowercase();
     }
     view.split(':').next().unwrap_or(view).to_ascii_lowercase()
 }
@@ -652,7 +651,7 @@ pub fn resolve_oss_operator_and_path_with_config(
     full_path: &str,
     cfg: &ObjectStoreConfig,
 ) -> Result<(Operator, String), String> {
-    let op = build_oss_operator(&cfg).map_err(|e| e.to_string())?;
+    let op = build_oss_operator(cfg).map_err(|e| e.to_string())?;
     let rel = normalize_oss_path(full_path, &cfg.bucket, &cfg.root)?;
     Ok((op, rel))
 }

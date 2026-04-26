@@ -172,14 +172,14 @@ fn eval_nullif_generic(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, St
         ArrayFormatter::try_new(right.as_ref(), &fmt_opts).map_err(|e| format!("nullif: {e}"))?;
 
     let mut valid = vec![true; len];
-    for i in 0..len {
+    for (i, valid) in valid.iter_mut().enumerate().take(len) {
         if left.is_null(i) {
-            valid[i] = false;
+            *valid = false;
         } else if !right.is_null(i) {
             let l_str = left_fmt.value(i).to_string();
             let r_str = right_fmt.value(i).to_string();
             if l_str == r_str {
-                valid[i] = false;
+                *valid = false;
             }
         }
     }

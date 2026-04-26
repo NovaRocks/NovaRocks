@@ -77,7 +77,7 @@ pub(crate) fn logical_plan_to_memo(plan: &LogicalPlan, memo: &mut Memo) -> Group
             let left = logical_plan_to_memo(&node.left, memo);
             let right = logical_plan_to_memo(&node.right, memo);
             let op = Operator::LogicalJoin(LogicalJoinOp {
-                join_type: node.join_type.clone(),
+                join_type: node.join_type,
                 condition: node.condition.clone(),
             });
             let expr = MExpr {

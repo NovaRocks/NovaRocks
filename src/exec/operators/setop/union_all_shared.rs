@@ -85,8 +85,7 @@ impl UnionAllSharedState {
 
     pub(crate) fn pop_chunk(&self) -> Option<Chunk> {
         let mut guard = self.inner.lock().expect("union all state lock");
-        let chunk = guard.buffer.pop_front();
-        chunk
+        guard.buffer.pop_front()
     }
 
     pub(crate) fn has_buffered(&self) -> bool {

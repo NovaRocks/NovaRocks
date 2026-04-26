@@ -170,14 +170,13 @@ pub fn eval_array_top_n(
         }
         insertion_sort_indices_desc(&values, &mut non_null_indices)?;
 
-        let mut picked = 0_i64;
-        for idx in non_null_indices.into_iter().chain(null_indices.into_iter()) {
-            if picked >= n {
-                break;
-            }
+        for idx in non_null_indices
+            .into_iter()
+            .chain(null_indices.into_iter())
+            .take(n as usize)
+        {
             mutable.extend(0, idx, idx + 1);
             current += 1;
-            picked += 1;
         }
 
         if current > i32::MAX as i64 {

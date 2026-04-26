@@ -349,10 +349,10 @@ fn push_down_local_runtime_filters_inner(
                 let mut next = spec.clone();
                 next.expr_id = new_expr_id;
                 let expr_slots = expr_slot_ids(arena, new_expr_id);
-                if expr_slots.len() == 1 {
-                    if let Some(slot) = expr_slots.iter().next() {
-                        next.slot_id = *slot;
-                    }
+                if expr_slots.len() == 1
+                    && let Some(slot) = expr_slots.iter().next()
+                {
+                    next.slot_id = *slot;
                 }
                 rewritten.push(next);
             }
@@ -462,16 +462,15 @@ fn push_down_local_runtime_filters_inner(
             if matches!(
                 *join_type,
                 JoinType::Inner | JoinType::LeftSemi | JoinType::RightSemi
-            ) {
-                if !runtime_filters.is_empty() {
-                    for rf in runtime_filters {
-                        if let Some(expr_id) = probe_exprs.get(rf.expr_order) {
-                            probe_filters.push(RuntimeFilterPushSpec {
-                                filter_id: rf.filter_id,
-                                expr_id: *expr_id,
-                                slot_id: rf.probe_slot_id,
-                            });
-                        }
+            ) && !runtime_filters.is_empty()
+            {
+                for rf in runtime_filters {
+                    if let Some(expr_id) = probe_exprs.get(rf.expr_order) {
+                        probe_filters.push(RuntimeFilterPushSpec {
+                            filter_id: rf.filter_id,
+                            expr_id: *expr_id,
+                            slot_id: rf.probe_slot_id,
+                        });
                     }
                 }
             }

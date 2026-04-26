@@ -25,19 +25,10 @@ use super::common::{AggScalarValue, build_scalar_array, scalar_from_array};
 
 pub(super) struct AnyValueAgg;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct AnyValueState {
     has_value: bool,
     value: Option<AggScalarValue>,
-}
-
-impl Default for AnyValueState {
-    fn default() -> Self {
-        Self {
-            has_value: false,
-            value: None,
-        }
-    }
 }
 
 impl AggregateFunction for AnyValueAgg {

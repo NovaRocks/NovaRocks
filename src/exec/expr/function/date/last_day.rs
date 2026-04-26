@@ -84,12 +84,12 @@ pub fn eval_last_day(
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "last_day expects string".to_string())?;
 
-    for i in 0..dates.len() {
+    for (i, date) in dates.iter().copied().enumerate() {
         if unit_arr.is_null(i) {
             out.push(None);
             continue;
         }
-        let Some(date) = dates[i] else {
+        let Some(date) = date else {
             out.push(None);
             continue;
         };

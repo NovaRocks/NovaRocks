@@ -42,7 +42,7 @@ pub(super) fn avg_decimal_sum_info(
         return Err("avg decimal intermediate expects 2 fields".to_string());
     }
     let sum_field = fields
-        .get(0)
+        .first()
         .ok_or_else(|| "avg decimal intermediate missing sum field".to_string())?;
     let count_field = fields
         .get(1)

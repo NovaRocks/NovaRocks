@@ -10,6 +10,8 @@ use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
 use super::scope::AnalyzerScope;
 
+type WindowSpecAnalysis = (Vec<TypedExpr>, Vec<SortItem>, Option<WindowFrame>);
+
 impl<'a> super::AnalyzerContext<'a> {
     /// Analyze a single expression and produce a TypedExpr.
     pub(super) fn analyze_expr(
@@ -377,7 +379,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     let days = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
                         .map_err(|e| format!("invalid date literal '{date_str}': {e}"))?
                         .signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
-                        .num_days() as i64;
+                        .num_days();
                     return Ok(TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(days)),
                         data_type: DataType::Date32,
@@ -1196,7 +1198,7 @@ impl<'a> super::AnalyzerContext<'a> {
         }
 
         // IF(cond, then, else): cast first arg to Boolean if needed
-        if name == "if" && args_typed.len() >= 1 && args_typed[0].data_type != DataType::Boolean {
+        if name == "if" && !args_typed.is_empty() && args_typed[0].data_type != DataType::Boolean {
             let inner = std::mem::replace(
                 &mut args_typed[0],
                 TypedExpr {
@@ -1295,15 +1297,13 @@ impl<'a> super::AnalyzerContext<'a> {
             let mut return_type = infer_scalar_return_type(&name, &arg_types);
             // For round/truncate with decimal input and constant 2nd arg,
             // use the target decimal places as the output scale.
-            if matches!(name.as_str(), "round" | "truncate") {
-                if let DataType::Decimal128(p, s) = &return_type {
-                    if args_typed.len() >= 2 {
-                        if let ExprKind::Literal(LiteralValue::Int(d)) = &args_typed[1].kind {
-                            let target = (*d as i8).max(0).min(*s);
-                            return_type = DataType::Decimal128(*p, target);
-                        }
-                    }
-                }
+            if matches!(name.as_str(), "round" | "truncate")
+                && let DataType::Decimal128(p, s) = &return_type
+                && args_typed.len() >= 2
+                && let ExprKind::Literal(LiteralValue::Int(d)) = &args_typed[1].kind
+            {
+                let target = (*d as i8).max(0).min(*s);
+                return_type = DataType::Decimal128(*p, target);
             }
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
@@ -1566,7 +1566,7 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         over: &sqlast::WindowType,
         scope: &AnalyzerScope,
-    ) -> Result<(Vec<TypedExpr>, Vec<SortItem>, Option<WindowFrame>), String> {
+    ) -> Result<WindowSpecAnalysis, String> {
         let spec = match over {
             sqlast::WindowType::WindowSpec(spec) => spec,
             sqlast::WindowType::NamedWindow(_) => {
@@ -1895,7 +1895,7 @@ fn infer_decimal_precision_scale(s: &str) -> (u8, i8) {
     let scale = frac_part.len();
     let precision = int_digits + scale;
     // Clamp to Decimal128 limits
-    let precision = precision.max(1).min(38) as u8;
+    let precision = precision.clamp(1, 38) as u8;
     let scale = scale.min(38) as i8;
     (precision, scale)
 }

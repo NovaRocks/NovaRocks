@@ -64,13 +64,14 @@ fn eval_locate_impl(
             needle_arr.len()
         ));
     }
-    if let Some(start) = &start_arr {
-        if start.len() != 1 && start.len() != rows {
-            return Err(format!(
-                "{fn_name} start position length mismatch: {} vs {rows}",
-                start.len()
-            ));
-        }
+    if let Some(start) = &start_arr
+        && start.len() != 1
+        && start.len() != rows
+    {
+        return Err(format!(
+            "{fn_name} start position length mismatch: {} vs {rows}",
+            start.len()
+        ));
     }
 
     let mut out: Vec<Option<i32>> = Vec::with_capacity(rows);

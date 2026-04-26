@@ -49,7 +49,7 @@ pub fn eval_null_or_empty(
             if list_arr.is_null(i) {
                 out.push(Some(true));
             } else {
-                out.push(Some(list_arr.value(i).len() == 0));
+                out.push(Some(list_arr.value(i).is_empty()));
             }
         }
         return Ok(Arc::new(BooleanArray::from(out)) as ArrayRef);

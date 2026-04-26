@@ -217,7 +217,7 @@ fn format_grouped_integer(v: u128) -> String {
     let digits = v.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (idx, ch) in digits.chars().enumerate() {
-        if idx > 0 && (digits.len() - idx) % 3 == 0 {
+        if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);

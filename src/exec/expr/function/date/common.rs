@@ -154,9 +154,7 @@ fn parse_datetime_flexible(raw: &str) -> Option<NaiveDateTime> {
         microsecond = microsecond.checked_mul(10u32.pow((6 - lengths[6]) as u32))?;
     }
 
-    if !is_compact && lengths[0] == 2 {
-        year = if year < 70 { year + 2000 } else { year + 1900 };
-    } else if is_compact && lengths[0] == 2 {
+    if lengths[0] == 2 {
         year = if year < 70 { year + 2000 } else { year + 1900 };
     }
 

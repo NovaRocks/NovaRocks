@@ -824,7 +824,7 @@ impl Default for ObjectStorageConfig {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct PathRewriteConfig {
     #[serde(default)]
     pub enable: bool,
@@ -832,16 +832,6 @@ pub struct PathRewriteConfig {
     pub from_prefix: String,
     #[serde(default)]
     pub to_prefix: String,
-}
-
-impl Default for PathRewriteConfig {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            from_prefix: String::new(),
-            to_prefix: String::new(),
-        }
-    }
 }
 
 impl RuntimeConfig {
@@ -985,7 +975,7 @@ fn default_datacache_disk_size() -> u64 {
 }
 
 fn default_datacache_block_size() -> u64 {
-    1 * 1024 * 1024
+    1024 * 1024
 }
 
 fn default_datacache_checksum_enable() -> bool {
@@ -1400,8 +1390,10 @@ data_runtime_max_blocking_threads = 99
 
     #[test]
     fn test_actual_data_runtime_threads_behavior() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.data_runtime_worker_threads = 0;
+        let mut runtime = RuntimeConfig {
+            data_runtime_worker_threads: 0,
+            ..Default::default()
+        };
         let expected = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
@@ -1435,8 +1427,10 @@ internal_service_query_rpc_thread_num = 7
 
     #[test]
     fn test_actual_internal_service_query_rpc_threads_behavior() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.internal_service_query_rpc_thread_num = 0;
+        let mut runtime = RuntimeConfig {
+            internal_service_query_rpc_thread_num: 0,
+            ..Default::default()
+        };
         let expected = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);

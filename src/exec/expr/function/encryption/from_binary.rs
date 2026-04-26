@@ -95,14 +95,14 @@ pub fn eval_from_binary(
     }
 
     let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
+    for (row, format) in formats.iter().enumerate().take(chunk.len()) {
         if input.is_null(row) {
             out.push(None);
             continue;
         }
 
         let bytes = input.bytes(row);
-        let value = match formats[row].expect("non-null input row must have a parsed format") {
+        let value = match format.expect("non-null input row must have a parsed format") {
             super::common::BinaryFormatType::Hex => Some(hex::encode_upper(bytes)),
             super::common::BinaryFormatType::Encode64 => {
                 if bytes.is_empty() {

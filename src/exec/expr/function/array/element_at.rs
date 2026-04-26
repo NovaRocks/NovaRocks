@@ -59,14 +59,15 @@ pub fn eval_element_at(
             subscript_arr.len()
         ));
     }
-    if let Some(flags) = check_arr {
-        if flags.len() != 1 && flags.len() != list.len() {
-            return Err(format!(
-                "element_at check flag length mismatch: list rows={}, check rows={}",
-                list.len(),
-                flags.len()
-            ));
-        }
+    if let Some(flags) = check_arr
+        && flags.len() != 1
+        && flags.len() != list.len()
+    {
+        return Err(format!(
+            "element_at check flag length mismatch: list rows={}, check rows={}",
+            list.len(),
+            flags.len()
+        ));
     }
 
     let offsets = list.value_offsets();

@@ -251,8 +251,8 @@ impl WindowFunnelState {
                             max_level = curr_level;
                         }
                         eliminate_last_event_chains(&mut curr_level, &mut events_timestamp);
-                    } else if events_timestamp[(event_idx - 1) as usize].start_timestamp >= 0 {
-                        if promote_to_next_level(
+                    } else if events_timestamp[(event_idx - 1) as usize].start_timestamp >= 0
+                        && promote_to_next_level(
                             &mut events_timestamp,
                             *timestamp,
                             event_idx,
@@ -260,9 +260,9 @@ impl WindowFunnelState {
                             window_size,
                             increase,
                             events_size,
-                        ) {
-                            return events_size as i32;
-                        }
+                        )
+                    {
+                        return events_size as i32;
                     }
                 }
             }
@@ -288,8 +288,8 @@ impl WindowFunnelState {
                             }
                             eliminate_last_event_chains(&mut curr_level, &mut events_timestamp);
                         }
-                    } else if events_timestamp[(event_idx - 1) as usize].start_timestamp >= 0 {
-                        if promote_to_next_level(
+                    } else if events_timestamp[(event_idx - 1) as usize].start_timestamp >= 0
+                        && promote_to_next_level(
                             &mut events_timestamp,
                             *timestamp,
                             event_idx,
@@ -297,9 +297,9 @@ impl WindowFunnelState {
                             window_size,
                             increase,
                             events_size,
-                        ) {
-                            return events_size as i32;
-                        }
+                        )
+                    {
+                        return events_size as i32;
                     }
                 }
             }
@@ -330,8 +330,8 @@ impl WindowFunnelState {
                             }
                             eliminate_last_event_chains(&mut curr_level, &mut events_timestamp);
                         }
-                    } else if events_timestamp[(event_idx - 1) as usize].start_timestamp >= 0 {
-                        if promote_to_next_level(
+                    } else if events_timestamp[(event_idx - 1) as usize].start_timestamp >= 0
+                        && promote_to_next_level(
                             &mut events_timestamp,
                             *timestamp,
                             event_idx,
@@ -339,9 +339,9 @@ impl WindowFunnelState {
                             window_size,
                             increase,
                             events_size,
-                        ) {
-                            return events_size as i32;
-                        }
+                        )
+                    {
+                        return events_size as i32;
                     }
                 }
             }
@@ -654,12 +654,11 @@ fn merge_from_list(
             continue;
         }
 
-        if let (Some(window_view), Some(mode_view)) = (window_view, mode_view) {
-            if let Some(window_size) = window_view.value_at(row) {
-                if let Some(mode) = mode_view.value_at(row) {
-                    state.ensure_params(window_size, mode as i32)?;
-                }
-            }
+        if let (Some(window_view), Some(mode_view)) = (window_view, mode_view)
+            && let Some(window_size) = window_view.value_at(row)
+            && let Some(mode) = mode_view.value_at(row)
+        {
+            state.ensure_params(window_size, mode as i32)?;
         } else if state.window_size.is_none() || state.mode.is_none() {
             return Err("window_funnel merge missing window_size/mode".to_string());
         }

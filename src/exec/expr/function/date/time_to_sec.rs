@@ -144,18 +144,12 @@ pub fn parse_from_cast_source(
 ) -> Result<Option<Vec<Option<i64>>>, String> {
     let mut current = arg_expr;
     let mut seen_cast = false;
-    loop {
-        match arena.node(current) {
-            Some(
-                ExprNode::Cast(child)
-                | ExprNode::CastTime(child)
-                | ExprNode::CastTimeFromDatetime(child),
-            ) => {
-                current = *child;
-                seen_cast = true;
-            }
-            _ => break,
-        }
+    while let Some(
+        ExprNode::Cast(child) | ExprNode::CastTime(child) | ExprNode::CastTimeFromDatetime(child),
+    ) = arena.node(current)
+    {
+        current = *child;
+        seen_cast = true;
     }
     if !seen_cast {
         return Ok(None);
@@ -203,12 +197,12 @@ pub fn eval_time_to_sec(
         return Ok(Arc::new(Int64Array::from(out)) as ArrayRef);
     }
 
-    if out.iter().any(Option::is_none) {
-        if let Some(source_out) = parse_from_cast_source(arena, arg_expr, chunk)? {
-            for (idx, value) in out.iter_mut().enumerate() {
-                if value.is_none() && idx < source_out.len() {
-                    *value = source_out[idx];
-                }
+    if out.iter().any(Option::is_none)
+        && let Some(source_out) = parse_from_cast_source(arena, arg_expr, chunk)?
+    {
+        for (idx, value) in out.iter_mut().enumerate() {
+            if value.is_none() && idx < source_out.len() {
+                *value = source_out[idx];
             }
         }
     }

@@ -628,7 +628,7 @@ impl ParquetScanIter {
                 .open_with_len(&path, len)
                 .map(|r| r.with_modification_time_override(range_modification_time))
                 .map_err(|e| e.to_string())?;
-            let open_file_ns = open_file_start.elapsed().as_nanos() as u128;
+            let open_file_ns = open_file_start.elapsed().as_nanos();
             let reader_init_start = std::time::Instant::now();
             let app_io_before_reader_init = self.profile.as_ref().map(read_app_io_time_ns);
             let record_reader_init = |profile: &RuntimeProfile, reader_init_wall_ns: u128| {
@@ -667,7 +667,7 @@ impl ParquetScanIter {
             let app_io_before_footer = self.profile.as_ref().map(read_app_io_time_ns);
             let footer_read_start = std::time::Instant::now();
             let builder = self.new_parquet_builder(&cached_reader)?;
-            let footer_read_ns = footer_read_start.elapsed().as_nanos() as u128;
+            let footer_read_ns = footer_read_start.elapsed().as_nanos();
             if let Some(profile) = self.profile.as_ref() {
                 let footer_read_ns = clamp_u128_to_i64(footer_read_ns);
                 let footer_io_ns = app_io_before_footer
@@ -799,7 +799,7 @@ impl ParquetScanIter {
 
                 if row_groups.is_empty() {
                     debug!("all row groups filtered out for file: {}", path);
-                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos();
                     if let Some(profile) = self.profile.as_ref() {
                         record_reader_init(profile, reader_init_ns);
                     }
@@ -817,7 +817,7 @@ impl ParquetScanIter {
             };
 
             if row_groups.is_empty() {
-                let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                let reader_init_ns = reader_init_start.elapsed().as_nanos();
                 if let Some(profile) = self.profile.as_ref() {
                     record_reader_init(profile, reader_init_ns);
                 }
@@ -860,11 +860,11 @@ impl ParquetScanIter {
                 &predicates,
             )? {
                 DelayedReaderDecision::Use(reader) => {
-                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos();
                     if let Some(profile) = self.profile.as_ref() {
                         record_reader_init(profile, reader_init_ns);
                     }
-                    let prep_ns = prep_start.elapsed().as_nanos() as u128;
+                    let prep_ns = prep_start.elapsed().as_nanos();
                     if let Some(profile) = self.profile.as_ref() {
                         profile.counter_add(
                             "PrepareChunkSourceTime",
@@ -876,7 +876,7 @@ impl ParquetScanIter {
                     return Ok(true);
                 }
                 DelayedReaderDecision::SkipRange => {
-                    let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+                    let reader_init_ns = reader_init_start.elapsed().as_nanos();
                     if let Some(profile) = self.profile.as_ref() {
                         record_reader_init(profile, reader_init_ns);
                     }
@@ -887,12 +887,12 @@ impl ParquetScanIter {
 
             let maybe_reader =
                 self.build_parquet_reader(builder, &metadata, &row_groups, &predicates)?;
-            let reader_init_ns = reader_init_start.elapsed().as_nanos() as u128;
+            let reader_init_ns = reader_init_start.elapsed().as_nanos();
             if let Some(profile) = self.profile.as_ref() {
                 record_reader_init(profile, reader_init_ns);
             }
             if let Some(reader) = maybe_reader {
-                let prep_ns = prep_start.elapsed().as_nanos() as u128;
+                let prep_ns = prep_start.elapsed().as_nanos();
                 if let Some(profile) = self.profile.as_ref() {
                     profile.counter_add(
                         "PrepareChunkSourceTime",
@@ -932,7 +932,7 @@ impl Iterator for ParquetScanIter {
                 }
                 ParquetRangeReader::Delayed(reader) => reader.next_batch(),
             };
-            let column_read_ns = column_read_start.elapsed().as_nanos() as u128;
+            let column_read_ns = column_read_start.elapsed().as_nanos();
             if let Some(profile) = self.profile.as_ref() {
                 let column_read_ns = clamp_u128_to_i64(column_read_ns);
                 let shared_io_ns = app_io_before_batch
@@ -1624,7 +1624,7 @@ fn align_batch_to_iceberg_schema(
         {
             let source_field = batch_schema.field(source_idx);
             let array = align_iceberg_array_to_field(
-                source_field.as_ref(),
+                source_field,
                 batch.column(source_idx).clone(),
                 target.as_ref(),
                 row_count,
@@ -1821,14 +1821,14 @@ fn convert_variant_columns(
                     builder.append_value(serialized.as_slice());
                 }
 
-                let mut meta = field.metadata().clone();
+                let meta = field.metadata().clone();
                 let new_field = Arc::new(
                     arrow::datatypes::Field::new(
                         field.name(),
                         DataType::LargeBinary,
                         field.is_nullable(),
                     )
-                    .with_metadata(meta.drain().collect()),
+                    .with_metadata(meta),
                 );
                 new_fields.push(new_field);
                 new_columns.push(Arc::new(builder.finish()) as ArrayRef);

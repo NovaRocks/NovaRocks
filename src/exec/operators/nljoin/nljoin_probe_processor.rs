@@ -46,6 +46,8 @@ use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
+type OuterPermutedBatch = (Option<RecordBatch>, Vec<u32>, Vec<u32>);
+
 /// Factory for nested-loop join probe operators that execute row-wise nested-loop matching.
 pub struct NlJoinProbeProcessorFactory {
     name: String,
@@ -826,7 +828,7 @@ impl NlJoinProbeProcessorOperator {
         probe_chunk: &Chunk,
         build_batch: &Chunk,
         chunk_size: usize,
-    ) -> Result<(Option<arrow::record_batch::RecordBatch>, Vec<u32>, Vec<u32>), String> {
+    ) -> Result<OuterPermutedBatch, String> {
         let probe_len = probe_chunk.len();
         let build_len = build_batch.len();
         if probe_len == 0 || build_len == 0 {
@@ -936,12 +938,11 @@ impl NlJoinProbeProcessorOperator {
                     .copied()
                     .ok_or_else(|| "nljoin build index out of bounds".to_string())?
                     as usize;
-                if let Some(flags) = self.build_matched.as_mut() {
-                    if let Some(batch_flags) = flags.get_mut(build_batch_idx) {
-                        if build_row < batch_flags.len() {
-                            batch_flags[build_row] = true;
-                        }
-                    }
+                if let Some(flags) = self.build_matched.as_mut()
+                    && let Some(batch_flags) = flags.get_mut(build_batch_idx)
+                    && build_row < batch_flags.len()
+                {
+                    batch_flags[build_row] = true;
                 }
             }
         }

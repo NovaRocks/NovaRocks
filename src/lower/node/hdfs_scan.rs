@@ -285,7 +285,7 @@ pub(crate) fn lower_hdfs_scan_node(
     };
     let tuple_id = hdfs
         .tuple_id
-        .or_else(|| node.row_tuples.get(0).copied())
+        .or_else(|| node.row_tuples.first().copied())
         .ok_or_else(|| "HDFS_SCAN_NODE missing tuple_id".to_string())?;
 
     debug!(
@@ -693,7 +693,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 ));
             }
         } else {
-            scan_format = Some(file_format.clone());
+            scan_format = Some(*file_format);
         }
         if is_paimon {
             if file_format != &descriptors::THdfsFileFormat::PARQUET
@@ -931,7 +931,7 @@ pub(crate) fn lower_hdfs_scan_node(
         batch_size: parquet_cfg.batch_size,
         datacache: parquet_cfg.datacache.clone(),
     };
-    let format = match scan_format.clone() {
+    let format = match scan_format {
         Some(descriptors::THdfsFileFormat::PARQUET) => Some(FileFormatConfig::Parquet(parquet_cfg)),
         Some(descriptors::THdfsFileFormat::ORC) => Some(FileFormatConfig::Orc(orc_cfg)),
         Some(other) => {

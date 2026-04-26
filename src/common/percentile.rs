@@ -358,17 +358,18 @@ impl TDigest {
             return Some(self.min + 2.0 * index / self.weight(0) * (self.mean(0) - self.min));
         }
 
-        if let Some(i) = self.cumulative.iter().position(|value| *value >= index) {
-            if i > 0 && i < self.cumulative.len() - 1 {
-                let z1 = index - self.cumulative[i - 1];
-                let z2 = self.cumulative[i] - index;
-                return Some(Self::weighted_average(
-                    self.mean(i - 1),
-                    z2,
-                    self.mean(i),
-                    z1,
-                ));
-            }
+        if let Some(i) = self.cumulative.iter().position(|value| *value >= index)
+            && i > 0
+            && i < self.cumulative.len() - 1
+        {
+            let z1 = index - self.cumulative[i - 1];
+            let z2 = self.cumulative[i] - index;
+            return Some(Self::weighted_average(
+                self.mean(i - 1),
+                z2,
+                self.mean(i),
+                z1,
+            ));
         }
 
         let z1 = index - self.processed_weight - self.weight(n - 1) / 2.0;
@@ -585,9 +586,8 @@ pub fn encode_state(state: &PercentileState) -> Vec<u8> {
     } else {
         state.digest.serialize_binary()
     };
-    let mut out = Vec::with_capacity(
-        HEADER_LEN + quantiles.len() * std::mem::size_of::<f64>() + digest_payload.len(),
-    );
+    let mut out =
+        Vec::with_capacity(HEADER_LEN + std::mem::size_of_val(quantiles) + digest_payload.len());
     out.push(PERCENTILE_STATE_MAGIC);
     out.push(PERCENTILE_STATE_VERSION);
     out.push(quantile_kind);

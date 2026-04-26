@@ -207,9 +207,9 @@ impl NamedJsonOutputProtocol {
                 for (k, v) in entries {
                     arr.push(serde_json::Value::Array(vec![k, v]));
                 }
-                if pending_key.is_some() {
+                if let Some(pending_key) = pending_key {
                     arr.push(serde_json::Value::Array(vec![
-                        pending_key.unwrap(),
+                        pending_key,
                         serde_json::Value::Null,
                     ]));
                 }

@@ -119,10 +119,17 @@ impl BlockCache {
         if options.io_align_unit_size == 0 {
             return Err("block cache io_align_unit_size must be > 0".to_string());
         }
-        if options.enable_checksum && options.block_size % options.slice_size != 0 {
+        if options.slice_size == 0 {
+            return Err("block cache slice_size must be > 0".to_string());
+        }
+        if options.enable_checksum && !options.block_size.is_multiple_of(options.slice_size) {
             return Err("block cache block_size must align to slice_size".to_string());
         }
-        if options.direct_io && options.block_size % options.io_align_unit_size != 0 {
+        if options.direct_io
+            && !options
+                .block_size
+                .is_multiple_of(options.io_align_unit_size)
+        {
             return Err("block cache block_size must align to io_align_unit_size".to_string());
         }
 
@@ -200,14 +207,13 @@ impl BlockCache {
             .read_block(block_id, 0, size)
         {
             Ok(data) => {
-                if self.enable_checksum {
-                    if let Some(expected) = checksums {
-                        if !verify_checksums(&data, data_len, self.slice_size as usize, &expected) {
-                            let mut inner = self.inner.lock().expect("block cache lock");
-                            inner.remove_entry(&block_key);
-                            return None;
-                        }
-                    }
+                if self.enable_checksum
+                    && let Some(expected) = checksums
+                    && !verify_checksums(&data, data_len, self.slice_size as usize, &expected)
+                {
+                    let mut inner = self.inner.lock().expect("block cache lock");
+                    inner.remove_entry(&block_key);
+                    return None;
                 }
                 Some(data)
             }
@@ -321,7 +327,6 @@ impl BlockCacheInner {
         loop {
             let key = self
                 .head
-                .clone()
                 .ok_or_else(|| "block cache is full and cannot evict".to_string())?;
             self.remove_entry(&key);
             if let Some(block_id) = self.disk.alloc_block() {
@@ -369,7 +374,7 @@ impl BlockCacheInner {
     }
 
     fn attach_tail(&mut self, key: &BlockKey) {
-        let tail = self.tail.clone();
+        let tail = self.tail;
         if let Some(entry) = self.entries.get_mut(key) {
             entry.prev = tail;
             entry.next = None;
@@ -974,15 +979,14 @@ fn compute_checksums(data: &Bytes, slice_size: usize, block_size: usize) -> Vec<
 }
 
 fn verify_checksums(data: &Bytes, data_len: usize, slice_size: usize, expected: &[u32]) -> bool {
-    let slice_count = expected.len();
-    for i in 0..slice_count {
+    for (i, expected_crc) in expected.iter().enumerate() {
         let start = i * slice_size;
         if start >= data_len {
             break;
         }
         let end = std::cmp::min(start + slice_size, data_len);
         let actual = crc32c(&data[start..end]);
-        if actual != expected[i] {
+        if actual != *expected_crc {
             return false;
         }
     }
@@ -993,17 +997,17 @@ fn round_up(value: usize, factor: usize) -> usize {
     if factor == 0 {
         return value;
     }
-    (value + (factor - 1)) / factor * factor
+    value.div_ceil(factor) * factor
 }
 
 fn direct_io_supported() -> bool {
     #[cfg(target_os = "linux")]
     {
-        return true;
+        true
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return false;
+        false
     }
 }
 

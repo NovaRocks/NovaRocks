@@ -85,21 +85,19 @@ pub(crate) fn lower_analytic_node(
         .transpose()?;
 
     // Validate RANGE window constraints aligned with StarRocks BE.
-    if let Some(w) = window.as_ref() {
-        if matches!(w.window_type, WindowType::Range) {
-            if w.start.is_some() {
-                return Err("RANGE window must have UNBOUNDED PRECEDING start".to_string());
-            }
-            if let Some(end) = w.end.as_ref() {
-                if !matches!(end, WindowBoundary::CurrentRow) {
-                    return Err(
-                        "RANGE window end must be CURRENT ROW or UNBOUNDED FOLLOWING".to_string(),
-                    );
-                }
-            }
-            if order_by_exprs.is_empty() {
-                return Err("RANGE window requires non-empty order_by_exprs".to_string());
-            }
+    if let Some(w) = window.as_ref()
+        && matches!(w.window_type, WindowType::Range)
+    {
+        if w.start.is_some() {
+            return Err("RANGE window must have UNBOUNDED PRECEDING start".to_string());
+        }
+        if let Some(end) = w.end.as_ref()
+            && !matches!(end, WindowBoundary::CurrentRow)
+        {
+            return Err("RANGE window end must be CURRENT ROW or UNBOUNDED FOLLOWING".to_string());
+        }
+        if order_by_exprs.is_empty() {
+            return Err("RANGE window requires non-empty order_by_exprs".to_string());
         }
     }
 
@@ -233,7 +231,7 @@ fn lower_window_function(
 ) -> Result<WindowFunctionSpec, String> {
     let root = e
         .nodes
-        .get(0)
+        .first()
         .ok_or_else(|| "empty analytic function expr".to_string())?;
     let fn_ = root
         .fn_

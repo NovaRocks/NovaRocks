@@ -1505,9 +1505,8 @@ fn parse_time_literal_to_micros(value: &str) -> Result<i64, String> {
     let time = NaiveTime::parse_from_str(value, "%H:%M:%S%.f")
         .or_else(|_| NaiveTime::parse_from_str(value, "%H:%M:%S"))
         .map_err(|e| format!("parse TIME literal `{value}` failed: {e}"))?;
-    i64::try_from(time.num_seconds_from_midnight())
-        .map(|seconds| seconds * 1_000_000 + i64::from(time.nanosecond() / 1_000))
-        .map_err(|_| format!("TIME literal `{value}` is out of range"))
+    Ok(i64::from(time.num_seconds_from_midnight()) * 1_000_000
+        + i64::from(time.nanosecond() / 1_000))
 }
 
 fn build_logical_type_properties(
@@ -1729,10 +1728,8 @@ fn parse_decimal_literal_to_i128(value: &str, scale: i8) -> Result<i128, String>
             .parse::<i128>()
             .map_err(|_| format!("DECIMAL literal `{value}` is out of range"))?
     };
-    if negative {
-        if parsed != i128::MIN {
-            parsed = -parsed;
-        }
+    if negative && parsed != i128::MIN {
+        parsed = -parsed;
     }
     Ok(parsed)
 }

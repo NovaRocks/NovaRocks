@@ -169,14 +169,13 @@ mod tests {
 
     #[test]
     fn classify_scan_paths_accepts_file_uri_as_local() {
-        let scheme = classify_scan_paths(["file:/tmp/a.parquet"].into_iter())
-            .expect("classify file URI path");
+        let scheme = classify_scan_paths(["file:/tmp/a.parquet"]).expect("classify file URI path");
         assert_eq!(scheme, ScanPathScheme::Local);
     }
 
     #[test]
     fn classify_scan_paths_accepts_hdfs_uri() {
-        let scheme = classify_scan_paths(["hdfs://nn-1:9000/user/hive/a.parquet"].into_iter())
+        let scheme = classify_scan_paths(["hdfs://nn-1:9000/user/hive/a.parquet"])
             .expect("classify hdfs URI path");
         assert_eq!(scheme, ScanPathScheme::Hdfs);
     }

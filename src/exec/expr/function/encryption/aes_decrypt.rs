@@ -58,10 +58,10 @@ fn decrypt_with_utf8_fallback(
     } else {
         latin1.as_deref()
     };
-    if let Some(fallback) = fallback {
-        if fallback != primary {
-            result = super::common::aes_decrypt_raw(mode, fallback, key, iv, aad);
-        }
+    if let Some(fallback) = fallback
+        && fallback != primary
+    {
+        result = super::common::aes_decrypt_raw(mode, fallback, key, iv, aad);
     }
 
     result

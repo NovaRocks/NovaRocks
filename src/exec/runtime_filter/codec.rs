@@ -44,6 +44,8 @@ const RF_TYPE_BLOOM_FILTER: u8 = 2;
 const RF_TYPE_BITSET_FILTER: u8 = 3;
 const RF_TYPE_IN_FILTER: u8 = 4;
 
+type RuntimeInFilterWriter<'a> = Box<dyn FnMut(&mut Vec<u8>) + 'a>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Wire-level runtime filter type tags used by StarRocks compatibility codec.
 pub(crate) enum StarrocksRuntimeFilterType {
@@ -199,7 +201,7 @@ pub(crate) fn decode_starrocks_in_filter(
 /// Encode a runtime IN filter into StarRocks-compatible wire payload.
 pub(crate) fn encode_starrocks_in_filter(filter: &RuntimeInFilter) -> Result<Vec<u8>, String> {
     use crate::types;
-    let (t, count, mut write_values): (types::TPrimitiveType, usize, Box<dyn FnMut(&mut Vec<u8>)>) =
+    let (t, count, mut write_values): (types::TPrimitiveType, usize, RuntimeInFilterWriter<'_>) =
         match filter.values() {
             RuntimeInFilterValues::Bool(values) => {
                 let mut iter = values.iter().copied();

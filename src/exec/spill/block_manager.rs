@@ -62,7 +62,7 @@ impl BlockHeader {
         if buf.len() < BLOCK_HEADER_LEN as usize {
             return Err("spill block header is too small".to_string());
         }
-        if &buf[..4] != BLOCK_MAGIC {
+        if buf[..4] != BLOCK_MAGIC {
             return Err("spill block header magic mismatch".to_string());
         }
         let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
@@ -177,7 +177,10 @@ pub fn read_block_index<R: Read + Seek>(
     if header.index_length == 0 {
         return Ok(Vec::new());
     }
-    if header.index_length % MESSAGE_INDEX_ENTRY_LEN as u64 != 0 {
+    if !header
+        .index_length
+        .is_multiple_of(MESSAGE_INDEX_ENTRY_LEN as u64)
+    {
         return Err("spill block index length is not aligned".to_string());
     }
     reader

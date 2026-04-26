@@ -257,7 +257,7 @@ pub fn eval_array_sum(
             if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH =>
         {
             let values = crate::common::largeint::as_fixed_size_binary_array(
-                &values,
+                values,
                 "array_sum LARGEINT values",
             )?;
             let sums = sum_i128_rows(list, values, chunk.len(), |a, idx| {

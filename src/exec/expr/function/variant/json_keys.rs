@@ -60,19 +60,17 @@ pub fn eval_json_keys(
     }
 
     let mut out = Arc::new(builder.finish()) as ArrayRef;
-    if let Some(target_type) = arena.data_type(expr) {
-        if out.data_type() != target_type {
-            out = crate::exec::expr::cast::cast_with_special_rules(&out, target_type).map_err(
-                |e| {
-                    format!(
-                        "json_keys failed to cast output {:?} -> {:?}: {}",
-                        out.data_type(),
-                        target_type,
-                        e
-                    )
-                },
-            )?;
-        }
+    if let Some(target_type) = arena.data_type(expr)
+        && out.data_type() != target_type
+    {
+        out = crate::exec::expr::cast::cast_with_special_rules(&out, target_type).map_err(|e| {
+            format!(
+                "json_keys failed to cast output {:?} -> {:?}: {}",
+                out.data_type(),
+                target_type,
+                e
+            )
+        })?;
     }
     Ok(out)
 }

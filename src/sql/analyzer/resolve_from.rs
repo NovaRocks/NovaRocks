@@ -162,10 +162,10 @@ impl<'a> super::AnalyzerContext<'a> {
                 let qualifier = alias_name.as_deref().unwrap_or(&table_def.name);
                 scope.add_table(Some(qualifier), &table_def.columns);
                 // If alias differs from table name, also register with table name
-                if let Some(ref a) = alias_name {
-                    if !a.eq_ignore_ascii_case(&table_def.name) {
-                        scope.add_table_qualified_only(&table_def.name, &table_def.columns);
-                    }
+                if let Some(ref a) = alias_name
+                    && !a.eq_ignore_ascii_case(&table_def.name)
+                {
+                    scope.add_table_qualified_only(&table_def.name, &table_def.columns);
                 }
 
                 let relation = Relation::Scan(ScanRelation {

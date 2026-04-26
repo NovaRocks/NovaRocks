@@ -257,28 +257,26 @@ impl JoinHashTable {
         match self.key_table.key_strategy() {
             GroupKeyStrategy::OneNumber => {
                 let view = key_views
-                    .get(0)
+                    .first()
                     .ok_or_else(|| "join one number key view missing".to_string())?;
                 let hashes = self.key_table.build_one_number_hashes(view, num_rows)?;
-                for row in 0..num_rows {
+                for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                     if row_has_forbidden_null(&key_views, row, &self.null_safe_eq) {
                         continue;
                     }
-                    let lookup =
-                        self.key_table
-                            .find_or_insert_one_number(view, row, hashes[row])?;
+                    let lookup = self.key_table.find_or_insert_one_number(view, row, hash)?;
                     self.handle_lookup(lookup, base_row_id + row as u32)?;
                 }
             }
             GroupKeyStrategy::OneString => {
                 let view = key_views
-                    .get(0)
+                    .first()
                     .ok_or_else(|| "join one string key view missing".to_string())?;
                 let GroupKeyArrayView::Utf8(arr) = view else {
                     return Err("join one string key expects Utf8 view".to_string());
                 };
                 let hashes = self.key_table.build_group_hashes(&key_views, num_rows)?;
-                for row in 0..num_rows {
+                for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                     if row_has_forbidden_null(&key_views, row, &self.null_safe_eq) {
                         continue;
                     }
@@ -287,21 +285,21 @@ impl JoinHashTable {
                     } else {
                         Some(arr.value(row))
                     };
-                    let lookup =
-                        self.key_table
-                            .find_or_insert_one_string(view, row, key, hashes[row])?;
+                    let lookup = self
+                        .key_table
+                        .find_or_insert_one_string(view, row, key, hash)?;
                     self.handle_lookup(lookup, base_row_id + row as u32)?;
                 }
             }
             GroupKeyStrategy::FixedSize => {
                 let hashes = self.key_table.build_group_hashes(&key_views, num_rows)?;
-                for row in 0..num_rows {
+                for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                     if row_has_forbidden_null(&key_views, row, &self.null_safe_eq) {
                         continue;
                     }
-                    let lookup =
-                        self.key_table
-                            .find_or_insert_fixed_size(&key_views, row, hashes[row])?;
+                    let lookup = self
+                        .key_table
+                        .find_or_insert_fixed_size(&key_views, row, hash)?;
                     self.handle_lookup(lookup, base_row_id + row as u32)?;
                 }
             }
@@ -311,25 +309,27 @@ impl JoinHashTable {
                     .build_compressed_flags(&key_views, num_rows)?;
                 let hashes = self.key_table.build_group_hashes(&key_views, num_rows)?;
                 let mut rows_opt = None;
-                for row in 0..num_rows {
+                for (row, (key, hash)) in keys
+                    .iter()
+                    .copied()
+                    .zip(hashes.iter().copied())
+                    .enumerate()
+                    .take(num_rows)
+                {
                     if row_has_forbidden_null(&key_views, row, &self.null_safe_eq) {
                         continue;
                     }
-                    let lookup = if keys[row] {
+                    let lookup = if key {
                         self.key_table
-                            .find_or_insert_compressed(&key_views, row, hashes[row])?
+                            .find_or_insert_compressed(&key_views, row, hash)?
                     } else {
                         if rows_opt.is_none() {
                             rows_opt = Some(self.build_rows_or_fallback(key_arrays)?);
                         }
                         let rows = rows_opt.as_ref().expect("join rows");
                         let row_bytes = rows.row_bytes(row)?;
-                        self.key_table.find_or_insert_from_row(
-                            &key_views,
-                            row,
-                            row_bytes,
-                            hashes[row],
-                        )?
+                        self.key_table
+                            .find_or_insert_from_row(&key_views, row, row_bytes, hash)?
                     };
                     self.handle_lookup(lookup, base_row_id + row as u32)?;
                 }
@@ -337,17 +337,14 @@ impl JoinHashTable {
             GroupKeyStrategy::Serialized => {
                 let rows = self.build_rows_or_fallback(key_arrays)?;
                 let hashes = self.key_table.build_group_hashes(&key_views, num_rows)?;
-                for row in 0..num_rows {
+                for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
                     if row_has_forbidden_null(&key_views, row, &self.null_safe_eq) {
                         continue;
                     }
                     let row_bytes = rows.row_bytes(row)?;
-                    let lookup = self.key_table.find_or_insert_from_row(
-                        &key_views,
-                        row,
-                        row_bytes,
-                        hashes[row],
-                    )?;
+                    let lookup = self
+                        .key_table
+                        .find_or_insert_from_row(&key_views, row, row_bytes, hash)?;
                     self.handle_lookup(lookup, base_row_id + row as u32)?;
                 }
             }
@@ -365,13 +362,13 @@ impl JoinHashTable {
         }
         let group_count = self.group_head.len();
         let mut counts = vec![0u32; group_count];
-        for group_id in 0..group_count {
+        for (group_id, count) in counts.iter_mut().enumerate().take(group_count) {
             let mut row = *self
                 .group_head
                 .get(group_id)
                 .ok_or_else(|| "join group id out of bounds".to_string())?;
             while row != ROW_NONE {
-                counts[group_id] = counts[group_id]
+                *count = count
                     .checked_add(1)
                     .ok_or_else(|| "join group row count overflow".to_string())?;
                 row = self.next_row(row)?;

@@ -343,7 +343,7 @@ fn build_be_config_rows() -> Result<Vec<SchemaRow>, String> {
     let be_id = backend_id::backend_id().unwrap_or(-1);
     collect_toml_rows("", &value, be_id, &mut rows);
     rows.sort_by(|left, right| {
-        schema_row_string(left, "NAME").cmp(&schema_row_string(right, "NAME"))
+        schema_row_string(left, "NAME").cmp(schema_row_string(right, "NAME"))
     });
     Ok(rows)
 }

@@ -1011,11 +1011,11 @@ pub(crate) fn resolve_desc_tbl_for_instance(
                 return Ok(Some(desc.clone()));
             }
         }
-        if let Some(desc) = fallback {
-            if !is_desc_tbl_effectively_empty(desc) {
-                ctx.desc_tbl = Some(desc.clone());
-                return Ok(Some(desc.clone()));
-            }
+        if let Some(desc) = fallback
+            && !is_desc_tbl_effectively_empty(desc)
+        {
+            ctx.desc_tbl = Some(desc.clone());
+            return Ok(Some(desc.clone()));
         }
         Ok(ctx.desc_tbl.clone())
     })

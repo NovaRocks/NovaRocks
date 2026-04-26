@@ -47,10 +47,10 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 db = node.database,
                 tbl = node.table.name
             ));
-            if let Some(ref cols) = node.required_columns {
-                if matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs) {
-                    out.push(format!("{pad}     columns: {}", cols.join(", ")));
-                }
+            if let Some(ref cols) = node.required_columns
+                && matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs)
+            {
+                out.push(format!("{pad}     columns: {}", cols.join(", ")));
             }
             if !node.predicates.is_empty() {
                 let preds: Vec<String> = node.predicates.iter().map(format_expr).collect();
@@ -270,10 +270,10 @@ fn format_physical_node(
                 "{pad}SCAN {}.{}{alias}{costs_suffix}",
                 op.database, op.table.name
             ));
-            if let Some(ref cols) = op.required_columns {
-                if matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs) {
-                    out.push(format!("{pad}     columns: {}", cols.join(", ")));
-                }
+            if let Some(ref cols) = op.required_columns
+                && matches!(level, ExplainLevel::Verbose | ExplainLevel::Costs)
+            {
+                out.push(format!("{pad}     columns: {}", cols.join(", ")));
             }
             let local_hints = explain_hints_for_local_scan(op);
             if matches!(level, ExplainLevel::Costs) && local_hints.has_decode {
@@ -588,15 +588,17 @@ fn explain_hints_for_local_scan(
         return LocalScanExplainHints::default();
     }
 
-    let mut hints = LocalScanExplainHints::default();
-    hints.has_min_max_stats = required_columns.iter().all(|required| {
-        op.table
-            .columns
-            .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(required))
-            .map(|column| supports_local_min_max_stats(&column.data_type))
-            .unwrap_or(false)
-    });
+    let mut hints = LocalScanExplainHints {
+        has_min_max_stats: required_columns.iter().all(|required| {
+            op.table
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(required))
+                .map(|column| supports_local_min_max_stats(&column.data_type))
+                .unwrap_or(false)
+        }),
+        ..Default::default()
+    };
     hints.has_decode = local_parquet_has_low_cardinality_string_dict(&op.table, path);
     hints
 }
@@ -651,7 +653,7 @@ fn local_parquet_has_low_cardinality_string_dict(
         Ok(file) => file,
         Err(_) => return false,
     };
-    let mut reader = match ParquetRecordBatchReaderBuilder::try_new(file)
+    let reader = match ParquetRecordBatchReaderBuilder::try_new(file)
         .and_then(|builder| builder.with_batch_size(4096).build())
     {
         Ok(reader) => reader,
@@ -664,7 +666,7 @@ fn local_parquet_has_low_cardinality_string_dict(
         .collect();
     let mut non_null_counts = vec![0usize; candidate_columns.len()];
 
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let Ok(batch) = batch else {
             return false;
         };

@@ -40,7 +40,9 @@ static OBSERVER_NOT_BLOCKED_LOG_COUNT: AtomicU64 = AtomicU64::new(0);
 const OBSERVER_LOG_EVERY: u64 = 1024;
 
 fn should_log_observer(counter: &AtomicU64) -> bool {
-    counter.fetch_add(1, Ordering::Relaxed) % OBSERVER_LOG_EVERY == 0
+    counter
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(OBSERVER_LOG_EVERY)
 }
 
 /// Callback type invoked when observable scheduling events are triggered.
@@ -159,7 +161,15 @@ impl Observable {
         let mut guard = self.observers.lock().expect("observable lock");
         guard.push(observer);
     }
+}
 
+impl Default for Observable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Observable {
     // Create a deferred notifier that triggers on drop if armed.
     pub fn defer_notify(self: &Arc<Self>) -> DeferNotify {
         DeferNotify::new(Arc::clone(self))
@@ -171,7 +181,7 @@ impl Observable {
             guard.clone()
         };
         let notify_count = NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if notify_count % 1024 == 0 {
+        if notify_count.is_multiple_of(1024) {
             debug!(
                 "Observable notify: count={} observers={}",
                 notify_count,

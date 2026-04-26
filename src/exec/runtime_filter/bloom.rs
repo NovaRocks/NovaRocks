@@ -107,8 +107,8 @@ impl SimdBlockFilter {
         let key = (hash >> (self.log_num_buckets as u32)) as u32;
         let masks = make_mask(key);
         let base = bucket_idx as usize * 8;
-        for i in 0..8 {
-            self.directory[base + i] |= masks[i];
+        for (i, mask) in masks.iter().enumerate() {
+            self.directory[base + i] |= *mask;
         }
     }
 
@@ -120,8 +120,8 @@ impl SimdBlockFilter {
         let key = (hash >> (self.log_num_buckets as u32)) as u32;
         let masks = make_mask(key);
         let base = bucket_idx as usize * 8;
-        for i in 0..8 {
-            if (self.directory[base + i] & masks[i]) == 0 {
+        for (i, mask) in masks.iter().enumerate() {
+            if (self.directory[base + i] & *mask) == 0 {
                 return false;
             }
         }
@@ -148,7 +148,7 @@ impl SimdBlockFilter {
         if data.len() < *offset + data_size {
             return Err("runtime bloom filter data truncated".to_string());
         }
-        if data_size % 4 != 0 {
+        if !data_size.is_multiple_of(4) {
             return Err("runtime bloom filter data size invalid".to_string());
         }
         let mut directory = Vec::with_capacity(data_size / 4);
@@ -348,7 +348,7 @@ impl RuntimeBloomFilter {
         join_mode: i8,
     ) -> Result<Self, String> {
         let size = array.len() as u64;
-        let min_max = RuntimeMinMaxFilter::from_arrays(ltype, &[array.clone()])?;
+        let min_max = RuntimeMinMaxFilter::from_arrays(ltype, std::slice::from_ref(array))?;
         if size == 0 {
             return Ok(Self::new(
                 filter_id, slot_id, ltype, false, join_mode, 0, None, min_max,
@@ -486,17 +486,17 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<BooleanArray>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Boolean".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = if arr.value(i) { 1u64 } else { 0u64 };
                 let hash = phmap_mix_8(v);
-                keep[i] = bf.test_hash(hash);
+                *keep = bf.test_hash(hash);
             }
         }
         DataType::Int8 => {
@@ -504,16 +504,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Int8".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i) as i64 as u64;
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Int16 => {
@@ -521,16 +521,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Int16".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i) as i64 as u64;
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Int32 => {
@@ -538,16 +538,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Int32".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i) as i64 as u64;
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Int64 => {
@@ -555,16 +555,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Int64".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i) as u64;
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Float32 => {
@@ -572,16 +572,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Float32Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Float32".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i).to_bits() as u64;
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Float64 => {
@@ -589,16 +589,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Float64".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i).to_bits();
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Date32 => {
@@ -606,16 +606,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Date32Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Date32".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let v = arr.value(i) as i64 as u64;
-                keep[i] = bf.test_hash(phmap_mix_8(v));
+                *keep = bf.test_hash(phmap_mix_8(v));
             }
         }
         DataType::Timestamp(unit, _) => match unit {
@@ -626,16 +626,16 @@ fn apply_bloom_filter(
                     .ok_or_else(|| {
                         "runtime bloom filter type mismatch for TimestampSecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i).saturating_mul(1_000_000);
-                    keep[i] = bf.test_hash(phmap_mix_8(v as u64));
+                    *keep = bf.test_hash(phmap_mix_8(v as u64));
                 }
             }
             arrow::datatypes::TimeUnit::Millisecond => {
@@ -645,16 +645,16 @@ fn apply_bloom_filter(
                     .ok_or_else(|| {
                         "runtime bloom filter type mismatch for TimestampMillisecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i).saturating_mul(1_000);
-                    keep[i] = bf.test_hash(phmap_mix_8(v as u64));
+                    *keep = bf.test_hash(phmap_mix_8(v as u64));
                 }
             }
             arrow::datatypes::TimeUnit::Microsecond => {
@@ -664,16 +664,16 @@ fn apply_bloom_filter(
                     .ok_or_else(|| {
                         "runtime bloom filter type mismatch for TimestampMicrosecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i);
-                    keep[i] = bf.test_hash(phmap_mix_8(v as u64));
+                    *keep = bf.test_hash(phmap_mix_8(v as u64));
                 }
             }
             arrow::datatypes::TimeUnit::Nanosecond => {
@@ -683,16 +683,16 @@ fn apply_bloom_filter(
                     .ok_or_else(|| {
                         "runtime bloom filter type mismatch for TimestampNanosecond".to_string()
                     })?;
-                for i in 0..len {
-                    if !keep[i] {
+                for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                    if !*keep {
                         continue;
                     }
                     if arr.is_null(i) {
-                        keep[i] = has_null;
+                        *keep = has_null;
                         continue;
                     }
                     let v = arr.value(i) / 1_000;
-                    keep[i] = bf.test_hash(phmap_mix_8(v as u64));
+                    *keep = bf.test_hash(phmap_mix_8(v as u64));
                 }
             }
         },
@@ -701,16 +701,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Utf8".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let hash = slice_hash(arr.value(i).as_bytes());
-                keep[i] = bf.test_hash(hash);
+                *keep = bf.test_hash(hash);
             }
         }
         DataType::Decimal128(_, _) => {
@@ -718,16 +718,16 @@ fn apply_bloom_filter(
                 .as_any()
                 .downcast_ref::<Decimal128Array>()
                 .ok_or_else(|| "runtime bloom filter type mismatch for Decimal128".to_string())?;
-            for i in 0..len {
-                if !keep[i] {
+            for (i, keep) in keep.iter_mut().enumerate().take(len) {
+                if !*keep {
                     continue;
                 }
                 if arr.is_null(i) {
-                    keep[i] = has_null;
+                    *keep = has_null;
                     continue;
                 }
                 let hash = decimal_hash(arr.value(i));
-                keep[i] = bf.test_hash(hash);
+                *keep = bf.test_hash(hash);
             }
         }
         _ => {

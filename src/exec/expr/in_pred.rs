@@ -376,8 +376,8 @@ mod tests {
         let scalar = Arc::new(create_test_map_array(&[Some(&[(0, 10), (1, 11)])])) as ArrayRef;
 
         let result = eq_with_scalar(&array, &scalar).expect("compare map scalar");
-        assert_eq!(result.value(0), true);
-        assert_eq!(result.value(1), false);
+        assert!(result.value(0));
+        assert!(!result.value(1));
         assert!(result.is_null(2));
     }
 
@@ -422,7 +422,7 @@ mod tests {
 
         let result = arena.eval(expr, &chunk).expect("eval IN");
         let result = result.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(result.value(0), true);
+        assert!(result.value(0));
         assert!(result.is_null(1));
         assert!(result.is_null(2));
     }

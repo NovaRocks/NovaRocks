@@ -49,7 +49,7 @@ impl SpillStorageConfig {
             .into_iter()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
-        let ipc_compression = SpillCodec::from_str(&config::spill_ipc_compression())?;
+        let ipc_compression = config::spill_ipc_compression().parse::<SpillCodec>()?;
         Ok(Self {
             local_dirs,
             dir_max_bytes: config::spill_dir_max_bytes(),
@@ -171,7 +171,7 @@ impl Spiller {
         }
 
         let index_offset = file
-            .seek(SeekFrom::Current(0))
+            .stream_position()
             .map_err(|e| format!("seek spill index offset failed: {e}"))?;
         write_block_index(&mut file, &index)?;
         let index_length = (index.len() * MESSAGE_INDEX_ENTRY_LEN) as u64;
@@ -237,7 +237,7 @@ const MESSAGE_INDEX_ENTRY_LEN: usize = 32;
 
 fn append_message(file: &mut File, encoded: &EncodedMessage) -> Result<MessageIndexEntry, String> {
     let offset = file
-        .seek(SeekFrom::Current(0))
+        .stream_position()
         .map_err(|e| format!("seek spill message offset failed: {e}"))?;
     file.write_all(&encoded.bytes)
         .map_err(|e| format!("write spill message failed: {e}"))?;

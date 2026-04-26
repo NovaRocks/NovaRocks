@@ -507,7 +507,7 @@ impl StandaloneSession {
                         query,
                     )?;
                 }
-                let level = forced_explain_level.unwrap_or_else(|| {
+                let level = forced_explain_level.unwrap_or({
                     if verbose {
                         crate::sql::explain::ExplainLevel::Verbose
                     } else {
@@ -1260,14 +1260,13 @@ fn collect_scan_stats(
         LogicalPlan::Scan(s) => {
             if let crate::sql::catalog::TableStorage::S3ParquetFiles { files, .. } =
                 &s.table.storage
+                && let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics(files)
             {
-                if let Some(ts) = crate::sql::optimizer::statistics::build_table_statistics(files) {
-                    // Insert by table name (canonical key).
-                    out.insert(s.table.name.clone(), ts.clone());
-                    // Also insert by alias so that aliased scans can find their stats.
-                    if let Some(ref alias) = s.alias {
-                        out.insert(alias.clone(), ts);
-                    }
+                // Insert by table name (canonical key).
+                out.insert(s.table.name.clone(), ts.clone());
+                // Also insert by alias so that aliased scans can find their stats.
+                if let Some(ref alias) = s.alias {
+                    out.insert(alias.clone(), ts);
                 }
             }
         }

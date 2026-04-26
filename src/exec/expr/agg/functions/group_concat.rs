@@ -172,7 +172,9 @@ fn parse_bool_list(v: &str) -> Result<Vec<bool>, String> {
     Ok(out)
 }
 
-fn group_concat_kind(spec: &AggSpec) -> Result<(bool, &[bool], &[bool], i64), String> {
+type GroupConcatKind<'a> = (bool, &'a [bool], &'a [bool], i64);
+
+fn group_concat_kind(spec: &AggSpec) -> Result<GroupConcatKind<'_>, String> {
     match &spec.kind {
         AggKind::GroupConcat {
             is_distinct,
@@ -797,14 +799,14 @@ impl AggregateFunction for GroupConcatAgg {
                 if reached_limit {
                     break;
                 }
-                if pos != last_unique_pos {
-                    if append_with_limit(
+                if pos != last_unique_pos
+                    && append_with_limit(
                         &mut out,
                         &separator_for_row(row, arg_types, layout)?,
                         max_len,
-                    ) {
-                        break;
-                    }
+                    )
+                {
+                    break;
                 }
             }
             builder.append_value(out);

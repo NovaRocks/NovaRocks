@@ -96,7 +96,7 @@ pub(crate) fn build_row_selection_for_row_groups(
         let rg_rows = row_group.num_rows().max(0) as usize;
         result.rows_total += rg_rows;
 
-        let mut ranges: Vec<Range<usize>> = vec![0..rg_rows];
+        let mut ranges: Vec<Range<usize>> = std::iter::once(0..rg_rows).collect();
         let mut any_supported = false;
 
         for pred in min_max_predicates {

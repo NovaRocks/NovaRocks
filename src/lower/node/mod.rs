@@ -358,20 +358,20 @@ fn lower_node_with_children(
     let mut out_layout = layout_for_row_tuples(&node.row_tuples, tuple_slots);
     // Some plan nodes carry multiple tuples in `row_tuples` (e.g. aggregate intermediate vs output).
     // For execution output layouts we should align with the node's declared output tuple id when available.
-    if node.node_type == plan_nodes::TPlanNodeType::AGGREGATION_NODE {
-        if let Some(agg) = node.agg_node.as_ref() {
-            let tuple_id = if agg.need_finalize {
-                agg.output_tuple_id
-            } else {
-                agg.intermediate_tuple_id
-            };
-            out_layout = layout_for_row_tuples(&[tuple_id], tuple_slots);
-        }
+    if node.node_type == plan_nodes::TPlanNodeType::AGGREGATION_NODE
+        && let Some(agg) = node.agg_node.as_ref()
+    {
+        let tuple_id = if agg.need_finalize {
+            agg.output_tuple_id
+        } else {
+            agg.intermediate_tuple_id
+        };
+        out_layout = layout_for_row_tuples(&[tuple_id], tuple_slots);
     }
-    if node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE {
-        if let Some(exchange) = node.exchange_node.as_ref() {
-            out_layout = layout_for_row_tuples(&exchange.input_row_tuples, tuple_slots);
-        }
+    if node.node_type == plan_nodes::TPlanNodeType::EXCHANGE_NODE
+        && let Some(exchange) = node.exchange_node.as_ref()
+    {
+        out_layout = layout_for_row_tuples(&exchange.input_row_tuples, tuple_slots);
     }
     let mut lowered = match node.node_type {
         t if t == plan_nodes::TPlanNodeType::EXCHANGE_NODE => lower_exchange_node(
@@ -630,8 +630,8 @@ fn lower_node_with_children(
     // satisfied in multi-fragment coordinated execution, causing pipeline
     // hangs.  Runtime filters should be applied at the scan level in the
     // producing fragment instead.
-    if is_scan_node_type(node.node_type) {
-        if let Some(specs) = node
+    if is_scan_node_type(node.node_type)
+        && let Some(specs) = node
             .probe_runtime_filters
             .as_ref()
             .filter(|v| !v.is_empty())
@@ -644,85 +644,83 @@ fn lower_node_with_children(
                     fe_addr,
                 )
             })
-        {
-            if !specs.is_empty() {
-                attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
-            }
-        }
+        && !specs.is_empty()
+    {
+        attach_probe_runtime_filter_specs_to_scan(&mut lowered.node, &specs);
     }
 
     // Apply conjuncts (predicates/filters) if present
-    if let Some(conjuncts) = node.conjuncts.as_ref() {
-        if !conjuncts.is_empty() {
-            let common_slot_map = node
-                .select_node
-                .as_ref()
-                .and_then(|n| n.common_slot_map.as_ref())
-                .or_else(|| {
-                    node.hash_join_node
-                        .as_ref()
-                        .and_then(|n| n.common_slot_map.as_ref())
-                })
-                .or_else(|| {
-                    node.nestloop_join_node
-                        .as_ref()
-                        .and_then(|n| n.common_slot_map.as_ref())
-                })
-                .or_else(|| {
-                    node.project_node
-                        .as_ref()
-                        .and_then(|n| n.common_slot_map.as_ref())
-                })
-                .or_else(|| node.common.as_ref().and_then(|n| n.heavy_exprs.as_ref()));
+    if let Some(conjuncts) = node.conjuncts.as_ref()
+        && !conjuncts.is_empty()
+    {
+        let common_slot_map = node
+            .select_node
+            .as_ref()
+            .and_then(|n| n.common_slot_map.as_ref())
+            .or_else(|| {
+                node.hash_join_node
+                    .as_ref()
+                    .and_then(|n| n.common_slot_map.as_ref())
+            })
+            .or_else(|| {
+                node.nestloop_join_node
+                    .as_ref()
+                    .and_then(|n| n.common_slot_map.as_ref())
+            })
+            .or_else(|| {
+                node.project_node
+                    .as_ref()
+                    .and_then(|n| n.common_slot_map.as_ref())
+            })
+            .or_else(|| node.common.as_ref().and_then(|n| n.heavy_exprs.as_ref()));
 
-            // Combine multiple conjuncts with AND logic
-            let mut conjunct_ids = Vec::new();
-            for conj in conjuncts {
-                let conj_id = lower_t_expr_with_common_slot_map(
-                    conj,
-                    arena,
-                    &lowered.layout,
-                    last_query_id,
-                    fe_addr,
-                    common_slot_map,
-                )?;
-                conjunct_ids.push(conj_id);
+        // Combine multiple conjuncts with AND logic
+        let mut conjunct_ids = Vec::new();
+        for conj in conjuncts {
+            let conj_id = lower_t_expr_with_common_slot_map(
+                conj,
+                arena,
+                &lowered.layout,
+                last_query_id,
+                fe_addr,
+                common_slot_map,
+            )?;
+            conjunct_ids.push(conj_id);
+        }
+
+        // If multiple conjuncts, combine with AND
+        let predicate = if conjunct_ids.len() == 1 {
+            conjunct_ids[0]
+        } else {
+            // Build AND expression: conjunct1 AND conjunct2 AND ...
+            let mut result = conjunct_ids[0];
+            for conj_id in &conjunct_ids[1..] {
+                result = arena.push(ExprNode::And(result, *conj_id));
             }
+            result
+        };
 
-            // If multiple conjuncts, combine with AND
-            let predicate = if conjunct_ids.len() == 1 {
-                conjunct_ids[0]
+        let mut pushed_to_scan = false;
+        if let ExecNodeKind::Scan(scan) = &mut lowered.node.kind {
+            let combined = if let Some(existing) = scan.conjunct_predicate() {
+                arena.push(ExprNode::And(existing, predicate))
             } else {
-                // Build AND expression: conjunct1 AND conjunct2 AND ...
-                let mut result = conjunct_ids[0];
-                for conj_id in &conjunct_ids[1..] {
-                    result = arena.push(ExprNode::And(result, *conj_id));
-                }
-                result
+                predicate
             };
-
-            let mut pushed_to_scan = false;
-            if let ExecNodeKind::Scan(scan) = &mut lowered.node.kind {
-                let combined = if let Some(existing) = scan.conjunct_predicate() {
-                    arena.push(ExprNode::And(existing, predicate))
-                } else {
-                    predicate
-                };
-                scan.set_conjunct_predicate(Some(combined));
-                pushed_to_scan = true;
-            }
-            if !pushed_to_scan {
-                lowered = Lowered {
-                    node: ExecNode {
-                        kind: ExecNodeKind::Filter(FilterNode {
-                            input: Box::new(lowered.node),
-                            node_id: node.node_id,
-                            predicate,
-                        }),
-                    },
-                    layout: lowered.layout,
-                };
-            }
+            scan.set_conjunct_predicate(Some(combined));
+            pushed_to_scan = true;
+        }
+        if !pushed_to_scan {
+            lowered = Lowered {
+                node: ExecNode {
+                    kind: ExecNodeKind::Filter(FilterNode {
+                        input: Box::new(lowered.node),
+                        node_id: node.node_id,
+                        predicate,
+                    }),
+                },
+                layout: lowered.layout,
+            };
         }
     }
 
@@ -787,7 +785,7 @@ pub(crate) fn local_rf_waiting_set(node: &plan_nodes::TPlanNode) -> Vec<i32> {
     let Some(set) = node.local_rf_waiting_set.as_ref() else {
         return Vec::new();
     };
-    let mut ids: Vec<i32> = set.iter().map(|id| *id as i32).collect();
+    let mut ids: Vec<i32> = set.iter().copied().collect();
     ids.sort_unstable();
     ids.dedup();
     ids
@@ -818,12 +816,11 @@ fn lower_probe_runtime_filter_specs(
             );
             continue;
         };
-        if let Some(filter_type) = desc.filter_type {
-            if filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
-                && filter_type != runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER
-            {
-                continue;
-            }
+        if let Some(filter_type) = desc.filter_type
+            && filter_type != runtime_filter::TRuntimeFilterBuildType::JOIN_FILTER
+            && filter_type != runtime_filter::TRuntimeFilterBuildType::TOPN_FILTER
+        {
+            continue;
         }
         let Some(targets) = desc.plan_node_id_to_target_expr.as_ref() else {
             continue;

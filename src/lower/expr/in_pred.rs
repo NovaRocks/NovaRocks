@@ -60,10 +60,10 @@ pub(crate) fn lower_in_pred(
         return Err("IN_PRED must have at least one child".to_string());
     }
     let mut child = children[0];
-    if let Some(dt) = arena.data_type(child) {
-        if matches!(dt, DataType::LargeBinary) {
-            return Err("VARIANT is not supported in IN predicates".to_string());
-        }
+    if let Some(dt) = arena.data_type(child)
+        && matches!(dt, DataType::LargeBinary)
+    {
+        return Err("VARIANT is not supported in IN predicates".to_string());
     }
 
     // Align with FE comparison semantics: IN_PRED may carry a compare child type.
@@ -104,10 +104,11 @@ pub(crate) fn lower_in_pred(
             .ok_or_else(|| "IN_PRED child type missing".to_string())?
     };
 
-    if let Some(child_type) = arena.data_type(child) {
-        if is_temporal_type(child_type) && is_numeric_like_type(&compare_type) {
-            compare_type = child_type.clone();
-        }
+    if let Some(child_type) = arena.data_type(child)
+        && is_temporal_type(child_type)
+        && is_numeric_like_type(&compare_type)
+    {
+        compare_type = child_type.clone();
     }
 
     if matches!(compare_type, DataType::LargeBinary) {

@@ -61,17 +61,20 @@ pub(crate) fn lower_aggregate_node(
         }
     }
     for expr_id in &group_by {
-        if let Some(dt) = arena.data_type(*expr_id) {
-            if matches!(dt, arrow::datatypes::DataType::LargeBinary) {
-                return Err("VARIANT is not supported in GROUP BY".to_string());
-            }
+        if let Some(dt) = arena.data_type(*expr_id)
+            && matches!(dt, arrow::datatypes::DataType::LargeBinary)
+        {
+            return Err("VARIANT is not supported in GROUP BY".to_string());
         }
     }
 
     // Agg functions
     let mut functions = Vec::new();
     for e in &agg.aggregate_functions {
-        let root = e.nodes.get(0).ok_or_else(|| "empty agg expr".to_string())?;
+        let root = e
+            .nodes
+            .first()
+            .ok_or_else(|| "empty agg expr".to_string())?;
         let is_merge = root
             .agg_expr
             .as_ref()
@@ -91,10 +94,10 @@ pub(crate) fn lower_aggregate_node(
             fn_name
         };
         let mut type_sig = agg_type_signature_from_node(root)?;
-        if rewrite_ds_hll_merge_to_union {
-            if let Some(intermediate_type) = type_sig.intermediate_type.clone() {
-                type_sig.output_type = Some(intermediate_type);
-            }
+        if rewrite_ds_hll_merge_to_union
+            && let Some(intermediate_type) = type_sig.intermediate_type.clone()
+        {
+            type_sig.output_type = Some(intermediate_type);
         }
 
         // Lower arguments

@@ -210,7 +210,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 2 != 0 {
+                if !bytes.len().is_multiple_of(2) {
                     return Err(format!(
                         "invalid Int16 value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -234,7 +234,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 4 != 0 {
+                if !bytes.len().is_multiple_of(4) {
                     return Err(format!(
                         "invalid Int32 value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -258,7 +258,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 4 != 0 {
+                if !bytes.len().is_multiple_of(4) {
                     return Err(format!(
                         "invalid Date32 value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -287,7 +287,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 8 != 0 {
+                if !bytes.len().is_multiple_of(8) {
                     return Err(format!(
                         "invalid Int64 value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -311,7 +311,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 16 != 0 {
+                if !bytes.len().is_multiple_of(16) {
                     return Err(format!(
                         "invalid FixedSizeBinary(16) value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -335,7 +335,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 8 != 0 {
+                if !bytes.len().is_multiple_of(8) {
                     return Err(format!(
                         "invalid Timestamp(Microsecond,None) value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -364,7 +364,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % elem_size != 0 {
+                if !bytes.len().is_multiple_of(elem_size) {
                     return Err(format!(
                         "invalid Decimal128 value bytes length: output_column={}, segment={}, bytes={}, elem_size={}",
                         output_name,
@@ -402,7 +402,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % elem_size != 0 {
+                if !bytes.len().is_multiple_of(elem_size) {
                     return Err(format!(
                         "invalid Decimal256 value bytes length: output_column={}, segment={}, bytes={}, elem_size={}",
                         output_name,
@@ -427,7 +427,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 4 != 0 {
+                if !bytes.len().is_multiple_of(4) {
                     return Err(format!(
                         "invalid Float32 value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,
@@ -451,7 +451,7 @@ impl OutputColumnData {
                         output_name, segment_path, elem_size
                     ));
                 }
-                if bytes.len() % 8 != 0 {
+                if !bytes.len().is_multiple_of(8) {
                     return Err(format!(
                         "invalid Float64 value bytes length: output_column={}, segment={}, bytes={}",
                         output_name,

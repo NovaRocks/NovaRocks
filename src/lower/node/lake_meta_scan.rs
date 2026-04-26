@@ -244,15 +244,14 @@ pub(crate) fn lower_lake_meta_scan_node(
                 internal_db_name = Some(candidate.to_string());
             }
         }
-        if internal_table_name.is_none() {
-            if let Some(name) = internal
+        if internal_table_name.is_none()
+            && let Some(name) = internal
                 .table_name
                 .as_deref()
                 .map(|v| v.trim())
                 .filter(|v| !v.is_empty())
-            {
-                internal_table_name = Some(name.to_string());
-            }
+        {
+            internal_table_name = Some(name.to_string());
         }
     }
     if has_more {

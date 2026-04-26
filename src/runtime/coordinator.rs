@@ -173,15 +173,9 @@ impl ExecutionCoordinator {
         // ---------------------------------------------------------------
         // Runtime filter parameter assembly
         // ---------------------------------------------------------------
-        let rf_params = match rf_plan {
-            Some(mut plan) => Some(setup_runtime_filter_params(
-                &mut plan,
-                &mut fragment_results,
-                &instance_map,
-                &brpc_addr,
-            )),
-            None => None,
-        };
+        let rf_params = rf_plan.map(|mut plan| {
+            setup_runtime_filter_params(&mut plan, &mut fragment_results, &instance_map, &brpc_addr)
+        });
 
         // Separate root, CTE produce fragments, and Stream-edge producers (Gather splits).
         let mut root_fragment: Option<FragmentBuildResult> = None;
@@ -228,8 +222,7 @@ impl ExecutionCoordinator {
             }
             let edge = outgoing[0];
 
-            let consumer_exchange_nodes =
-                vec![(edge.target_fragment_id, edge.target_exchange_node_id)];
+            let consumer_exchange_nodes = [(edge.target_fragment_id, edge.target_exchange_node_id)];
 
             let unpartitioned = partitions::TDataPartition::new(
                 partitions::TPartitionType::UNPARTITIONED,
@@ -657,14 +650,14 @@ fn setup_runtime_filter_params(
     }
 
     // Builder number: always 1 in standalone (single instance per fragment).
-    for (_, filter_ids) in &rf_plan.build_side_filters {
+    for filter_ids in rf_plan.build_side_filters.values() {
         for fid in filter_ids {
             builder_number.insert(*fid, 1);
         }
     }
 
     // Patch merge node addresses on remote filter descriptions.
-    for (_filter_id, desc) in rf_plan.all_filters.iter_mut() {
+    for desc in rf_plan.all_filters.values_mut() {
         if desc.has_remote_targets == Some(true) {
             desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
         }
@@ -672,12 +665,12 @@ fn setup_runtime_filter_params(
     // Also patch inside the plan nodes.
     for fr in fragment_results.iter_mut() {
         for node in fr.plan.nodes.iter_mut() {
-            if let Some(ref mut hj) = node.hash_join_node {
-                if let Some(ref mut rf_descs) = hj.build_runtime_filters {
-                    for desc in rf_descs.iter_mut() {
-                        if desc.has_remote_targets == Some(true) {
-                            desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
-                        }
+            if let Some(ref mut hj) = node.hash_join_node
+                && let Some(ref mut rf_descs) = hj.build_runtime_filters
+            {
+                for desc in rf_descs.iter_mut() {
+                    if desc.has_remote_targets == Some(true) {
+                        desc.runtime_filter_merge_nodes = Some(vec![exchange_addr.clone()]);
                     }
                 }
             }

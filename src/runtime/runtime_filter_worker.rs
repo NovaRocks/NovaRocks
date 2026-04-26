@@ -223,11 +223,11 @@ fn merge_and_encode_filters(
                 }
             }
             let mut data = encode_starrocks_in_filter(&merged)?;
-            if let Some(limit) = max_size {
-                if data.len() as i64 > limit {
-                    merged = merged.empty_like();
-                    data = encode_starrocks_in_filter(&merged)?;
-                }
+            if let Some(limit) = max_size
+                && data.len() as i64 > limit
+            {
+                merged = merged.empty_like();
+                data = encode_starrocks_in_filter(&merged)?;
             }
             Ok(data)
         }
@@ -262,10 +262,10 @@ fn merge_and_encode_filters(
                     _ => return Err("runtime filter merge type mismatch".to_string()),
                 }
             }
-            if let Some(limit) = max_size {
-                if total_size as i64 > limit {
-                    force_empty = true;
-                }
+            if let Some(limit) = max_size
+                && total_size as i64 > limit
+            {
+                force_empty = true;
             }
             let mut result = if force_empty {
                 let mut base = merged_membership.unwrap_or(merged);
@@ -277,12 +277,12 @@ fn merge_and_encode_filters(
                 base
             };
             let mut data = encode_membership_filter(&result)?;
-            if let Some(limit) = max_size {
-                if data.len() as i64 > limit {
-                    result = result.to_empty();
-                    result.set_min_max(min_max);
-                    data = encode_membership_filter(&result)?;
-                }
+            if let Some(limit) = max_size
+                && data.len() as i64 > limit
+            {
+                result = result.to_empty();
+                result.set_min_max(min_max);
+                data = encode_membership_filter(&result)?;
             }
             Ok(data)
         }

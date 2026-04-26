@@ -438,10 +438,10 @@ fn encode_roaring32_run_single_container(values: &[u32]) -> Option<Vec<u8>> {
 }
 
 fn encode_roaring32_payload(values: &[u32]) -> Result<Vec<u8>, String> {
-    if should_encode_run_container(values) {
-        if let Some(out) = encode_roaring32_run_single_container(values) {
-            return Ok(out);
-        }
+    if should_encode_run_container(values)
+        && let Some(out) = encode_roaring32_run_single_container(values)
+    {
+        return Ok(out);
     }
     encode_roaring32_no_run(values)
 }

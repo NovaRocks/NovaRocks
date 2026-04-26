@@ -207,7 +207,7 @@ pub fn eval_array_to_bitmap(
         }
         let start = offsets[idx] as usize;
         let end = offsets[idx + 1] as usize;
-        let set = collect_set(&values, start, end)?;
+        let set = collect_set(values, start, end)?;
         builder.append_value(encode_bitmap_text(&set));
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)

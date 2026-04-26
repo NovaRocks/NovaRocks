@@ -230,7 +230,7 @@ pub fn eval_array_contains(
                 let mut found = false;
                 for i in start..end {
                     if super::common::compare_values_with_null(
-                        &values,
+                        values,
                         i,
                         &target_arr,
                         target_idx,
@@ -263,7 +263,7 @@ pub fn eval_array_contains(
             let mut found = false;
             for i in start..end {
                 if super::common::compare_values_with_null(
-                    &values,
+                    values,
                     i,
                     &target_arr,
                     target_idx,
@@ -330,7 +330,7 @@ pub fn eval_array_contains(
                 let mut found = false;
                 for i in start..end {
                     if super::common::compare_values_with_null(
-                        &values,
+                        values,
                         i,
                         &target_arr,
                         target_idx,
@@ -357,7 +357,7 @@ pub fn eval_array_contains(
         } else {
             let mut found = false;
             for i in start..end {
-                if super::common::compare_values_with_null(&values, i, &target_arr, 0, false)? {
+                if super::common::compare_values_with_null(values, i, &target_arr, 0, false)? {
                     found = true;
                     break;
                 }
@@ -392,7 +392,7 @@ pub fn eval_array_contains(
 
         let mut found = false;
         for i in start..end {
-            if super::common::compare_value_to_target(&values, i, &target_arr, row)? {
+            if super::common::compare_value_to_target(values, i, &target_arr, row)? {
                 found = true;
                 break;
             }

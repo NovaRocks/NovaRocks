@@ -98,7 +98,7 @@ pub(super) fn validate_scalar_function_call(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<(), String> {
-    if name == "map" && arg_types.len() % 2 != 0 {
+    if name == "map" && !arg_types.len().is_multiple_of(2) {
         return Err(no_matching_signature(name, arg_types));
     }
     let expected_arity = match name {

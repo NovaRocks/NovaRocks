@@ -27,30 +27,30 @@ pub(crate) fn lower_cast(
     source_primitive: Option<types::TPrimitiveType>,
 ) -> Result<ExprId, String> {
     let child = children
-        .get(0)
+        .first()
         .copied()
         .ok_or_else(|| "CAST missing child".to_string())?;
     if matches!(data_type, DataType::LargeBinary) {
         return Err("CAST to VARIANT is not supported".to_string());
     }
-    if let Some(child_type) = arena.data_type(child) {
-        if matches!(child_type, DataType::LargeBinary) {
-            let supported = matches!(
-                data_type,
-                DataType::Boolean
-                    | DataType::Int8
-                    | DataType::Int16
-                    | DataType::Int32
-                    | DataType::Int64
-                    | DataType::Float32
-                    | DataType::Float64
-                    | DataType::Utf8
-                    | DataType::Date32
-                    | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
-            );
-            if !supported {
-                return Err("CAST from VARIANT is not supported".to_string());
-            }
+    if let Some(child_type) = arena.data_type(child)
+        && matches!(child_type, DataType::LargeBinary)
+    {
+        let supported = matches!(
+            data_type,
+            DataType::Boolean
+                | DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+                | DataType::Utf8
+                | DataType::Date32
+                | DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
+        );
+        if !supported {
+            return Err("CAST from VARIANT is not supported".to_string());
         }
     }
     let node = if target_primitive == Some(types::TPrimitiveType::TIME) {

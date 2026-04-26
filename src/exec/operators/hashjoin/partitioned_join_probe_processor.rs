@@ -407,11 +407,11 @@ impl PartitionedJoinProbeProcessorOperator {
                 self.buffered_rows = self.buffered_rows.saturating_add(chunk.len() as u64);
                 self.buffered.push_back(chunk);
             }
-            if let Some(buffered) = self.buffered.pop_front() {
-                if !buffered.is_empty() {
-                    self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
-                    probe_chunks.push(buffered);
-                }
+            if let Some(buffered) = self.buffered.pop_front()
+                && !buffered.is_empty()
+            {
+                self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
+                probe_chunks.push(buffered);
             }
         } else if drain_all {
             while let Some(buffered) = self.buffered.pop_front() {
@@ -420,11 +420,11 @@ impl PartitionedJoinProbeProcessorOperator {
                     probe_chunks.push(buffered);
                 }
             }
-        } else if let Some(buffered) = self.buffered.pop_front() {
-            if !buffered.is_empty() {
-                self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
-                probe_chunks.push(buffered);
-            }
+        } else if let Some(buffered) = self.buffered.pop_front()
+            && !buffered.is_empty()
+        {
+            self.buffered_rows = self.buffered_rows.saturating_sub(buffered.len() as u64);
+            probe_chunks.push(buffered);
         }
         probe_chunks
     }
@@ -578,7 +578,7 @@ mod tests {
     fn append_quads(chunk: Chunk, out: &mut Vec<(i32, i32, i32, i32)>) {
         let c0 = chunk
             .columns()
-            .get(0)
+            .first()
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -617,7 +617,7 @@ mod tests {
         assert!(chunk.columns().len() >= 2);
         let c0 = chunk
             .columns()
-            .get(0)
+            .first()
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -787,10 +787,10 @@ mod tests {
         .expect("partition probe");
 
         // Build per partition.
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             if let Some(sink) = op.as_processor_mut() {
-                let c = build_parts[part].clone();
+                let c = build_part.clone();
                 if !c.is_empty() {
                     push_expect_consumed(sink, &rt, c);
                 }
@@ -802,9 +802,9 @@ mod tests {
 
         // Probe per partition.
         let mut pairs = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
 
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
@@ -815,7 +815,7 @@ mod tests {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
                     let left_arr = out
                         .columns()
-                        .get(0)
+                        .first()
                         .unwrap()
                         .as_any()
                         .downcast_ref::<Int32Array>()
@@ -837,7 +837,7 @@ mod tests {
                 if let Some(out) = proc.pull_chunk(&rt).expect("probe pull") {
                     let left_arr = out
                         .columns()
-                        .get(0)
+                        .first()
                         .unwrap()
                         .as_any()
                         .downcast_ref::<Int32Array>()
@@ -936,12 +936,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -949,9 +949,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1053,12 +1053,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1066,9 +1066,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1164,12 +1164,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1177,9 +1177,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1269,12 +1269,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1282,9 +1282,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1389,12 +1389,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1402,9 +1402,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1498,12 +1498,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1511,9 +1511,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1613,12 +1613,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1626,9 +1626,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1718,12 +1718,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1731,9 +1731,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1828,12 +1828,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1841,9 +1841,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };
@@ -1951,12 +1951,12 @@ mod tests {
         )
         .expect("partition probe");
 
-        for part in 0..2 {
+        for (part, build_part) in build_parts.iter().enumerate() {
             let mut op = build_factory.create(2, part as i32);
             let Some(sink) = op.as_processor_mut() else {
                 panic!("build operator missing processor");
             };
-            let c = build_parts[part].clone();
+            let c = build_part.clone();
             if !c.is_empty() {
                 push_expect_consumed(sink, &rt, c);
             }
@@ -1964,9 +1964,9 @@ mod tests {
         }
 
         let mut rows = Vec::new();
-        for part in 0..2 {
+        for (part, probe_part) in probe_parts.iter().enumerate() {
             let mut op = probe_factory.create(2, part as i32);
-            let c = probe_parts[part].clone();
+            let c = probe_part.clone();
             let Some(proc) = op.as_processor_mut() else {
                 panic!("probe operator missing processor");
             };

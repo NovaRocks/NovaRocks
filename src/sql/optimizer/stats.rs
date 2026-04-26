@@ -1005,7 +1005,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::LogicalJoin(j) => {
             let left_cols = expr
                 .children
-                .get(0)
+                .first()
                 .and_then(|&id| memo.groups[id].logical_props.as_ref())
                 .map(|p| p.output_columns.clone())
                 .unwrap_or_default();
@@ -1075,7 +1075,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalHashJoin(j) => {
             let left_cols = expr
                 .children
-                .get(0)
+                .first()
                 .and_then(|&id| memo.groups[id].logical_props.as_ref())
                 .map(|p| p.output_columns.clone())
                 .unwrap_or_default();
@@ -1090,7 +1090,7 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
         Operator::PhysicalNestLoopJoin(j) => {
             let left_cols = expr
                 .children
-                .get(0)
+                .first()
                 .and_then(|&id| memo.groups[id].logical_props.as_ref())
                 .map(|p| p.output_columns.clone())
                 .unwrap_or_default();
@@ -1196,9 +1196,9 @@ pub(crate) fn estimate_selectivity(
             op: UnOp::Not,
             expr,
         } => 1.0 - estimate_selectivity(expr, column_stats),
-        ExprKind::IsTruthValue { value, negated, .. } => {
+        ExprKind::IsTruthValue { negated, .. } => {
             // IS TRUE / IS NOT TRUE / IS FALSE / IS NOT FALSE
-            let base = if *value { 0.5 } else { 0.5 };
+            let base = 0.5;
             if *negated { 1.0 - base } else { base }
         }
         ExprKind::Nested(inner) => estimate_selectivity(inner, column_stats),
@@ -1214,12 +1214,11 @@ fn estimate_eq_selectivity(
     // col = literal: use 1/ndv
     let col_name = extract_column_name(left).or_else(|| extract_column_name(right));
 
-    if let Some(name) = col_name {
-        if let Some(cs) = column_stats.get(&name.to_lowercase()) {
-            if cs.distinct_values_count > 1.0 {
-                return 1.0 / cs.distinct_values_count;
-            }
-        }
+    if let Some(name) = col_name
+        && let Some(cs) = column_stats.get(&name.to_lowercase())
+        && cs.distinct_values_count > 1.0
+    {
+        return 1.0 / cs.distinct_values_count;
     }
     PREDICATE_UNKNOWN_FILTER
 }
@@ -1234,20 +1233,20 @@ fn estimate_range_selectivity(
     let col_name = extract_column_name(left);
     let literal_val = extract_literal_f64(right);
 
-    if let (Some(name), Some(val)) = (col_name, literal_val) {
-        if let Some(cs) = column_stats.get(&name.to_lowercase()) {
-            let min = cs.min_value;
-            let max = cs.max_value;
-            if min.is_finite() && max.is_finite() && max > min {
-                let range = max - min;
-                return match op {
-                    BinOp::Lt => ((val - min) / range).clamp(0.01, 0.99),
-                    BinOp::Le => ((val - min + 1.0) / range).clamp(0.01, 0.99),
-                    BinOp::Gt => ((max - val) / range).clamp(0.01, 0.99),
-                    BinOp::Ge => ((max - val + 1.0) / range).clamp(0.01, 0.99),
-                    _ => 0.5,
-                };
-            }
+    if let (Some(name), Some(val)) = (col_name, literal_val)
+        && let Some(cs) = column_stats.get(&name.to_lowercase())
+    {
+        let min = cs.min_value;
+        let max = cs.max_value;
+        if min.is_finite() && max.is_finite() && max > min {
+            let range = max - min;
+            return match op {
+                BinOp::Lt => ((val - min) / range).clamp(0.01, 0.99),
+                BinOp::Le => ((val - min + 1.0) / range).clamp(0.01, 0.99),
+                BinOp::Gt => ((max - val) / range).clamp(0.01, 0.99),
+                BinOp::Ge => ((max - val + 1.0) / range).clamp(0.01, 0.99),
+                _ => 0.5,
+            };
         }
     }
     0.5 // default for range predicates
@@ -1270,10 +1269,10 @@ fn extract_literal_f64(expr: &TypedExpr) -> Option<f64> {
 
 /// Get the NDV for an expression from column statistics.
 fn get_expr_ndv(expr: &TypedExpr, column_stats: &HashMap<String, ColumnStatistic>) -> f64 {
-    if let Some(name) = extract_column_name(expr) {
-        if let Some(cs) = column_stats.get(&name.to_lowercase()) {
-            return cs.distinct_values_count.max(1.0);
-        }
+    if let Some(name) = extract_column_name(expr)
+        && let Some(cs) = column_stats.get(&name.to_lowercase())
+    {
+        return cs.distinct_values_count.max(1.0);
     }
     10.0
 }

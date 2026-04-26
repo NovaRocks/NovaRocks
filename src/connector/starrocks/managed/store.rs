@@ -3145,18 +3145,16 @@ mod tests {
             let mut stmt = conn
                 .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info('materialized_views') ORDER BY cid")
                 .expect("prepare");
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                })
-                .expect("query")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("collect");
-            rows
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
         };
         let names: Vec<&str> = mv_cols.iter().map(|(n, _, _)| n.as_str()).collect();
         assert_eq!(
@@ -3194,7 +3192,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
 
-        let mut snapshot = ManagedSnapshot {
+        let snapshot = ManagedSnapshot {
             global: ManagedGlobalMeta {
                 warehouse_uri: "s3://bucket/warehouse".to_string(),
                 next_db_id: 2,
@@ -3275,9 +3273,7 @@ mod tests {
             }],
         };
 
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
         let loaded = store.load_snapshot().expect("reload").managed;
         assert_eq!(loaded, snapshot);
     }
@@ -3305,9 +3301,7 @@ mod tests {
             name: "analytics".to_string(),
         });
 
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
         let loaded = store.load_snapshot().expect("reload").managed;
         assert_eq!(loaded.tables[0].kind, ManagedTableKind::Table);
         assert!(loaded.materialized_views.is_empty());
@@ -3390,9 +3384,7 @@ mod tests {
             next_version: 2,
             state: ManagedPartitionState::Creating,
         });
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
 
         let err = store
             .stage_mv_refresh_partition(StageMvRefreshRequest {
@@ -3412,9 +3404,7 @@ mod tests {
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
         let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
         snapshot.tables[0].state = ManagedTableState::Dropping;
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
 
         let err = store
             .stage_mv_refresh_partition(StageMvRefreshRequest {
@@ -3434,10 +3424,8 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
-        let mut snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        let snapshot = empty_mv_refresh_snapshot("s3://bucket/warehouse");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
 
         let staged = store
             .stage_mv_refresh_partition(StageMvRefreshRequest {
@@ -3508,9 +3496,7 @@ mod tests {
             next_version: 2,
             state: ManagedPartitionState::Creating,
         });
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
 
         let err = store
             .drop_managed_table(10, "s3://bucket/warehouse/db_1/table_10")
@@ -3530,9 +3516,7 @@ mod tests {
         for index in &mut snapshot.indexes {
             index.state = ManagedIndexState::Retired;
         }
-        store
-            .replace_managed_snapshot(&mut snapshot)
-            .expect("persist");
+        store.replace_managed_snapshot(&snapshot).expect("persist");
 
         store.purge_retired_table_metadata(10).expect("purge");
         let loaded = store.load_snapshot().expect("reload").managed;

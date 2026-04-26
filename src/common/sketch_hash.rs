@@ -57,17 +57,6 @@ pub fn murmur_hash64a(data: &[u8], seed: u32) -> Result<u64, String> {
     Ok(h)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{MURMUR_SEED, murmur_hash64a};
-
-    #[test]
-    fn murmur_hash64a_matches_known_value() {
-        let hash = murmur_hash64a(b"novarocks", MURMUR_SEED).expect("hash");
-        assert_eq!(hash, 7_139_930_336_803_328_733);
-    }
-}
-
 pub fn prehash_array_value(
     array: &ArrayRef,
     row: usize,
@@ -228,5 +217,16 @@ pub fn prehash_array_value(
             "{context}: unsupported sketch hash input type {:?}",
             other
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MURMUR_SEED, murmur_hash64a};
+
+    #[test]
+    fn murmur_hash64a_matches_known_value() {
+        let hash = murmur_hash64a(b"novarocks", MURMUR_SEED).expect("hash");
+        assert_eq!(hash, 7_139_930_336_803_328_733);
     }
 }

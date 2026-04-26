@@ -52,14 +52,15 @@ pub fn eval_element_at(
             key_arr.len()
         ));
     }
-    if let Some(flags) = check_arr {
-        if flags.len() != 1 && flags.len() != map.len() {
-            return Err(format!(
-                "element_at check flag length mismatch: map rows={}, check rows={}",
-                map.len(),
-                flags.len()
-            ));
-        }
+    if let Some(flags) = check_arr
+        && flags.len() != 1
+        && flags.len() != map.len()
+    {
+        return Err(format!(
+            "element_at check flag length mismatch: map rows={}, check rows={}",
+            map.len(),
+            flags.len()
+        ));
     }
 
     let keys = map.keys();

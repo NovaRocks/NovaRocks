@@ -40,14 +40,14 @@ pub(crate) fn lower_raw_values_node(
     };
 
     if out_layout.order.is_empty() {
-        *out_layout = layout_from_slot_ids(raw.tuple_id, [0].into_iter());
+        *out_layout = layout_from_slot_ids(raw.tuple_id, [0]);
     }
 
     if let Some(vals) = raw.long_values.as_ref() {
         let array = Int64Array::from_iter(vals.iter().copied().map(Some));
         let slot_id = out_layout
             .order
-            .get(0)
+            .first()
             .map(|(_, slot)| *slot)
             .ok_or_else(|| "RAW_VALUES_NODE missing output slot id".to_string())?;
         let slot_id = SlotId::try_from(slot_id)?;
@@ -75,7 +75,7 @@ pub(crate) fn lower_raw_values_node(
         let array = StringArray::from_iter(vals.iter().map(|v| Some(v.as_str())));
         let slot_id = out_layout
             .order
-            .get(0)
+            .first()
             .map(|(_, slot)| *slot)
             .ok_or_else(|| "RAW_VALUES_NODE missing output slot id".to_string())?;
         let slot_id = SlotId::try_from(slot_id)?;

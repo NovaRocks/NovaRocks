@@ -103,13 +103,13 @@ impl SpillConfig {
             return Err("spill to remote storage is not supported".to_string());
         }
 
-        if let Some(opts) = spill_opts.and_then(|v| v.spill_to_remote_storage_options.as_ref()) {
-            if opts.disable_spill_to_local_disk.unwrap_or(false) {
-                return Err(
-                    "spill_to_remote_storage_options.disable_spill_to_local_disk=true is not supported"
-                        .to_string(),
-                );
-            }
+        if let Some(opts) = spill_opts.and_then(|v| v.spill_to_remote_storage_options.as_ref())
+            && opts.disable_spill_to_local_disk.unwrap_or(false)
+        {
+            return Err(
+                "spill_to_remote_storage_options.disable_spill_to_local_disk=true is not supported"
+                    .to_string(),
+            );
         }
 
         let spill_mem_table_size = spill_opts

@@ -132,13 +132,13 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                         break;
                     }
                 };
-                if let Some(status) = result.status.as_ref() {
-                    if status.status_code != 0 {
-                        let _ = tx
-                            .send(Err(tonic::Status::internal(status.error_msgs.join("; "))))
-                            .await;
-                        break;
-                    }
+                if let Some(status) = result.status.as_ref()
+                    && status.status_code != 0
+                {
+                    let _ = tx
+                        .send(Err(tonic::Status::internal(status.error_msgs.join("; "))))
+                        .await;
+                    break;
                 }
 
                 let ack = proto::novarocks::ExchangeResponse {
@@ -200,10 +200,10 @@ impl proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpc for GrpcService {
                 .map_err(|e| {
                     tonic::Status::internal(format!("exchange_unary handler panicked: {e}"))
                 })?;
-        if let Some(status) = result.status.as_ref() {
-            if status.status_code != 0 {
-                return Err(tonic::Status::internal(status.error_msgs.join("; ")));
-            }
+        if let Some(status) = result.status.as_ref()
+            && status.status_code != 0
+        {
+            return Err(tonic::Status::internal(status.error_msgs.join("; ")));
         }
         Ok(tonic::Response::new(proto::novarocks::ExchangeResponse {
             ack_sequence: req.sequence,
@@ -529,7 +529,7 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
             let mut http_shutdown = shutdown_rx.clone();
             let mut starlet_shutdown = shutdown_rx.clone();
 
-            let svc = GrpcService::default();
+            let svc = GrpcService;
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -545,7 +545,7 @@ pub fn start_grpc_server(host: &str) -> Result<(), String> {
                     }
                 });
 
-            let starlet = StarletGrpcService::default();
+            let starlet = StarletGrpcService;
             let starlet = proto::staros::starlet_server::StarletServer::new(starlet)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
@@ -677,7 +677,7 @@ pub fn start_grpc_exchange_server(host: &str, port: u16) -> Result<(), String> {
                 .expect("parse standalone grpc bind addr");
             let mut shutdown = shutdown_rx.clone();
 
-            let svc = GrpcService::default();
+            let svc = GrpcService;
             let svc = proto::novarocks::nova_rocks_grpc_server::NovaRocksGrpcServer::new(svc)
                 .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);

@@ -45,6 +45,12 @@ impl NoopSinkFactory {
     }
 }
 
+impl Default for NoopSinkFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OperatorFactory for NoopSinkFactory {
     fn name(&self) -> &str {
         &self.name

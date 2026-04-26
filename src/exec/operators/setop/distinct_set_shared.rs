@@ -101,11 +101,11 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
             (rows, hashes)
         };
 
-        for row in 0..num_rows {
+        for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
             let row_bytes = rows.row(row).data();
             let lookup = {
                 let table = guard.key_table.as_mut().expect("key table");
-                table.find_or_insert_from_row(&key_views, row, row_bytes, hashes[row])?
+                table.find_or_insert_from_row(&key_views, row, row_bytes, hash)?
             };
             if lookup.is_new {
                 if lookup.group_id != guard.markers.len() {
@@ -139,11 +139,11 @@ impl<S: DistinctSetSemantics> DistinctSetSharedState<S> {
             (rows, hashes)
         };
 
-        for row in 0..num_rows {
+        for (row, hash) in hashes.iter().copied().enumerate().take(num_rows) {
             let row_bytes = rows.row(row).data();
             let group_id_opt = {
                 let table = guard.key_table.as_ref().expect("key table");
-                table.lookup_serialized(row_bytes, hashes[row])?
+                table.lookup_serialized(row_bytes, hash)?
             };
             let Some(group_id) = group_id_opt else {
                 continue;

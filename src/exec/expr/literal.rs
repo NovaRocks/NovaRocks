@@ -63,9 +63,7 @@ pub fn eval(value: &LiteralValue, len: usize) -> Result<ArrayRef, String> {
             Ok(Arc::new(arr))
         }
         LiteralValue::Binary(v) => {
-            let values = std::iter::repeat(v.as_slice())
-                .take(len)
-                .collect::<Vec<&[u8]>>();
+            let values = std::iter::repeat_n(v.as_slice(), len).collect::<Vec<&[u8]>>();
             let arr = BinaryArray::from_vec(values);
             Ok(Arc::new(arr))
         }

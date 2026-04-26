@@ -46,10 +46,10 @@ pub(crate) fn plan_runtime_filters(
     let mut join_targets: Vec<(FragmentId, usize, i32)> = Vec::new();
     for fr in fragment_results.iter() {
         for (idx, node) in fr.plan.nodes.iter().enumerate() {
-            if node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE {
-                if is_rf_eligible_join_op(node) {
-                    join_targets.push((fr.fragment_id, idx, node.node_id));
-                }
+            if node.node_type == plan_nodes::TPlanNodeType::HASH_JOIN_NODE
+                && is_rf_eligible_join_op(node)
+            {
+                join_targets.push((fr.fragment_id, idx, node.node_id));
             }
         }
     }
@@ -214,10 +214,11 @@ fn is_rf_eligible_join_op(node: &plan_nodes::TPlanNode) -> bool {
 /// Extract (slot_id, tuple_id) from a TExpr if it is a simple SlotRef.
 /// Returns None for complex expressions (v1 limitation).
 fn extract_slot_ref(expr: &exprs::TExpr) -> Option<(i32, i32)> {
-    if expr.nodes.len() == 1 && expr.nodes[0].node_type == exprs::TExprNodeType::SLOT_REF {
-        if let Some(ref sr) = expr.nodes[0].slot_ref {
-            return Some((sr.slot_id, sr.tuple_id));
-        }
+    if expr.nodes.len() == 1
+        && expr.nodes[0].node_type == exprs::TExprNodeType::SLOT_REF
+        && let Some(ref sr) = expr.nodes[0].slot_ref
+    {
+        return Some((sr.slot_id, sr.tuple_id));
     }
     None
 }

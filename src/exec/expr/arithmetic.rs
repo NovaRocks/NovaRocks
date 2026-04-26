@@ -914,45 +914,45 @@ fn nullify_zeros(arr: &ArrayRef) -> ArrayRef {
     match arr.data_type() {
         DataType::Int8 => {
             if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int8Array>() {
-                for i in 0..len {
+                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
                     if !a.is_null(i) && a.value(i) == 0 {
-                        is_zero_buf[i] = true;
+                        *is_zero = true;
                     }
                 }
             }
         }
         DataType::Int16 => {
             if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int16Array>() {
-                for i in 0..len {
+                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
                     if !a.is_null(i) && a.value(i) == 0 {
-                        is_zero_buf[i] = true;
+                        *is_zero = true;
                     }
                 }
             }
         }
         DataType::Int32 => {
             if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Int32Array>() {
-                for i in 0..len {
+                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
                     if !a.is_null(i) && a.value(i) == 0 {
-                        is_zero_buf[i] = true;
+                        *is_zero = true;
                     }
                 }
             }
         }
         DataType::Int64 => {
             if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                for i in 0..len {
+                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
                     if !a.is_null(i) && a.value(i) == 0 {
-                        is_zero_buf[i] = true;
+                        *is_zero = true;
                     }
                 }
             }
         }
         DataType::Float64 => {
             if let Some(a) = arr.as_any().downcast_ref::<Float64Array>() {
-                for i in 0..len {
+                for (i, is_zero) in is_zero_buf.iter_mut().enumerate().take(len) {
                     if !a.is_null(i) && a.value(i) == 0.0 {
-                        is_zero_buf[i] = true;
+                        *is_zero = true;
                     }
                 }
             }
