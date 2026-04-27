@@ -126,6 +126,29 @@ impl HadoopFileSystemCatalog {
         let namespace = ident.namespace().join("/");
         format!("{}/{}", namespace, ident.name())
     }
+
+    /// Read the current version hint from the filesystem and, if valid, insert
+    /// the resolved metadata location into the in-memory cache.
+    ///
+    /// Returns `Some(metadata_location)` when the table exists on disk, or
+    /// `None` when `version-hint.text` is absent or unparseable.  Both
+    /// `load_table` and `table_exists` delegate to this helper so that every
+    /// filesystem probe also populates the cache, making subsequent calls
+    /// cache-hit fast.
+    async fn try_cache_existing_table(&self, table: &TableIdent) -> Option<String> {
+        let table_location = self.table_location(table);
+        let version = self.read_version_hint(&table_location).await;
+        if version == 0 {
+            return None;
+        }
+        let metadata_location = Self::metadata_path(&table_location, version);
+        let key = Self::table_key(table);
+        self.tables
+            .lock()
+            .await
+            .insert(key, metadata_location.clone());
+        Some(metadata_location)
+    }
 }
 
 #[async_trait]
@@ -213,16 +236,27 @@ impl Catalog for HadoopFileSystemCatalog {
     }
 
     /// Load a table from its registered metadata location.
+    ///
+    /// When the table is not in the in-memory registry (e.g. after a server
+    /// restart or when a different catalog instance created the table), this
+    /// falls back to reading `version-hint.text` from the filesystem to locate
+    /// the current metadata file.
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
         let key = Self::table_key(table);
         let metadata_location = {
-            let guard = self.tables.lock().await;
-            guard.get(&key).cloned().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::FeatureUnsupported,
-                    format!("table not found: {}", key),
-                )
-            })?
+            let cached = self.tables.lock().await.get(&key).cloned();
+            if let Some(loc) = cached {
+                loc
+            } else {
+                // Fall back to filesystem: read version-hint.text written by
+                // create_table and populate the cache via try_cache_existing_table.
+                self.try_cache_existing_table(table).await.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::FeatureUnsupported,
+                        format!("table not found: {}", key),
+                    )
+                })?
+            }
         };
 
         let metadata = TableMetadata::read_from(&self.file_io, &metadata_location)
@@ -240,12 +274,32 @@ impl Catalog for HadoopFileSystemCatalog {
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         let key = Self::table_key(table);
         self.tables.lock().await.remove(&key);
+
+        // Physically delete the table's warehouse directory (metadata/ and data/
+        // sub-directories) so that files are not left orphaned after DROP.
+        // The table location follows the Hadoop catalog convention:
+        //   <warehouse>/<namespace>/<table>
+        let table_location = self.table_location(table);
+        if let Err(e) = self.file_io.delete_prefix(&table_location).await {
+            // Log but do not propagate — the in-memory and SQLite state has
+            // already been removed, so the drop must be considered successful
+            // even if the filesystem cleanup fails (e.g. table files were never
+            // written because creation failed mid-way).
+            tracing::warn!(
+                "drop_table: failed to delete warehouse files for {table_location}: {e}"
+            );
+        }
         Ok(())
     }
 
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
         let key = Self::table_key(table);
-        Ok(self.tables.lock().await.contains_key(&key))
+        if self.tables.lock().await.contains_key(&key) {
+            return Ok(true);
+        }
+        // Fall back to filesystem: check version-hint.text and populate the
+        // in-memory cache so that a subsequent load_table call is cache-hot.
+        Ok(self.try_cache_existing_table(table).await.is_some())
     }
 
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()> {

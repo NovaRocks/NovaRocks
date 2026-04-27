@@ -1082,10 +1082,10 @@ mod mv_target_tests {
     };
     use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
     use crate::connector::starrocks::managed::store::{
-        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
-        ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
-        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
+        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
+        ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
+        SqliteMetadataStore, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
+        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
     use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
@@ -1514,6 +1514,8 @@ mod mv_target_tests {
                 region: None,
                 enable_path_style_access: Some(true),
             },
+            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_iceberg_warehouse_location: None,
         };
         let active_tablet_root = format!("{metadata_root}/db_1/table_10/partition_20");
         let tablet_schema = aggregate_primary_key_tablet_schema();
@@ -1647,6 +1649,9 @@ mod mv_target_tests {
                 last_refresh_rows: Some(1),
                 last_refresh_snapshots: BTreeMap::new(),
                 created_at_ms: 1,
+                storage_engine: ManagedMvStorageEngine::ManagedLake,
+                iceberg_table_identifier: None,
+                last_refreshed_iceberg_snapshot_id: None,
             }],
         };
 
@@ -1854,6 +1859,7 @@ mod mv_target_tests {
         )
     }
 
+    #[allow(clippy::large_enum_variant)]
     enum MvFixtureStorage {
         Local,
         ObjectStore(ManagedLakeConfig),
@@ -1887,6 +1893,8 @@ mod mv_target_tests {
                         region: None,
                         enable_path_style_access: Some(true),
                     },
+                    mv_default_storage_engine: "managed_lake".to_string(),
+                    mv_iceberg_warehouse_location: None,
                 };
                 (
                     config,
@@ -2101,6 +2109,9 @@ mod mv_target_tests {
                     last_refresh_rows: Some(0),
                     last_refresh_snapshots: std::collections::BTreeMap::new(),
                     created_at_ms: 1,
+                    storage_engine: ManagedMvStorageEngine::ManagedLake,
+                    iceberg_table_identifier: None,
+                    last_refreshed_iceberg_snapshot_id: None,
                 }]
             } else {
                 vec![]
@@ -2202,6 +2213,8 @@ mod mv_target_tests {
                 region: None,
                 enable_path_style_access: Some(true),
             },
+            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_iceberg_warehouse_location: None,
         })
     }
 

@@ -33,10 +33,10 @@ use crate::connector::starrocks::managed::ddl::{
 };
 use crate::connector::starrocks::managed::mv_shape::{AggregateMvShape, IncrementalMvShape};
 use crate::connector::starrocks::managed::store::{
-    IcebergTableRef, ManagedMvRefreshMode, ManagedPartitionState, ManagedTableKind,
-    ManagedTableState, ManagedTxnState, StoredManagedIndex, StoredManagedPartition,
-    StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
-    StoredMaterializedView,
+    IcebergTableRef, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedPartitionState,
+    ManagedTableKind, ManagedTableState, ManagedTxnState, StoredManagedIndex,
+    StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+    StoredManagedTxn, StoredMaterializedView,
 };
 use crate::standalone::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
@@ -88,6 +88,18 @@ pub(crate) fn extract_base_table_refs(
     Ok(out)
 }
 
+pub(crate) fn resolve_mv_storage_engine(
+    properties: &[(String, String)],
+    default_from_config: &str,
+) -> Result<ManagedMvStorageEngine, String> {
+    let property = properties
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("storage_engine"))
+        .map(|(_, v)| v.as_str());
+    let raw = property.unwrap_or(default_from_config);
+    ManagedMvStorageEngine::parse_sql_str(raw)
+}
+
 pub(crate) fn create_mv(
     state: &Arc<StandaloneState>,
     current_database: &str,
@@ -107,6 +119,20 @@ pub(crate) fn create_mv(
                 "materialized view or table already exists: {db_name}.{mv_name}"
             ));
         }
+    }
+
+    let default_engine = state
+        .managed_lake_config
+        .as_ref()
+        .map(|c| c.mv_default_storage_engine.as_str())
+        .unwrap_or("managed_lake");
+    let storage_engine = resolve_mv_storage_engine(&stmt.properties, default_engine)?;
+    if storage_engine == ManagedMvStorageEngine::Iceberg {
+        return crate::connector::starrocks::managed::mv_refresh_iceberg::create_iceberg_mv(
+            state,
+            current_database,
+            stmt,
+        );
     }
 
     let managed_config = state
@@ -257,6 +283,9 @@ pub(crate) fn create_mv(
         last_refresh_rows: None,
         last_refresh_snapshots: Default::default(),
         created_at_ms: now_ms(),
+        storage_engine: ManagedMvStorageEngine::ManagedLake,
+        iceberg_table_identifier: None,
+        last_refreshed_iceberg_snapshot_id: None,
     });
 
     let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot.clone())?;
@@ -355,6 +384,44 @@ pub(crate) fn drop_mv(
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
+
+    // Dispatch to the iceberg drop path when the MV's storage engine is
+    // Iceberg. We use the `storage_engine` field in the SQLite snapshot
+    // (the canonical authoritative gate) rather than the secondary
+    // `iceberg_table_identifier` column. Note: `mv_refresh.rs` currently
+    // uses the `iceberg_table_identifier` lookup as its gate; both gates
+    // are functionally equivalent for any well-formed MV (storage_engine
+    // and iceberg_table_identifier are set together by insert_iceberg_mv_row),
+    // but consolidating both onto `storage_engine` is a follow-up cleanup.
+    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
+        "managed lake drop materialized view requires sqlite metadata store".to_string()
+    })?;
+    {
+        let snapshot = metadata_store.load_snapshot()?.managed;
+        let is_iceberg = snapshot.materialized_views.iter().any(|mv| {
+            mv.storage_engine == ManagedMvStorageEngine::Iceberg
+                && snapshot.tables.iter().any(|t| {
+                    t.table_id == mv.mv_id
+                        && t.name == mv_name
+                        && t.db_id == {
+                            snapshot
+                                .databases
+                                .iter()
+                                .find(|db| db.name == db_name)
+                                .map(|db| db.db_id)
+                                .unwrap_or(-1)
+                        }
+                })
+        });
+        if is_iceberg {
+            return crate::connector::starrocks::managed::mv_refresh_iceberg::drop_iceberg_mv(
+                state,
+                current_database,
+                stmt,
+            );
+        }
+    }
+
     let runtime = {
         let managed = state
             .managed_lake
@@ -386,6 +453,7 @@ pub(crate) fn drop_mv(
             "`{db_name}.{mv_name}` is not a materialized view; use DROP TABLE instead"
         ));
     }
+
     crate::connector::starrocks::managed::ddl::drop_managed_table(state, &db_name, &mv_name)?;
     Ok(StatementResult::Ok)
 }
@@ -425,6 +493,7 @@ pub(crate) fn list_mvs(
         rows.push(ShowMvRow {
             name: table.name.clone(),
             database,
+            storage_engine: mv.storage_engine.as_sql_str().to_string(),
             refresh_mode: mv.refresh_mode.as_sql_str().to_string(),
             last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
@@ -447,12 +516,12 @@ pub(crate) fn list_mvs(
 }
 
 #[derive(Clone, Debug)]
-struct MvAnalysis {
-    resolved_refs: Vec<ResolvedTableRef>,
-    output_columns: Vec<OutputColumn>,
+pub(crate) struct MvAnalysis {
+    pub resolved_refs: Vec<ResolvedTableRef>,
+    pub output_columns: Vec<OutputColumn>,
 }
 
-fn analyze_mv_select(
+pub(crate) fn analyze_mv_select(
     state: &Arc<StandaloneState>,
     current_database: &str,
     query: &sqlparser::ast::Query,
@@ -533,7 +602,10 @@ fn validate_aggregate_distribution_columns(
     Ok(())
 }
 
-fn resolve_mv_name(name: &ObjectName, current_database: &str) -> Result<(String, String), String> {
+pub(crate) fn resolve_mv_name(
+    name: &ObjectName,
+    current_database: &str,
+) -> Result<(String, String), String> {
     match name.parts.as_slice() {
         [table] => Ok((
             normalize_identifier(current_database)?,
@@ -723,6 +795,7 @@ pub(crate) fn arrow_data_type_to_sql_type(data_type: &DataType) -> Result<SqlTyp
 struct ShowMvRow {
     name: String,
     database: String,
+    storage_engine: String,
     refresh_mode: String,
     last_refresh_time: Option<String>,
     last_refresh_rows: Option<String>,
@@ -740,6 +813,12 @@ fn build_mv_rows_result(rows: &[ShowMvRow]) -> Result<QueryResult, String> {
         },
         QueryResultColumn {
             name: "Database".to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: None,
+        },
+        QueryResultColumn {
+            name: "StorageEngine".to_string(),
             data_type: DataType::Utf8,
             nullable: false,
             logical_type: None,
@@ -779,6 +858,7 @@ fn build_mv_rows_result(rows: &[ShowMvRow]) -> Result<QueryResult, String> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("Name", DataType::Utf8, false),
         Field::new("Database", DataType::Utf8, false),
+        Field::new("StorageEngine", DataType::Utf8, false),
         Field::new("RefreshMode", DataType::Utf8, false),
         Field::new("LastRefreshTime", DataType::Utf8, true),
         Field::new("LastRefreshRows", DataType::Utf8, true),
@@ -794,6 +874,11 @@ fn build_mv_rows_result(rows: &[ShowMvRow]) -> Result<QueryResult, String> {
         Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| Some(row.database.clone()))
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| Some(row.storage_engine.clone()))
                 .collect::<Vec<_>>(),
         )),
         Arc::new(StringArray::from(
@@ -830,7 +915,7 @@ fn build_mv_rows_result(rows: &[ShowMvRow]) -> Result<QueryResult, String> {
     })
 }
 
-fn alloc_id(next_id: &mut i64) -> i64 {
+pub(crate) fn alloc_id(next_id: &mut i64) -> i64 {
     if *next_id <= 0 {
         *next_id = 1;
     }
@@ -839,7 +924,7 @@ fn alloc_id(next_id: &mut i64) -> i64 {
     id
 }
 
-fn find_or_create_managed_database(
+pub(crate) fn find_or_create_managed_database(
     snapshot: &mut crate::connector::starrocks::managed::store::ManagedSnapshot,
     database_name: &str,
 ) -> crate::connector::starrocks::managed::store::StoredManagedDatabase {
@@ -859,7 +944,7 @@ fn find_or_create_managed_database(
     database
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -1087,5 +1172,39 @@ GROUP BY k1",
             "err={err}"
         );
         assert!(err.contains("hidden column name collision"), "err={err}");
+    }
+
+    #[test]
+    fn create_mv_routes_iceberg_storage_engine_to_phase4_path() {
+        let stmt_sql = "CREATE MATERIALIZED VIEW analytics.mv1 \
+            DISTRIBUTED BY HASH(k) BUCKETS 2 \
+            PROPERTIES('storage_engine' = 'iceberg') \
+            AS SELECT k FROM ice.ns.t";
+        let stmt = parse_create_mv(stmt_sql);
+        // resolve_storage_engine takes (PROPERTIES, default_from_config) and returns the resolved enum.
+        let resolved =
+            resolve_mv_storage_engine(&stmt.properties, "managed_lake").expect("resolve");
+        assert_eq!(resolved, ManagedMvStorageEngine::Iceberg);
+    }
+
+    #[test]
+    fn create_mv_uses_default_when_property_missing() {
+        let stmt_sql = "CREATE MATERIALIZED VIEW analytics.mv1 \
+            DISTRIBUTED BY HASH(k) BUCKETS 2 \
+            AS SELECT k FROM ice.ns.t";
+        let stmt = parse_create_mv(stmt_sql);
+        let resolved = resolve_mv_storage_engine(&stmt.properties, "iceberg").expect("resolve");
+        assert_eq!(resolved, ManagedMvStorageEngine::Iceberg);
+    }
+
+    #[test]
+    fn create_mv_rejects_unknown_storage_engine() {
+        let stmt_sql = "CREATE MATERIALIZED VIEW analytics.mv1 \
+            DISTRIBUTED BY HASH(k) BUCKETS 2 \
+            PROPERTIES('storage_engine' = 'duckdb') \
+            AS SELECT k FROM ice.ns.t";
+        let stmt = parse_create_mv(stmt_sql);
+        let err = resolve_mv_storage_engine(&stmt.properties, "managed_lake").unwrap_err();
+        assert!(err.contains("duckdb"));
     }
 }

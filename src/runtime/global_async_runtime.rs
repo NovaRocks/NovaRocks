@@ -58,10 +58,21 @@ pub fn data_block_on<F>(future: F) -> Result<F::Output, String>
 where
     F: Future,
 {
-    if Handle::try_current().is_ok() {
-        return Err("data_block_on cannot run inside an async runtime context".to_string());
-    }
     let runtime = data_runtime()?;
+    if Handle::try_current().is_ok() {
+        // Path A: Caller is on a thread that has a Tokio runtime handle (e.g. a
+        // `task::spawn_blocking` closure inside the standalone server's request
+        // handler).  `block_in_place` detects we are on a blocking thread (NOT a
+        // worker thread) and simply runs the closure directly without suspending
+        // any async task.  Using it instead of `Handle::block_on` lets us call
+        // `runtime.block_on` on the *separate* data runtime safely.
+        //
+        // True async task callers (poll-context worker threads) must NOT reach this
+        // path — `block_in_place` from a worker would still allow runtime.block_on
+        // on the same runtime to deadlock. We rely on the convention that all DDL
+        // is dispatched through `task::spawn_blocking`.
+        return Ok(tokio::task::block_in_place(|| runtime.block_on(future)));
+    }
     Ok(runtime.block_on(future))
 }
 
@@ -95,11 +106,17 @@ mod tests {
     }
 
     #[test]
-    fn data_block_on_rejects_nested_runtime_context() {
+    fn data_block_on_via_block_in_place_from_runtime_context() {
+        // Exercises the `Handle::try_current().is_ok()` branch — specifically the
+        // case where `runtime.block_on` drives the outer async context, which
+        // `block_in_place` treats as a blocking thread regardless of whether the
+        // call site is a literal `spawn_blocking` closure or a `block_on` call.
+        // In production DDL all paths go through `task::spawn_blocking`, but the
+        // behaviour of `block_in_place` is identical in both cases.
         let runtime = data_runtime().expect("get data runtime");
-        let err = runtime.block_on(async {
-            data_block_on(async { 1_u8 }).expect_err("must reject nested block_on")
+        let value = runtime.block_on(async {
+            data_block_on(async { 1_u8 }).expect("block_in_place succeeds from runtime context")
         });
-        assert!(err.contains("cannot run inside an async runtime context"));
+        assert_eq!(value, 1_u8);
     }
 }

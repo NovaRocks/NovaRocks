@@ -145,6 +145,34 @@ pub(crate) struct StoredMaterializedView {
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: std::collections::BTreeMap<String, i64>,
     pub created_at_ms: i64,
+    pub storage_engine: ManagedMvStorageEngine,
+    pub iceberg_table_identifier: Option<String>,
+    pub last_refreshed_iceberg_snapshot_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManagedMvStorageEngine {
+    ManagedLake,
+    Iceberg,
+}
+
+impl ManagedMvStorageEngine {
+    pub(crate) fn as_sql_str(self) -> &'static str {
+        match self {
+            Self::ManagedLake => "managed_lake",
+            Self::Iceberg => "iceberg",
+        }
+    }
+
+    pub(crate) fn parse_sql_str(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "managed_lake" => Ok(Self::ManagedLake),
+            "iceberg" => Ok(Self::Iceberg),
+            _ => Err(format!(
+                "unknown materialized view storage_engine `{value}`"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +305,23 @@ pub(crate) struct UpdateMvRefreshMetadataRequest {
     pub table_id: i64,
     pub last_refresh_rows: i64,
     pub snapshots: std::collections::BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UpdateMvIcebergRefreshMetadataRequest {
+    pub table_id: i64,
+    pub last_refresh_rows: i64,
+    pub snapshots: std::collections::BTreeMap<String, i64>,
+    pub iceberg_snapshot_id: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InsertIcebergMvRowRequest {
+    pub mv_id: i64,
+    pub select_sql: String,
+    pub base_table_refs: Vec<IcebergTableRef>,
+    pub iceberg_table_identifier: String,
+    pub created_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -821,8 +866,11 @@ impl SqliteMetadataStore {
                         last_refresh_ms,
                         last_refresh_rows,
                         last_refresh_snapshots_json,
-                        created_at_ms
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        created_at_ms,
+                        storage_engine,
+                        iceberg_table_identifier,
+                        last_refreshed_iceberg_snapshot_id
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         mv.mv_id,
                         mv.select_sql,
@@ -832,6 +880,9 @@ impl SqliteMetadataStore {
                         mv.last_refresh_rows,
                         snapshots_json,
                         mv.created_at_ms,
+                        mv.storage_engine.as_sql_str(),
+                        mv.iceberg_table_identifier,
+                        mv.last_refreshed_iceberg_snapshot_id,
                     ],
                 )
                 .map_err(|e| format!("insert materialized_view failed: {e}"))?;
@@ -1315,6 +1366,68 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    pub(crate) fn update_mv_iceberg_refresh_metadata(
+        &self,
+        request: UpdateMvIcebergRefreshMetadataRequest,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let snapshots_json = serde_json::to_string(&request.snapshots)
+            .map_err(|e| format!("serialize iceberg refresh snapshots failed: {e}"))?;
+        let changed = conn
+            .execute(
+                "UPDATE materialized_views
+                 SET last_refresh_ms = strftime('%s','now') * 1000,
+                     last_refresh_rows = ?1,
+                     last_refresh_snapshots_json = ?2,
+                     last_refreshed_iceberg_snapshot_id = ?3
+                 WHERE mv_id = ?4",
+                params![
+                    request.last_refresh_rows,
+                    snapshots_json,
+                    request.iceberg_snapshot_id,
+                    request.table_id
+                ],
+            )
+            .map_err(|e| format!("update mv iceberg refresh metadata failed: {e}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "materialized view {} metadata row not found",
+                request.table_id
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insert_iceberg_mv_row(
+        &self,
+        request: InsertIcebergMvRowRequest,
+    ) -> Result<(), String> {
+        let conn = self.connection()?;
+        let base_refs_json = serde_json::to_string(&request.base_table_refs)
+            .map_err(|e| format!("serialize base_table_refs failed: {e}"))?;
+        conn.execute(
+            "INSERT INTO materialized_views(
+                mv_id, select_sql, refresh_mode, base_table_refs_json,
+                last_refresh_ms, last_refresh_rows, last_refresh_snapshots_json,
+                created_at_ms, storage_engine, iceberg_table_identifier,
+                last_refreshed_iceberg_snapshot_id
+            ) VALUES (
+                ?1, ?2, 'DEFERRED_MANUAL', ?3,
+                NULL, NULL, NULL,
+                ?4, 'iceberg', ?5, NULL
+            )",
+            rusqlite::params![
+                request.mv_id,
+                request.select_sql,
+                base_refs_json,
+                request.created_at_ms,
+                request.iceberg_table_identifier,
+            ],
+        )
+        .map_err(|e| format!("insert iceberg mv row failed: {e}"))?;
+        Ok(())
+    }
+
     pub(crate) fn enqueue_erase_job_for_partition_root(
         &self,
         table_id: i64,
@@ -1619,6 +1732,29 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    /// Delete the `materialized_views` row and the corresponding `tables` row
+    /// for an iceberg-backed MV in a single atomic transaction.
+    ///
+    /// Unlike `purge_retired_table_metadata`, this helper does not require the
+    /// table to be in `DROPPING` state.  Iceberg-backed MVs have no tablets,
+    /// partitions, schemas, or indexes so those DELETE statements are omitted.
+    pub(crate) fn delete_iceberg_mv_row(&self, table_id: i64) -> Result<(), String> {
+        let conn = self.connection()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin delete_iceberg_mv_row transaction failed: {e}"))?;
+        tx.execute(
+            "DELETE FROM materialized_views WHERE mv_id = ?1",
+            params![table_id],
+        )
+        .map_err(|e| format!("delete materialized_views row for iceberg mv failed: {e}"))?;
+        tx.execute("DELETE FROM tables WHERE table_id = ?1", params![table_id])
+            .map_err(|e| format!("delete tables row for iceberg mv failed: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit delete_iceberg_mv_row failed: {e}"))?;
+        Ok(())
+    }
+
     pub(crate) fn purge_retired_partition_metadata(&self, partition_id: i64) -> Result<(), String> {
         let conn = self.connection()?;
         let tx = conn.unchecked_transaction().map_err(|e| {
@@ -1828,13 +1964,20 @@ impl SqliteMetadataStore {
         let current_version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|e| format!("read standalone metadata schema version failed: {e}"))?;
-        if current_version != 0 && current_version != 4 && current_version != 5 {
+        if current_version != 0
+            && current_version != 4
+            && current_version != 5
+            && current_version != 6
+        {
             return Err(format!(
                 "unsupported standalone metadata schema version {current_version}; delete the metadata db and reopen"
             ));
         }
         if current_version == 4 {
             migrate_schema_v4_to_v5(&conn)?;
+        }
+        if current_version == 4 || current_version == 5 {
+            migrate_schema_v5_to_v6(&conn)?;
         }
         conn.execute_batch(
             "
@@ -1939,7 +2082,10 @@ impl SqliteMetadataStore {
                 last_refresh_ms INTEGER,
                 last_refresh_rows INTEGER,
                 last_refresh_snapshots_json TEXT,
-                created_at_ms INTEGER NOT NULL
+                created_at_ms INTEGER NOT NULL,
+                storage_engine TEXT NOT NULL DEFAULT 'managed_lake',
+                iceberg_table_identifier TEXT,
+                last_refreshed_iceberg_snapshot_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS iceberg_catalogs (
                 name TEXT PRIMARY KEY,
@@ -1956,7 +2102,7 @@ impl SqliteMetadataStore {
                 table_name TEXT NOT NULL,
                 PRIMARY KEY (catalog_name, namespace_name, table_name)
             );
-            PRAGMA user_version = 5;
+            PRAGMA user_version = 6;
             ",
         )
         .map_err(|e| format!("initialize standalone metadata schema failed: {e}"))?;
@@ -2261,7 +2407,10 @@ impl SqliteMetadataStore {
                         last_refresh_ms,
                         last_refresh_rows,
                         last_refresh_snapshots_json,
-                        created_at_ms
+                        created_at_ms,
+                        storage_engine,
+                        iceberg_table_identifier,
+                        last_refreshed_iceberg_snapshot_id
                      FROM materialized_views
                      ORDER BY mv_id",
                 )
@@ -2279,6 +2428,9 @@ impl SqliteMetadataStore {
                             Some(s) => serde_json::from_str(&s).map_err(json_to_sql_error)?,
                             None => std::collections::BTreeMap::new(),
                         };
+                    let storage_engine =
+                        ManagedMvStorageEngine::parse_sql_str(&row.get::<_, String>(8)?)
+                            .map_err(invalid_state_sql_error)?;
                     Ok(StoredMaterializedView {
                         mv_id: row.get(0)?,
                         select_sql: row.get(1)?,
@@ -2288,6 +2440,9 @@ impl SqliteMetadataStore {
                         last_refresh_rows: row.get(5)?,
                         last_refresh_snapshots: snapshots,
                         created_at_ms: row.get(7)?,
+                        storage_engine,
+                        iceberg_table_identifier: row.get(9)?,
+                        last_refreshed_iceberg_snapshot_id: row.get(10)?,
                     })
                 })
                 .map_err(|e| format!("query materialized_views failed: {e}"))?;
@@ -2402,6 +2557,51 @@ fn migrate_schema_v4_to_v5(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("PRAGMA user_version = 5;")
         .map_err(|e| {
             format!("migrate standalone metadata schema v4 to v5 failed setting version: {e}")
+        })?;
+    Ok(())
+}
+
+fn migrate_schema_v5_to_v6(conn: &Connection) -> Result<(), String> {
+    // The materialized_views table was introduced in v5 DDL. When migrating from v4, the table
+    // may not yet exist — in that case the fresh DDL CREATE TABLE IF NOT EXISTS will create it
+    // with all columns already present, so we only need to ALTER when the table exists.
+    let mv_table_exists: bool = {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='materialized_views'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("check materialized_views table existence failed: {e}"))?;
+        count > 0
+    };
+    if mv_table_exists {
+        if !table_column_exists(conn, "materialized_views", "storage_engine")? {
+            conn.execute_batch(
+                "ALTER TABLE materialized_views ADD COLUMN storage_engine TEXT NOT NULL DEFAULT 'managed_lake';",
+            )
+            .map_err(|e| format!("migrate standalone metadata schema v5 to v6 failed adding storage_engine: {e}"))?;
+        }
+        if !table_column_exists(conn, "materialized_views", "iceberg_table_identifier")? {
+            conn.execute_batch(
+                "ALTER TABLE materialized_views ADD COLUMN iceberg_table_identifier TEXT;",
+            )
+            .map_err(|e| format!("migrate standalone metadata schema v5 to v6 failed adding iceberg_table_identifier: {e}"))?;
+        }
+        if !table_column_exists(
+            conn,
+            "materialized_views",
+            "last_refreshed_iceberg_snapshot_id",
+        )? {
+            conn.execute_batch(
+                "ALTER TABLE materialized_views ADD COLUMN last_refreshed_iceberg_snapshot_id INTEGER;",
+            )
+            .map_err(|e| format!("migrate standalone metadata schema v5 to v6 failed adding last_refreshed_iceberg_snapshot_id: {e}"))?;
+        }
+    }
+    conn.execute_batch("PRAGMA user_version = 6;")
+        .map_err(|e| {
+            format!("migrate standalone metadata schema v5 to v6 failed setting version: {e}")
         })?;
     Ok(())
 }
@@ -2545,13 +2745,14 @@ mod tests {
     use prost::Message;
 
     use super::{
-        ActivateMvRefreshRequest, IcebergTableRef, ManagedEraseJobKind, ManagedEraseJobState,
-        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedPartitionState,
-        ManagedSnapshot, ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
-        StageManagedTruncateRequest, StageMvRefreshRequest, StoredManagedColumn,
-        StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex, StoredManagedPartition,
-        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
-        StoredMaterializedView, UpdateMvRefreshMetadataRequest,
+        ActivateMvRefreshRequest, IcebergTableRef, InsertIcebergMvRowRequest, ManagedEraseJobKind,
+        ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode,
+        ManagedMvStorageEngine, ManagedPartitionState, ManagedSnapshot, ManagedTableKind,
+        ManagedTableState, ManagedTxnState, SqliteMetadataStore, StageManagedTruncateRequest,
+        StageMvRefreshRequest, StoredManagedColumn, StoredManagedDatabase, StoredManagedEraseJob,
+        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
+        StoredManagedTablet, StoredManagedTxn, StoredMaterializedView,
+        UpdateMvRefreshMetadataRequest,
     };
 
     #[test]
@@ -2847,6 +3048,9 @@ mod tests {
             last_refresh_rows: Some(3),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
             created_at_ms: 1,
+            storage_engine: ManagedMvStorageEngine::ManagedLake,
+            iceberg_table_identifier: None,
+            last_refreshed_iceberg_snapshot_id: None,
         });
         store.replace_managed_snapshot(&snapshot).expect("persist");
 
@@ -2885,6 +3089,9 @@ mod tests {
             last_refresh_rows: Some(2),
             last_refresh_snapshots: std::collections::BTreeMap::new(),
             created_at_ms: 1,
+            storage_engine: ManagedMvStorageEngine::ManagedLake,
+            iceberg_table_identifier: None,
+            last_refreshed_iceberg_snapshot_id: None,
         });
         store.replace_managed_snapshot(&snapshot).expect("persist");
         let prepared = store.prepare_txn(10, 20, 1).expect("prepare");
@@ -3288,7 +3495,7 @@ mod tests {
     }
 
     #[test]
-    fn init_schema_v5_creates_tables_with_kind_and_materialized_views_table() {
+    fn init_schema_v6_creates_tables_with_kind_and_materialized_views_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
             .expect("open fresh store");
@@ -3297,7 +3504,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         // `tables` must have the new `kind` column with the expected default and check.
         let kind_col_exists: i64 = conn
@@ -3337,12 +3544,15 @@ mod tests {
                 "last_refresh_rows",
                 "last_refresh_snapshots_json",
                 "created_at_ms",
+                "storage_engine",
+                "iceberg_table_identifier",
+                "last_refreshed_iceberg_snapshot_id",
             ],
         );
     }
 
     #[test]
-    fn init_schema_v5_creates_table_column_flags() {
+    fn init_schema_v6_creates_table_column_flags() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
             .expect("open fresh store");
@@ -3351,7 +3561,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let cols: Vec<(String, String, i64)> = {
             let mut stmt = conn
@@ -3498,7 +3708,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let visible_col_exists: i64 = conn
             .query_row(
@@ -3678,6 +3888,9 @@ mod tests {
                     map
                 },
                 created_at_ms: 1_699_999_999_000,
+                storage_engine: ManagedMvStorageEngine::ManagedLake,
+                iceberg_table_identifier: None,
+                last_refreshed_iceberg_snapshot_id: None,
             }],
         };
 
@@ -3775,6 +3988,9 @@ mod tests {
             last_refresh_rows: None,
             last_refresh_snapshots: std::collections::BTreeMap::new(),
             created_at_ms: 1_700_000_000_000,
+            storage_engine: ManagedMvStorageEngine::ManagedLake,
+            iceberg_table_identifier: None,
+            last_refreshed_iceberg_snapshot_id: None,
         });
         snapshot
     }
@@ -3930,5 +4146,209 @@ mod tests {
         let loaded = store.load_snapshot().expect("reload").managed;
         assert!(loaded.tables.is_empty());
         assert!(loaded.materialized_views.is_empty());
+    }
+
+    #[test]
+    fn init_schema_v6_creates_storage_engine_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite"))
+            .expect("open fresh store");
+        let conn = store.connection().expect("connection");
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 6);
+
+        let cols: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, type, \"notnull\"
+                     FROM pragma_table_info('materialized_views')
+                     WHERE name IN ('storage_engine','iceberg_table_identifier','last_refreshed_iceberg_snapshot_id')
+                     ORDER BY cid",
+                )
+                .expect("prepare");
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+        };
+        assert_eq!(
+            cols,
+            vec![
+                ("storage_engine".to_string(), "TEXT".to_string(), 1),
+                (
+                    "iceberg_table_identifier".to_string(),
+                    "TEXT".to_string(),
+                    0
+                ),
+                (
+                    "last_refreshed_iceberg_snapshot_id".to_string(),
+                    "INTEGER".to_string(),
+                    0
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn init_schema_migrates_v5_materialized_views_storage_engine() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "
+            CREATE TABLE materialized_views (
+                mv_id INTEGER PRIMARY KEY,
+                select_sql TEXT NOT NULL,
+                refresh_mode TEXT NOT NULL DEFAULT 'DEFERRED_MANUAL',
+                base_table_refs_json TEXT NOT NULL,
+                last_refresh_ms INTEGER,
+                last_refresh_rows INTEGER,
+                last_refresh_snapshots_json TEXT,
+                created_at_ms INTEGER NOT NULL
+            );
+            INSERT INTO materialized_views(
+                mv_id, select_sql, refresh_mode, base_table_refs_json, created_at_ms
+            ) VALUES (
+                42, 'SELECT 1', 'DEFERRED_MANUAL', '[]', 0
+            );
+            PRAGMA user_version = 5;
+            ",
+            )
+            .expect("seed v5");
+        }
+
+        let store = SqliteMetadataStore::open(&path).expect("open migrates v5");
+        let conn = store.connection().expect("connection");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user_version");
+        assert_eq!(version, 6);
+
+        let storage_engine: String = conn
+            .query_row(
+                "SELECT storage_engine FROM materialized_views WHERE mv_id = 42",
+                [],
+                |row| row.get(0),
+            )
+            .expect("storage_engine value");
+        assert_eq!(storage_engine, "managed_lake");
+    }
+
+    #[test]
+    fn managed_mv_storage_engine_parse_sql_str_is_case_insensitive() {
+        assert_eq!(
+            ManagedMvStorageEngine::parse_sql_str("iceberg").unwrap(),
+            ManagedMvStorageEngine::Iceberg
+        );
+        assert_eq!(
+            ManagedMvStorageEngine::parse_sql_str("ICEBERG").unwrap(),
+            ManagedMvStorageEngine::Iceberg
+        );
+        assert_eq!(
+            ManagedMvStorageEngine::parse_sql_str("Iceberg").unwrap(),
+            ManagedMvStorageEngine::Iceberg
+        );
+        assert_eq!(
+            ManagedMvStorageEngine::parse_sql_str("MANAGED_LAKE").unwrap(),
+            ManagedMvStorageEngine::ManagedLake
+        );
+        let err = ManagedMvStorageEngine::parse_sql_str("DuckDB").unwrap_err();
+        assert!(
+            err.contains("DuckDB"),
+            "preserves original casing in error: {err}"
+        );
+    }
+
+    #[test]
+    fn delete_iceberg_mv_row_removes_both_mv_and_tables_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
+
+        // Bootstrap: persist global meta + a database so FK constraints are
+        // satisfied for the `tables` insert.
+        let mut snapshot = ManagedSnapshot::default();
+        snapshot.global.warehouse_uri = "s3://bucket/warehouse".to_string();
+        snapshot.global.next_db_id = 2;
+        snapshot.global.next_table_id = 2;
+        snapshot.databases.push(StoredManagedDatabase {
+            db_id: 1,
+            name: "analytics".to_string(),
+        });
+        // Insert the `tables` row that the iceberg MV row will reference via FK.
+        snapshot.tables.push(StoredManagedTable {
+            table_id: 1,
+            db_id: 1,
+            name: "mv_orders".to_string(),
+            keys_type: "DUP_KEYS".to_string(),
+            bucket_num: 0,
+            current_schema_id: 0,
+            state: ManagedTableState::Active,
+            kind: ManagedTableKind::MaterializedView,
+        });
+        store
+            .replace_managed_snapshot(&snapshot)
+            .expect("persist snapshot");
+
+        // Insert the iceberg MV row (references tables.table_id = 1).
+        store
+            .insert_iceberg_mv_row(InsertIcebergMvRowRequest {
+                mv_id: 1,
+                select_sql: "SELECT k1 FROM cat.ns.orders".to_string(),
+                base_table_refs: vec![IcebergTableRef {
+                    catalog: "cat".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders".to_string(),
+                }],
+                iceberg_table_identifier: "__nova_mv__.analytics.mv_orders".to_string(),
+                created_at_ms: 1_700_000_000_000,
+            })
+            .expect("insert iceberg mv row");
+
+        // Verify the rows exist before deletion.
+        let before = store.load_snapshot().expect("load before").managed;
+        assert!(
+            before.tables.iter().any(|t| t.table_id == 1),
+            "tables row must exist before delete"
+        );
+        assert!(
+            before.materialized_views.iter().any(|mv| mv.mv_id == 1),
+            "materialized_views row must exist before delete"
+        );
+
+        // Call the function under test.
+        store
+            .delete_iceberg_mv_row(1)
+            .expect("delete_iceberg_mv_row must succeed");
+
+        // Both rows must be gone.
+        let conn = store.connection().expect("connection");
+        let mv_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM materialized_views WHERE mv_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count materialized_views");
+        assert_eq!(mv_count, 0, "materialized_views row must be deleted");
+
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tables WHERE table_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count tables");
+        assert_eq!(table_count, 0, "tables row must be deleted");
     }
 }

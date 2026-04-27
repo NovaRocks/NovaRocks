@@ -29,7 +29,7 @@ pub(crate) fn looks_like_create_materialized_view(parser: &Parser<'_>) -> bool {
 ///   DISTRIBUTED BY HASH(col, ...) [BUCKETS n]
 ///   [REFRESH DEFERRED MANUAL]    -- IMMEDIATE / ASYNC rejected
 ///   [ORDER BY ...]               -- rejected
-///   [PROPERTIES(...)]            -- parsed and dropped
+///   [PROPERTIES(...)]            -- parsed and retained on the AST node
 ///   AS <query>`
 pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<Statement, String> {
     parser
@@ -78,12 +78,14 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
         return Err("ORDER BY is not supported on materialized views yet".to_string());
     }
 
-    // Optional PROPERTIES(...) — parsed and dropped in Phase 1. Note:
+    // Optional PROPERTIES(...) — parsed and retained on the AST node. Note:
     // PROPERTIES is not a sqlparser keyword, so we detect it textually.
-    if peek_word_eq(parser, 0, "PROPERTIES") {
+    let properties = if peek_word_eq(parser, 0, "PROPERTIES") {
         parser.next_token(); // PROPERTIES
-        parse_and_drop_properties(parser)?;
-    }
+        parse_properties(parser)?
+    } else {
+        Vec::new()
+    };
 
     parser
         .expect_keyword(Keyword::AS)
@@ -104,6 +106,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
             refresh_manual_explicit,
             select_sql,
             select_query: *query,
+            properties,
         },
     ))
 }
@@ -174,33 +177,35 @@ fn parse_refresh_clause(parser: &mut Parser<'_>) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Parse `(k = v, ...)` and discard — PROPERTIES contents are ignored in
-/// Phase 1 because MV storage and replication are managed by the lake.
-fn parse_and_drop_properties(parser: &mut Parser<'_>) -> Result<(), String> {
+/// Parse `(k = v, ...)` and return the key-value pairs.
+fn parse_properties(parser: &mut Parser<'_>) -> Result<Vec<(String, String)>, String> {
     parser
         .expect_token(&Token::LParen)
         .map_err(|e| format!("expected ( after PROPERTIES: {e}"))?;
+    let mut out = Vec::new();
     loop {
         if parser.consume_token(&Token::RParen) {
             break;
         }
-        let _key = parser
+        let key = parser
             .parse_literal_string()
             .map_err(|e| format!("parse MV property key failed: {e}"))?;
         parser
             .expect_token(&Token::Eq)
             .map_err(|e| format!("expected = in MV property: {e}"))?;
-        let _val = parser
+        let value = parser
             .parse_literal_string()
             .map_err(|e| format!("parse MV property value failed: {e}"))?;
-        if !parser.consume_token(&Token::Comma) {
-            parser
-                .expect_token(&Token::RParen)
-                .map_err(|e| format!("expected , or ) in MV properties: {e}"))?;
-            break;
+        out.push((key, value));
+        if parser.consume_token(&Token::Comma) {
+            continue;
         }
+        parser
+            .expect_token(&Token::RParen)
+            .map_err(|e| format!("expected ) or , in PROPERTIES: {e}"))?;
+        break;
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Check if the current position looks like `DROP MATERIALIZED VIEW ...`.
@@ -372,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_create_mv_with_if_not_exists_and_comment_and_properties_ignored() {
+    fn parse_create_mv_with_if_not_exists_and_comment_and_properties_parsed() {
         let stmt = parse_one(
             "CREATE MATERIALIZED VIEW IF NOT EXISTS mv1 \
              COMMENT 'demo' \
@@ -549,6 +554,25 @@ mod tests {
             err_where.to_lowercase().contains("where")
                 || err_where.to_lowercase().contains("not supported"),
             "err={err_where}"
+        );
+    }
+
+    #[test]
+    fn parse_create_materialized_view_keeps_storage_engine_property() {
+        let sql = "CREATE MATERIALIZED VIEW mv1 \
+            DISTRIBUTED BY HASH(k) BUCKETS 2 \
+            PROPERTIES('storage_engine' = 'iceberg', 'comment' = 'demo') \
+            AS SELECT k, v FROM ice.ns.t";
+        let stmt = parse_one(sql);
+        let crate::sql::parser::ast::Statement::CreateMaterializedView(create) = stmt else {
+            panic!("expected CREATE MATERIALIZED VIEW");
+        };
+        assert_eq!(
+            create.properties,
+            vec![
+                ("storage_engine".to_string(), "iceberg".to_string()),
+                ("comment".to_string(), "demo".to_string()),
+            ],
         );
     }
 }

@@ -504,6 +504,16 @@ fn build_concurrent_limit_layer() -> ConcurrentLimitLayer {
         .clone()
 }
 
+/// Return the effective S3 region string.
+///
+/// An absent or empty region defaults to `"us-east-1"` — the value required
+/// by AWS-compatible object stores when no region is configured (e.g. MinIO).
+/// Both this module and `mv_iceberg_catalog` use the same default, so we
+/// centralise the logic here.
+pub(crate) fn effective_s3_region(region: Option<&str>) -> &str {
+    region.filter(|r| !r.is_empty()).unwrap_or("us-east-1")
+}
+
 fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> {
     let endpoint = normalize_s3_endpoint(&cfg.endpoint)?;
     let local_endpoint = is_local_endpoint(&endpoint);
@@ -512,7 +522,7 @@ fn build_raw_object_store_operator(cfg: &ObjectStoreConfig) -> Result<Operator> 
     let mut builder = opendal::services::S3::default()
         .endpoint(&endpoint)
         .bucket(&cfg.bucket)
-        .region(cfg.region.as_deref().unwrap_or("us-east-1"))
+        .region(effective_s3_region(cfg.region.as_deref()))
         .access_key_id(&cfg.access_key_id)
         .secret_access_key(&cfg.access_key_secret);
     if !use_path_style {
@@ -698,8 +708,9 @@ pub fn normalize_oss_path(full: &str, bucket: &str, root: &str) -> Result<String
 mod tests {
     use super::{
         DEFAULT_OSS_IO_TIMEOUT_MS, DEFAULT_OSS_TIMEOUT_MS, ObjectStoreRetrySettings,
-        build_timeout_layer, effective_io_timeout_ms, effective_timeout_ms, normalize_oss_path,
-        normalize_s3_endpoint, prefer_virtual_host_style, should_use_path_style,
+        build_timeout_layer, effective_io_timeout_ms, effective_s3_region, effective_timeout_ms,
+        normalize_oss_path, normalize_s3_endpoint, prefer_virtual_host_style,
+        should_use_path_style,
     };
     use crate::fs::object_store::ObjectStoreConfig;
     use std::collections::BTreeMap;
@@ -847,5 +858,20 @@ mod tests {
         assert_eq!(effective_timeout_ms(&cfg), None);
         assert_eq!(effective_io_timeout_ms(&cfg), None);
         assert!(build_timeout_layer(&cfg).is_none());
+    }
+
+    #[test]
+    fn effective_s3_region_defaults_empty_string_to_us_east_1() {
+        assert_eq!(effective_s3_region(Some("")), "us-east-1");
+    }
+
+    #[test]
+    fn effective_s3_region_returns_provided_region() {
+        assert_eq!(effective_s3_region(Some("eu-west-1")), "eu-west-1");
+    }
+
+    #[test]
+    fn effective_s3_region_defaults_none_to_us_east_1() {
+        assert_eq!(effective_s3_region(None), "us-east-1");
     }
 }

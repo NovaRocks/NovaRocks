@@ -74,6 +74,29 @@ pub(crate) fn refresh_mv(
         .ok_or_else(|| "managed lake mv refresh requires sqlite metadata store".to_string())?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
 
+    // For iceberg-backed MVs the `managed_lake` catalog does not hold a
+    // `tables_by_name` entry (iceberg MVs have no tablet schema row), so we
+    // check the SQLite snapshot first.  An iceberg MV row always has a
+    // non-null `iceberg_table_identifier` column.  If found, hand off to
+    // `refresh_iceberg_mv` before attempting the managed-lake catalog lookup.
+    {
+        use crate::connector::starrocks::managed::mv_iceberg_catalog::NOVA_MV_CATALOG_NAME;
+        let snapshot = metadata_store.load_snapshot()?.managed;
+        let expected_iceberg_id = format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}");
+        let is_iceberg = snapshot
+            .materialized_views
+            .iter()
+            .any(|mv| mv.iceberg_table_identifier.as_deref() == Some(expected_iceberg_id.as_str()));
+        if is_iceberg {
+            drop(_refresh_guard);
+            return crate::connector::starrocks::managed::mv_refresh_iceberg::refresh_iceberg_mv(
+                state,
+                current_database,
+                stmt,
+            );
+        }
+    }
+
     let runtime = {
         let managed = state
             .managed_lake
@@ -479,7 +502,21 @@ fn run_mv_select_and_chunks(ctx: MvRefreshContext) -> Result<Vec<Chunk>, String>
     query_result_to_chunks(result)
 }
 
-fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, String> {
+/// Run the MV SELECT against the base table and return the resulting chunks.
+/// Wrapper around `run_mv_select_and_chunks` for use by the iceberg refresh path.
+pub(crate) fn run_mv_full_select_chunks(
+    state: &Arc<StandaloneState>,
+    database: &str,
+    select_sql: &str,
+) -> Result<Vec<Chunk>, String> {
+    run_mv_select_and_chunks(MvRefreshContext {
+        state: Arc::clone(state),
+        database: database.to_string(),
+        select_sql: select_sql.to_string(),
+    })
+}
+
+pub(crate) fn query_result_to_chunks(result: QueryResult) -> Result<Vec<Chunk>, String> {
     result
         .chunks
         .into_iter()
@@ -618,7 +655,7 @@ fn normalize_three_part_base_table(
     Ok((catalog.clone(), namespace.clone(), table.clone()))
 }
 
-fn load_current_iceberg_base_table(
+pub(crate) fn load_current_iceberg_base_table(
     state: &Arc<StandaloneState>,
     table_ref: &IcebergTableRef,
 ) -> Result<crate::connector::iceberg::catalog::IcebergLoadedTable, String> {
@@ -632,7 +669,10 @@ fn load_current_iceberg_base_table(
     load_table(&entry, &table_ref.namespace, &table_ref.table)
 }
 
-fn single_snapshot_map(table_ref: &IcebergTableRef, snapshot_id: i64) -> BTreeMap<String, i64> {
+pub(crate) fn single_snapshot_map(
+    table_ref: &IcebergTableRef,
+    snapshot_id: i64,
+) -> BTreeMap<String, i64> {
     let mut snapshots = BTreeMap::new();
     snapshots.insert(table_ref.fqn(), snapshot_id);
     snapshots
@@ -771,10 +811,10 @@ mod tests {
         table_columns_from_physical_columns,
     };
     use crate::connector::starrocks::managed::store::{
-        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedSnapshot,
-        ManagedTableKind, ManagedTableState, SqliteMetadataStore, StoredManagedDatabase,
-        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
-        StoredManagedTablet, StoredMaterializedView,
+        ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
+        ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
@@ -1128,6 +1168,9 @@ mod tests {
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),
             created_at_ms: 1,
+            storage_engine: ManagedMvStorageEngine::ManagedLake,
+            iceberg_table_identifier: None,
+            last_refreshed_iceberg_snapshot_id: None,
         });
         store
             .replace_managed_snapshot(&snapshot)
@@ -1246,6 +1289,9 @@ mod tests {
                 last_refresh_rows: None,
                 last_refresh_snapshots: BTreeMap::new(),
                 created_at_ms: 1,
+                storage_engine: ManagedMvStorageEngine::ManagedLake,
+                iceberg_table_identifier: None,
+                last_refreshed_iceberg_snapshot_id: None,
             }],
         };
         store.replace_managed_snapshot(&snapshot)?;
@@ -1373,6 +1419,8 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
+            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_iceberg_warehouse_location: None,
         })
     }
 
@@ -1425,6 +1473,8 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
+            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_iceberg_warehouse_location: None,
         }
     }
 }

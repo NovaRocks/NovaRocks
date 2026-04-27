@@ -1288,6 +1288,8 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
             },
+            mv_default_storage_engine: "managed_lake".to_string(),
+            mv_iceberg_warehouse_location: None,
         }
     }
 

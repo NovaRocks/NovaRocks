@@ -64,6 +64,10 @@ pub(crate) struct CreateMaterializedViewStmt {
     /// re-parsing on every REFRESH in Phase 1.
     pub select_sql: String,
     pub select_query: sqlparser::ast::Query,
+    /// Key-value pairs from `PROPERTIES(...)`, retained for later semantic
+    /// interpretation (e.g. `storage_engine`). Empty when the clause is
+    /// absent.
+    pub properties: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
