@@ -336,4 +336,4 @@ cargo run --manifest-path tests/sql-test-runner/Cargo.toml --bin sql-tests -- \
 
 ## 10. StarRocks Reference Code Location
 
-For StarRocks side-by-side reference implementation, use: `~/worktree/starrocks/main`
+For StarRocks side-by-side reference implementation, use: `~/project/starrocks`
