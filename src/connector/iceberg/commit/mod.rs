@@ -27,6 +27,7 @@ mod collector;
 mod data_file;
 mod fast_append;
 mod helpers;
+mod overwrite;
 mod row_delta;
 mod types;
 mod validation;
@@ -35,6 +36,7 @@ pub use abort::{AbortLog, CleanupError};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use fast_append::FastAppendCommit;
+pub use overwrite::OverwriteCommit;
 pub use row_delta::RowDeltaCommit;
 pub use types::{CommitOpKind, CommitOutcome, WrittenFile};
 pub use validation::{
