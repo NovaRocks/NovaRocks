@@ -26,8 +26,8 @@
 //! file path is mirrored into the [`AbortLog`] so that a later commit failure
 //! can clean up via OpenDAL.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use iceberg::TableIdent;
 use iceberg::spec::{Literal, PartitionSpecRef, PrimitiveType, SchemaRef, Struct, Transform, Type};
@@ -49,6 +49,14 @@ pub struct IcebergCommitCollector {
     pub staging_dir: String,
     pub finst_id: UniqueId,
     pub abort_log: Arc<AbortLog>,
+    /// Files supplied directly by the engine layer when it bypasses the
+    /// IcebergSink path (e.g. standalone INSERT/DELETE that uses iceberg-rust
+    /// `DataFileWriter` directly, mirroring phase4a). When non-empty,
+    /// [`take_written_files`] returns these instead of draining
+    /// [`runtime::sink_commit`]. [`AbortLog`] entries are still recorded
+    /// because abort cleanup applies regardless of which channel produced
+    /// the file.
+    injected: Mutex<Vec<WrittenFile>>,
     committed: AtomicBool,
 }
 
@@ -74,14 +82,40 @@ impl IcebergCommitCollector {
             staging_dir,
             finst_id,
             abort_log: Arc::new(AbortLog::new()),
+            injected: Mutex::new(Vec::new()),
             committed: AtomicBool::new(false),
         }
     }
 
-    /// Drain the per-fragment-instance `sink_commit` entries and convert each
-    /// `TIcebergDataFile` into a [`WrittenFile`]. Each path is also recorded
-    /// in the [`AbortLog`] so a commit failure can later clean up.
+    /// Pre-load a written file into the collector. Used by the standalone
+    /// engine when it writes data files via iceberg-rust `DataFileWriter`
+    /// directly (no IcebergSink in the loop). Each path is recorded in the
+    /// [`AbortLog`] so abort cleanup still works.
+    pub fn inject_written_file(&self, wf: WrittenFile) {
+        self.abort_log.record_data_file(wf.path.clone());
+        self.injected
+            .lock()
+            .expect("collector injected lock poisoned")
+            .push(wf);
+    }
+
+    /// Returns the [`WrittenFile`] set produced by this query.
+    ///
+    /// If the engine pre-loaded files via [`inject_written_file`], those are
+    /// returned and the per-fragment-instance `sink_commit` table is left
+    /// untouched. Otherwise the collector drains
+    /// [`runtime::sink_commit::list`] and converts each `TIcebergDataFile`
+    /// into a [`WrittenFile`].
     pub fn take_written_files(&self) -> Result<Vec<WrittenFile>, String> {
+        {
+            let mut guard = self
+                .injected
+                .lock()
+                .expect("collector injected lock poisoned");
+            if !guard.is_empty() {
+                return Ok(std::mem::take(&mut *guard));
+            }
+        }
         let infos = crate::runtime::sink_commit::list(self.finst_id);
         let mut out = Vec::with_capacity(infos.len());
         for info in infos {
