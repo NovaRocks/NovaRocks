@@ -42,6 +42,7 @@ libm = "0.2"
 num-traits = "0.2"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
+as-any = "0.3"
 opensrv-mysql = { version = "0.7", default-features = false }
 
 # starust core
