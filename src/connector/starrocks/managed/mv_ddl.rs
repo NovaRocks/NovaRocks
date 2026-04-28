@@ -145,6 +145,25 @@ pub(crate) fn create_mv(
 
     let analysis = analyze_mv_select(state, current_database, &stmt.select_query)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
+
+    // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
+    // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
+    // unchanged.
+    if let Some(pk_cols) = stmt.primary_key.as_deref() {
+        if base_refs.len() != 1 {
+            return Err(
+                "PRIMARY KEY on materialized view requires exactly one iceberg base table"
+                    .to_string(),
+            );
+        }
+        let base_ref = &base_refs[0];
+        let loaded = crate::connector::starrocks::managed::mv_refresh::load_current_iceberg_base_table(
+            state, base_ref,
+        )?;
+        let descriptor = descriptor_from_loaded(&loaded);
+        validate_ivm_primary_key(pk_cols, &descriptor).map_err(|e| e.to_string())?;
+    }
+
     let distribution = stmt
         .distribution
         .as_ref()
@@ -464,6 +483,28 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
             | "TIMESTAMP"
             | "DECIMAL"
     )
+}
+
+/// Build the `BaseTableDescriptor` projection from an already-loaded
+/// iceberg table. Used by `create_mv` and `create_iceberg_mv` before
+/// invoking `validate_ivm_primary_key`.
+pub(crate) fn descriptor_from_loaded(
+    loaded: &crate::connector::iceberg::catalog::IcebergLoadedTable,
+) -> BaseTableDescriptor {
+    let format_version = loaded.table.metadata().format_version() as i32;
+    let columns = loaded
+        .columns
+        .iter()
+        .map(|col| BaseColumnDescriptor {
+            name: col.name.clone(),
+            sql_type: format!("{}", col.data_type),
+            nullable: col.nullable,
+        })
+        .collect();
+    BaseTableDescriptor {
+        format_version,
+        columns,
+    }
 }
 
 pub(crate) fn drop_mv(
