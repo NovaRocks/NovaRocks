@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
+use arrow::datatypes::DataType;
 use futures::StreamExt;
 use iceberg::Catalog;
 use iceberg::expr::{Predicate, Reference};
@@ -396,16 +397,22 @@ async fn scan_for_position_deletes(
             .schema()
             .index_of("_pos")
             .map_err(|_| "scan batch missing `_pos` column".to_string())?;
-        let file_arr = batch
-            .column(file_idx)
+        // iceberg-rust encodes constant virtual columns (`_file`) as REE
+        // (RunEndEncoded) arrays for memory efficiency. Cast to a plain
+        // primitive type before downcasting — `arrow::compute::cast`
+        // unwraps REE transparently.
+        let file_col = arrow::compute::cast(batch.column(file_idx), &DataType::Utf8)
+            .map_err(|e| format!("cast _file to Utf8 failed: {e}"))?;
+        let pos_col = arrow::compute::cast(batch.column(pos_idx), &DataType::Int64)
+            .map_err(|e| format!("cast _pos to Int64 failed: {e}"))?;
+        let file_arr = file_col
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| "_file column not Utf8".to_string())?;
-        let pos_arr = batch
-            .column(pos_idx)
+            .ok_or_else(|| "_file column not Utf8 after cast".to_string())?;
+        let pos_arr = pos_col
             .as_any()
             .downcast_ref::<Int64Array>()
-            .ok_or_else(|| "_pos column not Int64".to_string())?;
+            .ok_or_else(|| "_pos column not Int64 after cast".to_string())?;
         for i in 0..batch.num_rows() {
             if file_arr.is_null(i) || pos_arr.is_null(i) {
                 continue;

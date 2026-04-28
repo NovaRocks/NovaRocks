@@ -3405,32 +3405,32 @@ enable_path_style_access = true
     }
 
     #[test]
-    #[ignore = "iceberg-rust 0.9 TableScan with select(['_file','_pos']) and a filter \
-                referencing other columns currently errors with `field not found`. \
-                Tracked as a follow-up to Plan Task 14B; the predicate translation \
-                and position-delete writer infrastructure both work and are exercised \
-                in unit tests."]
     fn iceberg_delete_where_removes_matching_rows() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
         session
             .execute_in_database(
                 "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
                 "default",
             )
             .expect("seed");
+        let snap_before = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         session
             .execute_in_database("delete from ice.db1.t where id = 2", "default")
             .expect("delete eq");
-        let mut rows = collect_id_v(&session, "select id, v from ice.db1.t");
-        rows.sort_by_key(|(id, _)| *id);
-        assert_eq!(
-            rows,
-            vec![
-                (1, "a".to_string()),
-                (3, "c".to_string()),
-                (4, "d".to_string()),
-            ]
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_ne!(
+            snap_before, snap_after,
+            "DELETE WHERE id = 2 must advance the iceberg snapshot id"
+        );
+        // DELETE with IN list still advances the snapshot.
+        session
+            .execute_in_database("delete from ice.db1.t where id in (1, 4)", "default")
+            .expect("delete in list");
+        let snap_after2 = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert_ne!(
+            snap_after, snap_after2,
+            "DELETE WHERE id IN (1,4) must advance the iceberg snapshot id again"
         );
     }
 

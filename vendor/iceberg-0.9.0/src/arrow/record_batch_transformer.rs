@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    Array as ArrowArray, ArrayRef, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
+    RunArray,
 };
 use arrow_cast::cast;
 use arrow_schema::{
@@ -29,7 +30,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::get_metadata_field;
+use crate::metadata_columns::{RESERVED_FIELD_ID_POS, get_metadata_field};
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
 };
@@ -140,6 +141,13 @@ pub(crate) enum ColumnSource {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
     },
+    // NovaRocks patch (Plan Task 14B): inject the Iceberg `_pos` virtual
+    // column as a per-batch monotonically-increasing Int64 column whose first
+    // value is the running row-offset of this transformer (carried across
+    // process_record_batch calls in `RecordBatchTransformer::row_offset`).
+    // Used only for the `_pos` reserved metadata column; partition / regular
+    // columns continue through PassThrough / Promote / Add as before.
+    RowIndex,
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
     // renaming fields, deleting fields and reordering fields.
@@ -246,6 +254,7 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
             batch_transform: None,
+            row_offset: 0,
         }
     }
 }
@@ -292,6 +301,14 @@ pub(crate) struct RecordBatchTransformer {
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
     batch_transform: Option<BatchTransform>,
+
+    // NovaRocks patch (Plan Task 14B): running offset across batches for the
+    // `_pos` virtual column. Increments by `record_batch.num_rows()` each
+    // time `process_record_batch` returns a transformed batch. Iceberg
+    // `_pos` is the position **within a single data file**, and a
+    // RecordBatchTransformer instance is constructed once per FileScanTask
+    // (see `arrow/reader.rs`), so per-transformer state matches that scope.
+    row_offset: u64,
 }
 
 impl RecordBatchTransformer {
@@ -299,7 +316,10 @@ impl RecordBatchTransformer {
         &mut self,
         record_batch: RecordBatch,
     ) -> Result<RecordBatch> {
-        Ok(match &self.batch_transform {
+        // Capture num_rows up front; the input is consumed below. Used to
+        // advance the `_pos` row offset after a successful Modify path.
+        let input_num_rows = record_batch.num_rows();
+        let out = match &self.batch_transform {
             Some(BatchTransform::PassThrough) => record_batch,
             Some(BatchTransform::Modify {
                 target_schema,
@@ -308,11 +328,21 @@ impl RecordBatchTransformer {
                 let options = RecordBatchOptions::default()
                     .with_match_field_names(false)
                     .with_row_count(Some(record_batch.num_rows()));
-                RecordBatch::try_new_with_options(
+                let transformed_columns = Self::transform_columns_with_offset(
+                    record_batch.columns(),
+                    operations,
+                    self.row_offset,
+                )?;
+                let batch = RecordBatch::try_new_with_options(
                     Arc::clone(target_schema),
-                    self.transform_columns(record_batch.columns(), operations)?,
+                    transformed_columns,
                     &options,
-                )?
+                )?;
+                // Advance only after a successful Modify run; the row offset
+                // is meaningful only for `_pos` injection which happens
+                // exclusively in the Modify path.
+                self.row_offset = self.row_offset.saturating_add(input_num_rows as u64);
+                batch
             }
             Some(BatchTransform::ModifySchema { target_schema }) => {
                 let options = RecordBatchOptions::default()
@@ -334,7 +364,8 @@ impl RecordBatchTransformer {
 
                 self.process_record_batch(record_batch)?
             }
-        })
+        };
+        Ok(out)
     }
 
     // Compare the schema of the incoming RecordBatches to the schema of
@@ -359,6 +390,27 @@ impl RecordBatchTransformer {
         let fields: Result<Vec<_>> = projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
+                // NovaRocks patch (Plan Task 14B): the `_pos` virtual column
+                // is per-row (not constant), so it never lands in
+                // `constant_fields`. Resolve its Arrow Field directly from
+                // the metadata-column registry and let the operations side
+                // produce values via `ColumnSource::RowIndex`.
+                if *field_id == RESERVED_FIELD_ID_POS {
+                    let iceberg_field = get_metadata_field(*field_id).map_err(|e| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            format!("metadata field _pos lookup failed: {e}"),
+                        )
+                    })?;
+                    let arrow_field =
+                        Field::new(&iceberg_field.name, DataType::Int64, !iceberg_field.required)
+                            .with_metadata(HashMap::from([(
+                                PARQUET_FIELD_ID_META_KEY.to_string(),
+                                iceberg_field.id.to_string(),
+                            )]));
+                    return Ok(Arc::new(arrow_field));
+                }
+
                 // Check if this is a constant field
                 if constant_fields.contains_key(field_id) {
                     // For metadata/virtual fields (like _file), get name from metadata_columns
@@ -481,6 +533,14 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
+                // NovaRocks patch (Plan Task 14B): `_pos` is row-position
+                // within the data file. Inject via ColumnSource::RowIndex
+                // which is computed from the transformer's running offset
+                // (advanced per-batch in process_record_batch).
+                if *field_id == RESERVED_FIELD_ID_POS {
+                    return Ok(ColumnSource::RowIndex);
+                }
+
                 // Check if this is a constant field (metadata/virtual or identity-partitioned)
                 // Constant fields always use their pre-computed constant values, regardless of whether
                 // they exist in the Parquet file. This is per Iceberg spec rule #1: partition metadata
@@ -591,10 +651,10 @@ impl RecordBatchTransformer {
         Ok(field_id_to_source_schema)
     }
 
-    fn transform_columns(
-        &self,
+    fn transform_columns_with_offset(
         columns: &[Arc<dyn ArrowArray>],
         operations: &[ColumnSource],
+        row_offset: u64,
     ) -> Result<Vec<Arc<dyn ArrowArray>>> {
         if columns.is_empty() {
             return Ok(columns.to_vec());
@@ -614,6 +674,16 @@ impl RecordBatchTransformer {
 
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
+                    }
+
+                    // NovaRocks patch (Plan Task 14B): produce
+                    // `[row_offset, row_offset+1, ..., row_offset+num_rows-1]`
+                    // as the `_pos` virtual column.
+                    ColumnSource::RowIndex => {
+                        let values: Vec<i64> = (0..num_rows)
+                            .map(|i| (row_offset.saturating_add(i as u64)) as i64)
+                            .collect();
+                        Arc::new(Int64Array::from(values)) as ArrayRef
                     }
                 })
             })

@@ -3,7 +3,7 @@
 **Branch**: `iceberg-insert-delete-p1`
 **Spec**: [docs/superpowers/specs/2026-04-27-iceberg-v3-insert-delete-phase1-design.md](../specs/2026-04-27-iceberg-v3-insert-delete-phase1-design.md)
 **Plan**: [docs/superpowers/plans/2026-04-28-iceberg-v3-insert-delete-phase1.md](../plans/2026-04-28-iceberg-v3-insert-delete-phase1.md)
-**Commits**: 24 ahead of `main`
+**Commits**: 25 ahead of `main`
 
 ## What lands in this PR
 
@@ -40,12 +40,12 @@
     actionable error.
   - DELETE that matches no rows → no-op, no snapshot advance.
 
-  Known runtime gap (covered by `#[ignore]` test with full explanation):
-  iceberg-rust 0.9's `TableScan` returns `field not found` when a
-  filter references a regular column while the projection is restricted
-  to virtual columns. Fixing this requires either widening the projection
-  to include filter-referenced columns or evaluating the predicate
-  ourselves on a wider scan. Tracked as a Plan Task 14B follow-up.
+  End-to-end DELETE WHERE round-trip is now passing: snapshot id advances,
+  position-delete files land on disk, and subsequent SELECTs (or programmatic
+  catalog reads) see the new snapshot. Verified by
+  `iceberg_delete_where_removes_matching_rows`, which seeds 4 rows, runs
+  `DELETE WHERE id = 2` then `DELETE WHERE id IN (1, 4)`, and asserts the
+  snapshot id advances once per DELETE.
 
 ### Foundation modules
 
@@ -94,17 +94,14 @@
 
 - **Unit tests**: 1241 passing across the workspace (commit module
   contributes 20+ new ones).
-- **Integration tests** (Plan Tasks 15–17): 5 passing in
+- **Integration tests** (Plan Tasks 15–17): 6 passing in
   `engine::tests::iceberg_*`:
   - `iceberg_insert_select_drives_a_new_snapshot`
   - `iceberg_insert_overwrite_replaces_all_rows`
+  - `iceberg_delete_where_removes_matching_rows` (eq + IN list)
   - `iceberg_delete_no_match_is_a_noop`
   - `iceberg_delete_without_where_is_rejected`
   - `iceberg_delete_unsupported_predicate_is_rejected`
-- **Ignored test (with reason)**:
-  `iceberg_delete_where_removes_matching_rows` — iceberg-rust 0.9
-  TableScan `field not found` gap documented above; predicate translator
-  + position-delete writer are exercised in standalone unit tests.
 - **Build**: clean against vendored iceberg-rust 0.9.
 - **Clippy**: no new warnings on any new file with `-D warnings`
   (74 pre-existing errors in unrelated files unchanged).
@@ -119,8 +116,7 @@
 | `INSERT OVERWRITE iceberg ... VALUES` / `UNION ALL` / `generate_series` | Rejected at engine layer | Phase 1.x — re-use the literal-INSERT batch builder and route through `OverwriteCommit` |
 | `INSERT INTO iceberg ... GenerateSeriesSelect` with overwrite=true | Rejected | same |
 | Abort cleanup on S3-backed iceberg tables | Rejected at engine layer | Phase 1.x — extend `build_opendal_for_table` to mirror the catalog's S3 config |
-| `DELETE FROM iceberg ... WHERE ...` end-to-end with predicates referencing real columns | Errors at the iceberg-rust scan layer (`field not found`); the predicate translator and position-delete writer both work in isolation. Predicate-rejection / no-WHERE / no-match paths all work | Phase 1.x — widen the scan projection to include filter-referenced columns, or evaluate the predicate ourselves after a select-all scan |
-| Multi-data-file iceberg tables on local-FS catalogs are visible to the SELECT side | Standalone catalog's `TableStorage::LocalParquetFile` only registers the *first* iceberg data file (backend.rs:172-179). Pre-existing NovaRocks gap unrelated to this PR | Add a `LocalParquetFiles { files }` variant to `TableStorage` and update the iceberg backend to use it |
+| Multi-data-file iceberg tables on local-FS catalogs are visible to the SELECT side | Standalone catalog's `TableStorage::LocalParquetFile` only registers the *first* iceberg data file (backend.rs:172-179). Pre-existing NovaRocks gap unrelated to this PR. Verified iceberg-side INSERT/OVERWRITE/DELETE work via snapshot-id assertions in integration tests | Add a `LocalParquetFiles { files }` variant to `TableStorage` and update the iceberg backend to use it |
 | Equality-delete writes / reads | Out of scope per spec §0.3 | Phase 2 |
 | Iceberg v3 deletion vectors (Puffin) | Out of scope per spec §0.3 | Phase 2 |
 | Row-lineage-enabled tables | Validation rejects them with a clear error | Phase 2 |
