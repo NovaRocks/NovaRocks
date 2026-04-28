@@ -24,12 +24,15 @@
 mod abort;
 mod action;
 mod collector;
+mod data_file;
+mod fast_append;
 mod types;
 mod validation;
 
 pub use abort::{AbortLog, CleanupError};
 pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
+pub use fast_append::FastAppendCommit;
 pub use types::{CommitOpKind, CommitOutcome, WrittenFile};
 pub use validation::{
     ensure_no_equality_deletes, ensure_single_partition_spec, ensure_v3_writable,
