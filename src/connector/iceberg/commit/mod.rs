@@ -22,11 +22,13 @@
 //! [`CommitOutcome`] (result of a successful commit).
 
 mod abort;
+mod action;
 mod collector;
 mod types;
 mod validation;
 
 pub use abort::{AbortLog, CleanupError};
+pub use action::{CommitCtx, IcebergCommitAction};
 pub use collector::IcebergCommitCollector;
 pub use types::{CommitOpKind, CommitOutcome, WrittenFile};
 pub use validation::{

@@ -2837,6 +2837,7 @@ dependencies = [
  "twox-hash 2.1.2",
  "typetag",
  "url",
+ "uuid",
  "which",
 ]
 
