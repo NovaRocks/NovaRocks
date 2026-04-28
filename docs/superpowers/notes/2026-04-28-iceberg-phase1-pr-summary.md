@@ -3,7 +3,7 @@
 **Branch**: `iceberg-insert-delete-p1`
 **Spec**: [docs/superpowers/specs/2026-04-27-iceberg-v3-insert-delete-phase1-design.md](../specs/2026-04-27-iceberg-v3-insert-delete-phase1-design.md)
 **Plan**: [docs/superpowers/plans/2026-04-28-iceberg-v3-insert-delete-phase1.md](../plans/2026-04-28-iceberg-v3-insert-delete-phase1.md)
-**Commits**: 20 ahead of `main`
+**Commits**: 24 ahead of `main`
 
 ## What lands in this PR
 
@@ -23,13 +23,29 @@
   through the existing fast-append path at
   [`registry::insert_rows`](../../../src/connector/iceberg/catalog/registry.rs).
 
-### Plumbing in place but not yet driving execution
+### Plumbing in place but partially exercised end-to-end
 
 - **`DELETE FROM iceberg.<db>.<tbl> WHERE ...`** — the AST surface,
-  validation (`ensure_v3_writable` / `ensure_single_partition_spec` /
-  `ensure_no_equality_deletes`), and the `RowDeltaCommit` action are all
-  implemented. The actual SCAN + position-delete-file write is gated on
-  follow-up work in the analyzer (see "Known limitations" below).
+  validation, predicate translator (sqlparser → `iceberg::expr::Predicate`),
+  position-delete Parquet writer
+  ([`commit/position_delete_writer.rs`](../../../src/connector/iceberg/commit/position_delete_writer.rs)),
+  and `RowDeltaCommit` action are all implemented. iceberg-rust 0.9 ships
+  the `_file` / `_pos` virtual columns natively, so we use
+  `TableScan::select(['_file','_pos']).with_filter(predicate).with_row_selection_enabled(true)`
+  rather than touching the analyzer.
+
+  Active runtime paths:
+  - DELETE without WHERE → user-actionable error (Phase 1 NEG-3).
+  - DELETE with an unsupported predicate (LIKE / arithmetic / etc.) →
+    actionable error.
+  - DELETE that matches no rows → no-op, no snapshot advance.
+
+  Known runtime gap (covered by `#[ignore]` test with full explanation):
+  iceberg-rust 0.9's `TableScan` returns `field not found` when a
+  filter references a regular column while the projection is restricted
+  to virtual columns. Fixing this requires either widening the projection
+  to include filter-referenced columns or evaluating the predicate
+  ourselves on a wider scan. Tracked as a Plan Task 14B follow-up.
 
 ### Foundation modules
 
@@ -47,7 +63,8 @@
 | [`commit/helpers.rs`](../../../src/connector/iceberg/commit/helpers.rs) | snapshot id / now_ms / metadata-dir / manifest-list IO |
 | [`commit/run.rs`](../../../src/connector/iceberg/commit/run.rs) | `run_iceberg_commit` orchestrator with commit-unknown classification |
 | [`engine/iceberg_writer.rs`](../../../src/engine/iceberg_writer.rs) | Engine-side INSERT INTO / OVERWRITE entry point |
-| [`engine/delete_flow.rs`](../../../src/engine/delete_flow.rs) | Engine-side DELETE entry point (validation + plumbing; SCAN side TBD) |
+| [`engine/delete_flow.rs`](../../../src/engine/delete_flow.rs) | Engine-side DELETE entry point — validation, sqlparser→Predicate translator, scan-and-write driver, RowDeltaCommit dispatch |
+| [`commit/position_delete_writer.rs`](../../../src/connector/iceberg/commit/position_delete_writer.rs) | Minimal v2-compatible position-delete Parquet writer (iceberg-rust 0.9 doesn't ship one) |
 
 ### Vendor / dependency changes
 
@@ -75,14 +92,25 @@
 
 ## Test status
 
-- **Unit tests**: 1235 passing across the workspace (commit module
-  contributes 18+ new ones).
+- **Unit tests**: 1241 passing across the workspace (commit module
+  contributes 20+ new ones).
+- **Integration tests** (Plan Tasks 15–17): 5 passing in
+  `engine::tests::iceberg_*`:
+  - `iceberg_insert_select_drives_a_new_snapshot`
+  - `iceberg_insert_overwrite_replaces_all_rows`
+  - `iceberg_delete_no_match_is_a_noop`
+  - `iceberg_delete_without_where_is_rejected`
+  - `iceberg_delete_unsupported_predicate_is_rejected`
+- **Ignored test (with reason)**:
+  `iceberg_delete_where_removes_matching_rows` — iceberg-rust 0.9
+  TableScan `field not found` gap documented above; predicate translator
+  + position-delete writer are exercised in standalone unit tests.
 - **Build**: clean against vendored iceberg-rust 0.9.
 - **Clippy**: no new warnings on any new file with `-D warnings`
   (74 pre-existing errors in unrelated files unchanged).
-- **Integration tests** (Plan Tasks 15–19, IT-* / NEG-* / SQL regression
-  / fault-injection): **not in this PR**. They need a standalone-server
-  test harness wiring that's separate work; tracked as Phase 1.x.
+- **SQL regression suite + Fault injection** (Plan Tasks 18–19):
+  **not in this PR** — they need a standalone-server test harness that
+  is separate work; tracked as Phase 1.x.
 
 ## Known limitations (explicit `Err(...)` today)
 
@@ -91,7 +119,8 @@
 | `INSERT OVERWRITE iceberg ... VALUES` / `UNION ALL` / `generate_series` | Rejected at engine layer | Phase 1.x — re-use the literal-INSERT batch builder and route through `OverwriteCommit` |
 | `INSERT INTO iceberg ... GenerateSeriesSelect` with overwrite=true | Rejected | same |
 | Abort cleanup on S3-backed iceberg tables | Rejected at engine layer | Phase 1.x — extend `build_opendal_for_table` to mirror the catalog's S3 config |
-| `DELETE FROM iceberg ... WHERE ...` (execution) | Validates the table then errors with an action-oriented message | Phase 1.x (Plan Task 14B) — analyzer/planner must project iceberg `_file` / `_pos` virtual columns; the scan lowering layer at [`hdfs_scan.rs:420-440`](../../../src/lower/node/hdfs_scan.rs:420) already supports them |
+| `DELETE FROM iceberg ... WHERE ...` end-to-end with predicates referencing real columns | Errors at the iceberg-rust scan layer (`field not found`); the predicate translator and position-delete writer both work in isolation. Predicate-rejection / no-WHERE / no-match paths all work | Phase 1.x — widen the scan projection to include filter-referenced columns, or evaluate the predicate ourselves after a select-all scan |
+| Multi-data-file iceberg tables on local-FS catalogs are visible to the SELECT side | Standalone catalog's `TableStorage::LocalParquetFile` only registers the *first* iceberg data file (backend.rs:172-179). Pre-existing NovaRocks gap unrelated to this PR | Add a `LocalParquetFiles { files }` variant to `TableStorage` and update the iceberg backend to use it |
 | Equality-delete writes / reads | Out of scope per spec §0.3 | Phase 2 |
 | Iceberg v3 deletion vectors (Puffin) | Out of scope per spec §0.3 | Phase 2 |
 | Row-lineage-enabled tables | Validation rejects them with a clear error | Phase 2 |
