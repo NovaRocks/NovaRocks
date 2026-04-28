@@ -451,6 +451,32 @@ impl StandaloneSession {
         use sqlparser::ast as sqlast;
 
         let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+        // For MV DDL (CREATE/DROP/REFRESH/SHOW MATERIALIZED VIEW) we must
+        // propagate errors from our custom parser rather than falling through to
+        // the generic sqlparser-rs path, which would emit confusing diagnostics
+        // like "Expected AS, found DISTRIBUTED" for invalid PRIMARY KEY clauses.
+        {
+            let sr_dialect = StarRocksDialect;
+            if let Ok(ref peek_parser) =
+                sqlparser::parser::Parser::new(&sr_dialect).try_with_sql(&normalized)
+            {
+                use crate::sql::parser::dialect::materialized_view::{
+                    looks_like_create_materialized_view, looks_like_drop_materialized_view,
+                    looks_like_refresh_materialized_view, looks_like_show_materialized_views,
+                };
+                if looks_like_create_materialized_view(peek_parser)
+                    || looks_like_drop_materialized_view(peek_parser)
+                    || looks_like_refresh_materialized_view(peek_parser)
+                    || looks_like_show_materialized_views(peek_parser)
+                {
+                    let mut statements = crate::sql::parser::parse_sql(&normalized)?;
+                    let statement = statements
+                        .pop()
+                        .ok_or_else(|| "custom parser returned no statements".to_string())?;
+                    return dispatch_statement(&self.inner, current_database, statement);
+                }
+            }
+        }
         if let Ok(mut statements) = crate::sql::parser::parse_sql(&normalized) {
             let statement = statements
                 .pop()

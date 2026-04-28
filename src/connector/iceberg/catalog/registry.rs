@@ -1124,12 +1124,15 @@ fn build_iceberg_schema(columns: &[TableColumnDef]) -> Result<Schema, String> {
         .map(|(idx, column)| {
             let field_id =
                 i32::try_from(idx + 1).map_err(|_| "too many iceberg columns".to_string())?;
-            Ok(NestedField::optional(
-                field_id,
-                &column.name,
-                iceberg_type_for_sql_type(&column.data_type, &mut next_nested_field_id)?,
-            )
-            .into())
+            let iceberg_type =
+                iceberg_type_for_sql_type(&column.data_type, &mut next_nested_field_id)?;
+            // Honor NOT NULL: required = non-nullable, optional = nullable.
+            let nested = if column.nullable {
+                NestedField::optional(field_id, &column.name, iceberg_type)
+            } else {
+                NestedField::required(field_id, &column.name, iceberg_type)
+            };
+            Ok(nested.into())
         })
         .collect::<Result<Vec<_>, String>>()?;
     Schema::builder()
