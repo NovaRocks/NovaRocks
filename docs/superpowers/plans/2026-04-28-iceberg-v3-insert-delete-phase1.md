@@ -72,7 +72,7 @@ All file paths in this plan are relative to `src/` of the NovaRocks repo. All co
 
 ## Task 1: Spike — verify ManifestWriter status=DELETED entry path
 
-**Why:** Spec §7.1 — OverwriteCommit (Task 13) needs to write `ManifestEntry { status: ManifestStatus::Deleted }` for every base-snapshot data file. Need to verify whether iceberg-rust 0.9 `ManifestWriter` exposes a public path for this, and if not, identify the fallback (handcraft `ManifestEntry` and feed via internal avro encoding).
+**Why:** Spec §7.1 — OverwriteCommit (Task 10) needs to write `ManifestEntry { status: ManifestStatus::Deleted }` for every base-snapshot data file. Need to verify whether iceberg-rust 0.9 `ManifestWriter` exposes a public path for this, and if not, identify the fallback (handcraft `ManifestEntry` and feed via internal avro encoding).
 
 **Files:** Investigation only; output is a markdown note.
 
@@ -101,7 +101,7 @@ Verify `ManifestEntry` and `ManifestStatus::Deleted` are public.
 //! Scratch test: can we write a v2-data manifest containing one DELETED entry
 //! using iceberg-rust 0.9 public APIs?
 //!
-//! This test validates spec §7.1; the implementation in Task 13 depends on the
+//! This test validates spec §7.1; the implementation in Task 10 depends on the
 //! result. The test should be deleted after the spike is resolved.
 
 use iceberg::spec::{
@@ -182,7 +182,7 @@ Create `docs/superpowers/spikes/2026-04-28-manifest-deleted-entry.md`:
 // exact, compileable snippet
 \`\`\`
 
-## Implications for Task 13 (OverwriteCommit)
+## Implications for Task 10 (OverwriteCommit)
 
 [describe the helper signature: e.g. `pub(crate) fn write_deleted_entry(writer: &mut ManifestWriter, file: DataFile, base_seq: i64)`]
 
@@ -199,10 +199,10 @@ git commit -m "spike: verify ManifestWriter status=DELETED entry path
 
 Spec §7.1 spike. Documents which iceberg-rust 0.9 public API path
 supports writing ManifestEntry { status: Deleted } for OverwriteCommit
-(Task 13)."
+(Task 10)."
 ```
 
-**Halt condition:** If all three paths fail, STOP. Open a discussion: either pin a forked iceberg-rust, or change the OverwriteCommit strategy to "rewrite each base manifest with each entry's status flipped to DELETED" (more code, no new dependency). Do not proceed with Task 13 until resolved.
+**Halt condition:** If all three paths fail, STOP. Open a discussion: either pin a forked iceberg-rust, or change the OverwriteCommit strategy to "rewrite each base manifest with each entry's status flipped to DELETED" (more code, no new dependency). Do not proceed with Task 10 until resolved.
 
 ---
 
@@ -703,7 +703,7 @@ pub fn ensure_no_equality_deletes(table: &Table) -> Result<(), String> {
     // and just check that flag.
     let manifest_list_path = snap.manifest_list();
     let _ = manifest_list_path;
-    // Detailed implementation deferred to Task 13/14 helpers, which already
+    // Detailed implementation deferred to Task 9/10 helpers, which already
     // need to walk manifests for the OverwriteCommit path. For now, do the
     // best-effort check using the snapshot summary:
     if let Some(s) = snap.summary().additional_properties.get("total-equality-deletes") {
@@ -3268,7 +3268,7 @@ git commit -m "docs(test): cross-engine v3 round-trip procedure with first-run r
 **Files:**
 - Delete: `tests/scratch_manifest_deleted.rs`
 
-- [ ] **Step 1: Verify spike findings have been baked into Task 13**
+- [ ] **Step 1: Verify spike findings have been baked into Task 10**
 
 ```bash
 grep -n 'ManifestEntry::builder\|ManifestStatus::Deleted\|add_entry\|ManifestStatus' src/connector/iceberg/commit/overwrite.rs | head
