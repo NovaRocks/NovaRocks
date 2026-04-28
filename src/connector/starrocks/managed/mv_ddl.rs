@@ -485,6 +485,29 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
     )
 }
 
+/// Map an Arrow `DataType` to the SQL head token that
+/// `is_hashable_pk_type` recognizes. Returns the token only — no
+/// precision/scale or element-type tail. Anything not on the accepted
+/// list falls through to the Arrow Debug form (e.g. `Float32`,
+/// `List(...)`), which `is_hashable_pk_type` will then reject.
+fn arrow_data_type_pk_head(dt: &arrow::datatypes::DataType) -> String {
+    use arrow::datatypes::DataType;
+    match dt {
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INT".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "STRING".to_string(),
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "DECIMAL".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Timestamp(_, _) => "DATETIME".to_string(),
+        // Explicitly unsupported as PK: floats (NaN equality), booleans
+        // (degenerate cardinality), composites (no stable hash). Fall
+        // through to Debug form so is_hashable_pk_type rejects them.
+        other => format!("{other:?}"),
+    }
+}
+
 /// Build the `BaseTableDescriptor` projection from an already-loaded
 /// iceberg table. Used by `create_mv` and `create_iceberg_mv` before
 /// invoking `validate_ivm_primary_key`.
@@ -497,7 +520,7 @@ pub(crate) fn descriptor_from_loaded(
         .iter()
         .map(|col| BaseColumnDescriptor {
             name: col.name.clone(),
-            sql_type: format!("{}", col.data_type),
+            sql_type: arrow_data_type_pk_head(&col.data_type),
             nullable: col.nullable,
         })
         .collect();
@@ -1452,5 +1475,33 @@ GROUP BY k1",
             err,
             ChangeError::PrimaryKeyMissingFromBase { pk_col } if pk_col == "absent"
         ));
+    }
+
+    #[test]
+    fn arrow_data_type_pk_head_maps_supported_scalars() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Int8), "TINYINT");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Int16), "SMALLINT");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Int32), "INT");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Int64), "BIGINT");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Utf8), "STRING");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::LargeUtf8), "STRING");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Decimal128(18, 2)), "DECIMAL");
+        assert_eq!(super::arrow_data_type_pk_head(&DataType::Date32), "DATE");
+        assert_eq!(
+            super::arrow_data_type_pk_head(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+            "DATETIME"
+        );
+    }
+
+    #[test]
+    fn arrow_data_type_pk_head_rejects_unsupported_via_debug_fallback() {
+        use arrow::datatypes::DataType;
+        // Floats are intentionally rejected (NaN equality). The fallback
+        // returns the Debug form which is_hashable_pk_type does not match.
+        let head = super::arrow_data_type_pk_head(&DataType::Float64);
+        assert!(!super::is_hashable_pk_type(&head), "head={head}");
+        let head = super::arrow_data_type_pk_head(&DataType::Boolean);
+        assert!(!super::is_hashable_pk_type(&head), "head={head}");
     }
 }
