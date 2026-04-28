@@ -378,6 +378,94 @@ fn validate_unique_aggregate_physical_column_names(
     Ok(())
 }
 
+/// Lightweight projection of the iceberg base table that
+/// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
+/// from the loaded iceberg table; passing this struct keeps validation
+/// pure and easy to unit-test.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseColumnDescriptor {
+    pub name: String,
+    /// Uppercased SQL type as the analyzer/iceberg-schema mapper produced
+    /// it (e.g. `BIGINT`, `STRING`, `DECIMAL(18,2)`, `ARRAY<STRING>`).
+    pub sql_type: String,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseTableDescriptor {
+    pub format_version: i32,
+    pub columns: Vec<BaseColumnDescriptor>,
+}
+
+/// Validate that a parsed `PRIMARY KEY (col, ...)` clause on a CREATE
+/// MATERIALIZED VIEW statement satisfies the IVM Phase-2 contract:
+///
+/// 1. The base table is iceberg format-version 2.
+/// 2. Every PK column exists on the base table.
+/// 3. Every PK column is NOT NULL on the base table.
+/// 4. Every PK column has a hashable scalar type.
+///
+/// Errors fail fast in declared column order — the first mismatch wins.
+/// Returns `Ok(())` on success and discards the PK list (PR-1 does not
+/// persist it; PR-3 will).
+pub(crate) fn validate_ivm_primary_key(
+    pk_columns: &[String],
+    base: &BaseTableDescriptor,
+) -> Result<(), crate::connector::iceberg::changes::ChangeError> {
+    use crate::connector::iceberg::changes::ChangeError;
+
+    if base.format_version != 2 {
+        return Err(ChangeError::IcebergFormatUnsupported {
+            format_version: base.format_version,
+        });
+    }
+    for pk in pk_columns {
+        let col = base
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(pk))
+            .ok_or_else(|| ChangeError::PrimaryKeyMissingFromBase {
+                pk_col: pk.clone(),
+            })?;
+        if col.nullable {
+            return Err(ChangeError::PrimaryKeyNullable {
+                pk_col: col.name.clone(),
+            });
+        }
+        if !is_hashable_pk_type(&col.sql_type) {
+            return Err(ChangeError::PrimaryKeyTypeUnsupported {
+                pk_col: col.name.clone(),
+                ty: col.sql_type.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Hashable scalar-type predicate for IVM Phase-2 PRIMARY KEY columns.
+/// Accepts: BIGINT, INT, SMALLINT, TINYINT, STRING, VARCHAR, DATE,
+/// DATETIME, DECIMAL (with or without precision/scale).
+/// Rejects: BOOLEAN, FLOAT, DOUBLE, ARRAY, MAP, STRUCT, JSON.
+fn is_hashable_pk_type(sql_type: &str) -> bool {
+    let upper = sql_type.to_ascii_uppercase();
+    let head = upper.split(['(', '<']).next().unwrap_or("").trim();
+    matches!(
+        head,
+        "BIGINT"
+            | "INT"
+            | "INTEGER"
+            | "SMALLINT"
+            | "TINYINT"
+            | "STRING"
+            | "VARCHAR"
+            | "CHAR"
+            | "DATE"
+            | "DATETIME"
+            | "TIMESTAMP"
+            | "DECIMAL"
+    )
+}
+
 pub(crate) fn drop_mv(
     state: &Arc<StandaloneState>,
     current_database: &str,
@@ -1204,5 +1292,124 @@ GROUP BY k1",
         let stmt = parse_create_mv(stmt_sql);
         let err = resolve_mv_storage_engine(&stmt.properties, "managed_lake").unwrap_err();
         assert!(err.contains("duckdb"));
+    }
+
+    use crate::connector::iceberg::changes::ChangeError;
+
+    /// Build a `BaseTableDescriptor` directly without touching iceberg-rust.
+    /// Mirrors the production projection done by the caller in `create_mv`.
+    fn descriptor(
+        format_version: i32,
+        cols: &[(&str, &str, bool)], // name, type, nullable
+    ) -> super::BaseTableDescriptor {
+        super::BaseTableDescriptor {
+            format_version,
+            columns: cols
+                .iter()
+                .map(|(n, t, nullable)| super::BaseColumnDescriptor {
+                    name: (*n).to_string(),
+                    sql_type: (*t).to_string(),
+                    nullable: *nullable,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_ivm_pk_happy_path() {
+        let base = descriptor(
+            2,
+            &[
+                ("order_id", "BIGINT", false),
+                ("customer", "STRING", true),
+            ],
+        );
+        validate_ivm_primary_key(&["order_id".to_string()], &base).expect("ok");
+    }
+
+    #[test]
+    fn validate_ivm_pk_rejects_v1_base_table() {
+        let base = descriptor(1, &[("order_id", "BIGINT", false)]);
+        let err = validate_ivm_primary_key(&["order_id".to_string()], &base).expect_err("err");
+        assert!(matches!(err, ChangeError::IcebergFormatUnsupported { format_version: 1 }));
+    }
+
+    #[test]
+    fn validate_ivm_pk_rejects_missing_column() {
+        let base = descriptor(2, &[("customer", "STRING", true)]);
+        let err = validate_ivm_primary_key(&["order_id".to_string()], &base).expect_err("err");
+        assert!(matches!(
+            err,
+            ChangeError::PrimaryKeyMissingFromBase { pk_col } if pk_col == "order_id"
+        ));
+    }
+
+    #[test]
+    fn validate_ivm_pk_rejects_nullable_column() {
+        let base = descriptor(2, &[("order_id", "BIGINT", true)]);
+        let err = validate_ivm_primary_key(&["order_id".to_string()], &base).expect_err("err");
+        assert!(matches!(
+            err,
+            ChangeError::PrimaryKeyNullable { pk_col } if pk_col == "order_id"
+        ));
+    }
+
+    #[test]
+    fn validate_ivm_pk_rejects_unhashable_type_double() {
+        let base = descriptor(2, &[("order_id", "DOUBLE", false)]);
+        let err = validate_ivm_primary_key(&["order_id".to_string()], &base).expect_err("err");
+        assert!(matches!(
+            err,
+            ChangeError::PrimaryKeyTypeUnsupported { pk_col, .. } if pk_col == "order_id"
+        ));
+    }
+
+    #[test]
+    fn validate_ivm_pk_rejects_unhashable_type_array() {
+        let base = descriptor(2, &[("tags", "ARRAY<STRING>", false)]);
+        let err = validate_ivm_primary_key(&["tags".to_string()], &base).expect_err("err");
+        assert!(matches!(
+            err,
+            ChangeError::PrimaryKeyTypeUnsupported { pk_col, .. } if pk_col == "tags"
+        ));
+    }
+
+    #[test]
+    fn validate_ivm_pk_accepts_decimal_and_string() {
+        let base = descriptor(
+            2,
+            &[
+                ("k1", "DECIMAL(18,2)", false),
+                ("k2", "STRING", false),
+            ],
+        );
+        validate_ivm_primary_key(
+            &["k1".to_string(), "k2".to_string()],
+            &base,
+        )
+        .expect("ok");
+    }
+
+    #[test]
+    fn validate_ivm_pk_first_failure_wins_per_column_order() {
+        // missing comes before nullable in column order; expect missing.
+        let base = descriptor(
+            2,
+            &[
+                ("present_but_nullable", "BIGINT", true),
+            ],
+        );
+        let err = validate_ivm_primary_key(
+            &[
+                "absent".to_string(),
+                "present_but_nullable".to_string(),
+            ],
+            &base,
+        )
+        .expect_err("err");
+        assert!(matches!(
+            err,
+            ChangeError::PrimaryKeyMissingFromBase { pk_col } if pk_col == "absent"
+        ));
     }
 }
