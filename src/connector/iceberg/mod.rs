@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod catalog;
+pub mod commit;
 mod jvm;
 pub mod metadata;
 pub mod position_delete;
