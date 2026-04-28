@@ -597,6 +597,15 @@ impl StandaloneSession {
                 current_database,
                 query_opts.as_ref(),
             ),
+            sqlast::Statement::Delete(ref delete) => {
+                let stmt = crate::engine::statement::convert_sqlparser_delete_to_custom(delete)?;
+                crate::engine::delete_flow::execute_delete_statement(
+                    &self.inner,
+                    &stmt,
+                    current_catalog,
+                    current_database,
+                )
+            }
             sqlast::Statement::Truncate(truncate) => {
                 for truncate_table in &truncate.table_names {
                     let table_name = crate::sql::parser::dialect::convert_object_name(
@@ -713,6 +722,7 @@ impl StandaloneSession {
 // Custom statement dispatch
 // ---------------------------------------------------------------------------
 
+pub(crate) mod delete_flow;
 pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
