@@ -168,7 +168,34 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         .await
     })??;
 
+    // 8. Invalidate the iceberg entry's table cache so subsequent SELECTs
+    //    see the new snapshot. The standalone catalog rebuilds its TableDef
+    //    on the next register_iceberg_tables_for_query call.
+    invalidate_iceberg_caches(state, target)?;
+
     Ok(StatementResult::Ok)
+}
+
+pub(crate) fn invalidate_iceberg_caches(
+    state: &Arc<StandaloneState>,
+    target: &TargetBackend,
+) -> Result<(), String> {
+    {
+        let registry = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        let entry = registry.get(&target.catalog)?;
+        entry.invalidate_table_cache(&target.namespace, &target.table);
+    }
+    {
+        let mut local = state
+            .catalog
+            .write()
+            .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+        let _ = local.drop_table(&target.namespace, &target.table);
+    }
+    Ok(())
 }
 
 fn target_string(t: &TargetBackend) -> String {
@@ -198,9 +225,36 @@ fn run_select_to_chunks(
     target: &TargetBackend,
     query: &sqlparser::ast::Query,
 ) -> Result<Vec<Chunk>, String> {
+    // Force-refresh every iceberg table referenced by the SELECT. The
+    // simpler `register_iceberg_tables_for_query` skips already-registered
+    // tables, but the table backing the INSERT may have been mutated by a
+    // prior statement in the same session and the cached `TableDef` would
+    // miss the new files. Refreshing here is mandatory before running the
+    // SELECT so it sees all data files committed up to this point.
+    crate::engine::query_prep::refresh_external_tables_for_query(
+        state,
+        None,
+        &target.namespace,
+        query,
+    )?;
+
+    // The SELECT may use 3-part `catalog.database.table` names (the INSERT
+    // target itself uses one). Strip the catalog prefix before analysis so
+    // we feed the analyzer 2-part names — it does not understand catalog-
+    // qualified references on its own. This mirrors the standalone SELECT
+    // dispatcher's handling of three-part names.
+    let mut rewritten = query.clone();
+    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut rewritten);
+
     let result = {
         let in_mem = state.catalog.read().expect("standalone catalog read lock");
-        crate::engine::execute_query(query, &in_mem, &target.namespace, state.exchange_port, None)?
+        crate::engine::execute_query(
+            &rewritten,
+            &in_mem,
+            &target.namespace,
+            state.exchange_port,
+            None,
+        )?
     };
     query_result_to_chunks(result)
 }

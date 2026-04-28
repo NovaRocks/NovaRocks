@@ -136,6 +136,21 @@ impl IcebergCatalogEntry {
         }
         map
     }
+
+    /// Drop the cached `IcebergLoadedTable` for `(namespace, table_name)` so
+    /// the next `load_table` call re-reads the metadata. Used by the
+    /// standalone INSERT / OVERWRITE / DELETE flows after a successful
+    /// commit so subsequent SELECTs see the new snapshot.
+    pub(crate) fn invalidate_table_cache(&self, namespace_name: &str, table_name: &str) {
+        if let (Ok(ns), Ok(tbl)) = (
+            normalize_identifier(namespace_name),
+            normalize_identifier(table_name),
+        ) {
+            if let Ok(mut cache) = self.table_cache.write() {
+                cache.remove(&(ns, tbl));
+            }
+        }
+    }
 }
 
 pub(crate) fn create_namespace(
