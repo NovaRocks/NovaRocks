@@ -26,32 +26,55 @@ use iceberg::table::Table;
 /// `variant`-typed columns are also rejected because the parquet writer in
 /// `IcebergSink` has no encoding path for variant.
 pub fn ensure_v3_writable(table: &Table) -> Result<(), String> {
-    let props = table.metadata().properties();
-    if let Some(v) = props.get("write.row-lineage") {
-        if v == "true" {
-            return Err("iceberg table has row-lineage enabled; phase 1 does not \
-                 support writing such tables. Disable row-lineage or wait \
-                 for phase 2."
-                .to_string());
-        }
+    if table
+        .metadata()
+        .properties()
+        .get("write.row-lineage")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+    {
+        return Err("iceberg table has row-lineage enabled; phase 1 does not \
+             support writing such tables. Disable row-lineage or wait \
+             for phase 2."
+            .to_string());
     }
 
     // Check for variant-typed columns. iceberg-rust 0.9 predates the Variant
     // primitive type, so we use a name-based fallback rather than a match arm.
     // If a future iceberg-rust release introduces PrimitiveType::Variant, the
     // Debug output will naturally contain "Variant" and we catch it here.
+    // The check recurses into nested Struct/List/Map so that STRUCT<x VARIANT>
+    // or ARRAY<VARIANT> are not missed.
     let schema = table.metadata().current_schema();
     for f in schema.as_struct().fields() {
-        let ty_name = format!("{:?}", f.field_type);
-        if ty_name.to_lowercase().contains("variant") {
+        if type_contains_variant(&f.field_type) {
             return Err(format!(
-                "iceberg table column `{}` has variant type; phase 1 does not \
+                "iceberg table column `{}` contains variant type; phase 1 does not \
                  support writing variant. Drop the column or wait for phase 2.",
                 f.name
             ));
         }
     }
     Ok(())
+}
+
+/// Returns `true` when `ty` or any type nested inside it has a Debug
+/// representation that contains "variant" (case-insensitive).  This is a
+/// name-based proxy because iceberg-rust 0.9 does not have a dedicated
+/// `PrimitiveType::Variant` arm yet.
+fn type_contains_variant(ty: &iceberg::spec::Type) -> bool {
+    match ty {
+        iceberg::spec::Type::Primitive(_) => format!("{ty:?}").to_lowercase().contains("variant"),
+        iceberg::spec::Type::Struct(s) => s
+            .fields()
+            .iter()
+            .any(|f| type_contains_variant(&f.field_type)),
+        iceberg::spec::Type::List(l) => type_contains_variant(&l.element_field.field_type),
+        iceberg::spec::Type::Map(m) => {
+            type_contains_variant(&m.key_field.field_type)
+                || type_contains_variant(&m.value_field.field_type)
+        }
+    }
 }
 
 /// Phase 1 only handles tables whose data is all under the current default
@@ -87,22 +110,20 @@ pub fn ensure_no_equality_deletes(table: &Table) -> Result<(), String> {
         Some(s) => s,
         None => return Ok(()), // empty table — no manifests to inspect
     };
-    if let Some(s) = snap
+    let n = snap
         .summary()
         .additional_properties
         .get("total-equality-deletes")
-    {
-        if let Ok(n) = s.parse::<u64>() {
-            if n > 0 {
-                return Err(
-                    "iceberg table has equality-delete files in its current snapshot; \
-                     phase 1 reader does not support equality deletes (see \
-                     iceberg/position_delete.rs). Compact away the equality \
-                     deletes before issuing DELETE."
-                        .to_string(),
-                );
-            }
-        }
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if n > 0 {
+        return Err(
+            "iceberg table has equality-delete files in its current snapshot; \
+             phase 1 reader does not support equality deletes (see \
+             iceberg/position_delete.rs). Compact away the equality \
+             deletes before issuing DELETE."
+                .to_string(),
+        );
     }
     Ok(())
 }
