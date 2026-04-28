@@ -73,6 +73,44 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
         false
     };
 
+    // Optional PRIMARY KEY (col, ...) clause — IVM Phase-2 opt-in marker.
+    let primary_key = if parser.parse_keyword(Keyword::PRIMARY) {
+        parser
+            .expect_keyword(Keyword::KEY)
+            .map_err(|e| format!("expected KEY after PRIMARY: {e}"))?;
+        parser
+            .expect_token(&Token::LParen)
+            .map_err(|e| format!("expected ( after PRIMARY KEY: {e}"))?;
+        let mut cols: Vec<String> = Vec::new();
+        loop {
+            if parser.consume_token(&Token::RParen) {
+                break;
+            }
+            let ident = parser
+                .parse_identifier()
+                .map_err(|e| format!("parse PRIMARY KEY column failed: {e}"))?;
+            let name = ident.value;
+            if cols.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                return Err(format!(
+                    "duplicate column `{name}` in PRIMARY KEY clause"
+                ));
+            }
+            cols.push(name);
+            if parser.consume_token(&Token::RParen) {
+                break;
+            }
+            parser
+                .expect_token(&Token::Comma)
+                .map_err(|e| format!("expected , or ) in PRIMARY KEY column list: {e}"))?;
+        }
+        if cols.is_empty() {
+            return Err("PRIMARY KEY clause requires at least one column".to_string());
+        }
+        Some(cols)
+    } else {
+        None
+    };
+
     // Reject ORDER BY (mirroring StarRocks clause ordering).
     if parser.parse_keywords(&[Keyword::ORDER, Keyword::BY]) {
         return Err("ORDER BY is not supported on materialized views yet".to_string());
@@ -107,7 +145,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
             select_sql,
             select_query: *query,
             properties,
-            primary_key: None,
+            primary_key,
         },
     ))
 }
@@ -574,6 +612,68 @@ mod tests {
                 ("storage_engine".to_string(), "iceberg".to_string()),
                 ("comment".to_string(), "demo".to_string()),
             ],
+        );
+    }
+
+    #[test]
+    fn parse_create_mv_with_primary_key_captures_columns() {
+        let stmt = parse_one(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 2 \
+             PRIMARY KEY (order_id, line_id) \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        );
+        let mv = match stmt {
+            Statement::CreateMaterializedView(mv) => mv,
+            other => panic!("unexpected stmt: {other:?}"),
+        };
+        assert_eq!(
+            mv.primary_key.as_deref(),
+            Some(["order_id".to_string(), "line_id".to_string()].as_slice()),
+        );
+    }
+
+    #[test]
+    fn parse_create_mv_without_primary_key_keeps_field_none() {
+        let stmt = parse_one(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 2 \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        );
+        let mv = match stmt {
+            Statement::CreateMaterializedView(mv) => mv,
+            other => panic!("unexpected stmt: {other:?}"),
+        };
+        assert!(mv.primary_key.is_none());
+    }
+
+    #[test]
+    fn parse_create_mv_rejects_empty_primary_key_list() {
+        let err = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 2 \
+             PRIMARY KEY () \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        )
+        .expect_err("should reject");
+        assert!(
+            err.to_lowercase().contains("primary key"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_create_mv_rejects_duplicate_primary_key_columns() {
+        let err = crate::sql::parser::parse_sql(
+            "CREATE MATERIALIZED VIEW mv1 \
+             DISTRIBUTED BY HASH(k1) BUCKETS 2 \
+             PRIMARY KEY (order_id, order_id) \
+             AS SELECT k1 FROM iceberg_cat.ns.orders",
+        )
+        .expect_err("should reject");
+        assert!(
+            err.to_lowercase().contains("duplicate"),
+            "unexpected err: {err}"
         );
     }
 }
