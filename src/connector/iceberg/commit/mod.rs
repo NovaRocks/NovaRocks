@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Iceberg commit machinery for standalone INSERT / INSERT OVERWRITE / DELETE.
+//! Foundational types for Iceberg commit operations.
 //!
-//! The engine layer constructs an [`IcebergCommitCollector`] before lowering,
-//! drives the pipeline (which writes data / position-delete files via the
-//! existing `IcebergSink`), and at pipeline completion calls
-//! [`run_iceberg_write_or_delete`] which dispatches to one of three
-//! [`IcebergCommitAction`] implementations and handles abort cleanup.
+//! Exports [`CommitOpKind`] (which commit action to run), [`WrittenFile`]
+//! (metadata for a single Parquet file produced by the pipeline), and
+//! [`CommitOutcome`] (result of a successful commit).
 
 mod types;
 

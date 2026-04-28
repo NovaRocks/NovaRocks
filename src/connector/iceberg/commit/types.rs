@@ -52,15 +52,14 @@ pub struct WrittenFile {
 #[derive(Clone, Debug)]
 pub struct CommitOutcome {
     pub new_snapshot_id: i64,
-    /// Manifest / manifest-list files written by the commit-action.
-    /// Used by AbortLog for cleanup on failure; ignored on success.
+    /// Manifest / manifest-list paths written by the commit-action; consumed by
+    /// abort cleanup on failure.
     pub written_manifest_paths: Vec<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iceberg::spec::{DataContentType, DataFileFormat, Struct};
 
     #[test]
     fn written_file_can_be_constructed() {
@@ -84,13 +83,9 @@ mod tests {
     }
 
     #[test]
-    fn op_kind_round_trips() {
-        for k in [
-            CommitOpKind::FastAppend,
-            CommitOpKind::Overwrite,
-            CommitOpKind::RowDelta,
-        ] {
-            assert_eq!(k, k);
-        }
+    fn op_kind_variants_are_distinct() {
+        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::Overwrite);
+        assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDelta);
+        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDelta);
     }
 }
