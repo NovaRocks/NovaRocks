@@ -72,6 +72,27 @@ pub(crate) fn create_iceberg_mv(
         );
     }
 
+    // IVM Phase-2 PRIMARY KEY validation. Only runs when the user opted in
+    // by writing `PRIMARY KEY (...)` in the DDL; otherwise behavior is
+    // unchanged. Reuses the same descriptor + validator as the managed-
+    // lake-stored path in mv_ddl::create_mv.
+    if let Some(pk_cols) = stmt.primary_key.as_deref() {
+        if base_refs.len() != 1 {
+            return Err(
+                "PRIMARY KEY on materialized view requires exactly one iceberg base table"
+                    .to_string(),
+            );
+        }
+        let base_ref = &base_refs[0];
+        let loaded = load_current_iceberg_base_table(state, base_ref)?;
+        let descriptor =
+            crate::connector::starrocks::managed::mv_ddl::descriptor_from_loaded(&loaded);
+        crate::connector::starrocks::managed::mv_ddl::validate_ivm_primary_key(
+            pk_cols, &descriptor,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
     // 2. Allocate a managed-lake table_id for the MV (register it in the
     //    managed-lake `tables` row so SHOW MATERIALIZED VIEWS works uniformly,
     //    but no tablets, schemas, partitions, or indexes are allocated for the
