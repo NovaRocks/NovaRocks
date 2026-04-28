@@ -102,6 +102,20 @@ pub(crate) struct InsertStmt {
     pub table: ObjectName,
     pub columns: Vec<String>,
     pub source: InsertSource,
+    /// `true` when the statement was `INSERT OVERWRITE`; `false` for
+    /// `INSERT INTO`. Phase 1 only honors this for iceberg backends — non-iceberg
+    /// backends reject `overwrite = true` at the engine layer.
+    pub overwrite: bool,
+}
+
+/// `DELETE FROM <table> WHERE <predicate>`. Phase 1 only supports iceberg
+/// backends; the engine layer rejects other backends. WHERE is required;
+/// `DELETE FROM <table>` (no filter) is rejected — the spec recommends
+/// `INSERT OVERWRITE t SELECT * FROM t WHERE FALSE` for the truncate use case.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DeleteStmt {
+    pub table: ObjectName,
+    pub where_clause: sqlparser::ast::Expr,
 }
 
 #[derive(Clone, Debug, PartialEq)]

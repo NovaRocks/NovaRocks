@@ -225,6 +225,62 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
         table,
         columns,
         source,
+        overwrite: insert.overwrite,
+    })
+}
+
+/// Convert a sqlparser DELETE AST to our custom DeleteStmt.
+///
+/// Phase 1 restrictions:
+/// - Exactly one table in `FROM`; `USING` clauses are rejected.
+/// - `WHERE` is mandatory. `DELETE FROM t` (no filter) is rejected — the
+///   spec recommends `INSERT OVERWRITE t SELECT * FROM t WHERE FALSE` instead.
+/// - `LIMIT` and `ORDER BY` are rejected.
+pub(crate) fn convert_sqlparser_delete_to_custom(
+    delete: &sqlparser::ast::Delete,
+) -> Result<crate::sql::parser::ast::DeleteStmt, String> {
+    use sqlparser::ast as sqlast;
+
+    let tables = match &delete.from {
+        sqlast::FromTable::WithFromKeyword(tables) => tables,
+        sqlast::FromTable::WithoutKeyword(tables) => tables,
+    };
+    if tables.len() != 1 {
+        return Err(format!(
+            "phase 1 DELETE supports exactly one table in FROM, got {}",
+            tables.len()
+        ));
+    }
+    if !tables[0].joins.is_empty() {
+        return Err("phase 1 DELETE does not support JOIN in FROM".to_string());
+    }
+    let table = match &tables[0].relation {
+        sqlast::TableFactor::Table { name, .. } => {
+            crate::sql::parser::dialect::convert_object_name(name.clone())?
+        }
+        other => {
+            return Err(format!(
+                "phase 1 DELETE source must be a table, got {other:?}"
+            ));
+        }
+    };
+    if delete.using.as_ref().is_some_and(|u| !u.is_empty()) {
+        return Err("phase 1 DELETE does not support USING".to_string());
+    }
+    if delete.limit.is_some() {
+        return Err("phase 1 DELETE does not support LIMIT".to_string());
+    }
+    if !delete.order_by.is_empty() {
+        return Err("phase 1 DELETE does not support ORDER BY".to_string());
+    }
+    let where_clause = delete.selection.clone().ok_or_else(|| {
+        "DELETE requires a WHERE clause; for full table replacement use \
+         INSERT OVERWRITE t SELECT * FROM t WHERE FALSE"
+            .to_string()
+    })?;
+    Ok(crate::sql::parser::ast::DeleteStmt {
+        table,
+        where_clause,
     })
 }
 
