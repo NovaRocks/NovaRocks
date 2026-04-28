@@ -23,6 +23,11 @@
 
 mod abort;
 mod types;
+mod validation;
 
 pub use abort::{AbortLog, CleanupError};
 pub use types::{CommitOpKind, CommitOutcome, WrittenFile};
+pub use validation::{
+    ensure_no_equality_deletes, ensure_single_partition_spec, ensure_v3_writable,
+    match_select_schema_to_table,
+};
