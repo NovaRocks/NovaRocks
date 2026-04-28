@@ -107,6 +107,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
             select_sql,
             select_query: *query,
             properties,
+            primary_key: None,
         },
     ))
 }

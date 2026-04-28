@@ -68,6 +68,11 @@ pub(crate) struct CreateMaterializedViewStmt {
     /// interpretation (e.g. `storage_engine`). Empty when the clause is
     /// absent.
     pub properties: Vec<(String, String)>,
+    /// Columns named in `PRIMARY KEY (col, ...)`. `None` when the clause is
+    /// absent. The clause is the IVM Phase-2 opt-in marker; columns must
+    /// reference the iceberg base table and satisfy the constraints checked
+    /// by `mv_ddl::validate_ivm_primary_key`.
+    pub primary_key: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
