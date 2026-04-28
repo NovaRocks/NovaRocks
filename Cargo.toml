@@ -27,7 +27,7 @@ orc-rust = { version = "0.7.1", default-features = false }
 apache-avro = "0.21.0"
 iceberg = "0.9.0"
 typetag = "0.2"
-opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native"] }
+opendal = { version = "0.55", features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 futures = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 mysql = "25"

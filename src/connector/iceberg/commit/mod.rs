@@ -21,6 +21,8 @@
 //! (metadata for a single Parquet file produced by the pipeline), and
 //! [`CommitOutcome`] (result of a successful commit).
 
+mod abort;
 mod types;
 
+pub use abort::{AbortLog, CleanupError};
 pub use types::{CommitOpKind, CommitOutcome, WrittenFile};
