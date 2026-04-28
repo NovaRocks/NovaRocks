@@ -29,6 +29,7 @@ mod fast_append;
 mod helpers;
 mod overwrite;
 mod row_delta;
+mod run;
 mod types;
 mod validation;
 
@@ -38,6 +39,7 @@ pub use collector::IcebergCommitCollector;
 pub use fast_append::FastAppendCommit;
 pub use overwrite::OverwriteCommit;
 pub use row_delta::RowDeltaCommit;
+pub use run::{RunInput, run_iceberg_commit};
 pub use types::{CommitOpKind, CommitOutcome, WrittenFile};
 pub use validation::{
     ensure_no_equality_deletes, ensure_single_partition_spec, ensure_v3_writable,
