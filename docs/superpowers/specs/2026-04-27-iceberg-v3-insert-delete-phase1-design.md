@@ -10,7 +10,7 @@
 
 ### 0.1 背景
 
-NovaRocks 当前对 Iceberg 的写入支持仅限 **MV refresh fast-append 路径**（[mv_refresh_iceberg.rs](../../../src/connector/starrocks/managed/mv_refresh_iceberg.rs)，commit `b93bdb6` phase4a）。直接 `INSERT INTO iceberg_table` 在 standalone 引擎里被显式拒绝（[insert_flow.rs:69-70](../../../src/standalone/engine/insert_flow.rs:69)）；`DELETE FROM iceberg_table` 没有任何 SQL 分析器/lowering 路径。
+NovaRocks 当前对 Iceberg 的写入支持仅限 **MV refresh fast-append 路径**（[mv_refresh_iceberg.rs](../../../src/connector/starrocks/managed/mv_refresh_iceberg.rs)，commit `b93bdb6` phase4a）。直接 `INSERT INTO iceberg_table` 在 standalone 引擎里被显式拒绝（[insert_flow.rs:65-66](../../../src/engine/insert_flow.rs:65)）；`DELETE FROM iceberg_table` 没有任何 SQL 分析器/lowering 路径。
 
 读路径已支持 v2 position deletes（[position_delete.rs](../../../src/connector/iceberg/position_delete.rs)），显式拒绝 equality deletes 与 v3 deletion vectors。
 
@@ -63,7 +63,7 @@ DELETE FROM  [<catalog>.]<db>.<tbl> WHERE <predicate>
 SQL: INSERT INTO / INSERT OVERWRITE / DELETE FROM iceberg_table
   │
   ▼
-[src/standalone/engine/insert_flow.rs | new delete_flow.rs]   ←── 事务所有者
+[src/engine/insert_flow.rs | new delete_flow.rs]   ←── 事务所有者
    ├─ 通过 IcebergCatalogRegistry 解析 catalog + table
    ├─ 加载当前 Iceberg 表的 base snapshot
    ├─ v3 兼容性校验（启用 row-lineage / 含 variant 列 → fail-fast）
@@ -124,11 +124,11 @@ collector.abort():  通过 OpenDAL 删除已 staged 的数据/删除/manifest �
 
 | 位置 | 改动 |
 |---|---|
-| [insert_flow.rs:69](../../../src/standalone/engine/insert_flow.rs:69) | 拆掉 iceberg 拒绝；接入 IcebergCommitCollector |
-| `src/standalone/engine/delete_flow.rs`（新） | DELETE FROM 入口 |
+| [insert_flow.rs:65](../../../src/engine/insert_flow.rs:65) | 拆掉 iceberg 拒绝；接入 IcebergCommitCollector |
+| `src/engine/delete_flow.rs`（新） | DELETE FROM 入口 |
 | `src/sql/parser/ast.rs` | 在 `InsertStmt` 加 `overwrite: bool`；新增 `DeleteStmt` |
-| `src/standalone/engine/sqlparse/statement.rs` | `convert_sqlparser_insert_to_custom` 透传 overwrite；新增 `convert_sqlparser_delete_to_custom` |
-| `src/standalone/engine/mod.rs` | 新增 `Statement::Delete` 分支 |
+| `src/engine/statement.rs` | `convert_sqlparser_insert_to_custom` 透传 overwrite；新增 `convert_sqlparser_delete_to_custom` |
+| `src/engine/mod.rs` | 新增 `Statement::Delete` 分支 |
 | `src/connector/iceberg/commit/mod.rs`（新模块） | `IcebergCommitCollector` + `IcebergCommitAction` trait + `CommitOpKind` |
 | `src/connector/iceberg/commit/abort.rs`（新） | `AbortLog` |
 | `src/connector/iceberg/commit/validation.rs`（新） | 共享校验函数 |
@@ -153,7 +153,7 @@ INSERT INTO [<catalog>.]<db>.<tbl> [(col1, col2, ...)]
 
 **AST 不变**：复用 `InsertStmt`；source 优先 `FromQuery`，VALUES 走 literal 快速路径。
 
-**校验**（在 [insert_flow.rs](../../../src/standalone/engine/insert_flow.rs) 进入 lowering 之前）：
+**校验**（在 [insert_flow.rs](../../../src/engine/insert_flow.rs) 进入 lowering 之前）：
 
 1. 表存在且 backend = iceberg
 2. v3 兼容性：拒绝启用 row-lineage、含 variant 列的表
@@ -862,5 +862,5 @@ Phase 2 的 deletion vectors 实施将复用：
 
 - 上游 StarRocks Iceberg sink：`fe/fe-core/src/main/java/com/starrocks/planner/IcebergTableSink.java`、`be/src/connector/iceberg_chunk_sink.{h,cpp}`、`be/src/connector/iceberg_delete_sink.{h,cpp}`、`fe/fe-core/src/main/java/com/starrocks/connector/iceberg/IcebergMetadata.java`
 - iceberg-rust 0.9 源码（本地 cargo registry）：`/Users/harbor/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iceberg-0.9.0/`
-- NovaRocks 现状代码：[sink.rs](../../../src/connector/iceberg/sink.rs)、[position_delete.rs](../../../src/connector/iceberg/position_delete.rs)、[hdfs_scan.rs](../../../src/lower/node/hdfs_scan.rs)、[insert_flow.rs](../../../src/standalone/engine/insert_flow.rs)、[mv_refresh_iceberg.rs](../../../src/connector/starrocks/managed/mv_refresh_iceberg.rs)
+- NovaRocks 现状代码：[sink.rs](../../../src/connector/iceberg/sink.rs)、[position_delete.rs](../../../src/connector/iceberg/position_delete.rs)、[hdfs_scan.rs](../../../src/lower/node/hdfs_scan.rs)、[insert_flow.rs](../../../src/engine/insert_flow.rs)、[mv_refresh_iceberg.rs](../../../src/connector/starrocks/managed/mv_refresh_iceberg.rs)
 - Iceberg spec：v2 spec position deletes、v3 spec deletion vectors（Phase 2 参考）
