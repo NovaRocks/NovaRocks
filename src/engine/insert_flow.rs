@@ -20,6 +20,7 @@ pub(crate) fn run_insert(
     name: &ObjectName,
     columns: &[String],
     source: &InsertSource,
+    overwrite: bool,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
@@ -32,6 +33,29 @@ pub(crate) fn run_insert(
         )
     };
     let resolved = catalog.load_table(&target.catalog, &target.namespace, &target.table)?;
+
+    // INSERT OVERWRITE is only supported on iceberg backends in phase 1.
+    // For non-iceberg targets, fail fast with a clear message instead of
+    // silently doing INSERT INTO.
+    if overwrite && target.backend_name != "iceberg" {
+        return Err(format!(
+            "INSERT OVERWRITE is only supported for iceberg backends in phase 1, \
+             target uses backend `{}`",
+            target.backend_name
+        ));
+    }
+
+    // Iceberg + (OVERWRITE or FromQuery) routes through the new commit-action
+    // pipeline (execute_iceberg_insert_or_overwrite). Iceberg + literal-row
+    // INSERT INTO continues to use the existing fast-append path via
+    // sink.append_rows for backwards compatibility.
+    let needs_iceberg_pipeline = target.backend_name == "iceberg"
+        && (overwrite || matches!(source, InsertSource::FromQuery(_)));
+    if needs_iceberg_pipeline {
+        return crate::engine::iceberg_writer::execute_iceberg_insert_or_overwrite(
+            state, &target, &resolved, columns, source, overwrite,
+        );
+    }
 
     match source {
         InsertSource::Values(rows) => {
@@ -55,6 +79,7 @@ pub(crate) fn run_insert(
                     name,
                     columns,
                     part,
+                    overwrite,
                     current_catalog,
                     current_database,
                 )?;
@@ -62,9 +87,6 @@ pub(crate) fn run_insert(
         }
         InsertSource::FromQuery(query) => {
             if !sink.supports_pipeline_insert() {
-                if target.backend_name == "iceberg" {
-                    return Err("unsupported INSERT SELECT source for iceberg table".to_string());
-                }
                 return Err(format!(
                     "backend {} does not support INSERT SELECT",
                     target.backend_name

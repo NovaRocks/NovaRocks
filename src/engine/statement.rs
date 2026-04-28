@@ -513,6 +513,7 @@ pub(crate) fn execute_insert_statement(
     name: &ObjectName,
     columns: &[String],
     source: &InsertSource,
+    overwrite: bool,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<StatementResult, String> {
@@ -521,6 +522,7 @@ pub(crate) fn execute_insert_statement(
         name,
         columns,
         source,
+        overwrite,
         current_catalog,
         current_database,
     )

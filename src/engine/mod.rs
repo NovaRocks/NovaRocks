@@ -702,6 +702,7 @@ impl StandaloneSession {
             &insert_stmt.table,
             &insert_stmt.columns,
             &insert_stmt.source,
+            insert_stmt.overwrite,
             current_catalog,
             current_database,
         )
@@ -711,6 +712,8 @@ impl StandaloneSession {
 // ---------------------------------------------------------------------------
 // Custom statement dispatch
 // ---------------------------------------------------------------------------
+
+pub(crate) mod iceberg_writer;
 
 pub(crate) fn dispatch_statement(
     state: &Arc<StandaloneState>,
