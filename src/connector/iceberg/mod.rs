@@ -21,6 +21,7 @@ pub mod commit;
 mod jvm;
 pub mod metadata;
 pub mod position_delete;
+pub mod scan_deletes;
 pub mod schema;
 pub mod sink;
 mod state;
