@@ -157,9 +157,270 @@ pub(crate) struct IcebergChangeBatch {
     pub deletes: Vec<PositionDeleteRef>,
 }
 
+/// One unit of work the file-collection phase needs to perform for a
+/// single snapshot in the lineage. `Replace` snapshots are validated by
+/// `classify_snapshot` itself and never produce a `LineageAction` —
+/// they're silently absorbed once the validator passes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum LineageAction {
+    /// Walk the snapshot's data manifests, collect entries with
+    /// `added_snapshot_id == this`, project to `DataFileRef`.
+    CollectInserts { snapshot_id: i64 },
+    /// Walk the snapshot's delete manifests, collect entries whose
+    /// `DataFile.content_type()` is `PositionDeletes`. Reject equality
+    /// deletes.
+    CollectDeletes { snapshot_id: i64 },
+}
+
+/// Output of `classify_lineage`: a chronologically-ordered list of
+/// actions to execute against snapshots from `previous_snapshot_id`
+/// (exclusive) to `current_snapshot_id` (inclusive). Replace snapshots
+/// validated and skipped during classification do not appear here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct LineagePlan {
+    pub previous_snapshot_id: i64,
+    pub current_snapshot_id: i64,
+    pub actions: Vec<LineageAction>,
+}
+
+/// Pure per-snapshot decision. Returns:
+/// - `Ok(Some(action))` when the snapshot contributes work to the file
+///   collector,
+/// - `Ok(None)` when the snapshot is a validated REPLACE compaction and
+///   should be silently absorbed,
+/// - `Err(ChangeError)` for OVERWRITE, REPLACE-validation failure, etc.
+///
+/// `parent` is required for REPLACE (the validator compares
+/// `total-records` and `schema_id` against the parent). It can be
+/// `None` for any other operation; passing `None` for REPLACE
+/// produces a `ReplaceValidationFailed` error.
+#[allow(dead_code)]
+fn classify_snapshot(
+    snapshot: &iceberg::spec::Snapshot,
+    parent: Option<&iceberg::spec::Snapshot>,
+) -> Result<Option<LineageAction>, ChangeError> {
+    use iceberg::spec::Operation;
+    let snapshot_id = snapshot.snapshot_id();
+    match &snapshot.summary().operation {
+        Operation::Append => Ok(Some(LineageAction::CollectInserts { snapshot_id })),
+        Operation::Delete => Ok(Some(LineageAction::CollectDeletes { snapshot_id })),
+        Operation::Replace => {
+            let parent = parent.ok_or_else(|| ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason:
+                    "REPLACE snapshot has no parent reachable for compaction validation"
+                        .to_string(),
+            })?;
+            validate_replace_snapshot(snapshot, parent)?;
+            Ok(None)
+        }
+        Operation::Overwrite => Err(ChangeError::UnsupportedOperation {
+            snapshot_id,
+            op: "overwrite".to_string(),
+        }),
+    }
+}
+
+/// Validate that a `Replace` snapshot is a compaction (file rewrite that
+/// preserves logical content). A passing REPLACE leaves `total-records`
+/// unchanged, contributes both `added-data-files` and `deleted-data-files`
+/// counters, and does not change the schema. Anything else is rejected.
+#[allow(dead_code)]
+fn validate_replace_snapshot(
+    snapshot: &iceberg::spec::Snapshot,
+    parent: &iceberg::spec::Snapshot,
+) -> Result<(), ChangeError> {
+    let snap_props = &snapshot.summary().additional_properties;
+    let parent_props = &parent.summary().additional_properties;
+
+    let snap_records = snap_props.get("total-records").and_then(|s| s.parse::<i64>().ok());
+    let parent_records = parent_props.get("total-records").and_then(|s| s.parse::<i64>().ok());
+    match (snap_records, parent_records) {
+        (Some(a), Some(b)) if a == b => {}
+        (Some(a), Some(b)) => {
+            return Err(ChangeError::ReplaceValidationFailed {
+                snapshot_id: snapshot.snapshot_id(),
+                reason: format!(
+                    "total-records changed across REPLACE: parent={b}, replace={a}"
+                ),
+            });
+        }
+        _ => {
+            return Err(ChangeError::ReplaceValidationFailed {
+                snapshot_id: snapshot.snapshot_id(),
+                reason:
+                    "REPLACE snapshot summary is missing `total-records`; cannot prove compaction"
+                        .to_string(),
+            });
+        }
+    }
+
+    let added = snap_props
+        .get("added-data-files")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    let removed = snap_props
+        .get("deleted-data-files")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0);
+    if added <= 0 || removed <= 0 {
+        return Err(ChangeError::ReplaceValidationFailed {
+            snapshot_id: snapshot.snapshot_id(),
+            reason: format!(
+                "REPLACE snapshot must report both added-data-files (>0) and \
+                 deleted-data-files (>0); got added={added}, deleted={removed}"
+            ),
+        });
+    }
+
+    if snapshot.schema_id() != parent.schema_id() {
+        return Err(ChangeError::ReplaceValidationFailed {
+            snapshot_id: snapshot.snapshot_id(),
+            reason: format!(
+                "REPLACE snapshot schema-id {:?} differs from parent {:?}; schema evolution \
+                 across compaction is not in scope",
+                snapshot.schema_id(),
+                parent.schema_id(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Walk the parent chain from `current_snapshot` back to
+/// `previous_snapshot_id`, dispatching each node through
+/// `classify_snapshot`. Performs no I/O.
+///
+/// Errors:
+/// - `LineageBroken` when `previous_snapshot_id` is not an ancestor of
+///   the current snapshot (its metadata entry has been pruned, or the
+///   chain runs off its root).
+/// - `UnsupportedOperation` / `ReplaceValidationFailed` propagated from
+///   `classify_snapshot`.
+#[allow(dead_code)]
+pub(crate) fn classify_lineage(
+    metadata: &iceberg::spec::TableMetadata,
+    previous_snapshot_id: i64,
+) -> Result<LineagePlan, ChangeError> {
+    let current_snapshot = metadata.current_snapshot().ok_or_else(|| {
+        ChangeError::InternalInconsistency(
+            "classify_lineage: table has no current snapshot".to_string(),
+        )
+    })?;
+    let current_snapshot_id = current_snapshot.snapshot_id();
+
+    if current_snapshot_id == previous_snapshot_id {
+        return Ok(LineagePlan {
+            previous_snapshot_id,
+            current_snapshot_id,
+            actions: Vec::new(),
+        });
+    }
+
+    if metadata.snapshot_by_id(previous_snapshot_id).is_none() {
+        return Err(ChangeError::LineageBroken {
+            previous_snapshot: previous_snapshot_id,
+        });
+    }
+
+    let mut actions_reversed: Vec<LineageAction> = Vec::new();
+    let mut cursor = current_snapshot_id;
+    loop {
+        if cursor == previous_snapshot_id {
+            break;
+        }
+        let snapshot_ref = metadata.snapshot_by_id(cursor).ok_or_else(|| {
+            ChangeError::LineageBroken {
+                previous_snapshot: previous_snapshot_id,
+            }
+        })?;
+        let snapshot = snapshot_ref.as_ref();
+        let parent_id = snapshot.parent_snapshot_id();
+        let parent = parent_id
+            .and_then(|id| metadata.snapshot_by_id(id))
+            .map(|sr| sr.as_ref());
+
+        if let Some(action) = classify_snapshot(snapshot, parent)? {
+            actions_reversed.push(action);
+        }
+
+        match parent_id {
+            Some(id) => cursor = id,
+            None => {
+                // Walked off the root without finding previous_snapshot_id.
+                return Err(ChangeError::LineageBroken {
+                    previous_snapshot: previous_snapshot_id,
+                });
+            }
+        }
+    }
+
+    actions_reversed.reverse();
+    Ok(LineagePlan {
+        previous_snapshot_id,
+        current_snapshot_id,
+        actions: actions_reversed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ChangeError;
+    use std::collections::HashMap;
+
+    use iceberg::spec::{Operation, Snapshot, Summary};
+
+    use super::{
+        classify_snapshot, validate_replace_snapshot, ChangeError, LineageAction,
+    };
+
+    /// Build a synthetic `Snapshot` whose summary carries the given
+    /// operation and properties. `manifest_list` and timestamps get
+    /// throwaway-but-positive values; the classifier never reads them.
+    /// schema_id is encoded in the summary's `schema_id` only when the
+    /// caller passes it via the builder.
+    fn snap(
+        snapshot_id: i64,
+        parent_snapshot_id: Option<i64>,
+        operation: Operation,
+        properties: &[(&str, &str)],
+        schema_id: i32,
+    ) -> Snapshot {
+        let mut props: HashMap<String, String> = HashMap::new();
+        for (k, v) in properties {
+            props.insert((*k).to_string(), (*v).to_string());
+        }
+        // iceberg-rust 0.9 `Snapshot::with_parent_snapshot_id` is generated
+        // by typed_builder without `strip_option`, so its setter takes
+        // `Option<i64>` directly. We always call it (passing `None` when
+        // there's no parent) because TypedBuilder's type-state means we
+        // can't reassign the builder across optional setters.
+        Snapshot::builder()
+            .with_snapshot_id(snapshot_id)
+            .with_parent_snapshot_id(parent_snapshot_id)
+            .with_sequence_number(snapshot_id)
+            .with_timestamp_ms(1_700_000_000_000 + snapshot_id)
+            .with_manifest_list(format!("file:///tmp/manifest-list-{snapshot_id}.avro"))
+            .with_summary(Summary {
+                operation,
+                additional_properties: props,
+            })
+            .with_schema_id(schema_id)
+            .build()
+    }
+
+    fn replace_props(
+        total_records: i64,
+        added_files: i64,
+        deleted_files: i64,
+    ) -> Vec<(&'static str, String)> {
+        vec![
+            ("total-records", total_records.to_string()),
+            ("added-data-files", added_files.to_string()),
+            ("deleted-data-files", deleted_files.to_string()),
+        ]
+    }
 
     #[test]
     fn display_primary_key_missing() {
@@ -177,5 +438,125 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("format-version 1"), "{s}");
         assert!(s.to_lowercase().contains("v2"), "{s}");
+    }
+
+    #[test]
+    fn classify_snapshot_append_emits_collect_inserts() {
+        let s = snap(7, Some(1), Operation::Append, &[], 0);
+        let action = classify_snapshot(&s, None).expect("ok");
+        assert_eq!(action, Some(LineageAction::CollectInserts { snapshot_id: 7 }));
+    }
+
+    #[test]
+    fn classify_snapshot_delete_emits_collect_deletes() {
+        let s = snap(7, Some(1), Operation::Delete, &[], 0);
+        let action = classify_snapshot(&s, None).expect("ok");
+        assert_eq!(action, Some(LineageAction::CollectDeletes { snapshot_id: 7 }));
+    }
+
+    #[test]
+    fn classify_snapshot_overwrite_is_rejected() {
+        let s = snap(7, Some(1), Operation::Overwrite, &[], 0);
+        let err = classify_snapshot(&s, None).expect_err("err");
+        assert!(matches!(
+            err,
+            ChangeError::UnsupportedOperation { snapshot_id: 7, ref op } if op == "overwrite"
+        ));
+    }
+
+    #[test]
+    fn classify_snapshot_replace_compaction_is_skipped() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props(100, 3, 5);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+        let action = classify_snapshot(&s, Some(&parent)).expect("ok");
+        assert_eq!(action, None);
+    }
+
+    #[test]
+    fn classify_snapshot_replace_without_parent_is_rejected() {
+        let owned = replace_props(100, 3, 5);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, None, Operation::Replace, &props, 0);
+        let err = classify_snapshot(&s, None).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("parent"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_record_count_change_is_rejected() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props(101, 3, 5);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("total-records"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_missing_total_records_is_rejected() {
+        // Parent has total-records, REPLACE doesn't. Validator can't prove the
+        // record count is unchanged → reject.
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let s = snap(
+            2,
+            Some(1),
+            Operation::Replace,
+            &[("added-data-files", "3"), ("deleted-data-files", "5")],
+            0,
+        );
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("total-records"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_missing_added_or_removed_is_rejected() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props(100, 0, 5);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let s = snap(2, Some(1), Operation::Replace, &props, 0);
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("added-data-files"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_replace_schema_id_change_is_rejected() {
+        let parent = snap(1, None, Operation::Append, &[("total-records", "100")], 0);
+        let owned = replace_props(100, 3, 5);
+        let props: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        // schema_id 7 ≠ parent's 0.
+        let s = snap(2, Some(1), Operation::Replace, &props, 7);
+        let err = validate_replace_snapshot(&s, &parent).expect_err("err");
+        match err {
+            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+                assert_eq!(snapshot_id, 2);
+                assert!(reason.contains("schema"), "{reason}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
