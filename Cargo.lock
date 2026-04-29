@@ -2786,6 +2786,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "crc32c",
+ "crc32fast",
  "csv",
  "ctrlc",
  "datasketches",
