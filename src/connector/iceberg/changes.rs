@@ -155,6 +155,37 @@ pub(crate) struct IcebergChangeBatch {
     pub deletes: Vec<PositionDeleteRef>,
 }
 
+/// Per-row Change action: this row got inserted or deleted relative to
+/// the previous MV refresh state. Carried alongside the row contents
+/// through the materialize-changes pipeline so the aggregate path can
+/// route inserts and deletes differently (insert → positive delta;
+/// delete → negative delta after sign-flip).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ChangeAction {
+    Insert,
+    Delete,
+}
+
+/// Output of `materialize_changes`: separate `QueryResult` streams for
+/// the insert side and the delete side. Both are produced by running
+/// the MV's SELECT statement against a one-shot in-memory catalog
+/// whose base table has been replaced by the relevant subset of rows
+/// (insert files, or deleted-rows-as-temp-parquet). Aggregate semantics
+/// (WHERE, GROUP BY, projection) are honored uniformly because the SQL
+/// is the same on both branches.
+///
+/// Either branch may be the empty `QueryResult` (no rows / no chunks)
+/// if the corresponding file list was empty.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct MaterializedChanges {
+    pub previous_snapshot_id: i64,
+    pub current_snapshot_id: i64,
+    pub inserts: crate::engine::QueryResult,
+    pub deletes: crate::engine::QueryResult,
+}
+
 /// One unit of work the file-collection phase needs to perform for a
 /// single snapshot in the lineage. `Replace` snapshots are validated by
 /// `classify_snapshot` itself and never produce a `LineageAction` —
