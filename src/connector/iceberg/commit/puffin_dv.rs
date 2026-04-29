@@ -19,14 +19,27 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use bytes::Bytes;
 use roaring::RoaringBitmap;
+use serde_json::json;
 
 const MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
+const PUFFIN_MAGIC: &[u8; 4] = b"PFA1";
 const MAX_POSITIVE_I64_POSITION: u64 = 1u64 << 63;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DeletionVector {
     bitmaps: BTreeMap<u32, RoaringBitmap>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WrittenPuffinDv {
+    pub path: String,
+    pub referenced_data_file: String,
+    pub cardinality: u64,
+    pub content_offset: i64,
+    pub content_size_in_bytes: i64,
+    pub file_size_in_bytes: u64,
 }
 
 impl DeletionVector {
@@ -178,9 +191,141 @@ fn read_le_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+pub async fn write_single_deletion_vector_puffin(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+    referenced_data_file: &str,
+    dv: &DeletionVector,
+) -> Result<WrittenPuffinDv> {
+    let payload = dv.to_iceberg_payload()?;
+    let content_offset = i64::try_from(PUFFIN_MAGIC.len()).context("puffin header is too large")?;
+    let content_size_in_bytes =
+        i64::try_from(payload.len()).context("deletion vector payload is too large")?;
+    let cardinality = dv.cardinality();
+    let footer = json!({
+        "blobs": [{
+            "type": "deletion-vector-v1",
+            "fields": [],
+            "snapshot-id": -1,
+            "sequence-number": -1,
+            "offset": content_offset,
+            "length": content_size_in_bytes,
+            "properties": {
+                "referenced-data-file": referenced_data_file,
+                "cardinality": cardinality.to_string(),
+            }
+        }],
+        "properties": {
+            "created-by": "NovaRocks",
+        }
+    });
+    let footer_json =
+        serde_json::to_vec(&footer).context("failed to serialize Puffin footer metadata")?;
+    let footer_json_len =
+        u32::try_from(footer_json.len()).context("Puffin footer metadata is too large")?;
+
+    let file_size_in_bytes = PUFFIN_MAGIC.len()
+        + payload.len()
+        + PUFFIN_MAGIC.len()
+        + footer_json.len()
+        + size_of::<u32>()
+        + 4
+        + PUFFIN_MAGIC.len();
+    let mut file = Vec::with_capacity(file_size_in_bytes);
+    file.extend_from_slice(PUFFIN_MAGIC);
+    file.extend_from_slice(&payload);
+    file.extend_from_slice(PUFFIN_MAGIC);
+    file.extend_from_slice(&footer_json);
+    file.extend_from_slice(&footer_json_len.to_le_bytes());
+    file.extend_from_slice(&[0u8; 4]);
+    file.extend_from_slice(PUFFIN_MAGIC);
+
+    let output = file_io
+        .new_output(path)
+        .with_context(|| format!("failed to create Puffin output file: {path}"))?;
+    output
+        .write(Bytes::from(file))
+        .await
+        .with_context(|| format!("failed to write Puffin deletion vector file: {path}"))?;
+
+    Ok(WrittenPuffinDv {
+        path: path.to_string(),
+        referenced_data_file: referenced_data_file.to_string(),
+        cardinality,
+        content_offset,
+        content_size_in_bytes,
+        file_size_in_bytes: file_size_in_bytes as u64,
+    })
+}
+
+pub async fn read_deletion_vector_puffin(
+    file_io: &iceberg::io::FileIO,
+    path: &str,
+    content_offset: i64,
+    content_size_in_bytes: i64,
+) -> Result<DeletionVector> {
+    ensure!(
+        content_offset >= 0,
+        "Puffin deletion vector content offset must be non-negative"
+    );
+    ensure!(
+        content_size_in_bytes >= 0,
+        "Puffin deletion vector content size must be non-negative"
+    );
+
+    let start = u64::try_from(content_offset).context("invalid Puffin content offset")?;
+    let size =
+        u64::try_from(content_size_in_bytes).context("invalid Puffin content size in bytes")?;
+    let end = start
+        .checked_add(size)
+        .context("Puffin deletion vector byte range overflows u64")?;
+    let input = file_io
+        .new_input(path)
+        .with_context(|| format!("failed to create Puffin input file: {path}"))?;
+    let reader = input
+        .reader()
+        .await
+        .with_context(|| format!("failed to open Puffin input file reader: {path}"))?;
+    let payload = reader
+        .read(start..end)
+        .await
+        .with_context(|| format!("failed to read Puffin deletion vector byte range: {path}"))?;
+
+    DeletionVector::from_iceberg_payload(payload.as_ref())
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use iceberg::io::{FileIO, LocalFsStorageFactory};
+
+    struct TestFsFileIOBuilder {
+        root: Option<String>,
+    }
+
+    trait TestFileIOBuilderExt {
+        fn new_fs_io() -> TestFsFileIOBuilder;
+    }
+
+    impl TestFileIOBuilderExt for iceberg::io::FileIOBuilder {
+        fn new_fs_io() -> TestFsFileIOBuilder {
+            TestFsFileIOBuilder { root: None }
+        }
+    }
+
+    impl TestFsFileIOBuilder {
+        fn with_root(mut self, root: &str) -> Self {
+            self.root = Some(root.to_string());
+            self
+        }
+
+        fn build(self) -> FileIO {
+            let _ = self.root;
+            iceberg::io::FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build()
+        }
+    }
 
     fn bitmap_with(values: &[u32]) -> RoaringBitmap {
         let mut bitmap = RoaringBitmap::new();
@@ -217,6 +362,48 @@ mod tests {
             err.contains(expected),
             "expected error containing {expected:?}, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn single_blob_puffin_round_trips_metadata_and_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_io = iceberg::io::FileIOBuilder::new_fs_io()
+            .with_root(dir.path().to_str().unwrap())
+            .build();
+        let path = format!("{}/dv.puffin", dir.path().to_str().unwrap());
+        let referenced_data_file = "file:///warehouse/t/data/data-1.parquet";
+        let mut dv = DeletionVector::new();
+        dv.insert(3).unwrap();
+        dv.insert(u32::MAX as u64 + 5).unwrap();
+
+        let written =
+            write_single_deletion_vector_puffin(&file_io, &path, referenced_data_file, &dv)
+                .await
+                .unwrap();
+
+        assert_eq!(written.path, path);
+        assert_eq!(written.referenced_data_file, referenced_data_file);
+        assert_eq!(written.cardinality, dv.cardinality());
+        assert!(written.content_offset >= 4);
+        assert!(written.content_size_in_bytes > 0);
+        let metadata = file_io
+            .new_input(&written.path)
+            .unwrap()
+            .metadata()
+            .await
+            .unwrap();
+        assert_eq!(written.file_size_in_bytes, metadata.size);
+
+        let decoded = read_deletion_vector_puffin(
+            &file_io,
+            &written.path,
+            written.content_offset,
+            written.content_size_in_bytes,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decoded, dv);
     }
 
     #[test]
