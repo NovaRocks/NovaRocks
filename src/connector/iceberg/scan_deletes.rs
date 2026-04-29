@@ -33,10 +33,9 @@ use std::collections::HashMap;
 
 use arrow::array::Array;
 #[allow(unused_imports)] // removed in Task 5 once scan_deletes lands
-use arrow::array::{ArrayRef, BooleanArray};
-#[allow(unused_imports)] // removed in Task 5 once scan_deletes lands
+use arrow::array::ArrayRef;
+use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
-#[allow(unused_imports)] // removed in Task 5 once scan_deletes lands
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -189,5 +188,87 @@ pub(crate) fn read_delete_positions_per_data_file(
     Ok(positions_per_file)
 }
 
-// TODO PR-3 Task 4: implement read_data_file_at_positions
+/// Open a single data file and project the rows at the positions
+/// listed in `positions`. Returns one `RecordBatch` per parquet
+/// `RecordBatch` boundary that contained at least one matching row.
+/// Empty if the file has no matching rows (which would be a bug;
+/// `read_delete_positions_per_data_file` only emits keys for files that
+/// actually had deletions, but defensive empty-handling avoids surprise).
+///
+/// `data_file_path` is in iceberg's path format (e.g. `file:///...` or
+/// `s3://...`). The `factory` knows how to dispatch.
+// removed when scan_deletes lands in Task 5
+#[allow(dead_code)]
+pub(crate) fn read_data_file_at_positions(
+    data_file_path: &str,
+    data_file_size: Option<u64>,
+    positions: &RoaringTreemap,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+) -> Result<Vec<RecordBatch>, ChangeError> {
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+
+    if positions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let reader = factory
+        .open_with_len(data_file_path, data_file_size)
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "open iceberg data file {data_file_path} for delete reverse projection: {e}"
+            ))
+        })?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
+        ))
+    })?;
+    let reader = builder.build().map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "build parquet reader for {data_file_path}: {e}"
+        ))
+    })?;
+
+    let mut out: Vec<RecordBatch> = Vec::new();
+    let mut row_offset: u64 = 0;
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
+            ))
+        })?;
+        let n = batch.num_rows() as u64;
+        if n == 0 {
+            continue;
+        }
+        let mut mask = Vec::with_capacity(batch.num_rows());
+        let mut any_kept = false;
+        for local in 0..n {
+            let global = row_offset + local;
+            let keep = positions.contains(global);
+            mask.push(keep);
+            if keep {
+                any_kept = true;
+            }
+        }
+        if any_kept {
+            let mask_array = BooleanArray::from(mask);
+            let projected = filter_record_batch(&batch, &mask_array).map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "filter rows in {data_file_path}: {e}"
+                ))
+            })?;
+            out.push(projected);
+        }
+        row_offset += n;
+    }
+
+    Ok(out)
+}
+
 // TODO PR-3 Task 5: implement scan_deletes (top-level orchestrator)
