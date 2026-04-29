@@ -326,12 +326,11 @@ pub(crate) fn classify_lineage(
         if cursor == previous_snapshot_id {
             break;
         }
-        let snapshot_ref =
-            metadata
-                .snapshot_by_id(cursor)
-                .ok_or_else(|| ChangeError::LineageBroken {
-                    previous_snapshot: previous_snapshot_id,
-                })?;
+        let snapshot_ref = metadata
+            .snapshot_by_id(cursor)
+            .ok_or(ChangeError::LineageBroken {
+                previous_snapshot: previous_snapshot_id,
+            })?;
         let snapshot = snapshot_ref.as_ref();
         let parent_id = snapshot.parent_snapshot_id();
         let parent = parent_id
