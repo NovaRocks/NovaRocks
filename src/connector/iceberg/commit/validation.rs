@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 
 use arrow::datatypes::SchemaRef as ArrowSchemaRef;
+use iceberg::spec::FormatVersion;
 use iceberg::table::Table;
 
 use super::types::IcebergWriteMode;
@@ -34,7 +35,17 @@ pub fn row_lineage_property_enabled(props: &HashMap<String, String>) -> bool {
 }
 
 pub fn classify_iceberg_write_mode(table: &Table) -> IcebergWriteMode {
-    if row_lineage_property_enabled(table.metadata().properties()) {
+    classify_iceberg_write_mode_from_metadata(
+        table.metadata().format_version(),
+        table.metadata().properties(),
+    )
+}
+
+fn classify_iceberg_write_mode_from_metadata(
+    format_version: FormatVersion,
+    props: &HashMap<String, String>,
+) -> IcebergWriteMode {
+    if format_version == FormatVersion::V3 || row_lineage_property_enabled(props) {
         IcebergWriteMode::RowLineageV3
     } else {
         IcebergWriteMode::LegacyPositionDeletes
@@ -221,6 +232,24 @@ mod tests {
         let mut props = std::collections::HashMap::new();
         props.insert("write.row-lineage".to_string(), "false".to_string());
         assert!(!row_lineage_property_enabled(&props));
+    }
+
+    #[test]
+    fn write_mode_classifies_v3_without_property_as_row_lineage() {
+        let props = std::collections::HashMap::<String, String>::new();
+        assert_eq!(
+            classify_iceberg_write_mode_from_metadata(FormatVersion::V3, &props),
+            IcebergWriteMode::RowLineageV3
+        );
+    }
+
+    #[test]
+    fn write_mode_classifies_v2_without_property_as_legacy() {
+        let props = std::collections::HashMap::<String, String>::new();
+        assert_eq!(
+            classify_iceberg_write_mode_from_metadata(FormatVersion::V2, &props),
+            IcebergWriteMode::LegacyPositionDeletes
+        );
     }
 
     #[test]

@@ -46,5 +46,5 @@ pub use run::{RunInput, run_iceberg_commit};
 pub use types::{CommitOpKind, CommitOutcome, IcebergWriteMode, WrittenFile};
 pub use validation::{
     classify_iceberg_write_mode, ensure_iceberg_write_supported, ensure_no_equality_deletes,
-    ensure_single_partition_spec, match_select_schema_to_table, row_lineage_property_enabled,
+    ensure_single_partition_spec, match_select_schema_to_table,
 };

@@ -3571,7 +3571,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_delete_where_removes_matching_rows() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
             .execute_in_database(
                 "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
@@ -3601,7 +3601,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_legacy_delete_still_uses_position_delete_path() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
             .expect("seed");
@@ -3678,7 +3678,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_delete_no_match_is_a_noop() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
             .expect("seed");
@@ -3693,7 +3693,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_delete_without_where_is_rejected() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
             .expect("seed");
@@ -3709,7 +3709,7 @@ enable_path_style_access = true
     #[test]
     fn iceberg_delete_unsupported_predicate_is_rejected() {
         let warehouse = TempDir::new().expect("warehouse");
-        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        let (_engine, session) = open_iceberg_session_with_table(&warehouse, "2");
         session
             .execute_in_database("insert into ice.db1.t values (1, 'a')", "default")
             .expect("seed");

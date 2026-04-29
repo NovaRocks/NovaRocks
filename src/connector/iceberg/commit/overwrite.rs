@@ -75,7 +75,10 @@ impl IcebergCommitAction for OverwriteCommit {
                 IcebergWriteMode::RowLineageV3 => Some(ctx.table.metadata().next_row_id()),
                 IcebergWriteMode::LegacyPositionDeletes => None,
             };
-        let row_lineage_added_rows = written.iter().map(|f| f.record_count).sum();
+        let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
+            sum.checked_add(f.record_count)
+                .ok_or_else(|| "row-lineage added row count overflow".to_string())
+        })?;
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = OverwriteTxnAction {
