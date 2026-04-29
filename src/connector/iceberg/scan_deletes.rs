@@ -32,8 +32,6 @@
 use std::collections::HashMap;
 
 use arrow::array::Array;
-#[allow(unused_imports)] // removed in Task 5 once scan_deletes lands
-use arrow::array::ArrayRef;
 use arrow::array::BooleanArray;
 use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
@@ -44,11 +42,7 @@ use roaring::RoaringTreemap;
 use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};
 
 /// Constants matching the iceberg position-delete file schema (file_path, pos).
-// removed when scan_deletes lands in Task 5
-#[allow(dead_code)]
 const FILE_PATH_COLUMN: &str = "file_path";
-// removed when scan_deletes lands in Task 5
-#[allow(dead_code)]
 const POS_COLUMN: &str = "pos";
 
 // TODO(ivm-phase-2 follow-up): every failure path here funnels into
@@ -271,4 +265,41 @@ pub(crate) fn read_data_file_at_positions(
     Ok(out)
 }
 
-// TODO PR-3 Task 5: implement scan_deletes (top-level orchestrator)
+/// Top-level: take a slice of `PositionDeleteRef`s and produce
+/// `Vec<RecordBatch>` containing the original deleted base rows in the
+/// data files' full schema (no projection / no WHERE applied — those
+/// are SQL-level concerns layered on top of this function).
+///
+/// `data_file_size_lookup` returns the on-disk size in bytes for a given
+/// `data_file_path`. iceberg-rust's `DataFile::file_size_in_bytes` is
+/// the canonical source. Caller must provide a closure since iceberg
+/// table state isn't carried into this module to keep the dependency
+/// graph minimal.
+// removed when materialize_changes lands in Task 7
+#[allow(dead_code)]
+pub(crate) fn scan_deletes<F>(
+    delete_files: &[PositionDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    data_file_size_lookup: F,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    F: Fn(&str) -> Option<u64>,
+{
+    if delete_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let positions_per_file = read_delete_positions_per_data_file(delete_files, factory)?;
+    let mut out: Vec<RecordBatch> = Vec::new();
+    // Sort keys for deterministic output ordering — useful for tests
+    // and downstream equality assertions.
+    let mut data_file_paths: Vec<&String> = positions_per_file.keys().collect();
+    data_file_paths.sort();
+    for data_file_path in data_file_paths {
+        let positions = &positions_per_file[data_file_path];
+        let size = data_file_size_lookup(data_file_path);
+        let batches = read_data_file_at_positions(data_file_path, size, positions, factory)?;
+        out.extend(batches);
+    }
+    Ok(out)
+}
