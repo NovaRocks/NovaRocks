@@ -27,6 +27,12 @@ pub enum CommitOpKind {
     RowDelta,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcebergWriteMode {
+    LegacyPositionDeletes,
+    RowLineageV3,
+}
+
 /// Metadata about a single Parquet file produced by `IcebergSink` during a
 /// pipeline run. Mirrors the subset of `TIcebergDataFile` we need for commit
 /// and abort flows. Constructed from `TSinkCommitInfo` after pipeline finish.
