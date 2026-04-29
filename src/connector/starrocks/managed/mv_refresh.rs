@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::iceberg::catalog::load_table;
-use crate::connector::iceberg::changes::plan_changes;
+use crate::connector::iceberg::changes::{materialize_changes, plan_changes};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::engine::mv_flow::{
@@ -307,13 +307,6 @@ fn refresh_aggregate_mv_incremental(
 ) -> Result<StatementResult, String> {
     let batch =
         plan_changes(ctx.base_table, ctx.previous_snapshot_id, &[]).map_err(|e| e.to_string())?;
-    if !batch.deletes.is_empty() {
-        return Err(format!(
-            "iceberg aggregate materialized view incremental refresh does not yet support \
-             delete snapshots; {} delete file(s) seen in lineage",
-            batch.deletes.len()
-        ));
-    }
     if batch.current_snapshot_id != ctx.current_snapshot_id {
         return Err(format!(
             "iceberg change batch current snapshot mismatch: expected {}, got {}",
@@ -321,25 +314,52 @@ fn refresh_aggregate_mv_incremental(
         ));
     }
 
-    let added_files: Vec<(String, i64, Option<i64>)> = batch
-        .inserts
-        .iter()
-        .map(|f| (f.path.clone(), f.size, f.record_count))
-        .collect();
-    let result = execute_query_for_mv_incremental_refresh(
+    // Empty-input early return: nothing to merge, just advance lineage.
+    if batch.inserts.is_empty() && batch.deletes.is_empty() {
+        // The refresh metadata write is what advances the lineage marker.
+        // PR-3 doesn't yet have a no-op write path that touches metadata
+        // without writing chunks; defer to PR-4.
+        return Err(
+            "aggregate MV incremental refresh: no inserts and no deletes; \
+             lineage-advance-only path not yet implemented in PR-3 — defer to PR-4"
+                .to_string(),
+        );
+    }
+
+    let materialized = materialize_changes(
         ctx.state,
         ctx.database,
         ctx.select_sql,
         ctx.base_ref,
-        added_files,
+        ctx.base_table,
+        batch,
+        &[], // PR-4 wires the PK columns once StoredMaterializedView persists them.
     )?;
-    let output_columns = result
+
+    // Build the layout from whichever branch has chunks (both produce identical column shape).
+    let layout_source = if !materialized.inserts.chunks.is_empty() {
+        &materialized.inserts
+    } else {
+        &materialized.deletes
+    };
+    let output_columns = layout_source
         .columns
         .iter()
         .map(query_result_column_to_output_column)
         .collect::<Result<Vec<_>, String>>()?;
     let layout = super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &output_columns)?;
-    let delta_chunks = super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)?;
+
+    let insert_delta =
+        super::mv_agg_state::materialize_aggregate_result_chunks(materialized.inserts, &layout)?;
+    let delete_delta_positive =
+        super::mv_agg_state::materialize_aggregate_result_chunks(materialized.deletes, &layout)?;
+    let delete_delta =
+        super::mv_agg_state::negate_aggregate_state_chunks(delete_delta_positive, &layout)?;
+
+    let mut delta_chunks = Vec::with_capacity(insert_delta.len() + delete_delta.len());
+    delta_chunks.extend(insert_delta);
+    delta_chunks.extend(delete_delta);
+
     let plan = load_physical_insert_plan(
         ctx.state,
         &crate::engine::ResolvedLocalTableName {
