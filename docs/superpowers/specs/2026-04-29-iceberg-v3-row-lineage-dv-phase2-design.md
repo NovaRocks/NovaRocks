@@ -1,7 +1,7 @@
 # Iceberg v3 Row Lineage + Puffin DV Phase 2 Design
 
 **日期**：2026-04-29
-**状态**：Draft（待 review）
+**状态**：Accepted for Phase 2a planning
 **范围**：standalone 模式下，对 `write.row-lineage=true` 的 Iceberg v3 表支持 `INSERT INTO` / `INSERT OVERWRITE` / `DELETE`
 
 ---
