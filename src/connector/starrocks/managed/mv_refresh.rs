@@ -1223,6 +1223,171 @@ mod tests {
         drop(engine);
     }
 
+    #[test]
+    fn aggregate_mv_incremental_refresh_handles_v3_row_lineage_base_delete() {
+        // TODO(ivm-phase-2 follow-up): this test is a near-copy of
+        // `aggregate_mv_incremental_refresh_handles_base_delete` differing only in
+        // `tblproperties`. Extract a shared `run_aggregate_mv_incremental_delete_refresh`
+        // harness once we touch the reference test for another reason; the duplication
+        // is intentional here to keep this PR's diff minimal and reviewable.
+        //
+        // End-to-end variant of `aggregate_mv_incremental_refresh_handles_base_delete`
+        // that puts the base on Iceberg v3 with `write.row-lineage=true`. The DELETE
+        // therefore writes a Puffin deletion-vector file (Phase 2a RowDeltaDvCommit)
+        // instead of a v2 position-delete Parquet. The IVM incremental refresh path
+        // exercised here is `plan_changes` -> `materialize_changes` -> `scan_deletes`,
+        // with scan_deletes routing the Puffin DV through the new
+        // `read_dv_positions_per_data_file` helper.
+        //
+        // Skipped when the minio object-store endpoint is unreachable, matching
+        // `aggregate_mv_incremental_refresh_handles_base_delete`.
+        //
+        // We hold `lock_runtime_test_state()` for the test's full duration so
+        // that no parallel test holding the same runtime-state lock can clear
+        // the global tablet/shard registries underneath us once
+        // `StandaloneNovaRocks::open` has registered our tablets.
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+                metadata_db_path: None,
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping v3 row-lineage MV incremental DELETE test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        // The only delta vs `_handles_base_delete`: tblproperties enables row-lineage.
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3","write.row-lineage"="true")"#,
+                "default",
+            )
+            .expect("create row-lineage iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view agg_mv \
+             distributed by hash(customer) buckets 2 \
+             as select customer, count(*) as c, sum(amount) as s \
+             from ice.ns.orders group by customer",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let pre_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on pre-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select pre-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            pre_state,
+            vec![
+                ("A".to_string(), 2_i64, 30_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "row-lineage MV state after full refresh must reflect the 3 seeded base rows"
+        );
+
+        // Trigger a DELETE — this writes a Puffin DV (Phase 2a RowDeltaDvCommit).
+        session
+            .execute_in_database("delete from ice.ns.orders where id = 1", "default")
+            .expect("delete base row id=1 (writes puffin dv)");
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, DV-bearing) refresh materialized view: {err}");
+        }
+
+        let post_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping v3 row-lineage MV incremental DELETE test: object store unavailable on post-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select post-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            post_state,
+            vec![
+                ("A".to_string(), 1_i64, 20_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "row-lineage MV state after DV-bearing incremental refresh must drop \
+             count and sum for the affected group; other groups untouched"
+        );
+
+        drop(engine);
+    }
+
     /// Read the managed-lake aggregate MV's visible state as
     /// `(customer, c, s)` rows sorted by customer. Used by the
     /// end-to-end `aggregate_mv_incremental_refresh_handles_base_delete`
@@ -1279,7 +1444,7 @@ mod tests {
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
         if !managed_lake_endpoint_reachable(&endpoint) {
             eprintln!(
-                "skipping aggregate MV incremental DELETE test: object store endpoint is unreachable: {endpoint}"
+                "skipping MV integration test: object store endpoint is unreachable: {endpoint}"
             );
             return None;
         }
