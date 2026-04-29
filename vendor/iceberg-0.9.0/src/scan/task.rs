@@ -151,10 +151,18 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             file_path: ctx.manifest_entry.file_path().to_string(),
             file_size_in_bytes: ctx.manifest_entry.file_size_in_bytes(),
             file_type: ctx.manifest_entry.content_type(),
+            file_format: ctx.manifest_entry.file_format(),
             partition_spec_id: ctx.partition_spec_id,
             equality_ids: ctx.manifest_entry.data_file.equality_ids.clone(),
+            referenced_data_file: ctx.manifest_entry.data_file.referenced_data_file(),
+            content_offset: ctx.manifest_entry.data_file.content_offset(),
+            content_size_in_bytes: ctx.manifest_entry.data_file.content_size_in_bytes(),
         }
     }
+}
+
+fn default_delete_file_format() -> DataFileFormat {
+    DataFileFormat::Parquet
 }
 
 /// A task to scan part of file.
@@ -169,9 +177,29 @@ pub struct FileScanTaskDeleteFile {
     /// delete file type
     pub file_type: DataContentType,
 
+    /// File format of the delete file. Parquet for v2 position-delete files,
+    /// Puffin for v3 deletion-vector files.
+    #[serde(default = "default_delete_file_format")]
+    pub file_format: DataFileFormat,
+
     /// partition id
     pub partition_spec_id: i32,
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     pub equality_ids: Option<Vec<i32>>,
+
+    /// For Puffin deletion-vector entries: fully-qualified path of the data
+    /// file that the deletion vector applies to.
+    #[serde(default)]
+    pub referenced_data_file: Option<String>,
+
+    /// For Puffin deletion-vector entries: byte offset of the
+    /// `deletion-vector-v1` blob inside the Puffin file.
+    #[serde(default)]
+    pub content_offset: Option<i64>,
+
+    /// For Puffin deletion-vector entries: byte length of the
+    /// `deletion-vector-v1` blob inside the Puffin file.
+    #[serde(default)]
+    pub content_size_in_bytes: Option<i64>,
 }

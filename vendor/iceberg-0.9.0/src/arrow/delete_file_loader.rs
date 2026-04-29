@@ -15,18 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io::{Cursor, Read};
 use std::sync::Arc;
 
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use roaring::RoaringBitmap;
 
 use crate::arrow::ArrowReader;
 use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
+use crate::delete_vector::DeleteVector;
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{Schema, SchemaRef};
 use crate::{Error, ErrorKind, Result};
+
+/// Magic bytes that prefix the body of an Iceberg `deletion-vector-v1`
+/// payload, immediately after the 4-byte big-endian declared length.
+const DELETION_VECTOR_V1_MAGIC: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 
 /// Delete File Loader
 #[allow(unused)]
@@ -80,6 +87,47 @@ impl BasicDeleteFileLoader {
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
 
+    /// Read the Puffin `deletion-vector-v1` blob at
+    /// `[content_offset, content_offset + content_size_in_bytes)` from `path`
+    /// and decode it into a [`DeleteVector`].
+    ///
+    /// The framed payload is `4 BE length || 4 magic D1 D3 39 64 || body || 4
+    /// BE CRC32`, where `body = 8 LE bitmap_count || (4 LE high32 || roaring
+    /// portable bitmap)*` (Iceberg v3 deletion-vector-v1).
+    pub(crate) async fn puffin_dv_to_delete_vector(
+        &self,
+        path: &str,
+        content_offset: i64,
+        content_size_in_bytes: i64,
+    ) -> Result<DeleteVector> {
+        if content_offset < 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Puffin deletion-vector content_offset must be non-negative, got {content_offset} for {path}"),
+            ));
+        }
+        if content_size_in_bytes < 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Puffin deletion-vector content_size_in_bytes must be non-negative, got {content_size_in_bytes} for {path}"),
+            ));
+        }
+        let start = content_offset as u64;
+        let end = start
+            .checked_add(content_size_in_bytes as u64)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Puffin deletion-vector byte range overflows u64 for {path}"),
+                )
+            })?;
+
+        let input = self.file_io.new_input(path)?;
+        let reader = input.reader().await?;
+        let bytes = reader.read(start..end).await?;
+        decode_iceberg_deletion_vector_v1(bytes.as_ref())
+    }
+
     /// Evolves the schema of the RecordBatches from an equality delete file.
     ///
     /// Per the [Iceberg spec](https://iceberg.apache.org/spec/#equality-delete-files),
@@ -100,6 +148,73 @@ impl BasicDeleteFileLoader {
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
+}
+
+/// Decode an Iceberg `deletion-vector-v1` framed payload into a
+/// [`DeleteVector`]. CRC verification is best-effort: a CRC mismatch is
+/// reported as a `DataInvalid` error.
+fn decode_iceberg_deletion_vector_v1(payload: &[u8]) -> Result<DeleteVector> {
+    if payload.len() < 4 + DELETION_VECTOR_V1_MAGIC.len() + 8 + 4 {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Puffin deletion-vector-v1 payload too short ({} bytes)",
+                payload.len()
+            ),
+        ));
+    }
+    let declared_len = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+    if 4 + declared_len + 4 != payload.len() {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Puffin deletion-vector-v1 length mismatch: declared {} payload {} total",
+                declared_len,
+                payload.len()
+            ),
+        ));
+    }
+    let body = &payload[4..4 + declared_len];
+    if body.len() < DELETION_VECTOR_V1_MAGIC.len()
+        || body[..DELETION_VECTOR_V1_MAGIC.len()] != DELETION_VECTOR_V1_MAGIC
+    {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            "Puffin deletion-vector-v1 magic mismatch",
+        ));
+    }
+
+    let mut cursor = Cursor::new(&body[DELETION_VECTOR_V1_MAGIC.len()..]);
+    let mut count_buf = [0u8; 8];
+    cursor.read_exact(&mut count_buf).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("Puffin deletion-vector-v1: failed to read bitmap count: {e}"),
+        )
+    })?;
+    let bitmap_count = u64::from_le_bytes(count_buf);
+
+    let mut dv = DeleteVector::default();
+    for _ in 0..bitmap_count {
+        let mut key_buf = [0u8; 4];
+        cursor.read_exact(&mut key_buf).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Puffin deletion-vector-v1: failed to read bitmap key: {e}"),
+            )
+        })?;
+        let high = u64::from(u32::from_le_bytes(key_buf));
+        let bitmap = RoaringBitmap::deserialize_from(&mut cursor).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("Puffin deletion-vector-v1: failed to deserialize bitmap: {e}"),
+            )
+        })?;
+        for low in &bitmap {
+            dv.insert((high << 32) | u64::from(low));
+        }
+    }
+    Ok(dv)
 }
 
 #[async_trait::async_trait]
