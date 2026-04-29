@@ -1066,6 +1066,265 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_mv_incremental_refresh_handles_base_delete() {
+        // End-to-end PR-3 deliverable test. Builds a real iceberg base
+        // table (3 rows over (id, customer, amount)), creates a
+        // managed-lake aggregate MV (count + sum grouped by customer),
+        // populates the MV via a full REFRESH, then DELETEs one base row
+        // and triggers an incremental REFRESH. Asserts the MV's count
+        // and sum decrease for the affected group while the other group
+        // is untouched.
+        //
+        // Skipped when the minio object-store endpoint is unreachable
+        // (matches the pattern in `aggregate_full_refresh_executor_writes_physical_columns`).
+        //
+        // We hold `lock_runtime_test_state()` for the test's full
+        // duration so that no parallel test holding the same runtime-state
+        // lock can clear the global tablet/shard registries underneath
+        // us once `StandaloneNovaRocks::open` has registered our tablets.
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_config_dir, config_path)) = maybe_managed_lake_config_path() else {
+            return;
+        };
+        let iceberg_dir = tempfile::tempdir().expect("iceberg warehouse tempdir");
+        let iceberg_warehouse = format!("file://{}", iceberg_dir.path().display());
+
+        let engine = match crate::engine::StandaloneNovaRocks::open(
+            crate::engine::StandaloneOptions {
+                config_path: Some(config_path),
+                metadata_db_path: None,
+            },
+        ) {
+            Ok(engine) => engine,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV incremental DELETE test: object store unavailable: {err}"
+                    );
+                    return;
+                }
+                panic!("open standalone engine: {err}");
+            }
+        };
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="hadoop","iceberg.catalog.warehouse"="{iceberg_warehouse}")"#
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create iceberg catalog");
+        session
+            .execute_in_database("create database ice.ns", "default")
+            .expect("create iceberg namespace");
+        session
+            .execute_in_database(
+                r#"create table ice.ns.orders (id bigint not null, customer string, amount bigint) tblproperties("format-version"="3")"#,
+                "default",
+            )
+            .expect("create iceberg orders table");
+        session
+            .execute_in_database(
+                "insert into ice.ns.orders values (1, 'A', 10), (2, 'A', 20), (3, 'B', 30)",
+                "default",
+            )
+            .expect("seed iceberg base rows");
+
+        session
+            .execute_in_database("create database analytics", "default")
+            .expect("create analytics database");
+        if let Err(err) = session.execute_in_database(
+            "create materialized view agg_mv \
+             distributed by hash(customer) buckets 2 \
+             as select customer, count(*) as c, sum(amount) as s \
+             from ice.ns.orders group by customer",
+            "analytics",
+        ) {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV incremental DELETE test: object store unavailable on create: {err}"
+                );
+                return;
+            }
+            panic!("create materialized view: {err}");
+        }
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV incremental DELETE test: object store unavailable on full refresh: {err}"
+                );
+                return;
+            }
+            panic!("first (full) refresh materialized view: {err}");
+        }
+
+        let pre_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV incremental DELETE test: object store unavailable on pre-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select pre-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            pre_state,
+            vec![
+                ("A".to_string(), 2_i64, 30_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "MV state after full refresh must reflect the 3 seeded base rows"
+        );
+
+        // Trigger a DELETE-bearing snapshot on the base.
+        session
+            .execute_in_database("delete from ice.ns.orders where id = 1", "default")
+            .expect("delete base row id=1");
+
+        if let Err(err) =
+            session.execute_in_database("refresh materialized view agg_mv", "analytics")
+        {
+            if is_unavailable_object_store_error(&err) {
+                eprintln!(
+                    "skipping aggregate MV incremental DELETE test: object store unavailable on incremental refresh: {err}"
+                );
+                return;
+            }
+            panic!("second (incremental, delete-bearing) refresh materialized view: {err}");
+        }
+
+        let post_state = match collect_agg_mv_state(&session) {
+            Ok(rows) => rows,
+            Err(err) => {
+                if is_unavailable_object_store_error(&err) {
+                    eprintln!(
+                        "skipping aggregate MV incremental DELETE test: object store unavailable on post-delete select: {err}"
+                    );
+                    return;
+                }
+                panic!("select post-delete agg_mv state: {err}");
+            }
+        };
+        assert_eq!(
+            post_state,
+            vec![
+                ("A".to_string(), 1_i64, 20_i64),
+                ("B".to_string(), 1_i64, 30_i64),
+            ],
+            "MV state after delete-bearing incremental refresh must drop \
+             count and sum for the affected group; other groups untouched"
+        );
+
+        drop(engine);
+    }
+
+    /// Read the managed-lake aggregate MV's visible state as
+    /// `(customer, c, s)` rows sorted by customer. Used by the
+    /// end-to-end `aggregate_mv_incremental_refresh_handles_base_delete`
+    /// test to verify state before and after each refresh.
+    fn collect_agg_mv_state(
+        session: &crate::engine::StandaloneSession,
+    ) -> Result<Vec<(String, i64, i64)>, String> {
+        let result = session.execute_in_context(
+            "select customer, c, s from agg_mv order by customer",
+            None,
+            "analytics",
+            None,
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("select from agg_mv must return rows".to_string());
+        };
+        let mut out = Vec::new();
+        for chunk in &query_result.chunks {
+            let customers = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| "agg_mv customer column not Utf8".to_string())?;
+            let counts = chunk
+                .batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "agg_mv count column not Int64".to_string())?;
+            let sums = chunk
+                .batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| "agg_mv sum column not Int64".to_string())?;
+            for i in 0..chunk.batch.num_rows() {
+                out.push((
+                    customers.value(i).to_string(),
+                    counts.value(i),
+                    sums.value(i),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Build a TOML config file that points the standalone server at
+    /// the minio endpoint identified by `maybe_object_store_config_for_mv_refresh`,
+    /// plus a per-test sqlite metadata-db path. Returns `None` when minio
+    /// is unreachable (the caller skips). Mirrors `engine::tests::maybe_managed_lake_config`.
+    fn maybe_managed_lake_config_path() -> Option<(tempfile::TempDir, std::path::PathBuf)> {
+        let endpoint = std::env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+        if !managed_lake_endpoint_reachable(&endpoint) {
+            eprintln!(
+                "skipping aggregate MV incremental DELETE test: object store endpoint is unreachable: {endpoint}"
+            );
+            return None;
+        }
+        let access_key_id = std::env::var("AWS_S3_ACCESS_KEY_ID")
+            .or_else(|_| std::env::var("MINIO_ROOT_USER"))
+            .unwrap_or_else(|_| "admin".to_string());
+        let access_key_secret = std::env::var("AWS_S3_SECRET_ACCESS_KEY")
+            .or_else(|_| std::env::var("MINIO_ROOT_PASSWORD"))
+            .unwrap_or_else(|_| "admin123".to_string());
+        let bucket = std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "novarocks".to_string());
+        let run_id = format!(
+            "mv_refresh_delete_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        );
+        let warehouse_uri = format!("s3://{bucket}/{run_id}");
+
+        let dir = tempfile::TempDir::new().expect("create managed lake config dir");
+        let metadata_dir = dir.path().join("meta");
+        std::fs::create_dir_all(&metadata_dir).expect("create metadata dir");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[standalone_server]
+user = "root"
+metadata_db_path = "meta/standalone.sqlite"
+warehouse_uri = "{warehouse_uri}"
+
+[standalone_server.object_store]
+endpoint = "{endpoint}"
+access_key_id = "{access_key_id}"
+access_key_secret = "{access_key_secret}"
+enable_path_style_access = true
+"#
+            ),
+        )
+        .expect("write standalone config");
+        Some((dir, config_path))
+    }
+
+    #[test]
     fn collect_current_snapshots_cleans_staged_partition_on_failure() {
         let (_dir, store) = seed_mv_refresh_store();
         let config = test_managed_config();
