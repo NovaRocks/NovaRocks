@@ -74,11 +74,13 @@ impl std::fmt::Display for ChangeError {
                 f,
                 "iceberg snapshot {snapshot_id} contains v3 deletion-vector files; not supported in this phase"
             ),
-            ChangeError::SchemaEvolutionUnsupported { detail } => write!(
-                f,
-                "iceberg schema evolution not supported: {detail}"
-            ),
-            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => write!(
+            ChangeError::SchemaEvolutionUnsupported { detail } => {
+                write!(f, "iceberg schema evolution not supported: {detail}")
+            }
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => write!(
                 f,
                 "iceberg REPLACE snapshot {snapshot_id} failed compaction validation: {reason}"
             ),
@@ -94,10 +96,9 @@ impl std::fmt::Display for ChangeError {
                 f,
                 "PRIMARY KEY column `{pk_col}` has unsupported type `{ty}`; only hashable scalar types are allowed"
             ),
-            ChangeError::PrimaryKeyValueNull { row_info } => write!(
-                f,
-                "PRIMARY KEY value is NULL in base row: {row_info}"
-            ),
+            ChangeError::PrimaryKeyValueNull { row_info } => {
+                write!(f, "PRIMARY KEY value is NULL in base row: {row_info}")
+            }
             ChangeError::IcebergFormatUnsupported { format_version } => write!(
                 f,
                 "iceberg base table format-version {format_version} is not supported; IVM Phase 2 requires v2"
@@ -209,9 +210,8 @@ fn classify_snapshot(
         Operation::Replace => {
             let parent = parent.ok_or_else(|| ChangeError::ReplaceValidationFailed {
                 snapshot_id,
-                reason:
-                    "REPLACE snapshot has no parent reachable for compaction validation"
-                        .to_string(),
+                reason: "REPLACE snapshot has no parent reachable for compaction validation"
+                    .to_string(),
             })?;
             validate_replace_snapshot(snapshot, parent)?;
             Ok(None)
@@ -235,16 +235,18 @@ fn validate_replace_snapshot(
     let snap_props = &snapshot.summary().additional_properties;
     let parent_props = &parent.summary().additional_properties;
 
-    let snap_records = snap_props.get("total-records").and_then(|s| s.parse::<i64>().ok());
-    let parent_records = parent_props.get("total-records").and_then(|s| s.parse::<i64>().ok());
+    let snap_records = snap_props
+        .get("total-records")
+        .and_then(|s| s.parse::<i64>().ok());
+    let parent_records = parent_props
+        .get("total-records")
+        .and_then(|s| s.parse::<i64>().ok());
     match (snap_records, parent_records) {
         (Some(a), Some(b)) if a == b => {}
         (Some(a), Some(b)) => {
             return Err(ChangeError::ReplaceValidationFailed {
                 snapshot_id: snapshot.snapshot_id(),
-                reason: format!(
-                    "total-records changed across REPLACE: parent={b}, replace={a}"
-                ),
+                reason: format!("total-records changed across REPLACE: parent={b}, replace={a}"),
             });
         }
         _ => {
@@ -331,11 +333,12 @@ pub(crate) fn classify_lineage(
         if cursor == previous_snapshot_id {
             break;
         }
-        let snapshot_ref = metadata.snapshot_by_id(cursor).ok_or_else(|| {
-            ChangeError::LineageBroken {
-                previous_snapshot: previous_snapshot_id,
-            }
-        })?;
+        let snapshot_ref =
+            metadata
+                .snapshot_by_id(cursor)
+                .ok_or_else(|| ChangeError::LineageBroken {
+                    previous_snapshot: previous_snapshot_id,
+                })?;
         let snapshot = snapshot_ref.as_ref();
         let parent_id = snapshot.parent_snapshot_id();
         let parent = parent_id
@@ -400,10 +403,10 @@ pub(crate) fn plan_changes(
 
     let file_io = table.file_io();
     let collect = collect_files(metadata, file_io, &plan.actions);
-    let (inserts, deletes) = crate::connector::iceberg::catalog::registry::block_on_iceberg(collect)
-        .map_err(|e| {
-            ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}"))
-        })??;
+    let (inserts, deletes) = crate::connector::iceberg::catalog::registry::block_on_iceberg(
+        collect,
+    )
+    .map_err(|e| ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}")))??;
 
     Ok(IcebergChangeBatch {
         previous_snapshot_id,
@@ -547,13 +550,11 @@ mod tests {
 
     use iceberg::spec::{Operation, Snapshot, Summary};
 
-    use super::{
-        classify_snapshot, validate_replace_snapshot, ChangeError, LineageAction,
-    };
+    use super::{ChangeError, LineageAction, classify_snapshot, validate_replace_snapshot};
 
     use crate::connector::iceberg::catalog::registry::{
-        build_catalog_entry, create_namespace, create_table, insert_rows, load_table,
-        IcebergCatalogEntry,
+        IcebergCatalogEntry, build_catalog_entry, create_namespace, create_table, insert_rows,
+        load_table,
     };
     use crate::sql::{Literal, SqlType, TableColumnDef};
 
@@ -643,14 +644,20 @@ mod tests {
     fn classify_snapshot_append_emits_collect_inserts() {
         let s = snap(7, Some(1), Operation::Append, &[], 0);
         let action = classify_snapshot(&s, None).expect("ok");
-        assert_eq!(action, Some(LineageAction::CollectInserts { snapshot_id: 7 }));
+        assert_eq!(
+            action,
+            Some(LineageAction::CollectInserts { snapshot_id: 7 })
+        );
     }
 
     #[test]
     fn classify_snapshot_delete_emits_collect_deletes() {
         let s = snap(7, Some(1), Operation::Delete, &[], 0);
         let action = classify_snapshot(&s, None).expect("ok");
-        assert_eq!(action, Some(LineageAction::CollectDeletes { snapshot_id: 7 }));
+        assert_eq!(
+            action,
+            Some(LineageAction::CollectDeletes { snapshot_id: 7 })
+        );
     }
 
     #[test]
@@ -680,7 +687,10 @@ mod tests {
         let s = snap(2, None, Operation::Replace, &props, 0);
         let err = classify_snapshot(&s, None).expect_err("err");
         match err {
-            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
                 assert_eq!(snapshot_id, 2);
                 assert!(reason.contains("parent"), "{reason}");
             }
@@ -696,7 +706,10 @@ mod tests {
         let s = snap(2, Some(1), Operation::Replace, &props, 0);
         let err = validate_replace_snapshot(&s, &parent).expect_err("err");
         match err {
-            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
                 assert_eq!(snapshot_id, 2);
                 assert!(reason.contains("total-records"), "{reason}");
             }
@@ -718,7 +731,10 @@ mod tests {
         );
         let err = validate_replace_snapshot(&s, &parent).expect_err("err");
         match err {
-            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
                 assert_eq!(snapshot_id, 2);
                 assert!(reason.contains("total-records"), "{reason}");
             }
@@ -734,7 +750,10 @@ mod tests {
         let s = snap(2, Some(1), Operation::Replace, &props, 0);
         let err = validate_replace_snapshot(&s, &parent).expect_err("err");
         match err {
-            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
                 assert_eq!(snapshot_id, 2);
                 assert!(reason.contains("added-data-files"), "{reason}");
             }
@@ -751,7 +770,10 @@ mod tests {
         let s = snap(2, Some(1), Operation::Replace, &props, 7);
         let err = validate_replace_snapshot(&s, &parent).expect_err("err");
         match err {
-            ChangeError::ReplaceValidationFailed { snapshot_id, reason } => {
+            ChangeError::ReplaceValidationFailed {
+                snapshot_id,
+                reason,
+            } => {
                 assert_eq!(snapshot_id, 2);
                 assert!(reason.contains("schema"), "{reason}");
             }
@@ -860,6 +882,8 @@ mod tests {
             .expect("pruned table");
 
         let err = plan_changes(&pruned_table, previous, &[]).expect_err("should fail");
-        assert!(matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == previous));
+        assert!(
+            matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == previous)
+        );
     }
 }
