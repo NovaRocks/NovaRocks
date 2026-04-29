@@ -545,6 +545,7 @@ pub(crate) fn materialize_changes(
         let deleted_rows = crate::connector::iceberg::scan_deletes::scan_deletes(
             &batch.deletes,
             &factory,
+            base_table.file_io(),
             size_lookup,
         )
         .map_err(|e| e.to_string())?;

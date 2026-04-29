@@ -270,29 +270,108 @@ pub(crate) fn read_data_file_at_positions(
     Ok(out)
 }
 
-/// Top-level: take a slice of `PositionDeleteRef`s and produce
-/// `Vec<RecordBatch>` containing the original deleted base rows in the
-/// data files' full schema (no projection / no WHERE applied — those
-/// are SQL-level concerns layered on top of this function).
+/// v3 deletion-vector counterpart of `read_delete_positions_per_data_file`.
+/// Reads each Puffin `deletion-vector-v1` blob and folds its positions into
+/// the per-data-file `RoaringTreemap`.
 ///
-/// `data_file_size_lookup` returns the on-disk size in bytes for a given
-/// `data_file_path`. iceberg-rust's `DataFile::file_size_in_bytes` is
-/// the canonical source. Caller must provide a closure since iceberg
-/// table state isn't carried into this module to keep the dependency
-/// graph minimal.
+/// Caller must guarantee every entry in `delete_files` has
+/// `file_format == Puffin` and the DV-specific fields populated; mixed-format
+/// input must be split by the caller (`scan_deletes` handles this).
+pub(crate) async fn read_dv_positions_per_data_file(
+    delete_files: &[PositionDeleteRef],
+    file_io: &iceberg::io::FileIO,
+) -> Result<HashMap<String, RoaringTreemap>, ChangeError> {
+    use crate::connector::iceberg::commit::read_deletion_vector_puffin;
+    use iceberg::spec::DataFileFormat;
+
+    let mut out: HashMap<String, RoaringTreemap> = HashMap::new();
+    for r in delete_files {
+        if r.file_format != DataFileFormat::Puffin {
+            return Err(ChangeError::InternalInconsistency(format!(
+                "read_dv_positions_per_data_file received non-Puffin entry: {}",
+                r.delete_file_path
+            )));
+        }
+        r.validate_invariants()?;
+        let referenced = r.referenced_data_file.as_ref().ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "Puffin DV {} missing referenced_data_file after invariant check",
+                r.delete_file_path
+            ))
+        })?;
+        let offset = r.content_offset.expect("invariant-checked");
+        let length = r.content_size_in_bytes.expect("invariant-checked");
+        let dv = read_deletion_vector_puffin(file_io, &r.delete_file_path, offset, length)
+            .await
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "read Puffin DV {}: {e}",
+                    r.delete_file_path
+                ))
+            })?;
+        let treemap = dv.to_roaring_treemap();
+        *out.entry(referenced.clone()).or_default() |= treemap;
+    }
+    Ok(out)
+}
+
+/// Top-level: take a slice of `PositionDeleteRef`s (mixed v2 Parquet and
+/// v3 Puffin DV) and produce `Vec<RecordBatch>` containing the original
+/// deleted base rows.
+///
+/// Internal flow:
+/// 1. Partition by `file_format`.
+/// 2. v2 Parquet entries: read positions via `read_delete_positions_per_data_file`.
+/// 3. v3 Puffin entries: read positions via `read_dv_positions_per_data_file`.
+/// 4. Merge per-data-file position sets.
+/// 5. For each data file, project rows at the union position set via
+///    `read_data_file_at_positions` (works on raw parquet, format-agnostic).
+///
+/// # Threading
+///
+/// This function is synchronous but bridges to an async helper
+/// (`read_dv_positions_per_data_file`) on the Puffin path via
+/// `block_on_iceberg`. Callers must invoke it from a blocking thread, never
+/// directly from a tokio worker — `block_on_iceberg` would panic on a
+/// running async runtime. Production callers (the IVM refresh path via
+/// `materialize_changes`) are always synchronous; `#[tokio::test]` callers
+/// must use `tokio::task::spawn_blocking` (see the test
+/// `scan_deletes_merges_v2_parquet_and_v3_puffin_against_same_data_file`
+/// for the pattern).
 pub(crate) fn scan_deletes<F>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    file_io: &iceberg::io::FileIO,
     data_file_size_lookup: F,
 ) -> Result<Vec<RecordBatch>, ChangeError>
 where
     F: Fn(&str) -> Option<u64>,
 {
+    use crate::connector::iceberg::catalog::registry::block_on_iceberg;
+    use iceberg::spec::DataFileFormat;
+
     if delete_files.is_empty() {
         return Ok(Vec::new());
     }
 
-    let positions_per_file = read_delete_positions_per_data_file(delete_files, factory)?;
+    let (parquet_dels, puffin_dels): (Vec<_>, Vec<_>) = delete_files
+        .iter()
+        .cloned()
+        .partition(|r| r.file_format == DataFileFormat::Parquet);
+
+    let mut positions_per_file = read_delete_positions_per_data_file(&parquet_dels, factory)?;
+    if !puffin_dels.is_empty() {
+        let dv_positions = block_on_iceberg(read_dv_positions_per_data_file(&puffin_dels, file_io))
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "scan_deletes: block_on_iceberg for Puffin DV: {e}"
+                ))
+            })??;
+        for (path, treemap) in dv_positions {
+            *positions_per_file.entry(path).or_default() |= treemap;
+        }
+    }
+
     let mut out: Vec<RecordBatch> = Vec::new();
     // Sort keys for deterministic output ordering — useful for tests
     // and downstream equality assertions.
@@ -320,9 +399,10 @@ mod tests {
 
     use super::{
         FILE_PATH_COLUMN, POS_COLUMN, read_data_file_at_positions,
-        read_delete_positions_per_data_file, scan_deletes,
+        read_delete_positions_per_data_file, read_dv_positions_per_data_file, scan_deletes,
     };
     use crate::connector::iceberg::changes::PositionDeleteRef;
+    use crate::connector::iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
     use crate::fs::opendal::{OpendalRangeReaderFactory, build_fs_operator};
 
     fn write_data_parquet(path: &std::path::Path, ids: &[i32], names: &[&str]) {
@@ -367,6 +447,29 @@ mod tests {
     fn factory_for_dir(dir: &std::path::Path) -> OpendalRangeReaderFactory {
         let op = build_fs_operator(dir.to_str().expect("utf8 dir")).expect("fs operator");
         OpendalRangeReaderFactory::from_operator(op).expect("factory")
+    }
+
+    fn make_local_file_io() -> iceberg::io::FileIO {
+        use iceberg::io::LocalFsStorageFactory;
+        use std::sync::Arc;
+        iceberg::io::FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build()
+    }
+
+    async fn write_puffin_dv_file(
+        dir: &std::path::Path,
+        name: &str,
+        referenced_data_file: &str,
+        positions: &[u64],
+    ) -> crate::connector::iceberg::commit::WrittenPuffinDv {
+        let path = format!("{}/{}", dir.display(), name);
+        let file_io = make_local_file_io();
+        let mut dv = DeletionVector::new();
+        for p in positions {
+            dv.insert(*p).unwrap();
+        }
+        write_single_deletion_vector_puffin(&file_io, &path, referenced_data_file, &dv)
+            .await
+            .expect("write puffin dv")
     }
 
     #[test]
@@ -434,7 +537,13 @@ mod tests {
     #[test]
     fn scan_deletes_returns_empty_for_empty_input() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let batches = scan_deletes(&[], &factory_for_dir(dir.path()), |_| None).expect("ok");
+        let batches = scan_deletes(
+            &[],
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+        )
+        .expect("ok");
         assert!(batches.is_empty());
     }
 
@@ -455,7 +564,13 @@ mod tests {
             content_offset: None,
             content_size_in_bytes: None,
         }];
-        let batches = scan_deletes(&refs, &factory_for_dir(dir.path()), |_| None).expect("ok");
+        let batches = scan_deletes(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+        )
+        .expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
     }
@@ -480,9 +595,120 @@ mod tests {
             content_offset: None,
             content_size_in_bytes: None,
         }];
-        let batches = scan_deletes(&refs, &factory_for_dir(dir.path()), |_| None).expect("ok");
+        let batches = scan_deletes(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+        )
+        .expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         // 1 row from data1 (id=1) + 1 row from data2 (id=200) = 2 rows total.
         assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn dv_path_reads_positions_from_puffin_file() {
+        use iceberg::spec::DataFileFormat;
+        use roaring::RoaringTreemap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_file = format!("file://{}/data.parquet", dir.path().display());
+        let written = write_puffin_dv_file(dir.path(), "dv-1.puffin", &data_file, &[1, 3, 5]).await;
+        let file_io = make_local_file_io();
+        let refs = vec![PositionDeleteRef {
+            delete_file_path: written.path.clone(),
+            delete_file_size: written.file_size_in_bytes as i64,
+            record_count: Some(written.cardinality as i64),
+            referenced_data_file: Some(data_file.clone()),
+            file_format: DataFileFormat::Puffin,
+            content_offset: Some(written.content_offset),
+            content_size_in_bytes: Some(written.content_size_in_bytes),
+        }];
+        let map = read_dv_positions_per_data_file(&refs, &file_io)
+            .await
+            .expect("read DV positions");
+        assert_eq!(map.len(), 1);
+        let positions = &map[&data_file];
+        let mut expected = RoaringTreemap::new();
+        expected.insert(1);
+        expected.insert(3);
+        expected.insert(5);
+        assert_eq!(positions, &expected);
+    }
+
+    #[tokio::test]
+    async fn scan_deletes_merges_v2_parquet_and_v3_puffin_against_same_data_file() {
+        use iceberg::spec::DataFileFormat;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        write_data_parquet(
+            &data_path,
+            &[10, 20, 30, 40, 50],
+            &["a", "b", "c", "d", "e"],
+        );
+        let data_uri = "data.parquet";
+
+        let v2_delete_path = dir.path().join("v2-deletes.parquet");
+        write_delete_parquet(&v2_delete_path, &[data_uri], &[1]); // delete pos 1 -> id=20
+
+        let dv_written = write_puffin_dv_file(
+            dir.path(),
+            "dv.puffin",
+            data_uri,
+            &[3], // delete pos 3 -> id=40
+        )
+        .await;
+
+        let refs = vec![
+            PositionDeleteRef {
+                delete_file_path: "v2-deletes.parquet".to_string(),
+                delete_file_size: 0,
+                record_count: Some(1),
+                referenced_data_file: Some(data_uri.to_string()),
+                file_format: DataFileFormat::Parquet,
+                content_offset: None,
+                content_size_in_bytes: None,
+            },
+            PositionDeleteRef {
+                delete_file_path: dv_written.path.clone(),
+                delete_file_size: dv_written.file_size_in_bytes as i64,
+                record_count: Some(dv_written.cardinality as i64),
+                referenced_data_file: Some(data_uri.to_string()),
+                file_format: DataFileFormat::Puffin,
+                content_offset: Some(dv_written.content_offset),
+                content_size_in_bytes: Some(dv_written.content_size_in_bytes),
+            },
+        ];
+
+        let factory = factory_for_dir(dir.path());
+        let file_io = make_local_file_io();
+        // scan_deletes is sync but bridges to read_dv_positions_per_data_file
+        // (async) via block_on_iceberg, which requires a blocking thread (not
+        // an async tokio worker). spawn_blocking gives us such a thread, where
+        // block_on_iceberg's Handle::try_current() -> handle.block_on path is
+        // safe to invoke. Calling scan_deletes directly from this #[tokio::test]
+        // would panic.
+        let batches =
+            tokio::task::spawn_blocking(move || scan_deletes(&refs, &factory, &file_io, |_| None))
+                .await
+                .expect("spawn_blocking ok")
+                .expect("scan_deletes ok");
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "merged v2 + DV must yield exactly 2 deleted rows");
+        let mut all_ids: Vec<i32> = Vec::new();
+        for b in &batches {
+            let id = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id col");
+            for i in 0..id.len() {
+                all_ids.push(id.value(i));
+            }
+        }
+        all_ids.sort();
+        assert_eq!(all_ids, vec![20, 40]);
     }
 }
