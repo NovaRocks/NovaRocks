@@ -383,6 +383,9 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(3),
             referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
         }];
         let map =
             read_delete_positions_per_data_file(&refs, &factory_for_dir(dir.path())).expect("ok");
@@ -448,6 +451,9 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: Some(data_uri.to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
         }];
         let batches = scan_deletes(&refs, &factory_for_dir(dir.path()), |_| None).expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -470,6 +476,9 @@ mod tests {
             delete_file_size: 0,
             record_count: Some(2),
             referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
         }];
         let batches = scan_deletes(&refs, &factory_for_dir(dir.path()), |_| None).expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();

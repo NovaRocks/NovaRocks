@@ -140,6 +140,64 @@ pub(crate) struct PositionDeleteRef {
     pub delete_file_size: i64,
     pub record_count: Option<i64>,
     pub referenced_data_file: Option<String>,
+    /// `Parquet` for v2 position-delete files, `Puffin` for v3 deletion-vector
+    /// files. Other variants are rejected at construction.
+    pub file_format: iceberg::spec::DataFileFormat,
+    /// Required when `file_format == Puffin`: byte offset of the
+    /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
+    /// `file_format == Parquet`.
+    pub content_offset: Option<i64>,
+    /// Required when `file_format == Puffin`: byte length of the
+    /// `deletion-vector-v1` blob inside the Puffin file. Must be `None` when
+    /// `file_format == Parquet`.
+    pub content_size_in_bytes: Option<i64>,
+}
+
+#[allow(dead_code)]
+impl PositionDeleteRef {
+    /// Verify the file_format / content_offset / content_size_in_bytes /
+    /// referenced_data_file fields are mutually consistent. Returns
+    /// `ChangeError::InternalInconsistency` on any mismatch.
+    pub(crate) fn validate_invariants(&self) -> Result<(), ChangeError> {
+        use iceberg::spec::DataFileFormat;
+        match self.file_format {
+            DataFileFormat::Parquet => {
+                if self.content_offset.is_some() || self.content_size_in_bytes.is_some() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "PositionDeleteRef {} has Parquet file_format but content_offset/size set",
+                        self.delete_file_path
+                    )));
+                }
+            }
+            DataFileFormat::Puffin => {
+                if self.referenced_data_file.is_none() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "Puffin DV {} missing referenced_data_file",
+                        self.delete_file_path
+                    )));
+                }
+                if self.content_offset.is_none() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "Puffin DV {} missing content_offset",
+                        self.delete_file_path
+                    )));
+                }
+                if self.content_size_in_bytes.is_none() {
+                    return Err(ChangeError::InternalInconsistency(format!(
+                        "Puffin DV {} missing content_size_in_bytes",
+                        self.delete_file_path
+                    )));
+                }
+            }
+            other => {
+                return Err(ChangeError::InternalInconsistency(format!(
+                    "PositionDeleteRef {} has unsupported file_format {:?}",
+                    self.delete_file_path, other
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Output of `plan_changes`: a flattened, in-order projection of every
@@ -630,6 +688,9 @@ async fn collect_files(
                                         i64::try_from(df.record_count()).unwrap_or(i64::MAX),
                                     ),
                                     referenced_data_file: df.referenced_data_file(),
+                                    file_format: iceberg::spec::DataFileFormat::Parquet,
+                                    content_offset: None,
+                                    content_size_in_bytes: None,
                                 });
                             }
                             DataContentType::EqualityDeletes => {
@@ -938,6 +999,94 @@ mod tests {
             .map(|f| f.record_count.unwrap_or_default())
             .sum();
         assert_eq!(returned_rows, 1);
+    }
+
+    #[test]
+    fn position_delete_ref_validates_parquet_with_no_content_offset() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/x.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        r.validate_invariants().expect("ok");
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_parquet_with_content_offset() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/x.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: Some(0),
+            content_size_in_bytes: None,
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_parquet_with_content_size() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/x.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: Some(120),
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
+    }
+
+    #[test]
+    fn position_delete_ref_validates_puffin_with_full_metadata() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/dv.puffin".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: Some("/tmp/data.parquet".to_string()),
+            file_format: iceberg::spec::DataFileFormat::Puffin,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(120),
+        };
+        r.validate_invariants().expect("ok");
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_puffin_missing_offset() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/dv.puffin".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: Some("/tmp/data.parquet".to_string()),
+            file_format: iceberg::spec::DataFileFormat::Puffin,
+            content_offset: None,
+            content_size_in_bytes: Some(120),
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
+    }
+
+    #[test]
+    fn position_delete_ref_rejects_puffin_missing_referenced_data_file() {
+        let r = super::PositionDeleteRef {
+            delete_file_path: "/tmp/dv.puffin".to_string(),
+            delete_file_size: 0,
+            record_count: None,
+            referenced_data_file: None,
+            file_format: iceberg::spec::DataFileFormat::Puffin,
+            content_offset: Some(4),
+            content_size_in_bytes: Some(120),
+        };
+        let err = r.validate_invariants().expect_err("must reject");
+        assert!(matches!(err, super::ChangeError::InternalInconsistency(_)));
     }
 
     #[test]

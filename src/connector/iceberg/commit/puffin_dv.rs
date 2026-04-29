@@ -79,6 +79,21 @@ impl DeletionVector {
         self.bitmaps.values().all(RoaringBitmap::is_empty)
     }
 
+    /// Convert this deletion vector into a flat [`RoaringTreemap`] over the
+    /// full 64-bit position space. Used by the IVM-changelog-scan path
+    /// (`scan_deletes`) to reuse the v2-style `RoaringTreemap`-based
+    /// position-set machinery without having to introduce a new bitmap type.
+    pub fn to_roaring_treemap(&self) -> roaring::RoaringTreemap {
+        let mut out = roaring::RoaringTreemap::new();
+        for (high_word, bitmap) in &self.bitmaps {
+            let high = (*high_word as u64) << 32;
+            for low in bitmap {
+                out.insert(high | low as u64);
+            }
+        }
+        out
+    }
+
     pub fn to_iceberg_payload(&self) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
@@ -468,6 +483,25 @@ mod tests {
         payload[last] ^= 0xff;
 
         assert_payload_error_contains(&payload, "CRC mismatch");
+    }
+
+    #[test]
+    fn to_roaring_treemap_round_trips_positions() {
+        let mut dv = DeletionVector::new();
+        dv.insert(0).unwrap();
+        dv.insert(7).unwrap();
+        dv.insert(u32::MAX as u64 + 3).unwrap();
+        let treemap = dv.to_roaring_treemap();
+        assert_eq!(treemap.len(), 3);
+        assert!(treemap.contains(0));
+        assert!(treemap.contains(7));
+        assert!(treemap.contains(u32::MAX as u64 + 3));
+    }
+
+    #[test]
+    fn to_roaring_treemap_empty_for_empty_dv() {
+        let dv = DeletionVector::new();
+        assert!(dv.to_roaring_treemap().is_empty());
     }
 
     #[test]
