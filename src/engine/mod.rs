@@ -3350,6 +3350,62 @@ enable_path_style_access = true
         (engine, session)
     }
 
+    fn open_row_lineage_iceberg_session_with_table(
+        warehouse: &TempDir,
+    ) -> (StandaloneNovaRocks, StandaloneSession) {
+        use iceberg::Catalog;
+
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        let session = engine.session();
+        let create_catalog_sql = format!(
+            r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+            warehouse.path().display()
+        );
+        session
+            .execute_in_database(&create_catalog_sql, "default")
+            .expect("create catalog");
+        let catalog = {
+            let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+            let entry = registry.get("ice").expect("entry");
+            crate::connector::iceberg::catalog::registry::build_hadoop_catalog(&entry)
+                .expect("build hadoop catalog")
+        };
+        let namespace = iceberg::NamespaceIdent::new("db1".to_string());
+        let schema = iceberg::spec::Schema::builder()
+            .with_fields(vec![
+                Arc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "id",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                )),
+                Arc::new(iceberg::spec::NestedField::required(
+                    2,
+                    "v",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("build schema");
+        let table_creation = iceberg::TableCreation::builder()
+            .name("t".to_string())
+            .schema(schema)
+            .format_version(iceberg::spec::FormatVersion::V3)
+            .properties([("write.row-lineage".to_string(), "true".to_string())])
+            .build();
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+            catalog
+                .create_namespace(&namespace, Default::default())
+                .await
+                .expect("create namespace");
+            catalog
+                .create_table(&namespace, table_creation)
+                .await
+                .expect("create row-lineage table");
+        })
+        .expect("create row-lineage table runtime");
+        (engine, session)
+    }
+
     fn collect_id_v(session: &StandaloneSession, sql: &str) -> Vec<(i32, String)> {
         let result = session.query(sql).expect("query");
         let mut out = Vec::new();
@@ -3422,6 +3478,69 @@ enable_path_style_access = true
             .map(|s| s.snapshot_id())
     }
 
+    fn current_iceberg_row_lineage(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> (u64, Option<(u64, u64)>) {
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get(catalog).expect("entry");
+        entry.invalidate_table_cache(namespace, table);
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
+        let metadata = loaded.table.metadata();
+        (
+            metadata.next_row_id(),
+            metadata.current_snapshot().and_then(|s| s.row_range()),
+        )
+    }
+
+    fn current_snapshot_has_position_delete_parquet(
+        engine: &StandaloneNovaRocks,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> bool {
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get(catalog).expect("entry");
+        entry.invalidate_table_cache(namespace, table);
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, namespace, table).expect("load");
+        let metadata = loaded.table.metadata();
+        let Some(snapshot) = metadata.current_snapshot() else {
+            return false;
+        };
+        let file_io = loaded.table.file_io().clone();
+        crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+            let manifest_list = snapshot
+                .load_manifest_list(&file_io, metadata)
+                .await
+                .expect("load manifest list");
+            for manifest_file in manifest_list.entries() {
+                if manifest_file.content != iceberg::spec::ManifestContentType::Deletes {
+                    continue;
+                }
+                let manifest = manifest_file
+                    .load_manifest(&file_io)
+                    .await
+                    .expect("load delete manifest");
+                for entry in manifest.entries() {
+                    let data_file = entry.data_file();
+                    if entry.is_alive()
+                        && data_file.content_type()
+                            == iceberg::spec::DataContentType::PositionDeletes
+                        && data_file.file_format() == iceberg::spec::DataFileFormat::Parquet
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .expect("inspect delete manifests")
+    }
+
     #[test]
     fn iceberg_insert_overwrite_replaces_all_rows() {
         let warehouse = TempDir::new().expect("warehouse");
@@ -3491,6 +3610,69 @@ enable_path_style_access = true
             .expect("legacy delete");
         let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
         assert!(snap_after.is_some(), "legacy DELETE must still commit");
+        assert!(
+            current_snapshot_has_position_delete_parquet(&engine, "ice", "db1", "t"),
+            "legacy DELETE must commit at least one live Parquet position-delete file"
+        );
+    }
+
+    #[test]
+    fn iceberg_row_lineage_insert_select_advances_next_row_id() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("seed");
+        let (before_next_row_id, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
+        session
+            .execute_in_database(
+                "insert into ice.db1.t select id, upper(v) from ice.db1.t where id <= 2",
+                "default",
+            )
+            .expect("row-lineage insert select");
+        let (after_next_row_id, row_range) =
+            current_iceberg_row_lineage(&engine, "ice", "db1", "t");
+        assert_eq!(
+            after_next_row_id,
+            before_next_row_id + 2,
+            "row-lineage INSERT SELECT must advance next-row-id by written rows"
+        );
+        assert_eq!(
+            row_range,
+            Some((before_next_row_id, 2)),
+            "row-lineage INSERT SELECT snapshot must record its row range"
+        );
+    }
+
+    #[test]
+    fn iceberg_row_lineage_overwrite_writes_row_range() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c')",
+                "default",
+            )
+            .expect("seed");
+        let (before_next_row_id, _) = current_iceberg_row_lineage(&engine, "ice", "db1", "t");
+        session
+            .execute_in_database(
+                "insert overwrite ice.db1.t select id, upper(v) from ice.db1.t where id <= 2",
+                "default",
+            )
+            .expect("row-lineage overwrite");
+        let (after_next_row_id, row_range) =
+            current_iceberg_row_lineage(&engine, "ice", "db1", "t");
+        assert_eq!(
+            after_next_row_id,
+            before_next_row_id + 2,
+            "row-lineage OVERWRITE must advance next-row-id by added rows"
+        );
+        assert_eq!(
+            row_range,
+            Some((before_next_row_id, 2)),
+            "row-lineage OVERWRITE snapshot must record its row range"
+        );
     }
 
     #[test]

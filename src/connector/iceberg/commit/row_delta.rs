@@ -192,6 +192,7 @@ impl TransactionAction for RowDeltaTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
+            None,
         )
         .await
         .map_err(to_iceberg_unexpected)?;

@@ -90,8 +90,6 @@ pub(crate) fn execute_delete_statement(
 
     // 3. Validation.
     let write_mode = ensure_iceberg_write_supported(&table)?;
-    ensure_single_partition_spec(&table)?;
-    ensure_no_equality_deletes(&table)?;
     match write_mode {
         IcebergWriteMode::LegacyPositionDeletes => {}
         IcebergWriteMode::RowLineageV3 => {
@@ -101,6 +99,8 @@ pub(crate) fn execute_delete_statement(
             );
         }
     }
+    ensure_single_partition_spec(&table)?;
+    ensure_no_equality_deletes(&table)?;
 
     // 4. Translate WHERE → iceberg::Predicate against the table's schema.
     let schema = table.metadata().current_schema();

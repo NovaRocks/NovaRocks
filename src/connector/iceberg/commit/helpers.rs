@@ -54,7 +54,8 @@ pub async fn write_manifest_list(
     parent_snap_id: Option<i64>,
     sequence_number: i64,
     format_version: FormatVersion,
-) -> Result<(), String> {
+    first_row_id: Option<u64>,
+) -> Result<Option<u64>, String> {
     let output = file_io
         .new_output(out_path)
         .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
@@ -63,20 +64,23 @@ pub async fn write_manifest_list(
         FormatVersion::V2 => {
             ManifestListWriter::v2(output, snap_id, parent_snap_id, sequence_number)
         }
-        FormatVersion::V3 => {
-            // first_row_id is always None for our delete and overwrite paths;
-            // row-lineage tables are rejected by ensure_v3_writable upstream.
-            ManifestListWriter::v3(output, snap_id, parent_snap_id, sequence_number, None)
-        }
+        FormatVersion::V3 => ManifestListWriter::v3(
+            output,
+            snap_id,
+            parent_snap_id,
+            sequence_number,
+            first_row_id,
+        ),
     };
     writer
         .add_manifests(entries.into_iter())
         .map_err(|e| format!("ManifestListWriter::add_manifests failed: {e}"))?;
+    let next_row_id = writer.next_row_id();
     writer
         .close()
         .await
         .map_err(|e| format!("ManifestListWriter::close failed: {e}"))?;
-    Ok(())
+    Ok(next_row_id)
 }
 
 /// Read the manifest list referenced by `current_snapshot()` and return its

@@ -54,7 +54,7 @@ use uuid::Uuid;
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
-use super::types::{CommitOutcome, WrittenFile};
+use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
 pub struct OverwriteCommit;
 
@@ -70,6 +70,12 @@ impl IcebergCommitAction for OverwriteCommit {
                 ));
             }
         }
+        let row_lineage_first_row_id =
+            match crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table) {
+                IcebergWriteMode::RowLineageV3 => Some(ctx.table.metadata().next_row_id()),
+                IcebergWriteMode::LegacyPositionDeletes => None,
+            };
+        let row_lineage_added_rows = written.iter().map(|f| f.record_count).sum();
 
         let manifest_paths_out: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let action = OverwriteTxnAction {
@@ -80,6 +86,8 @@ impl IcebergCommitAction for OverwriteCommit {
             schema_id: ctx.table.metadata().current_schema_id(),
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
+            row_lineage_first_row_id,
+            row_lineage_added_rows,
         };
 
         let tx = Transaction::new(ctx.table);
@@ -117,6 +125,8 @@ struct OverwriteTxnAction {
     schema_id: i32,
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
+    row_lineage_first_row_id: Option<u64>,
+    row_lineage_added_rows: u64,
 }
 
 #[async_trait]
@@ -204,7 +214,7 @@ impl TransactionAction for OverwriteTxnAction {
             .lock()
             .expect("manifest_paths_out poisoned")
             .push(manifest_list_path.clone());
-        write_manifest_list(
+        let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
             new_manifests,
@@ -212,23 +222,53 @@ impl TransactionAction for OverwriteTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
+            self.row_lineage_first_row_id,
         )
         .await
         .map_err(to_iceberg_unexpected)?;
+        if let Some(first_row_id) = self.row_lineage_first_row_id {
+            let expected_next_row_id = first_row_id
+                .checked_add(self.row_lineage_added_rows)
+                .ok_or_else(|| {
+                    to_iceberg_unexpected(format!(
+                        "Row ID overflow when computing overwrite row lineage range: first_row_id={first_row_id}, added_rows={}",
+                        self.row_lineage_added_rows
+                    ))
+                })?;
+            if manifest_list_next_row_id != Some(expected_next_row_id) {
+                return Err(to_iceberg_unexpected(format!(
+                    "Manifest list row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
+                )));
+            }
+        }
 
         // 5. Construct the Snapshot.
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(new_snapshot_id)
-            .with_parent_snapshot_id(parent_snapshot_id)
-            .with_sequence_number(new_seq)
-            .with_timestamp_ms(now_ms())
-            .with_manifest_list(manifest_list_path)
-            .with_summary(Summary {
-                operation: Operation::Overwrite,
-                additional_properties: overwrite_summary(&self.written, &existing),
-            })
-            .with_schema_id(self.schema_id)
-            .build();
+        let summary = Summary {
+            operation: Operation::Overwrite,
+            additional_properties: overwrite_summary(&self.written, &existing),
+        };
+        let snapshot = if let Some(first_row_id) = self.row_lineage_first_row_id {
+            Snapshot::builder()
+                .with_snapshot_id(new_snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(new_seq)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(summary)
+                .with_schema_id(self.schema_id)
+                .with_row_range(first_row_id, self.row_lineage_added_rows)
+                .build()
+        } else {
+            Snapshot::builder()
+                .with_snapshot_id(new_snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(new_seq)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(summary)
+                .with_schema_id(self.schema_id)
+                .build()
+        };
 
         // 6. Build TableUpdate / TableRequirement set.
         let updates = vec![
