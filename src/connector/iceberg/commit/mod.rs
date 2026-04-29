@@ -32,6 +32,7 @@ mod overwrite;
 mod position_delete_writer;
 mod puffin_dv;
 mod row_delta;
+mod row_delta_dv;
 mod run;
 mod types;
 mod validation;
@@ -44,6 +45,7 @@ pub use overwrite::OverwriteCommit;
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use puffin_dv::DeletionVector;
 pub use row_delta::RowDeltaCommit;
+pub use row_delta_dv::RowDeltaDvCommit;
 pub use run::{RunInput, run_iceberg_commit};
 pub use types::{CommitOpKind, CommitOutcome, IcebergWriteMode, WrittenFile};
 pub use validation::{

@@ -25,6 +25,10 @@ pub enum CommitOpKind {
     FastAppend,
     Overwrite,
     RowDelta,
+    /// Iceberg v3 row-lineage DELETE: writes Puffin deletion-vector files and
+    /// rewrites touched delete manifests instead of producing v2 Parquet
+    /// position-delete files.
+    RowDeltaDv,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,5 +97,8 @@ mod tests {
         assert_ne!(CommitOpKind::FastAppend, CommitOpKind::Overwrite);
         assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDelta);
         assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDelta);
+        assert_ne!(CommitOpKind::RowDelta, CommitOpKind::RowDeltaDv);
+        assert_ne!(CommitOpKind::FastAppend, CommitOpKind::RowDeltaDv);
+        assert_ne!(CommitOpKind::Overwrite, CommitOpKind::RowDeltaDv);
     }
 }

@@ -39,6 +39,7 @@ use super::collector::IcebergCommitCollector;
 use super::fast_append::FastAppendCommit;
 use super::overwrite::OverwriteCommit;
 use super::row_delta::RowDeltaCommit;
+use super::row_delta_dv::RowDeltaDvCommit;
 use super::types::{CommitOpKind, CommitOutcome};
 
 pub struct RunInput {
@@ -69,6 +70,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, String
         CommitOpKind::FastAppend => Box::new(FastAppendCommit),
         CommitOpKind::Overwrite => Box::new(OverwriteCommit),
         CommitOpKind::RowDelta => Box::new(RowDeltaCommit),
+        CommitOpKind::RowDeltaDv => Box::new(RowDeltaDvCommit),
     };
 
     let ctx = CommitCtx {

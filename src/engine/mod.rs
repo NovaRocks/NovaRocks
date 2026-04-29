@@ -3722,4 +3722,92 @@ enable_path_style_access = true
             "expected unsupported-predicate error, got {err}"
         );
     }
+
+    #[test]
+    fn iceberg_row_lineage_delete_writes_puffin_dv_and_merges_second_delete() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_row_lineage_iceberg_session_with_table(&warehouse);
+        session
+            .execute_in_database(
+                "insert into ice.db1.t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+                "default",
+            )
+            .expect("seed");
+        session
+            .execute_in_database("delete from ice.db1.t where id = 2", "default")
+            .expect("first row-lineage delete");
+        session
+            .execute_in_database("delete from ice.db1.t where id = 3", "default")
+            .expect("second row-lineage delete");
+
+        let registry = engine.inner.iceberg_catalogs.read().expect("registry");
+        let entry = registry.get("ice").expect("entry");
+        entry.invalidate_table_cache("db1", "t");
+        let loaded =
+            crate::connector::iceberg::catalog::load_table(&entry, "db1", "t").expect("load");
+        let table = loaded.table;
+        let metadata = table.metadata();
+        let file_io = table.file_io().clone();
+        let (live_dv_count, live_dv_cardinality, live_dv_format_is_puffin) =
+            crate::connector::iceberg::catalog::registry::block_on_iceberg(async {
+                let snapshot = metadata.current_snapshot().expect("current snapshot");
+                let manifests = snapshot
+                    .load_manifest_list(&file_io, metadata)
+                    .await
+                    .expect("manifest list");
+                let mut dv_count = 0u64;
+                let mut total_cardinality = 0u64;
+                let mut all_puffin = true;
+                for mf in manifests.entries() {
+                    if mf.content != iceberg::spec::ManifestContentType::Deletes {
+                        continue;
+                    }
+                    let manifest = mf.load_manifest(&file_io).await.expect("delete manifest");
+                    for entry in manifest.entries() {
+                        if !entry.is_alive() {
+                            continue;
+                        }
+                        let data_file = entry.data_file();
+                        if data_file.content_type()
+                            != iceberg::spec::DataContentType::PositionDeletes
+                        {
+                            continue;
+                        }
+                        if data_file.file_format() != iceberg::spec::DataFileFormat::Puffin {
+                            all_puffin = false;
+                            continue;
+                        }
+                        assert!(
+                            data_file.referenced_data_file().is_some(),
+                            "Puffin DV must record referenced_data_file"
+                        );
+                        assert!(
+                            data_file.content_offset().is_some(),
+                            "Puffin DV must record content_offset"
+                        );
+                        assert!(
+                            data_file.content_size_in_bytes().is_some(),
+                            "Puffin DV must record content_size_in_bytes"
+                        );
+                        dv_count += 1;
+                        total_cardinality += data_file.record_count();
+                    }
+                }
+                (dv_count, total_cardinality, all_puffin)
+            })
+            .expect("inspect manifests");
+
+        assert!(
+            live_dv_format_is_puffin,
+            "row-lineage DELETE must not commit any non-Puffin position-delete files"
+        );
+        assert_eq!(
+            live_dv_count, 1,
+            "two DELETEs against the same data file must merge into one live Puffin DV (count={live_dv_count})"
+        );
+        assert_eq!(
+            live_dv_cardinality, 2,
+            "merged DV must record both deleted rows (got {live_dv_cardinality})"
+        );
+    }
 }

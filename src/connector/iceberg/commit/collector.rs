@@ -35,6 +35,7 @@ use iceberg::spec::{Literal, PartitionSpecRef, PrimitiveType, SchemaRef, Struct,
 use crate::common::types::UniqueId;
 
 use super::abort::AbortLog;
+use super::position_delete_writer::PositionDeleteGroup;
 use super::types::{CommitOpKind, WrittenFile};
 
 /// Query-scoped Iceberg INSERT / INSERT OVERWRITE / DELETE state.
@@ -57,6 +58,11 @@ pub struct IcebergCommitCollector {
     /// because abort cleanup applies regardless of which channel produced
     /// the file.
     injected: Mutex<Vec<WrittenFile>>,
+    /// Grouped `(referenced_data_file, positions)` records produced by the
+    /// engine-side row-lineage DELETE flow. Only used when
+    /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
+    /// drains this channel via [`take_delete_groups`].
+    delete_groups: Mutex<Vec<PositionDeleteGroup>>,
     committed: AtomicBool,
 }
 
@@ -83,8 +89,29 @@ impl IcebergCommitCollector {
             finst_id,
             abort_log: Arc::new(AbortLog::new()),
             injected: Mutex::new(Vec::new()),
+            delete_groups: Mutex::new(Vec::new()),
             committed: AtomicBool::new(false),
         }
+    }
+
+    /// Push a grouped DELETE position vector into the collector. Used by the
+    /// engine-side row-lineage DELETE flow so that `RowDeltaDvCommit` can
+    /// build the merged Puffin DV files at commit time.
+    pub fn inject_delete_group(&self, group: PositionDeleteGroup) {
+        self.delete_groups
+            .lock()
+            .expect("collector delete_groups lock poisoned")
+            .push(group);
+    }
+
+    /// Drain the grouped DELETE position vectors registered via
+    /// [`inject_delete_group`].
+    pub fn take_delete_groups(&self) -> Vec<PositionDeleteGroup> {
+        let mut guard = self
+            .delete_groups
+            .lock()
+            .expect("collector delete_groups lock poisoned");
+        std::mem::take(&mut *guard)
     }
 
     /// Pre-load a written file into the collector. Used by the standalone
@@ -351,5 +378,33 @@ mod tests {
         let (schema, spec) = fixture_schema_and_spec();
         let r = parse_partition_path("p1", &spec, &schema);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn collector_round_trips_injected_delete_groups() {
+        let (schema, spec) = fixture_schema_and_spec();
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::RowDeltaDv,
+            iceberg::TableIdent::new(
+                iceberg::NamespaceIdent::new("db".to_string()),
+                "t".to_string(),
+            ),
+            None,
+            0,
+            schema,
+            spec,
+            "file:///tmp/staging".to_string(),
+            crate::common::types::UniqueId { hi: 0, lo: 0 },
+        );
+        collector.inject_delete_group(PositionDeleteGroup {
+            referenced_data_file: "file:///tmp/data.parquet".to_string(),
+            positions: vec![1, 3, 5],
+        });
+        let groups = collector.take_delete_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].referenced_data_file, "file:///tmp/data.parquet");
+        assert_eq!(groups[0].positions, vec![1, 3, 5]);
+        // Subsequent take must return an empty vec.
+        assert!(collector.take_delete_groups().is_empty());
     }
 }

@@ -37,10 +37,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, StringArray};
+use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use futures::StreamExt;
 use iceberg::Catalog;
+use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
@@ -90,31 +91,32 @@ pub(crate) fn execute_delete_statement(
 
     // 3. Validation.
     let write_mode = ensure_iceberg_write_supported(&table)?;
-    match write_mode {
-        IcebergWriteMode::LegacyPositionDeletes => {}
-        IcebergWriteMode::RowLineageV3 => {
-            return Err(
-                "row-lineage DELETE selected the Puffin deletion-vector path before RowDeltaDvCommit was added"
-                    .to_string(),
-            );
-        }
-    }
     ensure_single_partition_spec(&table)?;
     ensure_no_equality_deletes(&table)?;
 
-    // 4. Translate WHERE → iceberg::Predicate against the table's schema.
+    // 4. Validate WHERE → iceberg::Predicate to surface unsupported clauses
+    //    early. The bound `Predicate` is also used for manifest-level pruning
+    //    inside [`scan_for_position_deletes`].
     let schema = table.metadata().current_schema();
     let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
 
-    // 5. Scan with virtual columns + filter.
-    let groups = block_on_iceberg(async { scan_for_position_deletes(&table, predicate).await })??;
+    // 5. Scan data files and collect (file, pos) pairs. We deliberately bypass
+    //    iceberg-rust's row-selection / row-filter path because the v0.9 `_pos`
+    //    virtual column (NovaRocks Patch 3) is implemented as a per-batch
+    //    running counter and reports incorrect positions whenever
+    //    `RowSelection` skips physical rows during decoding (existing delete
+    //    files OR predicate row-selection both trigger this). We instead read
+    //    every row in order, pin `_pos` to the running parquet row index, and
+    //    apply the WHERE predicate per row using the original sqlparser AST.
+    let groups = block_on_iceberg(async {
+        scan_for_position_deletes(&table, predicate, &stmt.where_clause).await
+    })??;
 
     // Empty result → no rows match the WHERE; return Ok without commit.
     if groups.iter().all(|g| g.positions.is_empty()) {
         return Ok(StatementResult::Ok);
     }
 
-    // 6. Write position-delete Parquet files into staging.
     let metadata = table.metadata();
     let staging_dir = format!(
         "{}/data/_staging/{}",
@@ -122,42 +124,77 @@ pub(crate) fn execute_delete_statement(
         uuid::Uuid::new_v4()
     );
     let file_io = table.file_io().clone();
-    let written = block_on_iceberg(async {
-        write_position_delete_files(
-            &file_io,
-            &staging_dir,
-            metadata.default_partition_spec_id(),
-            groups,
-        )
-        .await
-    })??;
 
-    // 7. Build collector + inject + commit via RowDeltaCommit.
-    let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::RowDelta,
-        table_ident,
-        metadata.current_snapshot().map(|s| s.snapshot_id()),
-        metadata.last_sequence_number(),
-        metadata.current_schema().clone(),
-        metadata.default_partition_spec().clone(),
-        staging_dir.clone(),
-        crate::common::types::UniqueId { hi: 0, lo: 0 },
-    ));
-    for wf in written {
-        collector.inject_written_file(wf);
+    match write_mode {
+        IcebergWriteMode::LegacyPositionDeletes => {
+            // 6. Write v2 Parquet position-delete files into staging.
+            let written = block_on_iceberg(async {
+                write_position_delete_files(
+                    &file_io,
+                    &staging_dir,
+                    metadata.default_partition_spec_id(),
+                    groups,
+                )
+                .await
+            })??;
+
+            // 7. Build collector + inject written files + commit via RowDeltaCommit.
+            let collector = Arc::new(IcebergCommitCollector::new(
+                CommitOpKind::RowDelta,
+                table_ident,
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                staging_dir.clone(),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            ));
+            for wf in written {
+                collector.inject_written_file(wf);
+            }
+
+            let fs = build_local_fs_operator()?;
+            let _outcome = block_on_iceberg(async {
+                run_iceberg_commit(RunInput {
+                    collector: collector.clone(),
+                    catalog: catalog.clone(),
+                    table,
+                    fs,
+                    file_io,
+                })
+                .await
+            })??;
+        }
+        IcebergWriteMode::RowLineageV3 => {
+            // 6/7. Inject the grouped DELETE positions and let RowDeltaDvCommit
+            //      build the merged Puffin deletion vectors at commit time.
+            let collector = Arc::new(IcebergCommitCollector::new(
+                CommitOpKind::RowDeltaDv,
+                table_ident,
+                metadata.current_snapshot().map(|s| s.snapshot_id()),
+                metadata.last_sequence_number(),
+                metadata.current_schema().clone(),
+                metadata.default_partition_spec().clone(),
+                staging_dir.clone(),
+                crate::common::types::UniqueId { hi: 0, lo: 0 },
+            ));
+            for group in groups {
+                collector.inject_delete_group(group);
+            }
+
+            let fs = build_local_fs_operator()?;
+            let _outcome = block_on_iceberg(async {
+                run_iceberg_commit(RunInput {
+                    collector: collector.clone(),
+                    catalog: catalog.clone(),
+                    table,
+                    fs,
+                    file_io,
+                })
+                .await
+            })??;
+        }
     }
-
-    let fs = build_local_fs_operator()?;
-    let _outcome = block_on_iceberg(async {
-        run_iceberg_commit(RunInput {
-            collector: collector.clone(),
-            catalog: catalog.clone(),
-            table,
-            fs,
-            file_io,
-        })
-        .await
-    })??;
 
     // Invalidate caches so subsequent SELECTs see the new snapshot.
     crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
@@ -379,20 +416,52 @@ fn literal_to_datum(
 async fn scan_for_position_deletes(
     table: &iceberg::table::Table,
     predicate: Predicate,
+    where_expr: &sqlast::Expr,
 ) -> Result<Vec<PositionDeleteGroup>, String> {
-    // Build a TableScan that projects only the iceberg virtual columns we
-    // need plus applies the predicate at row-selection level.
+    let schema = table.metadata().current_schema();
+
+    // Project `_file`, `_pos`, and every primitive top-level column the WHERE
+    // clause may reference. Reading the whole row schema keeps the
+    // per-row evaluator simple and matches the supported predicate set
+    // (primitive comparisons + IN + IS NULL/IS NOT NULL + AND/OR).
+    let mut select_cols: Vec<String> = vec!["_file".to_string(), "_pos".to_string()];
+    for f in schema.as_struct().fields() {
+        select_cols.push(f.name.clone());
+    }
+
+    // Pass `predicate` to the scan so manifest pruning still applies. We
+    // strip it on each task below before handing the stream to
+    // ArrowReader so no row_filter / row_selection is applied at decode
+    // time.
     let scan = table
         .scan()
-        .select(["_file", "_pos"])
+        .select(select_cols)
         .with_filter(predicate)
-        .with_row_selection_enabled(true)
         .build()
         .map_err(|e| format!("build TableScan failed: {e}"))?;
-    let mut stream = scan
-        .to_arrow()
+    let task_stream = scan
+        .plan_files()
         .await
-        .map_err(|e| format!("TableScan::to_arrow failed: {e}"))?;
+        .map_err(|e| format!("TableScan::plan_files failed: {e}"))?;
+    let cleaned_tasks = task_stream.map(|task_result| {
+        task_result.map(|mut task| {
+            task.deletes.clear();
+            task.predicate = None;
+            task
+        })
+    });
+
+    // Build an ArrowReader with row_selection_enabled=false. Combined with
+    // cleared `task.deletes` and `task.predicate`, this guarantees parquet
+    // returns every physical row in order, so `_pos` (NovaRocks Patch 3
+    // running counter) is the original parquet row index.
+    let arrow_reader = ArrowReaderBuilder::new(table.file_io().clone())
+        .with_row_group_filtering_enabled(false)
+        .with_row_selection_enabled(false)
+        .build();
+    let mut stream = arrow_reader
+        .read(Box::pin(cleaned_tasks))
+        .map_err(|e| format!("ArrowReader::read failed: {e}"))?;
 
     let mut by_file: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     while let Some(batch_result) = stream.next().await {
@@ -425,6 +494,10 @@ async fn scan_for_position_deletes(
             if file_arr.is_null(i) || pos_arr.is_null(i) {
                 continue;
             }
+            let matches = evaluate_where_at_row(where_expr, &batch, i, schema.as_ref())?;
+            if !matches {
+                continue;
+            }
             let path = file_arr.value(i).to_string();
             let pos = pos_arr.value(i);
             by_file.entry(path).or_default().push(pos);
@@ -438,6 +511,182 @@ async fn scan_for_position_deletes(
             positions,
         })
         .collect())
+}
+
+/// Evaluate a Phase-1 supported WHERE expression against a single row of a
+/// scanned [`RecordBatch`]. Mirrors the operator coverage of
+/// [`translate_where`]; any clause this engine cannot map should already have
+/// been rejected upstream during predicate translation.
+fn evaluate_where_at_row(
+    expr: &sqlast::Expr,
+    batch: &RecordBatch,
+    row: usize,
+    schema: &iceberg::spec::Schema,
+) -> Result<bool, String> {
+    match expr {
+        sqlast::Expr::BinaryOp { left, op, right } => match op {
+            sqlast::BinaryOperator::And => Ok(evaluate_where_at_row(left, batch, row, schema)?
+                && evaluate_where_at_row(right, batch, row, schema)?),
+            sqlast::BinaryOperator::Or => Ok(evaluate_where_at_row(left, batch, row, schema)?
+                || evaluate_where_at_row(right, batch, row, schema)?),
+            sqlast::BinaryOperator::Eq
+            | sqlast::BinaryOperator::NotEq
+            | sqlast::BinaryOperator::Lt
+            | sqlast::BinaryOperator::LtEq
+            | sqlast::BinaryOperator::Gt
+            | sqlast::BinaryOperator::GtEq => {
+                let (col_name, value_expr, flipped) = extract_comparison(left, right)?;
+                let cell = column_value_at_row(&col_name, batch, row, schema)?;
+                let datum = literal_to_datum(value_expr, schema, &col_name)?;
+                let cmp = match cell {
+                    None => return Ok(false),
+                    Some(v) => compare_cell_to_datum(&v, &datum, &col_name)?,
+                };
+                Ok(match (op, flipped) {
+                    (sqlast::BinaryOperator::Eq, _) => cmp == std::cmp::Ordering::Equal,
+                    (sqlast::BinaryOperator::NotEq, _) => cmp != std::cmp::Ordering::Equal,
+                    (sqlast::BinaryOperator::Lt, false) | (sqlast::BinaryOperator::Gt, true) => {
+                        cmp == std::cmp::Ordering::Less
+                    }
+                    (sqlast::BinaryOperator::LtEq, false)
+                    | (sqlast::BinaryOperator::GtEq, true) => cmp != std::cmp::Ordering::Greater,
+                    (sqlast::BinaryOperator::Gt, false) | (sqlast::BinaryOperator::Lt, true) => {
+                        cmp == std::cmp::Ordering::Greater
+                    }
+                    (sqlast::BinaryOperator::GtEq, false)
+                    | (sqlast::BinaryOperator::LtEq, true) => cmp != std::cmp::Ordering::Less,
+                    _ => unreachable!("unsupported binary operator already rejected upstream"),
+                })
+            }
+            other => Err(format!(
+                "phase 1 DELETE WHERE evaluator does not support binary operator `{other:?}`"
+            )),
+        },
+        sqlast::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let col_name = expr_to_column_name(expr)?;
+            let cell = column_value_at_row(&col_name, batch, row, schema)?;
+            let cell = match cell {
+                Some(v) => v,
+                None => return Ok(false),
+            };
+            for lit in list {
+                let datum = literal_to_datum(lit, schema, &col_name)?;
+                if compare_cell_to_datum(&cell, &datum, &col_name)? == std::cmp::Ordering::Equal {
+                    return Ok(!*negated);
+                }
+            }
+            Ok(*negated)
+        }
+        sqlast::Expr::IsNull(inner) => {
+            let col = expr_to_column_name(inner)?;
+            Ok(column_value_at_row(&col, batch, row, schema)?.is_none())
+        }
+        sqlast::Expr::IsNotNull(inner) => {
+            let col = expr_to_column_name(inner)?;
+            Ok(column_value_at_row(&col, batch, row, schema)?.is_some())
+        }
+        sqlast::Expr::Nested(inner) => evaluate_where_at_row(inner, batch, row, schema),
+        other => Err(format!(
+            "phase 1 DELETE WHERE evaluator does not support {other:?}"
+        )),
+    }
+}
+
+/// Owned, evaluator-friendly view of a single row's column value.
+#[derive(Debug, Clone)]
+enum CellValue {
+    Int(i64),
+    Long(i64),
+    String(String),
+    Bool(bool),
+}
+
+fn column_value_at_row(
+    col_name: &str,
+    batch: &RecordBatch,
+    row: usize,
+    schema: &iceberg::spec::Schema,
+) -> Result<Option<CellValue>, String> {
+    let field = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(col_name))
+        .ok_or_else(|| format!("column `{col_name}` not found in iceberg schema"))?;
+    let prim = match &*field.field_type {
+        Type::Primitive(p) => p,
+        other => {
+            return Err(format!(
+                "phase 1 DELETE WHERE evaluator only supports primitive columns; column `{col_name}` is {other:?}"
+            ));
+        }
+    };
+    let idx = batch
+        .schema()
+        .index_of(&field.name)
+        .map_err(|_| format!("scan batch missing column `{col_name}`"))?;
+    let column = batch.column(idx);
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    let value = match prim {
+        PrimitiveType::Int => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .ok_or_else(|| format!("column `{col_name}` is not Int32"))?;
+            CellValue::Int(arr.value(row) as i64)
+        }
+        PrimitiveType::Long => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| format!("column `{col_name}` is not Int64"))?;
+            CellValue::Long(arr.value(row))
+        }
+        PrimitiveType::String => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| format!("column `{col_name}` is not Utf8"))?;
+            CellValue::String(arr.value(row).to_string())
+        }
+        PrimitiveType::Boolean => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| format!("column `{col_name}` is not Boolean"))?;
+            CellValue::Bool(arr.value(row))
+        }
+        other => {
+            return Err(format!(
+                "phase 1 DELETE WHERE evaluator does not yet support primitive type {other:?} (column `{col_name}`)"
+            ));
+        }
+    };
+    Ok(Some(value))
+}
+
+fn compare_cell_to_datum(
+    cell: &CellValue,
+    datum: &Datum,
+    col_name: &str,
+) -> Result<std::cmp::Ordering, String> {
+    use iceberg::spec::PrimitiveLiteral;
+    let lit = datum.literal();
+    match (cell, lit) {
+        (CellValue::Int(c), PrimitiveLiteral::Int(d)) => Ok(c.cmp(&(*d as i64))),
+        (CellValue::Long(c), PrimitiveLiteral::Long(d)) => Ok(c.cmp(d)),
+        (CellValue::String(c), PrimitiveLiteral::String(d)) => Ok(c.as_str().cmp(d.as_str())),
+        (CellValue::Bool(c), PrimitiveLiteral::Boolean(d)) => Ok(c.cmp(d)),
+        (cell, lit) => Err(format!(
+            "phase 1 DELETE WHERE evaluator: column `{col_name}` and literal types disagree (cell={cell:?}, lit={lit:?})"
+        )),
+    }
 }
 
 fn build_local_fs_operator() -> Result<opendal::Operator, String> {
