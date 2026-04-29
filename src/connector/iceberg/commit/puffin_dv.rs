@@ -121,6 +121,10 @@ impl DeletionVector {
         let mut bitmaps = BTreeMap::new();
         for _ in 0..bitmap_count {
             let key = read_le_u32_from(&mut cursor)?;
+            ensure!(
+                !bitmaps.contains_key(&key),
+                "deletion vector payload contains duplicate key {key}"
+            );
             let bitmap = RoaringBitmap::deserialize_from(&mut cursor)
                 .context("failed to deserialize deletion vector bitmap")?;
             bitmaps.insert(key, bitmap);
@@ -138,7 +142,7 @@ impl DeletionVector {
 fn ensure_positive_64_bit_position(position: u64) -> Result<()> {
     ensure!(
         position < MAX_POSITIVE_I64_POSITION,
-        "deletion vector position must be a positive 64-bit value"
+        "deletion vector position must be a non-negative 63-bit value"
     );
     Ok(())
 }
@@ -178,6 +182,43 @@ fn read_le_u64_from(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
 mod tests {
     use super::*;
 
+    fn bitmap_with(values: &[u32]) -> RoaringBitmap {
+        let mut bitmap = RoaringBitmap::new();
+        for value in values {
+            bitmap.insert(*value);
+        }
+        bitmap
+    }
+
+    fn payload_from_body(body: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&crc32fast::hash(body).to_be_bytes());
+        payload
+    }
+
+    fn payload_from_entries(entries: &[(u32, RoaringBitmap)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, bitmap) in entries {
+            body.extend_from_slice(&key.to_le_bytes());
+            bitmap.serialize_into(&mut body).unwrap();
+        }
+        payload_from_body(&body)
+    }
+
+    fn assert_payload_error_contains(payload: &[u8], expected: &str) {
+        let err = DeletionVector::from_iceberg_payload(payload)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
     #[test]
     fn deletion_vector_round_trips_32_and_64_bit_positions() {
         let mut dv = DeletionVector::new();
@@ -201,6 +242,58 @@ mod tests {
     fn deletion_vector_rejects_high_bit_positions() {
         let mut dv = DeletionVector::new();
         let err = dv.insert(1u64 << 63).unwrap_err().to_string();
-        assert!(err.contains("positive 64-bit"));
+        assert!(err.contains("non-negative 63-bit"));
+    }
+
+    #[test]
+    fn deletion_vector_rejects_duplicate_keys() {
+        let payload = payload_from_entries(&[(7, bitmap_with(&[1, 2])), (7, bitmap_with(&[3, 4]))]);
+
+        assert_payload_error_contains(&payload, "duplicate key");
+    }
+
+    #[test]
+    fn deletion_vector_rejects_bad_length() {
+        let mut dv = DeletionVector::new();
+        dv.insert(7).unwrap();
+        let mut payload = dv.to_iceberg_payload().unwrap();
+        payload[..4].copy_from_slice(&1u32.to_be_bytes());
+
+        assert_payload_error_contains(&payload, "length mismatch");
+    }
+
+    #[test]
+    fn deletion_vector_rejects_bad_magic() {
+        let mut dv = DeletionVector::new();
+        dv.insert(7).unwrap();
+        let mut payload = dv.to_iceberg_payload().unwrap();
+        payload[4] ^= 0xff;
+
+        assert_payload_error_contains(&payload, "magic");
+    }
+
+    #[test]
+    fn deletion_vector_rejects_crc_mismatch() {
+        let mut dv = DeletionVector::new();
+        dv.insert(7).unwrap();
+        let mut payload = dv.to_iceberg_payload().unwrap();
+        let last = payload.len() - 1;
+        payload[last] ^= 0xff;
+
+        assert_payload_error_contains(&payload, "CRC mismatch");
+    }
+
+    #[test]
+    fn deletion_vector_rejects_trailing_bytes() {
+        let bitmap = bitmap_with(&[1, 2, 3]);
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.extend_from_slice(&1u64.to_le_bytes());
+        body.extend_from_slice(&9u32.to_le_bytes());
+        bitmap.serialize_into(&mut body).unwrap();
+        body.push(0);
+        let payload = payload_from_body(&body);
+
+        assert_payload_error_contains(&payload, "trailing bytes");
     }
 }
