@@ -19,8 +19,7 @@
 //!
 //! Phase 1 path:
 //! 1. Resolve + load the iceberg table.
-//! 2. Run pre-lowering validators (v3 writable, single partition spec, no
-//!    equality deletes).
+//! 2. Run pre-lowering validators and choose the Iceberg write mode.
 //! 3. Translate the sqlparser WHERE into an iceberg [`Predicate`]. Phase 1
 //!    supports comparison operators (`= != < <= > >=`), `IN (...)`, and
 //!    `AND` / `OR` against primitive columns (int / long / string / bool).
@@ -48,8 +47,8 @@ use sqlparser::ast as sqlast;
 
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, PositionDeleteGroup, RunInput,
-    ensure_no_equality_deletes, ensure_single_partition_spec, ensure_v3_writable,
+    CommitOpKind, IcebergCommitCollector, IcebergWriteMode, PositionDeleteGroup, RunInput,
+    ensure_iceberg_write_supported, ensure_no_equality_deletes, ensure_single_partition_spec,
     run_iceberg_commit, write_position_delete_files,
 };
 use crate::engine::backend_resolver::resolve_existing_table_target;
@@ -90,9 +89,18 @@ pub(crate) fn execute_delete_statement(
         .map_err(|e| format!("load iceberg table {}: {e}", &table_ident))?;
 
     // 3. Validation.
-    ensure_v3_writable(&table)?;
+    let write_mode = ensure_iceberg_write_supported(&table)?;
     ensure_single_partition_spec(&table)?;
     ensure_no_equality_deletes(&table)?;
+    match write_mode {
+        IcebergWriteMode::LegacyPositionDeletes => {}
+        IcebergWriteMode::RowLineageV3 => {
+            return Err(
+                "row-lineage DELETE selected the Puffin deletion-vector path before RowDeltaDvCommit was added"
+                    .to_string(),
+            );
+        }
+    }
 
     // 4. Translate WHERE → iceberg::Predicate against the table's schema.
     let schema = table.metadata().current_schema();

@@ -37,8 +37,8 @@ use iceberg::{NamespaceIdent, TableIdent};
 use crate::connector::backend::ResolvedTable;
 use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, RunInput, WrittenFile, ensure_no_equality_deletes,
-    ensure_single_partition_spec, ensure_v3_writable, run_iceberg_commit,
+    CommitOpKind, IcebergCommitCollector, RunInput, WrittenFile, ensure_iceberg_write_supported,
+    ensure_no_equality_deletes, ensure_single_partition_spec, run_iceberg_commit,
 };
 use crate::connector::starrocks::managed::mv_refresh::query_result_to_chunks;
 use crate::connector::starrocks::managed::mv_refresh_iceberg::write_chunks_as_iceberg_data_files;
@@ -107,7 +107,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
         })?;
 
     // 2. Pre-lowering validators.
-    ensure_v3_writable(&table)?;
+    let _write_mode = ensure_iceberg_write_supported(&table)?;
     ensure_single_partition_spec(&table)?;
     if overwrite {
         ensure_no_equality_deletes(&table)?;

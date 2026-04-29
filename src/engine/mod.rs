@@ -3480,6 +3480,20 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn iceberg_legacy_delete_still_uses_position_delete_path() {
+        let warehouse = TempDir::new().expect("warehouse");
+        let (engine, session) = open_iceberg_session_with_table(&warehouse, "3");
+        session
+            .execute_in_database("insert into ice.db1.t values (1, 'a'), (2, 'b')", "default")
+            .expect("seed");
+        session
+            .execute_in_database("delete from ice.db1.t where id = 1", "default")
+            .expect("legacy delete");
+        let snap_after = current_iceberg_snapshot_id(&engine, "ice", "db1", "t");
+        assert!(snap_after.is_some(), "legacy DELETE must still commit");
+    }
+
+    #[test]
     fn iceberg_delete_no_match_is_a_noop() {
         let warehouse = TempDir::new().expect("warehouse");
         let (_engine, session) = open_iceberg_session_with_table(&warehouse, "3");

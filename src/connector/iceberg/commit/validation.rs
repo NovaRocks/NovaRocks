@@ -48,10 +48,6 @@ pub fn ensure_iceberg_write_supported(table: &Table) -> Result<IcebergWriteMode,
     Ok(classify_iceberg_write_mode(table))
 }
 
-pub(crate) fn ensure_v3_writable(table: &Table) -> Result<(), String> {
-    ensure_iceberg_write_supported(table).map(|_| ())
-}
-
 fn ensure_no_variant_columns(table: &Table) -> Result<(), String> {
     let schema = table.metadata().current_schema();
     for f in schema.as_struct().fields() {
