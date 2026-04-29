@@ -45,10 +45,20 @@ use roaring::RoaringTreemap;
 use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};
 
 /// Constants matching the iceberg position-delete file schema (file_path, pos).
+// removed when scan_deletes lands in Task 5
 #[allow(dead_code)]
 const FILE_PATH_COLUMN: &str = "file_path";
+// removed when scan_deletes lands in Task 5
 #[allow(dead_code)]
 const POS_COLUMN: &str = "pos";
+
+// TODO(ivm-phase-2 follow-up): every failure path here funnels into
+// ChangeError::InternalInconsistency, but operationally several classes
+// of failure (I/O errors, corrupt delete-file schema, negative pos)
+// are *external* — not invariants of NovaRocks. Re-classify into
+// distinct ChangeError variants (e.g. DeleteFileIoError /
+// DeleteFileSchemaInvalid) once the orchestrator (Task 5+) provides
+// caller context to disambiguate.
 
 /// Read every position-delete file in `delete_files` and return, per
 /// referenced data file, the set of positions deleted by those files.
@@ -56,6 +66,7 @@ const POS_COLUMN: &str = "pos";
 /// Equivalent to `iceberg::position_delete::load_position_deletes` run
 /// once per distinct `data_file_path`, but reads each delete file only
 /// once.
+// removed when scan_deletes lands in Task 5
 #[allow(dead_code)]
 pub(crate) fn read_delete_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
