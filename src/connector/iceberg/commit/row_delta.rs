@@ -284,11 +284,20 @@ async fn write_delete_manifest(
         // the conversion only needs schema-derived hints which are not used
         // (DataFileBuilder ignores the collector parameter for now).
         let df = written_file_to_iceberg_data_file_minimal(f)?;
-        // For ADDED delete files the data sequence is the new snapshot's seq;
-        // file_sequence_number is the same since these files are introduced now.
+        // Newly-introduced position-delete files must be recorded with
+        // `ManifestStatus::Added` so downstream readers (e.g., the
+        // `plan_changes` / `collect_files` lineage walk) include them in
+        // the delete-bearing change set.  iceberg-rust's `add_delete_file`
+        // helper sets `status=Deleted` — that variant is reserved for
+        // marking files REMOVED in compaction-style snapshots, not for
+        // adding new delete files — its name is misleading.  Use
+        // `add_file`, which builds a status=Added entry that the writer
+        // accepts for `Deletes`-content manifests too (`check_data_file`
+        // verifies the file's `DataContentType` is `PositionDeletes` or
+        // `EqualityDeletes`).
         writer
-            .add_delete_file(df, new_seq, Some(new_seq))
-            .map_err(|e| format!("ManifestWriter::add_delete_file failed: {e}"))?;
+            .add_file(df, new_seq)
+            .map_err(|e| format!("ManifestWriter::add_file failed: {e}"))?;
     }
     let manifest_file = writer
         .write_manifest_file()
