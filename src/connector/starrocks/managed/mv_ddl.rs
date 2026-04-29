@@ -434,7 +434,7 @@ pub(crate) fn validate_ivm_primary_key(
 ) -> Result<(), crate::connector::iceberg::changes::ChangeError> {
     use crate::connector::iceberg::changes::ChangeError;
 
-    if base.format_version != 2 {
+    if base.format_version != 2 && base.format_version != 3 {
         return Err(ChangeError::IcebergFormatUnsupported {
             format_version: base.format_version,
         });
@@ -1395,6 +1395,12 @@ GROUP BY k1",
             err,
             ChangeError::IcebergFormatUnsupported { format_version: 1 }
         ));
+    }
+
+    #[test]
+    fn validate_ivm_primary_key_accepts_v3_base() {
+        let base = descriptor(3, &[("id", "BIGINT", false)]);
+        super::validate_ivm_primary_key(&["id".to_string()], &base).expect("v3 must be accepted");
     }
 
     #[test]
