@@ -45,6 +45,14 @@ use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};
 const FILE_PATH_COLUMN: &str = "file_path";
 const POS_COLUMN: &str = "pos";
 
+/// Strip the `file://` URL scheme so the path can be passed to a local-FS
+/// opendal operator (which expects bare filesystem paths). Other schemes
+/// (s3://, hdfs://, …) are returned unchanged because PR-3 only supports
+/// the local-FS path; cloud handling is PR-4.
+fn normalize_local_fs_path(path: &str) -> &str {
+    path.strip_prefix("file://").unwrap_or(path)
+}
+
 // TODO(ivm-phase-2 follow-up): every failure path here funnels into
 // ChangeError::InternalInconsistency, but operationally several classes
 // of failure (I/O errors, corrupt delete-file schema, negative pos)
@@ -78,7 +86,10 @@ pub(crate) fn read_delete_positions_per_data_file(
             None
         };
         let reader = factory
-            .open_with_len(&delete_file.delete_file_path, length)
+            .open_with_len(
+                normalize_local_fs_path(&delete_file.delete_file_path),
+                length,
+            )
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
                     "open iceberg position-delete file {} failed: {e}",
@@ -207,7 +218,7 @@ pub(crate) fn read_data_file_at_positions(
     }
 
     let reader = factory
-        .open_with_len(data_file_path, data_file_size)
+        .open_with_len(normalize_local_fs_path(data_file_path), data_file_size)
         .map_err(|e| {
             ChangeError::InternalInconsistency(format!(
                 "open iceberg data file {data_file_path} for delete reverse projection: {e}"
