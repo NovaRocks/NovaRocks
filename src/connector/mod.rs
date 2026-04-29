@@ -29,9 +29,9 @@ pub(crate) use iceberg::catalog::{
     register_existing_table as register_existing_iceberg_table,
 };
 #[cfg(test)]
-pub(crate) use iceberg::catalog::{
-    load_table as load_iceberg_table, plan_append_delta as plan_iceberg_append_delta,
-};
+pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
+#[cfg(test)]
+pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
 pub(crate) use starrocks::managed::ddl::truncate_managed_table;
 pub(crate) use starrocks::managed::erase::spawn_erase_worker as spawn_managed_erase_worker;
 #[cfg(test)]

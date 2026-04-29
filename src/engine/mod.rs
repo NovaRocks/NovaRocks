@@ -2617,9 +2617,18 @@ enable_path_style_access = true
 
         let second_loaded =
             crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
-        let delta =
-            crate::connector::plan_iceberg_append_delta(&second_loaded.table, previous_snapshot_id)
-                .expect("plan append delta");
+        let batch = crate::connector::plan_iceberg_changes(
+            &second_loaded.table,
+            previous_snapshot_id,
+            &[],
+        )
+        .expect("plan_changes");
+        assert!(batch.deletes.is_empty(), "append-only fixture: {:?}", batch.deletes);
+        let added_files: Vec<(String, i64, Option<i64>)> = batch
+            .inserts
+            .iter()
+            .map(|f| (f.path.clone(), f.size, f.record_count))
+            .collect();
 
         let result = super::mv_flow::execute_query_for_mv_incremental_refresh(
             &engine.inner,
@@ -2630,7 +2639,7 @@ enable_path_style_access = true
                 namespace: "db1".to_string(),
                 table: "tbl".to_string(),
             },
-            delta.added_files,
+            added_files,
         )
         .expect("execute mv incremental refresh");
 
@@ -2809,10 +2818,18 @@ enable_path_style_access = true
 
         let second_loaded =
             crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
-        let mut delta_files =
-            crate::connector::plan_iceberg_append_delta(&second_loaded.table, previous_snapshot_id)
-                .expect("plan append delta")
-                .added_files;
+        let batch = crate::connector::plan_iceberg_changes(
+            &second_loaded.table,
+            previous_snapshot_id,
+            &[],
+        )
+        .expect("plan_changes");
+        assert!(batch.deletes.is_empty(), "append-only fixture: {:?}", batch.deletes);
+        let mut delta_files: Vec<(String, i64, Option<i64>)> = batch
+            .inserts
+            .iter()
+            .map(|f| (f.path.clone(), f.size, f.record_count))
+            .collect();
         let first_delta_file = delta_files
             .first()
             .expect("at least one delta file")
