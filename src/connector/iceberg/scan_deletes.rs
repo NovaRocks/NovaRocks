@@ -67,8 +67,6 @@ fn normalize_local_fs_path(path: &str) -> &str {
 /// Equivalent to `iceberg::position_delete::load_position_deletes` run
 /// once per distinct `data_file_path`, but reads each delete file only
 /// once.
-// removed when scan_deletes lands in Task 5
-#[allow(dead_code)]
 pub(crate) fn read_delete_positions_per_data_file(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
@@ -202,8 +200,6 @@ pub(crate) fn read_delete_positions_per_data_file(
 ///
 /// `data_file_path` is in iceberg's path format (e.g. `file:///...` or
 /// `s3://...`). The `factory` knows how to dispatch.
-// removed when scan_deletes lands in Task 5
-#[allow(dead_code)]
 pub(crate) fn read_data_file_at_positions(
     data_file_path: &str,
     data_file_size: Option<u64>,
@@ -284,8 +280,6 @@ pub(crate) fn read_data_file_at_positions(
 /// the canonical source. Caller must provide a closure since iceberg
 /// table state isn't carried into this module to keep the dependency
 /// graph minimal.
-// removed when materialize_changes lands in Task 7
-#[allow(dead_code)]
 pub(crate) fn scan_deletes<F>(
     delete_files: &[PositionDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,

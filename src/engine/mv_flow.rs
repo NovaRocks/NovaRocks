@@ -258,8 +258,6 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
 /// list construction — the caller has already projected the rows.
 ///
 /// Returns the empty `QueryResult` when `deleted_rows` is empty.
-// removed when Task 10 wires this in
-#[allow(dead_code)]
 pub(crate) fn execute_query_for_mv_incremental_deletes(
     state: &Arc<StandaloneState>,
     current_database: &str,

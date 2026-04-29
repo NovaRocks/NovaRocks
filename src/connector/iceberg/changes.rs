@@ -252,7 +252,6 @@ fn classify_snapshot(
 /// preserves logical content). A passing REPLACE leaves `total-records`
 /// unchanged, contributes both `added-data-files` and `deleted-data-files`
 /// counters, and does not change the schema. Anything else is rejected.
-#[allow(dead_code)]
 fn validate_replace_snapshot(
     snapshot: &iceberg::spec::Snapshot,
     parent: &iceberg::spec::Snapshot,
@@ -445,8 +444,6 @@ pub(crate) fn plan_changes(
 ///
 /// The `_pk_columns` parameter is reserved for PR-4 (delete-side
 /// row-id computation when AggregateApplyChanges lands).
-// removed when Task 10 wires this in
-#[allow(dead_code)]
 pub(crate) fn materialize_changes(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     current_database: &str,
@@ -513,8 +510,6 @@ pub(crate) fn materialize_changes(
 /// same `OpendalRangeReaderFactory` shape as the HDFS scan path
 /// (`build_fs_operator` for local FS, S3/cloud-credentialled operator
 /// when the catalog has cloud properties).
-// removed when Task 10 wires this in
-#[allow(dead_code)]
 fn build_factory_for_table(
     table: &iceberg::table::Table,
 ) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {

@@ -1,6 +1,4 @@
-//! Aggregate MV state helpers intentionally staged before the following
-//! aggregate MV wiring tasks use them.
-#![allow(dead_code)]
+//! Aggregate MV state helpers for aggregate MV incremental refresh.
 
 use std::collections::HashMap;
 use std::sync::Arc;
