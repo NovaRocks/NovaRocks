@@ -118,7 +118,6 @@ impl std::error::Error for ChangeError {}
 /// MV-incremental-refresh executor (which currently consumes
 /// `Vec<(String, i64, Option<i64>)>` directly).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct DataFileRef {
     pub path: String,
     pub size: i64,
@@ -136,7 +135,6 @@ pub(crate) struct DataFileRef {
 /// When `None`, every delete row carries its own `file_path` cell and the
 /// reader must read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct PositionDeleteRef {
     pub delete_file_path: String,
     pub delete_file_size: i64,
@@ -150,7 +148,6 @@ pub(crate) struct PositionDeleteRef {
 /// (inclusive). REPLACE compaction snapshots are validated and skipped;
 /// they contribute to neither vector.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct IcebergChangeBatch {
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
@@ -163,7 +160,6 @@ pub(crate) struct IcebergChangeBatch {
 /// `classify_snapshot` itself and never produce a `LineageAction` —
 /// they're silently absorbed once the validator passes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum LineageAction {
     /// Walk the snapshot's data manifests, collect entries with
     /// `added_snapshot_id == this`, project to `DataFileRef`.
@@ -179,7 +175,6 @@ pub(crate) enum LineageAction {
 /// (exclusive) to `current_snapshot_id` (inclusive). Replace snapshots
 /// validated and skipped during classification do not appear here.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct LineagePlan {
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
@@ -197,7 +192,6 @@ pub(crate) struct LineagePlan {
 /// `total-records` and `schema_id` against the parent). It can be
 /// `None` for any other operation; passing `None` for REPLACE
 /// produces a `ReplaceValidationFailed` error.
-#[allow(dead_code)]
 fn classify_snapshot(
     snapshot: &iceberg::spec::Snapshot,
     parent: Option<&iceberg::spec::Snapshot>,
@@ -301,7 +295,6 @@ fn validate_replace_snapshot(
 ///   chain runs off its root).
 /// - `UnsupportedOperation` / `ReplaceValidationFailed` propagated from
 ///   `classify_snapshot`.
-#[allow(dead_code)]
 pub(crate) fn classify_lineage(
     metadata: &iceberg::spec::TableMetadata,
     previous_snapshot_id: i64,
@@ -368,14 +361,13 @@ pub(crate) fn classify_lineage(
     })
 }
 
-/// Public entrypoint replacing the old `plan_append_delta`. Walks the
+/// Public entrypoint for snapshot-lineage change planning. Walks the
 /// lineage from `previous_snapshot_id` (exclusive) to the table's
 /// current snapshot (inclusive), classifies each snapshot operation,
 /// and assembles `IcebergChangeBatch { inserts, deletes }`.
 ///
 /// The `_pk_columns` parameter is reserved for PR-3 (delete reverse
 /// projection); it is intentionally unused in PR-2.
-#[allow(dead_code)]
 pub(crate) fn plan_changes(
     table: &iceberg::table::Table,
     previous_snapshot_id: i64,

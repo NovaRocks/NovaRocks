@@ -157,9 +157,10 @@ pub(crate) fn create_mv(
             );
         }
         let base_ref = &base_refs[0];
-        let loaded = crate::connector::starrocks::managed::mv_refresh::load_current_iceberg_base_table(
-            state, base_ref,
-        )?;
+        let loaded =
+            crate::connector::starrocks::managed::mv_refresh::load_current_iceberg_base_table(
+                state, base_ref,
+            )?;
         let descriptor = descriptor_from_loaded(&loaded);
         validate_ivm_primary_key(pk_cols, &descriptor).map_err(|e| e.to_string())?;
     }
@@ -443,9 +444,7 @@ pub(crate) fn validate_ivm_primary_key(
             .columns
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(pk))
-            .ok_or_else(|| ChangeError::PrimaryKeyMissingFromBase {
-                pk_col: pk.clone(),
-            })?;
+            .ok_or_else(|| ChangeError::PrimaryKeyMissingFromBase { pk_col: pk.clone() })?;
         if col.nullable {
             return Err(ChangeError::PrimaryKeyNullable {
                 pk_col: col.name.clone(),
@@ -1383,10 +1382,7 @@ GROUP BY k1",
     fn validate_ivm_pk_happy_path() {
         let base = descriptor(
             2,
-            &[
-                ("order_id", "BIGINT", false),
-                ("customer", "STRING", true),
-            ],
+            &[("order_id", "BIGINT", false), ("customer", "STRING", true)],
         );
         validate_ivm_primary_key(&["order_id".to_string()], &base).expect("ok");
     }
@@ -1395,7 +1391,10 @@ GROUP BY k1",
     fn validate_ivm_pk_rejects_v1_base_table() {
         let base = descriptor(1, &[("order_id", "BIGINT", false)]);
         let err = validate_ivm_primary_key(&["order_id".to_string()], &base).expect_err("err");
-        assert!(matches!(err, ChangeError::IcebergFormatUnsupported { format_version: 1 }));
+        assert!(matches!(
+            err,
+            ChangeError::IcebergFormatUnsupported { format_version: 1 }
+        ));
     }
 
     #[test]
@@ -1442,32 +1441,17 @@ GROUP BY k1",
     fn validate_ivm_pk_accepts_decimal_and_string() {
         let base = descriptor(
             2,
-            &[
-                ("k1", "DECIMAL(18,2)", false),
-                ("k2", "STRING", false),
-            ],
+            &[("k1", "DECIMAL(18,2)", false), ("k2", "STRING", false)],
         );
-        validate_ivm_primary_key(
-            &["k1".to_string(), "k2".to_string()],
-            &base,
-        )
-        .expect("ok");
+        validate_ivm_primary_key(&["k1".to_string(), "k2".to_string()], &base).expect("ok");
     }
 
     #[test]
     fn validate_ivm_pk_first_failure_wins_per_column_order() {
         // missing comes before nullable in column order; expect missing.
-        let base = descriptor(
-            2,
-            &[
-                ("present_but_nullable", "BIGINT", true),
-            ],
-        );
+        let base = descriptor(2, &[("present_but_nullable", "BIGINT", true)]);
         let err = validate_ivm_primary_key(
-            &[
-                "absent".to_string(),
-                "present_but_nullable".to_string(),
-            ],
+            &["absent".to_string(), "present_but_nullable".to_string()],
             &base,
         )
         .expect_err("err");
@@ -1485,8 +1469,14 @@ GROUP BY k1",
         assert_eq!(super::arrow_data_type_pk_head(&DataType::Int32), "INT");
         assert_eq!(super::arrow_data_type_pk_head(&DataType::Int64), "BIGINT");
         assert_eq!(super::arrow_data_type_pk_head(&DataType::Utf8), "STRING");
-        assert_eq!(super::arrow_data_type_pk_head(&DataType::LargeUtf8), "STRING");
-        assert_eq!(super::arrow_data_type_pk_head(&DataType::Decimal128(18, 2)), "DECIMAL");
+        assert_eq!(
+            super::arrow_data_type_pk_head(&DataType::LargeUtf8),
+            "STRING"
+        );
+        assert_eq!(
+            super::arrow_data_type_pk_head(&DataType::Decimal128(18, 2)),
+            "DECIMAL"
+        );
         assert_eq!(super::arrow_data_type_pk_head(&DataType::Date32), "DATE");
         assert_eq!(
             super::arrow_data_type_pk_head(&DataType::Timestamp(TimeUnit::Microsecond, None)),

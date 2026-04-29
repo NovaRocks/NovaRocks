@@ -88,7 +88,8 @@ pub(crate) fn create_iceberg_mv(
         let descriptor =
             crate::connector::starrocks::managed::mv_ddl::descriptor_from_loaded(&loaded);
         crate::connector::starrocks::managed::mv_ddl::validate_ivm_primary_key(
-            pk_cols, &descriptor,
+            pk_cols,
+            &descriptor,
         )
         .map_err(|e| e.to_string())?;
     }

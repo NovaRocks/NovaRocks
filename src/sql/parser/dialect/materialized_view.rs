@@ -91,9 +91,7 @@ pub(crate) fn parse_create_materialized_view(parser: &mut Parser<'_>) -> Result<
                 .map_err(|e| format!("parse PRIMARY KEY column failed: {e}"))?;
             let name = ident.value;
             if cols.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
-                return Err(format!(
-                    "duplicate column `{name}` in PRIMARY KEY clause"
-                ));
+                return Err(format!("duplicate column `{name}` in PRIMARY KEY clause"));
             }
             cols.push(name);
             if parser.consume_token(&Token::RParen) {

@@ -2617,13 +2617,14 @@ enable_path_style_access = true
 
         let second_loaded =
             crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
-        let batch = crate::connector::plan_iceberg_changes(
-            &second_loaded.table,
-            previous_snapshot_id,
-            &[],
-        )
-        .expect("plan_changes");
-        assert!(batch.deletes.is_empty(), "append-only fixture: {:?}", batch.deletes);
+        let batch =
+            crate::connector::plan_iceberg_changes(&second_loaded.table, previous_snapshot_id, &[])
+                .expect("plan_changes");
+        assert!(
+            batch.deletes.is_empty(),
+            "append-only fixture: {:?}",
+            batch.deletes
+        );
         let added_files: Vec<(String, i64, Option<i64>)> = batch
             .inserts
             .iter()
@@ -2818,13 +2819,14 @@ enable_path_style_access = true
 
         let second_loaded =
             crate::connector::load_iceberg_table(&entry, "db1", "tbl").expect("load second table");
-        let batch = crate::connector::plan_iceberg_changes(
-            &second_loaded.table,
-            previous_snapshot_id,
-            &[],
-        )
-        .expect("plan_changes");
-        assert!(batch.deletes.is_empty(), "append-only fixture: {:?}", batch.deletes);
+        let batch =
+            crate::connector::plan_iceberg_changes(&second_loaded.table, previous_snapshot_id, &[])
+                .expect("plan_changes");
+        assert!(
+            batch.deletes.is_empty(),
+            "append-only fixture: {:?}",
+            batch.deletes
+        );
         let mut delta_files: Vec<(String, i64, Option<i64>)> = batch
             .inserts
             .iter()

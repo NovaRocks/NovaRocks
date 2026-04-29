@@ -305,8 +305,8 @@ struct AggregateMvIncrementalRefreshContext<'a> {
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
-    let batch = plan_changes(ctx.base_table, ctx.previous_snapshot_id, &[])
-        .map_err(|e| e.to_string())?;
+    let batch =
+        plan_changes(ctx.base_table, ctx.previous_snapshot_id, &[]).map_err(|e| e.to_string())?;
     if !batch.deletes.is_empty() {
         return Err(format!(
             "iceberg aggregate materialized view incremental refresh does not yet support \

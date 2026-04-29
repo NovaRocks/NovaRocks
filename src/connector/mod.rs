@@ -22,14 +22,14 @@ pub mod schema;
 pub mod starrocks;
 
 pub(crate) use backend::{CatalogBackend, MvBackend, TableSink, TableSource};
+#[cfg(test)]
+pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
 pub(crate) use iceberg::catalog::{IcebergCatalogEntry, insert_rows as insert_iceberg_rows};
 pub(crate) use iceberg::catalog::{
     IcebergCatalogRegistry, create_namespace as create_iceberg_namespace,
     namespace_exists as iceberg_namespace_exists,
     register_existing_table as register_existing_iceberg_table,
 };
-#[cfg(test)]
-pub(crate) use iceberg::catalog::load_table as load_iceberg_table;
 #[cfg(test)]
 pub(crate) use iceberg::changes::plan_changes as plan_iceberg_changes;
 pub(crate) use starrocks::managed::ddl::truncate_managed_table;
