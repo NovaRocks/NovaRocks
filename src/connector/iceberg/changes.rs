@@ -365,6 +365,182 @@ pub(crate) fn classify_lineage(
     })
 }
 
+/// Public entrypoint replacing the old `plan_append_delta`. Walks the
+/// lineage from `previous_snapshot_id` (exclusive) to the table's
+/// current snapshot (inclusive), classifies each snapshot operation,
+/// and assembles `IcebergChangeBatch { inserts, deletes }`.
+///
+/// The `_pk_columns` parameter is reserved for PR-3 (delete reverse
+/// projection); it is intentionally unused in PR-2.
+#[allow(dead_code)]
+pub(crate) fn plan_changes(
+    table: &iceberg::table::Table,
+    previous_snapshot_id: i64,
+    _pk_columns: &[String],
+) -> Result<IcebergChangeBatch, ChangeError> {
+    let metadata = table.metadata();
+    let current_snapshot_id = metadata
+        .current_snapshot()
+        .map(|s| s.snapshot_id())
+        .ok_or_else(|| {
+            ChangeError::InternalInconsistency(
+                "plan_changes: table has no current snapshot".to_string(),
+            )
+        })?;
+
+    let plan = classify_lineage(metadata, previous_snapshot_id)?;
+    if plan.actions.is_empty() {
+        return Ok(IcebergChangeBatch {
+            previous_snapshot_id,
+            current_snapshot_id,
+            inserts: Vec::new(),
+            deletes: Vec::new(),
+        });
+    }
+
+    let file_io = table.file_io();
+    let collect = collect_files(metadata, file_io, &plan.actions);
+    let (inserts, deletes) = crate::connector::iceberg::catalog::registry::block_on_iceberg(collect)
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!("plan_changes runtime: {e}"))
+        })??;
+
+    Ok(IcebergChangeBatch {
+        previous_snapshot_id,
+        current_snapshot_id,
+        inserts,
+        deletes,
+    })
+}
+
+/// Async file collection for one `LineagePlan`. Loads each snapshot's
+/// manifest list, walks data manifests for `CollectInserts` actions, and
+/// walks delete manifests for `CollectDeletes` actions. Order of the
+/// returned `(inserts, deletes)` matches the lineage order in `actions`.
+async fn collect_files(
+    metadata: &iceberg::spec::TableMetadata,
+    file_io: &iceberg::io::FileIO,
+    actions: &[LineageAction],
+) -> Result<(Vec<DataFileRef>, Vec<PositionDeleteRef>), ChangeError> {
+    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+
+    let mut inserts: Vec<DataFileRef> = Vec::new();
+    let mut deletes: Vec<PositionDeleteRef> = Vec::new();
+
+    for action in actions {
+        let snapshot_id = match action {
+            LineageAction::CollectInserts { snapshot_id }
+            | LineageAction::CollectDeletes { snapshot_id } => *snapshot_id,
+        };
+        let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "collect_files: snapshot {snapshot_id} no longer in metadata"
+            ))
+        })?;
+        let manifest_list = snapshot
+            .load_manifest_list(file_io, metadata)
+            .await
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "load manifest list for snapshot {snapshot_id}: {e}"
+                ))
+            })?;
+
+        match action {
+            LineageAction::CollectInserts { .. } => {
+                for manifest_file in manifest_list.entries() {
+                    if manifest_file.content != ManifestContentType::Data {
+                        continue;
+                    }
+                    if manifest_file.added_snapshot_id != snapshot_id {
+                        continue;
+                    }
+                    let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+                        ChangeError::InternalInconsistency(format!(
+                            "load data manifest {} for snapshot {snapshot_id}: {e}",
+                            manifest_file.manifest_path
+                        ))
+                    })?;
+                    for entry in manifest.entries() {
+                        if entry.status == ManifestStatus::Deleted {
+                            return Err(ChangeError::InternalInconsistency(format!(
+                                "data manifest entry has DELETED status in snapshot {snapshot_id}: {}",
+                                entry.data_file().file_path()
+                            )));
+                        }
+                        if entry.status != ManifestStatus::Added {
+                            continue;
+                        }
+                        if entry.snapshot_id() != Some(snapshot_id) {
+                            continue;
+                        }
+                        let df = entry.data_file();
+                        if df.content_type() != DataContentType::Data {
+                            continue;
+                        }
+                        inserts.push(DataFileRef {
+                            path: df.file_path().to_string(),
+                            size: i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX),
+                            record_count: Some(
+                                i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                            ),
+                        });
+                    }
+                }
+            }
+            LineageAction::CollectDeletes { .. } => {
+                for manifest_file in manifest_list.entries() {
+                    if manifest_file.content != ManifestContentType::Deletes {
+                        continue;
+                    }
+                    if manifest_file.added_snapshot_id != snapshot_id {
+                        continue;
+                    }
+                    let manifest = manifest_file.load_manifest(file_io).await.map_err(|e| {
+                        ChangeError::InternalInconsistency(format!(
+                            "load delete manifest {} for snapshot {snapshot_id}: {e}",
+                            manifest_file.manifest_path
+                        ))
+                    })?;
+                    for entry in manifest.entries() {
+                        if entry.status != ManifestStatus::Added {
+                            continue;
+                        }
+                        if entry.snapshot_id() != Some(snapshot_id) {
+                            continue;
+                        }
+                        let df = entry.data_file();
+                        match df.content_type() {
+                            DataContentType::PositionDeletes => {
+                                deletes.push(PositionDeleteRef {
+                                    delete_file_path: df.file_path().to_string(),
+                                    delete_file_size: i64::try_from(df.file_size_in_bytes())
+                                        .unwrap_or(i64::MAX),
+                                    record_count: Some(
+                                        i64::try_from(df.record_count()).unwrap_or(i64::MAX),
+                                    ),
+                                    referenced_data_file: df.referenced_data_file(),
+                                });
+                            }
+                            DataContentType::EqualityDeletes => {
+                                return Err(ChangeError::EqualityDeleteUnsupported { snapshot_id });
+                            }
+                            DataContentType::Data => {
+                                return Err(ChangeError::InternalInconsistency(format!(
+                                    "delete manifest contains DATA file in snapshot {snapshot_id}: {}",
+                                    df.file_path()
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((inserts, deletes))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -374,6 +550,29 @@ mod tests {
     use super::{
         classify_snapshot, validate_replace_snapshot, ChangeError, LineageAction,
     };
+
+    use crate::connector::iceberg::catalog::registry::{
+        build_catalog_entry, create_namespace, create_table, insert_rows, load_table,
+        IcebergCatalogEntry,
+    };
+    use crate::sql::{Literal, SqlType, TableColumnDef};
+
+    use super::plan_changes;
+
+    fn test_hadoop_catalog_entry(catalog_name: &str, warehouse_uri: &str) -> IcebergCatalogEntry {
+        build_catalog_entry(
+            catalog_name,
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                (
+                    "iceberg.catalog.warehouse".to_string(),
+                    warehouse_uri.to_string(),
+                ),
+            ],
+        )
+        .expect("catalog entry")
+    }
 
     /// Build a synthetic `Snapshot` whose summary carries the given
     /// operation and properties. `manifest_list` and timestamps get
@@ -558,5 +757,109 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_changes_collects_inserts_after_previous_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+            }],
+            None,
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load first");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load second");
+        let batch = plan_changes(&loaded.table, previous, &[]).expect("plan");
+        assert_eq!(batch.previous_snapshot_id, previous);
+        assert_eq!(
+            batch.current_snapshot_id,
+            loaded
+                .table
+                .metadata()
+                .current_snapshot()
+                .unwrap()
+                .snapshot_id()
+        );
+        assert!(!batch.inserts.is_empty());
+        assert!(batch.deletes.is_empty());
+        let returned_rows: i64 = batch
+            .inserts
+            .iter()
+            .map(|f| f.record_count.unwrap_or_default())
+            .sum();
+        assert_eq!(returned_rows, 1);
+    }
+
+    #[test]
+    fn plan_changes_rejects_pruned_previous_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}", dir.path().join("warehouse").display());
+        let entry = test_hadoop_catalog_entry("ice", &warehouse);
+        create_namespace(&entry, "ns").expect("namespace");
+        create_table(
+            &entry,
+            "ns",
+            "orders",
+            &[TableColumnDef {
+                name: "k1".to_string(),
+                data_type: SqlType::Int,
+                nullable: true,
+                aggregation: None,
+            }],
+            None,
+            &[],
+        )
+        .expect("table");
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(1)]]).expect("first insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load first");
+        let previous = loaded
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("snapshot")
+            .snapshot_id();
+
+        insert_rows(&entry, "ns", "orders", &[vec![Literal::Int(2)]]).expect("second insert");
+        let loaded = load_table(&entry, "ns", "orders").expect("load second");
+
+        let pruned_metadata = loaded
+            .table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .remove_snapshots(&[previous])
+            .build()
+            .expect("pruned metadata")
+            .metadata;
+        let pruned_table = iceberg::table::Table::builder()
+            .file_io(loaded.table.file_io().clone())
+            .metadata(std::sync::Arc::new(pruned_metadata))
+            .identifier(loaded.table.identifier().clone())
+            .build()
+            .expect("pruned table");
+
+        let err = plan_changes(&pruned_table, previous, &[]).expect_err("should fail");
+        assert!(matches!(err, ChangeError::LineageBroken { previous_snapshot } if previous_snapshot == previous));
     }
 }

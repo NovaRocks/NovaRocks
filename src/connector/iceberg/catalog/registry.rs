@@ -865,7 +865,7 @@ pub(crate) fn register_existing_table(
     Ok(())
 }
 
-fn build_catalog_entry(
+pub(crate) fn build_catalog_entry(
     catalog_name: &str,
     properties: &[(String, String)],
 ) -> Result<IcebergCatalogEntry, String> {
