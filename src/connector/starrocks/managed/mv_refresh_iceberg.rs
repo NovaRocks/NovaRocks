@@ -393,8 +393,8 @@ fn first_refresh_iceberg_mv(
 /// Execute the incremental refresh of an iceberg-backed MV.
 ///
 /// Steps:
-/// 1. Plan the append delta from `previous_snapshot_id` to `current_snapshot_id`.
-/// 2. Run the MV SELECT scoped to the delta files only.
+/// 1. Plan the change batch from `previous_snapshot_id` to `current_snapshot_id`.
+/// 2. Run the MV SELECT scoped to the inserts only.
 /// 3. If the delta yields 0 rows, advance lineage without committing an empty snapshot.
 /// 4. Otherwise: verify MV iceberg table is in the expected state (inconsistent-state guard),
 ///    write data files, commit fast-append, and update SQLite metadata.
