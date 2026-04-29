@@ -17,7 +17,7 @@ use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 use parquet::file::properties::WriterProperties;
 
-use crate::connector::iceberg::catalog::plan_append_delta;
+use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::starrocks::managed::mv_ddl::{
     alloc_id, analyze_mv_select, extract_base_table_refs, find_or_create_managed_database, now_ms,
     resolve_mv_name,
@@ -417,22 +417,34 @@ fn incremental_refresh_iceberg_mv(
     current_snapshot_id: i64,
     base_table: &iceberg::table::Table,
 ) -> Result<StatementResult, String> {
-    // 1. Plan the append delta.
-    let delta = plan_append_delta(base_table, previous_snapshot_id)?;
-    if delta.current_snapshot_id != current_snapshot_id {
+    // 1. Plan the change batch.
+    let batch = plan_changes(base_table, previous_snapshot_id, &[]).map_err(|e| e.to_string())?;
+    if !batch.deletes.is_empty() {
         return Err(format!(
-            "iceberg mv incremental refresh: delta snapshot mismatch (expected {current_snapshot_id}, got {})",
-            delta.current_snapshot_id,
+            "iceberg-stored materialized view incremental refresh does not yet support \
+             delete snapshots; {} delete file(s) seen in lineage",
+            batch.deletes.len()
+        ));
+    }
+    if batch.current_snapshot_id != current_snapshot_id {
+        return Err(format!(
+            "iceberg mv incremental refresh: change batch snapshot mismatch (expected {current_snapshot_id}, got {})",
+            batch.current_snapshot_id,
         ));
     }
 
-    // 2. Run the MV SELECT scoped to the delta files only.
+    // 2. Run the MV SELECT scoped to the inserts only.
+    let added_files: Vec<(String, i64, Option<i64>)> = batch
+        .inserts
+        .iter()
+        .map(|f| (f.path.clone(), f.size, f.record_count))
+        .collect();
     let chunks = execute_query_for_mv_incremental_refresh(
         state,
         db_name,
         &mv_row.select_sql,
         base_ref,
-        delta.added_files,
+        added_files,
     )
     .and_then(query_result_to_chunks)?;
     let added_rows = chunks

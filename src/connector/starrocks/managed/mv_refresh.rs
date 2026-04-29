@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use crate::connector::iceberg::catalog::{load_table, plan_append_delta};
+use crate::connector::iceberg::catalog::load_table;
+use crate::connector::iceberg::changes::plan_changes;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::engine::mv_flow::{
@@ -149,11 +150,19 @@ pub(crate) fn refresh_mv(
             Ok(StatementResult::Ok)
         },
         |previous_snapshot_id, current_snapshot_id| {
-            let delta = plan_append_delta(&loaded.table, previous_snapshot_id)?;
-            if delta.current_snapshot_id != current_snapshot_id {
+            let batch = plan_changes(&loaded.table, previous_snapshot_id, &[])
+                .map_err(|e| e.to_string())?;
+            if !batch.deletes.is_empty() {
                 return Err(format!(
-                    "iceberg append delta current snapshot mismatch: expected {current_snapshot_id}, got {}",
-                    delta.current_snapshot_id
+                    "iceberg materialized view incremental refresh does not yet support \
+                     delete snapshots; {} delete file(s) seen in lineage",
+                    batch.deletes.len()
+                ));
+            }
+            if batch.current_snapshot_id != current_snapshot_id {
+                return Err(format!(
+                    "iceberg change batch current snapshot mismatch: expected {current_snapshot_id}, got {}",
+                    batch.current_snapshot_id
                 ));
             }
 
@@ -162,7 +171,11 @@ pub(crate) fn refresh_mv(
                 &db_name,
                 &mv_row.select_sql,
                 base_ref,
-                delta.added_files,
+                batch
+                    .inserts
+                    .iter()
+                    .map(|f| (f.path.clone(), f.size, f.record_count))
+                    .collect(),
             )?;
             let chunks = query_result_to_chunks(result)?;
             let plan = load_insert_plan(
@@ -292,20 +305,33 @@ struct AggregateMvIncrementalRefreshContext<'a> {
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
-    let delta = plan_append_delta(ctx.base_table, ctx.previous_snapshot_id)?;
-    if delta.current_snapshot_id != ctx.current_snapshot_id {
+    let batch = plan_changes(ctx.base_table, ctx.previous_snapshot_id, &[])
+        .map_err(|e| e.to_string())?;
+    if !batch.deletes.is_empty() {
         return Err(format!(
-            "iceberg append delta current snapshot mismatch: expected {}, got {}",
-            ctx.current_snapshot_id, delta.current_snapshot_id
+            "iceberg aggregate materialized view incremental refresh does not yet support \
+             delete snapshots; {} delete file(s) seen in lineage",
+            batch.deletes.len()
+        ));
+    }
+    if batch.current_snapshot_id != ctx.current_snapshot_id {
+        return Err(format!(
+            "iceberg change batch current snapshot mismatch: expected {}, got {}",
+            ctx.current_snapshot_id, batch.current_snapshot_id
         ));
     }
 
+    let added_files: Vec<(String, i64, Option<i64>)> = batch
+        .inserts
+        .iter()
+        .map(|f| (f.path.clone(), f.size, f.record_count))
+        .collect();
     let result = execute_query_for_mv_incremental_refresh(
         ctx.state,
         ctx.database,
         ctx.select_sql,
         ctx.base_ref,
-        delta.added_files,
+        added_files,
     )?;
     let output_columns = result
         .columns
