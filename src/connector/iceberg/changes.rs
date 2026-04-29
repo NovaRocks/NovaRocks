@@ -111,6 +111,52 @@ impl std::fmt::Display for ChangeError {
 
 impl std::error::Error for ChangeError {}
 
+/// Reference to a single data file added to the table by an `Append`
+/// snapshot. PR-2 builds these from the snapshot's data manifests; PR-3
+/// will pass the path/size/record_count tuple through to the existing
+/// MV-incremental-refresh executor (which currently consumes
+/// `Vec<(String, i64, Option<i64>)>` directly).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct DataFileRef {
+    pub path: String,
+    pub size: i64,
+    pub record_count: Option<i64>,
+}
+
+/// Reference to a single position-delete file added to the table by a
+/// `Delete` snapshot. PR-2 only reports these on the lineage path; the
+/// reverse-projection that turns each (delete_file, pos) pair back into
+/// the original base row lives in PR-3.
+///
+/// `referenced_data_file` carries the iceberg `DataFile.referenced_data_file`
+/// field — a position-delete file MAY declare a single data file that all
+/// of its rows target, in which case readers can short-circuit the join.
+/// When `None`, every delete row carries its own `file_path` cell and the
+/// reader must read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct PositionDeleteRef {
+    pub delete_file_path: String,
+    pub delete_file_size: i64,
+    pub record_count: Option<i64>,
+    pub referenced_data_file: Option<String>,
+}
+
+/// Output of `plan_changes`: a flattened, in-order projection of every
+/// data-file insert and every position-delete-file ref in the lineage
+/// from `previous_snapshot_id` (exclusive) to `current_snapshot_id`
+/// (inclusive). REPLACE compaction snapshots are validated and skipped;
+/// they contribute to neither vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct IcebergChangeBatch {
+    pub previous_snapshot_id: i64,
+    pub current_snapshot_id: i64,
+    pub inserts: Vec<DataFileRef>,
+    pub deletes: Vec<PositionDeleteRef>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::ChangeError;
