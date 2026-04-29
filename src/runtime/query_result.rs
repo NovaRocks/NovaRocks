@@ -30,4 +30,13 @@ impl QueryResult {
     pub fn into_chunks(self) -> Vec<Chunk> {
         self.chunks
     }
+
+    /// Empty schema, empty chunks. Used as the no-op output when an
+    /// IVM branch (insert or delete) has zero input files / rows.
+    pub(crate) fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            chunks: Vec::new(),
+        }
+    }
 }

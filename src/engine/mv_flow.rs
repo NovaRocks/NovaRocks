@@ -250,3 +250,97 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
         None,
     )
 }
+
+/// Run the MV's SELECT statement against a one-shot in-memory catalog
+/// where the base table's storage is a single temp parquet file
+/// containing the supplied deleted rows. Mirrors the insert-side
+/// `execute_query_for_mv_incremental_refresh` but without iceberg-file
+/// list construction — the caller has already projected the rows.
+///
+/// Returns the empty `QueryResult` when `deleted_rows` is empty.
+// removed when Task 10 wires this in
+#[allow(dead_code)]
+pub(crate) fn execute_query_for_mv_incremental_deletes(
+    state: &Arc<StandaloneState>,
+    current_database: &str,
+    sql: &str,
+    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    deleted_rows: Vec<arrow::record_batch::RecordBatch>,
+) -> Result<QueryResult, String> {
+    if deleted_rows.is_empty() {
+        return Ok(QueryResult::empty());
+    }
+
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("sql parser error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = statement else {
+        return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
+    };
+    let (catalog_name, namespace, table_name) = validate_incremental_mv_base_ref(&query, base_ref)?;
+
+    // Write the deleted rows to a temp parquet file. The temp directory
+    // is OS-cleaned (or torn down by the next test run); we don't add
+    // explicit cleanup logic — matches register_empty_iceberg_table.
+    let dir = std::env::temp_dir().join(format!(
+        "novarocks_mv_deletes_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create temp dir for delete-side mv refresh: {e}"))?;
+    let path = dir.join(format!("{namespace}_{table_name}.parquet"));
+    let schema = deleted_rows[0].schema();
+    let file = std::fs::File::create(&path)
+        .map_err(|e| format!("create temp parquet for delete-side mv refresh: {e}"))?;
+    let mut writer = parquet::arrow::ArrowWriter::try_new(file, schema, None)
+        .map_err(|e| format!("create temp parquet writer for delete-side mv refresh: {e}"))?;
+    for batch in &deleted_rows {
+        writer
+            .write(batch)
+            .map_err(|e| format!("write temp parquet batch for delete-side mv refresh: {e}"))?;
+    }
+    writer
+        .close()
+        .map_err(|e| format!("close temp parquet writer for delete-side mv refresh: {e}"))?;
+
+    // Build a TableDef whose storage is the temp parquet file. Reuse
+    // build_iceberg_table_def_with_files's column-shape logic by giving
+    // it a one-element file list.
+    let total_size: i64 = deleted_rows
+        .iter()
+        .map(|b| {
+            // Best-effort byte estimate — used only for cardinality hints.
+            // The query path doesn't depend on the exact value.
+            let mut bytes: i64 = 0;
+            for col in b.columns() {
+                bytes += col.get_array_memory_size() as i64;
+            }
+            bytes
+        })
+        .sum();
+    let total_rows: Option<i64> = Some(deleted_rows.iter().map(|b| b.num_rows() as i64).sum());
+    let delete_files = vec![(format!("file://{}", path.display()), total_size, total_rows)];
+
+    let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(
+        state,
+        &catalog_name,
+        &namespace,
+        &table_name,
+        delete_files,
+    )?;
+    let mut incremental_catalog = InMemoryCatalog::default();
+    incremental_catalog.create_database(&namespace)?;
+    incremental_catalog
+        .register(&namespace, table_def)
+        .map_err(|e| format!("register delete-side iceberg table: {e}"))?;
+
+    let mut executable = query.as_ref().clone();
+    strip_catalog_from_three_part_names(&mut executable);
+    execute_query(
+        &executable,
+        &incremental_catalog,
+        current_database,
+        state.exchange_port,
+        None,
+    )
+}

@@ -438,6 +438,96 @@ pub(crate) fn plan_changes(
     })
 }
 
+/// Top-level PR-3 entry: take an `IcebergChangeBatch`, produce a
+/// `MaterializedChanges` whose `inserts` and `deletes` branches each
+/// hold the result of running the MV's SELECT statement against the
+/// relevant subset of base-table rows.
+///
+/// The `_pk_columns` parameter is reserved for PR-4 (delete-side
+/// row-id computation when AggregateApplyChanges lands).
+// removed when Task 10 wires this in
+#[allow(dead_code)]
+pub(crate) fn materialize_changes(
+    state: &std::sync::Arc<crate::engine::StandaloneState>,
+    current_database: &str,
+    sql: &str,
+    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_table: &iceberg::table::Table,
+    batch: IcebergChangeBatch,
+    _pk_columns: &[String],
+) -> Result<MaterializedChanges, String> {
+    let inserts = if batch.inserts.is_empty() {
+        crate::engine::QueryResult::empty()
+    } else {
+        let added_files: Vec<(String, i64, Option<i64>)> = batch
+            .inserts
+            .iter()
+            .map(|f| (f.path.clone(), f.size, f.record_count))
+            .collect();
+        crate::engine::mv_flow::execute_query_for_mv_incremental_refresh(
+            state,
+            current_database,
+            sql,
+            base_ref,
+            added_files,
+        )?
+    };
+
+    let deletes = if batch.deletes.is_empty() {
+        crate::engine::QueryResult::empty()
+    } else {
+        let factory = build_factory_for_table(base_table)?;
+        let size_lookup = |path: &str| -> Option<u64> {
+            // For PR-3 we don't carry the per-data-file size index across
+            // the boundary; iceberg-rust's parquet reader reads metadata
+            // by HEAD when we pass `None`. Best-effort optimization is
+            // PR-4 territory.
+            let _ = path;
+            None
+        };
+        let deleted_rows = crate::connector::iceberg::scan_deletes::scan_deletes(
+            &batch.deletes,
+            &factory,
+            size_lookup,
+        )
+        .map_err(|e| e.to_string())?;
+        crate::engine::mv_flow::execute_query_for_mv_incremental_deletes(
+            state,
+            current_database,
+            sql,
+            base_ref,
+            deleted_rows,
+        )?
+    };
+
+    Ok(MaterializedChanges {
+        previous_snapshot_id: batch.previous_snapshot_id,
+        current_snapshot_id: batch.current_snapshot_id,
+        inserts,
+        deletes,
+    })
+}
+
+/// Build a filesystem factory that can read both data files and
+/// position-delete files for the given iceberg base table. We use the
+/// same `OpendalRangeReaderFactory` shape as the HDFS scan path
+/// (`build_fs_operator` for local FS, S3/cloud-credentialled operator
+/// when the catalog has cloud properties).
+// removed when Task 10 wires this in
+#[allow(dead_code)]
+fn build_factory_for_table(
+    table: &iceberg::table::Table,
+) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
+    let _ = table; // Per PR-3 scope: local-FS only — same constraint as
+    // execute_query_for_mv_incremental_refresh which
+    // rejects multi-file local reads. PR-4 wires cloud.
+    // Build a local-FS operator rooted at "/" so absolute file paths work.
+    let operator = crate::fs::opendal::build_fs_operator("/")
+        .map_err(|e| format!("build local fs operator for delete reverse projection: {e}"))?;
+    crate::fs::opendal::OpendalRangeReaderFactory::from_operator(operator)
+        .map_err(|e| format!("build opendal range reader factory: {e}"))
+}
+
 /// Async file collection for one `LineagePlan`. Loads each snapshot's
 /// manifest list, walks data manifests for `CollectInserts` actions, and
 /// walks delete manifests for `CollectDeletes` actions. Order of the
