@@ -704,8 +704,11 @@ pub(crate) fn extract_data_files_with_stats(
                 // manifest file's own sequence number (the spec allows entries
                 // in a V1/V2 manifest list to inherit the manifest's sequence
                 // number when the per-entry field is absent).
-                let data_sequence_number =
-                    Some(entry.sequence_number().unwrap_or(manifest_file.sequence_number));
+                let data_sequence_number = Some(
+                    entry
+                        .sequence_number()
+                        .unwrap_or(manifest_file.sequence_number),
+                );
 
                 results.push(DataFileWithStats {
                     path,
@@ -1766,8 +1769,7 @@ mod data_file_with_stats_tests {
             data_sequence_number: None,
         };
         assert_eq!(
-            f.data_sequence_number,
-            None,
+            f.data_sequence_number, None,
             "data_sequence_number should be None for non-Iceberg sources"
         );
     }

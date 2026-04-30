@@ -186,23 +186,22 @@ fn build_iceberg_table_def_with_data_files(
         register_empty_iceberg_table(namespace, table_name, &loaded.columns)?
     };
 
-    let iceberg_row_lineage_metadata_columns =
-        if is_v3_row_lineage(loaded.table.metadata()) {
-            vec![
-                ColumnDef {
-                    name: "_row_id".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                },
-                ColumnDef {
-                    name: "_last_updated_sequence_number".to_string(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
-                },
-            ]
-        } else {
-            vec![]
-        };
+    let iceberg_row_lineage_metadata_columns = if is_v3_row_lineage(loaded.table.metadata()) {
+        vec![
+            ColumnDef {
+                name: "_row_id".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "_last_updated_sequence_number".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
+            },
+        ]
+    } else {
+        vec![]
+    };
 
     Ok(TableDef {
         name: table_name.to_string(),
@@ -216,10 +215,7 @@ fn build_iceberg_table_def_with_data_files(
 /// `write.row-lineage=true`, meaning per-row `_row_id` and
 /// `_last_updated_sequence_number` metadata columns are available.
 fn is_v3_row_lineage(metadata: &iceberg::spec::TableMetadata) -> bool {
-    let v3 = matches!(
-        metadata.format_version(),
-        iceberg::spec::FormatVersion::V3
-    );
+    let v3 = matches!(metadata.format_version(), iceberg::spec::FormatVersion::V3);
     let lineage = metadata
         .properties()
         .get("write.row-lineage")

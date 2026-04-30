@@ -270,8 +270,8 @@ fn synthesize_row_lineage_columns(
     };
 
     let row_ids = if want_row_id {
-        let stored = stored_row_id_idx
-            .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
+        let stored =
+            stored_row_id_idx.and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
         (0..num_rows)
             .map(|i| match stored {
                 Some(arr) if !arr.is_null(i) => arr.value(i),
@@ -286,8 +286,8 @@ fn synthesize_row_lineage_columns(
     };
 
     let seqs = if want_last_updated_seq {
-        let stored = stored_seq_idx
-            .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
+        let stored =
+            stored_seq_idx.and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
         (0..num_rows)
             .map(|i| match stored {
                 Some(arr) if !arr.is_null(i) => arr.value(i),
@@ -632,9 +632,7 @@ impl ScanAsyncRunner {
             ..
         } = morsel
         else {
-            return Err(
-                "iceberg virtual columns require file range morsels".to_string(),
-            );
+            return Err("iceberg virtual columns require file range morsels".to_string());
         };
         Ok(Some(IcebergVirtualState {
             spec: spec.clone(),
@@ -841,12 +839,14 @@ impl ScanAsyncRunner {
         } else {
             (Vec::new(), Vec::new())
         };
-        let row_id_array = state.spec.row_id_slot.map(|_| {
-            Arc::new(Int64Array::from(row_ids_vec)) as ArrayRef
-        });
-        let last_updated_seq_array = state.spec.last_updated_seq_slot.map(|_| {
-            Arc::new(Int64Array::from(seqs_vec)) as ArrayRef
-        });
+        let row_id_array = state
+            .spec
+            .row_id_slot
+            .map(|_| Arc::new(Int64Array::from(row_ids_vec)) as ArrayRef);
+        let last_updated_seq_array = state
+            .spec
+            .last_updated_seq_slot
+            .map(|_| Arc::new(Int64Array::from(seqs_vec)) as ArrayRef);
 
         let mut field_map = HashMap::new();
         let chunk_schema = chunk.schema();
@@ -928,14 +928,9 @@ impl ScanAsyncRunner {
                 continue;
             }
             if Some(*slot_id) == state.spec.last_updated_seq_slot {
-                let field = state
-                    .spec
-                    .last_updated_seq_field
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "iceberg _last_updated_sequence_number slot missing field metadata"
-                            .to_string()
-                    })?;
+                let field = state.spec.last_updated_seq_field.as_ref().ok_or_else(|| {
+                    "iceberg _last_updated_sequence_number slot missing field metadata".to_string()
+                })?;
                 fields.push(field.clone());
                 columns.push(
                     last_updated_seq_array
@@ -1537,12 +1532,11 @@ mod tests {
     fn row_id_synthesis_uses_stored_when_all_non_null() {
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
         let id_field = Field::new("id", DataType::Int64, false);
-        let stored_field = Field::new("_row_id", DataType::Int64, true).with_metadata(
-            HashMap::from([(
+        let stored_field =
+            Field::new("_row_id", DataType::Int64, true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
-            )]),
-        );
+            )]));
         let schema = Arc::new(Schema::new(vec![id_field, stored_field]));
         let id = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
         let stored =
@@ -1558,15 +1552,13 @@ mod tests {
     #[test]
     fn row_id_synthesis_mixed_per_row_null() {
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-        let stored_field = Field::new("_row_id", DataType::Int64, true).with_metadata(
-            HashMap::from([(
+        let stored_field =
+            Field::new("_row_id", DataType::Int64, true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
-            )]),
-        );
+            )]));
         let schema = Arc::new(Schema::new(vec![stored_field]));
-        let stored =
-            Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
+        let stored = Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
 
         let mut spec = IcebergVirtualSpec::default();
@@ -1579,17 +1571,14 @@ mod tests {
     #[test]
     fn last_updated_seq_synthesis_uses_stored_when_present() {
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-        let stored_field =
-            Field::new("_last_updated_sequence_number", DataType::Int64, true).with_metadata(
-                HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
-                        .to_string(),
-                )]),
-            );
+        let stored_field = Field::new("_last_updated_sequence_number", DataType::Int64, true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+                    .to_string(),
+            )]));
         let schema = Arc::new(Schema::new(vec![stored_field]));
-        let stored =
-            Arc::new(Int64Array::from(vec![Some(11_i64), Some(12), Some(13)])) as ArrayRef;
+        let stored = Arc::new(Int64Array::from(vec![Some(11_i64), Some(12), Some(13)])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
 
         let mut spec = IcebergVirtualSpec::default();
@@ -1601,17 +1590,14 @@ mod tests {
     #[test]
     fn last_updated_seq_synthesis_mixed_per_row_null() {
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-        let stored_field =
-            Field::new("_last_updated_sequence_number", DataType::Int64, true).with_metadata(
-                HashMap::from([(
-                    PARQUET_FIELD_ID_META_KEY.to_string(),
-                    crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
-                        .to_string(),
-                )]),
-            );
+        let stored_field = Field::new("_last_updated_sequence_number", DataType::Int64, true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+                    .to_string(),
+            )]));
         let schema = Arc::new(Schema::new(vec![stored_field]));
-        let stored =
-            Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(13)])) as ArrayRef;
+        let stored = Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(13)])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
 
         let mut spec = IcebergVirtualSpec::default();
@@ -1674,15 +1660,13 @@ mod tests {
     #[test]
     fn row_id_synthesis_stored_wins_over_positions_in_mor_path() {
         use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-        let stored_field = Field::new("_row_id", DataType::Int64, true).with_metadata(
-            HashMap::from([(
+        let stored_field =
+            Field::new("_row_id", DataType::Int64, true).with_metadata(HashMap::from([(
                 PARQUET_FIELD_ID_META_KEY.to_string(),
                 crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
-            )]),
-        );
+            )]));
         let schema = Arc::new(Schema::new(vec![stored_field]));
-        let stored =
-            Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
+        let stored = Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
         let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
         let columns: Vec<ArrayRef> = batch.columns().iter().cloned().collect();
 

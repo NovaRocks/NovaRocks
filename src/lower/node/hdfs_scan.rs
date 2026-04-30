@@ -457,9 +457,7 @@ pub(crate) fn lower_hdfs_scan_node(
             if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _row_id slot_id={} expects BIGINT, got {:?}",
-                    node.node_id,
-                    slot_id,
-                    arrow_type
+                    node.node_id, slot_id, arrow_type
                 ));
             }
             iceberg_virtual_row_id_slot = Some(slot_id);
@@ -472,9 +470,7 @@ pub(crate) fn lower_hdfs_scan_node(
             if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _last_updated_sequence_number slot_id={} expects BIGINT, got {:?}",
-                    node.node_id,
-                    slot_id,
-                    arrow_type
+                    node.node_id, slot_id, arrow_type
                 ));
             }
             iceberg_virtual_last_updated_seq_slot = Some(slot_id);

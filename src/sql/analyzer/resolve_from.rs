@@ -167,6 +167,15 @@ impl<'a> super::AnalyzerContext<'a> {
                 {
                     scope.add_table_qualified_only(&table_def.name, &table_def.columns);
                 }
+                // Register Iceberg V3 row-lineage pseudo-columns (_row_id,
+                // _last_updated_sequence_number) when the table carries them.
+                // These are hidden from SELECT * but resolvable by explicit name.
+                if !table_def.iceberg_row_lineage_metadata_columns.is_empty() {
+                    scope.add_iceberg_metadata_columns(
+                        qualifier,
+                        &table_def.iceberg_row_lineage_metadata_columns,
+                    );
+                }
 
                 let relation = Relation::Scan(ScanRelation {
                     database: db_lower,

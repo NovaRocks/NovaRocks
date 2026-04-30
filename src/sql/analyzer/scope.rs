@@ -88,22 +88,17 @@ impl AnalyzerScope {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
             let q_lower = q.to_lowercase();
-            if let Some(found) = self
-                .qualified
-                .get(&(q_lower.clone(), name_lower.clone()))
-            {
+            if let Some(found) = self.qualified.get(&(q_lower.clone(), name_lower.clone())) {
                 return Ok(found.clone());
             }
-            return Err(reserved_name_error(name).unwrap_or_else(|| {
-                format!("Column '{}.{}' cannot be resolved.", q, name)
-            }));
+            return Err(reserved_name_error(name)
+                .unwrap_or_else(|| format!("Column '{}.{}' cannot be resolved.", q, name)));
         }
         if let Some(found) = self.unqualified.get(&name_lower) {
             return Ok(found.clone());
         }
-        Err(reserved_name_error(name).unwrap_or_else(|| {
-            format!("Column '{}' cannot be resolved.", name)
-        }))
+        Err(reserved_name_error(name)
+            .unwrap_or_else(|| format!("Column '{}' cannot be resolved.", name)))
     }
 
     /// Register Iceberg V3 row-lineage reserved pseudo-columns. Unlike
@@ -244,11 +239,11 @@ mod tests {
     fn select_star_does_not_expose_row_lineage_pseudo_columns() {
         let mut scope = AnalyzerScope::new();
         scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
-        scope.add_iceberg_metadata_columns(
-            "ice",
-            &[col("_row_id", DataType::Int64, false)],
-        );
-        let names: Vec<_> = scope.iter_columns().map(|(_, n, _, _)| n.as_str()).collect();
+        scope.add_iceberg_metadata_columns("ice", &[col("_row_id", DataType::Int64, false)]);
+        let names: Vec<_> = scope
+            .iter_columns()
+            .map(|(_, n, _, _)| n.as_str())
+            .collect();
         assert_eq!(names, vec!["id"]);
     }
 }

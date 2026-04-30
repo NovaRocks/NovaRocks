@@ -466,9 +466,7 @@ pub(crate) fn build_exec_params_multi(
                 }
                 TableStorage::S3ParquetFiles { files, .. } => files
                     .iter()
-                    .map(|f| {
-                        build_hdfs_scan_range_params(&f.path, f.size, f.data_sequence_number)
-                    })
+                    .map(|f| build_hdfs_scan_range_params(&f.path, f.size, f.data_sequence_number))
                     .collect(),
             }
         };
