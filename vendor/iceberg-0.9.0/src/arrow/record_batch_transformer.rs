@@ -579,7 +579,7 @@ impl RecordBatchTransformer {
                                 "_row_id metadata column was projected but the Parquet reader did not provide a RowNumber source column",
                             )
                         })?;
-                    // NEW: detect stored _row_id column by reserved field id.
+                    // Detect a stored _row_id column written by cross-engine writers (Spark/Trino).
                     let stored_source_index = field_id_to_source_schema_map
                         .get(&RESERVED_FIELD_ID_ROW_ID)
                         .map(|(field, idx)| {
@@ -786,10 +786,10 @@ impl RecordBatchTransformer {
             .iter()
             .enumerate()
             .map(|(i, position)| {
-                if let Some(stored_arr) = stored {
-                    if !stored_arr.is_null(i) {
-                        return Ok(stored_arr.value(i));
-                    }
+                if let Some(stored_arr) = stored
+                    && !stored_arr.is_null(i)
+                {
+                    return Ok(stored_arr.value(i));
                 }
                 let position = position.ok_or_else(|| {
                     Error::new(
