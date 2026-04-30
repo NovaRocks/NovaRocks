@@ -1759,6 +1759,7 @@ pub mod tests {
             assert_eq!(task.project_field_ids, deserialized.project_field_ids);
             assert_eq!(task.predicate, deserialized.predicate);
             assert_eq!(task.schema, deserialized.schema);
+            assert_eq!(task.first_row_id, deserialized.first_row_id);
         };
 
         // without predicate
@@ -1781,6 +1782,7 @@ pub mod tests {
             predicate: None,
             schema: schema.clone(),
             record_count: Some(100),
+            first_row_id: Some(123),
             data_file_format: DataFileFormat::Parquet,
             deletes: vec![],
             partition: None,
@@ -1800,6 +1802,7 @@ pub mod tests {
             predicate: Some(BoundPredicate::AlwaysTrue),
             schema,
             record_count: None,
+            first_row_id: None,
             data_file_format: DataFileFormat::Avro,
             deletes: vec![],
             partition: None,

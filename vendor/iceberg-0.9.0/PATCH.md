@@ -38,44 +38,52 @@ so that downstream crates can construct `TableCommit` directly when invoking
   pub struct TableCommit {
 ```
 
-## Patch 3 — `src/arrow/record_batch_transformer.rs` (`_pos` virtual column)
+## Patch 3 — `src/arrow/record_batch_transformer.rs` (`_pos` / `_row_id` virtual columns)
 
-iceberg-rust 0.9 declares the `_file` and `_pos` reserved metadata columns in
+iceberg-rust 0.9 declares the `_file`, `_pos`, and `_row_id` reserved metadata columns in
 [`src/metadata_columns.rs`](src/metadata_columns.rs), and `TableScanBuilder`
-accepts both in `select(...)`. Only `_file` is wired up in
+accepts them in `select(...)`. Only `_file` is wired up in
 [`src/arrow/reader.rs:422-427`](src/arrow/reader.rs:422); projecting `_pos`
 reaches the `RecordBatchTransformer` with `RESERVED_FIELD_ID_POS` in
 `projected_iceberg_field_ids` but no entry in `constant_fields` (it can't be
 a constant — `_pos` is per-row), and the transformer falls through to the
 "regular field" branch which can't find the field id in the data file's
-schema and errors with `Unexpected => field not found`.
+schema and errors with `Unexpected => field not found`. `_row_id` has the same
+per-row shape, but also needs the Iceberg v3 `first_row_id` assigned to the
+data file.
 
 This patch teaches the Arrow reader to inject `_pos` as a Parquet `RowNumber`
-virtual column and lets `RecordBatchTransformer` pass that column through by
-Iceberg metadata field id. Because the row number is produced by parquet's
-reader, `_pos` continues to report the original physical row number after
-`RowSelection`, predicate filters, or row-group selection skip rows.
+virtual column and lets `RecordBatchTransformer` either pass that column
+through for `_pos` or derive `_row_id = first_row_id + _pos`. Because the row
+number is produced by parquet's reader, both metadata columns continue to use
+the original physical row number after `RowSelection`, predicate filters, or
+row-group selection skip rows.
 
 Concretely:
 
-* When `_pos` is projected, `arrow/reader.rs` adds a virtual Arrow field named
-  `_pos` with Parquet `RowNumber` extension type and the Iceberg reserved field
-  id metadata.
+* When `_pos` or `_row_id` is projected, `arrow/reader.rs` adds a virtual
+  Arrow field named `_pos` with Parquet `RowNumber` extension type and the
+  Iceberg `_pos` reserved field id metadata.
+* `FileScanTask` carries optional `first_row_id` from the data file manifest
+  entry so v3 scans can derive `_row_id` without guessing.
 * Schema-side branch in `generate_batch_transform`: when `field_id ==
-  RESERVED_FIELD_ID_POS`, emit `Field::new("_pos", DataType::Int64, …)` with
-  the field-id metadata. (Without this branch the transformer would still
-  fall through to "field not found".)
+  RESERVED_FIELD_ID_POS` or `field_id == RESERVED_FIELD_ID_ROW_ID`, emit the
+  corresponding metadata field with `DataType::Int64` and field-id metadata.
+  (Without this branch the transformer would still fall through to "field not
+  found".)
 * Operations-side branch in `generate_transform_operations`: when
   `field_id == RESERVED_FIELD_ID_POS`, use the reader-provided source field
-  instead of looking for `_pos` in the table schema.
+  instead of looking for `_pos` in the table schema; when
+  `field_id == RESERVED_FIELD_ID_ROW_ID`, require `first_row_id` and derive
+  the row id from the reader-provided RowNumber column.
 * `delete_file_loader.rs` calls the shared parquet-open helper with no virtual
   columns so position-delete file loading keeps the old behavior.
 
-No public API renames; downstream callers just see `_pos` working across both
-plain scans and row-selection scans.
+No public API renames; downstream callers just see `_pos` and `_row_id`
+working across both plain scans and row-selection scans.
 
 Spec ref: <https://iceberg.apache.org/spec/#reserved-field-ids> — `_pos` =
-2147483645 = `i32::MAX - 2`.
+2147483645 = `i32::MAX - 2`; `_row_id` = 2147483540 = `i32::MAX - 107`.
 
 ## Patch 4 — Puffin deletion-vector read support
 

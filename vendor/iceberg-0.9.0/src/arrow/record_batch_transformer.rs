@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, Int32Array, RecordBatch, RecordBatchOptions, RunArray,
+    Array as ArrowArray, ArrayRef, Int32Array, Int64Array, RecordBatch, RecordBatchOptions,
+    RunArray,
 };
 use arrow_cast::cast;
 use arrow_schema::{
@@ -29,7 +30,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::{RESERVED_FIELD_ID_POS, get_metadata_field};
+use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field};
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
 };
@@ -140,6 +141,11 @@ pub(crate) enum ColumnSource {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
     },
+
+    RowId {
+        first_row_id: i64,
+        pos_source_index: usize,
+    },
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
     // renaming fields, deleting fields and reordering fields.
@@ -193,6 +199,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, Datum>,
+    first_row_id: Option<i64>,
 }
 
 impl RecordBatchTransformerBuilder {
@@ -204,7 +211,13 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
+            first_row_id: None,
         }
+    }
+
+    pub(crate) fn with_first_row_id(mut self, first_row_id: Option<i64>) -> Self {
+        self.first_row_id = first_row_id;
+        self
     }
 
     /// Add a constant value for a specific field ID.
@@ -245,6 +258,7 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
+            first_row_id: self.first_row_id,
             batch_transform: None,
         }
     }
@@ -288,6 +302,7 @@ pub(crate) struct RecordBatchTransformer {
     // Includes both virtual/metadata fields (like _file) and identity-partitioned fields
     // Datum holds both the Iceberg type and the value
     constant_fields: HashMap<i32, Datum>,
+    first_row_id: Option<i64>,
 
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
@@ -332,6 +347,7 @@ impl RecordBatchTransformer {
                     self.snapshot_schema.as_ref(),
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
+                    self.first_row_id,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -352,6 +368,7 @@ impl RecordBatchTransformer {
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, Datum>,
+        first_row_id: Option<i64>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
@@ -362,16 +379,13 @@ impl RecordBatchTransformer {
         let fields: Result<Vec<_>> = projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // NovaRocks patch: `_pos` is per-row (not constant), so it
-                // never lands in `constant_fields`. Resolve its target Arrow
-                // field directly from the metadata-column registry. The
-                // Parquet reader injects the source values via its RowNumber
-                // virtual column when `_pos` is projected.
-                if *field_id == RESERVED_FIELD_ID_POS {
+                // NovaRocks patch: `_pos` and `_row_id` are per-row metadata
+                // columns, so they never land in `constant_fields`.
+                if *field_id == RESERVED_FIELD_ID_POS || *field_id == RESERVED_FIELD_ID_ROW_ID {
                     let iceberg_field = get_metadata_field(*field_id).map_err(|e| {
                         Error::new(
                             ErrorKind::Unexpected,
-                            format!("metadata field _pos lookup failed: {e}"),
+                            format!("metadata field lookup failed for field id {field_id}: {e}"),
                         )
                     })?;
                     let arrow_field =
@@ -441,6 +455,7 @@ impl RecordBatchTransformer {
                     projected_iceberg_field_ids,
                     field_id_to_mapped_schema_map,
                     constant_fields,
+                    first_row_id,
                 )?,
                 target_schema,
             }),
@@ -480,6 +495,12 @@ impl RecordBatchTransformer {
                 return SchemaComparison::Different;
             }
 
+            if source_field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+                != target_field.metadata().get(PARQUET_FIELD_ID_META_KEY)
+            {
+                return SchemaComparison::Different;
+            }
+
             if source_field.name() != target_field.name() {
                 names_changed = true;
             }
@@ -498,6 +519,7 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
         constant_fields: &HashMap<i32, Datum>,
+        first_row_id: Option<i64>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -523,6 +545,42 @@ impl RecordBatchTransformer {
                     return Ok(ColumnSource::Promote {
                         target_type,
                         source_index: *source_index,
+                    });
+                }
+
+                if *field_id == RESERVED_FIELD_ID_ROW_ID {
+                    let first_row_id = first_row_id.ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "_row_id metadata column was projected but first_row_id is missing",
+                        )
+                    })?;
+                    if first_row_id < 0 {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("first_row_id must be non-negative, got {first_row_id}"),
+                        ));
+                    }
+                    let (source_field, source_index) = field_id_to_source_schema_map
+                        .get(&RESERVED_FIELD_ID_POS)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Unexpected,
+                                "_row_id metadata column was projected but the Parquet reader did not provide a RowNumber source column",
+                            )
+                        })?;
+                    if !source_field.data_type().equals_datatype(&DataType::Int64) {
+                        return Err(Error::new(
+                            ErrorKind::Unexpected,
+                            format!(
+                                "_row_id RowNumber source column must be Int64, got {:?}",
+                                source_field.data_type()
+                            ),
+                        ));
+                    }
+                    return Ok(ColumnSource::RowId {
+                        first_row_id,
+                        pos_source_index: *source_index,
                     });
                 }
 
@@ -659,9 +717,51 @@ impl RecordBatchTransformer {
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
                     }
+
+                    ColumnSource::RowId {
+                        first_row_id,
+                        pos_source_index,
+                    } => Self::create_row_id_column(*first_row_id, &columns[*pos_source_index])?,
                 })
             })
             .collect()
+    }
+
+    fn create_row_id_column(first_row_id: i64, position_column: &ArrayRef) -> Result<ArrayRef> {
+        let positions = position_column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "_row_id RowNumber source column must be Int64, got {:?}",
+                        position_column.data_type()
+                    ),
+                )
+            })?;
+
+        let row_ids: Result<Vec<i64>> = positions
+            .iter()
+            .map(|position| {
+                let position = position.ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        "_row_id RowNumber source column contained null",
+                    )
+                })?;
+                first_row_id.checked_add(position).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "Row ID overflow when computing _row_id: first_row_id={first_row_id}, pos={position}"
+                        ),
+                    )
+                })
+            })
+            .collect();
+
+        Ok(Arc::new(Int64Array::from(row_ids?)))
     }
 
     fn create_column(
@@ -707,6 +807,7 @@ mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use arrow_array::cast::AsArray;
     use arrow_array::{
         Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
         StringArray,
@@ -717,6 +818,7 @@ mod test {
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
     };
+    use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
     use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
@@ -765,6 +867,55 @@ mod test {
         } else {
             panic!("Expected Int32Array or RunEndEncoded<Int32Array>");
         }
+    }
+
+    #[test]
+    fn row_id_projection_derives_from_first_row_id_and_pos_source() {
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let projected_field_ids = [RESERVED_FIELD_ID_ROW_ID, 1];
+
+        let source_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )])),
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 3, 5])),
+                Arc::new(Int32Array::from(vec![11, 13, 15])),
+            ],
+        )
+        .unwrap();
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids)
+                .with_first_row_id(Some(1000))
+                .build();
+        let result = transformer.process_record_batch(batch).unwrap();
+
+        assert_eq!(result.schema().field(0).name(), "_row_id");
+        let row_ids = result
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>();
+        let ids = result
+            .column(1)
+            .as_primitive::<arrow_array::types::Int32Type>();
+        assert_eq!(row_ids.values(), &[1001, 1003, 1005]);
+        assert_eq!(ids.values(), &[11, 13, 15]);
     }
 
     #[test]

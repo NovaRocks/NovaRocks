@@ -64,6 +64,11 @@ pub struct FileScanTask {
     /// reading the entire data file.
     pub record_count: Option<u64>,
 
+    /// The first row ID assigned to the data file in an Iceberg v3 table.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_row_id: Option<i64>,
+
     /// The data file path corresponding to the task.
     pub data_file_path: String,
 

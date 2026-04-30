@@ -58,7 +58,8 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, get_metadata_field, is_metadata_field,
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
+    is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
@@ -366,7 +367,8 @@ impl ArrowReader {
         // that come back from the file, such as type promotion, default column insertion,
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
-            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids());
+            RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
+                .with_first_row_id(task.first_row_id);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -620,7 +622,9 @@ impl ArrowReader {
     }
 
     fn projected_virtual_columns(project_field_ids: &[i32]) -> Result<Vec<FieldRef>> {
-        if !project_field_ids.contains(&RESERVED_FIELD_ID_POS) {
+        if !project_field_ids.contains(&RESERVED_FIELD_ID_POS)
+            && !project_field_ids.contains(&RESERVED_FIELD_ID_ROW_ID)
+        {
             return Ok(Vec::new());
         }
 
@@ -2031,7 +2035,9 @@ mod tests {
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, Predicate, Reference};
     use crate::io::FileIO;
-    use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS};
+    use crate::metadata_columns::{
+        RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
+    };
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
@@ -2333,6 +2339,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -2656,6 +2663,7 @@ message schema {
             start: rg0_start,
             length: row_group_0.compressed_size() as u64,
             record_count: Some(100),
+            first_row_id: None,
             data_file_path: file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -2674,6 +2682,7 @@ message schema {
             start: rg1_start,
             length: file_end - rg1_start,
             record_count: Some(200),
+            first_row_id: None,
             data_file_path: file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -2805,6 +2814,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/old_file.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: new_schema.clone(),
@@ -2973,6 +2983,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: Some(200),
+            first_row_id: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3115,6 +3126,7 @@ message schema {
             start: 0,
             length: 0,
             record_count: Some(6),
+            first_row_id: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3186,6 +3198,139 @@ message schema {
         assert_eq!(file_paths, vec![data_file_path; 3]);
         assert_eq!(ids, vec![11, 13, 15]);
         assert_eq!(positions, vec![1, 3, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_row_id_metadata_column_uses_first_row_id_after_row_selection() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
+        const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let data_file_path = format!("{table_location}/data.parquet");
+        let data_batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(10..=15),
+        )])
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(&data_file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        writer.write(&data_batch).expect("Writing data batch");
+        writer.close().unwrap();
+
+        let delete_file_path = format!("{table_location}/deletes.parquet");
+        let delete_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH.to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                FIELD_ID_POSITIONAL_DELETE_POS.to_string(),
+            )])),
+        ]));
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![
+                data_file_path.clone(),
+                data_file_path.clone(),
+                data_file_path.clone(),
+            ])),
+            Arc::new(Int64Array::from_iter_values(vec![0_i64, 2, 4])),
+        ])
+        .unwrap();
+
+        let delete_file = File::create(&delete_file_path).unwrap();
+        let mut delete_writer = ArrowWriter::try_new(delete_file, delete_schema, None).unwrap();
+        delete_writer.write(&delete_batch).unwrap();
+        delete_writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_file_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(6),
+            first_row_id: Some(1000),
+            data_file_path: data_file_path.clone(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: table_schema.clone(),
+            project_field_ids: vec![RESERVED_FIELD_ID_ROW_ID, 1],
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_size_in_bytes: std::fs::metadata(&delete_file_path).unwrap().len(),
+                file_path: delete_file_path,
+                file_type: DataContentType::PositionDeletes,
+                file_format: DataFileFormat::Parquet,
+                partition_spec_id: 0,
+                equality_ids: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let row_ids: Vec<i64> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let ids: Vec<i32> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(ids, vec![11, 13, 15]);
+        assert_eq!(row_ids, vec![1001, 1003, 1005]);
     }
 
     /// Test for bug where position deletes are lost when skipping unselected row groups.
@@ -3343,6 +3488,7 @@ message schema {
             start: rg1_start,
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
+            first_row_id: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3560,6 +3706,7 @@ message schema {
             start: rg1_start,
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
+            first_row_id: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3677,6 +3824,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -3778,6 +3926,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -3868,6 +4017,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -3972,6 +4122,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4105,6 +4256,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4205,6 +4357,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4318,6 +4471,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4412,6 +4566,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/file_0.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4430,6 +4585,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/file_1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4448,6 +4604,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/file_2.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4630,6 +4787,7 @@ message schema {
                 start: 0,
                 length: 0,
                 record_count: None,
+                first_row_id: None,
                 data_file_path: format!("{table_location}/data.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
