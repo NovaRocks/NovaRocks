@@ -375,13 +375,33 @@ fn refresh_aggregate_mv_incremental(
         );
     }
 
-    // Build the layout from visible types obtained by analyzing the ORIGINAL select_sql.
+    // Build the layout early (cheap: parse + analyze only, no SQL execution) so we can
+    // inspect the aggregate functions before deciding how to handle DELETE files.
     // The rewritten state SQL (AVG → SUM + COUNT) produces state-shaped columns whose count
     // does not match shape.visible_outputs. Sourcing types from the analyzer avoids this mismatch.
     let visible_output_columns =
         analyze_visible_output_types(ctx.state, ctx.database, ctx.select_sql)?;
     let layout =
         super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &visible_output_columns)?;
+
+    // MIN/MAX state has no closed-form retract: negate_aggregate_state_chunks panics on
+    // MIN/MAX columns. When DELETE files appear in the change batch and the layout includes
+    // any MIN or MAX aggregate, fall back to a full refresh instead of attempting a partial
+    // retract that cannot be expressed as state arithmetic.
+    if change_stream.deletes.row_count() > 0 && super::mv_agg_state::layout_has_min_or_max(&layout)
+    {
+        tracing::info!(
+            target: "mv_refresh",
+            mv = %format!("{}.{}", ctx.database, ctx.mv_name),
+            base = %ctx.base_ref.fqn(),
+            snapshot_from = ctx.previous_snapshot_id,
+            snapshot_to = ctx.current_snapshot_id,
+            delete_rows = change_stream.deletes.row_count(),
+            reason = "min_max_with_deletes",
+            "mv_refresh fall-back to Full: MIN/MAX aggregate cannot retract DELETE state"
+        );
+        return refresh_aggregate_mv_full(ctx.state, ctx.database, ctx.mv_name, ctx.shape);
+    }
 
     let (inserts, deletes) = change_stream.into_results();
     let insert_delta = super::mv_agg_state::materialize_aggregate_result_chunks(
