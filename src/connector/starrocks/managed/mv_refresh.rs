@@ -2079,6 +2079,7 @@ enable_path_style_access = true
                         storage: TableStorage::LocalParquetFile {
                             path: std::path::PathBuf::from("/unused/for/analysis"),
                         },
+                        iceberg_row_lineage_metadata_columns: vec![],
                     },
                 )
                 .expect("register orders table");

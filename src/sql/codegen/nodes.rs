@@ -9,7 +9,7 @@ use crate::types;
 
 use super::resolve::ResolvedTable;
 
-use crate::sql::catalog::TableStorage;
+use crate::sql::catalog::{IcebergDeleteFileFormat, IcebergDeleteFileInfo, TableStorage};
 
 // ---------------------------------------------------------------------------
 // Scan node
@@ -462,12 +462,22 @@ pub(crate) fn build_exec_params_multi(
                         &path.display().to_string(),
                         file_len,
                         None,
-                    )]
+                        None,
+                        &[],
+                    )?]
                 }
                 TableStorage::S3ParquetFiles { files, .. } => files
                     .iter()
-                    .map(|f| build_hdfs_scan_range_params(&f.path, f.size, f.data_sequence_number))
-                    .collect(),
+                    .map(|f| {
+                        build_hdfs_scan_range_params(
+                            &f.path,
+                            f.size,
+                            f.first_row_id,
+                            f.data_sequence_number,
+                            &f.delete_files,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
             }
         };
         per_node_scan_ranges.insert(scan_node_id, ranges);
@@ -541,8 +551,56 @@ fn build_internal_scan_range_params(
 fn build_hdfs_scan_range_params(
     full_path: &str,
     file_len: i64,
+    first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
-) -> internal_service::TScanRangeParams {
+    delete_files: &[IcebergDeleteFileInfo],
+) -> Result<internal_service::TScanRangeParams, String> {
+    let mut parquet_delete_files = Vec::new();
+    let mut deletion_vector_descriptor = None;
+    for delete_file in delete_files {
+        match delete_file.file_format {
+            IcebergDeleteFileFormat::Parquet => {
+                parquet_delete_files.push(plan_nodes::TIcebergDeleteFile::new(
+                    Some(delete_file.path.clone()),
+                    Some(descriptors::THdfsFileFormat::PARQUET),
+                    Some(types::TIcebergFileContent::POSITION_DELETES),
+                    delete_file.length,
+                ));
+            }
+            IcebergDeleteFileFormat::Puffin => {
+                if deletion_vector_descriptor.is_some() {
+                    return Err(format!(
+                        "multiple Puffin deletion vectors are attached to data file {}",
+                        full_path
+                    ));
+                }
+                let offset = delete_file.content_offset.ok_or_else(|| {
+                    format!(
+                        "Puffin deletion vector {} for data file {} is missing content_offset",
+                        delete_file.path, full_path
+                    )
+                })?;
+                let size = delete_file.content_size_in_bytes.ok_or_else(|| {
+                    format!(
+                        "Puffin deletion vector {} for data file {} is missing content_size_in_bytes",
+                        delete_file.path, full_path
+                    )
+                })?;
+                deletion_vector_descriptor = Some(plan_nodes::TDeletionVectorDescriptor::new(
+                    Some("PUFFIN".to_string()),
+                    Some(delete_file.path.clone()),
+                    Some(offset),
+                    Some(size),
+                    None::<i64>,
+                ));
+            }
+        }
+    }
+    let parquet_delete_files = if parquet_delete_files.is_empty() {
+        None
+    } else {
+        Some(parquet_delete_files)
+    };
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
         Some(0_i64),
@@ -554,7 +612,7 @@ fn build_hdfs_scan_range_params(
         Some(full_path.to_string()),
         None::<Vec<String>>,
         None::<bool>,
-        None::<Vec<plan_nodes::TIcebergDeleteFile>>,
+        parquet_delete_files,
         None::<i64>,
         None::<bool>,
         None::<String>,
@@ -574,17 +632,17 @@ fn build_hdfs_scan_range_params(
         None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
         None::<descriptors::THdfsPartition>,
         None::<types::TTableId>,
-        None::<plan_nodes::TDeletionVectorDescriptor>,
+        deletion_vector_descriptor,
         None::<String>,
         None::<i64>,
         None::<bool>,
         None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
         None::<i32>,
-        None::<i64>, // first_row_id: not populated via standalone SQL path
+        first_row_id,
         data_sequence_number,
     );
 
-    internal_service::TScanRangeParams::new(
+    Ok(internal_service::TScanRangeParams::new(
         plan_nodes::TScanRange::new(
             None::<plan_nodes::TInternalScanRange>,
             None::<Vec<u8>>,
@@ -597,7 +655,7 @@ fn build_hdfs_scan_range_params(
         None::<i32>,
         Some(false),
         Some(false),
-    )
+    ))
 }
 
 // ---------------------------------------------------------------------------

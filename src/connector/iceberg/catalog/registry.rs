@@ -577,10 +577,13 @@ pub(crate) struct DataFileWithStats {
     pub size: i64,
     pub record_count: Option<i64>,
     pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
+    /// Iceberg v3 row-lineage: first row id assigned to this data file.
+    pub first_row_id: Option<i64>,
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
     /// file belongs to.  Falls back to the manifest file's sequence number when
     /// the entry itself does not carry one (e.g. V1/V2 manifests).
     pub data_sequence_number: Option<i64>,
+    pub delete_files: Vec<crate::sql::catalog::IcebergDeleteFileInfo>,
 }
 
 /// Extract data file paths, sizes, row counts, and per-column statistics from
@@ -594,7 +597,8 @@ pub(crate) struct DataFileWithStats {
 pub(crate) fn extract_data_files_with_stats(
     table: &iceberg::table::Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    use iceberg::spec::{DataContentType, ManifestContentType, ManifestStatus};
+    use crate::sql::catalog::{IcebergDeleteFileFormat, IcebergDeleteFileInfo};
+    use iceberg::spec::{DataContentType, DataFileFormat, ManifestContentType, ManifestStatus};
 
     let metadata = table.metadata();
     let snapshot = match metadata.current_snapshot() {
@@ -619,6 +623,86 @@ pub(crate) fn extract_data_files_with_stats(
             .await
             .map_err(|e| format!("load manifest list: {e}"))?;
 
+        let mut delete_files_by_data_path: HashMap<String, Vec<IcebergDeleteFileInfo>> =
+            HashMap::new();
+        let mut global_delete_files: Vec<IcebergDeleteFileInfo> = Vec::new();
+
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.content != ManifestContentType::Deletes {
+                continue;
+            }
+
+            let manifest = manifest_file
+                .load_manifest(file_io)
+                .await
+                .map_err(|e| format!("load manifest: {e}"))?;
+
+            for entry in manifest.entries() {
+                if entry.status == ManifestStatus::Deleted {
+                    continue;
+                }
+                let df = entry.data_file();
+                match df.content_type() {
+                    DataContentType::PositionDeletes => {
+                        let (file_format, content_offset, content_size_in_bytes) =
+                            match df.file_format() {
+                                DataFileFormat::Parquet => {
+                                    (IcebergDeleteFileFormat::Parquet, None, None)
+                                }
+                                DataFileFormat::Puffin => {
+                                    let offset = df.content_offset().ok_or_else(|| {
+                                        format!("Puffin DV {} missing content_offset", df.file_path())
+                                    })?;
+                                    let length = df.content_size_in_bytes().ok_or_else(|| {
+                                        format!(
+                                            "Puffin DV {} missing content_size_in_bytes",
+                                            df.file_path()
+                                        )
+                                    })?;
+                                    (
+                                        IcebergDeleteFileFormat::Puffin,
+                                        Some(offset),
+                                        Some(length),
+                                    )
+                                }
+                                other => {
+                                    return Err(format!(
+                                        "unsupported iceberg delete file format {:?}: {}",
+                                        other,
+                                        df.file_path()
+                                    ));
+                                }
+                            };
+                        let info = IcebergDeleteFileInfo {
+                            path: df.file_path().to_string(),
+                            file_format,
+                            length: Some(
+                                i64::try_from(df.file_size_in_bytes())
+                                    .map_err(|_| format!("delete file too large: {}", df.file_path()))?,
+                            ),
+                            content_offset,
+                            content_size_in_bytes,
+                        };
+                        if let Some(referenced) = df.referenced_data_file() {
+                            delete_files_by_data_path
+                                .entry(referenced)
+                                .or_default()
+                                .push(info);
+                        } else {
+                            global_delete_files.push(info);
+                        }
+                    }
+                    DataContentType::EqualityDeletes => {
+                        return Err(format!(
+                            "iceberg equality-delete files are not supported by standalone SELECT: {}",
+                            df.file_path()
+                        ));
+                    }
+                    DataContentType::Data => {}
+                }
+            }
+        }
+
         let mut results = Vec::new();
 
         for manifest_file in manifest_list.entries() {
@@ -631,6 +715,14 @@ pub(crate) fn extract_data_files_with_stats(
                 .load_manifest(file_io)
                 .await
                 .map_err(|e| format!("load manifest: {e}"))?;
+
+            let mut next_manifest_first_row_id = manifest_file
+                .first_row_id
+                .map(|v| {
+                    i64::try_from(v)
+                        .map_err(|_| format!("manifest first_row_id too large: {v}"))
+                })
+                .transpose()?;
 
             for entry in manifest.entries() {
                 // Skip deleted entries.
@@ -647,7 +739,18 @@ pub(crate) fn extract_data_files_with_stats(
 
                 let path = df.file_path().to_string();
                 let size = i64::try_from(df.file_size_in_bytes()).unwrap_or(i64::MAX);
-                let record_count = Some(i64::try_from(df.record_count()).unwrap_or(i64::MAX));
+                let record_count_i64 = i64::try_from(df.record_count())
+                    .map_err(|_| format!("record_count too large for {}", df.file_path()))?;
+                let record_count = Some(record_count_i64);
+                let first_row_id = df.first_row_id().or(next_manifest_first_row_id);
+                if let Some(next) = next_manifest_first_row_id.as_mut() {
+                    *next = next.checked_add(record_count_i64).ok_or_else(|| {
+                        format!(
+                            "first_row_id overflow for manifest {}",
+                            manifest_file.manifest_path
+                        )
+                    })?;
+                }
 
                 // Build per-column stats.
                 let null_counts = df.null_value_counts();
@@ -709,13 +812,20 @@ pub(crate) fn extract_data_files_with_stats(
                         .sequence_number()
                         .unwrap_or(manifest_file.sequence_number),
                 );
+                let mut delete_files = delete_files_by_data_path
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_default();
+                delete_files.extend(global_delete_files.clone());
 
                 results.push(DataFileWithStats {
                     path,
                     size,
                     record_count,
                     column_stats,
+                    first_row_id,
                     data_sequence_number,
+                    delete_files,
                 });
             }
         }
@@ -1750,7 +1860,9 @@ mod data_file_with_stats_tests {
             size: 1024,
             record_count: Some(100),
             column_stats: None,
+            first_row_id: Some(7),
             data_sequence_number: Some(42),
+            delete_files: vec![],
         };
         assert_eq!(
             f.data_sequence_number,
@@ -1766,7 +1878,9 @@ mod data_file_with_stats_tests {
             size: 512,
             record_count: None,
             column_stats: None,
+            first_row_id: None,
             data_sequence_number: None,
+            delete_files: vec![],
         };
         assert_eq!(
             f.data_sequence_number, None,

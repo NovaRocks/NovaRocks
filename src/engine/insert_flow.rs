@@ -99,6 +99,9 @@ pub(crate) fn run_insert(
             }
         }
     }
+    if target.backend_name == "iceberg" {
+        crate::engine::iceberg_writer::invalidate_iceberg_caches(state, &target)?;
+    }
     Ok(StatementResult::Ok)
 }
 

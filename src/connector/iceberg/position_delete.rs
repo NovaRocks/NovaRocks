@@ -54,6 +54,8 @@ pub struct IcebergDeleteFileSpec {
     pub path: String,
     pub file_format: THdfsFileFormat,
     pub length: Option<u64>,
+    pub content_offset: Option<i64>,
+    pub content_size_in_bytes: Option<i64>,
 }
 
 /// Convert the `THdfsScanRange.delete_files` list attached to a scan range
@@ -113,6 +115,8 @@ pub fn convert_scan_range_delete_files(
             path,
             file_format,
             length,
+            content_offset: None,
+            content_size_in_bytes: None,
         });
     }
     Ok(out)
@@ -140,6 +144,40 @@ fn accumulate_deletes_from_file(
     factory: &OpendalRangeReaderFactory,
     deleted: &mut RoaringTreemap,
 ) -> Result<(), String> {
+    if spec.content_offset.is_some() || spec.content_size_in_bytes.is_some() {
+        let offset = spec.content_offset.ok_or_else(|| {
+            format!(
+                "Puffin deletion vector {} missing content_offset",
+                spec.path
+            )
+        })?;
+        let size = spec.content_size_in_bytes.ok_or_else(|| {
+            format!(
+                "Puffin deletion vector {} missing content_size_in_bytes",
+                spec.path
+            )
+        })?;
+        let start = u64::try_from(offset)
+            .map_err(|_| format!("Puffin deletion vector {} has negative offset", spec.path))?;
+        let size_usize = usize::try_from(size)
+            .map_err(|_| format!("Puffin deletion vector {} size is too large", spec.path))?;
+        let reader = factory
+            .open_with_len(&spec.path, spec.length)
+            .map_err(|e| format!("open Puffin deletion vector {} failed: {}", spec.path, e))?;
+        let payload = reader.read_remote_bytes(start, size_usize).map_err(|e| {
+            format!(
+                "read Puffin deletion vector {} at {}+{} failed: {}",
+                spec.path, offset, size, e
+            )
+        })?;
+        let dv = crate::connector::iceberg::commit::DeletionVector::from_iceberg_payload(
+            payload.as_ref(),
+        )
+        .map_err(|e| format!("decode Puffin deletion vector {} failed: {e}", spec.path))?;
+        let _ = data_file_path;
+        *deleted |= dv.to_roaring_treemap();
+        return Ok(());
+    }
     if spec.file_format != THdfsFileFormat::PARQUET {
         return Err(format!(
             "iceberg position-delete file {} has unsupported format {:?}; only PARQUET is supported",
@@ -345,6 +383,8 @@ mod tests {
             path: del.file_name().unwrap().to_string_lossy().to_string(),
             file_format: THdfsFileFormat::PARQUET,
             length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         };
         let factory = factory_for_dir(&dir);
         let deleted =
@@ -362,6 +402,8 @@ mod tests {
             path: del.file_name().unwrap().to_string_lossy().to_string(),
             file_format: THdfsFileFormat::PARQUET,
             length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         };
         let factory = factory_for_dir(&dir);
         let deleted = load_position_deletes(&[spec], "/unrelated.parquet", &factory).expect("load");
@@ -381,11 +423,15 @@ mod tests {
                 path: del_a.file_name().unwrap().to_string_lossy().to_string(),
                 file_format: THdfsFileFormat::PARQUET,
                 length: None,
+                content_offset: None,
+                content_size_in_bytes: None,
             },
             IcebergDeleteFileSpec {
                 path: del_b.file_name().unwrap().to_string_lossy().to_string(),
                 file_format: THdfsFileFormat::PARQUET,
                 length: None,
+                content_offset: None,
+                content_size_in_bytes: None,
             },
         ];
         let factory = factory_for_dir(&dir);
@@ -400,6 +446,8 @@ mod tests {
             path: "irrelevant".to_string(),
             file_format: THdfsFileFormat::ORC,
             length: None,
+            content_offset: None,
+            content_size_in_bytes: None,
         };
         let factory = factory_for_dir(&dir);
         let err = load_position_deletes(&[spec], "/foo", &factory).unwrap_err();

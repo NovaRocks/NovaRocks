@@ -20,6 +20,21 @@ pub struct IcebergColumnStats {
     pub upper_bound: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IcebergDeleteFileFormat {
+    Parquet,
+    Puffin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergDeleteFileInfo {
+    pub path: String,
+    pub file_format: IcebergDeleteFileFormat,
+    pub length: Option<i64>,
+    pub content_offset: Option<i64>,
+    pub content_size_in_bytes: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct S3FileInfo {
     pub path: String,
@@ -27,10 +42,17 @@ pub struct S3FileInfo {
     /// Row count from Iceberg file metadata. None for non-Iceberg sources.
     pub row_count: Option<i64>,
     pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
+    /// Iceberg v3 row-lineage: first row id assigned to this data file.
+    /// Used as the fallback base for `_row_id` reads. None for non-Iceberg
+    /// sources and tables without row-lineage metadata.
+    pub first_row_id: Option<i64>,
     /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
     /// file belongs to.  Populated from the Iceberg manifest at catalog scan
     /// time.  None for non-Iceberg sources.
     pub data_sequence_number: Option<i64>,
+    /// Iceberg position-delete / Puffin deletion-vector files that apply to
+    /// this data file. Empty for append-only snapshots and non-Iceberg scans.
+    pub delete_files: Vec<IcebergDeleteFileInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

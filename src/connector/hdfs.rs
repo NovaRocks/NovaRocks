@@ -373,6 +373,8 @@ impl ScanOp for HdfsScanOp {
                 path: resolved.path.clone(),
                 file_format: original.file_format,
                 length: original.length,
+                content_offset: original.content_offset,
+                content_size_in_bytes: original.content_size_in_bytes,
             })
             .collect();
         let deleted =

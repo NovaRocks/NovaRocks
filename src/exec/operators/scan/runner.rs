@@ -637,7 +637,7 @@ impl ScanAsyncRunner {
         Ok(Some(IcebergVirtualState {
             spec: spec.clone(),
             file_path: path.clone(),
-            next_row_offset: first_row_id.unwrap_or(0),
+            next_row_offset: 0,
             first_row_id: *first_row_id,
             data_sequence_number: *data_sequence_number,
         }))
@@ -647,12 +647,7 @@ impl ScanAsyncRunner {
         &self,
         morsel: &ScanMorsel,
     ) -> Result<Option<IcebergDeleteFilterState>, String> {
-        let ScanMorsel::FileRange {
-            delete_files,
-            first_row_id,
-            ..
-        } = morsel
-        else {
+        let ScanMorsel::FileRange { delete_files, .. } = morsel else {
             return Ok(None);
         };
         if delete_files.is_empty() {
@@ -663,7 +658,7 @@ impl ScanAsyncRunner {
         };
         Ok(Some(IcebergDeleteFilterState {
             deleted,
-            next_row_offset: first_row_id.unwrap_or(0),
+            next_row_offset: 0,
         }))
     }
 
@@ -788,15 +783,19 @@ impl ScanAsyncRunner {
         // rather than using the sequential `scan_position_start + i` formula.
         // When no MoR is active, `next_row_offset` was already advanced by
         // `row_count` in the block above, so `scan_position_start` is
-        // `next_row_offset - first_row_id - row_count`.
+        // `next_row_offset - row_count`.
         let want_row_id = state.spec.row_id_slot.is_some();
         let want_last_updated_seq = state.spec.last_updated_seq_slot.is_some();
         let (row_ids_vec, seqs_vec) = if want_row_id || want_last_updated_seq {
-            let first_row_id = state.first_row_id.ok_or_else(|| {
-                "_row_id / _last_updated_sequence_number requested but morsel missing first_row_id; \
+            let first_row_id = if want_row_id {
+                state.first_row_id.ok_or_else(|| {
+                    "_row_id requested but morsel missing first_row_id; \
                  iceberg base table must be V3 row-lineage with manifest-derived ranges (not files-only path)"
-                    .to_string()
-            })?;
+                        .to_string()
+                })?
+            } else {
+                0
+            };
             let data_seq = if want_last_updated_seq {
                 state.data_sequence_number.ok_or_else(|| {
                     "_last_updated_sequence_number requested but morsel missing data_sequence_number; \
@@ -823,7 +822,7 @@ impl ScanAsyncRunner {
             } else {
                 // Non-MoR case: rows are sequential; next_row_offset was already
                 // advanced by row_count above.
-                let scan_position_start = state.next_row_offset - first_row_id - row_count as i64;
+                let scan_position_start = state.next_row_offset - row_count as i64;
                 synthesize_row_lineage_columns(
                     &chunk.schema(),
                     chunk.columns(),

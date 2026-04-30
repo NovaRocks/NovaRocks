@@ -382,6 +382,57 @@ impl<'a> PlanFragmentBuilder<'a> {
                 scope.add_column(Some(op.table.name.clone()), col.name.clone(), binding);
             }
         }
+
+        // Iceberg V3 row-lineage pseudo-columns (_row_id,
+        // _last_updated_sequence_number): register in ExprScope and emit as
+        // output slots so that SELECT _row_id references resolve in codegen
+        // and the slot flows through to the HDFS_SCAN_NODE tuple descriptor.
+        // Lowering picks up the slot by name via `is_iceberg_row_id` /
+        // `is_iceberg_last_updated_sequence_number` to populate
+        // IcebergVirtualSpec.
+        //
+        // Note: these pseudo-columns are NOT in `scan.columns`, so the column
+        // pruning rule never adds them to `required_columns`. Always register
+        // them regardless of `required`; the lowering layer only synthesises
+        // the values for slots that are actually in the tuple descriptor.
+        let meta_col_offset = op.table.columns.len();
+        for (meta_idx, col) in op
+            .table
+            .iceberg_row_lineage_metadata_columns
+            .iter()
+            .enumerate()
+        {
+            let col_pos = (meta_col_offset + meta_idx) as i32;
+            let slot_id = self.alloc_slot();
+            self.desc_builder.add_slot(
+                slot_id,
+                scan_tuple_id,
+                &col.name,
+                &col.data_type,
+                col.nullable,
+                col_pos,
+            );
+            let binding = ColumnBinding {
+                tuple_id: scan_tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                type_desc: None,
+                nullable: col.nullable,
+            };
+            scope.add_column(
+                qualifier.map(|s| s.to_string()),
+                col.name.clone(),
+                binding.clone(),
+            );
+            if op
+                .alias
+                .as_deref()
+                .is_some_and(|a| !a.eq_ignore_ascii_case(&op.table.name))
+            {
+                scope.add_column(Some(op.table.name.clone()), col.name.clone(), binding);
+            }
+        }
+
         // Compile predicates pushed down by the optimizer
         let pushed_conjuncts = if op.predicates.is_empty() {
             vec![]

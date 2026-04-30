@@ -3867,6 +3867,7 @@ enable_path_style_access = true
                 out.push((ids.value(i), row_ids.value(i), seqs.value(i)));
             }
         }
+        out.sort_by_key(|row| row.0);
         out
     }
 
@@ -3935,17 +3936,7 @@ enable_path_style_access = true
         (engine, session)
     }
 
-    // This test is marked #[ignore] because the standalone SQL execution path
-    // does not yet wire iceberg_row_lineage_metadata_columns through the codegen
-    // ExprScope and ScanOp output columns. The analyzer accepts _row_id (after
-    // the resolve_from.rs fix), but the code generator rejects it with "Column
-    // '_row_id' cannot be resolved." because ExprScope.unqualified is populated
-    // only from op.table.columns (regular columns), not from
-    // iceberg_row_lineage_metadata_columns. Fixing this requires Task 4 changes
-    // in fragment_builder.rs::build_scan_op to emit row-lineage pseudo-columns
-    // as output slots and register them in the ExprScope.
     #[test]
-    #[ignore = "blocked: codegen ExprScope does not wire iceberg row-lineage pseudo-columns (Task 4 gap)"]
     fn select_row_id_and_last_updated_seq_on_v3_row_lineage_table() {
         let warehouse = TempDir::new().expect("warehouse tempdir");
         let (engine, session) = open_v3_row_lineage_session_bigint(&warehouse);
@@ -3961,7 +3952,7 @@ enable_path_style_access = true
 
         let pre_rows = collect_id_rowid_seq(
             &session,
-            "select id, _row_id, _last_updated_sequence_number from ice.ns.t order by id",
+            "select id, _row_id, _last_updated_sequence_number from ice.ns.t",
         );
         assert_eq!(pre_rows.len(), 3, "S1 must have 3 rows");
         assert_eq!(
@@ -4001,7 +3992,7 @@ enable_path_style_access = true
 
         let post_rows = collect_id_rowid_seq(
             &session,
-            "select id, _row_id, _last_updated_sequence_number from ice.ns.t order by id",
+            "select id, _row_id, _last_updated_sequence_number from ice.ns.t",
         );
         assert_eq!(post_rows.len(), 5, "after S2 must have 5 rows");
         // Old rows keep their S1 row_ids and S1 sequence_numbers.
@@ -4018,7 +4009,7 @@ enable_path_style_access = true
             .expect("delete row id=2");
         let after_rows = collect_id_rowid_seq(
             &session,
-            "select id, _row_id, _last_updated_sequence_number from ice.ns.t order by id",
+            "select id, _row_id, _last_updated_sequence_number from ice.ns.t",
         );
         assert_eq!(after_rows.len(), 4, "after delete must have 4 rows");
         assert!(

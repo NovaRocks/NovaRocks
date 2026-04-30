@@ -18,7 +18,9 @@ use std::collections::HashMap;
 
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
-use crate::connector::iceberg::position_delete::convert_scan_range_delete_files;
+use crate::connector::iceberg::position_delete::{
+    IcebergDeleteFileSpec, convert_scan_range_delete_files,
+};
 use crate::connector::iceberg::{
     IcebergArrowColumn, IcebergMetadataOutputColumn, IcebergMetadataScanConfig,
     IcebergMetadataScanRange, IcebergMetadataTableType, build_projected_output_schema,
@@ -358,6 +360,10 @@ pub(crate) fn lower_hdfs_scan_node(
             (name, primitive, arrow_type, nullable),
         );
     }
+    let has_row_position_marker_slots = slot_info_map.values().any(|(name, _, _, _)| {
+        crate::exec::row_position::is_row_source_id(name)
+            || crate::exec::row_position::is_scan_range_id(name)
+    });
 
     let mut slot_ids = Vec::with_capacity(out_layout.order.len());
     let mut data_columns = Vec::new();
@@ -410,7 +416,7 @@ pub(crate) fn lower_hdfs_scan_node(
             scan_range_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
-        if crate::exec::row_position::is_row_id(&name) {
+        if has_row_position_marker_slots && crate::exec::row_position::is_row_id(&name) {
             if primitive != types::TPrimitiveType::BIGINT {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} row_id slot_id={} expects BIGINT, got {:?}",
@@ -522,6 +528,7 @@ pub(crate) fn lower_hdfs_scan_node(
             ));
         }
     };
+    let needs_first_row_id = row_position_spec.is_some() || iceberg_virtual_row_id_slot.is_some();
 
     let case_sensitive = hdfs.case_sensitive.unwrap_or(true);
     let mut cache_options = CacheOptions::from_query_options(query_opts)?;
@@ -682,15 +689,42 @@ pub(crate) fn lower_hdfs_scan_node(
                 node.node_id
             ));
         }
-        let iceberg_delete_files = convert_scan_range_delete_files(
+        let mut iceberg_delete_files = convert_scan_range_delete_files(
             &format!("HDFS_SCAN_NODE node_id={}", node.node_id),
             hdfs_range,
         )?;
-        if hdfs_range.deletion_vector_descriptor.is_some() {
-            return Err(format!(
-                "HDFS_SCAN_NODE node_id={} does not support deletion vectors (append-only only)",
-                node.node_id
-            ));
+        if let Some(dv) = hdfs_range.deletion_vector_descriptor.as_ref() {
+            let path = dv
+                .path_or_inline_dv
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "HDFS_SCAN_NODE node_id={} deletion vector is missing path_or_inline_dv",
+                        node.node_id
+                    )
+                })?
+                .to_string();
+            let offset = dv.offset.ok_or_else(|| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={} deletion vector {} is missing offset",
+                    node.node_id, path
+                )
+            })?;
+            let size = dv.size_in_bytes.ok_or_else(|| {
+                format!(
+                    "HDFS_SCAN_NODE node_id={} deletion vector {} is missing size_in_bytes",
+                    node.node_id, path
+                )
+            })?;
+            iceberg_delete_files.push(IcebergDeleteFileSpec {
+                path,
+                file_format: descriptors::THdfsFileFormat::UNKNOWN,
+                length: None,
+                content_offset: Some(offset),
+                content_size_in_bytes: Some(size),
+            });
         }
         if hdfs_range
             .delete_column_slot_ids
@@ -764,15 +798,15 @@ pub(crate) fn lower_hdfs_scan_node(
         } else {
             -1
         };
-        let first_row_id = if row_position_spec.is_some() {
-            hdfs_range.first_row_id.ok_or_else(|| {
+        let first_row_id = if needs_first_row_id {
+            Some(hdfs_range.first_row_id.ok_or_else(|| {
                 format!(
-                    "HDFS_SCAN_NODE node_id={} missing first_row_id for iceberg row position",
+                    "HDFS_SCAN_NODE node_id={} missing first_row_id for iceberg row position or row-lineage scan",
                     node.node_id
                 )
-            })?
+            })?)
         } else {
-            0
+            None
         };
         let external_datacache = {
             let range_datacache_options = hdfs_range.datacache_options.as_ref();
@@ -816,7 +850,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 offset,
                 length,
                 scan_range_id,
-                first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
+                first_row_id,
                 data_sequence_number,
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
@@ -842,7 +876,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 offset,
                 length,
                 scan_range_id,
-                first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
+                first_row_id,
                 data_sequence_number,
                 external_datacache,
                 delete_files: iceberg_delete_files,
