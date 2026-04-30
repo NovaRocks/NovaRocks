@@ -1313,6 +1313,7 @@ mod join_demotion_tests {
                 table: TableDef {
                     name: "t".into(),
                     columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/t.parquet"),
                     },

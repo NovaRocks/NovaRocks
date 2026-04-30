@@ -74,6 +74,22 @@ pub fn is_iceberg_row_pos(name: &str) -> bool {
     name.eq_ignore_ascii_case(ICEBERG_ROW_POS_COL)
 }
 
+// Iceberg V3 row-lineage virtual column names.
+pub const ICEBERG_ROW_ID_COL: &str = "_row_id";
+pub const ICEBERG_LAST_UPDATED_SEQ_COL: &str = "_last_updated_sequence_number";
+
+// Reserved Iceberg field IDs for V3 row-lineage metadata columns.
+pub const ICEBERG_RESERVED_FIELD_ID_ROW_ID: i32 = i32::MAX - 107;
+pub const ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER: i32 = i32::MAX - 108;
+
+pub fn is_iceberg_row_id(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ICEBERG_ROW_ID_COL)
+}
+
+pub fn is_iceberg_last_updated_sequence_number(name: &str) -> bool {
+    name.eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
+}
+
 #[derive(Clone, Debug)]
 pub struct RowPositionDescriptor {
     pub row_position_type: descriptors::TRowPositionType,
@@ -82,20 +98,28 @@ pub struct RowPositionDescriptor {
     pub lookup_ref_slots: Vec<SlotId>,
 }
 
-/// Iceberg v2 virtual columns `_file` / `_pos` used by row-level DELETE.
-/// Both are optional: only the slots present in the SELECT list (and therefore
-/// in the scan-node output layout) are set.
+/// Iceberg virtual columns used by row-level DELETE (`_file`, `_pos`) and
+/// V3 row-lineage reads (`_row_id`, `_last_updated_sequence_number`).
+/// All fields are optional: only the slots present in the SELECT list (and
+/// therefore in the scan-node output layout) are populated.
 #[derive(Clone, Debug, Default)]
 pub struct IcebergVirtualSpec {
     pub file_path_slot: Option<SlotId>,
     pub row_pos_slot: Option<SlotId>,
+    pub row_id_slot: Option<SlotId>,
+    pub last_updated_seq_slot: Option<SlotId>,
     pub file_path_field: Option<Field>,
     pub row_pos_field: Option<Field>,
+    pub row_id_field: Option<Field>,
+    pub last_updated_seq_field: Option<Field>,
 }
 
 impl IcebergVirtualSpec {
     pub fn is_empty(&self) -> bool {
-        self.file_path_slot.is_none() && self.row_pos_slot.is_none()
+        self.file_path_slot.is_none()
+            && self.row_pos_slot.is_none()
+            && self.row_id_slot.is_none()
+            && self.last_updated_seq_slot.is_none()
     }
 }
 
@@ -124,4 +148,36 @@ pub struct LakeRowPositionSpec {
     pub tablet_id_field: Field,
     pub rss_id_field: Field,
     pub row_id_field: Field,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_iceberg_row_id_recognizes_name_case_insensitive() {
+        assert!(is_iceberg_row_id("_row_id"));
+        assert!(is_iceberg_row_id("_ROW_ID"));
+        assert!(!is_iceberg_row_id("row_id"));
+        assert!(!is_iceberg_row_id("_rowid"));
+    }
+
+    #[test]
+    fn is_iceberg_last_updated_sequence_number_recognizes_name_case_insensitive() {
+        assert!(is_iceberg_last_updated_sequence_number(
+            "_last_updated_sequence_number"
+        ));
+        assert!(is_iceberg_last_updated_sequence_number(
+            "_Last_Updated_Sequence_Number"
+        ));
+        assert!(!is_iceberg_last_updated_sequence_number(
+            "last_updated_sequence_number"
+        ));
+    }
+
+    #[test]
+    fn iceberg_virtual_spec_default_is_empty() {
+        let spec = IcebergVirtualSpec::default();
+        assert!(spec.is_empty());
+    }
 }

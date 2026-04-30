@@ -1219,6 +1219,12 @@ impl<'a> AnalyzerContext<'a> {
             Relation::Scan(scan) => {
                 let qualifier = scan.alias.as_deref().unwrap_or(&scan.table.name);
                 scope.add_table(Some(qualifier), &scan.table.columns);
+                if !scan.table.iceberg_row_lineage_metadata_columns.is_empty() {
+                    scope.add_iceberg_metadata_columns(
+                        qualifier,
+                        &scan.table.iceberg_row_lineage_metadata_columns,
+                    );
+                }
                 Ok(())
             }
             Relation::Subquery { query, alias } => {
@@ -1939,6 +1945,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/orders.parquet"),
                     },
@@ -1992,6 +1999,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/lineitem.parquet"),
                     },
@@ -2015,6 +2023,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/supplier.parquet"),
                     },
@@ -2038,6 +2047,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/part.parquet"),
                     },
@@ -2066,6 +2076,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/partsupp.parquet"),
                     },
@@ -2089,6 +2100,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/customer.parquet"),
                     },
@@ -2107,6 +2119,7 @@ mod tests {
                             nullable: true,
                         },
                     ],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile {
                         path: std::path::PathBuf::from("/tmp/nation.parquet"),
                     },

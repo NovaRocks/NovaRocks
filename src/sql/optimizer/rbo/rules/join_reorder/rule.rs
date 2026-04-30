@@ -69,6 +69,7 @@ mod tests {
             table: TableDef {
                 name: name.into(),
                 columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: TableStorage::LocalParquetFile {
                     path: std::path::PathBuf::from("/tmp/t.parquet"),
                 },

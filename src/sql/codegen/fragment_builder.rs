@@ -1851,6 +1851,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 data_type: ArrowDataType::Int64,
                 nullable: false,
             }],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: crate::sql::catalog::TableStorage::LocalParquetFile { path },
         };
 
@@ -2767,6 +2768,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                     }],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::LocalParquetFile { path },
                 },
                 alias: None,
@@ -2791,6 +2793,7 @@ mod tests {
                         data_type: DataType::Int32,
                         nullable: false,
                     }],
+                    iceberg_row_lineage_metadata_columns: vec![],
                     storage: TableStorage::S3ParquetFiles {
                         files: vec![],
                         cloud_properties: BTreeMap::new(),

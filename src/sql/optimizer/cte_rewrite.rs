@@ -278,6 +278,7 @@ mod tests {
                     data_type: DataType::Int32,
                     nullable: false,
                 }],
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: TableStorage::LocalParquetFile {
                     path: PathBuf::from("/tmp/t1.parquet"),
                 },

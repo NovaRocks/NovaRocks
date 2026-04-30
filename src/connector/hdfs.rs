@@ -103,6 +103,7 @@ impl ScanOp for HdfsScanOp {
             length,
             scan_range_id,
             first_row_id,
+            data_sequence_number,
             external_datacache,
             delete_files,
         } = morsel
@@ -117,6 +118,7 @@ impl ScanOp for HdfsScanOp {
             length,
             scan_range_id,
             first_row_id,
+            data_sequence_number,
             external_datacache: external_datacache.clone(),
             delete_files,
         }];
@@ -163,6 +165,7 @@ impl ScanOp for HdfsScanOp {
                 length: r.length,
                 scan_range_id: r.scan_range_id,
                 first_row_id: r.first_row_id,
+                data_sequence_number: r.data_sequence_number,
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
             });
@@ -272,6 +275,10 @@ impl ScanOp for HdfsScanOp {
                 &format!("HDFS_SCAN incremental morsel (scan_range_id={scan_range_id})"),
                 hdfs_range,
             )?;
+            // data_sequence_number is not carried in THdfsScanRange (FE
+            // incremental path). It is populated at initial lowering time from
+            // the Iceberg manifest entry for V3 row-lineage tables.
+            let data_sequence_number: Option<i64> = None;
             morsels.push(ScanMorsel::FileRange {
                 path,
                 file_len,
@@ -279,6 +286,7 @@ impl ScanOp for HdfsScanOp {
                 length,
                 scan_range_id,
                 first_row_id,
+                data_sequence_number,
                 external_datacache: build_external_datacache_options(hdfs_range),
                 delete_files,
             });
@@ -327,6 +335,7 @@ impl ScanOp for HdfsScanOp {
             length: 0,
             scan_range_id: -1,
             first_row_id: None,
+            data_sequence_number: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -338,6 +347,7 @@ impl ScanOp for HdfsScanOp {
                 length: del.length.unwrap_or(0),
                 scan_range_id: -1,
                 first_row_id: None,
+                data_sequence_number: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -539,6 +549,7 @@ mod tests {
                 length: 100,
                 scan_range_id: 7,
                 first_row_id: Some(10),
+                data_sequence_number: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             }],

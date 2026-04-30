@@ -199,6 +199,7 @@ mod tests {
             table: crate::sql::catalog::TableDef {
                 name: "t".into(),
                 columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: crate::sql::catalog::TableStorage::LocalParquetFile {
                     path: std::path::PathBuf::from("/tmp/t.parquet"),
                 },
@@ -277,6 +278,7 @@ mod tests {
             table: crate::sql::catalog::TableDef {
                 name: "t".into(),
                 columns: vec![],
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: crate::sql::catalog::TableStorage::LocalParquetFile {
                     path: std::path::PathBuf::from("/tmp/t.parquet"),
                 },

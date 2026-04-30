@@ -729,6 +729,7 @@ mod tests {
                     length: std::fs::metadata(&path).expect("metadata").len(),
                     scan_range_id: 9,
                     first_row_id: Some(0),
+                    data_sequence_number: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 }],

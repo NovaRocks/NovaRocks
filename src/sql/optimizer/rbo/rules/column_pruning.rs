@@ -326,6 +326,7 @@ mod tests {
                     nullable: true,
                 },
             ],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: TableStorage::LocalParquetFile {
                 path: std::path::PathBuf::from("/tmp/test.parquet"),
             },

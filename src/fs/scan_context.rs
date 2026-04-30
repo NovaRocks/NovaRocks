@@ -29,6 +29,10 @@ pub struct FileScanRange {
     pub length: u64,
     pub scan_range_id: i32,
     pub first_row_id: Option<i64>,
+    /// Iceberg V3 data sequence number of the manifest entry this range belongs
+    /// to. Used to synthesize `_last_updated_sequence_number` per-row.
+    /// None for non-row-lineage scans.
+    pub data_sequence_number: Option<i64>,
     pub external_datacache: Option<ExternalDataCacheRangeOptions>,
     /// Iceberg v2 position-delete files attached to this data-file range.
     /// Empty for v1 or append-only scans. Populated by the HDFS scan lowering

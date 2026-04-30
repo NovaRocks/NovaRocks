@@ -218,6 +218,7 @@ pub(crate) fn build_parquet_table(
     Ok(TableDef {
         name: normalized_name,
         columns,
+        iceberg_row_lineage_metadata_columns: vec![],
         storage: TableStorage::LocalParquetFile { path },
     })
 }
@@ -236,6 +237,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: TableStorage::S3ParquetFiles {
                 files: vec![],
                 cloud_properties: Default::default(),

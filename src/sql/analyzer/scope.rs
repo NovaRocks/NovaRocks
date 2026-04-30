@@ -75,7 +75,11 @@ impl AnalyzerScope {
         ));
     }
 
-    /// Resolve a column reference.
+    /// Resolve a column reference. Returns a spec-aligned error message when
+    /// the column name is one of the two Iceberg V3 row-lineage reserved names
+    /// but the table did not register them (i.e. it is not a V3 row-lineage
+    /// table), so the user gets a clear diagnostic instead of a generic
+    /// "cannot be resolved" message.
     pub(super) fn resolve(
         &self,
         qualifier: Option<&str>,
@@ -84,15 +88,42 @@ impl AnalyzerScope {
         let name_lower = name.to_lowercase();
         if let Some(q) = qualifier {
             let q_lower = q.to_lowercase();
-            self.qualified
+            if let Some(found) = self
+                .qualified
                 .get(&(q_lower.clone(), name_lower.clone()))
-                .cloned()
-                .ok_or_else(|| format!("Column '{}.{}' cannot be resolved.", q, name))
-        } else {
+            {
+                return Ok(found.clone());
+            }
+            return Err(reserved_name_error(name).unwrap_or_else(|| {
+                format!("Column '{}.{}' cannot be resolved.", q, name)
+            }));
+        }
+        if let Some(found) = self.unqualified.get(&name_lower) {
+            return Ok(found.clone());
+        }
+        Err(reserved_name_error(name).unwrap_or_else(|| {
+            format!("Column '{}' cannot be resolved.", name)
+        }))
+    }
+
+    /// Register Iceberg V3 row-lineage reserved pseudo-columns. Unlike
+    /// `add_table`, these go into the qualified/unqualified resolution maps
+    /// **but not** into `ordered`, so `SELECT *` does not expand them. Users
+    /// must reference them by name explicitly (`SELECT _row_id FROM t`).
+    pub(super) fn add_iceberg_metadata_columns(
+        &mut self,
+        qualifier: &str,
+        columns: &[crate::sql::catalog::ColumnDef],
+    ) {
+        let q_lower = qualifier.to_lowercase();
+        for col in columns {
+            let name_lower = col.name.to_lowercase();
+            self.qualified.insert(
+                (q_lower.clone(), name_lower.clone()),
+                (col.data_type.clone(), col.nullable),
+            );
             self.unqualified
-                .get(&name_lower)
-                .cloned()
-                .ok_or_else(|| format!("Column '{}' cannot be resolved.", name))
+                .insert(name_lower, (col.data_type.clone(), col.nullable));
         }
     }
 
@@ -143,5 +174,81 @@ impl AnalyzerScope {
                 (col.data_type.clone(), col.nullable),
             );
         }
+    }
+}
+
+/// Returns a spec-aligned error message when `name` is one of the two
+/// Iceberg V3 row-lineage reserved column names but was not registered in
+/// the scope (table is not V3 row-lineage). Returns `None` for other names.
+fn reserved_name_error(name: &str) -> Option<String> {
+    let lower = name.to_lowercase();
+    if lower == "_row_id" || lower == "_last_updated_sequence_number" {
+        Some(format!(
+            "column \"{}\" is only available on Iceberg V3 row-lineage tables \
+             (table is not Iceberg V3 with write.row-lineage=true)",
+            lower
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sql::catalog::ColumnDef;
+    use arrow::datatypes::DataType;
+
+    fn col(name: &str, ty: DataType, nullable: bool) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: ty,
+            nullable,
+        }
+    }
+
+    #[test]
+    fn rejects_row_id_on_non_iceberg_table() {
+        let mut scope = AnalyzerScope::new();
+        scope.add_table(Some("t"), &[col("id", DataType::Int64, false)]);
+        let err = scope.resolve(None, "_row_id").expect_err("must fail");
+        assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
+    }
+
+    #[test]
+    fn rejects_row_id_on_v2_iceberg_table_no_metadata_added() {
+        let mut scope = AnalyzerScope::new();
+        scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
+        // V2 path adds no row-lineage metadata columns.
+        let err = scope.resolve(None, "_row_id").expect_err("must fail");
+        assert!(err.contains("only available on Iceberg V3 row-lineage tables"));
+    }
+
+    #[test]
+    fn accepts_row_id_on_v3_row_lineage_table() {
+        let mut scope = AnalyzerScope::new();
+        scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
+        scope.add_iceberg_metadata_columns(
+            "ice",
+            &[
+                col("_row_id", DataType::Int64, false),
+                col("_last_updated_sequence_number", DataType::Int64, false),
+            ],
+        );
+        let (ty, nullable) = scope.resolve(None, "_row_id").expect("ok");
+        assert_eq!(ty, DataType::Int64);
+        assert!(!nullable);
+    }
+
+    #[test]
+    fn select_star_does_not_expose_row_lineage_pseudo_columns() {
+        let mut scope = AnalyzerScope::new();
+        scope.add_table(Some("ice"), &[col("id", DataType::Int64, false)]);
+        scope.add_iceberg_metadata_columns(
+            "ice",
+            &[col("_row_id", DataType::Int64, false)],
+        );
+        let names: Vec<_> = scope.iter_columns().map(|(_, n, _, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["id"]);
     }
 }

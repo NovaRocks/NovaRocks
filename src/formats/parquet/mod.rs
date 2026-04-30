@@ -2043,6 +2043,7 @@ mod tests {
                 length: file_len,
                 scan_range_id: -1,
                 first_row_id: None,
+                data_sequence_number: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             }],

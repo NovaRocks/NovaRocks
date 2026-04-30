@@ -1265,6 +1265,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: TableStorage::S3ParquetFiles {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),
@@ -1547,6 +1548,7 @@ mod tests {
                 data_type: DataType::Int32,
                 nullable: false,
             }],
+            iceberg_row_lineage_metadata_columns: vec![],
             storage: TableStorage::S3ParquetFiles {
                 files: vec![S3FileInfo {
                     path: format!("s3://bucket/{}.parquet", name),

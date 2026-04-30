@@ -373,8 +373,12 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut row_id_field: Option<arrow::datatypes::Field> = None;
     let mut iceberg_virtual_file_slot: Option<SlotId> = None;
     let mut iceberg_virtual_pos_slot: Option<SlotId> = None;
+    let mut iceberg_virtual_row_id_slot: Option<SlotId> = None;
+    let mut iceberg_virtual_last_updated_seq_slot: Option<SlotId> = None;
     let mut iceberg_virtual_file_field: Option<arrow::datatypes::Field> = None;
     let mut iceberg_virtual_pos_field: Option<arrow::datatypes::Field> = None;
+    let mut iceberg_virtual_row_id_field: Option<arrow::datatypes::Field> = None;
+    let mut iceberg_virtual_last_updated_seq_field: Option<arrow::datatypes::Field> = None;
 
     for (tuple_id, slot_id) in &out_layout.order {
         let slot_id = SlotId::try_from(*slot_id)?;
@@ -438,6 +442,43 @@ pub(crate) fn lower_hdfs_scan_node(
             }
             iceberg_virtual_pos_slot = Some(slot_id);
             iceberg_virtual_pos_field =
+                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            continue;
+        }
+
+        // Lowering of `_row_id` / `_last_updated_sequence_number` slots into
+        // IcebergVirtualSpec is exercised end-to-end by the Task 5 integration
+        // tests (e.g. `select_row_id_and_last_updated_seq_on_v3_row_lineage_table`).
+        // The synthetic-fixture style used elsewhere in this file is not added
+        // here because constructing a valid `TPlanNode` for an iceberg scan
+        // requires substantial scaffolding that the integration path already
+        // covers more economically.
+        if crate::exec::row_position::is_iceberg_row_id(&name) {
+            if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} _row_id slot_id={} expects BIGINT, got {:?}",
+                    node.node_id,
+                    slot_id,
+                    arrow_type
+                ));
+            }
+            iceberg_virtual_row_id_slot = Some(slot_id);
+            iceberg_virtual_row_id_field =
+                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            continue;
+        }
+
+        if crate::exec::row_position::is_iceberg_last_updated_sequence_number(&name) {
+            if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} _last_updated_sequence_number slot_id={} expects BIGINT, got {:?}",
+                    node.node_id,
+                    slot_id,
+                    arrow_type
+                ));
+            }
+            iceberg_virtual_last_updated_seq_slot = Some(slot_id);
+            iceberg_virtual_last_updated_seq_field =
                 Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
@@ -773,6 +814,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 length,
                 scan_range_id,
                 first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
+                data_sequence_number: None,
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
             });
@@ -798,6 +840,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 length,
                 scan_range_id,
                 first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
+                data_sequence_number: None,
                 external_datacache,
                 delete_files: iceberg_delete_files,
             });
@@ -985,8 +1028,12 @@ pub(crate) fn lower_hdfs_scan_node(
         .with_iceberg_virtual(Some(crate::exec::row_position::IcebergVirtualSpec {
             file_path_slot: iceberg_virtual_file_slot,
             row_pos_slot: iceberg_virtual_pos_slot,
+            row_id_slot: iceberg_virtual_row_id_slot,
+            last_updated_seq_slot: iceberg_virtual_last_updated_seq_slot,
             file_path_field: iceberg_virtual_file_field,
             row_pos_field: iceberg_virtual_pos_field,
+            row_id_field: iceberg_virtual_row_id_field,
+            last_updated_seq_field: iceberg_virtual_last_updated_seq_field,
         }))
         .with_local_rf_waiting_set(local_rf_waiting_set(node));
     Ok(Lowered {

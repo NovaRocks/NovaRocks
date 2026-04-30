@@ -174,6 +174,7 @@ mod tests {
                         nullable: true,
                     })
                     .collect(),
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: TableStorage::LocalParquetFile {
                     path: std::path::PathBuf::from("/tmp/t.parquet"),
                 },

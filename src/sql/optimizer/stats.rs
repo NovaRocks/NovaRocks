@@ -1391,6 +1391,7 @@ mod tests {
             table: TableDef {
                 name: name.to_string(),
                 columns: col_defs,
+                iceberg_row_lineage_metadata_columns: vec![],
                 storage: TableStorage::S3ParquetFiles {
                     files: vec![S3FileInfo {
                         path: format!("s3://bucket/{}.parquet", name),
