@@ -418,12 +418,58 @@ fn materialize_aggregate_result_batch(
     let num_visible_cols = layout.visible_columns.len();
 
     // Collect all state column values row by row.
+    //
+    // For AvgSum columns with Decimal128 type: the executor SUM output arrives at the
+    // input column's scale (SUM preserves input scale), while the state column is declared
+    // at the analyzer-promoted visible scale. We rescale the raw i128 on ingestion so that
+    // `derive_avg_visible` can perform integer division directly at the stored scale.
+    //
+    // Example: AVG(Decimal(20,4)) -> visible Decimal128(38,10), SUM output Decimal128(38,4).
+    //   raw i128 300.5000 = 3005000 at scale 4; multiply by 10^(10-4)=10^6 -> 3005000000000.
+    //   derive_avg_visible: 3005000000000 / count gives the correct scale-10 result.
     let mut all_state_values: Vec<Vec<Option<AggScalarValue>>> =
         vec![Vec::with_capacity(num_rows); num_state_cols];
     for (sc_idx, &batch_col) in state_col_batch_cols.iter().enumerate() {
         let column = batch.column(batch_col);
+        let sc = &layout.state_columns[sc_idx];
+        // Compute scale-up factor for AvgSum Decimal128 columns where batch scale < state scale.
+        let decimal_scale_factor: Option<i128> = if sc.state_role == AggregateStateRole::AvgSum {
+            if let (DataType::Decimal128(_, state_scale), DataType::Decimal128(_, batch_scale)) =
+                (&sc.data_type, column.data_type())
+            {
+                let diff = (*state_scale as i32) - (*batch_scale as i32);
+                if diff > 0 {
+                    Some(10_i128.checked_pow(diff as u32).ok_or_else(|| {
+                            format!(
+                                "AVG Decimal128 sum rescale factor overflow: state_scale={state_scale} batch_scale={batch_scale}"
+                            )
+                        })?)
+                } else if diff == 0 {
+                    None
+                } else {
+                    return Err(format!(
+                        "AVG Decimal128 sum scale mismatch: state_scale={state_scale} batch_scale={batch_scale}"
+                    ));
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         for row in 0..num_rows {
-            all_state_values[sc_idx].push(agg_scalar_from_array(column, row)?);
+            let mut val = agg_scalar_from_array(column, row)?;
+            if let (Some(factor), Some(AggScalarValue::Decimal128(raw))) =
+                (decimal_scale_factor, &val)
+            {
+                val = Some(AggScalarValue::Decimal128(
+                    raw.checked_mul(factor).ok_or_else(|| {
+                        format!("AVG Decimal128 sum rescale overflow: raw={raw} factor={factor}")
+                    })?,
+                ));
+            }
+            all_state_values[sc_idx].push(val);
         }
     }
 
@@ -1113,12 +1159,19 @@ fn agg_scalar_values_equal(left: &Option<AggScalarValue>, right: &Option<AggScal
         (None, None) => true,
         (Some(AggScalarValue::Bool(left)), Some(AggScalarValue::Bool(right))) => left == right,
         (Some(AggScalarValue::Int64(left)), Some(AggScalarValue::Int64(right))) => left == right,
+        // Float64: use bit equality so that NaN == NaN (consistent with merge's NaN preservation).
+        (Some(AggScalarValue::Float64(left)), Some(AggScalarValue::Float64(right))) => {
+            left.to_bits() == right.to_bits()
+        }
         (Some(AggScalarValue::Utf8(left)), Some(AggScalarValue::Utf8(right))) => left == right,
         (Some(AggScalarValue::Date32(left)), Some(AggScalarValue::Date32(right))) => left == right,
         (Some(AggScalarValue::Timestamp(left)), Some(AggScalarValue::Timestamp(right))) => {
             left == right
         }
         (Some(AggScalarValue::Decimal128(left)), Some(AggScalarValue::Decimal128(right))) => {
+            left == right
+        }
+        (Some(AggScalarValue::Decimal256(left)), Some(AggScalarValue::Decimal256(right))) => {
             left == right
         }
         _ => false,
@@ -1128,11 +1181,19 @@ fn agg_scalar_values_equal(left: &Option<AggScalarValue>, right: &Option<AggScal
 /// Map the visible (output) DataType of an AVG aggregate to the (sum_data_type, sum_sql_type)
 /// pair used for the AvgSum state column.
 ///
-/// StarRocks AVG output type rules:
-/// - Integer inputs (Int8/16/32/64) → visible Float64, sum state is Int64
-/// - Decimal128 inputs → visible Decimal128 (same precision/scale), sum state is Decimal128
-/// - Float/Double inputs: not supported in Phase 1 (AVG over float is uncommon in IVM
-///   workloads; can be added later if needed)
+/// The sum state is declared at the **visible** scale so that `derive_avg_visible` can produce
+/// the correct visible-scale result directly from integer division. The materialize step is
+/// responsible for rescaling the SUM executor's output (which arrives at input/SUM scale)
+/// up to the visible scale when storing into the state column.
+///
+/// Layout sees only the AVG visible type:
+/// - AVG over integer inputs produces visible Float64 and uses an Int64 sum state.
+/// - AVG over Decimal128 inputs produces visible Decimal128 and uses a Decimal128 sum state
+///   at the analyzer-promoted visible scale.
+///
+/// AVG over Float32/Float64 is rejected in the DDL analyzer validation path, where the
+/// input type is still available. Do not reject Float64 here, because that is also the
+/// visible type for supported integer AVG.
 ///
 /// Returns `None` for unsupported visible types.
 fn avg_sum_state_type(visible_dt: &DataType) -> Option<(DataType, SqlType)> {
@@ -1141,16 +1202,18 @@ fn avg_sum_state_type(visible_dt: &DataType) -> Option<(DataType, SqlType)> {
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
             Some((DataType::Int64, SqlType::BigInt))
         }
-        // Integer inputs promote to Float64 in the analyzer.
         DataType::Float64 => Some((DataType::Int64, SqlType::BigInt)),
-        DataType::Decimal128(p, s) => Some((
-            DataType::Decimal128(*p, *s),
-            SqlType::Decimal {
-                precision: *p,
-                scale: *s,
-            },
-        )),
-        // AVG over FLOAT32 is not supported in Phase 1.
+        DataType::Decimal128(_, visible_scale) => {
+            // Store sum state at the visible (promoted) scale. The materialize step will
+            // rescale the SUM executor output (at input scale) to this scale on write.
+            Some((
+                DataType::Decimal128(38, *visible_scale),
+                SqlType::Decimal {
+                    precision: 38,
+                    scale: *visible_scale,
+                },
+            ))
+        }
         _ => None,
     }
 }
@@ -2258,6 +2321,61 @@ mod tests {
         }
     }
 
+    /// Build a minimal AVG layout for AVG(Decimal128(20,2)) -> visible Decimal128(38, 8).
+    /// (scale 2 + 6 = 8 per analyzer promotion rule for s <= 6.)
+    /// sum state: Decimal128(38, 8) (at visible scale, so derive_avg_visible does direct division)
+    /// count state: Int64
+    fn make_avg_layout_decimal() -> AggregateMvLayout {
+        AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "a".to_string(),
+                data_type: DataType::Decimal128(38, 8),
+                sql_type: SqlType::Decimal {
+                    precision: 38,
+                    scale: 8,
+                },
+                nullable: true,
+                source_index: 0,
+            }],
+            state_columns: vec![
+                AggregateStateColumn {
+                    name: "__agg_state_a__sum".to_string(),
+                    data_type: DataType::Decimal128(38, 8),
+                    sql_type: SqlType::Decimal {
+                        precision: 38,
+                        scale: 8,
+                    },
+                    nullable: true,
+                    visible_source_index: 0,
+                    aggregate_index: 0,
+                    function: AggregateFunctionKind::Avg,
+                    state_role: AggregateStateRole::AvgSum,
+                    count_star: false,
+                },
+                AggregateStateColumn {
+                    name: "__agg_state_a__count".to_string(),
+                    data_type: DataType::Int64,
+                    sql_type: SqlType::BigInt,
+                    nullable: false,
+                    visible_source_index: 0,
+                    aggregate_index: 0,
+                    function: AggregateFunctionKind::Avg,
+                    state_role: AggregateStateRole::AvgCount,
+                    count_star: false,
+                },
+            ],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        }
+    }
+
     // ---- AVG layout tests ----
 
     #[test]
@@ -2292,7 +2410,7 @@ mod tests {
             },
             OutputColumn {
                 name: "a".to_string(),
-                data_type: DataType::Float64,
+                data_type: DataType::Decimal128(38, 10),
                 nullable: true,
             },
         ];
@@ -2304,6 +2422,11 @@ mod tests {
         );
         assert_eq!(layout.state_columns[0].name, "__agg_state_a__sum");
         assert_eq!(layout.state_columns[0].aggregate_index, 0);
+        // AvgSum state column is at visible scale (10) to allow direct integer division.
+        assert_eq!(
+            layout.state_columns[0].data_type,
+            DataType::Decimal128(38, 10)
+        );
         assert_eq!(
             layout.state_columns[1].state_role,
             AggregateStateRole::AvgCount
@@ -2311,35 +2434,59 @@ mod tests {
         assert_eq!(layout.state_columns[1].name, "__agg_state_a__count");
         assert_eq!(layout.state_columns[1].data_type, DataType::Int64);
         assert_eq!(layout.state_columns[1].aggregate_index, 0);
+
+        let float_outputs = vec![
+            OutputColumn {
+                name: "k".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "a".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+            },
+        ];
+        let float_layout =
+            build_aggregate_mv_layout(&shape, &float_outputs).expect("Float64 AVG visible layout");
+        assert_eq!(float_layout.state_columns[0].data_type, DataType::Int64);
+        assert_eq!(float_layout.state_columns[1].data_type, DataType::Int64);
     }
 
     // ---- AVG visible derivation tests ----
 
+    /// AVG(Decimal128): sum=30_00000000 (3.000... at scale 8 * 10), count=4 -> visible=7.5 at scale 8
+    /// 30_00000000 / 4 = 7_50000000 = 7.50000000 at scale 8
     #[test]
-    fn materialize_visible_value_avg_int_to_double() {
-        let layout = make_avg_layout_int_to_double();
+    fn materialize_visible_value_avg_decimal_divides_correctly() {
+        let layout = make_avg_layout_decimal();
         let mut row = AggregatePhysicalRow {
             row_id: "g".to_string(),
             visible_values: vec![None],
+            // sum = 3000000000 represents 30.00000000 at scale 8; count = 4
+            // expected visible = 30.00000000 / 4 = 7.50000000 = raw 750000000
             state_values: vec![
-                Some(AggScalarValue::Int64(30)),
+                Some(AggScalarValue::Decimal128(3_000_000_000_i128)),
                 Some(AggScalarValue::Int64(4)),
             ],
         };
         update_visible_values_from_state(&mut row, &layout).expect("derive");
         assert!(
-            matches!(row.visible_values[0], Some(AggScalarValue::Float64(v)) if (v - 7.5).abs() < 1e-12),
-            "expected 7.5, got {:?}",
+            matches!(
+                row.visible_values[0],
+                Some(AggScalarValue::Decimal128(750_000_000_i128))
+            ),
+            "expected Decimal128(750000000) = 7.50000000 at scale 8, got {:?}",
             row.visible_values[0]
         );
     }
 
     #[test]
     fn materialize_visible_value_avg_count_zero_returns_null() {
-        let layout = make_avg_layout_int_to_double();
+        let layout = make_avg_layout_decimal();
         let mut row = AggregatePhysicalRow {
             row_id: "g".to_string(),
-            visible_values: vec![Some(AggScalarValue::Float64(0.0))],
+            visible_values: vec![Some(AggScalarValue::Decimal128(0))],
             state_values: vec![None, Some(AggScalarValue::Int64(0))],
         };
         update_visible_values_from_state(&mut row, &layout).expect("derive");
@@ -2733,6 +2880,234 @@ mod tests {
         .expect("batch");
         let chunk = record_batch_to_chunk(batch).expect("chunk");
         negate_aggregate_state_chunks(vec![chunk], &layout).unwrap();
+    }
+
+    // ---- Bug C1: AVG Decimal128 scale correctness tests ----
+
+    /// AVG(Decimal128(20, 4)) with state-shaped input batch (from SUM executor).
+    ///
+    /// The SUM executor produces Decimal128(38, 4) (SUM keeps input scale).
+    /// The AvgSum state column is declared at visible scale (10) by avg_sum_state_type.
+    /// materialize_aggregate_result_batch must rescale the raw i128 when writing:
+    ///   batch scale = 4, state scale = 10 -> multiply by 10^(10-4) = 10^6
+    ///
+    /// sum raw value at scale 4 = 3005000 (represents 300.5000)
+    /// After rescale to scale 10: 3005000 * 10^6 = 3005000000000
+    /// count = 2
+    /// Expected visible AVG = 3005000000000 / 2 = 1502500000000 (150.2500000000 at scale 10)
+    ///
+    /// Bug C1: without the fix, raw 3005000 is stored as-is in the scale-10 state column,
+    /// then derive_avg_visible produces 3005000 / 2 = 1502500 which represents 0.0001502500
+    /// at scale 10 - off by 10^6.
+    #[test]
+    fn avg_decimal128_materialize_correct_scale() {
+        use arrow::array::Decimal128Array;
+
+        let shape = crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+            &parse_query("select k1, avg(d) as a from ice.ns.orders group by k1"),
+        )
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+
+        // Output columns: [k1 Int64, a AVG(Decimal(20,4)) -> Decimal128(38, 10)]
+        let output_columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "a".to_string(),
+                data_type: DataType::Decimal128(38, 10),
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &output_columns).expect("layout");
+
+        // The AvgSum state column must be declared at visible scale (10).
+        let sum_col = layout
+            .state_columns
+            .iter()
+            .find(|c| c.state_role == AggregateStateRole::AvgSum)
+            .expect("AvgSum state column");
+        assert_eq!(
+            sum_col.data_type,
+            DataType::Decimal128(38, 10),
+            "AvgSum state column must use visible scale (10)"
+        );
+
+        // State-shaped input batch from executor: [k1, sum_col, count_col].
+        // visible_outputs = [GroupKey(0), Aggregate(0)] -> batch cols [k1, sum, count].
+        // sum = 3005000 at scale 4 represents 300.5000 (SUM keeps input scale)
+        // count = 2
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int64, false),
+                Field::new("__agg_state_a__sum", DataType::Decimal128(38, 4), true),
+                Field::new("__agg_state_a__count", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+                Arc::new(
+                    Decimal128Array::from(vec![3005000_i128])
+                        .with_precision_and_scale(38, 4)
+                        .expect("precision/scale"),
+                ) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef,
+            ],
+        )
+        .expect("state-shaped batch");
+
+        let chunk =
+            materialize_aggregate_result_batch(&batch, &layout, &shape).expect("materialize");
+
+        // Physical schema: [row_id, k1_visible, a_visible, __agg_state_a__sum, __agg_state_a__count]
+        // visible 'a' is at column index 2, state sum is at index 3.
+        // Expected: 150.2500000000 at scale 10 => raw i128 = 1502500000000
+        let visible_a = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("visible a Decimal128");
+        assert_eq!(
+            visible_a.value(0),
+            1502500000000_i128,
+            "visible AVG should be 150.2500000000 (scale 10), \
+             i.e. raw i128 = 1502500000000; \
+             without fix, got {}",
+            visible_a.value(0)
+        );
+
+        // Also verify the state column was rescaled: stored value should be 3005000 * 10^6.
+        let state_sum = chunk
+            .batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("state sum Decimal128");
+        assert_eq!(
+            state_sum.value(0),
+            3005000_000000_i128,
+            "state sum must be rescaled from scale-4 to scale-10: 3005000 * 10^6 = 3005000000000"
+        );
+    }
+
+    /// derive_avg_visible for Decimal128 at uniform scale: sum and visible share the same scale.
+    /// This is the normal path after materialize has already rescaled the sum to state scale.
+    /// No further rescaling needed inside derive_avg_visible.
+    #[test]
+    fn derive_avg_visible_decimal128_same_scale() {
+        // sum_i128 = 3005000000000 at scale 10 (represents 300.5000000000, after rescaling)
+        // count = 2
+        // visible_dt = Decimal128(38, 10)
+        // Expected: 3005000000000 / 2 = 1502500000000 (represents 150.2500000000 at scale 10)
+        let result = derive_avg_visible(
+            Some(AggScalarValue::Decimal128(3005000_000000_i128)),
+            Some(AggScalarValue::Int64(2)),
+            &DataType::Decimal128(38, 10),
+        )
+        .expect("derive");
+        assert!(
+            matches!(result, Some(AggScalarValue::Decimal128(1502500000000_i128))),
+            "expected Some(Decimal128(1502500000000)), got {result:?}"
+        );
+    }
+
+    // ---- Bug I1: agg_scalar_values_equal Float64/Decimal256 tests ----
+
+    /// agg_scalar_values_equal must return true for Float64 values that are bit-equal.
+    /// Without the fix, this returns false causing validate_loaded_physical_row to fail
+    /// with "does not match state column" on the second refresh.
+    #[test]
+    fn agg_scalar_values_equal_float64_equal_values() {
+        assert!(
+            agg_scalar_values_equal(
+                &Some(AggScalarValue::Float64(1.5)),
+                &Some(AggScalarValue::Float64(1.5)),
+            ),
+            "Float64 equal values must compare equal"
+        );
+    }
+
+    #[test]
+    fn agg_scalar_values_equal_float64_nan_both_nan() {
+        // NaN == NaN at bit level (used for NaN preservation in merge)
+        assert!(
+            agg_scalar_values_equal(
+                &Some(AggScalarValue::Float64(f64::NAN)),
+                &Some(AggScalarValue::Float64(f64::NAN)),
+            ),
+            "Float64 NaN == NaN must be bit-equal"
+        );
+    }
+
+    #[test]
+    fn agg_scalar_values_equal_float64_different_values() {
+        assert!(
+            !agg_scalar_values_equal(
+                &Some(AggScalarValue::Float64(1.5)),
+                &Some(AggScalarValue::Float64(2.5)),
+            ),
+            "Float64 different values must not compare equal"
+        );
+    }
+
+    /// validate_loaded_physical_row succeeds for MIN(Float64) where visible == state.
+    /// Bug I1: without Float64 in agg_scalar_values_equal, the equality check returns
+    /// false and this fails with "does not match state column" corruption error.
+    #[test]
+    fn load_aggregate_physical_rows_min_float64_succeeds() {
+        use arrow::array::Float64Array;
+        // Build a MIN(Float64) layout.
+        let layout = AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "mn".to_string(),
+                data_type: DataType::Float64,
+                sql_type: SqlType::Double,
+                nullable: true,
+                source_index: 0,
+            }],
+            state_columns: vec![AggregateStateColumn {
+                name: "__agg_state_mn".to_string(),
+                data_type: DataType::Float64,
+                sql_type: SqlType::Double,
+                nullable: true,
+                visible_source_index: 0,
+                aggregate_index: 0,
+                function: AggregateFunctionKind::Min,
+                state_role: AggregateStateRole::Single,
+                count_star: false,
+            }],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        };
+        // Physical schema: [row_id, mn_visible, __agg_state_mn_state]
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![""])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(3.14)])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(3.14)])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
+
+        // This must succeed: visible and state are equal Float64 values.
+        let rows = load_aggregate_physical_rows(&[chunk], &layout)
+            .expect("MIN(Float64) load must succeed");
+        assert_eq!(rows.len(), 1);
     }
 
     // ---- layout_has_min_or_max tests ----

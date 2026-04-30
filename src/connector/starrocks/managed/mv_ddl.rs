@@ -12,7 +12,7 @@ use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::{record_batch_to_chunk, register_iceberg_tables_for_query};
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
-use crate::sql::analysis::{OutputColumn, QueryBody, ResolvedQuery};
+use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution, ObjectName,
     ShowMaterializedViewsStmt, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
@@ -31,7 +31,9 @@ use crate::connector::starrocks::managed::ddl::{
     patch_tablet_schema_column_flags, reclaim_dropping_table_for_reuse,
     stored_columns_from_physical_columns, table_columns_from_physical_columns,
 };
-use crate::connector::starrocks::managed::mv_shape::{AggregateMvShape, IncrementalMvShape};
+use crate::connector::starrocks::managed::mv_shape::{
+    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
+};
 use crate::connector::starrocks::managed::store::{
     IcebergTableRef, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedPartitionState,
     ManagedTableKind, ManagedTableState, ManagedTxnState, StoredManagedIndex,
@@ -177,6 +179,7 @@ pub(crate) fn create_mv(
         return Err("materialized view SELECT must produce at least one column".to_string());
     }
     let mv_shape = super::mv_shape::classify_incremental_mv_query(&stmt.select_query)?;
+    validate_incremental_mv_analyzed_types(&mv_shape, &analysis.resolved_query)?;
     let storage_layout =
         build_mv_storage_layout(&mv_shape, distribution, &analysis.output_columns)?;
     let key_desc = storage_layout.key_desc;
@@ -383,6 +386,86 @@ fn build_mv_storage_layout(
             })
         }
     }
+}
+
+fn validate_incremental_mv_analyzed_types(
+    mv_shape: &IncrementalMvShape,
+    resolved: &ResolvedQuery,
+) -> Result<(), String> {
+    match mv_shape {
+        IncrementalMvShape::ProjectionFilter(_) => Ok(()),
+        IncrementalMvShape::Aggregate(shape) => {
+            validate_aggregate_mv_analyzed_types(shape, resolved)
+        }
+    }
+}
+
+fn validate_aggregate_mv_analyzed_types(
+    shape: &AggregateMvShape,
+    resolved: &ResolvedQuery,
+) -> Result<(), String> {
+    let QueryBody::Select(select) = &resolved.body else {
+        return Err("incremental aggregate MV analyzer result must be SELECT".to_string());
+    };
+    if select.projection.len() != shape.visible_outputs.len() {
+        return Err(format!(
+            "aggregate MV analyzer projection count mismatch: analyzed_projection={} shape_outputs={}",
+            select.projection.len(),
+            shape.visible_outputs.len()
+        ));
+    }
+
+    for (projection_index, visible_output) in shape.visible_outputs.iter().enumerate() {
+        let VisibleAggregateOutput::Aggregate(aggregate_index) = visible_output else {
+            continue;
+        };
+        let aggregate = shape.aggregates.get(*aggregate_index).ok_or_else(|| {
+            format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
+        })?;
+        let projection = &select.projection[projection_index];
+        let ExprKind::AggregateCall { name, args, .. } = &projection.expr.kind else {
+            return Err(format!(
+                "aggregate MV analyzed projection `{}` is not an aggregate expression",
+                projection.output_name
+            ));
+        };
+        validate_aggregate_mv_input_type(aggregate.function, name, &aggregate.output_name, args)?;
+    }
+
+    Ok(())
+}
+
+fn validate_aggregate_mv_input_type(
+    function: AggregateFunctionKind,
+    analyzed_name: &str,
+    output_name: &str,
+    args: &[crate::sql::analysis::TypedExpr],
+) -> Result<(), String> {
+    if function != AggregateFunctionKind::Avg {
+        return Ok(());
+    }
+    if !analyzed_name.eq_ignore_ascii_case("avg") {
+        return Err(format!(
+            "aggregate MV analyzed aggregate mismatch for `{output_name}`: expected AVG, got {analyzed_name}"
+        ));
+    }
+    let input_type = args
+        .first()
+        .map(|arg| &arg.data_type)
+        .ok_or_else(|| "AVG aggregate requires a column expression argument".to_string())?;
+    if matches!(
+        input_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Decimal128(_, _)
+    ) {
+        return Ok(());
+    }
+    Err(format!(
+        "AVG state type is unsupported for aggregate `{output_name}` input: {input_type:?}"
+    ))
 }
 
 fn validate_unique_aggregate_physical_column_names(
@@ -672,6 +755,7 @@ pub(crate) fn list_mvs(
 pub(crate) struct MvAnalysis {
     pub resolved_refs: Vec<ResolvedTableRef>,
     pub output_columns: Vec<OutputColumn>,
+    pub resolved_query: ResolvedQuery,
 }
 
 pub(crate) fn analyze_mv_select(
@@ -698,6 +782,7 @@ pub(crate) fn analyze_mv_select(
     Ok(MvAnalysis {
         resolved_refs,
         output_columns,
+        resolved_query: resolved,
     })
 }
 
@@ -1164,6 +1249,92 @@ mod tests {
         let err = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect_err("agg rejected");
         assert!(err.contains("incremental aggregate MV"), "err={err}");
+    }
+
+    fn resolved_avg_query(arg_type: DataType) -> ResolvedQuery {
+        use crate::sql::analysis::{ExprKind, ProjectItem, ResolvedSelect, TypedExpr};
+
+        let group_key = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: "k".to_string(),
+            },
+            data_type: DataType::Int64,
+            nullable: false,
+        };
+        let avg_arg = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: None,
+                column: "v".to_string(),
+            },
+            data_type: arg_type,
+            nullable: true,
+        };
+        let avg = TypedExpr {
+            kind: ExprKind::AggregateCall {
+                name: "avg".to_string(),
+                args: vec![avg_arg],
+                distinct: false,
+                order_by: Vec::new(),
+            },
+            data_type: DataType::Float64,
+            nullable: true,
+        };
+
+        ResolvedQuery {
+            body: QueryBody::Select(ResolvedSelect {
+                from: None,
+                filter: None,
+                group_by: vec![group_key.clone()],
+                having: None,
+                projection: vec![
+                    ProjectItem {
+                        expr: group_key,
+                        output_name: "k".to_string(),
+                    },
+                    ProjectItem {
+                        expr: avg,
+                        output_name: "a".to_string(),
+                    },
+                ],
+                has_aggregation: true,
+                distinct: false,
+                repeat: None,
+            }),
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            output_columns: Vec::new(),
+            local_cte_ids: Vec::new(),
+        }
+    }
+
+    fn avg_shape() -> IncrementalMvShape {
+        let stmt = parse_create_mv(
+            "create materialized view mv1 distributed by hash(k) buckets 2 \
+             as select k, avg(v) as a from ice.ns.orders group by k",
+        );
+        super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
+            .expect("avg shape")
+    }
+
+    #[test]
+    fn aggregate_mv_analyzed_types_accepts_avg_integer_input() {
+        let shape = avg_shape();
+        let resolved = resolved_avg_query(DataType::Int64);
+        validate_incremental_mv_analyzed_types(&shape, &resolved).expect("AVG(Int64) is supported");
+    }
+
+    #[test]
+    fn aggregate_mv_analyzed_types_rejects_avg_float_and_string_inputs() {
+        let shape = avg_shape();
+        for data_type in [DataType::Float64, DataType::Utf8] {
+            let resolved = resolved_avg_query(data_type.clone());
+            let err = validate_incremental_mv_analyzed_types(&shape, &resolved)
+                .expect_err("unsupported AVG input should be rejected");
+            assert!(err.contains("AVG state type is unsupported"), "err={err}");
+            assert!(err.contains(&format!("{data_type:?}")), "err={err}");
+        }
     }
 
     #[test]

@@ -404,16 +404,10 @@ fn refresh_aggregate_mv_incremental(
     }
 
     let (inserts, deletes) = change_stream.into_results();
-    let insert_delta = super::mv_agg_state::materialize_aggregate_result_chunks(
-        inserts,
-        &layout,
-        ctx.shape,
-    )?;
-    let delete_delta_positive = super::mv_agg_state::materialize_aggregate_result_chunks(
-        deletes,
-        &layout,
-        ctx.shape,
-    )?;
+    let insert_delta =
+        super::mv_agg_state::materialize_aggregate_result_chunks(inserts, &layout, ctx.shape)?;
+    let delete_delta_positive =
+        super::mv_agg_state::materialize_aggregate_result_chunks(deletes, &layout, ctx.shape)?;
     let delete_delta =
         super::mv_agg_state::negate_aggregate_state_chunks(delete_delta_positive, &layout)?;
 
