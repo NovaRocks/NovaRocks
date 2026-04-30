@@ -231,9 +231,16 @@ struct IcebergDeleteFilterState {
 /// back to the manifest-derived `first_row_id + scan_position_start + row_index`
 /// and `data_sequence_number` respectively.
 ///
+/// The optional `positions` parameter supports merge-on-read (MoR) paths where
+/// rows are not contiguous. When `Some(pos)`, the fallback for row `i` uses
+/// `first_row_id + pos[i]` (absolute data-file position); when `None`, the
+/// sequential formula `first_row_id + scan_position_start + i` is used and
+/// `positions` is ignored.
+///
 /// Returns two `Vec<i64>` in the order `(row_ids, seqs)`. Either vector is empty
 /// when the corresponding `want_*` flag is false, which avoids allocations when
 /// only one of the two columns is requested.
+#[allow(clippy::too_many_arguments)]
 fn synthesize_row_lineage_columns(
     schema: &arrow::datatypes::SchemaRef,
     columns: &[ArrayRef],
@@ -241,6 +248,7 @@ fn synthesize_row_lineage_columns(
     first_row_id: i64,
     data_sequence_number: i64,
     scan_position_start: i64,
+    positions: Option<&[i64]>,
     want_row_id: bool,
     want_last_updated_seq: bool,
 ) -> (Vec<i64>, Vec<i64>) {
@@ -267,7 +275,10 @@ fn synthesize_row_lineage_columns(
         (0..num_rows)
             .map(|i| match stored {
                 Some(arr) if !arr.is_null(i) => arr.value(i),
-                _ => first_row_id + scan_position_start + i as i64,
+                _ => match positions {
+                    Some(pos) => first_row_id + pos[i],
+                    None => first_row_id + scan_position_start + i as i64,
+                },
             })
             .collect()
     } else {
@@ -798,58 +809,19 @@ impl ScanAsyncRunner {
                 0
             };
             if let Some(positions) = kept_positions {
-                // MoR case: use the absolute file offsets from `kept_positions` as
-                // the per-row position. The synthesis helper checks stored columns first;
-                // for the fallback, offset[i] = positions[i] (relative to file start = 0).
-                // We set scan_position_start=0 and first_row_id to the morsel base, but
-                // override the fallback with kept_positions-derived offsets via a wrapper.
-                let schema = chunk.schema();
-                let columns = chunk.columns();
-                let stored_row_id_idx = if want_row_id {
-                    find_field_by_id(
-                        &schema,
-                        crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                    )
-                } else {
-                    None
-                };
-                let stored_seq_idx = if want_last_updated_seq {
-                    find_field_by_id(
-                        &schema,
-                        crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                    )
-                } else {
-                    None
-                };
-                let row_ids = if want_row_id {
-                    let stored = stored_row_id_idx
-                        .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
-                    positions
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &file_pos)| match stored {
-                            Some(arr) if !arr.is_null(i) => arr.value(i),
-                            _ => first_row_id + file_pos,
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let seqs = if want_last_updated_seq {
-                    let stored = stored_seq_idx
-                        .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
-                    positions
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| match stored {
-                            Some(arr) if !arr.is_null(i) => arr.value(i),
-                            _ => data_seq,
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                (row_ids, seqs)
+                // MoR case: pass absolute data-file positions so the helper uses
+                // `first_row_id + positions[i]` as the per-row fallback.
+                synthesize_row_lineage_columns(
+                    &chunk.schema(),
+                    chunk.columns(),
+                    row_count,
+                    first_row_id,
+                    data_seq,
+                    0, // unused when positions is Some
+                    Some(positions),
+                    want_row_id,
+                    want_last_updated_seq,
+                )
             } else {
                 // Non-MoR case: rows are sequential; next_row_offset was already
                 // advanced by row_count above.
@@ -861,6 +833,7 @@ impl ScanAsyncRunner {
                     first_row_id,
                     data_seq,
                     scan_position_start,
+                    None,
                     want_row_id,
                     want_last_updated_seq,
                 )
@@ -1539,6 +1512,7 @@ mod tests {
             first_row_id,
             data_sequence_number,
             scan_position_start,
+            None, // no MoR positions in sequential-scan unit tests
             spec.row_id_slot.is_some(),
             spec.last_updated_seq_slot.is_some(),
         )
@@ -1671,6 +1645,62 @@ mod tests {
         let (row_ids, seqs) = synthesize(batch, 100, 9, spec, 0);
         assert!(row_ids.is_empty());
         assert!(seqs.is_empty());
+    }
+
+    #[test]
+    fn row_id_synthesis_uses_positions_for_mor_filtered_chunk() {
+        let id_field = Field::new("id", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![id_field]));
+        let id = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![id]).unwrap();
+        let columns: Vec<ArrayRef> = batch.columns().iter().cloned().collect();
+
+        // Simulate MoR: rows at parquet positions 5, 8, 12 survived.
+        let positions = vec![5_i64, 8, 12];
+        let (row_ids, _seqs) = synthesize_row_lineage_columns(
+            &batch.schema(),
+            &columns,
+            batch.num_rows(),
+            100,
+            9,
+            0, // unused when positions is Some
+            Some(&positions),
+            true,
+            false,
+        );
+        assert_eq!(row_ids, vec![105, 108, 112]);
+    }
+
+    #[test]
+    fn row_id_synthesis_stored_wins_over_positions_in_mor_path() {
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let stored_field = Field::new("_row_id", DataType::Int64, true).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![stored_field]));
+        let stored =
+            Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
+        let columns: Vec<ArrayRef> = batch.columns().iter().cloned().collect();
+
+        let positions = vec![5_i64, 8, 12];
+        let (row_ids, _seqs) = synthesize_row_lineage_columns(
+            &batch.schema(),
+            &columns,
+            batch.num_rows(),
+            100,
+            9,
+            0, // unused when positions is Some
+            Some(&positions),
+            true,
+            false,
+        );
+        // Row 0: stored 700 wins. Row 1: NULL -> fallback first_row_id + positions[1] = 108.
+        // Row 2: stored 900 wins.
+        assert_eq!(row_ids, vec![700, 108, 900]);
     }
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
