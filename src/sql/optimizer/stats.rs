@@ -1398,6 +1398,7 @@ mod tests {
                         size: 1000,
                         row_count: Some(1000),
                         column_stats: None,
+                        data_sequence_number: None,
                     }],
                     cloud_properties: Default::default(),
                 },

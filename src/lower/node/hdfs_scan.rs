@@ -806,6 +806,13 @@ pub(crate) fn lower_hdfs_scan_node(
             }
         };
 
+        // data_sequence_number is populated from THdfsScanRange field 38
+        // when the NovaRocks iceberg codegen path (standalone SQL) fills it in.
+        // For FE-sent scan ranges that do not carry field 38, this will be
+        // None, which is acceptable: the incremental morsel builder also
+        // produces None for FE-driven ranges (see build_incremental_morsels).
+        let data_sequence_number = hdfs_range.data_sequence_number;
+
         if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
             ranges.push(FileScanRange {
                 path: fp.clone(),
@@ -814,7 +821,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 length,
                 scan_range_id,
                 first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
-                data_sequence_number: None,
+                data_sequence_number,
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
             });
@@ -840,7 +847,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 length,
                 scan_range_id,
                 first_row_id: row_position_spec.as_ref().map(|_| first_row_id),
-                data_sequence_number: None,
+                data_sequence_number,
                 external_datacache,
                 delete_files: iceberg_delete_files,
             });

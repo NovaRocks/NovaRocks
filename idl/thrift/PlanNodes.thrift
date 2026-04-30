@@ -454,8 +454,14 @@ struct THdfsScanRange {
 
     // Iceberg v3 row lineage: first row id of the data file, used to compute _row_id
     // as first_row_id + row_position for non-compacted files.
-    // The _last_updated_sequence_number fallback value is passed via the extended_columns map.
     37: optional i64 first_row_id;
+
+    // Iceberg v3 row lineage: data sequence number of the manifest entry this
+    // data file belongs to.  Used as the fallback value for
+    // _last_updated_sequence_number when there are no position-delete or DV
+    // records for a given row.  Populated by the NovaRocks iceberg connector
+    // codegen path (standalone SQL); the FE does not set this field.
+    38: optional i64 data_sequence_number;
 }
 
 struct TBinlogScanRange {

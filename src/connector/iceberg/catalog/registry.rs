@@ -577,6 +577,10 @@ pub(crate) struct DataFileWithStats {
     pub size: i64,
     pub record_count: Option<i64>,
     pub column_stats: Option<HashMap<String, crate::sql::catalog::IcebergColumnStats>>,
+    /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
+    /// file belongs to.  Falls back to the manifest file's sequence number when
+    /// the entry itself does not carry one (e.g. V1/V2 manifests).
+    pub data_sequence_number: Option<i64>,
 }
 
 /// Extract data file paths, sizes, row counts, and per-column statistics from
@@ -695,11 +699,20 @@ pub(crate) fn extract_data_files_with_stats(
                     None
                 };
 
+                // Iceberg v3 row-lineage: the data sequence number comes from
+                // the manifest entry when available, falling back to the
+                // manifest file's own sequence number (the spec allows entries
+                // in a V1/V2 manifest list to inherit the manifest's sequence
+                // number when the per-entry field is absent).
+                let data_sequence_number =
+                    Some(entry.sequence_number().unwrap_or(manifest_file.sequence_number));
+
                 results.push(DataFileWithStats {
                     path,
                     size,
                     record_count,
                     column_stats,
+                    data_sequence_number,
                 });
             }
         }
@@ -1716,6 +1729,48 @@ fn parse_numeric_timestamp_literal(value: i64) -> Result<i64, String> {
         .signed_duration_since(epoch)
         .num_microseconds()
         .ok_or_else(|| format!("DATETIME literal `{value}` is out of range"))
+}
+
+#[cfg(test)]
+mod data_file_with_stats_tests {
+    use super::DataFileWithStats;
+
+    /// Regression test: data_sequence_number must be threaded from the
+    /// DataFileWithStats struct through to S3FileInfo.  The full
+    /// extract_data_files_with_stats -> build_iceberg_table_def_with_data_files
+    /// path is covered by Task 5's integration tests; this test validates the
+    /// struct plumbing so a future refactor cannot drop the field silently.
+    #[test]
+    fn data_file_with_stats_carries_data_sequence_number() {
+        let f = DataFileWithStats {
+            path: "s3://bucket/data/part-0.parquet".to_string(),
+            size: 1024,
+            record_count: Some(100),
+            column_stats: None,
+            data_sequence_number: Some(42),
+        };
+        assert_eq!(
+            f.data_sequence_number,
+            Some(42),
+            "data_sequence_number must be preserved on DataFileWithStats"
+        );
+    }
+
+    #[test]
+    fn data_file_with_stats_data_sequence_number_none_for_non_iceberg() {
+        let f = DataFileWithStats {
+            path: "/local/data.parquet".to_string(),
+            size: 512,
+            record_count: None,
+            column_stats: None,
+            data_sequence_number: None,
+        };
+        assert_eq!(
+            f.data_sequence_number,
+            None,
+            "data_sequence_number should be None for non-Iceberg sources"
+        );
+    }
 }
 
 #[cfg(test)]

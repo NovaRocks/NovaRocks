@@ -27,6 +27,10 @@ pub struct S3FileInfo {
     /// Row count from Iceberg file metadata. None for non-Iceberg sources.
     pub row_count: Option<i64>,
     pub column_stats: Option<HashMap<String, IcebergColumnStats>>,
+    /// Iceberg v3 row-lineage: data sequence number of the manifest entry this
+    /// file belongs to.  Populated from the Iceberg manifest at catalog scan
+    /// time.  None for non-Iceberg sources.
+    pub data_sequence_number: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

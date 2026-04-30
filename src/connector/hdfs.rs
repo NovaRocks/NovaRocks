@@ -469,6 +469,7 @@ mod tests {
             None::<std::collections::BTreeMap<i32, crate::exprs::TExprMinMaxValue>>,
             None::<i32>,
             first_row_id,
+            None::<i64>, // data_sequence_number: not set in test helper
         );
         internal_service::TScanRangeParams::new(
             plan_nodes::TScanRange::new(

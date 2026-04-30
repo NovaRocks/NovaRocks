@@ -142,6 +142,10 @@ pub(crate) fn build_iceberg_table_def_with_files(
                 size,
                 record_count,
                 column_stats: None,
+                // data_sequence_number is not available from the caller-supplied
+                // (path, size, record_count) tuple; callers that need it should
+                // use extract_data_files_with_stats instead.
+                data_sequence_number: None,
             },
         )
         .collect::<Vec<_>>();
@@ -165,6 +169,7 @@ fn build_iceberg_table_def_with_data_files(
                     size: file.size,
                     row_count: file.record_count,
                     column_stats: file.column_stats,
+                    data_sequence_number: file.data_sequence_number,
                 })
                 .collect(),
             cloud_properties,

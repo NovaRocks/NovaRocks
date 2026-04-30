@@ -461,11 +461,14 @@ pub(crate) fn build_exec_params_multi(
                     vec![build_hdfs_scan_range_params(
                         &path.display().to_string(),
                         file_len,
+                        None,
                     )]
                 }
                 TableStorage::S3ParquetFiles { files, .. } => files
                     .iter()
-                    .map(|f| build_hdfs_scan_range_params(&f.path, f.size))
+                    .map(|f| {
+                        build_hdfs_scan_range_params(&f.path, f.size, f.data_sequence_number)
+                    })
                     .collect(),
             }
         };
@@ -540,6 +543,7 @@ fn build_internal_scan_range_params(
 fn build_hdfs_scan_range_params(
     full_path: &str,
     file_len: i64,
+    data_sequence_number: Option<i64>,
 ) -> internal_service::TScanRangeParams {
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
@@ -578,7 +582,8 @@ fn build_hdfs_scan_range_params(
         None::<bool>,
         None::<BTreeMap<i32, exprs::TExprMinMaxValue>>,
         None::<i32>,
-        None::<i64>,
+        None::<i64>, // first_row_id: not populated via standalone SQL path
+        data_sequence_number,
     );
 
     internal_service::TScanRangeParams::new(

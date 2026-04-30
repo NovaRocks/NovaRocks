@@ -874,6 +874,7 @@ fn update_iceberg_mv_in_catalog(
                     size: f.size,
                     row_count: f.record_count,
                     column_stats: f.column_stats,
+                    data_sequence_number: f.data_sequence_number,
                 })
                 .collect(),
             cloud_properties,
@@ -906,6 +907,7 @@ fn update_iceberg_mv_in_catalog(
                     size: f.size,
                     row_count: f.record_count,
                     column_stats: f.column_stats,
+                    data_sequence_number: f.data_sequence_number,
                 })
                 .collect(),
             // No cloud credentials needed — the file:// scan path reads
