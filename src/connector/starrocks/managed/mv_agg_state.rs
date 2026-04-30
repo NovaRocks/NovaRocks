@@ -61,16 +61,12 @@ pub(crate) struct AggregateStateColumn {
 ///
 /// Cardinality contract: at most one `Single` per `aggregate_index`,
 /// or exactly one `AvgSum` + one `AvgCount` pair per `aggregate_index`.
-/// Today (Task 1) only `Single` is materialized; Task 2 introduces the
-/// AVG pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// AvgSum and AvgCount are not yet constructed but are reserved for Task 2 (AVG support).
-#[allow(dead_code)]
 pub(crate) enum AggregateStateRole {
     /// Single state column: state value IS the aggregate result.
     /// Used by COUNT, SUM, MIN, MAX.
     Single,
-    /// AVG sum sub-state (numeric type matching SUM coverage).
+    /// AVG sum sub-state (Int64 for integer inputs, Decimal128 for decimal inputs).
     AvgSum,
     /// AVG count sub-state (always Int64).
     AvgCount,
@@ -127,7 +123,7 @@ pub(crate) fn build_aggregate_mv_layout(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let mut state_columns = Vec::with_capacity(shape.aggregates.len());
+    let mut state_columns = Vec::new();
     for (aggregate_index, aggregate) in shape.aggregates.iter().enumerate() {
         let visible_source_index = aggregate_visible_source_index(shape, aggregate_index)?;
         let visible = output_columns.get(visible_source_index).ok_or_else(|| {
@@ -135,31 +131,101 @@ pub(crate) fn build_aggregate_mv_layout(
                 "aggregate MV visible source index out of range: aggregate_index={aggregate_index} source_index={visible_source_index}"
             )
         })?;
-        let sql_type = mv_ddl::arrow_data_type_to_sql_type(&visible.data_type)?;
-        let state_name = format!(
-            "{}{}",
-            AGG_STATE_PREFIX,
-            sanitize_state_column_name(&aggregate.output_name)
-        );
-        validate_state_column_type(aggregate.function, &visible.data_type, &state_name)?;
-        physical_columns.push(managed_physical_column(
-            state_name.clone(),
-            sql_type.clone(),
-            visible.nullable,
-            false,
-            false,
-        ));
-        state_columns.push(AggregateStateColumn {
-            name: state_name,
-            data_type: visible.data_type.clone(),
-            sql_type,
-            nullable: visible.nullable,
-            visible_source_index,
-            aggregate_index,
-            function: aggregate.function,
-            state_role: AggregateStateRole::Single,
-            count_star: matches!(aggregate.input, AggregateInput::Star),
-        });
+        let visible_sql_type = mv_ddl::arrow_data_type_to_sql_type(&visible.data_type)?;
+        let sanitized = sanitize_state_column_name(&aggregate.output_name);
+        let count_star = matches!(aggregate.input, AggregateInput::Star);
+
+        match aggregate.function {
+            AggregateFunctionKind::Count
+            | AggregateFunctionKind::Sum
+            | AggregateFunctionKind::Min
+            | AggregateFunctionKind::Max => {
+                let state_name = format!("{}{}", AGG_STATE_PREFIX, sanitized);
+                validate_state_column_type(
+                    aggregate.function,
+                    AggregateStateRole::Single,
+                    &visible.data_type,
+                    &state_name,
+                )?;
+                physical_columns.push(managed_physical_column(
+                    state_name.clone(),
+                    visible_sql_type.clone(),
+                    visible.nullable,
+                    false,
+                    false,
+                ));
+                state_columns.push(AggregateStateColumn {
+                    name: state_name,
+                    data_type: visible.data_type.clone(),
+                    sql_type: visible_sql_type,
+                    nullable: visible.nullable,
+                    visible_source_index,
+                    aggregate_index,
+                    function: aggregate.function,
+                    state_role: AggregateStateRole::Single,
+                    count_star,
+                });
+            }
+            AggregateFunctionKind::Avg => {
+                let (sum_dt, sum_sql) =
+                    avg_sum_state_type(&visible.data_type).ok_or_else(|| {
+                        format!(
+                            "AVG state type is unsupported for column `{}{}__sum`: {:?}",
+                            AGG_STATE_PREFIX, sanitized, visible.data_type
+                        )
+                    })?;
+                let count_dt = DataType::Int64;
+                let count_sql = SqlType::BigInt;
+
+                let sum_name = format!("{}{}__sum", AGG_STATE_PREFIX, sanitized);
+                let count_name = format!("{}{}__count", AGG_STATE_PREFIX, sanitized);
+
+                validate_state_column_type(
+                    AggregateFunctionKind::Avg,
+                    AggregateStateRole::AvgSum,
+                    &sum_dt,
+                    &sum_name,
+                )?;
+
+                physical_columns.push(managed_physical_column(
+                    sum_name.clone(),
+                    sum_sql.clone(),
+                    /* nullable */ true,
+                    false,
+                    false,
+                ));
+                physical_columns.push(managed_physical_column(
+                    count_name.clone(),
+                    count_sql.clone(),
+                    /* nullable */ false,
+                    false,
+                    false,
+                ));
+
+                state_columns.push(AggregateStateColumn {
+                    name: sum_name,
+                    data_type: sum_dt,
+                    sql_type: sum_sql,
+                    nullable: true,
+                    visible_source_index,
+                    aggregate_index,
+                    function: AggregateFunctionKind::Avg,
+                    state_role: AggregateStateRole::AvgSum,
+                    count_star: false,
+                });
+                state_columns.push(AggregateStateColumn {
+                    name: count_name,
+                    data_type: count_dt,
+                    sql_type: count_sql,
+                    nullable: false,
+                    visible_source_index,
+                    aggregate_index,
+                    function: AggregateFunctionKind::Avg,
+                    state_role: AggregateStateRole::AvgCount,
+                    count_star: false,
+                });
+            }
+        }
     }
 
     Ok(AggregateMvLayout {
@@ -283,7 +349,12 @@ pub(crate) fn merge_aggregate_state_batches(
 fn all_count_states_zero(row: &AggregatePhysicalRow, layout: &AggregateMvLayout) -> bool {
     let mut saw_count = false;
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
-        if state_column.function != AggregateFunctionKind::Count {
+        let is_count_role = matches!(
+            (state_column.function, state_column.state_role),
+            (AggregateFunctionKind::Count, AggregateStateRole::Single)
+                | (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount)
+        );
+        if !is_count_role {
             continue;
         }
         saw_count = true;
@@ -307,6 +378,22 @@ fn materialize_aggregate_result_batch(
             batch.num_columns(),
             layout.visible_columns.len()
         ));
+    }
+    // Validate that no AVG state columns are present — AVG materialization
+    // requires a SQL rewrite (sum/count sub-queries) that is handled in Task 4/5.
+    // Returning a clear error here prevents silent data corruption from trying
+    // to copy Float64 AVG values into Int64 sum state.
+    for state_column in &layout.state_columns {
+        if matches!(
+            state_column.state_role,
+            AggregateStateRole::AvgSum | AggregateStateRole::AvgCount
+        ) {
+            return Err(
+                "aggregate MV full-refresh materialization of AVG is not yet supported; \
+                 AVG requires SQL rewrite to sum/count sub-queries (Task 4/5)"
+                    .to_string(),
+            );
+        }
     }
     let mut arrays =
         Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len());
@@ -502,9 +589,31 @@ fn merge_state_value(
     delta: Option<AggScalarValue>,
     state_column: &AggregateStateColumn,
 ) -> Result<Option<AggScalarValue>, String> {
-    match state_column.function {
-        AggregateFunctionKind::Count => merge_count_state_value(old, delta, state_column),
-        AggregateFunctionKind::Sum => merge_sum_state_value(old, delta, state_column),
+    match (state_column.function, state_column.state_role) {
+        (AggregateFunctionKind::Count, AggregateStateRole::Single) => {
+            merge_count_state_value(old, delta, state_column)
+        }
+        (AggregateFunctionKind::Sum, AggregateStateRole::Single) => {
+            merge_sum_state_value(old, delta, state_column)
+        }
+        (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum) => {
+            // Same arithmetic as SUM (NULL-permissive int/decimal addition).
+            merge_sum_state_value(old, delta, state_column)
+        }
+        (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount) => {
+            // Same arithmetic as COUNT (NULL-rejecting int addition).
+            merge_count_state_value(old, delta, state_column)
+        }
+        (AggregateFunctionKind::Min, _) => {
+            Err("internal: MIN merge not yet implemented".to_string())
+        }
+        (AggregateFunctionKind::Max, _) => {
+            Err("internal: MAX merge not yet implemented".to_string())
+        }
+        (function, role) => Err(format!(
+            "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{}`",
+            state_column.name
+        )),
     }
 }
 
@@ -620,9 +729,25 @@ fn nullable_decimal128_state_value(
 }
 
 fn zero_state_value(state_column: &AggregateStateColumn) -> Option<AggScalarValue> {
-    match state_column.function {
-        AggregateFunctionKind::Count => Some(AggScalarValue::Int64(0)),
-        AggregateFunctionKind::Sum => None,
+    match (state_column.function, state_column.state_role) {
+        (AggregateFunctionKind::Count, AggregateStateRole::Single) => {
+            Some(AggScalarValue::Int64(0))
+        }
+        (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount) => {
+            Some(AggScalarValue::Int64(0))
+        }
+        (AggregateFunctionKind::Sum, AggregateStateRole::Single)
+        | (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum) => None,
+        // Min/Max reserved for Task 3 — return None for now.
+        (AggregateFunctionKind::Min, _) | (AggregateFunctionKind::Max, _) => None,
+        // Catch-all for unexpected combinations.
+        (function, role) => {
+            // This should never happen with well-formed layouts.
+            tracing::warn!(
+                "zero_state_value: unexpected (function, state_role) pair ({function:?}, {role:?})"
+            );
+            None
+        }
     }
 }
 
@@ -654,7 +779,12 @@ fn validate_loaded_physical_row(
 
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let state_value = &state_values[state_index];
-        if state_column.function == AggregateFunctionKind::Count {
+        let is_count_role = matches!(
+            (state_column.function, state_column.state_role),
+            (AggregateFunctionKind::Count, AggregateStateRole::Single)
+                | (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount)
+        );
+        if is_count_role {
             validate_loaded_count_state(
                 state_value,
                 &state_column.name,
@@ -663,25 +793,29 @@ fn validate_loaded_physical_row(
                 allow_negative_counts,
             )?;
         }
-        let visible_value =
-            visible_values
-                .get(state_column.visible_source_index)
-                .ok_or_else(|| {
-                    format!(
-                        "aggregate MV state corruption: visible source index {} is out of range for state column `{}`",
-                        state_column.visible_source_index, state_column.name
-                    )
-                })?;
-        // In delta-mode the visible column carries pre-negation values
-        // while the state column has been sign-flipped, so equality is
-        // expected to fail. The merge math reads only state_values, so
-        // the mismatch is harmless. We still keep the check for
-        // strict-mode (stored MV state must satisfy the invariant).
-        if !allow_negative_counts && !agg_scalar_values_equal(visible_value, state_value) {
-            return Err(format!(
-                "aggregate MV state corruption: visible aggregate column `{}` does not match state column `{}` for row id `{row_id}`",
-                layout.visible_columns[state_column.visible_source_index].name, state_column.name
-            ));
+        // Skip visible/state equality for non-Single states (e.g. AVG AvgSum/AvgCount
+        // state values differ from the visible AVG output).
+        // In delta-mode the visible column carries pre-negation values while the state
+        // column has been sign-flipped, so equality is expected to fail.
+        // The merge math reads only state_values, so mismatches are harmless.
+        // We keep the check for strict-mode Single-role states only.
+        if !allow_negative_counts && matches!(state_column.state_role, AggregateStateRole::Single) {
+            let visible_value =
+                visible_values
+                    .get(state_column.visible_source_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "aggregate MV state corruption: visible source index {} is out of range for state column `{}`",
+                            state_column.visible_source_index, state_column.name
+                        )
+                    })?;
+            if !agg_scalar_values_equal(visible_value, state_value) {
+                return Err(format!(
+                    "aggregate MV state corruption: visible aggregate column `{}` does not match state column `{}` for row id `{row_id}`",
+                    layout.visible_columns[state_column.visible_source_index].name,
+                    state_column.name
+                ));
+            }
         }
     }
     Ok(())
@@ -747,19 +881,50 @@ fn agg_scalar_values_equal(left: &Option<AggScalarValue>, right: &Option<AggScal
     }
 }
 
+/// Map the visible (output) DataType of an AVG aggregate to the (sum_data_type, sum_sql_type)
+/// pair used for the AvgSum state column.
+///
+/// StarRocks AVG output type rules:
+/// - Integer inputs (Int8/16/32/64) → visible Float64, sum state is Int64
+/// - Decimal128 inputs → visible Decimal128 (same precision/scale), sum state is Decimal128
+/// - Float/Double inputs: not supported in Phase 1 (AVG over float is uncommon in IVM
+///   workloads; can be added later if needed)
+///
+/// Returns `None` for unsupported visible types.
+fn avg_sum_state_type(visible_dt: &DataType) -> Option<(DataType, SqlType)> {
+    match visible_dt {
+        // Integer inputs produce Float64 visible output; sum state is Int64.
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            Some((DataType::Int64, SqlType::BigInt))
+        }
+        // Integer inputs promote to Float64 in the analyzer.
+        DataType::Float64 => Some((DataType::Int64, SqlType::BigInt)),
+        DataType::Decimal128(p, s) => Some((
+            DataType::Decimal128(*p, *s),
+            SqlType::Decimal {
+                precision: *p,
+                scale: *s,
+            },
+        )),
+        // AVG over FLOAT32 is not supported in Phase 1.
+        _ => None,
+    }
+}
+
 fn validate_state_column_type(
     function: AggregateFunctionKind,
+    state_role: AggregateStateRole,
     data_type: &DataType,
     state_name: &str,
 ) -> Result<(), String> {
-    match function {
-        AggregateFunctionKind::Count => match data_type {
+    match (function, state_role) {
+        (AggregateFunctionKind::Count, AggregateStateRole::Single) => match data_type {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(()),
             other => Err(format!(
                 "aggregate MV COUNT state type is unsupported for column `{state_name}`: {other:?}"
             )),
         },
-        AggregateFunctionKind::Sum => match data_type {
+        (AggregateFunctionKind::Sum, AggregateStateRole::Single) => match data_type {
             DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -769,6 +934,25 @@ fn validate_state_column_type(
                 "aggregate MV SUM state type is unsupported for column `{state_name}`: {other:?}"
             )),
         },
+        (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum) => match data_type {
+            DataType::Int64 | DataType::Decimal128(_, _) => Ok(()),
+            other => Err(format!(
+                "AVG sum state type is unsupported for column `{state_name}`: {other:?}"
+            )),
+        },
+        (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount) => match data_type {
+            DataType::Int64 => Ok(()),
+            other => Err(format!(
+                "AVG count state must be Int64 for column `{state_name}`: {other:?}"
+            )),
+        },
+        // Min/Max reserved for Task 3.
+        (AggregateFunctionKind::Min, _) | (AggregateFunctionKind::Max, _) => Err(format!(
+            "internal: MIN/MAX validation not yet implemented for column `{state_name}`"
+        )),
+        (function, role) => Err(format!(
+            "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{state_name}`"
+        )),
     }
 }
 
@@ -931,22 +1115,121 @@ where
 /// Derive visible column values from the current state values after a merge step.
 ///
 /// For `Single` state_role the visible value is a direct copy of the state value (1:1 mapping).
-/// AVG and other future multi-state aggregates will be handled here in Task 2 by iterating
-/// per-aggregate and computing the visible result from their sub-states (e.g. sum/count).
-///
-/// Returns `Result` for forward compatibility — Task 2 will introduce fallible AVG derivation
-/// (e.g., division-by-zero, decimal scale alignment).
+/// For AVG, the visible value is derived from the AvgSum and AvgCount sub-states as sum/count.
 fn update_visible_values_from_state(
     row: &mut AggregatePhysicalRow,
     layout: &AggregateMvLayout,
 ) -> Result<(), String> {
+    use std::collections::HashMap;
+    // Group state column indexes by aggregate_index.
+    let mut by_aggregate: HashMap<usize, Vec<usize>> = HashMap::new();
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
-        if matches!(state_column.state_role, AggregateStateRole::Single) {
-            row.visible_values[state_column.visible_source_index] =
-                row.state_values[state_index].clone();
+        by_aggregate
+            .entry(state_column.aggregate_index)
+            .or_default()
+            .push(state_index);
+    }
+
+    for state_indexes in by_aggregate.values() {
+        let primary = &layout.state_columns[state_indexes[0]];
+        match primary.function {
+            AggregateFunctionKind::Count
+            | AggregateFunctionKind::Sum
+            | AggregateFunctionKind::Min
+            | AggregateFunctionKind::Max => {
+                // Single state role: visible = state.
+                let state_index = state_indexes[0];
+                let state_column = &layout.state_columns[state_index];
+                row.visible_values[state_column.visible_source_index] =
+                    row.state_values[state_index].clone();
+            }
+            AggregateFunctionKind::Avg => {
+                let (sum_idx, count_idx) = avg_state_indexes(layout, state_indexes)?;
+                let visible_idx = layout.state_columns[sum_idx].visible_source_index;
+                let visible_dt = &layout.visible_columns[visible_idx].data_type;
+                let sum_val = row.state_values[sum_idx].clone();
+                let count_val = row.state_values[count_idx].clone();
+                row.visible_values[visible_idx] =
+                    derive_avg_visible(sum_val, count_val, visible_dt)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Locate the AvgSum and AvgCount state indexes within a set of state indexes
+/// that all belong to the same AVG aggregate.
+fn avg_state_indexes(
+    layout: &AggregateMvLayout,
+    state_indexes: &[usize],
+) -> Result<(usize, usize), String> {
+    let mut sum_idx = None;
+    let mut count_idx = None;
+    for &i in state_indexes {
+        match layout.state_columns[i].state_role {
+            AggregateStateRole::AvgSum => sum_idx = Some(i),
+            AggregateStateRole::AvgCount => count_idx = Some(i),
+            AggregateStateRole::Single => {
+                return Err(format!(
+                    "internal: AVG aggregate has Single state_role on state column index {i}"
+                ));
+            }
+        }
+    }
+    Ok((
+        sum_idx.ok_or("internal: AVG aggregate missing AvgSum state column")?,
+        count_idx.ok_or("internal: AVG aggregate missing AvgCount state column")?,
+    ))
+}
+
+/// Compute the AVG visible value from sum and count sub-states.
+///
+/// NULL semantics:
+/// - count = 0  → NULL (empty group)
+/// - sum = NULL → NULL (all inputs were NULL)
+/// - otherwise  → sum / count
+///
+/// For Decimal128 inputs: division is integer division at the stored scale.
+/// This is exact for the stored scale's precision but may lose fractional
+/// digits below the scale due to truncation. Production-grade Decimal AVG
+/// with extended-precision intermediate scaling is deferred.
+fn derive_avg_visible(
+    sum: Option<AggScalarValue>,
+    count: Option<AggScalarValue>,
+    visible_dt: &DataType,
+) -> Result<Option<AggScalarValue>, String> {
+    let count_i64 = match count {
+        Some(AggScalarValue::Int64(c)) => c,
+        Some(other) => {
+            return Err(format!("AVG count state must be Int64, got {other:?}"));
+        }
+        None => return Err("AVG count state must not be NULL".to_string()),
+    };
+    if count_i64 == 0 {
+        return Ok(None);
+    }
+    let sum = match sum {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    match (visible_dt, sum) {
+        (DataType::Float64, AggScalarValue::Int64(s)) => Ok(Some(AggScalarValue::Float64(
+            (s as f64) / (count_i64 as f64),
+        ))),
+        (DataType::Decimal128(_p, _scale), AggScalarValue::Decimal128(s)) => {
+            // Stored sum = real_sum * 10^scale; count is dimensionless.
+            // real_avg = real_sum / count = (stored_sum / 10^scale) / count
+            // stored_avg = real_avg * 10^scale = stored_sum / count
+            // Integer division truncates — acceptable as Phase-1 approximation.
+            let result = s
+                .checked_div(count_i64 as i128)
+                .ok_or("AVG decimal divide failed (overflow)")?;
+            Ok(Some(AggScalarValue::Decimal128(result)))
+        }
+        (dt, sum) => Err(format!(
+            "AVG visible derivation unsupported: visible_dt={dt:?} sum={sum:?}"
+        )),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1637,5 +1920,274 @@ mod tests {
         let kept = merge_aggregate_state_batches(&old_rows, &[], &layout).expect("merge nonzero");
         let kept_rows: usize = kept.iter().map(|c| c.batch.num_rows()).sum();
         assert_eq!(kept_rows, 1, "non-zero count row should be retained");
+    }
+
+    // ---- AVG helper layout ----
+
+    fn make_avg_layout_int_to_double() -> AggregateMvLayout {
+        AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "a".to_string(),
+                data_type: DataType::Float64,
+                sql_type: SqlType::Double,
+                nullable: true,
+                source_index: 0,
+            }],
+            state_columns: vec![
+                AggregateStateColumn {
+                    name: "__agg_state_a__sum".to_string(),
+                    data_type: DataType::Int64,
+                    sql_type: SqlType::BigInt,
+                    nullable: true,
+                    visible_source_index: 0,
+                    aggregate_index: 0,
+                    function: AggregateFunctionKind::Avg,
+                    state_role: AggregateStateRole::AvgSum,
+                    count_star: false,
+                },
+                AggregateStateColumn {
+                    name: "__agg_state_a__count".to_string(),
+                    data_type: DataType::Int64,
+                    sql_type: SqlType::BigInt,
+                    nullable: false,
+                    visible_source_index: 0,
+                    aggregate_index: 0,
+                    function: AggregateFunctionKind::Avg,
+                    state_role: AggregateStateRole::AvgCount,
+                    count_star: false,
+                },
+            ],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        }
+    }
+
+    // ---- AVG layout tests ----
+
+    #[test]
+    fn build_layout_avg_produces_two_state_columns() {
+        use crate::connector::starrocks::managed::mv_shape::{
+            AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
+            VisibleAggregateOutput,
+        };
+        use sqlparser::ast::ObjectName;
+
+        let shape = AggregateMvShape {
+            base_table: ObjectName(vec![]),
+            group_keys: vec![GroupKeyShape {
+                output_name: "k".to_string(),
+                expr: sqlparser::ast::Expr::Identifier("k".into()),
+            }],
+            aggregates: vec![AggregateCallShape {
+                output_name: "a".to_string(),
+                function: AggregateFunctionKind::Avg,
+                input: AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v".into()))),
+            }],
+            visible_outputs: vec![
+                VisibleAggregateOutput::GroupKey(0),
+                VisibleAggregateOutput::Aggregate(0),
+            ],
+        };
+        let outputs = vec![
+            OutputColumn {
+                name: "k".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "a".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &outputs).expect("layout build");
+        assert_eq!(layout.state_columns.len(), 2);
+        assert_eq!(
+            layout.state_columns[0].state_role,
+            AggregateStateRole::AvgSum
+        );
+        assert_eq!(layout.state_columns[0].name, "__agg_state_a__sum");
+        assert_eq!(layout.state_columns[0].aggregate_index, 0);
+        assert_eq!(
+            layout.state_columns[1].state_role,
+            AggregateStateRole::AvgCount
+        );
+        assert_eq!(layout.state_columns[1].name, "__agg_state_a__count");
+        assert_eq!(layout.state_columns[1].data_type, DataType::Int64);
+        assert_eq!(layout.state_columns[1].aggregate_index, 0);
+    }
+
+    // ---- AVG visible derivation tests ----
+
+    #[test]
+    fn materialize_visible_value_avg_int_to_double() {
+        let layout = make_avg_layout_int_to_double();
+        let mut row = AggregatePhysicalRow {
+            row_id: "g".to_string(),
+            visible_values: vec![None],
+            state_values: vec![
+                Some(AggScalarValue::Int64(30)),
+                Some(AggScalarValue::Int64(4)),
+            ],
+        };
+        update_visible_values_from_state(&mut row, &layout).expect("derive");
+        assert!(
+            matches!(row.visible_values[0], Some(AggScalarValue::Float64(v)) if (v - 7.5).abs() < 1e-12),
+            "expected 7.5, got {:?}",
+            row.visible_values[0]
+        );
+    }
+
+    #[test]
+    fn materialize_visible_value_avg_count_zero_returns_null() {
+        let layout = make_avg_layout_int_to_double();
+        let mut row = AggregatePhysicalRow {
+            row_id: "g".to_string(),
+            visible_values: vec![Some(AggScalarValue::Float64(0.0))],
+            state_values: vec![None, Some(AggScalarValue::Int64(0))],
+        };
+        update_visible_values_from_state(&mut row, &layout).expect("derive");
+        assert!(
+            row.visible_values[0].is_none(),
+            "expected None, got {:?}",
+            row.visible_values[0]
+        );
+    }
+
+    // ---- AVG merge tests ----
+
+    #[test]
+    fn merge_state_value_avg_sum_int64() {
+        let column = AggregateStateColumn {
+            name: "__agg_state_a__sum".to_string(),
+            data_type: DataType::Int64,
+            sql_type: SqlType::BigInt,
+            nullable: true,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Avg,
+            state_role: AggregateStateRole::AvgSum,
+            count_star: false,
+        };
+        // Some + Some
+        let r = merge_state_value(
+            Some(AggScalarValue::Int64(10)),
+            Some(AggScalarValue::Int64(20)),
+            &column,
+        )
+        .expect("merge");
+        assert!(matches!(r, Some(AggScalarValue::Int64(30))), "got {r:?}");
+        // Some + None
+        let r = merge_state_value(Some(AggScalarValue::Int64(10)), None, &column).expect("merge");
+        assert!(matches!(r, Some(AggScalarValue::Int64(10))), "got {r:?}");
+        // None + None
+        let r = merge_state_value(None, None, &column).expect("merge");
+        assert!(r.is_none(), "got {r:?}");
+    }
+
+    #[test]
+    fn merge_state_value_avg_count_int64() {
+        let column = AggregateStateColumn {
+            name: "__agg_state_a__count".to_string(),
+            data_type: DataType::Int64,
+            sql_type: SqlType::BigInt,
+            nullable: false,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Avg,
+            state_role: AggregateStateRole::AvgCount,
+            count_star: false,
+        };
+        let r = merge_state_value(
+            Some(AggScalarValue::Int64(2)),
+            Some(AggScalarValue::Int64(3)),
+            &column,
+        )
+        .expect("merge");
+        assert!(matches!(r, Some(AggScalarValue::Int64(5))), "got {r:?}");
+    }
+
+    // ---- AVG negate test ----
+
+    #[test]
+    fn negate_aggregate_state_chunks_avg_flips_both_substates() {
+        let layout = make_avg_layout_int_to_double();
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["g1"])) as ArrayRef,
+                Arc::new(arrow::array::Float64Array::from(vec![Some(7.5)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![30_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![4_i64])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
+        let negated = negate_aggregate_state_chunks(vec![chunk], &layout).expect("negate");
+        let sum = negated[0]
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let cnt = negated[0]
+            .batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(sum.value(0), -30);
+        assert_eq!(cnt.value(0), -4);
+    }
+
+    // ---- End-to-end AVG merge test ----
+
+    #[test]
+    fn merge_aggregate_state_batches_avg_int_to_double() {
+        let layout = make_avg_layout_int_to_double();
+        // The layout has no group keys, so the computed row_id is always "" (empty join).
+        let row_id = "";
+        let mut old: HashMap<String, AggregatePhysicalRow> = HashMap::new();
+        old.insert(
+            row_id.to_string(),
+            AggregatePhysicalRow {
+                row_id: row_id.to_string(),
+                visible_values: vec![Some(AggScalarValue::Float64(5.0))],
+                state_values: vec![
+                    Some(AggScalarValue::Int64(10)),
+                    Some(AggScalarValue::Int64(2)),
+                ],
+            },
+        );
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![row_id])) as ArrayRef,
+                Arc::new(arrow::array::Float64Array::from(vec![Some(10.0)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![20_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let delta = vec![record_batch_to_chunk(batch).expect("chunk")];
+        let merged = merge_aggregate_state_batches(&old, &delta, &layout).expect("merge");
+        assert_eq!(merged.len(), 1);
+        let visible = merged[0]
+            .batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        // (10 + 20) / (2 + 2) = 30 / 4 = 7.5
+        assert_eq!(visible.value(0), 7.5);
     }
 }

@@ -1159,7 +1159,7 @@ mod tests {
     fn create_mv_shape_rejects_unsupported_aggregation() {
         let stmt = parse_create_mv(
             "create materialized view mv1 distributed by hash(k1) buckets 2 \
-             as select k1, avg(v2) from ice.ns.orders group by k1",
+             as select k1, min(v2) from ice.ns.orders group by k1",
         );
         let err = super::super::mv_shape::classify_incremental_mv_query(&stmt.select_query)
             .expect_err("agg rejected");

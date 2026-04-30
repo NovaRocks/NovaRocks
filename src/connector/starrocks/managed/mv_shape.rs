@@ -39,10 +39,14 @@ pub(crate) struct AggregateCallShape {
     pub(crate) input: AggregateInput,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateFunctionKind {
     Count,
     Sum,
+    Avg,
+    Min, // Reserved for Task 3
+    Max, // Reserved for Task 3
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -334,6 +338,7 @@ fn classify_aggregate_call(
     let (function, input) = match function_name.as_str() {
         "count" => classify_count_input(&args.args)?,
         "sum" => (AggregateFunctionKind::Sum, classify_sum_input(&args.args)?),
+        "avg" => (AggregateFunctionKind::Avg, classify_avg_input(&args.args)?),
         _ => return Err(aggregate_error()),
     };
 
@@ -371,6 +376,17 @@ fn classify_sum_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateI
     };
     let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
         return Err(aggregate_error());
+    };
+    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+}
+
+fn classify_avg_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
+    let [arg] = args else {
+        return Err("AVG aggregate requires a column expression argument".to_string());
+    };
+    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+        return Err("AVG aggregate requires a column expression argument".to_string());
     };
     reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
     Ok(AggregateInput::Expr(Box::new(expr.clone())))
@@ -1014,7 +1030,7 @@ fn projection_filter_error() -> String {
 }
 
 fn aggregate_error() -> String {
-    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum aggregate outputs".to_string()
+    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum/avg aggregate outputs".to_string()
 }
 
 fn aggregate_expr_error(_err: String) -> String {
@@ -1112,7 +1128,6 @@ mod tests {
     #[test]
     fn rejects_unsupported_aggregate_functions() {
         for sql in [
-            "select k1, avg(v2) from ice.ns.orders group by k1",
             "select k1, min(v2) from ice.ns.orders group by k1",
             "select k1, count(distinct v2) from ice.ns.orders group by k1",
             "select k1, sum(v2) filter (where v2 > 0) from ice.ns.orders group by k1",
@@ -1121,6 +1136,34 @@ mod tests {
         ] {
             assert_rejects_with(sql, "incremental aggregate MV");
         }
+    }
+
+    #[test]
+    fn accepts_avg_aggregate() {
+        let shape = classify_sql("select k1, avg(v2) as a from ice.ns.orders group by k1")
+            .expect("query should be accepted");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        assert_eq!(shape.aggregates.len(), 1);
+        assert_eq!(shape.aggregates[0].output_name, "a");
+        assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Avg);
+        assert_eq!(
+            shape.aggregates[0].input,
+            AggregateInput::Expr(Box::new(sqlparser::ast::Expr::Identifier("v2".into())))
+        );
+    }
+
+    #[test]
+    fn rejects_avg_star_and_avg_distinct() {
+        assert_rejects_with(
+            "select k1, avg(*) from ice.ns.orders group by k1",
+            "AVG aggregate requires a column expression argument",
+        );
+        assert_rejects_with(
+            "select k1, avg(distinct v2) from ice.ns.orders group by k1",
+            "incremental aggregate MV",
+        );
     }
 
     #[test]
