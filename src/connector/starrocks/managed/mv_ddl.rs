@@ -306,6 +306,8 @@ pub(crate) fn create_mv(
         storage_engine: ManagedMvStorageEngine::ManagedLake,
         iceberg_table_identifier: None,
         last_refreshed_iceberg_snapshot_id: None,
+        refresh_in_progress: false,
+        refresh_target_snapshots: Default::default(),
     });
 
     let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot.clone())?;

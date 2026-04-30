@@ -1646,6 +1646,8 @@ mod mv_target_tests {
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,
                 last_refreshed_iceberg_snapshot_id: None,
+                refresh_in_progress: false,
+                refresh_target_snapshots: Default::default(),
             }],
         };
 
@@ -2106,6 +2108,8 @@ mod mv_target_tests {
                     storage_engine: ManagedMvStorageEngine::ManagedLake,
                     iceberg_table_identifier: None,
                     last_refreshed_iceberg_snapshot_id: None,
+                    refresh_in_progress: false,
+                    refresh_target_snapshots: Default::default(),
                 }]
             } else {
                 vec![]
