@@ -39,14 +39,13 @@ pub(crate) struct AggregateCallShape {
     pub(crate) input: AggregateInput,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AggregateFunctionKind {
     Count,
     Sum,
     Avg,
-    Min, // Reserved for Task 3
-    Max, // Reserved for Task 3
+    Min,
+    Max,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -339,6 +338,14 @@ fn classify_aggregate_call(
         "count" => classify_count_input(&args.args)?,
         "sum" => (AggregateFunctionKind::Sum, classify_sum_input(&args.args)?),
         "avg" => (AggregateFunctionKind::Avg, classify_avg_input(&args.args)?),
+        "min" => (
+            AggregateFunctionKind::Min,
+            classify_min_max_input(&args.args)?,
+        ),
+        "max" => (
+            AggregateFunctionKind::Max,
+            classify_min_max_input(&args.args)?,
+        ),
         _ => return Err(aggregate_error()),
     };
 
@@ -387,6 +394,17 @@ fn classify_avg_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateI
     };
     let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
         return Err("AVG aggregate requires a column expression argument".to_string());
+    };
+    reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
+    Ok(AggregateInput::Expr(Box::new(expr.clone())))
+}
+
+fn classify_min_max_input(args: &[sqlparser::ast::FunctionArg]) -> Result<AggregateInput, String> {
+    let [arg] = args else {
+        return Err("MIN/MAX aggregate requires a column expression argument".to_string());
+    };
+    let sqlparser::ast::FunctionArgExpr::Expr(expr) = simple_aggregate_arg_expr(arg)? else {
+        return Err("MIN/MAX aggregate requires a column expression argument".to_string());
     };
     reject_unsupported_expr(expr).map_err(aggregate_expr_error)?;
     Ok(AggregateInput::Expr(Box::new(expr.clone())))
@@ -1030,7 +1048,7 @@ fn projection_filter_error() -> String {
 }
 
 fn aggregate_error() -> String {
-    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum/avg aggregate outputs".to_string()
+    "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only count/sum/avg/min/max aggregate outputs".to_string()
 }
 
 fn aggregate_expr_error(_err: String) -> String {
@@ -1277,7 +1295,6 @@ mod tests {
     #[test]
     fn rejects_unsupported_aggregate_functions() {
         for sql in [
-            "select k1, min(v2) from ice.ns.orders group by k1",
             "select k1, count(distinct v2) from ice.ns.orders group by k1",
             "select k1, sum(v2) filter (where v2 > 0) from ice.ns.orders group by k1",
             "select k1, sum(v2 order by k1) from ice.ns.orders group by k1",
@@ -1285,6 +1302,31 @@ mod tests {
         ] {
             assert_rejects_with(sql, "incremental aggregate MV");
         }
+    }
+
+    #[test]
+    fn accepts_min_max_aggregates() {
+        let shape =
+            classify_sql("select k1, min(v2) as mn, max(v2) as mx from ice.ns.orders group by k1")
+                .expect("query should be accepted");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        assert_eq!(shape.aggregates.len(), 2);
+        assert_eq!(shape.aggregates[0].function, AggregateFunctionKind::Min);
+        assert_eq!(shape.aggregates[1].function, AggregateFunctionKind::Max);
+    }
+
+    #[test]
+    fn rejects_min_max_star() {
+        assert_rejects_with(
+            "select k1, min(*) from ice.ns.orders group by k1",
+            "MIN/MAX aggregate requires a column expression argument",
+        );
+        assert_rejects_with(
+            "select k1, max(*) from ice.ns.orders group by k1",
+            "MIN/MAX aggregate requires a column expression argument",
+        );
     }
 
     #[test]

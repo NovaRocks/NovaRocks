@@ -650,6 +650,16 @@ pub(crate) fn negate_aggregate_state_chunks(
         let batch = chunk.batch.clone();
         let mut arrays: Vec<ArrayRef> = batch.columns().to_vec();
         for (state_index, state_column) in layout.state_columns.iter().enumerate() {
+            if matches!(
+                state_column.function,
+                AggregateFunctionKind::Min | AggregateFunctionKind::Max
+            ) {
+                panic!(
+                    "MIN/MAX state should not enter negate path: column `{}`. \
+                     DELETE-induced refresh on MV with MIN/MAX must fall back to full refresh.",
+                    state_column.name
+                );
+            }
             let column_index = state_offset + state_index;
             let original = arrays
                 .get(column_index)
@@ -710,11 +720,11 @@ fn merge_state_value(
             // Same arithmetic as COUNT (NULL-rejecting int addition).
             merge_count_state_value(old, delta, state_column)
         }
-        (AggregateFunctionKind::Min, _) => {
-            Err("internal: MIN merge not yet implemented".to_string())
+        (AggregateFunctionKind::Min, AggregateStateRole::Single) => {
+            merge_min_max_state_value(old, delta, state_column, MinMax::Min)
         }
-        (AggregateFunctionKind::Max, _) => {
-            Err("internal: MAX merge not yet implemented".to_string())
+        (AggregateFunctionKind::Max, AggregateStateRole::Single) => {
+            merge_min_max_state_value(old, delta, state_column, MinMax::Max)
         }
         (function, role) => Err(format!(
             "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{}`",
@@ -793,6 +803,119 @@ fn merge_sum_state_value(
             "aggregate MV state merge does not support {:?} for column `{}`",
             other, state_column.name
         )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MinMax {
+    Min,
+    Max,
+}
+
+fn merge_min_max_state_value(
+    old: Option<AggScalarValue>,
+    delta: Option<AggScalarValue>,
+    state_column: &AggregateStateColumn,
+    op: MinMax,
+) -> Result<Option<AggScalarValue>, String> {
+    match (old, delta) {
+        (None, None) => Ok(None),
+        (Some(v), None) | (None, Some(v)) => Ok(Some(v)),
+        (Some(a), Some(b)) => Ok(Some(min_max_pair(a, b, state_column, op)?)),
+    }
+}
+
+fn min_max_pair(
+    a: AggScalarValue,
+    b: AggScalarValue,
+    state_column: &AggregateStateColumn,
+    op: MinMax,
+) -> Result<AggScalarValue, String> {
+    use AggScalarValue::*;
+    match (a, b) {
+        (Int64(x), Int64(y)) => Ok(Int64(pick_int64(x, y, op))),
+        (Float64(x), Float64(y)) => Ok(Float64(pick_float64(x, y, op))),
+        (Decimal128(x), Decimal128(y)) => Ok(Decimal128(pick_int128(x, y, op))),
+        (Decimal256(x), Decimal256(y)) => Ok(Decimal256(pick_i256(x, y, op))),
+        (Utf8(x), Utf8(y)) => Ok(Utf8(pick_string(x, y, op))),
+        (Date32(x), Date32(y)) => Ok(Date32(pick_int32(x, y, op))),
+        (Timestamp(x), Timestamp(y)) => Ok(Timestamp(pick_int64(x, y, op))),
+        (a, b) => Err(format!(
+            "MIN/MAX merge type mismatch on column `{}`: a={a:?}, b={b:?}",
+            state_column.name
+        )),
+    }
+}
+
+fn pick_int64(x: i64, y: i64, op: MinMax) -> i64 {
+    match op {
+        MinMax::Min => x.min(y),
+        MinMax::Max => x.max(y),
+    }
+}
+
+fn pick_int32(x: i32, y: i32, op: MinMax) -> i32 {
+    match op {
+        MinMax::Min => x.min(y),
+        MinMax::Max => x.max(y),
+    }
+}
+
+fn pick_int128(x: i128, y: i128, op: MinMax) -> i128 {
+    match op {
+        MinMax::Min => x.min(y),
+        MinMax::Max => x.max(y),
+    }
+}
+
+fn pick_i256(
+    x: arrow::datatypes::i256,
+    y: arrow::datatypes::i256,
+    op: MinMax,
+) -> arrow::datatypes::i256 {
+    match op {
+        MinMax::Min => {
+            if x <= y {
+                x
+            } else {
+                y
+            }
+        }
+        MinMax::Max => {
+            if x >= y {
+                x
+            } else {
+                y
+            }
+        }
+    }
+}
+
+fn pick_string(x: String, y: String, op: MinMax) -> String {
+    match op {
+        MinMax::Min => x.min(y),
+        MinMax::Max => x.max(y),
+    }
+}
+
+/// Pick min/max for f64 with NaN handling:
+/// - NaN + NaN   → NaN
+/// - NaN + x     → x  (NaN treated as "no real value")
+/// - x   + NaN   → x
+/// - x   + y     → cmp::min/max(x, y)
+fn pick_float64(x: f64, y: f64, op: MinMax) -> f64 {
+    if x.is_nan() && y.is_nan() {
+        return f64::NAN;
+    }
+    if x.is_nan() {
+        return y;
+    }
+    if y.is_nan() {
+        return x;
+    }
+    match op {
+        MinMax::Min => x.min(y),
+        MinMax::Max => x.max(y),
     }
 }
 
@@ -1052,10 +1175,28 @@ fn validate_state_column_type(
                 "AVG count state must be Int64 for column `{state_name}`: {other:?}"
             )),
         },
-        // Min/Max reserved for Task 3.
-        (AggregateFunctionKind::Min, _) | (AggregateFunctionKind::Max, _) => Err(format!(
-            "internal: MIN/MAX validation not yet implemented for column `{state_name}`"
-        )),
+        (AggregateFunctionKind::Min, AggregateStateRole::Single)
+        | (AggregateFunctionKind::Max, AggregateStateRole::Single) => match data_type {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _) => Ok(()),
+            DataType::Boolean => Err(format!(
+                "MIN/MAX state type is unsupported for column `{state_name}`: Boolean"
+            )),
+            other => Err(format!(
+                "MIN/MAX state type is unsupported for column `{state_name}`: {other:?}"
+            )),
+        },
         (function, role) => Err(format!(
             "internal: invalid (function, state_role) pair: ({function:?}, {role:?}) for column `{state_name}`"
         )),
@@ -2383,6 +2524,113 @@ mod tests {
         assert_eq!(state_cnt.value(0), 4, "state count");
     }
 
+    // ---- MIN/MAX merge tests ----
+
+    #[test]
+    fn merge_state_value_min_int64() {
+        let column = AggregateStateColumn {
+            name: "__agg_state_mn".to_string(),
+            data_type: DataType::Int64,
+            sql_type: SqlType::BigInt,
+            nullable: true,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Min,
+            state_role: AggregateStateRole::Single,
+            count_star: false,
+        };
+        // Some(5) min Some(3) = Some(3)
+        let r = merge_state_value(
+            Some(AggScalarValue::Int64(5)),
+            Some(AggScalarValue::Int64(3)),
+            &column,
+        )
+        .unwrap();
+        assert!(
+            matches!(r, Some(AggScalarValue::Int64(3))),
+            "expected Some(Int64(3)), got {r:?}"
+        );
+        // Some + None -> Some
+        let r = merge_state_value(Some(AggScalarValue::Int64(5)), None, &column).unwrap();
+        assert!(
+            matches!(r, Some(AggScalarValue::Int64(5))),
+            "expected Some(Int64(5)), got {r:?}"
+        );
+        // None + Some -> Some
+        let r = merge_state_value(None, Some(AggScalarValue::Int64(5)), &column).unwrap();
+        assert!(
+            matches!(r, Some(AggScalarValue::Int64(5))),
+            "expected Some(Int64(5)), got {r:?}"
+        );
+        // None + None -> None
+        let r = merge_state_value(None, None, &column).unwrap();
+        assert!(r.is_none(), "expected None, got {r:?}");
+    }
+
+    #[test]
+    fn merge_state_value_max_utf8() {
+        let column = AggregateStateColumn {
+            name: "__agg_state_mx".to_string(),
+            data_type: DataType::Utf8,
+            sql_type: SqlType::String,
+            nullable: true,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Max,
+            state_role: AggregateStateRole::Single,
+            count_star: false,
+        };
+        let r = merge_state_value(
+            Some(AggScalarValue::Utf8("apple".to_string())),
+            Some(AggScalarValue::Utf8("banana".to_string())),
+            &column,
+        )
+        .unwrap();
+        assert!(
+            matches!(r, Some(AggScalarValue::Utf8(ref s)) if s == "banana"),
+            "expected Some(Utf8(\"banana\")), got {r:?}"
+        );
+    }
+
+    #[test]
+    fn merge_state_value_min_float64_nan_handling() {
+        let column = AggregateStateColumn {
+            name: "__agg_state_mn".to_string(),
+            data_type: DataType::Float64,
+            sql_type: SqlType::Double,
+            nullable: true,
+            visible_source_index: 0,
+            aggregate_index: 0,
+            function: AggregateFunctionKind::Min,
+            state_role: AggregateStateRole::Single,
+            count_star: false,
+        };
+        // NaN + non-NaN -> non-NaN
+        let r = merge_state_value(
+            Some(AggScalarValue::Float64(f64::NAN)),
+            Some(AggScalarValue::Float64(5.0)),
+            &column,
+        )
+        .unwrap();
+        let v = match r {
+            Some(AggScalarValue::Float64(v)) => v,
+            _ => panic!("expected Float64"),
+        };
+        assert!(!v.is_nan() && v == 5.0);
+        // NaN + NaN -> NaN
+        let r = merge_state_value(
+            Some(AggScalarValue::Float64(f64::NAN)),
+            Some(AggScalarValue::Float64(f64::NAN)),
+            &column,
+        )
+        .unwrap();
+        let v = match r {
+            Some(AggScalarValue::Float64(v)) => v,
+            _ => panic!("expected Float64"),
+        };
+        assert!(v.is_nan());
+    }
+
     // ---- End-to-end AVG merge test ----
 
     #[test]
@@ -2424,5 +2672,53 @@ mod tests {
             .unwrap();
         // (10 + 20) / (2 + 2) = 30 / 4 = 7.5
         assert_eq!(visible.value(0), 7.5);
+    }
+
+    // ---- MIN/MAX negate panic test ----
+
+    #[test]
+    #[should_panic(expected = "MIN/MAX state should not enter negate path")]
+    fn negate_aggregate_state_chunks_min_panics() {
+        let layout = AggregateMvLayout {
+            row_id_column: managed_physical_column(
+                ROW_ID_COLUMN.to_string(),
+                SqlType::String,
+                false,
+                false,
+                true,
+            ),
+            visible_columns: vec![AggregateVisibleColumn {
+                name: "mn".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: true,
+                source_index: 0,
+            }],
+            state_columns: vec![AggregateStateColumn {
+                name: "__agg_state_mn".to_string(),
+                data_type: DataType::Int64,
+                sql_type: SqlType::BigInt,
+                nullable: true,
+                visible_source_index: 0,
+                aggregate_index: 0,
+                function: AggregateFunctionKind::Min,
+                state_role: AggregateStateRole::Single,
+                count_star: false,
+            }],
+            group_key_source_indexes: Vec::new(),
+            physical_columns: Vec::new(),
+        };
+        let schema = Arc::new(physical_schema(&layout));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["g"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(5)])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![Some(5)])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let chunk = record_batch_to_chunk(batch).expect("chunk");
+        negate_aggregate_state_chunks(vec![chunk], &layout).unwrap();
     }
 }
