@@ -18,10 +18,14 @@
 ### 目标
 
 1. `SELECT _row_id, _last_updated_sequence_number FROM ice.ns.t` 在 V3 row-lineage 表（`format-version=3` + `write.row-lineage=true`）上返回 spec 兼容的 BIGINT 值。
-2. Vendor `iceberg-rust` 0.9 的 `_row_id` 读路径从「无条件 `first_row_id + _pos`」升级到 spec 兼容的「stored 列存在且非 NULL → 用 stored；否则 fallback」。
-3. Vendor 新增 `_last_updated_sequence_number` 读路径，对称语义：「stored → 用 stored；否则 fallback 到 manifest entry 的 `data_sequence_number`」。
-4. NovaRocks SQL analyzer / lowering / connector / scan operator 把这两个名字端到端接到 vendor scan。
+2. **主路径** —— NovaRocks user-level scan 读路径（`src/exec/operators/scan/runner.rs::append_iceberg_virtual_columns`）按 spec 自己合成这两列，stored 列存在 → 逐行 stored / fallback；列缺失 → 全 fallback。
+3. **辅路径** —— Vendor `iceberg-rust` 0.9 的 `RecordBatchTransformer` 同样升级到 spec 兼容（`_row_id` stored 双路径、`_last_updated_sequence_number` 新增），覆盖 DELETE flow（`src/engine/delete_flow.rs:452` 用 vendor `ArrowReaderBuilder`）和未来潜在的 NovaRocks scan 路径迁移。
+4. NovaRocks SQL analyzer / lowering / connector 把这两个名字端到端接到 scan 路径。
 5. 在不支持的表（V2 Iceberg / V3 但未启 row-lineage / 非 Iceberg）上 SELECT 这两个名字时 fail fast，错误信息明确指出要求。
+
+### 双轨实现的必要性
+
+NovaRocks 当前 user-level scan **不通过 vendor `RecordBatchTransformer`** —— [`runner.rs::append_iceberg_virtual_columns`](src/exec/operators/scan/runner.rs:641) 直接读 raw parquet（`src/formats/parquet`）后自己合成 `_file` / `_pos`。仅 DELETE flow ([`delete_flow.rs:43, 452`](src/engine/delete_flow.rs:452)) 经过 vendor。所以「只改 vendor」不能让 user-level SELECT 工作；「只改 NovaRocks」会让 DELETE flow 在跨引擎读 stored 非 NULL 文件时不一致。本 PR 双轨同步修改，保持两条路径 spec 行为一致。
 
 ### 非目标
 
@@ -61,8 +65,10 @@
 
 ## 2. 架构
 
+### 2.1 主路径：User-level SELECT（NovaRocks runner）
+
 ```
-SQL                                        analyzer
+SQL                                        analyzer (sql/analyzer/scope.rs)
   SELECT _row_id, _last_updated_sequence_number  ──►  在 V3 row-lineage 表的 column 解析路径
   FROM ice_v3_lineage_t                                上接受这两个 reserved 名字；
                                                               其它表 fail fast
@@ -73,25 +79,51 @@ SQL                                        analyzer
                                                   跟现有 _pos / _file 路径并行
                                                               │
                                                               ▼
-                                          connector / scan range
+                                          connector / scan range (hdfs.rs)
                                               ScanRange 透传 first_row_id (existing) 和
                                               data_sequence_number (new)
                                                               │
                                                               ▼
-                                          file_scan operator
-                                              把 reserved field id 加进 vendor TableScanBuilder.select；
-                                              data_sequence_number 填到 FileScanTask
+                                          NovaRocks parquet reader (formats/parquet/mod.rs)
+                                              不向 vendor select；直接 reader builder
+                                              拿到 RecordBatch (含或不含 stored 列, 依文件)
                                                               │
                                                               ▼
-                                          vendor iceberg-0.9.0
-                                              record_batch_transformer 按 spec：
-                                                  stored 列存在     → 逐行 stored / fallback
-                                                  stored 列缺失     → 全 fallback
-                                                       _row_id      = first_row_id + _pos
+                                          scan/runner.rs::append_iceberg_virtual_columns
+                                              检测 RecordBatch schema 中是否有
+                                                  RESERVED_FIELD_ID_ROW_ID                = 2147483540
+                                                  RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE = 2147483539
+                                              的列（按 PARQUET_FIELD_ID_META_KEY 检索）。
+                                              按 spec：
+                                                  stored 列存在 → 逐行 stored / fallback
+                                                  stored 列缺失 → 全 fallback
+                                                       _row_id      = first_row_id + scan_position
                                                        _last_updated = data_sequence_number
+                                              把合成列附加到输出 chunk
 ```
 
-**架构原则**：所有跨 file 推导逻辑收敛在 vendor 层（spec 兼容性的天然层级）；NovaRocks 层只负责 SQL 名字解析和 slot 路由。这样上游 iceberg-rust 将来补完同款逻辑时，NovaRocks 改动量为零（vendor patch 退役即可）。
+### 2.2 辅路径：DELETE flow（vendor `ArrowReaderBuilder`）
+
+```
+delete_flow.rs (NovaRocks 内部 SQL 重写，目前 SELECT _file, _pos)
+       │
+       ▼
+vendor iceberg-rust 0.9
+       ArrowReaderBuilder ──► RecordBatchTransformer
+              │
+              └─► 按 ColumnSource 分发：
+                      _row_id / _last_updated_sequence_number 升级为 spec 兼容
+                      stored 列存在     → 逐行 stored / fallback
+                      stored 列缺失     → 全 fallback
+```
+
+DELETE flow 当前不投影 `_row_id` / `_last_updated_sequence_number`，但 vendor 升级后这两列对 DELETE flow 自动可用，跨引擎读 stored 非 NULL 文件时不会出现 silent drift。
+
+### 2.3 架构原则
+
+- **两条路径必须 spec 行为一致** —— 同一 parquet 文件经过两条路径输出的 `_row_id` / `_last_updated_sequence_number` 必须逐行 byte-equal。
+- **NovaRocks runner 是主路径**（用户实际的 `SELECT _row_id`），优先级最高；vendor 是辅路径（cross-engine consistency），优先级次之。
+- **将来 NovaRocks 切到 vendor scan 路径**（如果发生）时，runner 端的合成代码可以删除，vendor 改动留下；本 spec 把改动按层切分使这种迁移友好。
 
 ---
 
@@ -184,6 +216,33 @@ pub struct IcebergVirtualSpec {
 
 `src/connector/hdfs.rs`：scan range 已携带 `first_row_id: Option<i64>`，新增 `data_sequence_number: Option<i64>`，从 iceberg manifest entry 取，跟 first_row_id 同 pattern 透传。
 
+### 3.5 NovaRocks — `IcebergVirtualState`（runner 端 per-scan-range state）
+
+`src/exec/operators/scan/runner.rs`：现有 `IcebergVirtualState` 持有 `file_path` + `next_row_offset`。扩两个字段以支持 spec 兼容合成：
+
+```rust
+struct IcebergVirtualState {
+    spec: IcebergVirtualSpec,
+    file_path: String,
+    next_row_offset: i64,
+    first_row_id: Option<i64>,           // NEW — from morsel/scan_range
+    data_sequence_number: Option<i64>,   // NEW — from morsel/scan_range
+}
+```
+
+`build_iceberg_virtual_state`（[runner.rs:523](src/exec/operators/scan/runner.rs:523)）从 morsel 取这两个值并填入 state。
+
+### 3.6 NovaRocks — Reserved field id 常量
+
+`src/exec/row_position.rs`（与 §3.3 名字常量一处）：
+
+```rust
+pub const ICEBERG_RESERVED_FIELD_ID_ROW_ID: i32 = i32::MAX - 107;             // 2147483540
+pub const ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER: i32 = i32::MAX - 108; // 2147483539
+```
+
+这是 NovaRocks 端的常量复制（避免 NovaRocks 对 vendor private const 路径直接引用）；与 vendor `metadata_columns.rs:63, 66` 同值。`runner.rs` 的 stored-column 检测路径用这两个常量在 RecordBatch field metadata 中查找。
+
 ---
 
 ## 4. 改动点列表
@@ -202,12 +261,12 @@ pub struct IcebergVirtualSpec {
 
 | 文件 | 改动 |
 |---|---|
-| `src/exec/row_position.rs` | 加两个名字常量 + `is_iceberg_row_id` / `is_iceberg_last_updated_sequence_number` + `IcebergVirtualSpec` 扩 4 字段 |
-| `src/lower/node/hdfs_scan.rs` | 在现有 `iceberg_virtual_pos_slot` 识别循环中加两个新分支，类型校验（BIGINT），把 slot id + reserved field id 填到 `IcebergVirtualSpec` |
-| `src/lower/node/file_scan.rs` | `data_sequence_number` 从 metadata 一路传到 vendor scan task |
+| `src/exec/row_position.rs` | 加两个名字常量 + `is_iceberg_row_id` / `is_iceberg_last_updated_sequence_number` + 两个 reserved field id 常量（§3.6）+ `IcebergVirtualSpec` 扩 4 字段（§3.3）|
+| `src/lower/node/hdfs_scan.rs` | 在现有 `iceberg_virtual_pos_slot` 识别循环中加两个新分支，类型校验（BIGINT），把 slot id 填到 `IcebergVirtualSpec` |
+| `src/lower/node/file_scan.rs` | `data_sequence_number` 从 metadata 一路传到 ScanRange |
 | `src/connector/hdfs.rs` | scan range 透传 `data_sequence_number`，跟 `first_row_id` 同 pattern |
-| `src/exec/operators/scan/runner.rs` 或 `source.rs` | 当 `IcebergVirtualSpec` 的 `row_id_slot` / `last_updated_seq_slot` 是 Some 时，把 `RESERVED_COL_NAME_ROW_ID` / `RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER` 加进 vendor `TableScanBuilder.select(...)` |
-| `src/sql/analyzer/`（具体函数位置：处理 SELECT 列解析、把列名映射到 base table schema 字段的主路径——plan 阶段在该目录下定位现有 column resolution 入口） | 在 Iceberg 表的 column 解析路径中：当 base table 为 `format-version=3` 且 `write.row-lineage=true` 时把 `_row_id` / `_last_updated_sequence_number` 作为 BIGINT pseudo-column 加入可选投影列表；其它情况下返回 §5.1 的明确错误 |
+| `src/exec/operators/scan/runner.rs` | (a) `IcebergVirtualState` 扩 2 字段（§3.5）；(b) `build_iceberg_virtual_state` 从 morsel 填两个字段；(c) `append_iceberg_virtual_columns` 实现 spec 兼容的 `_row_id` / `_last_updated_sequence_number` 合成：用 `parse_parquet_field_id`（[parquet/mod.rs:1426](src/formats/parquet/mod.rs:1426)）按 reserved field id 检测 chunk schema 中是否有对应 stored 列；逐行 stored / fallback；stored 列缺失时全 fallback |
+| `src/sql/analyzer/scope.rs` 或调用 `AnalyzerScope::add_*` 的 schema 注册路径 | 注册 base table schema 时：当 table metadata 满足 V3 row-lineage 条件，把 `_row_id` / `_last_updated_sequence_number` 作为 BIGINT pseudo-column 加进 scope；用户 SELECT 这两个名字时 `AnalyzerScope::resolve` 直接 hit；其它表上 resolve fail 时返回 §5.1 的明确错误（在 fail 分支检测 reserved 名字 → 给特化错误信息）|
 
 ### 4.3 显式不动
 
@@ -246,16 +305,34 @@ pub struct IcebergVirtualSpec {
 
 ---
 
-## 6. 数据流（端到端 SELECT 路径）
+## 6. 数据流
+
+### 6.1 主路径：User-level SELECT（NovaRocks runner）
 
 以 `SELECT id, _row_id, _last_updated_sequence_number FROM ice.ns.t` 为例（t 是 V3 row-lineage 表）：
 
-1. **Analyzer**：从 catalog 加载 t 的 metadata，发现 `format-version=3` + `write.row-lineage=true`。在解析 SELECT 列时把 `_row_id` / `_last_updated_sequence_number` 作为 BIGINT pseudo-column 加入；否则报 §5.1 中相应错误。
+1. **Analyzer**：从 catalog 加载 t 的 metadata。schema 注册时检查 `format-version` 和 `write.row-lineage`，满足条件就把 `_row_id` / `_last_updated_sequence_number` 作为 BIGINT pseudo-column 加进 `AnalyzerScope`；不满足时不加。SELECT 列表中遇到这两个名字 → `scope.resolve` 在通过情况下直接命中；fail 分支检测 reserved 名字并返回 §5.1 的特化错误。
 2. **Lowering**：scan node 的 slot 列表里这两个名字进入 `hdfs_scan.rs`，被新分支识别成 row-lineage slot；写到 `IcebergVirtualSpec` 的 `row_id_slot` / `last_updated_seq_slot`。
 3. **Connector → ScanRange**：`hdfs.rs` 的 ScanRange 已携带 `first_row_id`，新增 `data_sequence_number`，从 iceberg manifest entry 取。
-4. **Operator**：scan operator 根据 `IcebergVirtualSpec` 的两个新 slot 决定在 vendor `TableScanBuilder.select(...)` 里加上 `RESERVED_COL_NAME_ROW_ID` / `RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER`；把 `data_sequence_number` 传给 vendor。
-5. **Vendor**：`reader.rs` 构造 `FileScanTask` 时填入 `first_row_id` 和 `data_sequence_number`；扫描时检测 parquet 文件 schema 中是否有对应 reserved field id 的列（按 iceberg-rust 既有的 field-id metadata 路径），有就把它的 source_index 一起传给 transformer；transformer 按第 §3.2 节的 stored / fallback 双路径输出。
-6. **Output**：`RecordBatch` 多两列 `_row_id: Int64` / `_last_updated_sequence_number: Int64`，沿现有 chunk 路径回到 SQL。
+4. **Reader**：NovaRocks parquet reader 按 connector 给的 select 列表读 raw parquet（**不**显式 select stored `_row_id` / `_last_updated_sequence_number` 列；如果 parquet 文件里物理上有这些列且 select 列表的 field-id 投影 happens to 把它们带过来 —— 实际上不会，因为这两列的 reserved field id 不在 NovaRocks slot 列表内）。
+
+   **关键澄清**：runner 默认拿不到 stored 列。要让 runner 走 stored 分支，必须在 connector 层把这两列也加入 parquet reader 的 select 列表。当 `IcebergVirtualSpec` 的 `row_id_slot` / `last_updated_seq_slot` 是 Some 时，connector 在 select 列表里加这两列（按 reserved field id 检索 parquet schema，存在则加入读取列表，不存在跳过）。
+5. **Runner `append_iceberg_virtual_columns`**：拿到 RecordBatch（含 stored 列与否依文件而定）。按 reserved field id 在 chunk schema 中查 stored column index：
+   - 有：逐行检查 stored 是否 NULL，NULL → fallback，非 NULL → 用 stored
+   - 无：所有行 = fallback（`first_row_id + scan_position` / `data_sequence_number`）
+   把合成的 `Int64Array` 加到输出 chunk 对应 slot 上。
+6. **Output**：chunk 多两列 `_row_id: Int64` / `_last_updated_sequence_number: Int64`，沿现有路径回到 SQL。
+
+### 6.2 辅路径：DELETE flow（vendor）
+
+DELETE flow ([delete_flow.rs:422](src/engine/delete_flow.rs:422)) 当前 SQL 重写为 `INSERT INTO sink SELECT _file, _pos, ...`，不投影 `_row_id` / `_last_updated_sequence_number`。本 PR 不改写 DELETE flow 的 SQL，但 vendor 升级后这两列对 DELETE flow 自动可用：
+
+1. NovaRocks DELETE flow 调 vendor `ArrowReaderBuilder::new(file_io)`
+2. Vendor `reader.rs` 构造 `FileScanTask` 时填入 `first_row_id` 和 `data_sequence_number`（§3.1 改动）
+3. Vendor `RecordBatchTransformer` 按 §3.2 双路径输出
+4. NovaRocks DELETE flow 拿到 `RecordBatch` 直接消费
+
+辅路径与主路径**逐行 byte-equal** —— 这是双轨 spec compliance 的核心 invariant，由 §7.2 vendor 单测和 §7.3 NovaRocks 集成测试共同保证。
 
 ---
 
@@ -290,10 +367,14 @@ pub struct IcebergVirtualSpec {
 | `src/exec/row_position.rs::tests::is_iceberg_last_updated_sequence_number_recognizes_name` | 同上 |
 | `src/lower/node/hdfs_scan.rs::tests::lowering_propagates_row_id_slot` | 验证 IcebergVirtualSpec 新字段被填 |
 | `src/lower/node/hdfs_scan.rs::tests::lowering_propagates_last_updated_seq_slot` | 同上 |
-| `src/sql/analyzer/...::tests::rejects_row_id_on_v2_iceberg_table` | 错误信息 |
-| `src/sql/analyzer/...::tests::rejects_row_id_on_v3_table_without_row_lineage` | 错误信息 |
-| `src/sql/analyzer/...::tests::rejects_row_id_on_non_iceberg_table` | 错误信息 |
-| `src/sql/analyzer/...::tests::accepts_row_id_on_v3_row_lineage_table` | resolve 成功 |
+| `src/exec/operators/scan/runner.rs::tests::row_id_synthesis_uses_stored_column_when_present` | runner 端 stored / fallback 逻辑（构造含 stored 列的 RecordBatch）|
+| `src/exec/operators/scan/runner.rs::tests::row_id_synthesis_falls_back_when_stored_null_per_row` | 混合 NULL / 非 NULL |
+| `src/exec/operators/scan/runner.rs::tests::row_id_synthesis_falls_back_when_stored_column_missing` | 不含 stored 列 |
+| `src/exec/operators/scan/runner.rs::tests::last_updated_seq_synthesis_*`（×3） | 对称三组 |
+| `src/sql/analyzer/scope.rs::tests::rejects_row_id_on_v2_iceberg_table` | 错误信息 |
+| `src/sql/analyzer/scope.rs::tests::rejects_row_id_on_v3_table_without_row_lineage` | 错误信息 |
+| `src/sql/analyzer/scope.rs::tests::rejects_row_id_on_non_iceberg_table` | 错误信息 |
+| `src/sql/analyzer/scope.rs::tests::accepts_row_id_on_v3_row_lineage_table` | resolve 成功 |
 
 ### 7.3 NovaRocks 集成测试
 
@@ -374,18 +455,20 @@ NovaRocks 自己写的第一个 INSERT snapshot 的 `first_row_id` 应该是 0�
 
 ## 9. 提交边界
 
-按 Brainstorming approach A：单一 PR，4 个 commit，每个独立可编译可测试。
+按 Brainstorming approach A（修订后双轨）：单一 PR，5 个 commit，每个独立可编译可测试。
 
 1. **`feat(vendor): add stored-column override for _row_id read path`**
    `record_batch_transformer.rs` 的 `RowId` 变体扩 `stored_source_index` + 检测逻辑 + 4 个新单测 + PATCH.md 更新 patch 3 描述
 2. **`feat(vendor): add _last_updated_sequence_number read path`**
    `FileScanTask::data_sequence_number` + manifest 填入 + reader.rs 透传 + 新 `LastUpdatedSeqNum` 变体 + 4 个新单测 + PATCH.md 加 patch 5
-3. **`feat(novarocks): expose _row_id / _last_updated_sequence_number in iceberg scan`**
-   `exec/row_position.rs` 新名字判定 + `IcebergVirtualSpec` 扩字段 + `hdfs_scan.rs` lowering 分支 + ScanRange `data_sequence_number` 透传 + scan operator 把两个 reserved field id 加入 vendor select + analyzer 在 V3 row-lineage 表上接受新名字 + fail-fast 错误 + 单元测试
-4. **`test(novarocks): cover row_id / last_updated_sequence_number end-to-end on v3 row-lineage table`**
+3. **`feat(novarocks): expose _row_id / _last_updated_sequence_number in iceberg lowering and analyzer`**
+   `exec/row_position.rs` 新名字判定 + reserved field id 常量 + `IcebergVirtualSpec` 扩字段 + `hdfs_scan.rs` lowering 分支 + ScanRange `data_sequence_number` 透传 + analyzer scope 在 V3 row-lineage 表上接受新名字 + fail-fast 错误 + 单元测试
+4. **`feat(novarocks): synthesize _row_id / _last_updated_sequence_number in scan runner`**
+   `runner.rs::IcebergVirtualState` 扩字段 + `build_iceberg_virtual_state` 填字段 + `append_iceberg_virtual_columns` 实现 spec 兼容 stored / fallback 合成 + connector 层加 stored 列到 reader select 列表（按 reserved field id 检测 parquet schema） + 6 个新 runner 单测
+5. **`test(novarocks): cover row_id / last_updated_sequence_number end-to-end on v3 row-lineage table`**
    集成测试 4 个
 
-每个 commit 独立 review、独立 bisect 友好。
+每个 commit 独立 review、独立 bisect 友好。Vendor 改动（commit 1-2）跟 NovaRocks 改动（commit 3-5）路径独立，bisect 时回归方向清晰。
 
 ---
 
@@ -395,7 +478,7 @@ NovaRocks 自己写的第一个 INSERT snapshot 的 `first_row_id` 应该是 0�
 - `cargo build -p novarocks` 通过
 - `cargo build` （vendor + 全 workspace）通过
 - Vendor 单测：8 个新增（4 row_id + 4 last_updated_seq）+ 1 个 task carry test 全过
-- NovaRocks 单测：8 个新增全过
+- NovaRocks 单测：14 个新增全过（2 名字判定 + 2 lowering + 6 runner stored/fallback + 4 analyzer scope）
 - NovaRocks 集成测试：4 个新增全过（minio 不可达时按既有模式跳过）
 - IVM Phase 2 既有测试：无回归（`cargo test -p novarocks --lib connector::iceberg::changes`、`scan_deletes`、`commit::puffin_dv`、`starrocks::managed::mv_refresh`）
 - Phase 2a 既有测试：无回归（`cargo test -p novarocks --lib engine::tests::iceberg_`、`connector::iceberg::commit`）
@@ -406,3 +489,4 @@ NovaRocks 自己写的第一个 INSERT snapshot 的 `first_row_id` 应该是 0�
 ## 11. 变更记录
 
 - 2026-04-30 — 初版。Brainstorming 经命名（直接用 `_row_id`）/ 行为（fail fast）/ scope（approach A）/ 5 节设计逐节确认通过。基于发现 vendor patch 3 的 `_row_id` 实现不符合 V3 spec 而要求修订，比 IVM-on-Iceberg roadmap §2.3 原始设想多一项 vendor 端 spec compliance 工作。
+- 2026-04-30（修订）— Plan-time 调研发现 NovaRocks user-level scan 路径绕开 vendor `RecordBatchTransformer`（runner.rs 自己读 raw parquet + 自己合成虚拟列），仅 DELETE flow 走 vendor。原 spec 假设「核心逻辑收敛于 vendor」错误，会导致 user-level `SELECT _row_id` 不工作。修订为双轨：NovaRocks runner 端做主路径合成（user SELECT 真实路径），vendor 端做辅路径（DELETE flow + cross-engine consistency）。两条路径共用同一套 spec 兼容规则，集成测试保证逐行 byte-equal。Commit 数量从 4 增加到 5（新增「runner 合成」commit）。
