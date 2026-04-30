@@ -49,7 +49,7 @@ use crate::metrics;
 use crate::novarocks_logging::debug;
 use crate::runtime::profile::{OperatorProfiles, clamp_u128_to_i64};
 use crate::types;
-use arrow::array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
 use arrow::compute::filter_record_batch;
 use roaring::RoaringTreemap;
 use std::collections::HashMap;
@@ -196,10 +196,18 @@ struct LakeRowPositionState {
 ///   and grows by the number of rows materialized so far. Predicate filters
 ///   run later, so `_pos` captures the pre-filter position that row-level
 ///   DELETE readers rely on.
+/// - `first_row_id`: manifest-derived row-id origin for V3 row-lineage synthesis
+///   (`_row_id` virtual column). `None` when the morsel did not carry row-lineage
+///   metadata (files-only path, e.g. MV refresh).
+/// - `data_sequence_number`: manifest-derived data sequence number used as the
+///   fallback value for `_last_updated_sequence_number`. `None` when absent from
+///   the morsel.
 struct IcebergVirtualState {
     spec: IcebergVirtualSpec,
     file_path: String,
     next_row_offset: i64,
+    first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
 }
 
 /// Iceberg v2 merge-on-read state owned by the scan runner.
@@ -213,6 +221,85 @@ struct IcebergVirtualState {
 struct IcebergDeleteFilterState {
     deleted: RoaringTreemap,
     next_row_offset: i64,
+}
+
+/// Synthesize `_row_id` and `_last_updated_sequence_number` row-lineage column
+/// values for one chunk.
+///
+/// For each row, stored column values (tagged with the Iceberg-spec reserved
+/// parquet field ids) take precedence per row; NULL / absent stored values fall
+/// back to the manifest-derived `first_row_id + scan_position_start + row_index`
+/// and `data_sequence_number` respectively.
+///
+/// Returns two `Vec<i64>` in the order `(row_ids, seqs)`. Either vector is empty
+/// when the corresponding `want_*` flag is false, which avoids allocations when
+/// only one of the two columns is requested.
+fn synthesize_row_lineage_columns(
+    schema: &arrow::datatypes::SchemaRef,
+    columns: &[ArrayRef],
+    num_rows: usize,
+    first_row_id: i64,
+    data_sequence_number: i64,
+    scan_position_start: i64,
+    want_row_id: bool,
+    want_last_updated_seq: bool,
+) -> (Vec<i64>, Vec<i64>) {
+    let stored_row_id_idx = if want_row_id {
+        find_field_by_id(
+            schema,
+            crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+        )
+    } else {
+        None
+    };
+    let stored_seq_idx = if want_last_updated_seq {
+        find_field_by_id(
+            schema,
+            crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+        )
+    } else {
+        None
+    };
+
+    let row_ids = if want_row_id {
+        let stored = stored_row_id_idx
+            .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
+        (0..num_rows)
+            .map(|i| match stored {
+                Some(arr) if !arr.is_null(i) => arr.value(i),
+                _ => first_row_id + scan_position_start + i as i64,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let seqs = if want_last_updated_seq {
+        let stored = stored_seq_idx
+            .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
+        (0..num_rows)
+            .map(|i| match stored {
+                Some(arr) if !arr.is_null(i) => arr.value(i),
+                _ => data_sequence_number,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    (row_ids, seqs)
+}
+
+/// Find the index of the parquet field with the given field-id metadata tag in
+/// the schema. Returns `None` when no field carries that field-id.
+fn find_field_by_id(schema: &arrow::datatypes::SchemaRef, target_id: i32) -> Option<usize> {
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    schema.fields().iter().position(|f| {
+        f.metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|s| s.parse::<i32>().ok())
+            == Some(target_id)
+    })
 }
 
 impl ScanAsyncRunner {
@@ -528,17 +615,22 @@ impl ScanAsyncRunner {
             return Ok(None);
         };
         let ScanMorsel::FileRange {
-            path, first_row_id, ..
+            path,
+            first_row_id,
+            data_sequence_number,
+            ..
         } = morsel
         else {
             return Err(
-                "iceberg _file/_pos virtual columns require file range morsels".to_string(),
+                "iceberg virtual columns require file range morsels".to_string(),
             );
         };
         Ok(Some(IcebergVirtualState {
             spec: spec.clone(),
             file_path: path.clone(),
             next_row_offset: first_row_id.unwrap_or(0),
+            first_row_id: *first_row_id,
+            data_sequence_number: *data_sequence_number,
         }))
     }
 
@@ -677,6 +769,112 @@ impl ScanAsyncRunner {
             state.next_row_offset = state.next_row_offset.saturating_add(row_count as i64);
         }
 
+        // V3 row-lineage synthesis: _row_id and _last_updated_sequence_number.
+        // Build the value vectors before the slot-attach loop; each vector is
+        // non-empty only when the corresponding slot is requested.
+        //
+        // MoR note: when MoR filtered the chunk, `kept_positions` holds the
+        // absolute data-file row offsets of surviving rows. In that case we
+        // compute per-row fallback values as `first_row_id + kept_positions[i]`
+        // rather than using the sequential `scan_position_start + i` formula.
+        // When no MoR is active, `next_row_offset` was already advanced by
+        // `row_count` in the block above, so `scan_position_start` is
+        // `next_row_offset - first_row_id - row_count`.
+        let want_row_id = state.spec.row_id_slot.is_some();
+        let want_last_updated_seq = state.spec.last_updated_seq_slot.is_some();
+        let (row_ids_vec, seqs_vec) = if want_row_id || want_last_updated_seq {
+            let first_row_id = state.first_row_id.ok_or_else(|| {
+                "_row_id / _last_updated_sequence_number requested but morsel missing first_row_id; \
+                 iceberg base table must be V3 row-lineage with manifest-derived ranges (not files-only path)"
+                    .to_string()
+            })?;
+            let data_seq = if want_last_updated_seq {
+                state.data_sequence_number.ok_or_else(|| {
+                    "_last_updated_sequence_number requested but morsel missing data_sequence_number; \
+                     iceberg base table must be V3 row-lineage with manifest-derived ranges (not files-only path)"
+                        .to_string()
+                })?
+            } else {
+                0
+            };
+            if let Some(positions) = kept_positions {
+                // MoR case: use the absolute file offsets from `kept_positions` as
+                // the per-row position. The synthesis helper checks stored columns first;
+                // for the fallback, offset[i] = positions[i] (relative to file start = 0).
+                // We set scan_position_start=0 and first_row_id to the morsel base, but
+                // override the fallback with kept_positions-derived offsets via a wrapper.
+                let schema = chunk.schema();
+                let columns = chunk.columns();
+                let stored_row_id_idx = if want_row_id {
+                    find_field_by_id(
+                        &schema,
+                        crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                    )
+                } else {
+                    None
+                };
+                let stored_seq_idx = if want_last_updated_seq {
+                    find_field_by_id(
+                        &schema,
+                        crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                    )
+                } else {
+                    None
+                };
+                let row_ids = if want_row_id {
+                    let stored = stored_row_id_idx
+                        .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
+                    positions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &file_pos)| match stored {
+                            Some(arr) if !arr.is_null(i) => arr.value(i),
+                            _ => first_row_id + file_pos,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let seqs = if want_last_updated_seq {
+                    let stored = stored_seq_idx
+                        .and_then(|idx| columns[idx].as_any().downcast_ref::<Int64Array>());
+                    positions
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| match stored {
+                            Some(arr) if !arr.is_null(i) => arr.value(i),
+                            _ => data_seq,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (row_ids, seqs)
+            } else {
+                // Non-MoR case: rows are sequential; next_row_offset was already
+                // advanced by row_count above.
+                let scan_position_start = state.next_row_offset - first_row_id - row_count as i64;
+                synthesize_row_lineage_columns(
+                    &chunk.schema(),
+                    chunk.columns(),
+                    row_count,
+                    first_row_id,
+                    data_seq,
+                    scan_position_start,
+                    want_row_id,
+                    want_last_updated_seq,
+                )
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let row_id_array = state.spec.row_id_slot.map(|_| {
+            Arc::new(Int64Array::from(row_ids_vec)) as ArrayRef
+        });
+        let last_updated_seq_array = state.spec.last_updated_seq_slot.map(|_| {
+            Arc::new(Int64Array::from(seqs_vec)) as ArrayRef
+        });
+
         let mut field_map = HashMap::new();
         let chunk_schema = chunk.schema();
         for (idx, slot_schema) in chunk.chunk_schema().slots().iter().enumerate() {
@@ -723,6 +921,53 @@ impl ScanAsyncRunner {
                     pos_array
                         .as_ref()
                         .expect("pos_array built when slot exists")
+                        .clone(),
+                );
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    field.name().clone(),
+                    field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    None,
+                ));
+                continue;
+            }
+            if Some(*slot_id) == state.spec.row_id_slot {
+                let field = state
+                    .spec
+                    .row_id_field
+                    .as_ref()
+                    .ok_or_else(|| "iceberg _row_id slot missing field metadata".to_string())?;
+                fields.push(field.clone());
+                columns.push(
+                    row_id_array
+                        .as_ref()
+                        .expect("row_id_array built when slot exists")
+                        .clone(),
+                );
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    field.name().clone(),
+                    field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    None,
+                ));
+                continue;
+            }
+            if Some(*slot_id) == state.spec.last_updated_seq_slot {
+                let field = state
+                    .spec
+                    .last_updated_seq_field
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "iceberg _last_updated_sequence_number slot missing field metadata"
+                            .to_string()
+                    })?;
+                fields.push(field.clone());
+                columns.push(
+                    last_updated_seq_array
+                        .as_ref()
+                        .expect("last_updated_seq_array built when slot exists")
                         .clone(),
                 );
                 slot_schemas.push(ChunkSlotSchema::new(
@@ -1270,10 +1515,163 @@ mod tests {
     };
     use crate::exec::operators::scan::dispatch::ScanDispatchState;
     use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
-    use arrow::array::Int32Array;
+    use crate::exec::row_position::IcebergVirtualSpec;
+    use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
+
+    /// Helper: call the production synthesis helper from a RecordBatch fixture.
+    fn synthesize(
+        batch: RecordBatch,
+        first_row_id: i64,
+        data_sequence_number: i64,
+        spec: IcebergVirtualSpec,
+        scan_position_start: i64,
+    ) -> (Vec<i64>, Vec<i64>) {
+        let schema = batch.schema();
+        let columns: Vec<ArrayRef> = batch.columns().iter().cloned().collect();
+        let num_rows = batch.num_rows();
+        synthesize_row_lineage_columns(
+            &schema,
+            &columns,
+            num_rows,
+            first_row_id,
+            data_sequence_number,
+            scan_position_start,
+            spec.row_id_slot.is_some(),
+            spec.last_updated_seq_slot.is_some(),
+        )
+    }
+
+    #[test]
+    fn row_lineage_synthesis_falls_back_when_stored_columns_missing() {
+        let id_field = Field::new("id", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![id_field]));
+        let id = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![id]).unwrap();
+
+        let mut spec = IcebergVirtualSpec::default();
+        spec.row_id_slot = Some(SlotId::new(10));
+        spec.last_updated_seq_slot = Some(SlotId::new(11));
+        let (row_ids, seqs) = synthesize(batch, 100, 9, spec, 0);
+        assert_eq!(row_ids, vec![100, 101, 102]);
+        assert_eq!(seqs, vec![9, 9, 9]);
+    }
+
+    #[test]
+    fn row_id_synthesis_uses_stored_when_all_non_null() {
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let id_field = Field::new("id", DataType::Int64, false);
+        let stored_field = Field::new("_row_id", DataType::Int64, true).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![id_field, stored_field]));
+        let id = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
+        let stored =
+            Arc::new(Int64Array::from(vec![Some(700_i64), Some(800), Some(900)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![id, stored]).unwrap();
+
+        let mut spec = IcebergVirtualSpec::default();
+        spec.row_id_slot = Some(SlotId::new(10));
+        let (row_ids, _seqs) = synthesize(batch, 100, 9, spec, 0);
+        assert_eq!(row_ids, vec![700, 800, 900]);
+    }
+
+    #[test]
+    fn row_id_synthesis_mixed_per_row_null() {
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let stored_field = Field::new("_row_id", DataType::Int64, true).with_metadata(
+            HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )]),
+        );
+        let schema = Arc::new(Schema::new(vec![stored_field]));
+        let stored =
+            Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
+
+        let mut spec = IcebergVirtualSpec::default();
+        spec.row_id_slot = Some(SlotId::new(10));
+        let (row_ids, _seqs) = synthesize(batch, 100, 9, spec, 0);
+        // index 1: 100 + scan_position_start(0) + i(1) = 101
+        assert_eq!(row_ids, vec![700, 101, 900]);
+    }
+
+    #[test]
+    fn last_updated_seq_synthesis_uses_stored_when_present() {
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let stored_field =
+            Field::new("_last_updated_sequence_number", DataType::Int64, true).with_metadata(
+                HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+                        .to_string(),
+                )]),
+            );
+        let schema = Arc::new(Schema::new(vec![stored_field]));
+        let stored =
+            Arc::new(Int64Array::from(vec![Some(11_i64), Some(12), Some(13)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
+
+        let mut spec = IcebergVirtualSpec::default();
+        spec.last_updated_seq_slot = Some(SlotId::new(11));
+        let (_row_ids, seqs) = synthesize(batch, 100, 9, spec, 0);
+        assert_eq!(seqs, vec![11, 12, 13]);
+    }
+
+    #[test]
+    fn last_updated_seq_synthesis_mixed_per_row_null() {
+        use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+        let stored_field =
+            Field::new("_last_updated_sequence_number", DataType::Int64, true).with_metadata(
+                HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    crate::exec::row_position::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+                        .to_string(),
+                )]),
+            );
+        let schema = Arc::new(Schema::new(vec![stored_field]));
+        let stored =
+            Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(13)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![stored]).unwrap();
+
+        let mut spec = IcebergVirtualSpec::default();
+        spec.last_updated_seq_slot = Some(SlotId::new(11));
+        let (_row_ids, seqs) = synthesize(batch, 100, 9, spec, 0);
+        assert_eq!(seqs, vec![11, 9, 13]);
+    }
+
+    #[test]
+    fn row_id_synthesis_advances_with_scan_position_start() {
+        let id_field = Field::new("id", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![id_field]));
+        let id = Arc::new(Int64Array::from(vec![1_i64, 2])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![id]).unwrap();
+
+        let mut spec = IcebergVirtualSpec::default();
+        spec.row_id_slot = Some(SlotId::new(10));
+        // Same file, second chunk: scan_position_start = 7 (rows 0..7 already produced).
+        let (row_ids, _seqs) = synthesize(batch, 100, 9, spec, 7);
+        assert_eq!(row_ids, vec![107, 108]);
+    }
+
+    #[test]
+    fn neither_slot_requested_yields_empty_vectors() {
+        let id_field = Field::new("id", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![id_field]));
+        let id = Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![id]).unwrap();
+
+        let spec = IcebergVirtualSpec::default();
+        let (row_ids, seqs) = synthesize(batch, 100, 9, spec, 0);
+        assert!(row_ids.is_empty());
+        assert!(seqs.is_empty());
+    }
 
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> Arc<ChunkSchema> {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
