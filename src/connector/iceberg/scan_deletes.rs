@@ -32,11 +32,9 @@
 use std::collections::HashMap;
 
 use arrow::array::Array;
-use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
 use roaring::RoaringTreemap;
 
 use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};
@@ -191,6 +189,54 @@ pub(crate) fn read_delete_positions_per_data_file(
     Ok(positions_per_file)
 }
 
+fn positions_to_row_selection(positions: &RoaringTreemap) -> Result<RowSelection, ChangeError> {
+    let mut selectors = Vec::new();
+    let mut next_pos = 0_u64;
+    let mut iter = positions.iter().peekable();
+
+    while let Some(start) = iter.next() {
+        if start > next_pos {
+            selectors.push(RowSelector::skip(
+                usize::try_from(start - next_pos).map_err(|_| {
+                    ChangeError::InternalInconsistency(format!(
+                        "iceberg position-delete skip distance {} exceeds platform usize",
+                        start - next_pos
+                    ))
+                })?,
+            ));
+        }
+
+        let mut end = start.checked_add(1).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg position-delete row position {start} overflows row selection"
+            ))
+        })?;
+        while let Some(peek) = iter.peek().copied() {
+            if peek != end {
+                break;
+            }
+            iter.next();
+            end = end.checked_add(1).ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "iceberg position-delete row position {peek} overflows row selection"
+                ))
+            })?;
+        }
+
+        selectors.push(RowSelector::select(usize::try_from(end - start).map_err(
+            |_| {
+                ChangeError::InternalInconsistency(format!(
+                    "iceberg position-delete select distance {} exceeds platform usize",
+                    end - start
+                ))
+            },
+        )?));
+        next_pos = end;
+    }
+
+    Ok(RowSelection::from(selectors))
+}
+
 /// Open a single data file and project the rows at the positions
 /// listed in `positions`. Returns one `RecordBatch` per parquet
 /// `RecordBatch` boundary that contained at least one matching row.
@@ -229,42 +275,26 @@ pub(crate) fn read_data_file_at_positions(
             "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
         ))
     })?;
-    let reader = builder.build().map_err(|e| {
-        ChangeError::InternalInconsistency(format!(
-            "build parquet reader for {data_file_path}: {e}"
-        ))
-    })?;
+    let row_selection = positions_to_row_selection(positions)?;
+    let reader = builder
+        .with_row_selection(row_selection)
+        .build()
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "build parquet reader for {data_file_path}: {e}"
+            ))
+        })?;
 
     let mut out: Vec<RecordBatch> = Vec::new();
-    let mut row_offset: u64 = 0;
     for batch_result in reader {
         let batch = batch_result.map_err(|e| {
             ChangeError::InternalInconsistency(format!(
                 "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
             ))
         })?;
-        let n = batch.num_rows() as u64;
-        if n == 0 {
-            continue;
+        if batch.num_rows() > 0 {
+            out.push(batch);
         }
-        let mut mask = Vec::with_capacity(batch.num_rows());
-        let mut any_kept = false;
-        for local in 0..n {
-            let global = row_offset + local;
-            let keep = positions.contains(global);
-            mask.push(keep);
-            if keep {
-                any_kept = true;
-            }
-        }
-        if any_kept {
-            let mask_array = BooleanArray::from(mask);
-            let projected = filter_record_batch(&batch, &mask_array).map_err(|e| {
-                ChangeError::InternalInconsistency(format!("filter rows in {data_file_path}: {e}"))
-            })?;
-            out.push(projected);
-        }
-        row_offset += n;
     }
 
     Ok(out)
@@ -395,10 +425,11 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::RowSelector;
     use roaring::RoaringTreemap;
 
     use super::{
-        FILE_PATH_COLUMN, POS_COLUMN, read_data_file_at_positions,
+        FILE_PATH_COLUMN, POS_COLUMN, positions_to_row_selection, read_data_file_at_positions,
         read_delete_positions_per_data_file, read_dv_positions_per_data_file, scan_deletes,
     };
     use crate::connector::iceberg::changes::PositionDeleteRef;
@@ -470,6 +501,28 @@ mod tests {
         write_single_deletion_vector_puffin(&file_io, &path, referenced_data_file, &dv)
             .await
             .expect("write puffin dv")
+    }
+
+    #[test]
+    fn positions_to_row_selection_coalesces_sparse_positions() {
+        let mut positions = RoaringTreemap::new();
+        for pos in [1, 3, 4, 8] {
+            positions.insert(pos);
+        }
+
+        let selection = positions_to_row_selection(&positions).expect("selection");
+        let selectors: Vec<RowSelector> = selection.into();
+        assert_eq!(
+            selectors,
+            vec![
+                RowSelector::skip(1),
+                RowSelector::select(1),
+                RowSelector::skip(1),
+                RowSelector::select(2),
+                RowSelector::skip(3),
+                RowSelector::select(1),
+            ]
+        );
     }
 
     #[test]
