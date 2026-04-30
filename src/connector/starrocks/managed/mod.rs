@@ -11,6 +11,7 @@ pub(crate) mod catalog;
 pub(crate) mod config;
 pub(crate) mod ddl;
 pub(crate) mod erase;
+pub(crate) mod ivm_change_stream;
 pub(crate) mod mv_agg_state;
 pub(crate) mod mv_ddl;
 pub(crate) mod mv_iceberg_catalog;

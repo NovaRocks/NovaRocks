@@ -2,9 +2,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::iceberg::catalog::load_table;
-use crate::connector::iceberg::changes::{materialize_changes, plan_changes};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
+use crate::connector::starrocks::managed::ivm_change_stream::{
+    materialize_iceberg_change_stream, plan_iceberg_change_batch_for_ivm,
+};
 use crate::engine::mv_flow::{
     execute_query_for_mv_incremental_refresh, execute_query_for_mv_refresh,
 };
@@ -150,19 +152,17 @@ pub(crate) fn refresh_mv(
             Ok(StatementResult::Ok)
         },
         |previous_snapshot_id, current_snapshot_id| {
-            let batch = plan_changes(&loaded.table, previous_snapshot_id, &[])
-                .map_err(|e| e.to_string())?;
+            let batch = plan_iceberg_change_batch_for_ivm(
+                &loaded.table,
+                previous_snapshot_id,
+                current_snapshot_id,
+                &[],
+            )?;
             if !batch.deletes.is_empty() {
                 return Err(format!(
                     "iceberg materialized view incremental refresh does not yet support \
                      delete snapshots; {} delete file(s) seen in lineage",
                     batch.deletes.len()
-                ));
-            }
-            if batch.current_snapshot_id != current_snapshot_id {
-                return Err(format!(
-                    "iceberg change batch current snapshot mismatch: expected {current_snapshot_id}, got {}",
-                    batch.current_snapshot_id
                 ));
             }
 
@@ -305,17 +305,19 @@ struct AggregateMvIncrementalRefreshContext<'a> {
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
-    let batch =
-        plan_changes(ctx.base_table, ctx.previous_snapshot_id, &[]).map_err(|e| e.to_string())?;
-    if batch.current_snapshot_id != ctx.current_snapshot_id {
-        return Err(format!(
-            "iceberg change batch current snapshot mismatch: expected {}, got {}",
-            ctx.current_snapshot_id, batch.current_snapshot_id
-        ));
-    }
+    let change_stream = materialize_iceberg_change_stream(
+        ctx.state,
+        ctx.database,
+        ctx.select_sql,
+        ctx.base_ref,
+        ctx.base_table,
+        ctx.previous_snapshot_id,
+        ctx.current_snapshot_id,
+        &[], // PR-4 wires the PK columns once StoredMaterializedView persists them.
+    )?;
 
     // Empty-input early return: nothing to merge, just advance lineage.
-    if batch.inserts.is_empty() && batch.deletes.is_empty() {
+    if change_stream.is_empty() {
         // The refresh metadata write is what advances the lineage marker.
         // PR-3 doesn't yet have a no-op write path that touches metadata
         // without writing chunks; defer to PR-4.
@@ -326,22 +328,10 @@ fn refresh_aggregate_mv_incremental(
         );
     }
 
-    let materialized = materialize_changes(
-        ctx.state,
-        ctx.database,
-        ctx.select_sql,
-        ctx.base_ref,
-        ctx.base_table,
-        batch,
-        &[], // PR-4 wires the PK columns once StoredMaterializedView persists them.
-    )?;
-
     // Build the layout from whichever branch has chunks (both produce identical column shape).
-    let layout_source = if !materialized.inserts.chunks.is_empty() {
-        &materialized.inserts
-    } else {
-        &materialized.deletes
-    };
+    let layout_source = change_stream
+        .first_non_empty_result()
+        .ok_or_else(|| "aggregate MV incremental refresh: empty change stream".to_string())?;
     let output_columns = layout_source
         .columns
         .iter()
@@ -349,10 +339,10 @@ fn refresh_aggregate_mv_incremental(
         .collect::<Result<Vec<_>, String>>()?;
     let layout = super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &output_columns)?;
 
-    let insert_delta =
-        super::mv_agg_state::materialize_aggregate_result_chunks(materialized.inserts, &layout)?;
+    let (inserts, deletes) = change_stream.into_results();
+    let insert_delta = super::mv_agg_state::materialize_aggregate_result_chunks(inserts, &layout)?;
     let delete_delta_positive =
-        super::mv_agg_state::materialize_aggregate_result_chunks(materialized.deletes, &layout)?;
+        super::mv_agg_state::materialize_aggregate_result_chunks(deletes, &layout)?;
     let delete_delta =
         super::mv_agg_state::negate_aggregate_state_chunks(delete_delta_positive, &layout)?;
 
