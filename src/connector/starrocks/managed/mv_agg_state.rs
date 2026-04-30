@@ -967,7 +967,9 @@ fn zero_state_value(state_column: &AggregateStateColumn) -> Option<AggScalarValu
         }
         (AggregateFunctionKind::Sum, AggregateStateRole::Single)
         | (AggregateFunctionKind::Avg, AggregateStateRole::AvgSum) => None,
-        // Min/Max reserved for Task 3 — return None for now.
+        // MIN/MAX have no identity element; the zero state for an empty
+        // merge buffer must be NULL (None). The first incoming non-NULL
+        // delta value will populate it via merge_min_max_state_value.
         (AggregateFunctionKind::Min, _) | (AggregateFunctionKind::Max, _) => None,
         // Catch-all for unexpected combinations.
         (function, role) => {
@@ -1186,9 +1188,7 @@ fn validate_state_column_type(
             | DataType::Decimal128(_, _)
             | DataType::Decimal256(_, _)
             | DataType::Utf8
-            | DataType::LargeUtf8
             | DataType::Date32
-            | DataType::Date64
             | DataType::Timestamp(_, _) => Ok(()),
             DataType::Boolean => Err(format!(
                 "MIN/MAX state type is unsupported for column `{state_name}`: Boolean"
