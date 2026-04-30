@@ -33,7 +33,9 @@ pub type FileScanTaskStream = BoxStream<'static, Result<FileScanTask>>;
 /// Serialization helper that always returns NotImplementedError.
 /// Used for fields that should not be serialized but we want to be explicit about it.
 fn serialize_not_implemented<S, T>(_: &T, _: S) -> std::result::Result<S::Ok, S::Error>
-where S: Serializer {
+where
+    S: Serializer,
+{
     Err(serde::ser::Error::custom(
         "Serialization not implemented for this field",
     ))
@@ -42,7 +44,9 @@ where S: Serializer {
 /// Deserialization helper that always returns NotImplementedError.
 /// Used for fields that should not be deserialized but we want to be explicit about it.
 fn deserialize_not_implemented<'de, D, T>(_: D) -> std::result::Result<T, D::Error>
-where D: serde::Deserializer<'de> {
+where
+    D: serde::Deserializer<'de>,
+{
     Err(serde::de::Error::custom(
         "Deserialization not implemented for this field",
     ))
@@ -68,6 +72,13 @@ pub struct FileScanTask {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_row_id: Option<i64>,
+
+    /// The data file's `data_sequence_number` from its manifest entry.
+    /// Used by `_last_updated_sequence_number` reads as the spec-defined
+    /// fallback when the data file does not physically store the column.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_sequence_number: Option<i64>,
 
     /// The data file path corresponding to the task.
     pub data_file_path: String,

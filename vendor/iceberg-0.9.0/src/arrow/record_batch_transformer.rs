@@ -31,7 +31,8 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
+    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
+    RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
 };
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
@@ -153,6 +154,15 @@ pub(crate) enum ColumnSource {
         /// non-NULL.
         stored_source_index: Option<usize>,
     },
+
+    LastUpdatedSeqNum {
+        /// Spec fallback value: data file's `data_sequence_number` from its
+        /// manifest entry. Used when stored is NULL or absent.
+        fallback_value: i64,
+        /// `Some` when the source RecordBatch physically carries a column
+        /// tagged with the reserved field id.
+        stored_source_index: Option<usize>,
+    },
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
     // renaming fields, deleting fields and reordering fields.
@@ -207,6 +217,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, Datum>,
     first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
 }
 
 impl RecordBatchTransformerBuilder {
@@ -219,11 +230,17 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
             first_row_id: None,
+            data_sequence_number: None,
         }
     }
 
     pub(crate) fn with_first_row_id(mut self, first_row_id: Option<i64>) -> Self {
         self.first_row_id = first_row_id;
+        self
+    }
+
+    pub(crate) fn with_data_sequence_number(mut self, value: Option<i64>) -> Self {
+        self.data_sequence_number = value;
         self
     }
 
@@ -266,6 +283,7 @@ impl RecordBatchTransformerBuilder {
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
             first_row_id: self.first_row_id,
+            data_sequence_number: self.data_sequence_number,
             batch_transform: None,
         }
     }
@@ -310,6 +328,7 @@ pub(crate) struct RecordBatchTransformer {
     // Datum holds both the Iceberg type and the value
     constant_fields: HashMap<i32, Datum>,
     first_row_id: Option<i64>,
+    data_sequence_number: Option<i64>,
 
     // BatchTransform gets lazily constructed based on the schema of
     // the first RecordBatch we receive from the file
@@ -355,6 +374,7 @@ impl RecordBatchTransformer {
                     &self.projected_iceberg_field_ids,
                     &self.constant_fields,
                     self.first_row_id,
+                    self.data_sequence_number,
                 )?);
 
                 self.process_record_batch(record_batch)?
@@ -376,6 +396,7 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, Datum>,
         first_row_id: Option<i64>,
+        data_sequence_number: Option<i64>,
     ) -> Result<BatchTransform> {
         let mapped_unprojected_arrow_schema = Arc::new(schema_to_arrow_schema(snapshot_schema)?);
         let field_id_to_mapped_schema_map =
@@ -386,9 +407,12 @@ impl RecordBatchTransformer {
         let fields: Result<Vec<_>> = projected_iceberg_field_ids
             .iter()
             .map(|field_id| {
-                // NovaRocks patch: `_pos` and `_row_id` are per-row metadata
-                // columns, so they never land in `constant_fields`.
-                if *field_id == RESERVED_FIELD_ID_POS || *field_id == RESERVED_FIELD_ID_ROW_ID {
+                // NovaRocks patch: `_pos`, `_row_id`, and `_last_updated_sequence_number`
+                // are per-row metadata columns, so they never land in `constant_fields`.
+                if *field_id == RESERVED_FIELD_ID_POS
+                    || *field_id == RESERVED_FIELD_ID_ROW_ID
+                    || *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+                {
                     let iceberg_field = get_metadata_field(*field_id).map_err(|e| {
                         Error::new(
                             ErrorKind::Unexpected,
@@ -466,6 +490,7 @@ impl RecordBatchTransformer {
                     field_id_to_mapped_schema_map,
                     constant_fields,
                     first_row_id,
+                    data_sequence_number,
                 )?,
                 target_schema,
             }),
@@ -530,6 +555,7 @@ impl RecordBatchTransformer {
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
         constant_fields: &HashMap<i32, Datum>,
         first_row_id: Option<i64>,
+        data_sequence_number: Option<i64>,
     ) -> Result<Vec<ColumnSource>> {
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
@@ -598,6 +624,34 @@ impl RecordBatchTransformer {
                     return Ok(ColumnSource::RowId {
                         first_row_id,
                         pos_source_index: *pos_source_index,
+                        stored_source_index,
+                    });
+                }
+
+                if *field_id == RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
+                    let fallback_value = data_sequence_number.ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::Unexpected,
+                            "_last_updated_sequence_number metadata column was projected but task is missing data_sequence_number",
+                        )
+                    })?;
+                    let stored_source_index = field_id_to_source_schema_map
+                        .get(&RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
+                        .map(|(field, idx)| {
+                            if !field.data_type().equals_datatype(&DataType::Int64) {
+                                return Err(Error::new(
+                                    ErrorKind::Unexpected,
+                                    format!(
+                                        "stored _last_updated_sequence_number column must be Int64, got {:?}",
+                                        field.data_type()
+                                    ),
+                                ));
+                            }
+                            Ok(*idx)
+                        })
+                        .transpose()?;
+                    return Ok(ColumnSource::LastUpdatedSeqNum {
+                        fallback_value,
                         stored_source_index,
                     });
                 }
@@ -745,6 +799,15 @@ impl RecordBatchTransformer {
                         &columns[*pos_source_index],
                         stored_source_index.map(|idx| &columns[idx]),
                     )?,
+
+                    ColumnSource::LastUpdatedSeqNum {
+                        fallback_value,
+                        stored_source_index,
+                    } => Self::create_last_updated_seq_column(
+                        *fallback_value,
+                        num_rows,
+                        stored_source_index.map(|idx| &columns[idx]),
+                    )?,
                 })
             })
             .collect()
@@ -811,6 +874,39 @@ impl RecordBatchTransformer {
         Ok(Arc::new(Int64Array::from(row_ids?)))
     }
 
+    fn create_last_updated_seq_column(
+        fallback_value: i64,
+        num_rows_when_no_columns: usize,
+        stored_column: Option<&ArrayRef>,
+    ) -> Result<ArrayRef> {
+        if let Some(stored_arr) = stored_column {
+            let stored = stored_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "stored _last_updated_sequence_number column must be Int64, got {:?}",
+                            stored_arr.data_type()
+                        ),
+                    )
+                })?;
+            let values: Vec<i64> = (0..stored.len())
+                .map(|i| {
+                    if stored.is_null(i) {
+                        fallback_value
+                    } else {
+                        stored.value(i)
+                    }
+                })
+                .collect();
+            return Ok(Arc::new(Int64Array::from(values)));
+        }
+        let values = vec![fallback_value; num_rows_when_no_columns];
+        Ok(Arc::new(Int64Array::from(values)))
+    }
+
     fn create_column(
         target_type: &DataType,
         prim_lit: &Option<PrimitiveLiteral>,
@@ -865,7 +961,10 @@ mod test {
     use crate::arrow::record_batch_transformer::{
         RecordBatchTransformer, RecordBatchTransformerBuilder,
     };
-    use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID};
+    use crate::metadata_columns::{
+        RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
+        RESERVED_FIELD_ID_ROW_ID,
+    };
     use crate::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, Type};
 
     /// Helper to extract string values from either StringArray or RunEndEncoded<StringArray>
@@ -2057,5 +2156,101 @@ mod test {
             .process_record_batch(batch)
             .expect_err("must fail");
         assert!(format!("{err}").contains("stored _row_id column must be Int64"));
+    }
+
+    #[test]
+    fn last_updated_seq_uses_stored_column_when_present() {
+        let stored_field = Field::new("_last_updated_sequence_number", DataType::Int64, true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER.to_string(),
+            )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![stored_field]));
+        let stored = Arc::new(Int64Array::from(vec![Some(11_i64), Some(12), Some(13)])) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema, vec![stored]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer = RecordBatchTransformerBuilder::new(
+            snapshot_schema,
+            &[RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        )
+        .with_data_sequence_number(Some(99))
+        .build();
+        let out = transformer.process_record_batch(batch).expect("process ok");
+
+        let seqs = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(seqs.values(), &[11_i64, 12, 13]);
+    }
+
+    #[test]
+    fn last_updated_seq_falls_back_when_stored_is_null_per_row() {
+        let stored_field = Field::new("_last_updated_sequence_number", DataType::Int64, true)
+            .with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER.to_string(),
+            )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![stored_field]));
+        let stored = Arc::new(Int64Array::from(vec![Some(11_i64), None, Some(13)])) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema, vec![stored]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer = RecordBatchTransformerBuilder::new(
+            snapshot_schema,
+            &[RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        )
+        .with_data_sequence_number(Some(99))
+        .build();
+        let out = transformer.process_record_batch(batch).expect("ok");
+
+        let seqs = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(seqs.values(), &[11_i64, 99, 13]);
+    }
+
+    #[test]
+    fn last_updated_seq_falls_back_when_stored_column_missing() {
+        // Minimal carrier column so the RecordBatch knows row count.
+        let pos_field =
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![pos_field]));
+        let pos = Arc::new(Int64Array::from(vec![0_i64, 1, 2])) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema, vec![pos]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer = RecordBatchTransformerBuilder::new(
+            snapshot_schema,
+            &[RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        )
+        .with_data_sequence_number(Some(99))
+        .build();
+        let out = transformer.process_record_batch(batch).expect("ok");
+
+        let seqs = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(seqs.values(), &[99_i64, 99, 99]);
+    }
+
+    #[test]
+    fn last_updated_seq_fails_when_data_sequence_number_missing() {
+        let pos_field =
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )]));
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![pos_field]));
+        let pos = Arc::new(Int64Array::from(vec![0_i64])) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema, vec![pos]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer = RecordBatchTransformerBuilder::new(
+            snapshot_schema,
+            &[RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        )
+        .build();
+        let err = transformer
+            .process_record_batch(batch)
+            .expect_err("must fail");
+        assert!(format!("{err}").contains("missing data_sequence_number"));
     }
 }

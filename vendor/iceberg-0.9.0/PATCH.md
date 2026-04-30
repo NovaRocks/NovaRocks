@@ -150,6 +150,32 @@ When this lands upstream (tracked under
 or successor) the helper can be deleted in favour of the upstream Puffin
 loader.
 
+## Patch 5 — `_last_updated_sequence_number` virtual column
+
+iceberg-rust 0.9 declares `_last_updated_sequence_number` in
+[`src/metadata_columns.rs`](src/metadata_columns.rs:65) but neither
+`FileScanTask` nor `RecordBatchTransformer` carry the data-file
+`data_sequence_number` needed to implement the column's spec-defined
+fallback. This patch wires the field through.
+
+Concretely:
+
+* `FileScanTask` gains `data_sequence_number: Option<i64>` populated from
+  the manifest entry's `data_sequence_number()` in
+  `scan/context.rs::into_file_scan_task`.
+* `RecordBatchTransformerBuilder::with_data_sequence_number(Option<i64>)`
+  threads the value to the transformer.
+* New `ColumnSource::LastUpdatedSeqNum { fallback_value, stored_source_index }`
+  variant: when the parquet file physically stores a column tagged with
+  `RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER`, non-NULL stored values
+  take precedence; NULL/missing rows use the file's
+  `data_sequence_number` as the spec-defined fallback.
+* `arrow/reader.rs` calls `with_data_sequence_number(task.data_sequence_number)`
+  on every transformer-builder chain so the value reaches the dispatch.
+
+Spec ref: <https://iceberg.apache.org/spec/#row-lineage> —
+`_last_updated_sequence_number` = 2147483539 = `i32::MAX - 108`.
+
 ## Verification after rebase
 
 When bumping the vendored copy to a newer iceberg-rust patch release:

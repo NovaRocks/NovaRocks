@@ -368,7 +368,8 @@ impl ArrowReader {
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder =
             RecordBatchTransformerBuilder::new(task.schema_ref(), task.project_field_ids())
-                .with_first_row_id(task.first_row_id);
+                .with_first_row_id(task.first_row_id)
+                .with_data_sequence_number(task.data_sequence_number);
 
         // Add the _file metadata column if it's in the projected fields
         if task.project_field_ids().contains(&RESERVED_FIELD_ID_FILE) {
@@ -592,7 +593,10 @@ impl ArrowReader {
                 // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
                 // to columns without field id"
                 // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
-                apply_name_mapping_to_arrow_schema(Arc::clone(arrow_metadata.schema()), name_mapping)?
+                apply_name_mapping_to_arrow_schema(
+                    Arc::clone(arrow_metadata.schema()),
+                    name_mapping,
+                )?
             } else {
                 // Branch 3: No name mapping - use position-based fallback IDs
                 // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
@@ -604,16 +608,20 @@ impl ArrowReader {
             ArrowReaderOptions::new()
         };
 
-        let arrow_reader_options = Self::with_virtual_columns(arrow_reader_options, virtual_columns)?;
+        let arrow_reader_options =
+            Self::with_virtual_columns(arrow_reader_options, virtual_columns)?;
         let arrow_metadata = if missing_field_ids || has_virtual_columns {
-            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), arrow_reader_options)
-                .map_err(|e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to create ArrowReaderMetadata with field ID schema",
-                    )
-                    .with_source(e)
-                })?
+            ArrowReaderMetadata::try_new(
+                Arc::clone(arrow_metadata.metadata()),
+                arrow_reader_options,
+            )
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to create ArrowReaderMetadata with field ID schema",
+                )
+                .with_source(e)
+            })?
         } else {
             arrow_metadata
         };
@@ -2256,27 +2264,30 @@ message schema {
     async fn test_predicate_cast_literal() {
         let predicates = vec![
             // a == 'foo'
-            (Reference::new("a").equal_to(Datum::string("foo")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").equal_to(Datum::string("foo")),
+                vec![Some("foo".to_string())],
+            ),
             // a != 'foo'
             (
                 Reference::new("a").not_equal_to(Datum::string("foo")),
                 vec![Some("bar".to_string())],
             ),
             // STARTS_WITH(a, 'foo')
-            (Reference::new("a").starts_with(Datum::string("f")), vec![
-                Some("foo".to_string()),
-            ]),
+            (
+                Reference::new("a").starts_with(Datum::string("f")),
+                vec![Some("foo".to_string())],
+            ),
             // NOT STARTS_WITH(a, 'foo')
             (
                 Reference::new("a").not_starts_with(Datum::string("f")),
                 vec![Some("bar".to_string())],
             ),
             // a < 'foo'
-            (Reference::new("a").less_than(Datum::string("foo")), vec![
-                Some("bar".to_string()),
-            ]),
+            (
+                Reference::new("a").less_than(Datum::string("foo")),
+                vec![Some("bar".to_string())],
+            ),
             // a <= 'foo'
             (
                 Reference::new("a").less_than_or_equal_to(Datum::string("foo")),
@@ -2340,6 +2351,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -2592,17 +2604,20 @@ message schema {
         let file_path = format!("{table_location}/multi_row_group.parquet");
 
         // Force each batch into its own row group for testing byte range filtering.
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (0..100).collect::<Vec<i32>>(),
-        ))])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((0..100).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (100..200).collect::<Vec<i32>>(),
-        ))])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((100..200).collect::<Vec<i32>>()))],
+        )
         .unwrap();
-        let batch3 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(Int32Array::from(
-            (200..300).collect::<Vec<i32>>(),
-        ))])
+        let batch3 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from((200..300).collect::<Vec<i32>>()))],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -2664,6 +2679,7 @@ message schema {
             length: row_group_0.compressed_size() as u64,
             record_count: Some(100),
             first_row_id: None,
+            data_sequence_number: None,
             data_file_path: file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -2683,6 +2699,7 @@ message schema {
             length: file_end - rg1_start,
             record_count: Some(200),
             first_row_id: None,
+            data_sequence_number: None,
             data_file_path: file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: schema.clone(),
@@ -2815,6 +2832,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/old_file.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: new_schema.clone(),
@@ -2912,14 +2930,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -2958,10 +2978,13 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![199i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![199i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -2984,6 +3007,7 @@ message schema {
             length: 0,
             record_count: Some(200),
             first_row_id: None,
+            data_sequence_number: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3081,9 +3105,10 @@ message schema {
         ]));
 
         let data_file_path = format!("{table_location}/data.parquet");
-        let data_batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(10..=15),
-        )])
+        let data_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(10..=15))],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -3105,14 +3130,17 @@ message schema {
                 FIELD_ID_POSITIONAL_DELETE_POS.to_string(),
             )])),
         ]));
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![
-                data_file_path.clone(),
-                data_file_path.clone(),
-                data_file_path.clone(),
-            ])),
-            Arc::new(Int64Array::from_iter_values(vec![0_i64, 2, 4])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![
+                    data_file_path.clone(),
+                    data_file_path.clone(),
+                    data_file_path.clone(),
+                ])),
+                Arc::new(Int64Array::from_iter_values(vec![0_i64, 2, 4])),
+            ],
+        )
         .unwrap();
 
         let delete_file = File::create(&delete_file_path).unwrap();
@@ -3127,6 +3155,7 @@ message schema {
             length: 0,
             record_count: Some(6),
             first_row_id: None,
+            data_sequence_number: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3228,9 +3257,10 @@ message schema {
         ]));
 
         let data_file_path = format!("{table_location}/data.parquet");
-        let data_batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(10..=15),
-        )])
+        let data_batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(10..=15))],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -3252,14 +3282,17 @@ message schema {
                 FIELD_ID_POSITIONAL_DELETE_POS.to_string(),
             )])),
         ]));
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![
-                data_file_path.clone(),
-                data_file_path.clone(),
-                data_file_path.clone(),
-            ])),
-            Arc::new(Int64Array::from_iter_values(vec![0_i64, 2, 4])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![
+                    data_file_path.clone(),
+                    data_file_path.clone(),
+                    data_file_path.clone(),
+                ])),
+                Arc::new(Int64Array::from_iter_values(vec![0_i64, 2, 4])),
+            ],
+        )
         .unwrap();
 
         let delete_file = File::create(&delete_file_path).unwrap();
@@ -3274,6 +3307,7 @@ message schema {
             length: 0,
             record_count: Some(6),
             first_row_id: Some(1000),
+            data_sequence_number: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3393,14 +3427,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -3439,10 +3475,13 @@ message schema {
         ]));
 
         // Delete row at position 199 (0-indexed, so it's the last row: id=200)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![199i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![199i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -3489,6 +3528,7 @@ message schema {
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
             first_row_id: None,
+            data_sequence_number: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3622,14 +3662,16 @@ message schema {
         // Row group 1: rows 100-199 (ids 101-200)
         let data_file_path = format!("{table_location}/data.parquet");
 
-        let batch1 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(1..=100),
-        )])
+        let batch1 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(1..=100))],
+        )
         .unwrap();
 
-        let batch2 = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
-            Int32Array::from_iter_values(101..=200),
-        )])
+        let batch2 = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(101..=200))],
+        )
         .unwrap();
 
         // Force each batch into its own row group
@@ -3668,10 +3710,13 @@ message schema {
         ]));
 
         // Delete row at position 0 (0-indexed, so it's the first row: id=1)
-        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
-            Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
-            Arc::new(Int64Array::from_iter_values(vec![0i64])),
-        ])
+        let delete_batch = RecordBatch::try_new(
+            delete_schema.clone(),
+            vec![
+                Arc::new(StringArray::from_iter_values(vec![data_file_path.clone()])),
+                Arc::new(Int64Array::from_iter_values(vec![0i64])),
+            ],
+        )
         .unwrap();
 
         let delete_props = WriterProperties::builder()
@@ -3707,6 +3752,7 @@ message schema {
             length: rg1_length,
             record_count: Some(100), // Row group 1 has 100 rows
             first_row_id: None,
+            data_sequence_number: None,
             data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             schema: table_schema.clone(),
@@ -3825,6 +3871,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -3901,9 +3948,10 @@ message schema {
         let col3_data = Arc::new(StringArray::from(vec!["c", "d"])) as ArrayRef;
         let col4_data = Arc::new(Int32Array::from(vec![30, 40])) as ArrayRef;
 
-        let to_write = RecordBatch::try_new(arrow_schema.clone(), vec![
-            col1_data, col2_data, col3_data, col4_data,
-        ])
+        let to_write = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![col1_data, col2_data, col3_data, col4_data],
+        )
         .unwrap();
 
         let props = WriterProperties::builder()
@@ -3927,6 +3975,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4018,6 +4067,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4123,6 +4173,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4257,6 +4308,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4358,6 +4410,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4472,6 +4525,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4567,6 +4621,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/file_0.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4586,6 +4641,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/file_1.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4605,6 +4661,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/file_2.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),
@@ -4788,6 +4845,7 @@ message schema {
                 length: 0,
                 record_count: None,
                 first_row_id: None,
+                data_sequence_number: None,
                 data_file_path: format!("{table_location}/data.parquet"),
                 data_file_format: DataFileFormat::Parquet,
                 schema: schema.clone(),

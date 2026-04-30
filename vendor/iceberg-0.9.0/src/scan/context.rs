@@ -122,6 +122,7 @@ impl ManifestEntryContext {
             length: self.manifest_entry.file_size_in_bytes(),
             record_count: Some(self.manifest_entry.record_count()),
             first_row_id: self.manifest_entry.data_file.first_row_id(),
+            data_sequence_number: self.manifest_entry.sequence_number(),
 
             data_file_path: self.manifest_entry.file_path().to_string(),
             data_file_format: self.manifest_entry.file_format(),
