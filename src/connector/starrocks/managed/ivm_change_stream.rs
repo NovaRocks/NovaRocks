@@ -32,13 +32,6 @@ impl IvmChangeStream {
         self.inserts.row_count() == 0 && self.deletes.row_count() == 0
     }
 
-    pub(crate) fn first_non_empty_result(&self) -> Option<&QueryResult> {
-        self.non_empty_branches()
-            .into_iter()
-            .next()
-            .map(|branch| branch.result)
-    }
-
     pub(crate) fn non_empty_branches(&self) -> Vec<IvmChangeBranch<'_>> {
         let mut branches = Vec::with_capacity(2);
         if self.inserts.row_count() > 0 {

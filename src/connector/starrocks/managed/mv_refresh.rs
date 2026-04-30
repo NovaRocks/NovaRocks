@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::connector::iceberg::catalog::load_table;
+use crate::connector::iceberg::changes::ChangeAction;
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::remove_tablet_runtime;
 use crate::connector::starrocks::managed::ivm_change_stream::{
@@ -338,6 +339,18 @@ fn refresh_aggregate_mv_incremental(
         &[], // PR-4 wires the PK columns once StoredMaterializedView persists them.
     )?;
 
+    if change_stream.previous_snapshot_id != ctx.previous_snapshot_id
+        || change_stream.current_snapshot_id != ctx.current_snapshot_id
+    {
+        return Err(format!(
+            "aggregate MV incremental refresh change stream snapshot window mismatch: expected {} -> {}, got {} -> {}",
+            ctx.previous_snapshot_id,
+            ctx.current_snapshot_id,
+            change_stream.previous_snapshot_id,
+            change_stream.current_snapshot_id
+        ));
+    }
+
     // Empty-input early return: nothing to merge, just advance lineage.
     if change_stream.is_empty() {
         // The refresh metadata write is what advances the lineage marker.
@@ -351,14 +364,20 @@ fn refresh_aggregate_mv_incremental(
     }
 
     // Build the layout from whichever branch has chunks (both produce identical column shape).
-    let layout_source = change_stream
-        .first_non_empty_result()
-        .ok_or_else(|| "aggregate MV incremental refresh: empty change stream".to_string())?;
-    let output_columns = layout_source
-        .columns
-        .iter()
-        .map(query_result_column_to_output_column)
-        .collect::<Result<Vec<_>, String>>()?;
+    let output_columns = {
+        let branches = change_stream.non_empty_branches();
+        let layout_branch = branches
+            .first()
+            .ok_or_else(|| "aggregate MV incremental refresh: empty change stream".to_string())?;
+        let layout_source = match layout_branch.action {
+            ChangeAction::Insert | ChangeAction::Delete => layout_branch.result,
+        };
+        layout_source
+            .columns
+            .iter()
+            .map(query_result_column_to_output_column)
+            .collect::<Result<Vec<_>, String>>()?
+    };
     let layout = super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &output_columns)?;
 
     let (inserts, deletes) = change_stream.into_results();
