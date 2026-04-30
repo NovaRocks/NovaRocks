@@ -266,11 +266,23 @@ if base_has_deletes_in_range(prev, cur) && layout_has_min_or_max(layout) {
 }
 ```
 
-### 6.2 base_has_deletes_in_range 的判断
+### 6.2 触发位置（更新）
 
-`plan_changes` 已能返回 `IcebergChangeBatch { inserts, deletes }`，`!batch.deletes.is_empty()` 即为 base 在区间内含 DELETE。
+代码盘点后发现 `mv_refresh.rs:152-161` 现有的 Incremental closure 已经在 `plan_changes` 之后立刻有一个 `if !batch.deletes.is_empty()` 报错分支（当前所有 DELETE 都直接 error，PR-3 时会扩展支持）。
 
-注意：fall-back 决策必须发生在 `plan_changes` 之后（拿到 batch）但在执行 `materialize_changes` 之前。这要求微调现有 `dispatch_mv_refresh_strategy` 的调用顺序——`plan_changes` 提前到 strategy 决定时执行（而非 Incremental 分支内）。
+fall-back 检查最自然的位置就是这个分支：
+
+```rust
+if !batch.deletes.is_empty() {
+    if layout_has_min_or_max(&layout) {
+        log::info!(...);
+        return refresh_mv_full_with_executor(...);  // fall-back to Full
+    }
+    return Err(format!(...));  // existing error
+}
+```
+
+不需要重构 `dispatch_mv_refresh_strategy` / `choose_refresh_strategy` 的签名；改动局部化。
 
 ### 6.3 OVERWRITE 与 fall-back 的关系
 
@@ -458,11 +470,9 @@ commit 5: test: add SQL integration test for AVG/MIN/MAX aggregate IVM
 - 缓解：MIN/MAX merge 时显式 `is_nan()` 处理；单测明确行为
 - 跟 StarRocks 完全对齐工作未来跟进
 
-### 11.4 fall-back 调用顺序（中）
+### 11.4 fall-back 调用顺序（低）
 
-- 现有 `dispatch_mv_refresh_strategy` 的 plan_changes 在 Incremental 分支内调用
-- fall-back 检查需要在分支决定前拿到 batch.deletes
-- 重构：plan_changes 提前到 choose_refresh_strategy；NoOp 分支保持不动
+代码盘点后确认现有 `mv_refresh.rs:155` 的 DELETE error 分支天然就是 fall-back 注入点；不需要重构 `choose_refresh_strategy` 签名。Risk 从「中」降到「低」。
 
 ---
 
