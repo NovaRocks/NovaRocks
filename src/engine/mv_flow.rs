@@ -58,6 +58,73 @@ pub(crate) fn list_mvs(
     Ok(StatementResult::Query(result))
 }
 
+/// Analyze the output column types of a MV SELECT SQL without executing it.
+///
+/// Runs the semantic analyzer on the ORIGINAL (un-rewritten) SQL and returns
+/// the visible output columns. This is used by the aggregate MV refresh path
+/// to obtain visible-shaped types for `build_aggregate_mv_layout`, which expects
+/// types matching `shape.visible_outputs` — not the state-shaped columns that
+/// the rewritten SELECT (AVG → SUM + COUNT) produces.
+pub(crate) fn analyze_visible_output_types(
+    state: &Arc<StandaloneState>,
+    current_database: &str,
+    sql: &str,
+) -> Result<Vec<crate::sql::analysis::OutputColumn>, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
+    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("sql parser error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = statement else {
+        return Err(
+            "aggregate MV visible type analysis: stored SQL must be a SELECT query".to_string(),
+        );
+    };
+
+    // Register iceberg tables referenced by the query so the analyzer can
+    // resolve their column types. Uses the non-forced variant so tables already
+    // present in the local catalog are skipped without touching the iceberg backend.
+    // If registration fails (e.g., iceberg connector unavailable), we only propagate
+    // the error when the table is genuinely missing from the local catalog; if it is
+    // already present the registration failure is harmless and we proceed.
+    let three_parts = extract_three_part_table_refs(&query);
+    if !three_parts.is_empty() {
+        let reg_result = crate::engine::query_prep::register_external_tables_for_query(
+            state,
+            None,
+            current_database,
+            &query,
+        );
+        if let Err(ref reg_err) = reg_result {
+            // Evaluate whether all referenced tables are already resolvable in the
+            // local catalog (after stripping the catalog prefix). If yes, swallow the
+            // registration error because the analyzer will resolve correctly. If not,
+            // propagate it so callers see a meaningful "table not found" error.
+            let catalog = state.catalog.read().expect("standalone catalog read lock");
+            let all_present = three_parts.iter().all(|(_cat, ns, tbl)| {
+                let ns_normalized = crate::engine::catalog::normalize_identifier(ns)
+                    .unwrap_or_else(|_| ns.to_lowercase());
+                let tbl_normalized = crate::engine::catalog::normalize_identifier(tbl)
+                    .unwrap_or_else(|_| tbl.to_lowercase());
+                catalog.get(&ns_normalized, &tbl_normalized).is_ok()
+            });
+            if !all_present {
+                return Err(format!(
+                    "aggregate MV visible type analysis: failed to register iceberg tables: {reg_err}"
+                ));
+            }
+        }
+    }
+
+    let mut analyzable = query.as_ref().clone();
+    if !three_parts.is_empty() {
+        strip_catalog_from_three_part_names(&mut analyzable);
+    }
+    let catalog = state.catalog.read().expect("standalone catalog read lock");
+    let (resolved, _cte_registry) =
+        crate::sql::analyzer::analyze(&analyzable, &*catalog, current_database)
+            .map_err(|e| format!("aggregate MV visible type analysis failed: {e}"))?;
+    Ok(resolved.output_columns)
+}
+
 pub(crate) fn execute_query_for_mv_refresh(
     state: &Arc<StandaloneState>,
     current_database: &str,
