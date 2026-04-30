@@ -30,7 +30,9 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::value::{create_primitive_array_repeated, create_primitive_array_single_element};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
-use crate::metadata_columns::{RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
+};
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
 };
@@ -145,6 +147,11 @@ pub(crate) enum ColumnSource {
     RowId {
         first_row_id: i64,
         pos_source_index: usize,
+        /// `Some` when the source RecordBatch contains a physical column for the
+        /// reserved `_row_id` field id (cross-engine writes); the per-row stored
+        /// value takes precedence over the `first_row_id + _pos` fallback when
+        /// non-NULL.
+        stored_source_index: Option<usize>,
     },
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
@@ -388,12 +395,15 @@ impl RecordBatchTransformer {
                             format!("metadata field lookup failed for field id {field_id}: {e}"),
                         )
                     })?;
-                    let arrow_field =
-                        Field::new(&iceberg_field.name, DataType::Int64, !iceberg_field.required)
-                            .with_metadata(HashMap::from([(
-                                PARQUET_FIELD_ID_META_KEY.to_string(),
-                                iceberg_field.id.to_string(),
-                            )]));
+                    let arrow_field = Field::new(
+                        &iceberg_field.name,
+                        DataType::Int64,
+                        !iceberg_field.required,
+                    )
+                    .with_metadata(HashMap::from([(
+                        PARQUET_FIELD_ID_META_KEY.to_string(),
+                        iceberg_field.id.to_string(),
+                    )]));
                     return Ok(Arc::new(arrow_field));
                 }
 
@@ -561,7 +571,7 @@ impl RecordBatchTransformer {
                             format!("first_row_id must be non-negative, got {first_row_id}"),
                         ));
                     }
-                    let (source_field, source_index) = field_id_to_source_schema_map
+                    let (_pos_field, pos_source_index) = field_id_to_source_schema_map
                         .get(&RESERVED_FIELD_ID_POS)
                         .ok_or_else(|| {
                             Error::new(
@@ -569,18 +579,26 @@ impl RecordBatchTransformer {
                                 "_row_id metadata column was projected but the Parquet reader did not provide a RowNumber source column",
                             )
                         })?;
-                    if !source_field.data_type().equals_datatype(&DataType::Int64) {
-                        return Err(Error::new(
-                            ErrorKind::Unexpected,
-                            format!(
-                                "_row_id RowNumber source column must be Int64, got {:?}",
-                                source_field.data_type()
-                            ),
-                        ));
-                    }
+                    // NEW: detect stored _row_id column by reserved field id.
+                    let stored_source_index = field_id_to_source_schema_map
+                        .get(&RESERVED_FIELD_ID_ROW_ID)
+                        .map(|(field, idx)| {
+                            if !field.data_type().equals_datatype(&DataType::Int64) {
+                                return Err(Error::new(
+                                    ErrorKind::Unexpected,
+                                    format!(
+                                        "stored _row_id column must be Int64, got {:?}",
+                                        field.data_type()
+                                    ),
+                                ));
+                            }
+                            Ok(*idx)
+                        })
+                        .transpose()?;
                     return Ok(ColumnSource::RowId {
                         first_row_id,
-                        pos_source_index: *source_index,
+                        pos_source_index: *pos_source_index,
+                        stored_source_index,
                     });
                 }
 
@@ -721,13 +739,22 @@ impl RecordBatchTransformer {
                     ColumnSource::RowId {
                         first_row_id,
                         pos_source_index,
-                    } => Self::create_row_id_column(*first_row_id, &columns[*pos_source_index])?,
+                        stored_source_index,
+                    } => Self::create_row_id_column(
+                        *first_row_id,
+                        &columns[*pos_source_index],
+                        stored_source_index.map(|idx| &columns[idx]),
+                    )?,
                 })
             })
             .collect()
     }
 
-    fn create_row_id_column(first_row_id: i64, position_column: &ArrayRef) -> Result<ArrayRef> {
+    fn create_row_id_column(
+        first_row_id: i64,
+        position_column: &ArrayRef,
+        stored_column: Option<&ArrayRef>,
+    ) -> Result<ArrayRef> {
         let positions = position_column
             .as_any()
             .downcast_ref::<Int64Array>()
@@ -741,13 +768,33 @@ impl RecordBatchTransformer {
                 )
             })?;
 
+        let stored = stored_column
+            .map(|arr| {
+                arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        format!(
+                            "stored _row_id column must be Int64, got {:?}",
+                            arr.data_type()
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
+
         let row_ids: Result<Vec<i64>> = positions
             .iter()
-            .map(|position| {
+            .enumerate()
+            .map(|(i, position)| {
+                if let Some(stored_arr) = stored {
+                    if !stored_arr.is_null(i) {
+                        return Ok(stored_arr.value(i));
+                    }
+                }
                 let position = position.ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        "_row_id RowNumber source column contained null",
+                        "_row_id RowNumber source column contained null in fallback row",
                     )
                 })?;
                 first_row_id.checked_add(position).ok_or_else(|| {
@@ -809,8 +856,8 @@ mod test {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        Array, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
-        StringArray,
+        Array, ArrayRef, Date32Array, Float32Array, Float64Array, Int32Array, Int64Array,
+        RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -998,14 +1045,17 @@ mod test {
             simple_field("name", DataType::Utf8, true, "2"),
         ]));
 
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec![
-                Some("Alice"),
-                Some("Bob"),
-                Some("Charlie"),
-            ])),
-        ])
+        let file_batch = RecordBatch::try_new(
+            file_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec![
+                    Some("Alice"),
+                    Some("Bob"),
+                    Some("Charlie"),
+                ])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
@@ -1079,10 +1129,13 @@ mod test {
             simple_field("data", DataType::Utf8, false, "2"),
         ]));
 
-        let file_batch = RecordBatch::try_new(file_schema, vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["a", "b", "c"])),
-        ])
+        let file_batch = RecordBatch::try_new(
+            file_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(file_batch).unwrap();
@@ -1153,27 +1206,30 @@ mod test {
     }
 
     pub fn expected_record_batch_migration_required() -> RecordBatch {
-        RecordBatch::try_new(arrow_schema_already_same_as_target(), vec![
-            Arc::new(StringArray::from(Vec::<Option<String>>::from([
-                None, None, None,
-            ]))), // a
-            Arc::new(Int64Array::from(vec![Some(1001), Some(1002), Some(1003)])), // b
-            Arc::new(Float64Array::from(vec![
-                Some(12.125),
-                Some(23.375),
-                Some(34.875),
-            ])), // c
-            Arc::new(StringArray::from(vec![
-                Some("Apache"),
-                Some("Iceberg"),
-                Some("Rocks"),
-            ])), // e (d skipped by projection)
-            Arc::new(StringArray::from(vec![
-                Some("(╯°□°）╯"),
-                Some("(╯°□°）╯"),
-                Some("(╯°□°）╯"),
-            ])), // f
-        ])
+        RecordBatch::try_new(
+            arrow_schema_already_same_as_target(),
+            vec![
+                Arc::new(StringArray::from(Vec::<Option<String>>::from([
+                    None, None, None,
+                ]))), // a
+                Arc::new(Int64Array::from(vec![Some(1001), Some(1002), Some(1003)])), // b
+                Arc::new(Float64Array::from(vec![
+                    Some(12.125),
+                    Some(23.375),
+                    Some(34.875),
+                ])), // c
+                Arc::new(StringArray::from(vec![
+                    Some("Apache"),
+                    Some("Iceberg"),
+                    Some("Rocks"),
+                ])), // e (d skipped by projection)
+                Arc::new(StringArray::from(vec![
+                    Some("(╯°□°）╯"),
+                    Some("(╯°□°）╯"),
+                    Some("(╯°□°）╯"),
+                ])), // f
+            ],
+        )
         .unwrap()
     }
 
@@ -1291,10 +1347,13 @@ mod test {
             RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
 
         // Create a Parquet RecordBatch with data for: name="John Doe", subdept="communications"
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(StringArray::from(vec!["John Doe"])),
-            Arc::new(StringArray::from(vec!["communications"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["John Doe"])),
+                Arc::new(StringArray::from(vec!["communications"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1421,10 +1480,13 @@ mod test {
 
         // Create a Parquet RecordBatch with actual data
         // The id column MUST be read from here, not treated as a constant
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200, 300])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1540,10 +1602,13 @@ mod test {
                 .expect("Failed to add partition constants")
                 .build();
 
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1651,10 +1716,13 @@ mod test {
 
         // Create a Parquet RecordBatch with actual data
         // Despite column rename, data should be read via field_id=1
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200, 300])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1754,10 +1822,13 @@ mod test {
                 .expect("Failed to add partition constants")
                 .build();
 
-        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
-            Arc::new(Int32Array::from(vec![100, 200])),
-            Arc::new(StringArray::from(vec!["value1", "value2"])),
-        ])
+        let parquet_batch = RecordBatch::try_new(
+            parquet_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["value1", "value2"])),
+            ],
+        )
         .unwrap();
 
         let result = transformer.process_record_batch(parquet_batch).unwrap();
@@ -1869,5 +1940,122 @@ mod test {
         assert!(data_col.is_null(0));
         assert!(data_col.is_null(1));
         assert!(data_col.is_null(2));
+    }
+
+    #[test]
+    fn row_id_uses_stored_column_when_all_non_null() {
+        let stored_field =
+            Field::new("_row_id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )]));
+        let pos_field =
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![pos_field, stored_field]));
+
+        let pos = Arc::new(Int64Array::from(vec![0_i64, 1, 2])) as ArrayRef;
+        let stored =
+            Arc::new(Int64Array::from(vec![Some(700_i64), Some(800), Some(900)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![pos, stored]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &[RESERVED_FIELD_ID_ROW_ID])
+                .with_first_row_id(Some(100))
+                .build();
+        let out = transformer.process_record_batch(batch).expect("process ok");
+
+        let row_ids = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row_ids.value(0), 700);
+        assert_eq!(row_ids.value(1), 800);
+        assert_eq!(row_ids.value(2), 900);
+    }
+
+    #[test]
+    fn row_id_falls_back_when_stored_is_null_per_row() {
+        let pos_field =
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )]));
+        let stored_field =
+            Field::new("_row_id", DataType::Int64, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![pos_field, stored_field]));
+
+        let pos = Arc::new(Int64Array::from(vec![0_i64, 1, 2])) as ArrayRef;
+        let stored = Arc::new(Int64Array::from(vec![Some(700_i64), None, Some(900)])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![pos, stored]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &[RESERVED_FIELD_ID_ROW_ID])
+                .with_first_row_id(Some(100))
+                .build();
+        let out = transformer.process_record_batch(batch).expect("process ok");
+
+        let row_ids = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row_ids.value(0), 700);
+        assert_eq!(row_ids.value(1), 101); // fallback: 100 + pos(1)
+        assert_eq!(row_ids.value(2), 900);
+    }
+
+    #[test]
+    fn row_id_falls_back_when_stored_column_missing() {
+        let pos_field =
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![pos_field]));
+
+        let pos = Arc::new(Int64Array::from(vec![0_i64, 1, 2])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![pos]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &[RESERVED_FIELD_ID_ROW_ID])
+                .with_first_row_id(Some(50))
+                .build();
+        let out = transformer.process_record_batch(batch).expect("process ok");
+
+        let row_ids = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row_ids.values(), &[50_i64, 51, 52]);
+    }
+
+    #[test]
+    fn row_id_fails_when_stored_column_is_wrong_type() {
+        use arrow_array::Int32Array;
+
+        let pos_field =
+            Field::new("_pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_POS.to_string(),
+            )]));
+        let stored_field =
+            Field::new("_row_id", DataType::Int32, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                RESERVED_FIELD_ID_ROW_ID.to_string(),
+            )]));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![pos_field, stored_field]));
+
+        let pos = Arc::new(Int64Array::from(vec![0_i64])) as ArrayRef;
+        let stored = Arc::new(Int32Array::from(vec![1_i32])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![pos, stored]).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &[RESERVED_FIELD_ID_ROW_ID])
+                .with_first_row_id(Some(0))
+                .build();
+        let err = transformer
+            .process_record_batch(batch)
+            .expect_err("must fail");
+        assert!(format!("{err}").contains("stored _row_id column must be Int64"));
     }
 }

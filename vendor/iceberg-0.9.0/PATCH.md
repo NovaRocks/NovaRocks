@@ -79,6 +79,13 @@ Concretely:
 * `delete_file_loader.rs` calls the shared parquet-open helper with no virtual
   columns so position-delete file loading keeps the old behavior.
 
+* `_row_id` stored-column override: when the parquet file physically contains a
+  column tagged with `RESERVED_FIELD_ID_ROW_ID`, `generate_transform_operations`
+  records its source index in `ColumnSource::RowId::stored_source_index`. At
+  per-row materialization, non-NULL stored values take precedence over the
+  `first_row_id + _pos` fallback. NULL stored values, missing stored columns,
+  and the previous-patch-3 path all fall back unchanged.
+
 No public API renames; downstream callers just see `_pos` and `_row_id`
 working across both plain scans and row-selection scans.
 
