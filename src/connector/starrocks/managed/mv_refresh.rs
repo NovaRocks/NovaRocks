@@ -300,15 +300,20 @@ fn refresh_aggregate_mv_full(
     mv_name: &str,
     shape: &super::mv_shape::AggregateMvShape,
 ) -> Result<StatementResult, String> {
-    refresh_mv_full_with_executor(state, database, mv_name, |ctx| {
-        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &ctx.select_sql)?;
+    let shape = shape.clone();
+    refresh_mv_full_with_executor(state, database, mv_name, move |ctx| {
+        // Rewrite the SELECT to emit state columns instead of visible aggregate results.
+        // For AVG, this replaces AVG(expr) with SUM(expr), COUNT(expr) so the executor
+        // output is state-shaped (group keys + state columns) rather than visible-shaped.
+        let state_sql = super::mv_shape::rewrite_select_sql_for_state(&ctx.select_sql, &shape)?;
+        let result = execute_query_for_mv_refresh(&ctx.state, &ctx.database, &state_sql)?;
         let output_columns = result
             .columns
             .iter()
             .map(query_result_column_to_output_column)
             .collect::<Result<Vec<_>, String>>()?;
-        let layout = super::mv_agg_state::build_aggregate_mv_layout(shape, &output_columns)?;
-        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout)
+        let layout = super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
+        super::mv_agg_state::materialize_aggregate_result_chunks(result, &layout, &shape)
     })
 }
 
@@ -328,10 +333,11 @@ struct AggregateMvIncrementalRefreshContext<'a> {
 fn refresh_aggregate_mv_incremental(
     ctx: AggregateMvIncrementalRefreshContext<'_>,
 ) -> Result<StatementResult, String> {
+    let state_sql = super::mv_shape::rewrite_select_sql_for_state(ctx.select_sql, ctx.shape)?;
     let change_stream = materialize_iceberg_change_stream(
         ctx.state,
         ctx.database,
-        ctx.select_sql,
+        &state_sql,
         ctx.base_ref,
         ctx.base_table,
         ctx.previous_snapshot_id,
@@ -381,9 +387,16 @@ fn refresh_aggregate_mv_incremental(
     let layout = super::mv_agg_state::build_aggregate_mv_layout(ctx.shape, &output_columns)?;
 
     let (inserts, deletes) = change_stream.into_results();
-    let insert_delta = super::mv_agg_state::materialize_aggregate_result_chunks(inserts, &layout)?;
-    let delete_delta_positive =
-        super::mv_agg_state::materialize_aggregate_result_chunks(deletes, &layout)?;
+    let insert_delta = super::mv_agg_state::materialize_aggregate_result_chunks(
+        inserts,
+        &layout,
+        ctx.shape,
+    )?;
+    let delete_delta_positive = super::mv_agg_state::materialize_aggregate_result_chunks(
+        deletes,
+        &layout,
+        ctx.shape,
+    )?;
     let delete_delta =
         super::mv_agg_state::negate_aggregate_state_chunks(delete_delta_positive, &layout)?;
 
@@ -1007,7 +1020,7 @@ mod tests {
                 let layout =
                     super::super::mv_agg_state::build_aggregate_mv_layout(&shape, &output_columns)?;
                 let chunks = super::super::mv_agg_state::materialize_aggregate_result_chunks(
-                    result, &layout,
+                    result, &layout, &shape,
                 )?;
                 assert_eq!(chunks.len(), 1);
                 assert_eq!(chunks[0].batch.num_columns(), layout.physical_columns.len());

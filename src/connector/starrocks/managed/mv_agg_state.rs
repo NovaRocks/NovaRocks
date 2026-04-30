@@ -240,11 +240,12 @@ pub(crate) fn build_aggregate_mv_layout(
 pub(crate) fn materialize_aggregate_result_chunks(
     result: QueryResult,
     layout: &AggregateMvLayout,
+    shape: &AggregateMvShape,
 ) -> Result<Vec<Chunk>, String> {
     result
         .chunks
         .into_iter()
-        .map(|chunk| materialize_aggregate_result_batch(&chunk.batch, layout))
+        .map(|chunk| materialize_aggregate_result_batch(&chunk.batch, layout, shape))
         .collect()
 }
 
@@ -368,54 +369,159 @@ fn all_count_states_zero(row: &AggregatePhysicalRow, layout: &AggregateMvLayout)
     saw_count
 }
 
+/// Materialize a state-shaped executor result batch into a physical batch.
+///
+/// **State-shaped input**: the executor output after `rewrite_select_sql_for_state` has been
+/// applied. Column layout (in `shape.visible_outputs` order):
+/// - GroupKey columns: one column per group key, in the order they appear in the projection.
+/// - Single-role aggregate (COUNT, SUM, MIN, MAX): one column per aggregate, carrying the
+///   state value directly (visible == state for these functions).
+/// - AVG aggregate: two consecutive columns — AvgSum first, then AvgCount — replacing the
+///   one AVG-result column that the un-rewritten query would have produced.
+///
+/// The output is a physical batch in `physical_schema(layout)` layout:
+/// `[__row_id__, visible_cols..., state_cols...]`.
 fn materialize_aggregate_result_batch(
     batch: &RecordBatch,
     layout: &AggregateMvLayout,
+    shape: &AggregateMvShape,
 ) -> Result<Chunk, String> {
-    if batch.num_columns() != layout.visible_columns.len() {
+    let (group_key_batch_cols, state_col_batch_cols) = compute_batch_col_indexes(shape, layout);
+
+    let expected = shape.group_keys.len() + layout.state_columns.len();
+    if batch.num_columns() != expected {
         return Err(format!(
-            "aggregate MV materialize column count mismatch: batch_columns={} visible_columns={}",
+            "aggregate MV materialize column count mismatch: \
+             batch_columns={} expected={expected} \
+             (group_keys={} + state_columns={})",
             batch.num_columns(),
-            layout.visible_columns.len()
+            shape.group_keys.len(),
+            layout.state_columns.len()
         ));
     }
-    // Validate that no AVG state columns are present — AVG materialization
-    // requires a SQL rewrite (sum/count sub-queries) that is handled in Task 4/5.
-    // Returning a clear error here prevents silent data corruption from trying
-    // to copy Float64 AVG values into Int64 sum state.
-    for state_column in &layout.state_columns {
-        if matches!(
-            state_column.state_role,
-            AggregateStateRole::AvgSum | AggregateStateRole::AvgCount
-        ) {
-            return Err(
-                "aggregate MV full-refresh materialization of AVG is not yet supported; \
-                 AVG requires SQL rewrite to sum/count sub-queries (Task 4/5)"
-                    .to_string(),
-            );
+
+    let num_rows = batch.num_rows();
+    let num_state_cols = layout.state_columns.len();
+    let num_visible_cols = layout.visible_columns.len();
+
+    // Collect all state column values row by row.
+    let mut all_state_values: Vec<Vec<Option<AggScalarValue>>> =
+        vec![Vec::with_capacity(num_rows); num_state_cols];
+    for (sc_idx, &batch_col) in state_col_batch_cols.iter().enumerate() {
+        let column = batch.column(batch_col);
+        for row in 0..num_rows {
+            all_state_values[sc_idx].push(agg_scalar_from_array(column, row)?);
         }
     }
-    let mut arrays =
-        Vec::with_capacity(1 + layout.visible_columns.len() + layout.state_columns.len());
-    arrays.push(build_row_id_array(batch, &layout.group_key_source_indexes)?);
-    arrays.extend(batch.columns().iter().cloned());
-    for state_column in &layout.state_columns {
-        let array = batch.column(state_column.visible_source_index).clone();
-        arrays.push(array);
+
+    // Map visible_source_index → batch column index for group key columns.
+    let mut group_key_visible_to_batch: HashMap<usize, usize> = HashMap::new();
+    for (gk_idx, &visible_src) in layout.group_key_source_indexes.iter().enumerate() {
+        group_key_visible_to_batch.insert(visible_src, group_key_batch_cols[gk_idx]);
     }
+
+    // Derive all visible values per row.
+    let mut all_visible_values: Vec<Vec<Option<AggScalarValue>>> =
+        vec![Vec::with_capacity(num_rows); num_visible_cols];
+    for row in 0..num_rows {
+        let state_values: Vec<Option<AggScalarValue>> = all_state_values
+            .iter()
+            .map(|col| col[row].clone())
+            .collect();
+        let mut scratch = AggregatePhysicalRow {
+            row_id: String::new(),
+            visible_values: vec![None; num_visible_cols],
+            state_values,
+        };
+        // Derive aggregate visible values from state (handles Single copy and AVG division).
+        update_visible_values_from_state(&mut scratch, layout)?;
+        // Override group key visible slots with direct batch values.
+        for (&visible_src, &batch_col) in &group_key_visible_to_batch {
+            scratch.visible_values[visible_src] =
+                agg_scalar_from_array(batch.column(batch_col), row)?;
+        }
+        for (v_idx, val) in scratch.visible_values.into_iter().enumerate() {
+            all_visible_values[v_idx].push(val);
+        }
+    }
+
+    // Build the output physical batch: [row_id, visible_cols..., state_cols...].
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + num_visible_cols + num_state_cols);
+    arrays.push(build_row_id_array(batch, &group_key_batch_cols)?);
+    for (v_idx, visible_col) in layout.visible_columns.iter().enumerate() {
+        arrays.push(build_agg_scalar_array(
+            &visible_col.data_type,
+            std::mem::take(&mut all_visible_values[v_idx]),
+        )?);
+    }
+    for (sc_idx, state_col) in layout.state_columns.iter().enumerate() {
+        arrays.push(build_agg_scalar_array(
+            &state_col.data_type,
+            std::mem::take(&mut all_state_values[sc_idx]),
+        )?);
+    }
+
     let physical_batch = RecordBatch::try_new(Arc::new(physical_schema(layout)), arrays)
         .map_err(|e| format!("build aggregate MV physical batch failed: {e}"))?;
     record_batch_to_chunk(physical_batch)
 }
 
+/// Compute the batch column indexes for group keys and state columns in a state-shaped
+/// executor result batch.
+///
+/// The state-shaped batch column order is determined by walking `shape.visible_outputs`:
+/// - Each GroupKey output contributes one column.
+/// - Each Single-role aggregate (COUNT, SUM, MIN, MAX) contributes one column.
+/// - Each AVG aggregate contributes two columns (AvgSum at offset 0, AvgCount at offset 1).
+///
+/// Returns `(group_key_batch_cols, state_col_batch_cols)` where:
+/// - `group_key_batch_cols[gk_idx]` = batch column index for group key `gk_idx`.
+/// - `state_col_batch_cols[sc_idx]` = batch column index for state column `sc_idx`.
+fn compute_batch_col_indexes(
+    shape: &AggregateMvShape,
+    layout: &AggregateMvLayout,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut group_key_batch_col = vec![0usize; shape.group_keys.len()];
+    let mut agg_batch_col_start = vec![0usize; shape.aggregates.len()];
+
+    let mut batch_col = 0usize;
+    for output in &shape.visible_outputs {
+        match output {
+            VisibleAggregateOutput::GroupKey(gk_idx) => {
+                group_key_batch_col[*gk_idx] = batch_col;
+                batch_col += 1;
+            }
+            VisibleAggregateOutput::Aggregate(agg_idx) => {
+                agg_batch_col_start[*agg_idx] = batch_col;
+                batch_col += if shape.aggregates[*agg_idx].function == AggregateFunctionKind::Avg {
+                    2
+                } else {
+                    1
+                };
+            }
+        }
+    }
+
+    let mut state_col_batch_col = vec![0usize; layout.state_columns.len()];
+    for (sc_idx, sc) in layout.state_columns.iter().enumerate() {
+        let start = agg_batch_col_start[sc.aggregate_index];
+        state_col_batch_col[sc_idx] = match sc.state_role {
+            AggregateStateRole::Single | AggregateStateRole::AvgSum => start,
+            AggregateStateRole::AvgCount => start + 1,
+        };
+    }
+
+    (group_key_batch_col, state_col_batch_col)
+}
+
 fn build_row_id_array(
     batch: &RecordBatch,
-    group_key_indexes: &[usize],
+    group_key_batch_cols: &[usize],
 ) -> Result<ArrayRef, String> {
     let mut row_ids = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let mut cells = Vec::with_capacity(group_key_indexes.len());
-        for &column_index in group_key_indexes {
+        let mut cells = Vec::with_capacity(group_key_batch_cols.len());
+        for &column_index in group_key_batch_cols {
             let array = batch.column(column_index);
             cells.push(hex_encode(&encoded_cell(array, row)?));
         }
@@ -1409,6 +1515,7 @@ mod tests {
 
     fn physical_chunks_with_count_state(
         layout: &AggregateMvLayout,
+        shape: &AggregateMvShape,
         count_state: Option<i64>,
     ) -> Vec<Chunk> {
         let mut chunks = materialize_aggregate_result_chunks(
@@ -1420,6 +1527,7 @@ mod tests {
                 ],
             },
             layout,
+            shape,
         )
         .expect("physical");
         let batch = &chunks[0].batch;
@@ -1438,7 +1546,10 @@ mod tests {
         chunks
     }
 
-    fn physical_chunks_with_bad_row_id(layout: &AggregateMvLayout) -> Vec<Chunk> {
+    fn physical_chunks_with_bad_row_id(
+        layout: &AggregateMvLayout,
+        shape: &AggregateMvShape,
+    ) -> Vec<Chunk> {
         let mut chunks = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1448,6 +1559,7 @@ mod tests {
                 ],
             },
             layout,
+            shape,
         )
         .expect("physical");
         let batch = &chunks[0].batch;
@@ -1458,7 +1570,10 @@ mod tests {
         chunks
     }
 
-    fn physical_chunks_with_mismatched_sum_state(layout: &AggregateMvLayout) -> Vec<Chunk> {
+    fn physical_chunks_with_mismatched_sum_state(
+        layout: &AggregateMvLayout,
+        shape: &AggregateMvShape,
+    ) -> Vec<Chunk> {
         let mut chunks = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1468,6 +1583,7 @@ mod tests {
                 ],
             },
             layout,
+            shape,
         )
         .expect("physical");
         let batch = &chunks[0].batch;
@@ -1480,14 +1596,16 @@ mod tests {
 
     #[test]
     fn materialize_physical_chunks_adds_row_id_and_state_columns() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
         let batch = visible_result_batch(vec![1], vec![2], vec![30]);
         let result = QueryResult {
             columns: Vec::new(),
             chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
         };
 
-        let chunks = materialize_aggregate_result_chunks(result, &layout).expect("materialize");
+        let chunks =
+            materialize_aggregate_result_chunks(result, &layout, &shape).expect("materialize");
         let schema = chunks[0].batch.schema();
         let names = schema
             .fields()
@@ -1509,7 +1627,8 @@ mod tests {
 
     #[test]
     fn merge_count_sum_state_adds_delta_to_old_state() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
         let old = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1519,6 +1638,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("old physical");
         let delta = materialize_aggregate_result_chunks(
@@ -1530,6 +1650,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("delta physical");
         let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
@@ -1565,7 +1686,8 @@ mod tests {
 
     #[test]
     fn merge_sum_state_preserves_null_for_new_all_null_group() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
         let delta = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1579,6 +1701,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("delta physical");
 
@@ -1618,9 +1741,9 @@ mod tests {
 
     #[test]
     fn row_id_uses_group_key_source_index_when_aggregate_is_projected_first() {
+        let shape = aggregate_first_shape();
         let layout =
-            build_aggregate_mv_layout(&aggregate_first_shape(), &aggregate_first_output_columns())
-                .expect("layout");
+            build_aggregate_mv_layout(&shape, &aggregate_first_output_columns()).expect("layout");
         assert_eq!(layout.group_key_source_indexes, vec![1]);
         let old = materialize_aggregate_result_chunks(
             QueryResult {
@@ -1631,6 +1754,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("old physical");
         let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
@@ -1644,6 +1768,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("delta physical");
 
@@ -1669,7 +1794,8 @@ mod tests {
 
     #[test]
     fn merge_rejects_duplicate_old_row_id() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
         let old = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1683,6 +1809,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("old physical");
 
@@ -1692,8 +1819,9 @@ mod tests {
 
     #[test]
     fn load_rejects_null_count_state_as_corruption() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_count_state(&layout, None);
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
+        let chunks = physical_chunks_with_count_state(&layout, &shape, None);
 
         let err = load_aggregate_physical_rows(&chunks, &layout).expect_err("null count rejected");
         assert!(err.contains("corruption"), "err={err}");
@@ -1703,8 +1831,9 @@ mod tests {
 
     #[test]
     fn load_rejects_zero_count_state_as_corruption() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_count_state(&layout, Some(0));
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
+        let chunks = physical_chunks_with_count_state(&layout, &shape, Some(0));
 
         let err = load_aggregate_physical_rows(&chunks, &layout).expect_err("zero count rejected");
         assert!(err.contains("corruption"), "err={err}");
@@ -1714,8 +1843,9 @@ mod tests {
 
     #[test]
     fn load_allows_zero_count_expr_state() {
-        let layout = build_aggregate_mv_layout(&count_expr_shape(), &count_expr_output_columns())
-            .expect("layout");
+        let shape = count_expr_shape();
+        let layout =
+            build_aggregate_mv_layout(&shape, &count_expr_output_columns()).expect("layout");
         let chunks = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1725,6 +1855,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("physical");
 
@@ -1743,8 +1874,9 @@ mod tests {
 
     #[test]
     fn load_rejects_row_id_mismatch_as_corruption() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_bad_row_id(&layout);
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
+        let chunks = physical_chunks_with_bad_row_id(&layout, &shape);
 
         let err =
             load_aggregate_physical_rows(&chunks, &layout).expect_err("row id mismatch rejected");
@@ -1755,8 +1887,9 @@ mod tests {
 
     #[test]
     fn load_rejects_visible_aggregate_state_mismatch_as_corruption() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
-        let chunks = physical_chunks_with_mismatched_sum_state(&layout);
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
+        let chunks = physical_chunks_with_mismatched_sum_state(&layout, &shape);
 
         let err = load_aggregate_physical_rows(&chunks, &layout)
             .expect_err("visible/state mismatch rejected");
@@ -1767,7 +1900,8 @@ mod tests {
 
     #[test]
     fn merge_rejects_duplicate_delta_row_id() {
-        let layout = build_aggregate_mv_layout(&test_shape(), &output_columns()).expect("layout");
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
         let delta = materialize_aggregate_result_chunks(
             QueryResult {
                 columns: Vec::new(),
@@ -1781,6 +1915,7 @@ mod tests {
                 ],
             },
             &layout,
+            &shape,
         )
         .expect("delta physical");
 
@@ -2146,6 +2281,106 @@ mod tests {
             .unwrap();
         assert_eq!(sum.value(0), -30);
         assert_eq!(cnt.value(0), -4);
+    }
+
+    // ---- AVG materialize test (state-shaped input) ----
+
+    fn avg_state_shape() -> AggregateMvShape {
+        let shape = crate::connector::starrocks::managed::mv_shape::classify_incremental_mv_query(
+            &parse_query("select k1, avg(v2) as a from ice.ns.orders group by k1"),
+        )
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    #[test]
+    fn materialize_aggregate_result_avg_state_shaped_input() {
+        use arrow::array::Float64Array;
+        // AVG(v2) AS a: visible = Float64, state = [__agg_state_a__sum Int64, __agg_state_a__count Int64]
+        let shape = avg_state_shape();
+        let output_columns = vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "a".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+            },
+        ];
+        let layout = build_aggregate_mv_layout(&shape, &output_columns).expect("layout");
+
+        // State-shaped input: [k1, __agg_state_a__sum, __agg_state_a__count]
+        // (visible_outputs = [GroupKey(0), Aggregate(0)] → batch cols [k1, sum, count])
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int64, false),
+                Field::new("__agg_state_a__sum", DataType::Int64, true),
+                Field::new("__agg_state_a__count", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![30_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![4_i64])) as ArrayRef,
+            ],
+        )
+        .expect("state-shaped batch");
+
+        let chunk =
+            materialize_aggregate_result_batch(&batch, &layout, &shape).expect("materialize");
+
+        // Physical schema: [__row_id__, k1, a, __agg_state_a__sum, __agg_state_a__count]
+        let batch_schema = chunk.batch.schema();
+        let schema_names: Vec<&str> = batch_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            schema_names,
+            vec![
+                ROW_ID_COLUMN,
+                "k1",
+                "a",
+                "__agg_state_a__sum",
+                "__agg_state_a__count"
+            ],
+            "unexpected schema"
+        );
+
+        // Visible 'a' = 30 / 4 = 7.5
+        let visible_a = chunk
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("visible a Float64");
+        assert!(
+            (visible_a.value(0) - 7.5).abs() < 1e-12,
+            "expected visible a = 7.5, got {}",
+            visible_a.value(0)
+        );
+
+        // State sum = 30, count = 4
+        let state_sum = chunk
+            .batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("state sum Int64");
+        let state_cnt = chunk
+            .batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("state count Int64");
+        assert_eq!(state_sum.value(0), 30, "state sum");
+        assert_eq!(state_cnt.value(0), 4, "state count");
     }
 
     // ---- End-to-end AVG merge test ----

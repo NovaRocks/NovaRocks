@@ -1037,6 +1037,172 @@ fn aggregate_expr_error(_err: String) -> String {
     "incremental aggregate MV query contains an unsupported expression".to_string()
 }
 
+/// Rewrite a MV SELECT SQL so that AVG aggregates are replaced by their SUM and COUNT
+/// sub-states, producing a SELECT whose output columns map directly to the layout's state
+/// columns rather than the user-visible aggregate results.
+///
+/// For each `AVG(expr) AS alias` projection item:
+/// - Replace with `SUM(expr) AS __agg_state_<sanitized(alias)>__sum`
+/// - Followed by  `COUNT(expr) AS __agg_state_<sanitized(alias)>__count`
+///
+/// COUNT, SUM, MIN, MAX projections are passed through unchanged (their visible == state).
+/// Group keys and WHERE/HAVING clauses are unchanged.
+///
+/// The returned SQL string can be fed directly to the executor to produce a state-shaped
+/// Arrow batch that `materialize_aggregate_result_chunks` can consume.
+pub(crate) fn rewrite_select_sql_for_state(
+    select_sql: &str,
+    shape: &AggregateMvShape,
+) -> Result<String, String> {
+    use sqlparser::ast::{SelectItem, SetExpr, Statement};
+
+    // Check if there are any AVG aggregates; if not, return the SQL unchanged.
+    if shape
+        .aggregates
+        .iter()
+        .all(|agg| agg.function != AggregateFunctionKind::Avg)
+    {
+        return Ok(select_sql.to_string());
+    }
+
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("rewrite_select_sql_for_state normalize error: {e}"))?;
+    let stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("rewrite_select_sql_for_state parse error: {e}"))?;
+    let mut stmt = stmt;
+
+    let Statement::Query(query) = &mut stmt else {
+        return Err("rewrite_select_sql_for_state: expected Query statement".to_string());
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("rewrite_select_sql_for_state: expected SELECT body".to_string());
+    };
+
+    let mut new_projection: Vec<SelectItem> = Vec::with_capacity(select.projection.len() + 4);
+    for item in std::mem::take(&mut select.projection) {
+        match extract_avg_expr_and_alias(&item) {
+            Some((arg_expr, alias)) => {
+                let sanitized = sanitize_name_for_state(&alias);
+                let sum_alias = format!("__agg_state_{sanitized}__sum");
+                let count_alias = format!("__agg_state_{sanitized}__count");
+
+                new_projection.push(make_aggregate_select_item(
+                    "SUM",
+                    arg_expr.clone(),
+                    &sum_alias,
+                ));
+                new_projection.push(make_aggregate_select_item("COUNT", arg_expr, &count_alias));
+            }
+            None => {
+                new_projection.push(item);
+            }
+        }
+    }
+    select.projection = new_projection;
+
+    Ok(stmt.to_string())
+}
+
+/// Returns `(arg_expr, alias)` if the select item is `AVG(expr) AS alias` or `AVG(expr)`.
+/// Returns `None` for all other items.
+fn extract_avg_expr_and_alias(
+    item: &sqlparser::ast::SelectItem,
+) -> Option<(sqlparser::ast::Expr, String)> {
+    use sqlparser::ast::{Expr, SelectItem};
+
+    let (expr, alias) = match item {
+        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.value.clone()),
+        SelectItem::UnnamedExpr(expr) => (expr, expr.to_string()),
+        _ => return None,
+    };
+
+    let Expr::Function(func) = expr else {
+        return None;
+    };
+
+    // Check that this is a plain `avg` call (no ODBC syntax, no window, etc.)
+    if !is_plain_avg_function(func) {
+        return None;
+    }
+
+    let arg_expr = extract_single_expr_arg(func)?;
+    Some((arg_expr, alias))
+}
+
+fn is_plain_avg_function(func: &sqlparser::ast::Function) -> bool {
+    let name = func.name.to_string().to_ascii_lowercase();
+    name == "avg"
+        && !func.uses_odbc_syntax
+        && func.null_treatment.is_none()
+        && func.over.is_none()
+        && func.filter.is_none()
+        && func.within_group.is_empty()
+        && matches!(func.parameters, sqlparser::ast::FunctionArguments::None)
+}
+
+fn extract_single_expr_arg(func: &sqlparser::ast::Function) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::{FunctionArg, FunctionArgExpr, FunctionArguments};
+    let FunctionArguments::List(list) = &func.args else {
+        return None;
+    };
+    let [arg] = list.args.as_slice() else {
+        return None;
+    };
+    match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr.clone()),
+        _ => None,
+    }
+}
+
+fn make_aggregate_select_item(
+    func_name: &str,
+    arg: sqlparser::ast::Expr,
+    alias: &str,
+) -> sqlparser::ast::SelectItem {
+    use sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName, ObjectNamePart, SelectItem,
+    };
+    let function = Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(func_name))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    };
+    SelectItem::ExprWithAlias {
+        expr: sqlparser::ast::Expr::Function(function),
+        alias: Ident::new(alias),
+    }
+}
+
+/// Sanitize an output alias for use in a state column name.
+/// Mirrors `mv_agg_state::sanitize_state_column_name`.
+pub(crate) fn sanitize_name_for_state(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "agg".to_string()
+    } else {
+        sanitized
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,5 +1497,100 @@ mod tests {
     fn accepts_unix_timestamp_with_argument() {
         classify_sql("select unix_timestamp(k1) from ice.ns.orders")
             .expect("query should be accepted");
+    }
+
+    fn as_aggregate_shape(shape: IncrementalMvShape) -> AggregateMvShape {
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
+    #[test]
+    fn rewrite_select_sql_avg_to_sum_count() {
+        let original = "SELECT k1, COUNT(*) AS c, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        // Must contain SUM and COUNT for the AVG column; exact spacing is flexible.
+        assert!(
+            rewritten.to_uppercase().contains("SUM(V2)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            rewritten.to_uppercase().contains("COUNT(V2)"),
+            "got: {rewritten}"
+        );
+        // Original AVG must be gone.
+        assert!(
+            !rewritten.to_uppercase().contains("AVG(V2)"),
+            "got: {rewritten}"
+        );
+        // COUNT(*) for the original COUNT aggregate should be preserved.
+        assert!(
+            rewritten.to_uppercase().contains("COUNT(*)"),
+            "got: {rewritten}"
+        );
+        // State aliases should be present.
+        assert!(rewritten.contains("__agg_state_a__sum"), "got: {rewritten}");
+        assert!(
+            rewritten.contains("__agg_state_a__count"),
+            "got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_select_sql_no_avg_is_passthrough() {
+        let original = "SELECT k1, COUNT(*) AS c, SUM(v2) AS s FROM ice.ns.orders GROUP BY k1";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        // No AVG → original SQL returned unchanged.
+        assert_eq!(
+            rewritten, original,
+            "no-AVG case should return original SQL"
+        );
+    }
+
+    #[test]
+    fn rewrite_select_sql_avg_only() {
+        let original = "SELECT k1, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        assert!(
+            rewritten.to_uppercase().contains("SUM(V2)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            rewritten.to_uppercase().contains("COUNT(V2)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !rewritten.to_uppercase().contains("AVG"),
+            "got: {rewritten}"
+        );
+        // Rewritten SQL must re-parse as a valid aggregate query.
+        let re_shape = classify_sql(&rewritten).expect("re-classify rewritten");
+        let IncrementalMvShape::Aggregate(_) = re_shape else {
+            panic!("rewritten SQL should be aggregate shape");
+        };
+    }
+
+    #[test]
+    fn rewrite_select_sql_multiple_avg() {
+        let original = "SELECT k1, AVG(v2) AS a1, AVG(v3) AS a2 FROM ice.ns.orders GROUP BY k1";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        // Both AVGs replaced.
+        assert!(
+            !rewritten.to_uppercase().contains("AVG"),
+            "got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_a1__sum"),
+            "got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_a2__sum"),
+            "got: {rewritten}"
+        );
     }
 }
