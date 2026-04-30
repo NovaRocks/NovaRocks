@@ -1130,7 +1130,7 @@ fn physical_schema(layout: &AggregateMvLayout) -> Schema {
     Schema::new(fields)
 }
 
-fn sanitize_state_column_name(name: &str) -> String {
+pub(crate) fn sanitize_state_column_name(name: &str) -> String {
     let sanitized = name
         .chars()
         .map(|ch| {

@@ -1082,7 +1082,10 @@ pub(crate) fn rewrite_select_sql_for_state(
     for item in std::mem::take(&mut select.projection) {
         match extract_avg_expr_and_alias(&item) {
             Some((arg_expr, alias)) => {
-                let sanitized = sanitize_name_for_state(&alias);
+                let sanitized =
+                    crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(
+                        &alias,
+                    );
                 let sum_alias = format!("__agg_state_{sanitized}__sum");
                 let count_alias = format!("__agg_state_{sanitized}__count");
 
@@ -1180,26 +1183,6 @@ fn make_aggregate_select_item(
     SelectItem::ExprWithAlias {
         expr: sqlparser::ast::Expr::Function(function),
         alias: Ident::new(alias),
-    }
-}
-
-/// Sanitize an output alias for use in a state column name.
-/// Mirrors `mv_agg_state::sanitize_state_column_name`.
-pub(crate) fn sanitize_name_for_state(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "agg".to_string()
-    } else {
-        sanitized
     }
 }
 
@@ -1592,5 +1575,51 @@ mod tests {
             rewritten.contains("__agg_state_a2__sum"),
             "got: {rewritten}"
         );
+    }
+
+    #[test]
+    fn rewrite_select_sql_avg_without_alias() {
+        let original = "SELECT k1, AVG(v2) FROM ice.ns.orders GROUP BY k1";
+        let shape = match classify_sql(original).expect("classify") {
+            IncrementalMvShape::Aggregate(s) => s,
+            _ => panic!("expected aggregate shape"),
+        };
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
+        assert!(upper.contains("SUM(V2)"), "got: {rewritten}");
+        assert!(upper.contains("COUNT(V2)"), "got: {rewritten}");
+        assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
+        // For an unaliased AVG(v2), the alias is derived from expr.to_string() which
+        // sqlparser renders as "AVG(v2)". After sanitize_state_column_name that becomes
+        // "avg_v2_" (parentheses are replaced with underscores, letters lowercased).
+        assert!(
+            rewritten.contains("__agg_state_avg_v2___sum"),
+            "state sum alias not found; got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("__agg_state_avg_v2___count"),
+            "state count alias not found; got: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_select_sql_avg_with_complex_argument() {
+        let original = "SELECT k1, AVG(v2 + 1) AS a FROM ice.ns.orders GROUP BY k1";
+        let shape = match classify_sql(original).expect("classify") {
+            IncrementalMvShape::Aggregate(s) => s,
+            _ => panic!("expected aggregate shape"),
+        };
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
+        // The complex argument must be preserved inside both SUM and COUNT.
+        assert!(
+            upper.contains("SUM(V2 + 1)") || upper.contains("SUM(V2+1)"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT(V2 + 1)") || upper.contains("COUNT(V2+1)"),
+            "got: {rewritten}"
+        );
+        assert!(!upper.contains("AVG(V2 + 1)"), "got: {rewritten}");
     }
 }

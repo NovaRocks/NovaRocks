@@ -85,6 +85,14 @@ pub(crate) fn analyze_visible_output_types(
     // If registration fails (e.g., iceberg connector unavailable), we only propagate
     // the error when the table is genuinely missing from the local catalog; if it is
     // already present the registration failure is harmless and we proceed.
+    //
+    // Safety contract for this swallow path: it is safe ONLY because the production
+    // refresh path (execute_query_for_mv_refresh / execute_query_for_mv_incremental_refresh)
+    // separately calls refresh_external_tables_for_query (force=true) before execution,
+    // ensuring catalog freshness. This analyzer-only path tolerates registration failure
+    // when tables are already cached locally to keep test fixtures simple (tests pre-populate
+    // the catalog without a live iceberg backend). If a non-refresh caller ever invokes this
+    // function, registration failures should be propagated rather than swallowed.
     let three_parts = extract_three_part_table_refs(&query);
     if !three_parts.is_empty() {
         let reg_result = crate::engine::query_prep::register_external_tables_for_query(
