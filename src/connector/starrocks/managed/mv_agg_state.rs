@@ -49,8 +49,31 @@ pub(crate) struct AggregateStateColumn {
     pub(crate) sql_type: SqlType,
     pub(crate) nullable: bool,
     pub(crate) visible_source_index: usize,
+    /// Index into `AggregateMvShape::aggregates` — multiple state columns
+    /// (e.g., AVG's AvgSum + AvgCount) share the same `aggregate_index`.
+    pub(crate) aggregate_index: usize,
     pub(crate) function: AggregateFunctionKind,
+    pub(crate) state_role: AggregateStateRole,
     pub(crate) count_star: bool,
+}
+
+/// Identifies a state column's role within its logical aggregate.
+///
+/// Cardinality contract: at most one `Single` per `aggregate_index`,
+/// or exactly one `AvgSum` + one `AvgCount` pair per `aggregate_index`.
+/// Today (Task 1) only `Single` is materialized; Task 2 introduces the
+/// AVG pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// AvgSum and AvgCount are not yet constructed but are reserved for Task 2 (AVG support).
+#[allow(dead_code)]
+pub(crate) enum AggregateStateRole {
+    /// Single state column: state value IS the aggregate result.
+    /// Used by COUNT, SUM, MIN, MAX.
+    Single,
+    /// AVG sum sub-state (numeric type matching SUM coverage).
+    AvgSum,
+    /// AVG count sub-state (always Int64).
+    AvgCount,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +155,9 @@ pub(crate) fn build_aggregate_mv_layout(
             sql_type,
             nullable: visible.nullable,
             visible_source_index,
+            aggregate_index,
             function: aggregate.function,
+            state_role: AggregateStateRole::Single,
             count_star: matches!(aggregate.input, AggregateInput::Star),
         });
     }
@@ -228,15 +253,18 @@ pub(crate) fn merge_aggregate_state_batches(
                 row.row_id
             ));
         }
+        // Step A: merge state values
         for (state_index, state_column) in layout.state_columns.iter().enumerate() {
             let next_value = merge_state_value(
                 row.state_values.get(state_index).cloned().unwrap_or(None),
                 delta.state_values.get(state_index).cloned().unwrap_or(None),
                 state_column,
             )?;
-            row.state_values[state_index] = next_value.clone();
-            row.visible_values[state_column.visible_source_index] = next_value;
+            row.state_values[state_index] = next_value;
         }
+
+        // Step B: derive visible values per-aggregate (Single = direct copy of state)
+        update_visible_values_from_state(row, layout)?;
     }
     // Drop merged rows whose every count-state column has reached zero
     // — the group has been fully retracted by deletes and should
@@ -900,6 +928,27 @@ where
     Ok(out)
 }
 
+/// Derive visible column values from the current state values after a merge step.
+///
+/// For `Single` state_role the visible value is a direct copy of the state value (1:1 mapping).
+/// AVG and other future multi-state aggregates will be handled here in Task 2 by iterating
+/// per-aggregate and computing the visible result from their sub-states (e.g. sum/count).
+///
+/// Returns `Result` for forward compatibility — Task 2 will introduce fallible AVG derivation
+/// (e.g., division-by-zero, decimal scale alignment).
+fn update_visible_values_from_state(
+    row: &mut AggregatePhysicalRow,
+    layout: &AggregateMvLayout,
+) -> Result<(), String> {
+    for (state_index, state_column) in layout.state_columns.iter().enumerate() {
+        if matches!(state_column.state_role, AggregateStateRole::Single) {
+            row.visible_values[state_column.visible_source_index] =
+                row.state_values[state_index].clone();
+        }
+    }
+    Ok(())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -1481,7 +1530,9 @@ mod tests {
                 sql_type: SqlType::BigInt,
                 nullable: false,
                 visible_source_index: 0,
+                aggregate_index: 0,
                 function: AggregateFunctionKind::Count,
+                state_role: AggregateStateRole::Single,
                 count_star: true,
             }],
             group_key_source_indexes: Vec::new(),
@@ -1555,7 +1606,9 @@ mod tests {
                 sql_type: SqlType::BigInt,
                 nullable: false,
                 visible_source_index: 0,
+                aggregate_index: 0,
                 function: AggregateFunctionKind::Count,
+                state_role: AggregateStateRole::Single,
                 count_star: true,
             }],
             group_key_source_indexes: Vec::new(),
