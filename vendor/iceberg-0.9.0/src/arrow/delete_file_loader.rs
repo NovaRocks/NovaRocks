@@ -71,11 +71,14 @@ impl BasicDeleteFileLoader {
         */
         let parquet_read_options = ParquetReadOptions::builder().build();
 
-        let (parquet_file_reader, arrow_metadata) = ArrowReader::open_parquet_file(
+        let (parquet_file_reader, arrow_metadata, _missing_field_ids) =
+            ArrowReader::open_parquet_file(
             data_file_path,
             &self.file_io,
             file_size_in_bytes,
             parquet_read_options,
+            None,
+            Vec::new(),
         )
         .await?;
 

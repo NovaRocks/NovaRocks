@@ -27,7 +27,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatc
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
-    ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+    ArrowError, DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
 use arrow_string::like::starts_with;
 use bytes::Bytes;
@@ -38,7 +38,9 @@ use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions, RowFilter, RowSelection, RowSelector,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
+use parquet::arrow::{
+    PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask, RowNumber,
+};
 use parquet::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
@@ -55,7 +57,9 @@ use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
-use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, is_metadata_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, get_metadata_field, is_metadata_field,
+};
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
@@ -321,70 +325,15 @@ impl ArrowReader {
             delete_file_loader.load_deletes(&task.deletes, Arc::clone(&task.schema));
 
         // Open the Parquet file once, loading its metadata
-        let (parquet_file_reader, arrow_metadata) = Self::open_parquet_file(
+        let (parquet_file_reader, arrow_metadata, missing_field_ids) = Self::open_parquet_file(
             &task.data_file_path,
             &file_io,
             task.file_size_in_bytes,
             parquet_read_options,
+            task.name_mapping.as_deref(),
+            Self::projected_virtual_columns(task.project_field_ids())?,
         )
         .await?;
-
-        // Check if Parquet file has embedded field IDs
-        // Corresponds to Java's ParquetSchemaUtil.hasIds()
-        // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
-        let missing_field_ids = arrow_metadata
-            .schema()
-            .fields()
-            .iter()
-            .next()
-            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
-
-        // Three-branch schema resolution strategy matching Java's ReadConf constructor
-        //
-        // Per Iceberg spec Column Projection rules:
-        // "Columns in Iceberg data files are selected by field id. The table schema's column
-        //  names and order may change after a data file is written, and projection must be done
-        //  using field ids."
-        // https://iceberg.apache.org/spec/#column-projection
-        //
-        // When Parquet files lack field IDs (e.g., Hive/Spark migrations via add_files),
-        // we must assign field IDs BEFORE reading data to enable correct projection.
-        //
-        // Java's ReadConf determines field ID strategy:
-        // - Branch 1: hasIds(fileSchema) → trust embedded field IDs, use pruneColumns()
-        // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
-        // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
-        let arrow_metadata = if missing_field_ids {
-            // Parquet file lacks field IDs - must assign them before reading
-            let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
-                // Branch 2: Apply name mapping to assign correct Iceberg field IDs
-                // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
-                // to columns without field id"
-                // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
-                apply_name_mapping_to_arrow_schema(
-                    Arc::clone(arrow_metadata.schema()),
-                    name_mapping,
-                )?
-            } else {
-                // Branch 3: No name mapping - use position-based fallback IDs
-                // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
-                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
-            };
-
-            let options = ArrowReaderOptions::new().with_schema(arrow_schema);
-            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
-                |e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to create ArrowReaderMetadata with field ID schema",
-                    )
-                    .with_source(e)
-                },
-            )?
-        } else {
-            // Branch 1: File has embedded field IDs - trust them
-            arrow_metadata
-        };
 
         // Build the stream reader, reusing the already-opened file reader
         let mut record_batch_stream_builder =
@@ -589,7 +538,9 @@ impl ArrowReader {
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
-    ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
+        name_mapping: Option<&NameMapping>,
+        virtual_columns: Vec<FieldRef>,
+    ) -> Result<(ArrowFileReader, ArrowReaderMetadata, bool)> {
         let parquet_file = file_io.new_input(data_file_path)?;
         let parquet_reader = parquet_file.reader().await?;
         let mut reader = ArrowFileReader::new(
@@ -606,7 +557,108 @@ impl ArrowReader {
                 Error::new(ErrorKind::Unexpected, "Failed to load Parquet metadata").with_source(e)
             })?;
 
-        Ok((reader, arrow_metadata))
+        // Check if Parquet file has embedded field IDs
+        // Corresponds to Java's ParquetSchemaUtil.hasIds()
+        // Reference: parquet/src/main/java/org/apache/iceberg/parquet/ParquetSchemaUtil.java:118
+        let missing_field_ids = arrow_metadata
+            .schema()
+            .fields()
+            .iter()
+            .next()
+            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
+
+        // Three-branch schema resolution strategy matching Java's ReadConf constructor
+        //
+        // Per Iceberg spec Column Projection rules:
+        // "Columns in Iceberg data files are selected by field id. The table schema's column
+        //  names and order may change after a data file is written, and projection must be done
+        //  using field ids."
+        // https://iceberg.apache.org/spec/#column-projection
+        //
+        // When Parquet files lack field IDs (e.g., Hive/Spark migrations via add_files),
+        // we must assign field IDs BEFORE reading data to enable correct projection.
+        //
+        // Java's ReadConf determines field ID strategy:
+        // - Branch 1: hasIds(fileSchema) → trust embedded field IDs, use pruneColumns()
+        // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
+        // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
+        let has_virtual_columns = !virtual_columns.is_empty();
+        let arrow_reader_options = if missing_field_ids {
+            // Parquet file lacks field IDs - must assign them before reading
+            let arrow_schema = if let Some(name_mapping) = name_mapping {
+                // Branch 2: Apply name mapping to assign correct Iceberg field IDs
+                // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
+                // to columns without field id"
+                // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
+                apply_name_mapping_to_arrow_schema(Arc::clone(arrow_metadata.schema()), name_mapping)?
+            } else {
+                // Branch 3: No name mapping - use position-based fallback IDs
+                // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
+                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
+            };
+
+            ArrowReaderOptions::new().with_schema(arrow_schema)
+        } else {
+            ArrowReaderOptions::new()
+        };
+
+        let arrow_reader_options = Self::with_virtual_columns(arrow_reader_options, virtual_columns)?;
+        let arrow_metadata = if missing_field_ids || has_virtual_columns {
+            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), arrow_reader_options)
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to create ArrowReaderMetadata with field ID schema",
+                    )
+                    .with_source(e)
+                })?
+        } else {
+            arrow_metadata
+        };
+
+        Ok((reader, arrow_metadata, missing_field_ids))
+    }
+
+    fn projected_virtual_columns(project_field_ids: &[i32]) -> Result<Vec<FieldRef>> {
+        if !project_field_ids.contains(&RESERVED_FIELD_ID_POS) {
+            return Ok(Vec::new());
+        }
+
+        let iceberg_field = get_metadata_field(RESERVED_FIELD_ID_POS).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("metadata field _pos lookup failed: {e}"),
+            )
+        })?;
+        let field = Field::new(
+            &iceberg_field.name,
+            DataType::Int64,
+            !iceberg_field.required,
+        )
+        .with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            iceberg_field.id.to_string(),
+        )]))
+        .with_extension_type(RowNumber);
+
+        Ok(vec![Arc::new(field)])
+    }
+
+    fn with_virtual_columns(
+        options: ArrowReaderOptions,
+        virtual_columns: Vec<FieldRef>,
+    ) -> Result<ArrowReaderOptions> {
+        if virtual_columns.is_empty() {
+            return Ok(options);
+        }
+
+        options.with_virtual_columns(virtual_columns).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "Failed to configure Parquet virtual columns",
+            )
+            .with_source(e)
+        })
     }
 
     /// computes a `RowSelection` from positional delete indices.
@@ -1959,6 +2011,7 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{ArrayRef, LargeStringArray, RecordBatch, StringArray};
+    use arrow_cast::cast;
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use futures::TryStreamExt;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
@@ -1978,6 +2031,7 @@ mod tests {
     use crate::expr::visitors::bound_predicate_visitor::visit;
     use crate::expr::{Bind, Predicate, Reference};
     use crate::io::FileIO;
+    use crate::metadata_columns::{RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS};
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{
         DataContentType, DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type,
@@ -2986,6 +3040,152 @@ message schema {
             all_ids, expected_ids,
             "Should have ids 1-199 but got different values"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pos_metadata_column_preserves_physical_positions_after_row_selection() {
+        use arrow_array::{Int32Array, Int64Array};
+
+        const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
+        const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().to_str().unwrap().to_string();
+
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
+        ]));
+
+        let data_file_path = format!("{table_location}/data.parquet");
+        let data_batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+            Int32Array::from_iter_values(10..=15),
+        )])
+        .unwrap();
+
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let file = File::create(&data_file_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props)).unwrap();
+        writer.write(&data_batch).expect("Writing data batch");
+        writer.close().unwrap();
+
+        let delete_file_path = format!("{table_location}/deletes.parquet");
+        let delete_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("file_path", DataType::Utf8, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                FIELD_ID_POSITIONAL_DELETE_FILE_PATH.to_string(),
+            )])),
+            Field::new("pos", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                FIELD_ID_POSITIONAL_DELETE_POS.to_string(),
+            )])),
+        ]));
+        let delete_batch = RecordBatch::try_new(delete_schema.clone(), vec![
+            Arc::new(StringArray::from_iter_values(vec![
+                data_file_path.clone(),
+                data_file_path.clone(),
+                data_file_path.clone(),
+            ])),
+            Arc::new(Int64Array::from_iter_values(vec![0_i64, 2, 4])),
+        ])
+        .unwrap();
+
+        let delete_file = File::create(&delete_file_path).unwrap();
+        let mut delete_writer = ArrowWriter::try_new(delete_file, delete_schema, None).unwrap();
+        delete_writer.write(&delete_batch).unwrap();
+        delete_writer.close().unwrap();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+        let task = FileScanTask {
+            file_size_in_bytes: std::fs::metadata(&data_file_path).unwrap().len(),
+            start: 0,
+            length: 0,
+            record_count: Some(6),
+            data_file_path: data_file_path.clone(),
+            data_file_format: DataFileFormat::Parquet,
+            schema: table_schema.clone(),
+            project_field_ids: vec![RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, 1],
+            predicate: None,
+            deletes: vec![FileScanTaskDeleteFile {
+                file_size_in_bytes: std::fs::metadata(&delete_file_path).unwrap().len(),
+                file_path: delete_file_path,
+                file_type: DataContentType::PositionDeletes,
+                file_format: DataFileFormat::Parquet,
+                partition_spec_id: 0,
+                equality_ids: None,
+                referenced_data_file: None,
+                content_offset: None,
+                content_size_in_bytes: None,
+            }],
+            partition: None,
+            partition_spec: None,
+            name_mapping: None,
+            case_sensitive: false,
+        };
+
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let result = reader
+            .read(tasks)
+            .unwrap()
+            .try_collect::<Vec<RecordBatch>>()
+            .await
+            .unwrap();
+
+        let ids: Vec<i32> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(2)
+                    .as_primitive::<arrow_array::types::Int32Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let positions: Vec<i64> = result
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let file_paths: Vec<String> = result
+            .iter()
+            .flat_map(|batch| {
+                let file_col = cast(batch.column(0), &DataType::Utf8).expect("cast _file");
+                file_col
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("_file StringArray")
+                    .iter()
+                    .map(|v| v.expect("_file value").to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(file_paths, vec![data_file_path; 3]);
+        assert_eq!(ids, vec![11, 13, 15]);
+        assert_eq!(positions, vec![1, 3, 5]);
     }
 
     /// Test for bug where position deletes are lost when skipping unselected row groups.

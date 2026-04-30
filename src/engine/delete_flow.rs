@@ -24,10 +24,9 @@
 //!    supports comparison operators (`= != < <= > >=`), `IN (...)`, and
 //!    `AND` / `OR` against primitive columns (int / long / string / bool).
 //!    Other expressions are rejected with an explicit error.
-//! 4. Build a [`TableScan`] with `select(["_file", "_pos"])` and
-//!    `with_filter(predicate).with_row_selection_enabled(true)`. iceberg-rust
-//!    natively projects the `_file` / `_pos` virtual columns and applies the
-//!    predicate down to row level.
+//! 4. Build a [`TableScan`] with `_file`, `_pos`, and the primitive columns
+//!    referenced by the WHERE expression. The iceberg `Predicate` is still
+//!    passed into planning for manifest pruning.
 //! 5. Drain the resulting Arrow stream, group `(file_path, pos)` pairs by
 //!    `file_path`, and write one v2 position-delete Parquet file per group
 //!    via [`write_position_delete_files`].
@@ -100,14 +99,10 @@ pub(crate) fn execute_delete_statement(
     let schema = table.metadata().current_schema();
     let predicate = translate_where(&stmt.where_clause, schema.as_ref())?;
 
-    // 5. Scan data files and collect (file, pos) pairs. We deliberately bypass
-    //    iceberg-rust's row-selection / row-filter path because the v0.9 `_pos`
-    //    virtual column (NovaRocks Patch 3) is implemented as a per-batch
-    //    running counter and reports incorrect positions whenever
-    //    `RowSelection` skips physical rows during decoding (existing delete
-    //    files OR predicate row-selection both trigger this). We instead read
-    //    every row in order, pin `_pos` to the running parquet row index, and
-    //    apply the WHERE predicate per row using the original sqlparser AST.
+    // 5. Scan data files and collect (file, pos) pairs. This path still reads
+    //    every physical row and applies the original sqlparser WHERE AST per
+    //    row so the currently supported DELETE semantics stay unchanged while
+    //    manifest pruning remains available through the iceberg Predicate.
     let groups = block_on_iceberg(async {
         scan_for_position_deletes(&table, predicate, &stmt.where_clause).await
     })??;
@@ -452,9 +447,8 @@ async fn scan_for_position_deletes(
     });
 
     // Build an ArrowReader with row_selection_enabled=false. Combined with
-    // cleared `task.deletes` and `task.predicate`, this guarantees parquet
-    // returns every physical row in order, so `_pos` (NovaRocks Patch 3
-    // running counter) is the original parquet row index.
+    // cleared `task.deletes` and `task.predicate`, this keeps the manual
+    // sqlparser WHERE evaluator responsible for row-level DELETE matching.
     let arrow_reader = ArrowReaderBuilder::new(table.file_io().clone())
         .with_row_group_filtering_enabled(false)
         .with_row_selection_enabled(false)
