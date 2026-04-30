@@ -349,8 +349,11 @@ impl RecordBatchTransformer {
                 let options = RecordBatchOptions::default()
                     .with_match_field_names(false)
                     .with_row_count(Some(record_batch.num_rows()));
-                let transformed_columns =
-                    Self::transform_columns(record_batch.columns(), operations)?;
+                let transformed_columns = Self::transform_columns(
+                    record_batch.columns(),
+                    operations,
+                    record_batch.num_rows(),
+                )?;
                 RecordBatch::try_new_with_options(
                     Arc::clone(target_schema),
                     transformed_columns,
@@ -769,11 +772,11 @@ impl RecordBatchTransformer {
     fn transform_columns(
         columns: &[Arc<dyn ArrowArray>],
         operations: &[ColumnSource],
+        num_rows: usize,
     ) -> Result<Vec<Arc<dyn ArrowArray>>> {
-        if columns.is_empty() {
-            return Ok(columns.to_vec());
+        if operations.is_empty() {
+            return Ok(Vec::new());
         }
-        let num_rows = columns[0].len();
 
         operations
             .iter()
@@ -876,7 +879,7 @@ impl RecordBatchTransformer {
 
     fn create_last_updated_seq_column(
         fallback_value: i64,
-        num_rows_when_no_columns: usize,
+        num_rows: usize,
         stored_column: Option<&ArrayRef>,
     ) -> Result<ArrayRef> {
         if let Some(stored_arr) = stored_column {
@@ -903,7 +906,7 @@ impl RecordBatchTransformer {
                 .collect();
             return Ok(Arc::new(Int64Array::from(values)));
         }
-        let values = vec![fallback_value; num_rows_when_no_columns];
+        let values = vec![fallback_value; num_rows];
         Ok(Arc::new(Int64Array::from(values)))
     }
 
@@ -2252,5 +2255,36 @@ mod test {
             .process_record_batch(batch)
             .expect_err("must fail");
         assert!(format!("{err}").contains("missing data_sequence_number"));
+    }
+
+    #[test]
+    fn last_updated_seq_works_when_only_column_projected_and_stored_missing() {
+        // Empty source schema: simulates a parquet file that does not physically
+        // carry the stored _last_updated_sequence_number column.  With the old
+        // code this triggered the columns.is_empty() early-return, dropping the
+        // LastUpdatedSeqNum operation and causing a column-count mismatch panic.
+        let schema = Arc::new(ArrowSchema::empty());
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(3));
+        let batch =
+            RecordBatch::try_new_with_options(schema, vec![], &options).unwrap();
+
+        let snapshot_schema = Arc::new(Schema::builder().with_fields(vec![]).build().unwrap());
+        let mut transformer = RecordBatchTransformerBuilder::new(
+            snapshot_schema,
+            &[RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER],
+        )
+        .with_data_sequence_number(Some(42))
+        .build();
+
+        let out = transformer
+            .process_record_batch(batch)
+            .expect("must not panic");
+        assert_eq!(out.num_rows(), 3);
+        let seqs = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(seqs.values(), &[42_i64, 42, 42]);
     }
 }
