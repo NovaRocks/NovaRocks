@@ -106,6 +106,9 @@ pub(crate) struct WindowExpr {
     pub window_frame: Option<crate::sql::analysis::WindowFrame>,
     pub result_type: DataType,
     pub output_name: String,
+    /// `IGNORE NULLS` modifier. Currently honored by first_value / last_value
+    /// / lead / lag; ignored for other window functions.
+    pub ignore_nulls: bool,
 }
 
 /// Inline table function: `TABLE(generate_series(start, end, step))`.

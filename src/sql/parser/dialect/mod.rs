@@ -44,6 +44,15 @@ impl sqlparser::dialect::Dialect for StarRocksDialect {
     fn supports_table_versioning(&self) -> bool {
         true
     }
+
+    /// Accept `IGNORE NULLS` / `RESPECT NULLS` written *inside* the function
+    /// argument list, e.g. `first_value(v IGNORE NULLS) OVER (...)`.
+    /// The post-args form (`first_value(v) IGNORE NULLS OVER (...)`) is parsed
+    /// unconditionally by sqlparser into `Function::null_treatment` and does
+    /// not depend on this flag.
+    fn supports_window_function_null_treatment_arg(&self) -> bool {
+        true
+    }
 }
 
 /// Peek at a token by offset and check if it matches a word (case-insensitive).
@@ -231,7 +240,253 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_version_as_of_string(&sql)?;
     let sql = rewrite_iceberg_metadata_suffix(&sql)?;
     let sql = rewrite_overwrite_partitions(&sql)?;
+    let sql = rewrite_inline_null_treatment(&sql);
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+/// Move `IGNORE NULLS` / `RESPECT NULLS` from before a comma to the end of
+/// its containing function call.
+///
+/// StarRocks accepts `LEAD(v IGNORE NULLS, 3) OVER (...)` — the modifier sits
+/// between the value argument and the offset, before the comma. sqlparser only
+/// recognizes the modifier *after* the last argument, so we rewrite
+/// `LEAD(v IGNORE NULLS, 3)` to `LEAD(v , 3 IGNORE NULLS)` so the standard
+/// post-args parsing path picks it up. Display-name generation is unaffected
+/// because the modifier still ends up on `Function::null_treatment` /
+/// `FunctionArgumentClause::IgnoreOrRespectNulls` after parsing.
+fn rewrite_inline_null_treatment(sql: &str) -> String {
+    // Fast path: if neither `ignore` nor `respect` appears (case-insensitive),
+    // there is nothing for us to rewrite. Avoids touching UTF-8 in the common
+    // case and keeps non-window queries cheap.
+    let lower = sql.to_ascii_lowercase();
+    if !lower.contains("ignore") && !lower.contains("respect") {
+        return sql.to_string();
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + 16);
+    // Per-depth slot: when set, inject the captured modifier just before the
+    // matching `)`. The first inline modifier encountered in a paren scope
+    // wins; later ones at the same depth are left in place (typically already
+    // at the end-of-args position, where sqlparser handles them natively).
+    let mut pending_at_depth: Vec<Option<&'static str>> = Vec::new();
+
+    let mut idx = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        // Multi-byte UTF-8: copy the whole code point verbatim. This keeps
+        // string and identifier literals (Chinese names, etc.) intact.
+        if byte >= 0x80 {
+            let len = utf8_sequence_len(byte);
+            let end = (idx + len).min(bytes.len());
+            output.push_str(&sql[idx..end]);
+            idx = end;
+            continue;
+        }
+
+        if in_single_quote {
+            if byte == b'\\' && idx + 1 < bytes.len() {
+                output.push(byte as char);
+                output.push(bytes[idx + 1] as char);
+                idx += 2;
+                continue;
+            }
+            if byte == b'\'' {
+                in_single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_double_quote {
+            if byte == b'"' {
+                in_double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if in_backtick {
+            if byte == b'`' {
+                in_backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                in_single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                in_double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                in_backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // Line comment.
+        if byte == b'-' && idx + 1 < bytes.len() && bytes[idx + 1] == b'-' {
+            while idx < bytes.len() && bytes[idx] != b'\n' {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            continue;
+        }
+        // Block comment.
+        if byte == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+            output.push_str("/*");
+            idx += 2;
+            while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            if idx + 1 < bytes.len() {
+                output.push_str("*/");
+                idx += 2;
+            }
+            continue;
+        }
+
+        if byte == b'(' {
+            pending_at_depth.push(None);
+            output.push('(');
+            idx += 1;
+            continue;
+        }
+        if byte == b')' {
+            if let Some(slot) = pending_at_depth.pop()
+                && let Some(treatment) = slot
+            {
+                output.push(' ');
+                output.push_str(treatment);
+            }
+            output.push(')');
+            idx += 1;
+            continue;
+        }
+
+        if !pending_at_depth.is_empty() {
+            // Only attempt the keyword match at a word boundary so we don't
+            // collide with identifiers like `IGNORED_NULLS`.
+            let prev = idx.checked_sub(1).map(|p| bytes[p]);
+            if !is_identifier_byte(prev) {
+                if let Some((treatment, consumed)) = match_inline_null_treatment(bytes, idx) {
+                    if let Some(slot) = pending_at_depth.last_mut()
+                        && slot.is_none()
+                    {
+                        *slot = Some(treatment);
+                    }
+                    idx += consumed;
+                    continue;
+                }
+            }
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+
+    output
+}
+
+fn utf8_sequence_len(byte: u8) -> usize {
+    if byte & 0x80 == 0 {
+        1
+    } else if byte & 0xE0 == 0xC0 {
+        2
+    } else if byte & 0xF0 == 0xE0 {
+        3
+    } else if byte & 0xF8 == 0xF0 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Match `IGNORE NULLS` or `RESPECT NULLS` (case-insensitive, with arbitrary
+/// inter-word whitespace) followed by optional whitespace and a `,`. Returns
+/// the canonical replacement text and the number of bytes that should be
+/// skipped (just the keyword tokens, excluding any trailing whitespace and the
+/// comma — those stay in the rewritten SQL).
+fn match_inline_null_treatment(bytes: &[u8], start: usize) -> Option<(&'static str, usize)> {
+    let candidates: [(&[&str], &str); 2] = [
+        (&["IGNORE", "NULLS"], "IGNORE NULLS"),
+        (&["RESPECT", "NULLS"], "RESPECT NULLS"),
+    ];
+    for (words, replacement) in candidates {
+        let Some(consumed) = match_keyword_sequence_ci(bytes, start, words) else {
+            continue;
+        };
+        let mut p = start + consumed;
+        while p < bytes.len() && (bytes[p] as char).is_ascii_whitespace() {
+            p += 1;
+        }
+        if p < bytes.len() && bytes[p] == b',' {
+            return Some((replacement, consumed));
+        }
+    }
+    None
+}
+
+/// Match a sequence of keywords case-insensitively, with one or more
+/// whitespace bytes between consecutive words and a word boundary at the end.
+/// Returns the number of bytes consumed if successful.
+fn match_keyword_sequence_ci(bytes: &[u8], start: usize, words: &[&str]) -> Option<usize> {
+    let mut p = start;
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            if p >= bytes.len() || !(bytes[p] as char).is_ascii_whitespace() {
+                return None;
+            }
+            while p < bytes.len() && (bytes[p] as char).is_ascii_whitespace() {
+                p += 1;
+            }
+        }
+        let kw = word.as_bytes();
+        if p + kw.len() > bytes.len() {
+            return None;
+        }
+        for j in 0..kw.len() {
+            if !bytes[p + j].eq_ignore_ascii_case(&kw[j]) {
+                return None;
+            }
+        }
+        p += kw.len();
+    }
+    if p < bytes.len() && is_identifier_byte(Some(bytes[p])) {
+        return None;
+    }
+    Some(p - start)
 }
 
 /// Rewrite `<ident>$<metatype>` (in unquoted/non-string context) to

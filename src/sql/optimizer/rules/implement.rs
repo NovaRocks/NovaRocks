@@ -1555,6 +1555,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: name.into(),
+            ignore_nulls: false,
         }
     }
 
@@ -1612,6 +1613,7 @@ mod window_split_tests {
             window_frame: None,
             result_type: DataType::Int64,
             output_name: "w".into(),
+            ignore_nulls: false,
         };
         let items = sort_items_for_window(&win);
         assert_eq!(items.len(), 3);

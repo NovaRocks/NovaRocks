@@ -1479,7 +1479,8 @@ impl<'a> PlanFragmentBuilder<'a> {
                 result_type: win_expr.result_type.clone(),
                 order_by: vec![],
             };
-            let texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
+            let mut texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
+            apply_ignore_nulls_to_root_fn(&mut texpr, win_expr.ignore_nulls);
             analytic_functions.push(texpr);
         }
 
@@ -1701,7 +1702,9 @@ impl<'a> PlanFragmentBuilder<'a> {
                     result_type: win_expr.result_type.clone(),
                     order_by: vec![],
                 };
-                analytic_functions.push(compiler.compile_aggregate_call_typed(&agg_call)?);
+                let mut texpr = compiler.compile_aggregate_call_typed(&agg_call)?;
+                apply_ignore_nulls_to_root_fn(&mut texpr, win_expr.ignore_nulls);
+                analytic_functions.push(texpr);
             }
 
             for (idx, win_expr) in group_exprs.iter().enumerate() {
@@ -2761,6 +2764,20 @@ impl<'a> PlanFragmentBuilder<'a> {
 
 fn synthetic_iceberg_table_id(scan_node_id: i32) -> i64 {
     -(scan_node_id as i64)
+}
+
+/// Set `TFunction.ignore_nulls` on the root function node of an analytic-call
+/// `TExpr` so the BE-side `lower_window_function` picks up the modifier when
+/// constructing `WindowFunctionKind::FirstValue/LastValue/Lead/Lag`.
+fn apply_ignore_nulls_to_root_fn(texpr: &mut exprs::TExpr, ignore_nulls: bool) {
+    if !ignore_nulls {
+        return;
+    }
+    if let Some(root) = texpr.nodes.first_mut()
+        && let Some(fn_) = root.fn_.as_mut()
+    {
+        fn_.ignore_nulls = Some(true);
+    }
 }
 
 // ---------------------------------------------------------------------------

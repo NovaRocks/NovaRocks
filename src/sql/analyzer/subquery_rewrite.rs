@@ -1402,6 +1402,7 @@ fn replace_placeholder_in_expr(
             partition_by,
             order_by,
             window_frame,
+            ignore_nulls,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -1418,6 +1419,7 @@ fn replace_placeholder_in_expr(
                     .collect(),
                 order_by: order_by.clone(),
                 window_frame: window_frame.clone(),
+                ignore_nulls: *ignore_nulls,
             },
         },
         _ => expr.clone(),

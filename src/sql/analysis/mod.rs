@@ -284,6 +284,9 @@ pub(crate) enum ExprKind {
         partition_by: Vec<TypedExpr>,
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,
+        /// `IGNORE NULLS` modifier (for first_value/last_value/lead/lag).
+        /// `false` means default (RESPECT NULLS).
+        ignore_nulls: bool,
     },
     /// Placeholder for a subquery that will be rewritten into a JOIN.
     /// This is an intermediate representation created during expression analysis

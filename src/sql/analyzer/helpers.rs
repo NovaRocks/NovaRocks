@@ -681,7 +681,10 @@ fn format_function_display_name(function: &sqlast::Function) -> String {
     }
     if let Some(null_treatment) = &function.null_treatment {
         out.push(' ');
-        out.push_str(&null_treatment.to_string());
+        out.push_str(match null_treatment {
+            sqlast::NullTreatment::IgnoreNulls => "ignore nulls",
+            sqlast::NullTreatment::RespectNulls => "respect nulls",
+        });
     }
     if let Some(over) = &function.over {
         out.push_str(" OVER ");
@@ -782,7 +785,10 @@ fn format_group_concat_display_name(function: &sqlast::Function, function_name: 
     }
     if let Some(null_treatment) = &function.null_treatment {
         out.push(' ');
-        out.push_str(&null_treatment.to_string());
+        out.push_str(match null_treatment {
+            sqlast::NullTreatment::IgnoreNulls => "ignore nulls",
+            sqlast::NullTreatment::RespectNulls => "respect nulls",
+        });
     }
     if let Some(over) = &function.over {
         out.push_str(" OVER ");
@@ -817,13 +823,20 @@ fn format_window_display_name(over: &sqlast::WindowType) -> String {
                 .join(", ")
         ));
     }
+    let has_frame = spec.window_frame.is_some();
     if let Some(frame) = &spec.window_frame {
         parts.push(format_window_frame_display_name(frame));
     }
 
     if parts.is_empty() {
         "()".to_string()
+    } else if has_frame {
+        // StarRocks omits the trailing space before `)` when a frame is
+        // present: `... ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)`.
+        format!("({})", parts.join(" "))
     } else {
+        // ... but keeps it for plain PARTITION BY / ORDER BY:
+        // `... ORDER BY v1 ASC, v2 ASC )`.
         format!("({} )", parts.join(" "))
     }
 }
@@ -1005,6 +1018,11 @@ fn format_function_clause_display_name(
         sqlast::FunctionArgumentClause::Limit(limit) => {
             format!("LIMIT {}", expr_display_name(limit))
         }
+        // Match StarRocks display convention: lowercase keywords.
+        sqlast::FunctionArgumentClause::IgnoreOrRespectNulls(t) => match t {
+            sqlast::NullTreatment::IgnoreNulls => "ignore nulls".to_string(),
+            sqlast::NullTreatment::RespectNulls => "respect nulls".to_string(),
+        },
         _ => clause.to_string(),
     }
 }

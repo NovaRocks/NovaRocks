@@ -641,6 +641,7 @@ fn rewrite_window_calls(
             partition_by,
             order_by,
             window_frame,
+            ignore_nulls,
         } => {
             let win_output_name = if *counter == 0 {
                 base_name.to_string()
@@ -657,6 +658,7 @@ fn rewrite_window_calls(
                 window_frame: window_frame.clone(),
                 result_type: expr.data_type.clone(),
                 output_name: win_output_name.clone(),
+                ignore_nulls: *ignore_nulls,
             });
             TypedExpr {
                 kind: ExprKind::ColumnRef {

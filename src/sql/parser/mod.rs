@@ -287,4 +287,117 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn parse_sql_raw_recognizes_ignore_nulls_inside_window_function_args() {
+        // `first_value(v IGNORE NULLS)` puts the null-treatment clause
+        // inside the function's argument list. sqlparser exposes that as
+        // FunctionArgumentClause::IgnoreOrRespectNulls; this requires
+        // StarRocksDialect to opt in via supports_window_function_null_treatment_arg().
+        let stmt = parse_sql_raw(
+            "SELECT first_value(v IGNORE NULLS) OVER (ORDER BY x) AS w FROM t",
+        )
+        .expect("IGNORE NULLS inside function args must parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[0] else {
+            panic!("expected aliased projection, got: {:?}", select.projection);
+        };
+        let sqlparser::ast::Expr::Function(func) = expr else {
+            panic!("expected function call projection, got: {expr:?}");
+        };
+        let sqlparser::ast::FunctionArguments::List(args) = &func.args else {
+            panic!("expected list arguments, got: {:?}", func.args);
+        };
+        let found = args.clauses.iter().any(|c| {
+            matches!(
+                c,
+                sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(
+                    sqlparser::ast::NullTreatment::IgnoreNulls,
+                ),
+            )
+        });
+        assert!(
+            found,
+            "expected IGNORE NULLS clause inside function args, got: {:?}",
+            args.clauses,
+        );
+        assert!(func.over.is_some(), "OVER clause must still be parsed");
+    }
+
+    #[test]
+    fn parse_sql_raw_recognizes_ignore_nulls_between_lead_args() {
+        // StarRocks dialect: `LEAD(v IGNORE NULLS, 3)` — IGNORE NULLS sits
+        // between the value and the offset, *before* the comma. sqlparser only
+        // parses null-treatment after the last arg, so this needs an explicit
+        // normalizer rewrite.
+        let stmt = parse_sql_raw(
+            "SELECT LEAD(v IGNORE NULLS, 3) OVER (ORDER BY x) AS w FROM t",
+        )
+        .expect("LEAD(v IGNORE NULLS, 3) must parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[0] else {
+            panic!("expected aliased projection");
+        };
+        let sqlparser::ast::Expr::Function(func) = expr else {
+            panic!("expected function call");
+        };
+        let sqlparser::ast::FunctionArguments::List(args) = &func.args else {
+            panic!("expected list arguments");
+        };
+        // Two unnamed args (v, 3) and one IgnoreOrRespectNulls clause.
+        assert_eq!(args.args.len(), 2, "expected 2 args, got: {:?}", args.args);
+        let found = args.clauses.iter().any(|c| {
+            matches!(
+                c,
+                sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(
+                    sqlparser::ast::NullTreatment::IgnoreNulls,
+                ),
+            )
+        });
+        assert!(
+            found,
+            "expected IGNORE NULLS clause in args.clauses, got: {:?}",
+            args.clauses,
+        );
+    }
+
+    #[test]
+    fn parse_sql_raw_recognizes_respect_nulls_inside_window_function_args() {
+        let stmt = parse_sql_raw(
+            "SELECT lead(v, 1) RESPECT NULLS OVER (ORDER BY x) AS w FROM t",
+        )
+        .expect("RESPECT NULLS after function call must parse");
+        let sqlparser::ast::Statement::Query(query) = stmt else {
+            panic!("expected query statement");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select body");
+        };
+        let sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } = &select.projection[0] else {
+            panic!("expected aliased projection, got: {:?}", select.projection);
+        };
+        let sqlparser::ast::Expr::Function(func) = expr else {
+            panic!("expected function call projection, got: {expr:?}");
+        };
+        // Post-args form lands in Function.null_treatment.
+        assert!(
+            matches!(
+                func.null_treatment,
+                Some(sqlparser::ast::NullTreatment::RespectNulls)
+            ),
+            "expected null_treatment=RespectNulls, got: {:?}",
+            func.null_treatment,
+        );
+        assert!(func.over.is_some(), "OVER clause must still be parsed");
+    }
 }

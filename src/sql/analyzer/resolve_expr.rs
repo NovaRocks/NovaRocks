@@ -1172,6 +1172,26 @@ impl<'a> super::AnalyzerContext<'a> {
             };
             let (partition_by, order_by, window_frame) =
                 self.analyze_window_spec(window_type, scope)?;
+            // sqlparser surfaces IGNORE/RESPECT NULLS in two places, depending
+            // on whether the keywords are written inside the function call's
+            // argument list (`first_value(v IGNORE NULLS)`) or after the
+            // closing paren (`first_value(v) IGNORE NULLS OVER (...)`).
+            // Per sqlparser, only one form can be set on a given function.
+            let post_args_treatment = func.null_treatment;
+            let inside_args_treatment = match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => list.clauses.iter().find_map(|c| {
+                    if let sqlparser::ast::FunctionArgumentClause::IgnoreOrRespectNulls(t) = c {
+                        Some(*t)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+            let ignore_nulls = matches!(
+                post_args_treatment.or(inside_args_treatment),
+                Some(sqlparser::ast::NullTreatment::IgnoreNulls)
+            );
             return Ok(TypedExpr {
                 kind: ExprKind::WindowCall {
                     name,
@@ -1180,6 +1200,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     partition_by,
                     order_by,
                     window_frame,
+                    ignore_nulls,
                 },
                 data_type: return_type,
                 nullable: true,

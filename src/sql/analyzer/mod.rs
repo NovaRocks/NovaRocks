@@ -1870,6 +1870,7 @@ fn replace_grouping_markers_in_typed_expr(
             partition_by,
             order_by,
             window_frame,
+            ignore_nulls,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
             nullable: expr.nullable,
@@ -1893,6 +1894,7 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 window_frame: window_frame.clone(),
+                ignore_nulls: *ignore_nulls,
             },
         },
         ExprKind::Case {
