@@ -1159,6 +1159,20 @@ impl<'a> super::AnalyzerContext<'a> {
 
         // Check for window function: func(...) OVER (...)
         if let Some(ref window_type) = func.over {
+            // StarRocks rejects LEAD/LAG when the third (default) argument
+            // doesn't match a per-shape type rule. The error message echoes
+            // the value column's type (INT/FLOAT/DECIMAL...) and is asserted
+            // by SQL regression tests.
+            if matches!(name.as_str(), "lead" | "lag") && args_typed.len() >= 3 {
+                let value_type = args_typed[0].data_type.clone();
+                let default_arg = &args_typed[2];
+                if !is_lead_lag_default_arg_acceptable(default_arg, &value_type) {
+                    return Err(format!(
+                        "The type of the third parameter of LEAD/LAG not match the type {}.",
+                        lead_lag_type_display(&value_type)
+                    ));
+                }
+            }
             let return_type = if is_window_only_function(&name) {
                 infer_window_return_type(&name, &arg_types)
             } else if is_aggregate_function(&name) {
@@ -2403,6 +2417,126 @@ fn strip_casts(expr: &TypedExpr) -> &TypedExpr {
         ExprKind::Cast { expr, .. } => strip_casts(expr),
         ExprKind::Nested(inner) => strip_casts(inner),
         _ => expr,
+    }
+}
+
+/// StarRocks's LEAD/LAG default-argument check uses different rules per
+/// expression shape:
+///   - Plain literal (or NULL): always accepted; runtime coerces to the value
+///     type.
+///   - Bare column reference: type must be in the same broad family as the
+///     value column (numeric/string/temporal).
+///   - Constant expression (literals + arithmetic on literals): type must be
+///     in the same *narrow* numeric family as the value column (INT-INT,
+///     FLOAT-FLOAT, DECIMAL-DECIMAL...). This is stricter than the bare
+///     ColumnRef rule because StarRocks doesn't constant-fold the expression
+///     for type purposes.
+///   - Anything else (function calls, column-bearing arithmetic): rejected
+///     for INT/FLOAT/DECIMAL value columns; VARCHAR allows them through
+///     because StarRocks stringifies arbitrary scalars.
+fn is_lead_lag_default_arg_acceptable(default_arg: &TypedExpr, value_type: &DataType) -> bool {
+    // VARCHAR is the lenient case: StarRocks stringifies arbitrary scalars,
+    // so any expression is accepted as the default.
+    if matches!(value_type, DataType::Utf8 | DataType::LargeUtf8) {
+        return true;
+    }
+    let stripped = strip_casts(default_arg);
+    // Plain (signed) literal — `1`, `-1`, `(1)`, etc. — is always accepted.
+    // sqlparser surfaces `-1` as `UnaryOp::Minus(Literal(1))`, so peel the
+    // unary minus before deciding.
+    if is_signed_literal(stripped) {
+        return true;
+    }
+    if matches!(stripped.kind, ExprKind::ColumnRef { .. }) {
+        return lead_lag_family_compatible(value_type, &default_arg.data_type);
+    }
+    if is_constant_default_expression(stripped) {
+        return lead_lag_narrow_numeric_compatible(value_type, &stripped.data_type);
+    }
+    false
+}
+
+fn is_signed_literal(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) => true,
+        ExprKind::Nested(inner) => is_signed_literal(inner),
+        ExprKind::UnaryOp { expr: inner, .. } => is_signed_literal(inner),
+        ExprKind::Cast { expr: inner, .. } => is_signed_literal(inner),
+        _ => false,
+    }
+}
+
+fn is_constant_default_expression(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(_) => true,
+        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => is_constant_default_expression(expr),
+        ExprKind::BinaryOp { left, right, .. } => {
+            is_constant_default_expression(left) && is_constant_default_expression(right)
+        }
+        ExprKind::UnaryOp { expr, .. } => is_constant_default_expression(expr),
+        _ => false,
+    }
+}
+
+fn lead_lag_family_compatible(value: &DataType, default: &DataType) -> bool {
+    if value == default || matches!(default, DataType::Null) {
+        return true;
+    }
+    if value.is_numeric() && default.is_numeric() {
+        return true;
+    }
+    let is_str = |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8);
+    if is_str(value) && is_str(default) {
+        return true;
+    }
+    let is_temporal =
+        |t: &DataType| matches!(t, DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _));
+    if is_temporal(value) && is_temporal(default) {
+        return true;
+    }
+    false
+}
+
+fn lead_lag_narrow_numeric_compatible(value: &DataType, default: &DataType) -> bool {
+    use DataType::*;
+    if matches!(default, Null) {
+        return true;
+    }
+    let is_int = |t: &DataType| matches!(t, Int8 | Int16 | Int32 | Int64);
+    let is_float = |t: &DataType| matches!(t, Float32 | Float64);
+    let is_decimal = |t: &DataType| matches!(t, Decimal128(_, _) | Decimal256(_, _));
+    let is_str = |t: &DataType| matches!(t, Utf8 | LargeUtf8);
+    if is_int(value) && is_int(default) {
+        return true;
+    }
+    if is_float(value) && is_float(default) {
+        return true;
+    }
+    if is_decimal(value) && is_decimal(default) {
+        return true;
+    }
+    if is_str(value) && is_str(default) {
+        return true;
+    }
+    value == default
+}
+
+fn lead_lag_type_display(t: &DataType) -> &'static str {
+    use DataType::*;
+    match t {
+        Int8 => "TINYINT",
+        Int16 => "SMALLINT",
+        Int32 => "INT",
+        Int64 => "BIGINT",
+        Float32 => "FLOAT",
+        Float64 => "DOUBLE",
+        Decimal128(_, _) | Decimal256(_, _) => "DECIMAL",
+        Utf8 | LargeUtf8 => "VARCHAR",
+        Date32 | Date64 => "DATE",
+        Timestamp(_, _) => "DATETIME",
+        Boolean => "BOOLEAN",
+        Binary | LargeBinary => "VARBINARY",
+        _ => "UNKNOWN",
     }
 }
 

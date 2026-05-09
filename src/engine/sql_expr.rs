@@ -278,19 +278,16 @@ pub(crate) fn literal_to_i128_for_integer(
                     literal
                 ));
             }
-            if v.fract() != 0.0 {
-                return Err(format!(
-                    "literal {:?} is not an integral value for {type_name}",
-                    literal
-                ));
-            }
             if *v < i128::MIN as f64 || *v > i128::MAX as f64 {
                 return Err(format!(
                     "literal {:?} is out of range for {type_name}",
                     literal
                 ));
             }
-            Ok(Some(*v as i128))
+            // StarRocks/MySQL truncate fractional values when assigning floats
+            // to integer columns (e.g. `INSERT INTO int_col SELECT 1/19` ->
+            // 0). Match that lenient behaviour rather than failing fast.
+            Ok(Some(v.trunc() as i128))
         }
         Literal::String(s) => s
             .trim()

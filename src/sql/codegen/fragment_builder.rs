@@ -1498,11 +1498,12 @@ impl<'a> PlanFragmentBuilder<'a> {
         }
         self.desc_builder.add_tuple(intermediate_tuple_id, None);
 
-        // Register output slots
+        // Register output slots. Forward the child's full scope (both
+        // qualified and unqualified) so post-window references like
+        // `<table>.col` (produced by `SELECT *` expansion under FROM <table>)
+        // still resolve.
         let mut output_scope = ExprScope::new();
-        for (name, binding) in child.scope.iter_columns() {
-            output_scope.add_column(None, name.clone(), binding.clone());
-        }
+        output_scope.merge(&child.scope);
         for (idx, win_expr) in op.window_exprs.iter().enumerate() {
             let slot_id = self.alloc_slot();
             self.desc_builder.add_slot(
@@ -1721,9 +1722,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             self.desc_builder.add_tuple(intermediate_tuple_id, None);
 
             let mut output_scope = ExprScope::new();
-            for (name, binding) in current.scope.iter_columns() {
-                output_scope.add_column(None, name.clone(), binding.clone());
-            }
+            output_scope.merge(&current.scope);
             for (idx, win_expr) in group_exprs.iter().enumerate() {
                 let slot_id = self.alloc_slot();
                 self.desc_builder.add_slot(
