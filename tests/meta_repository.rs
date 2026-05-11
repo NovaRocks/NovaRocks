@@ -148,6 +148,15 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
     };
 
     {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), refresh_id)?
+            .expect("refresh intent should persist");
+        assert_eq!(refresh.state, MvRefreshState::IntentCreated);
+        assert_eq!(refresh.target_snapshots["ice.ns.orders_mv"], 100);
+    }
+
+    {
         let mut txn = provider.begin_write("record external mv commit")?;
         repository.record_external_commit_outcome(
             txn.as_mut(),
@@ -158,6 +167,19 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
             },
         )?;
         txn.commit()?;
+    }
+
+    {
+        let read = provider.begin_read()?;
+        let refresh = repository
+            .load_refresh(read.as_ref(), refresh_id)?
+            .expect("refresh should exist after external commit");
+        assert_eq!(refresh.state.as_str(), "EXTERNAL_COMMITTED");
+        let outcome = refresh
+            .external_outcome
+            .expect("external outcome should persist");
+        assert_eq!(outcome.target_snapshot_id, Some(200));
+        assert_eq!(outcome.commit_id, "commit-1");
     }
 
     {
