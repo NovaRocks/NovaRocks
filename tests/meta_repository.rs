@@ -6,9 +6,12 @@ use novarocks::meta::repository::mv::{
     RefreshExternalOutcome,
 };
 use novarocks::meta::repository::{
-    RepositoryError, decode_json_payload, encode_json_payload, id_scopes,
+    RepositoryError, RepositoryErrorKind, decode_json_payload, encode_json_payload, id_scopes,
 };
-use novarocks::meta::{MetaKey, MetaStoreProvider, SqliteMetaStoreProvider};
+use novarocks::meta::{
+    ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
+    SqliteMetaStoreProvider,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,7 +234,121 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
     assert_eq!(definition.last_refresh_rows, Some(3));
     assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(200));
     assert!(!definition.refresh_in_progress);
+    assert_eq!(definition.active_refresh_id, None);
     assert!(definition.refresh_target_snapshots.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_rejects_second_refresh_intent() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id, amount FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("ns".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                created_at_ms: 11,
+            },
+        )?;
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    let refresh_a = {
+        let mut txn = provider.begin_write("begin mv refresh a")?;
+        let mut target_snapshots = BTreeMap::new();
+        target_snapshots.insert("ice.ns.orders_mv".to_string(), 100);
+        let refresh = repository.begin_refresh_intent(txn.as_mut(), mv_id, target_snapshots)?;
+        txn.commit()?;
+        refresh
+    };
+
+    {
+        let mut txn = provider.begin_write("begin mv refresh b")?;
+        let mut target_snapshots = BTreeMap::new();
+        target_snapshots.insert("ice.ns.orders_mv".to_string(), 999);
+        let err = repository
+            .begin_refresh_intent(txn.as_mut(), mv_id, target_snapshots)
+            .expect_err("second refresh should be rejected");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    let read = provider.begin_read()?;
+    let definition = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should exist");
+    assert!(definition.refresh_in_progress);
+    assert_eq!(definition.active_refresh_id, Some(refresh_a.refresh_id));
+    assert_eq!(definition.refresh_target_snapshots["ice.ns.orders_mv"], 100);
+
+    let persisted_refresh_a = repository
+        .load_refresh(read.as_ref(), refresh_a.refresh_id)?
+        .expect("refresh a should persist");
+    assert_eq!(
+        persisted_refresh_a.target_snapshots["ice.ns.orders_mv"],
+        100
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_rejects_definition_schema_version_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let key = MetaKey::new("mv", ["by-id", "1"])?;
+    let payload = serde_json::json!({
+        "mv_id": 1,
+        "select_sql": "SELECT id FROM iceberg.sales.orders",
+        "base_table_refs": ["iceberg.sales.orders"],
+        "primary_key_columns": ["id"],
+        "storage_engine": "iceberg",
+        "target_catalog": "ice",
+        "target_namespace": "ns",
+        "target_table": "orders_mv",
+        "last_refresh_ms": null,
+        "last_refresh_rows": null,
+        "last_refresh_snapshots": {},
+        "last_refresh_table_uuids": {},
+        "last_refreshed_iceberg_snapshot_id": null,
+        "refresh_in_progress": false,
+        "active_refresh_id": null,
+        "refresh_target_snapshots": {},
+        "created_at_ms": 11
+    });
+
+    {
+        let mut txn = provider.begin_write("write mismatched mv definition")?;
+        txn.put(MetaRecordPut::new(
+            key,
+            MetaRecordKind::new("mv.definition")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(999, &payload)?,
+        ))?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let err = repository
+        .load_by_id(read.as_ref(), 1)
+        .expect_err("schema version mismatch should fail");
+    assert!(
+        err.to_string()
+            .contains("metadata record by-id/1 has schema version 999")
+    );
 
     Ok(())
 }

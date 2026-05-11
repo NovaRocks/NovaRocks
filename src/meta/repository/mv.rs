@@ -37,6 +37,8 @@ pub struct StoredMvDefinition {
     pub last_refresh_table_uuids: BTreeMap<String, String>,
     pub last_refreshed_iceberg_snapshot_id: Option<i64>,
     pub refresh_in_progress: bool,
+    #[serde(default)]
+    pub active_refresh_id: Option<i64>,
     pub refresh_target_snapshots: BTreeMap<String, i64>,
     pub created_at_ms: i64,
 }
@@ -134,6 +136,7 @@ impl MvMetaRepository {
             last_refresh_table_uuids: BTreeMap::new(),
             last_refreshed_iceberg_snapshot_id: None,
             refresh_in_progress: false,
+            active_refresh_id: None,
             refresh_target_snapshots: BTreeMap::new(),
             created_at_ms: req.created_at_ms,
         };
@@ -191,7 +194,11 @@ impl MvMetaRepository {
         let Some(record) = txn.get(&key_by_target(catalog, namespace, table)?)? else {
             return Ok(None);
         };
-        let lookup: MvTargetLookup = decode_record_payload(&record, MV_TARGET_LOOKUP_KIND)?;
+        let lookup: MvTargetLookup = decode_record_payload(
+            &record,
+            MV_TARGET_LOOKUP_KIND,
+            MV_TARGET_LOOKUP_SCHEMA_VERSION,
+        )?;
         self.load_by_id(txn, lookup.mv_id)
     }
 
@@ -204,7 +211,15 @@ impl MvMetaRepository {
         let mut definition = self.load_versioned_by_id(txn, mv_id)?.ok_or_else(|| {
             RepositoryError::not_found(format!("mv definition {mv_id} not found"))
         })?;
+        if definition.value.refresh_in_progress {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {mv_id} already has refresh in progress"
+            )));
+        }
+
+        let refresh_id = txn.allocate_id(id_scopes::refresh_id())?;
         definition.value.refresh_in_progress = true;
+        definition.value.active_refresh_id = Some(refresh_id);
         definition.value.refresh_target_snapshots = target_snapshots.clone();
         put_definition(
             txn,
@@ -212,7 +227,6 @@ impl MvMetaRepository {
             ExpectedRevision::Exact(definition.record_revision.clone()),
         )?;
 
-        let refresh_id = txn.allocate_id(id_scopes::refresh_id())?;
         let refresh = StoredMvRefresh {
             refresh_id,
             mv_id,
@@ -285,11 +299,19 @@ impl MvMetaRepository {
                     refresh.value.mv_id
                 ))
             })?;
+        if definition.value.active_refresh_id != Some(req.refresh_id) {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {} active refresh is {:?}, expected {}",
+                refresh.value.mv_id, definition.value.active_refresh_id, req.refresh_id
+            )));
+        }
+
         definition.value.last_refresh_rows = Some(req.rows);
         definition.value.last_refresh_snapshots = req.base_snapshots;
         definition.value.last_refresh_table_uuids = req.base_table_uuids;
         definition.value.last_refreshed_iceberg_snapshot_id = req.target_snapshot_id;
         definition.value.refresh_in_progress = false;
+        definition.value.active_refresh_id = None;
         definition.value.refresh_target_snapshots.clear();
         put_definition(
             txn,
@@ -313,7 +335,7 @@ struct VersionedMvRefresh {
 }
 
 fn decode_definition_record(record: MetaRecord) -> RepositoryResult<VersionedMvDefinition> {
-    let value = decode_record_payload(&record, MV_DEFINITION_KIND)?;
+    let value = decode_record_payload(&record, MV_DEFINITION_KIND, MV_DEFINITION_SCHEMA_VERSION)?;
     Ok(VersionedMvDefinition {
         record_revision: record.revision,
         value,
@@ -326,7 +348,7 @@ fn load_versioned_refresh(
 ) -> RepositoryResult<Option<VersionedMvRefresh>> {
     txn.get(&key_refresh(refresh_id)?)?
         .map(|record| {
-            let value = decode_record_payload(&record, MV_REFRESH_KIND)?;
+            let value = decode_record_payload(&record, MV_REFRESH_KIND, MV_REFRESH_SCHEMA_VERSION)?;
             Ok(VersionedMvRefresh {
                 record_revision: record.revision,
                 value,
@@ -363,7 +385,11 @@ fn put_refresh(
     Ok(())
 }
 
-fn decode_record_payload<T>(record: &MetaRecord, expected_kind: &str) -> RepositoryResult<T>
+fn decode_record_payload<T>(
+    record: &MetaRecord,
+    expected_kind: &str,
+    expected_schema_version: i32,
+) -> RepositoryResult<T>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -372,6 +398,13 @@ where
             "metadata record {} has kind {}, expected {expected_kind}",
             record.key.canonical_path(),
             record.kind.as_str()
+        )));
+    }
+    if record.payload.schema_version != expected_schema_version {
+        return Err(RepositoryError::provider(format!(
+            "metadata record {} has schema version {}, expected {expected_schema_version}",
+            record.key.canonical_path(),
+            record.payload.schema_version
         )));
     }
     decode_json_payload(&record.payload)
