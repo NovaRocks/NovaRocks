@@ -24,6 +24,7 @@ pub mod exec;
 pub mod formats;
 pub mod fs;
 pub mod lower;
+pub mod meta;
 pub mod runtime;
 pub mod server;
 pub mod service;
