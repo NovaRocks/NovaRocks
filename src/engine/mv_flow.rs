@@ -26,36 +26,40 @@ fn mv_backend(
 
 pub(crate) fn create_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     db: &str,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    mv_backend(state)?.create_mv(stmt, db)?;
+    mv_backend(state)?.create_mv(stmt, current_catalog, db)?;
     Ok(StatementResult::Ok)
 }
 
 pub(crate) fn drop_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     db: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    mv_backend(state)?.drop_mv(stmt, db)?;
+    mv_backend(state)?.drop_mv(stmt, current_catalog, db)?;
     Ok(StatementResult::Ok)
 }
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     db: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    mv_backend(state)?.refresh_mv(stmt, db)?;
+    mv_backend(state)?.refresh_mv(stmt, current_catalog, db)?;
     Ok(StatementResult::Ok)
 }
 
 pub(crate) fn list_mvs(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,
 ) -> Result<StatementResult, String> {
-    let result: QueryResult = mv_backend(state)?.list_mvs(stmt)?;
+    let result: QueryResult = mv_backend(state)?.list_mvs(stmt, current_catalog)?;
     Ok(StatementResult::Query(result))
 }
 

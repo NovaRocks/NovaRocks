@@ -125,17 +125,24 @@ pub(crate) trait MvBackend: Send + Sync {
     fn create_mv(
         &self,
         stmt: &CreateMaterializedViewStmt,
+        current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<(), String>;
     fn drop_mv(
         &self,
         stmt: &DropMaterializedViewStmt,
+        current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<(), String>;
     fn refresh_mv(
         &self,
         stmt: &RefreshMaterializedViewStmt,
+        current_catalog: Option<&str>,
         current_database: &str,
     ) -> Result<(), String>;
-    fn list_mvs(&self, stmt: &ShowMaterializedViewsStmt) -> Result<QueryResult, String>;
+    fn list_mvs(
+        &self,
+        stmt: &ShowMaterializedViewsStmt,
+        current_catalog: Option<&str>,
+    ) -> Result<QueryResult, String>;
 }

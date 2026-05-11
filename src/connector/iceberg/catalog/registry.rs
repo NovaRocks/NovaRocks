@@ -92,12 +92,6 @@ impl IcebergCatalogRegistry {
         catalog_name: &str,
         properties: &[(String, String)],
     ) -> Result<(), String> {
-        use crate::connector::starrocks::managed::mv_iceberg_catalog::NOVA_MV_CATALOG_NAME;
-        if catalog_name.eq_ignore_ascii_case(NOVA_MV_CATALOG_NAME) {
-            return Err(format!(
-                "`{NOVA_MV_CATALOG_NAME}` is reserved for NovaRocks internal materialized view storage"
-            ));
-        }
         let key = normalize_identifier(catalog_name)?;
         if self.catalogs.contains_key(&key) {
             return Ok(());
@@ -121,12 +115,6 @@ impl IcebergCatalogRegistry {
     }
 
     pub(crate) fn drop_catalog(&mut self, catalog_name: &str) -> Result<(), String> {
-        use crate::connector::starrocks::managed::mv_iceberg_catalog::NOVA_MV_CATALOG_NAME;
-        if catalog_name.eq_ignore_ascii_case(NOVA_MV_CATALOG_NAME) {
-            return Err(format!(
-                "`{NOVA_MV_CATALOG_NAME}` is reserved for NovaRocks internal materialized view storage"
-            ));
-        }
         let key = normalize_identifier(catalog_name)?;
         self.catalogs
             .remove(&key)
@@ -2645,51 +2633,6 @@ mod table_property_tests {
         let expected = iceberg::spec::Literal::Primitive(iceberg::spec::PrimitiveLiteral::Int(5));
         assert_eq!(field.initial_default.as_ref(), Some(&expected));
         assert_eq!(field.write_default.as_ref(), Some(&expected));
-    }
-}
-
-#[cfg(test)]
-mod nova_mv_reserved_name_tests {
-    use super::*;
-
-    #[test]
-    fn create_external_catalog_rejects_reserved_nova_mv_name() {
-        let mut registry = IcebergCatalogRegistry::default();
-        let err = registry
-            .create_catalog("__nova_mv__", &[("type".to_string(), "hadoop".to_string())])
-            .expect_err("should reject reserved name");
-        assert!(
-            err.contains("__nova_mv__"),
-            "error should mention the reserved name: {err}"
-        );
-    }
-
-    #[test]
-    fn create_external_catalog_rejects_reserved_nova_mv_name_case_insensitive() {
-        let mut registry = IcebergCatalogRegistry::default();
-        let err = registry
-            .create_catalog("__NOVA_MV__", &[("type".to_string(), "hadoop".to_string())])
-            .expect_err("should reject reserved name regardless of case");
-        assert!(
-            err.contains("__nova_mv__"),
-            "error should mention the reserved name: {err}"
-        );
-    }
-
-    #[test]
-    fn drop_catalog_rejects_reserved_nova_mv_name() {
-        let mut registry = IcebergCatalogRegistry::default();
-        let err = registry
-            .drop_catalog("__nova_mv__")
-            .expect_err("should reject reserved name");
-        assert!(
-            err.contains("__nova_mv__"),
-            "error should mention the reserved name: {err}"
-        );
-        assert!(
-            err.contains("reserved"),
-            "error should mention that the name is reserved: {err}"
-        );
     }
 }
 

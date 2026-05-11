@@ -8,7 +8,6 @@ pub(crate) struct ManagedLakeConfig {
     pub(crate) warehouse_uri: String,
     pub(crate) s3: S3StoreConfig,
     pub(crate) mv_default_storage_engine: String,
-    pub(crate) mv_iceberg_warehouse_location: Option<String>,
 }
 
 impl ManagedLakeConfig {
@@ -46,19 +45,7 @@ impl ManagedLakeConfig {
                 enable_path_style_access: config.enable_path_style_access,
             },
             mv_default_storage_engine,
-            mv_iceberg_warehouse_location: config
-                .mv_iceberg_warehouse_location
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
         })
-    }
-
-    pub(crate) fn mv_iceberg_warehouse(&self) -> String {
-        self.mv_iceberg_warehouse_location
-            .clone()
-            .unwrap_or_else(|| format!("{}/_nova_iceberg_mv", self.warehouse_uri))
     }
 
     pub(crate) fn tablet_root_path(&self, db_id: i64, table_id: i64, partition_id: i64) -> String {
@@ -86,11 +73,9 @@ mod tests {
             region: None,
             enable_path_style_access: Some(true),
             mv_default_storage_engine: Some("iceberg".to_string()),
-            mv_iceberg_warehouse_location: None,
         };
         let cfg = ManagedLakeConfig::from_app_config(app).expect("config");
         assert_eq!(cfg.mv_default_storage_engine, "iceberg");
-        assert!(cfg.mv_iceberg_warehouse_location.is_none());
     }
 
     #[test]
@@ -103,7 +88,6 @@ mod tests {
             region: None,
             enable_path_style_access: Some(true),
             mv_default_storage_engine: None,
-            mv_iceberg_warehouse_location: None,
         };
         let cfg = ManagedLakeConfig::from_app_config(app).expect("config");
         assert_eq!(cfg.mv_default_storage_engine, "managed_lake");
@@ -119,34 +103,10 @@ mod tests {
             region: None,
             enable_path_style_access: Some(true),
             mv_default_storage_engine: Some("duckdb".to_string()),
-            mv_iceberg_warehouse_location: None,
         };
         let err = ManagedLakeConfig::from_app_config(app).unwrap_err();
         assert!(err.contains("duckdb"), "err={err}");
         assert!(err.contains("managed_lake"), "err={err}");
         assert!(err.contains("iceberg"), "err={err}");
-    }
-
-    #[test]
-    fn mv_iceberg_warehouse_falls_back_to_warehouse_uri_subpath() {
-        let mut app = StandaloneManagedLakeConfig {
-            warehouse_uri: "s3://bucket/wh".to_string(),
-            endpoint: "http://localhost:9000".to_string(),
-            access_key_id: "ak".to_string(),
-            access_key_secret: "sk".to_string(),
-            region: None,
-            enable_path_style_access: Some(true),
-            mv_default_storage_engine: None,
-            mv_iceberg_warehouse_location: None,
-        };
-        let cfg = ManagedLakeConfig::from_app_config(app.clone()).unwrap();
-        assert_eq!(
-            cfg.mv_iceberg_warehouse(),
-            "s3://bucket/wh/_nova_iceberg_mv"
-        );
-
-        app.mv_iceberg_warehouse_location = Some("s3://custom/path".to_string());
-        let cfg = ManagedLakeConfig::from_app_config(app).unwrap();
-        assert_eq!(cfg.mv_iceberg_warehouse(), "s3://custom/path");
     }
 }

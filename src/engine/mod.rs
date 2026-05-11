@@ -1446,15 +1446,17 @@ pub(crate) fn dispatch_statement(
 
     match statement {
         Statement::CreateMaterializedView(stmt) => {
-            crate::engine::mv_flow::create_mv(state, current_database, &stmt)
+            crate::engine::mv_flow::create_mv(state, current_catalog, current_database, &stmt)
         }
         Statement::DropMaterializedView(stmt) => {
-            crate::engine::mv_flow::drop_mv(state, current_database, &stmt)
+            crate::engine::mv_flow::drop_mv(state, current_catalog, current_database, &stmt)
         }
         Statement::RefreshMaterializedView(stmt) => {
-            crate::engine::mv_flow::refresh_mv(state, current_database, &stmt)
+            crate::engine::mv_flow::refresh_mv(state, current_catalog, current_database, &stmt)
         }
-        Statement::ShowMaterializedViews(stmt) => crate::engine::mv_flow::list_mvs(state, &stmt),
+        Statement::ShowMaterializedViews(stmt) => {
+            crate::engine::mv_flow::list_mvs(state, current_catalog, &stmt)
+        }
         Statement::AlterIcebergRef(stmt) => {
             crate::engine::iceberg_ref_flow::execute(state, current_database, &stmt)
         }
@@ -1554,6 +1556,7 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     let snapshot = store.load_snapshot()?;
     restore_managed_lake(state, &snapshot)?;
     restore_iceberg_catalogs(state, &snapshot)?;
+    crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(state)?;
     Ok(())
 }
 
@@ -2681,6 +2684,20 @@ mod tests {
         (0..ids.len())
             .map(|idx| ids.value(idx).to_string())
             .collect()
+    }
+
+    fn query_result_contains_string(result: &QueryResult, expected: &str) -> bool {
+        result.chunks.iter().any(|chunk| {
+            chunk.batch.columns().iter().any(|column| {
+                column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .is_some_and(|values| {
+                        (0..values.len())
+                            .any(|idx| !values.is_null(idx) && values.value(idx).contains(expected))
+                    })
+            })
+        })
     }
 
     fn managed_lake_endpoint_reachable(endpoint: &str) -> bool {
@@ -4247,6 +4264,133 @@ enable_path_style_access = true
             .downcast_ref::<arrow::array::StringArray>()
             .expect("string array");
         assert_eq!(names.value(0), "b");
+    }
+
+    #[test]
+    fn restore_metadata_registers_iceberg_mv_target_from_relationship() {
+        let warehouse = TempDir::new().expect("create iceberg warehouse");
+        let metadata_dir = TempDir::new().expect("create metadata dir");
+        let metadata_db_path = metadata_dir.path().join("standalone.sqlite");
+
+        {
+            let engine = StandaloneNovaRocks::open(StandaloneOptions {
+                config_path: None,
+                metadata_db_path: Some(metadata_db_path.clone()),
+            })
+            .expect("open engine");
+            let session = engine.session();
+
+            let create_catalog_sql = format!(
+                r#"create external catalog ice properties("type"="iceberg","iceberg.catalog.type"="memory","iceberg.catalog.warehouse"="{}")"#,
+                warehouse.path().display()
+            );
+            assert!(matches!(
+                session
+                    .execute_in_database(&create_catalog_sql, "default")
+                    .expect("create iceberg catalog"),
+                StatementResult::Ok
+            ));
+            assert!(matches!(
+                session
+                    .execute_in_database("create database ice.analytics", "default")
+                    .expect("create target namespace"),
+                StatementResult::Ok
+            ));
+            assert!(matches!(
+                session
+                    .execute_in_database("create database ice.sales", "default")
+                    .expect("create source namespace"),
+                StatementResult::Ok
+            ));
+            assert!(matches!(
+                session
+                    .execute_in_database(
+                        "create table ice.sales.orders (id int, name string)",
+                        "default",
+                    )
+                    .expect("create base table"),
+                StatementResult::Ok
+            ));
+            assert!(matches!(
+                session
+                    .execute_in_context(
+                        "CREATE MATERIALIZED VIEW mv_orders \
+                         DISTRIBUTED BY HASH(id) BUCKETS 1 \
+                         PROPERTIES('storage_engine'='iceberg') \
+                         AS SELECT id, name FROM ice.sales.orders",
+                        Some("ice"),
+                        "analytics",
+                        None,
+                    )
+                    .expect("create iceberg mv"),
+                StatementResult::Ok
+            ));
+
+            let store = engine
+                .inner
+                .metadata_store
+                .as_ref()
+                .expect("metadata store");
+            let snapshot = store.load_snapshot().expect("load snapshot");
+            assert!(
+                !snapshot
+                    .managed
+                    .tables
+                    .iter()
+                    .any(|table| table.name == "mv_orders")
+            );
+            assert!(
+                !snapshot.iceberg_tables.iter().any(|table| {
+                    table.catalog == "ice"
+                        && table.namespace == "analytics"
+                        && table.table == "mv_orders"
+                }),
+                "Iceberg MV target must be restored from relationship metadata, not generic table metadata"
+            );
+            assert!(snapshot.managed.materialized_views.iter().any(|mv| {
+                mv.target_catalog.as_deref() == Some("ice")
+                    && mv.target_namespace.as_deref() == Some("analytics")
+                    && mv.target_table.as_deref() == Some("mv_orders")
+            }));
+        }
+
+        let restored = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: None,
+            metadata_db_path: Some(metadata_db_path),
+        })
+        .expect("reopen engine");
+        let session = restored.session();
+        let show = session
+            .execute_in_context("SHOW MATERIALIZED VIEWS", Some("ice"), "analytics", None)
+            .expect("show restored mv");
+        let StatementResult::Query(show) = show else {
+            panic!("expected show query result");
+        };
+        assert!(query_result_contains_string(&show, "mv_orders"));
+        assert!(query_result_contains_string(&show, "iceberg"));
+
+        let info_schema = session
+            .execute_in_context(
+                "SELECT TABLE_NAME, IS_ACTIVE \
+                 FROM information_schema.materialized_views \
+                 WHERE TABLE_SCHEMA = 'analytics'",
+                Some("ice"),
+                "analytics",
+                None,
+            )
+            .expect("query information_schema materialized views");
+        let StatementResult::Query(info_schema) = info_schema else {
+            panic!("expected information_schema query result");
+        };
+        assert!(query_result_contains_string(&info_schema, "mv_orders"));
+
+        let select = session
+            .execute_in_context("SELECT * FROM mv_orders", Some("ice"), "analytics", None)
+            .expect("select restored mv target");
+        let StatementResult::Query(select) = select else {
+            panic!("expected select query result");
+        };
+        assert_eq!(select.row_count(), 0);
     }
 
     #[test]

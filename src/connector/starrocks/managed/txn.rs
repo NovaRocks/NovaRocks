@@ -1638,7 +1638,6 @@ mod mv_target_tests {
                 enable_path_style_access: Some(true),
             },
             mv_default_storage_engine: "managed_lake".to_string(),
-            mv_iceberg_warehouse_location: None,
         };
         let active_tablet_root = format!("{metadata_root}/db_1/table_10/partition_20");
         let tablet_schema = aggregate_primary_key_tablet_schema();
@@ -1776,6 +1775,9 @@ mod mv_target_tests {
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
                 last_refreshed_iceberg_snapshot_id: None,
                 refresh_in_progress: false,
                 refresh_target_snapshots: Default::default(),
@@ -2021,7 +2023,6 @@ mod mv_target_tests {
                         enable_path_style_access: Some(true),
                     },
                     mv_default_storage_engine: "managed_lake".to_string(),
-                    mv_iceberg_warehouse_location: None,
                 };
                 (
                     config,
@@ -2240,6 +2241,9 @@ mod mv_target_tests {
                     created_at_ms: 1,
                     storage_engine: ManagedMvStorageEngine::ManagedLake,
                     iceberg_table_identifier: None,
+                    target_catalog: None,
+                    target_namespace: None,
+                    target_table: None,
                     last_refreshed_iceberg_snapshot_id: None,
                     refresh_in_progress: false,
                     refresh_target_snapshots: Default::default(),
@@ -2345,7 +2349,6 @@ mod mv_target_tests {
                 enable_path_style_access: Some(true),
             },
             mv_default_storage_engine: "managed_lake".to_string(),
-            mv_iceberg_warehouse_location: None,
         })
     }
 

@@ -508,8 +508,8 @@ fn build_concurrent_limit_layer() -> ConcurrentLimitLayer {
 ///
 /// An absent or empty region defaults to `"us-east-1"` — the value required
 /// by AWS-compatible object stores when no region is configured (e.g. MinIO).
-/// Both this module and `mv_iceberg_catalog` use the same default, so we
-/// centralise the logic here.
+/// Keep this default centralized so all S3-compatible object store paths
+/// behave consistently.
 pub(crate) fn effective_s3_region(region: Option<&str>) -> &str {
     region.filter(|r| !r.is_empty()).unwrap_or("us-east-1")
 }

@@ -15,6 +15,7 @@ coverage includes:
 - Spark-written row-level DELETE, UPDATE, and MERGE visibility
 - Spark-created refs with NovaRocks time-travel reads
 - NovaRocks snapshot/history metadata-table reads over Spark commits
+- NovaRocks Iceberg MV refresh over Spark-written base-table commits
 
 Run it against the generated local environment (see
 [`docker/iceberg-rest/README.md`](../../docker/iceberg-rest/README.md) for

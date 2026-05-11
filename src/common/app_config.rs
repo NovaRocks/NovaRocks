@@ -254,8 +254,6 @@ pub struct StandaloneServerConfig {
     #[serde(default)]
     pub mv_default_storage_engine: Option<String>,
     #[serde(default)]
-    pub mv_iceberg_warehouse_location: Option<String>,
-    #[serde(default)]
     pub tables: Vec<StandaloneTableConfig>,
 }
 
@@ -276,7 +274,6 @@ impl Default for StandaloneServerConfig {
             warehouse_uri: None,
             object_store: None,
             mv_default_storage_engine: None,
-            mv_iceberg_warehouse_location: None,
             tables: Vec::new(),
         }
     }
@@ -291,7 +288,6 @@ pub struct StandaloneManagedLakeConfig {
     pub region: Option<String>,
     pub enable_path_style_access: Option<bool>,
     pub mv_default_storage_engine: Option<String>,
-    pub mv_iceberg_warehouse_location: Option<String>,
 }
 
 impl StandaloneServerConfig {
@@ -341,7 +337,6 @@ impl StandaloneServerConfig {
             region: object_store.region.clone(),
             enable_path_style_access: object_store.enable_path_style_access,
             mv_default_storage_engine: self.mv_default_storage_engine.clone(),
-            mv_iceberg_warehouse_location: self.mv_iceberg_warehouse_location.clone(),
         }))
     }
 }
@@ -1123,7 +1118,6 @@ starlet_port = 19070
                 warehouse_uri: None,
                 object_store: None,
                 mv_default_storage_engine: None,
-                mv_iceberg_warehouse_location: None,
                 tables: Vec::new(),
             })
         );
@@ -1231,13 +1225,12 @@ user = "root"
                 region: Some("us-east-1".to_string()),
                 enable_path_style_access: Some(true),
                 mv_default_storage_engine: None,
-                mv_iceberg_warehouse_location: None,
             })
         );
     }
 
     #[test]
-    fn test_standalone_server_managed_lake_config_propagates_mv_keys() {
+    fn test_standalone_server_managed_lake_config_propagates_mv_default_storage_engine() {
         let standalone = StandaloneServerConfig {
             warehouse_uri: Some("s3://bucket/wh".to_string()),
             object_store: Some(StandaloneObjectStoreConfig {
@@ -1248,15 +1241,10 @@ user = "root"
                 enable_path_style_access: Some(true),
             }),
             mv_default_storage_engine: Some("iceberg".to_string()),
-            mv_iceberg_warehouse_location: Some("s3://other/mv".to_string()),
             ..StandaloneServerConfig::default()
         };
         let cfg = standalone.managed_lake_config().expect("ok").expect("some");
         assert_eq!(cfg.mv_default_storage_engine.as_deref(), Some("iceberg"));
-        assert_eq!(
-            cfg.mv_iceberg_warehouse_location.as_deref(),
-            Some("s3://other/mv")
-        );
     }
 
     #[test]

@@ -43,6 +43,7 @@ use crate::connector::starrocks::managed::txn::{
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
@@ -53,23 +54,21 @@ pub(crate) fn refresh_mv(
         .ok_or_else(|| "managed lake mv refresh requires sqlite metadata store".to_string())?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
 
-    // For iceberg-backed MVs the `managed_lake` catalog does not hold a
-    // `tables_by_name` entry (iceberg MVs have no tablet schema row), so we
-    // check the SQLite snapshot first.  An iceberg MV row always has a
-    // non-null `iceberg_table_identifier` column.  If found, hand off to
-    // `refresh_iceberg_mv` before attempting the managed-lake catalog lookup.
-    {
-        use crate::connector::starrocks::managed::mv_iceberg_catalog::NOVA_MV_CATALOG_NAME;
-        let snapshot = metadata_store.load_snapshot()?.managed;
-        let expected_iceberg_id = format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}");
-        let is_iceberg = snapshot
-            .materialized_views
-            .iter()
-            .any(|mv| mv.iceberg_table_identifier.as_deref() == Some(expected_iceberg_id.as_str()));
-        if is_iceberg {
+    if current_catalog.is_some() {
+        let target =
+            crate::connector::starrocks::managed::mv_refresh_iceberg::resolve_refresh_target(
+                current_catalog,
+                current_database,
+                &stmt.name,
+            )?;
+        if metadata_store
+            .find_iceberg_mv_by_target(&target.catalog, &target.namespace, &target.table)?
+            .is_some()
+        {
             drop(_refresh_guard);
             return crate::connector::starrocks::managed::mv_refresh_iceberg::refresh_iceberg_mv(
                 state,
+                current_catalog,
                 current_database,
                 stmt,
             );
@@ -1029,6 +1028,7 @@ pub(crate) fn load_current_iceberg_base_table(
             .expect("iceberg registry read lock");
         registry.get(&table_ref.catalog)?
     };
+    entry.invalidate_table_cache(&table_ref.namespace, &table_ref.table);
     load_table(&entry, &table_ref.namespace, &table_ref.table)
 }
 
@@ -2371,6 +2371,7 @@ enable_path_style_access = true
 
         let err = refresh_mv(
             &state,
+            None,
             "analytics",
             &RefreshMaterializedViewStmt {
                 name: ObjectName {
@@ -2479,6 +2480,9 @@ enable_path_style_access = true
             created_at_ms: 1,
             storage_engine: ManagedMvStorageEngine::ManagedLake,
             iceberg_table_identifier: None,
+            target_catalog: None,
+            target_namespace: None,
+            target_table: None,
             last_refreshed_iceberg_snapshot_id: None,
             refresh_in_progress: false,
             refresh_target_snapshots: Default::default(),
@@ -2604,6 +2608,9 @@ enable_path_style_access = true
                 created_at_ms: 1,
                 storage_engine: ManagedMvStorageEngine::ManagedLake,
                 iceberg_table_identifier: None,
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
                 last_refreshed_iceberg_snapshot_id: None,
                 refresh_in_progress: false,
                 refresh_target_snapshots: Default::default(),
@@ -2735,7 +2742,6 @@ enable_path_style_access = true
                 enable_path_style_access: Some(true),
             },
             mv_default_storage_engine: "managed_lake".to_string(),
-            mv_iceberg_warehouse_location: None,
         })
     }
 
@@ -2789,7 +2795,6 @@ enable_path_style_access = true
                 enable_path_style_access: Some(true),
             },
             mv_default_storage_engine: "managed_lake".to_string(),
-            mv_iceberg_warehouse_location: None,
         }
     }
 

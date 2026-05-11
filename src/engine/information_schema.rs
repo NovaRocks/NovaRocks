@@ -5,7 +5,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::connector::starrocks::managed::store::{ManagedTableKind, ManagedTableState};
+use crate::connector::starrocks::managed::store::{
+    ManagedMvStorageEngine, ManagedTableKind, ManagedTableState,
+};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 #[derive(Clone, Debug)]
@@ -140,6 +142,20 @@ fn materialized_view_rows(
     let snapshot = metadata_store.load_snapshot()?.managed;
     let mut rows = Vec::new();
     for mv in &snapshot.materialized_views {
+        if mv.storage_engine == ManagedMvStorageEngine::Iceberg {
+            let (Some(table_schema), Some(table_name)) =
+                (mv.target_namespace.clone(), mv.target_table.clone())
+            else {
+                continue;
+            };
+            rows.push(MaterializedViewInfoRow {
+                table_schema,
+                table_name,
+                is_active: true,
+                inactive_reason: None,
+            });
+            continue;
+        }
         let Some(table) = snapshot.tables.iter().find(|table| {
             table.table_id == mv.mv_id && table.kind == ManagedTableKind::MaterializedView
         }) else {

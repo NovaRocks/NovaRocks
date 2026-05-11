@@ -10,7 +10,8 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::get_tablet_runtime;
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
 use crate::engine::catalog::normalize_identifier;
-use crate::engine::{record_batch_to_chunk, register_iceberg_tables_for_query};
+use crate::engine::query_prep::drop_registered_external_table;
+use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
@@ -104,16 +105,27 @@ pub(crate) fn resolve_mv_storage_engine(
 
 pub(crate) fn create_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
+    let default_engine = state
+        .managed_lake_config
+        .as_ref()
+        .map(|c| c.mv_default_storage_engine.as_str())
+        .unwrap_or("managed_lake");
+    let storage_engine = resolve_mv_storage_engine(&stmt.properties, default_engine)?;
     {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
-        if !catalog.database_exists(&db_name)? {
+        let database_exists = catalog.database_exists(&db_name)?;
+        if !database_exists && storage_engine != ManagedMvStorageEngine::Iceberg {
             return Err(format!("unknown database: {db_name}"));
         }
-        if catalog.get(&db_name, &mv_name).is_ok() {
+        if database_exists
+            && storage_engine != ManagedMvStorageEngine::Iceberg
+            && catalog.get(&db_name, &mv_name).is_ok()
+        {
             if stmt.if_not_exists {
                 return Ok(StatementResult::Ok);
             }
@@ -123,15 +135,10 @@ pub(crate) fn create_mv(
         }
     }
 
-    let default_engine = state
-        .managed_lake_config
-        .as_ref()
-        .map(|c| c.mv_default_storage_engine.as_str())
-        .unwrap_or("managed_lake");
-    let storage_engine = resolve_mv_storage_engine(&stmt.properties, default_engine)?;
     if storage_engine == ManagedMvStorageEngine::Iceberg {
         return crate::connector::starrocks::managed::mv_refresh_iceberg::create_iceberg_mv(
             state,
+            current_catalog,
             current_database,
             stmt,
         );
@@ -145,7 +152,7 @@ pub(crate) fn create_mv(
         "managed lake create materialized view requires sqlite metadata store".to_string()
     })?;
 
-    let analysis = analyze_mv_select(state, current_database, &stmt.select_query)?;
+    let analysis = analyze_mv_select(state, current_catalog, current_database, &stmt.select_query)?;
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
 
@@ -319,6 +326,9 @@ pub(crate) fn create_mv(
         created_at_ms: now_ms(),
         storage_engine: ManagedMvStorageEngine::ManagedLake,
         iceberg_table_identifier: None,
+        target_catalog: None,
+        target_namespace: None,
+        target_table: None,
         last_refreshed_iceberg_snapshot_id: None,
         refresh_in_progress: false,
         refresh_target_snapshots: Default::default(),
@@ -695,42 +705,23 @@ pub(crate) fn descriptor_from_loaded(
 
 pub(crate) fn drop_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-
-    // Dispatch to the iceberg drop path when the MV's storage engine is
-    // Iceberg. We use the `storage_engine` field in the SQLite snapshot
-    // (the canonical authoritative gate) rather than the secondary
-    // `iceberg_table_identifier` column. Note: `mv_refresh.rs` currently
-    // uses the `iceberg_table_identifier` lookup as its gate; both gates
-    // are functionally equivalent for any well-formed MV (storage_engine
-    // and iceberg_table_identifier are set together by insert_iceberg_mv_row),
-    // but consolidating both onto `storage_engine` is a follow-up cleanup.
     let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
         "managed lake drop materialized view requires sqlite metadata store".to_string()
     })?;
-    {
-        let snapshot = metadata_store.load_snapshot()?.managed;
-        let is_iceberg = snapshot.materialized_views.iter().any(|mv| {
-            mv.storage_engine == ManagedMvStorageEngine::Iceberg
-                && snapshot.tables.iter().any(|t| {
-                    t.table_id == mv.mv_id
-                        && t.name == mv_name
-                        && t.db_id == {
-                            snapshot
-                                .databases
-                                .iter()
-                                .find(|db| db.name == db_name)
-                                .map(|db| db.db_id)
-                                .unwrap_or(-1)
-                        }
-                })
-        });
-        if is_iceberg {
+    if let Some(catalog) = current_catalog {
+        let catalog = normalize_identifier(catalog)?;
+        if metadata_store
+            .find_iceberg_mv_by_target(&catalog, &db_name, &mv_name)?
+            .is_some()
+        {
             return crate::connector::starrocks::managed::mv_refresh_iceberg::drop_iceberg_mv(
                 state,
+                current_catalog,
                 current_database,
                 stmt,
             );
@@ -775,6 +766,7 @@ pub(crate) fn drop_mv(
 
 pub(crate) fn list_mvs(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     stmt: &ShowMaterializedViewsStmt,
 ) -> Result<StatementResult, String> {
     let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
@@ -784,6 +776,43 @@ pub(crate) fn list_mvs(
 
     let mut rows = Vec::new();
     for mv in &snapshot.materialized_views {
+        if mv.storage_engine == ManagedMvStorageEngine::Iceberg {
+            let Some(target_catalog) = mv.target_catalog.as_deref() else {
+                continue;
+            };
+            if let Some(current_catalog) = current_catalog
+                && !target_catalog.eq_ignore_ascii_case(current_catalog)
+            {
+                continue;
+            }
+            let Some(target_namespace) = mv.target_namespace.clone() else {
+                continue;
+            };
+            if let Some(filter_db) = stmt.database.as_deref()
+                && !target_namespace.eq_ignore_ascii_case(filter_db)
+            {
+                continue;
+            }
+            let Some(target_table) = mv.target_table.clone() else {
+                continue;
+            };
+            rows.push(ShowMvRow {
+                name: target_table,
+                database: target_namespace,
+                storage_engine: mv.storage_engine.as_sql_str().to_string(),
+                refresh_mode: mv.refresh_mode.as_sql_str().to_string(),
+                last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
+                last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
+                base_tables: mv
+                    .base_table_refs
+                    .iter()
+                    .map(IcebergTableRef::fqn)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                select_text: mv.select_sql.clone(),
+            });
+            continue;
+        }
         let Some(table) = snapshot.tables.iter().find(|table| {
             table.table_id == mv.mv_id && table.kind == ManagedTableKind::MaterializedView
         }) else {
@@ -839,12 +868,13 @@ pub(crate) struct MvAnalysis {
 
 pub(crate) fn analyze_mv_select(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     query: &sqlparser::ast::Query,
 ) -> Result<MvAnalysis, String> {
-    let resolved_refs = collect_table_refs_from_query(query, current_database);
+    let resolved_refs = collect_table_refs_from_query(query, current_catalog, current_database);
     let mut analyzed_query = query.clone();
-    register_iceberg_tables_for_query(state, None, current_database, &analyzed_query)?;
+    register_iceberg_tables_for_mv_analysis(state, &resolved_refs)?;
     if has_three_part_refs(&resolved_refs) {
         crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut analyzed_query);
     }
@@ -863,6 +893,165 @@ pub(crate) fn analyze_mv_select(
         output_columns,
         resolved_query: resolved,
     })
+}
+
+pub(crate) fn canonicalize_iceberg_mv_select_query(
+    query: &sqlparser::ast::Query,
+    current_catalog: Option<&str>,
+    current_database: &str,
+) -> sqlparser::ast::Query {
+    let mut query = query.clone();
+    let Some(catalog) = current_catalog else {
+        return query;
+    };
+    qualify_current_catalog_refs_in_query(
+        &mut query,
+        &catalog.to_ascii_lowercase(),
+        &current_database.to_ascii_lowercase(),
+    );
+    query
+}
+
+fn qualify_current_catalog_refs_in_query(
+    query: &mut sqlparser::ast::Query,
+    catalog: &str,
+    current_database: &str,
+) {
+    if let Some(with) = &mut query.with {
+        for cte in &mut with.cte_tables {
+            qualify_current_catalog_refs_in_set_expr(
+                cte.query.body.as_mut(),
+                catalog,
+                current_database,
+            );
+        }
+    }
+    qualify_current_catalog_refs_in_set_expr(query.body.as_mut(), catalog, current_database);
+}
+
+fn qualify_current_catalog_refs_in_set_expr(
+    expr: &mut sqlparser::ast::SetExpr,
+    catalog: &str,
+    current_database: &str,
+) {
+    match expr {
+        sqlparser::ast::SetExpr::Select(select) => {
+            for from in &mut select.from {
+                qualify_current_catalog_refs_in_factor(
+                    &mut from.relation,
+                    catalog,
+                    current_database,
+                );
+                for join in &mut from.joins {
+                    qualify_current_catalog_refs_in_factor(
+                        &mut join.relation,
+                        catalog,
+                        current_database,
+                    );
+                }
+            }
+        }
+        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+            qualify_current_catalog_refs_in_set_expr(left.as_mut(), catalog, current_database);
+            qualify_current_catalog_refs_in_set_expr(right.as_mut(), catalog, current_database);
+        }
+        sqlparser::ast::SetExpr::Query(query) => {
+            qualify_current_catalog_refs_in_set_expr(
+                query.body.as_mut(),
+                catalog,
+                current_database,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn qualify_current_catalog_refs_in_factor(
+    factor: &mut sqlparser::ast::TableFactor,
+    catalog: &str,
+    current_database: &str,
+) {
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let parts = name
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
+                        Some(ident.value.to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let qualified = match parts.as_slice() {
+                [table] => Some((
+                    catalog.to_string(),
+                    current_database.to_string(),
+                    table.clone(),
+                )),
+                [namespace, table] => Some((catalog.to_string(), namespace.clone(), table.clone())),
+                _ => None,
+            };
+            if let Some((catalog, namespace, table)) = qualified {
+                name.0 = vec![
+                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(catalog)),
+                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(
+                        namespace,
+                    )),
+                    sqlparser::ast::ObjectNamePart::Identifier(sqlparser::ast::Ident::new(table)),
+                ];
+            }
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            qualify_current_catalog_refs_in_set_expr(
+                subquery.body.as_mut(),
+                catalog,
+                current_database,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn register_iceberg_tables_for_mv_analysis(
+    state: &Arc<StandaloneState>,
+    resolved_refs: &[ResolvedTableRef],
+) -> Result<(), String> {
+    let (catalog_backend, table_source) = {
+        let registry = state
+            .connectors
+            .read()
+            .expect("standalone connector registry read lock");
+        (
+            registry.catalog_backend("iceberg")?,
+            registry.table_source("iceberg")?,
+        )
+    };
+
+    for table_ref in resolved_refs {
+        let ResolvedTableRef::Iceberg {
+            catalog,
+            namespace,
+            table,
+        } = table_ref
+        else {
+            continue;
+        };
+        drop_registered_external_table(state, namespace, table)?;
+        let resolved = catalog_backend
+            .load_table(catalog, namespace, table)
+            .map_err(|err| {
+                format!("load iceberg table {catalog}.{namespace}.{table} failed: {err}")
+            })?;
+        let table_def = table_source.build_table_def(&resolved)?;
+        let mut local_catalog = state
+            .catalog
+            .write()
+            .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+        local_catalog.create_database(namespace)?;
+        local_catalog.register(namespace, table_def)?;
+    }
+    Ok(())
 }
 
 fn resolved_output_columns_from_body(resolved: &ResolvedQuery) -> Vec<OutputColumn> {
@@ -973,38 +1162,65 @@ pub(crate) fn validate_mv_partition_columns(
 
 fn collect_table_refs_from_query(
     query: &sqlparser::ast::Query,
+    current_catalog: Option<&str>,
     current_database: &str,
 ) -> Vec<ResolvedTableRef> {
     let mut refs = Vec::new();
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            collect_table_refs_from_set_expr(cte.query.body.as_ref(), current_database, &mut refs);
+            collect_table_refs_from_set_expr(
+                cte.query.body.as_ref(),
+                current_catalog,
+                current_database,
+                &mut refs,
+            );
         }
     }
-    collect_table_refs_from_set_expr(query.body.as_ref(), current_database, &mut refs);
+    collect_table_refs_from_set_expr(
+        query.body.as_ref(),
+        current_catalog,
+        current_database,
+        &mut refs,
+    );
     refs
 }
 
 fn collect_table_refs_from_set_expr(
     expr: &sqlparser::ast::SetExpr,
+    current_catalog: Option<&str>,
     current_database: &str,
     refs: &mut Vec<ResolvedTableRef>,
 ) {
     match expr {
         sqlparser::ast::SetExpr::Select(select) => {
             for from in &select.from {
-                collect_table_refs_from_factor(&from.relation, current_database, refs);
+                collect_table_refs_from_factor(
+                    &from.relation,
+                    current_catalog,
+                    current_database,
+                    refs,
+                );
                 for join in &from.joins {
-                    collect_table_refs_from_factor(&join.relation, current_database, refs);
+                    collect_table_refs_from_factor(
+                        &join.relation,
+                        current_catalog,
+                        current_database,
+                        refs,
+                    );
                 }
             }
         }
         sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            collect_table_refs_from_set_expr(left, current_database, refs);
-            collect_table_refs_from_set_expr(right, current_database, refs);
+            collect_table_refs_from_set_expr(left, current_catalog, current_database, refs);
+            collect_table_refs_from_set_expr(right, current_catalog, current_database, refs);
         }
         sqlparser::ast::SetExpr::Query(query) => {
-            collect_table_refs_from_set_expr(query.body.as_ref(), current_database, refs);
+            collect_table_refs_from_set_expr(
+                query.body.as_ref(),
+                current_catalog,
+                current_database,
+                refs,
+            );
         }
         _ => {}
     }
@@ -1012,6 +1228,7 @@ fn collect_table_refs_from_set_expr(
 
 fn collect_table_refs_from_factor(
     factor: &sqlparser::ast::TableFactor,
+    current_catalog: Option<&str>,
     current_database: &str,
     refs: &mut Vec<ResolvedTableRef>,
 ) {
@@ -1033,13 +1250,27 @@ fn collect_table_refs_from_factor(
                     namespace: namespace.clone(),
                     table: table.clone(),
                 },
-                [table] => ResolvedTableRef::ManagedLake {
-                    database: current_database.to_ascii_lowercase(),
-                    table: table.clone(),
+                [table] => match current_catalog {
+                    Some(catalog) => ResolvedTableRef::Iceberg {
+                        catalog: catalog.to_ascii_lowercase(),
+                        namespace: current_database.to_ascii_lowercase(),
+                        table: table.clone(),
+                    },
+                    None => ResolvedTableRef::ManagedLake {
+                        database: current_database.to_ascii_lowercase(),
+                        table: table.clone(),
+                    },
                 },
-                [database, table] => ResolvedTableRef::ManagedLake {
-                    database: database.clone(),
-                    table: table.clone(),
+                [database, table] => match current_catalog {
+                    Some(catalog) => ResolvedTableRef::Iceberg {
+                        catalog: catalog.to_ascii_lowercase(),
+                        namespace: database.clone(),
+                        table: table.clone(),
+                    },
+                    None => ResolvedTableRef::ManagedLake {
+                        database: database.clone(),
+                        table: table.clone(),
+                    },
                 },
                 _ => {
                     let rendered = parts.join(".");
@@ -1058,12 +1289,18 @@ fn collect_table_refs_from_factor(
                 for cte in &with.cte_tables {
                     collect_table_refs_from_set_expr(
                         cte.query.body.as_ref(),
+                        current_catalog,
                         current_database,
                         refs,
                     );
                 }
             }
-            collect_table_refs_from_set_expr(subquery.body.as_ref(), current_database, refs);
+            collect_table_refs_from_set_expr(
+                subquery.body.as_ref(),
+                current_catalog,
+                current_database,
+                refs,
+            );
         }
         _ => {}
     }
@@ -1075,7 +1312,9 @@ fn has_three_part_refs(resolved_refs: &[ResolvedTableRef]) -> bool {
         .any(|table_ref| matches!(table_ref, ResolvedTableRef::Iceberg { .. }))
 }
 
-fn output_column_to_table_column(column: &OutputColumn) -> Result<TableColumnDef, String> {
+pub(crate) fn output_column_to_table_column(
+    column: &OutputColumn,
+) -> Result<TableColumnDef, String> {
     Ok(TableColumnDef {
         name: column.name.clone(),
         data_type: arrow_data_type_to_sql_type(&column.data_type)?,
@@ -1306,6 +1545,8 @@ mod tests {
     use super::*;
     use crate::connector::starrocks::managed::catalog::ManagedTableRuntime;
     use crate::engine::catalog::InMemoryCatalog;
+    use arrow::array::Array;
+    use tempfile::TempDir;
 
     fn parse_create_mv(sql: &str) -> crate::sql::parser::ast::CreateMaterializedViewStmt {
         let stmt = crate::sql::parser::parse_sql(sql).expect("parse").remove(0);
@@ -1313,6 +1554,73 @@ mod tests {
             panic!("not create mv");
         };
         stmt
+    }
+
+    fn open_state_with_sqlite_store() -> (Arc<StandaloneState>, TempDir) {
+        let dir = TempDir::new().expect("metadata tempdir");
+        let metadata_store =
+            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(
+                dir.path().join("standalone.sqlite"),
+            )
+            .expect("open sqlite store");
+        let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
+        snapshot.global.warehouse_uri = format!("file://{}", dir.path().join("managed").display());
+        snapshot.global.next_db_id = 1;
+        snapshot.global.next_table_id = 1;
+        metadata_store
+            .replace_managed_snapshot(&snapshot)
+            .expect("initialize metadata snapshot");
+        let state = Arc::new(StandaloneState {
+            metadata_store: Some(metadata_store),
+            ..StandaloneState::default()
+        });
+        (state, dir)
+    }
+
+    fn insert_iceberg_mv_relationship(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        select_sql: &str,
+    ) {
+        let store = state.metadata_store.as_ref().expect("metadata store");
+        let mv_id = store
+            .allocate_materialized_view_id()
+            .expect("allocate mv id");
+        store
+            .insert_iceberg_mv_row(
+                crate::connector::starrocks::managed::store::InsertIcebergMvRowRequest {
+                    mv_id,
+                    select_sql: select_sql.to_string(),
+                    base_table_refs: vec![IcebergTableRef {
+                        catalog: catalog.to_string(),
+                        namespace: "sales".to_string(),
+                        table: "orders".to_string(),
+                    }],
+                    primary_key_columns: Vec::new(),
+                    target_catalog: catalog.to_string(),
+                    target_namespace: namespace.to_string(),
+                    target_table: table.to_string(),
+                    created_at_ms: now_ms(),
+                },
+            )
+            .expect("insert iceberg mv relationship");
+    }
+
+    fn assert_query_result_contains(result: &QueryResult, expected: &str) {
+        for chunk in &result.chunks {
+            for column in chunk.batch.columns() {
+                if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+                    for row_idx in 0..strings.len() {
+                        if !strings.is_null(row_idx) && strings.value(row_idx).contains(expected) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        panic!("expected query result to contain `{expected}`, got {result:?}");
     }
 
     #[test]
@@ -1323,6 +1631,28 @@ mod tests {
         }])
         .expect_err("should reject non-iceberg");
         assert!(err.contains("Iceberg"), "err={err}");
+    }
+
+    #[test]
+    fn show_materialized_views_lists_iceberg_relationship_without_managed_table_row() {
+        let (state, _dir) = open_state_with_sqlite_store();
+        insert_iceberg_mv_relationship(
+            &state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            "SELECT id FROM ice.sales.orders",
+        );
+
+        let stmt = ShowMaterializedViewsStmt { database: None };
+        let StatementResult::Query(result) =
+            list_mvs(&state, Some("ice"), &stmt).expect("show mvs")
+        else {
+            panic!("expected query result");
+        };
+
+        assert_query_result_contains(&result, "mv_orders");
+        assert_query_result_contains(&result, "iceberg");
     }
 
     #[test]

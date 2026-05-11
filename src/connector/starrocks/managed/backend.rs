@@ -229,24 +229,43 @@ impl MvBackend for ManagedLakeMvBackend {
         "managed"
     }
 
-    fn create_mv(&self, stmt: &CreateMaterializedViewStmt, db: &str) -> Result<(), String> {
+    fn create_mv(
+        &self,
+        stmt: &CreateMaterializedViewStmt,
+        current_catalog: Option<&str>,
+        db: &str,
+    ) -> Result<(), String> {
         let state = self.state()?;
-        super::mv_ddl::create_mv(&state, db, stmt).map(|_| ())
+        super::mv_ddl::create_mv(&state, current_catalog, db, stmt).map(|_| ())
     }
 
-    fn drop_mv(&self, stmt: &DropMaterializedViewStmt, db: &str) -> Result<(), String> {
+    fn drop_mv(
+        &self,
+        stmt: &DropMaterializedViewStmt,
+        current_catalog: Option<&str>,
+        db: &str,
+    ) -> Result<(), String> {
         let state = self.state()?;
-        super::mv_ddl::drop_mv(&state, db, stmt).map(|_| ())
+        super::mv_ddl::drop_mv(&state, current_catalog, db, stmt).map(|_| ())
     }
 
-    fn refresh_mv(&self, stmt: &RefreshMaterializedViewStmt, db: &str) -> Result<(), String> {
+    fn refresh_mv(
+        &self,
+        stmt: &RefreshMaterializedViewStmt,
+        current_catalog: Option<&str>,
+        db: &str,
+    ) -> Result<(), String> {
         let state = self.state()?;
-        super::mv_refresh::refresh_mv(&state, db, stmt).map(|_| ())
+        super::mv_refresh::refresh_mv(&state, current_catalog, db, stmt).map(|_| ())
     }
 
-    fn list_mvs(&self, stmt: &ShowMaterializedViewsStmt) -> Result<QueryResult, String> {
+    fn list_mvs(
+        &self,
+        stmt: &ShowMaterializedViewsStmt,
+        current_catalog: Option<&str>,
+    ) -> Result<QueryResult, String> {
         let state = self.state()?;
-        match super::mv_ddl::list_mvs(&state, stmt)? {
+        match super::mv_ddl::list_mvs(&state, current_catalog, stmt)? {
             StatementResult::Query(query) => Ok(query),
             StatementResult::Ok => Err("list_mvs returned Ok; expected query result".to_string()),
         }

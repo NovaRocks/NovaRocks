@@ -1,28 +1,26 @@
-//! Phase4a: projection/filter materialized views backed by Iceberg tables in
-//! the NovaRocks-internal `__nova_mv__` catalog. Aggregate shapes (phase4b)
-//! and any unsupported MV definitions are rejected here.
+//! Phase4a: projection/filter materialized views backed by Iceberg target
+//! tables in the current Iceberg catalog. Aggregate shapes (phase4b) and any
+//! unsupported MV definitions are rejected here.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use iceberg::spec::{DataFile, NestedField, PrimitiveType, Schema, Type};
+use iceberg::TableIdent;
+use iceberg::spec::DataFile;
+#[cfg(test)]
+use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::{NamespaceIdent, TableCreation, TableIdent};
 
 use crate::connector::iceberg::changes::{
     IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
 use crate::connector::iceberg::commit::{
-    CleanupPathMapper, CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
+    CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::managed::mv_ddl::{
-    alloc_id, analyze_mv_select, extract_base_table_refs, find_or_create_managed_database, now_ms,
-    resolve_mv_name, validate_mv_partition_columns,
-};
-use crate::connector::starrocks::managed::mv_iceberg_catalog::{
-    NOVA_MV_CATALOG_NAME, build_nova_mv_catalog,
+    analyze_mv_select, canonicalize_iceberg_mv_select_query, extract_base_table_refs, now_ms,
+    output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::connector::starrocks::managed::mv_refresh::{
     load_current_iceberg_base_table, query_result_to_chunks, run_mv_full_select_chunks,
@@ -32,40 +30,64 @@ use crate::connector::starrocks::managed::mv_shape::{
     IncrementalMvShape, classify_incremental_mv_query,
 };
 use crate::connector::starrocks::managed::store::{
-    InsertIcebergMvRowRequest, ManagedTableKind, ManagedTableState, StoredManagedTable,
+    InsertIcebergMvRowRequest, ManagedMvStorageEngine, StoredMaterializedView,
     UpdateMvIcebergRefreshMetadataRequest,
 };
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
 use crate::engine::query_prep::IcebergFileForQuery;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::runtime::global_async_runtime::data_block_on;
+#[cfg(test)]
 use crate::sql::analysis::OutputColumn;
-use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
 use crate::sql::parser::ast::{
-    CreateMaterializedViewStmt, DropMaterializedViewStmt, RefreshMaterializedViewStmt,
+    CreateMaterializedViewStmt, DropMaterializedViewStmt, ObjectName, RefreshMaterializedViewStmt,
 };
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct IcebergMvTarget {
+    pub(crate) catalog: String,
+    pub(crate) namespace: String,
+    pub(crate) table: String,
+}
 
 pub(crate) fn create_iceberg_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    let cfg = state
-        .managed_lake_config
-        .as_ref()
-        .ok_or_else(|| "managed lake config required for iceberg mv".to_string())?
-        .clone();
+    let target = resolve_iceberg_mv_target(state, current_catalog, current_database, stmt)?;
     let metadata_store = state
         .metadata_store
         .as_ref()
         .ok_or_else(|| "sqlite metadata store required for iceberg mv".to_string())?;
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&target.catalog)?
+    };
+    if iceberg_mv_target_exists(&entry, &target.namespace, &target.table)? {
+        return Err(format!(
+            "Iceberg MV target table {}.{}.{} already exists",
+            target.catalog, target.namespace, target.table
+        ));
+    }
 
     // 1. Analyze and classify shape — phase4a only accepts projection/filter.
-    let analysis = analyze_mv_select(state, current_database, &stmt.select_query)?;
+    let canonical_select_query =
+        canonicalize_iceberg_mv_select_query(&stmt.select_query, current_catalog, current_database);
+    let canonical_select_sql = canonical_select_query.to_string();
+    let analysis = analyze_mv_select(
+        state,
+        current_catalog,
+        current_database,
+        &canonical_select_query,
+    )?;
     validate_mv_partition_columns(stmt.partition_by.as_deref(), &analysis.output_columns)?;
     let base_refs = extract_base_table_refs(&analysis.resolved_refs)?;
-    let shape = classify_incremental_mv_query(&stmt.select_query)?;
+    let shape = classify_incremental_mv_query(&canonical_select_query)?;
     if !matches!(shape, IncrementalMvShape::ProjectionFilter(_)) {
         return Err(
             "phase4a iceberg-backed materialized views support only projection/filter shapes; aggregates are phase4b"
@@ -95,89 +117,248 @@ pub(crate) fn create_iceberg_mv(
         .map_err(|e| e.to_string())?;
     }
 
-    // 2. Allocate a managed-lake table_id for the MV (register it in the
-    //    managed-lake `tables` row so SHOW MATERIALIZED VIEWS works uniformly,
-    //    but no tablets, schemas, partitions, or indexes are allocated for the
-    //    iceberg storage path).
-    let mv_id = allocate_iceberg_mv_table_row(state, &db_name, &mv_name)?;
+    // 2. Create the empty Iceberg v2 target table in the current catalog.
+    let columns = analysis
+        .output_columns
+        .iter()
+        .map(output_column_to_table_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::connector::iceberg::catalog::registry::create_table(
+        &entry,
+        &target.namespace,
+        &target.table,
+        &columns,
+        None,
+        &[],
+        &[("format-version".to_string(), "2".to_string())],
+    )?;
 
-    // 3. Build Iceberg schema from analyzed output columns.
-    let schema = build_iceberg_schema_from_outputs(&analysis.output_columns)?;
-
-    // 4. Create namespace + table in __nova_mv__.
-    let catalog = build_nova_mv_catalog(&cfg)?;
-    let ns = NamespaceIdent::from_strs([&db_name])
-        .map_err(|e| format!("namespace ident `{db_name}` failed: {e}"))?;
-    data_block_on(async {
-        if !catalog
-            .namespace_exists(&ns)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            catalog
-                .create_namespace(&ns, HashMap::new())
-                .await
-                .map_err(|e| format!("create namespace `{db_name}` in __nova_mv__ failed: {e}"))?;
-        }
-        let creation = TableCreation::builder()
-            .name(mv_name.clone())
-            .schema(schema)
-            .build();
-        catalog
-            .create_table(&ns, creation)
-            .await
-            .map_err(|e| format!("create iceberg mv table failed: {e}"))?;
-        Ok::<_, String>(())
-    })??;
-
-    // 5. Persist mv row in SQLite.
-    metadata_store.insert_iceberg_mv_row(InsertIcebergMvRowRequest {
+    // 3. Persist only the MV relationship metadata in SQLite.
+    let mv_id = metadata_store.allocate_materialized_view_id()?;
+    let insert_request = InsertIcebergMvRowRequest {
         mv_id,
-        select_sql: stmt.select_sql.clone(),
+        select_sql: canonical_select_sql,
         base_table_refs: base_refs,
         primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
-        iceberg_table_identifier: format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}"),
+        target_catalog: target.catalog.clone(),
+        target_namespace: target.namespace.clone(),
+        target_table: target.table.clone(),
         created_at_ms: now_ms(),
-    })?;
-
-    // 6. Register the MV in the in-memory catalog so that subsequent
-    //    `state.catalog.read().get(&db, &mv)` calls return Ok and the
-    //    duplicate-detection pre-check in create_mv works correctly.
-    //    Iceberg-backed MVs have no tablet storage, so we build a TableDef
-    //    directly from the analyzed output columns rather than going through
-    //    ManagedLakeCatalog::rebuild (which requires a tablet schema row).
-    {
-        let table_def = {
-            let columns = analysis
-                .output_columns
-                .iter()
-                .map(|col| ColumnDef {
-                    name: col.name.clone(),
-                    data_type: col.data_type.clone(),
-                    nullable: col.nullable,
-                    write_default: None,
-                })
-                .collect();
-            TableDef {
-                name: mv_name.clone(),
-                columns,
-                iceberg_row_lineage_metadata_columns: vec![],
-                iceberg_table: None,
-                storage: TableStorage::S3ParquetFiles {
-                    files: vec![],
-                    cloud_properties: Default::default(),
-                },
-            }
-        };
-        let mut catalog = state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        catalog.create_database(&db_name)?;
-        catalog.register(&db_name, table_def)?;
+    };
+    if let Err(err) = metadata_store.insert_iceberg_mv_row(insert_request) {
+        let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        );
+        return Err(match drop_result {
+            Ok(()) => format!("create iceberg MV relationship metadata failed: {err}"),
+            Err(drop_err) => format!(
+                "create iceberg MV relationship metadata failed: {err}; orphan target table {}.{}.{} could not be dropped: {drop_err}",
+                target.catalog, target.namespace, target.table
+            ),
+        });
     }
+    register_iceberg_mv_target_in_catalog(state, &target)?;
 
     Ok(StatementResult::Ok)
+}
+
+fn resolve_iceberg_mv_target(
+    state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &CreateMaterializedViewStmt,
+) -> Result<IcebergMvTarget, String> {
+    let current_catalog = current_catalog.ok_or_else(|| {
+        "storage_engine='iceberg' requires current catalog to be an Iceberg catalog".to_string()
+    })?;
+    {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        if !catalogs.contains_catalog(current_catalog)? {
+            return Err(
+                "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
+                    .to_string(),
+            );
+        }
+    }
+    let (namespace, table) = resolve_mv_name(&stmt.name, current_database)?;
+    Ok(IcebergMvTarget {
+        catalog: crate::engine::catalog::normalize_identifier(current_catalog)?,
+        namespace,
+        table,
+    })
+}
+
+fn iceberg_mv_target_exists(
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    namespace: &str,
+    table: &str,
+) -> Result<bool, String> {
+    match crate::connector::iceberg::catalog::registry::list_tables(entry, namespace) {
+        Ok(tables) => Ok(tables.iter().any(|name| name.eq_ignore_ascii_case(table))),
+        Err(err)
+            if err.contains("No such file")
+                || err.contains("os error 2")
+                || err.contains("not found")
+                || err.contains("NotFound") =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+pub(crate) fn register_iceberg_mv_target_in_catalog(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+) -> Result<(), String> {
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&target.catalog)?
+    };
+    entry.invalidate_table_cache(&target.namespace, &target.table);
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
+    let files = match loaded
+        .table
+        .metadata()
+        .current_snapshot()
+        .map(|s| s.snapshot_id())
+    {
+        Some(snapshot_id) => {
+            crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+                &loaded.table,
+                snapshot_id,
+            )?
+        }
+        None => Vec::new(),
+    };
+    let table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+        &entry,
+        &target.namespace,
+        &target.table,
+        loaded,
+        files,
+    )?;
+    let mut catalog = state
+        .catalog
+        .write()
+        .map_err(|e| format!("standalone catalog write lock: {e}"))?;
+    catalog.create_database(&target.namespace)?;
+    catalog.register(&target.namespace, table_def)?;
+    Ok(())
+}
+
+pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let Some(store) = state.metadata_store.as_ref() else {
+        return Ok(());
+    };
+    let snapshot = store.load_snapshot()?;
+    for mv in snapshot
+        .managed
+        .materialized_views
+        .iter()
+        .filter(|mv| mv.storage_engine == ManagedMvStorageEngine::Iceberg)
+    {
+        let target = IcebergMvTarget {
+            catalog: mv
+                .target_catalog
+                .clone()
+                .ok_or_else(|| format!("iceberg MV {} missing target_catalog", mv.mv_id))?,
+            namespace: mv
+                .target_namespace
+                .clone()
+                .ok_or_else(|| format!("iceberg MV {} missing target_namespace", mv.mv_id))?,
+            table: mv
+                .target_table
+                .clone()
+                .ok_or_else(|| format!("iceberg MV {} missing target_table", mv.mv_id))?,
+        };
+        register_iceberg_mv_target_in_catalog(state, &target)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_refresh_target(
+    current_catalog: Option<&str>,
+    current_database: &str,
+    name: &ObjectName,
+) -> Result<IcebergMvTarget, String> {
+    let catalog = current_catalog.ok_or_else(|| {
+        "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
+            .to_string()
+    })?;
+    let (namespace, table) = resolve_mv_name(name, current_database)?;
+    Ok(IcebergMvTarget {
+        catalog: crate::engine::catalog::normalize_identifier(catalog)?,
+        namespace,
+        table,
+    })
+}
+
+fn load_iceberg_mv_target(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+) -> Result<
+    (
+        crate::connector::iceberg::catalog::IcebergCatalogEntry,
+        Arc<dyn iceberg::Catalog>,
+        crate::connector::iceberg::catalog::IcebergLoadedTable,
+    ),
+    String,
+> {
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&target.catalog)?
+    };
+    entry.invalidate_table_cache(&target.namespace, &target.table);
+    let catalog = crate::connector::iceberg::catalog::registry::build_iceberg_catalog(&entry)?;
+    let loaded =
+        crate::connector::iceberg::catalog::load_table(&entry, &target.namespace, &target.table)?;
+    Ok((entry, catalog, loaded))
+}
+
+fn iceberg_mv_table_ident(target: &IcebergMvTarget) -> Result<TableIdent, String> {
+    TableIdent::from_strs([target.namespace.as_str(), target.table.as_str()])
+        .map_err(|e| format!("build mv iceberg ident failed: {e}"))
+}
+
+fn validate_target_snapshot(
+    target: &IcebergMvTarget,
+    mv_row: &StoredMaterializedView,
+    table: &iceberg::table::Table,
+) -> Result<(), String> {
+    let actual = table.metadata().current_snapshot().map(|s| s.snapshot_id());
+    let expected = mv_row.last_refreshed_iceberg_snapshot_id;
+    if actual != expected {
+        return Err(format!(
+            "target table {}.{}.{} was modified outside NovaRocks: expected snapshot {:?}, current snapshot {:?}",
+            target.catalog, target.namespace, target.table, expected, actual
+        ));
+    }
+    Ok(())
+}
+
+fn recorded_target_snapshot_id(
+    target: &IcebergMvTarget,
+    mv_row: &StoredMaterializedView,
+) -> Result<i64, String> {
+    mv_row.last_refreshed_iceberg_snapshot_id.ok_or_else(|| {
+        format!(
+            "iceberg materialized view {}.{}.{} has no recorded target snapshot",
+            target.catalog, target.namespace, target.table
+        )
+    })
 }
 
 /// Refresh an iceberg-backed materialized view.
@@ -190,31 +371,26 @@ pub(crate) fn create_iceberg_mv(
 /// - (Some(p), None)      → fail-fast (base snapshot was garbage-collected)
 pub(crate) fn refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    let cfg = state
-        .managed_lake_config
-        .as_ref()
-        .ok_or_else(|| "managed lake config required for iceberg mv refresh".to_string())?
-        .clone();
+    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name)?;
     let metadata_store = state
         .metadata_store
         .as_ref()
         .ok_or_else(|| "sqlite metadata store required for iceberg mv refresh".to_string())?;
 
-    // Load the MV row from SQLite.
-    let snapshot = metadata_store.load_snapshot()?.managed;
-    let expected_id = format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}");
-    let mv_row = snapshot
-        .materialized_views
-        .iter()
-        .find(|mv| mv.iceberg_table_identifier.as_deref() == Some(expected_id.as_str()))
-        .cloned()
+    let mv_row = metadata_store
+        .find_iceberg_mv_by_target(&target.catalog, &target.namespace, &target.table)?
         .ok_or_else(|| {
-            format!("iceberg materialized view {db_name}.{mv_name} has no materialized_views row")
+            format!(
+                "iceberg materialized view {}.{}.{} has no materialized_views row",
+                target.catalog, target.namespace, target.table
+            )
         })?;
+    let (target_entry, iceberg_catalog, target_loaded) = load_iceberg_mv_target(state, &target)?;
+    validate_target_snapshot(&target, &mv_row, &target_loaded.table)?;
 
     // We only handle single-base-table MVs in phase4a.
     let [base_ref] = mv_row.base_table_refs.as_slice() else {
@@ -238,14 +414,19 @@ pub(crate) fn refresh_iceberg_mv(
         && previous_uuid != &current_table_uuid
     {
         tracing::info!(
-            "iceberg mv {db_name}.{mv_name}: base table identity changed from {previous_uuid} to {current_table_uuid}; rebuilding with overwrite"
+            "iceberg mv {}.{}.{}: base table identity changed from {previous_uuid} to {current_table_uuid}; rebuilding with overwrite",
+            target.catalog,
+            target.namespace,
+            target.table
         );
         return rebuild_iceberg_mv(
             state,
-            &cfg,
+            &target,
+            &target_entry,
+            &iceberg_catalog,
+            &target_loaded.table,
             metadata_store,
-            &db_name,
-            &mv_name,
+            current_database,
             &mv_row,
             base_ref,
             current_snapshot_id,
@@ -257,7 +438,10 @@ pub(crate) fn refresh_iceberg_mv(
         // Base table has no snapshot yet — nothing to refresh.
         (None, None) => {
             tracing::info!(
-                "iceberg mv {db_name}.{mv_name}: base table has no snapshot; skipping refresh"
+                "iceberg mv {}.{}.{}: base table has no snapshot; skipping refresh",
+                target.catalog,
+                target.namespace,
+                target.table
             );
             Ok(StatementResult::Ok)
         }
@@ -265,10 +449,11 @@ pub(crate) fn refresh_iceberg_mv(
         // First refresh: base table now has a snapshot but we haven't run yet.
         (None, Some(cur)) => first_refresh_iceberg_mv(
             state,
-            &cfg,
+            &target,
+            &iceberg_catalog,
+            &target_loaded.table,
             metadata_store,
-            &db_name,
-            &mv_name,
+            current_database,
             &mv_row,
             base_ref,
             cur,
@@ -278,7 +463,10 @@ pub(crate) fn refresh_iceberg_mv(
         // No-op: base table snapshot has not advanced.
         (Some(prev), Some(cur)) if prev == cur => {
             tracing::info!(
-                "iceberg mv {db_name}.{mv_name}: base snapshot {cur} unchanged; updating metadata only"
+                "iceberg mv {}.{}.{}: base snapshot {cur} unchanged; updating metadata only",
+                target.catalog,
+                target.namespace,
+                target.table
             );
             let snapshots = single_snapshot_map(base_ref, cur);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
@@ -288,7 +476,7 @@ pub(crate) fn refresh_iceberg_mv(
                     last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                     snapshots,
                     table_uuids,
-                    iceberg_snapshot_id: mv_row.last_refreshed_iceberg_snapshot_id.unwrap_or(0),
+                    iceberg_snapshot_id: recorded_target_snapshot_id(&target, &mv_row)?,
                 },
             )?;
             Ok(StatementResult::Ok)
@@ -297,10 +485,12 @@ pub(crate) fn refresh_iceberg_mv(
         // Incremental: base snapshot has advanced.
         (Some(prev), Some(cur)) => incremental_refresh_iceberg_mv(
             state,
-            &cfg,
+            &target,
+            &target_entry,
+            &iceberg_catalog,
+            &target_loaded.table,
             metadata_store,
-            &db_name,
-            &mv_name,
+            current_database,
             &mv_row,
             base_ref,
             prev,
@@ -311,8 +501,9 @@ pub(crate) fn refresh_iceberg_mv(
 
         // Previous snapshot no longer reachable.
         (Some(prev), None) => Err(format!(
-            "cannot refresh iceberg materialized view {db_name}.{mv_name}: \
-             previously-refreshed base snapshot {prev} is no longer reachable"
+            "cannot refresh iceberg materialized view {}.{}.{}: \
+             previously-refreshed base snapshot {prev} is no longer reachable",
+            target.catalog, target.namespace, target.table
         )),
     }
 }
@@ -325,25 +516,24 @@ pub(crate) fn refresh_iceberg_mv(
 /// 3. Commit a fast-append snapshot.
 /// 4. Update SQLite metadata.
 ///
-/// On failure after writing but before commit, we attempt a best-effort
-/// rollback by dropping the iceberg table.  The SQLite mv_row is only
-/// updated after a successful commit, so a failure leaves the mv_row
-/// pointing at a non-existent (or empty) iceberg table.  Task 9 (DROP MV)
-/// is responsible for cleaning up such orphaned rows.
+/// On failure after writing but before commit, SQLite metadata is left
+/// unchanged. Stranded data files are orphaned until the warehouse is
+/// garbage-collected.
 #[allow(clippy::too_many_arguments)]
 fn first_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
-    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
+    target: &IcebergMvTarget,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
     metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
-    db_name: &str,
-    mv_name: &str,
+    current_database: &str,
     mv_row: &crate::connector::starrocks::managed::store::StoredMaterializedView,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     base_snapshot_id: i64,
     current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
     // 1. Run SELECT and collect chunks.
-    let chunks = run_mv_full_select_chunks(state, db_name, &mv_row.select_sql)?;
+    let chunks = run_mv_full_select_chunks(state, current_database, &mv_row.select_sql)?;
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
 
     // If the base table is currently empty, do not commit an empty Iceberg
@@ -351,51 +541,20 @@ fn first_refresh_iceberg_mv(
     // can re-enter first-refresh once the base table has data.
     if total_rows == 0 {
         tracing::info!(
-            "iceberg mv {db_name}.{mv_name}: first refresh produced 0 rows; \
-             skipping snapshot commit so next REFRESH can retry"
+            "iceberg mv {}.{}.{}: first refresh produced 0 rows; \
+             skipping snapshot commit so next REFRESH can retry",
+            target.catalog,
+            target.namespace,
+            target.table
         );
         return Ok(StatementResult::Ok);
     }
 
     // 2–3. Write data files and commit snapshot inside an async block.
-    let catalog = build_nova_mv_catalog(cfg)?;
-    let ident = TableIdent::from_strs([db_name, mv_name])
-        .map_err(|e| format!("build mv iceberg ident failed: {e}"))?;
-
-    let result: Result<i64, String> = data_block_on(async {
-        let table = catalog
-            .load_table(&ident)
-            .await
-            .map_err(|e| format!("load iceberg mv table for first refresh failed: {e}"))?;
-
-        let data_files = write_chunks_as_iceberg_data_files(&table, &chunks).await?;
-        let snapshot_id = commit_fast_append(&table, &catalog, data_files).await?;
-        Ok(snapshot_id)
-    })?;
-    let new_snapshot_id = match result {
-        Ok(id) => id,
-        Err(e) => {
-            // Best-effort rollback: drop the (partial) iceberg table so it does
-            // not linger after a failed first refresh.  The SQLite mv_row still
-            // points at this table; Task 9 (DROP MV) will clean that up if the
-            // rollback itself fails.
-            let rollback_result = data_block_on(async {
-                catalog.drop_table(&ident).await.map_err(|e| e.to_string())
-            });
-            match rollback_result {
-                Ok(Ok(())) => {} // rollback succeeded
-                Ok(Err(rollback_err)) | Err(rollback_err) => {
-                    tracing::warn!(
-                        "iceberg mv {db_name}.{mv_name}: best-effort rollback drop_table failed: \
-                         {rollback_err}; table may remain as an orphan until DROP MATERIALIZED VIEW"
-                    );
-                }
-            }
-            return Err(format!(
-                "first refresh failed (rolled back best-effort): {e}"
-            ));
-        }
-    };
+    let new_snapshot_id = data_block_on(async {
+        let data_files = write_chunks_as_iceberg_data_files(target_table, &chunks).await?;
+        commit_fast_append(target_table, iceberg_catalog, data_files).await
+    })??;
 
     // 4. Persist refresh metadata in SQLite.
     let snapshots = single_snapshot_map(base_ref, base_snapshot_id);
@@ -409,16 +568,22 @@ fn first_refresh_iceberg_mv(
     })?;
 
     // 5. Update the in-memory catalog so subsequent SELECTs can read the data.
-    if let Err(e) = update_iceberg_mv_in_catalog(state, cfg, db_name, mv_name) {
+    if let Err(e) = register_iceberg_mv_target_in_catalog(state, target) {
         tracing::warn!(
-            "iceberg mv {db_name}.{mv_name}: catalog update after first refresh failed: {e}; \
-             SELECT may return stale results until server restart"
+            "iceberg mv {}.{}.{}: catalog update after first refresh failed: {e}; \
+             SELECT may return stale results until server restart",
+            target.catalog,
+            target.namespace,
+            target.table
         );
     }
 
     tracing::info!(
-        "iceberg mv {db_name}.{mv_name}: first refresh complete: \
-         rows={total_rows} iceberg_snapshot={new_snapshot_id}"
+        "iceberg mv {}.{}.{}: first refresh complete: \
+         rows={total_rows} iceberg_snapshot={new_snapshot_id}",
+        target.catalog,
+        target.namespace,
+        target.table
     );
     Ok(StatementResult::Ok)
 }
@@ -426,32 +591,35 @@ fn first_refresh_iceberg_mv(
 #[allow(clippy::too_many_arguments)]
 fn rebuild_iceberg_mv(
     state: &Arc<StandaloneState>,
-    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
     metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
-    db_name: &str,
-    mv_name: &str,
+    current_database: &str,
     mv_row: &crate::connector::starrocks::managed::store::StoredMaterializedView,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     base_snapshot_id: Option<i64>,
     current_table_uuid: &str,
 ) -> Result<StatementResult, String> {
-    let chunks = run_mv_full_select_chunks(state, db_name, &mv_row.select_sql)?;
+    let chunks = run_mv_full_select_chunks(state, current_database, &mv_row.select_sql)?;
     let total_rows: i64 = chunks.iter().map(|c| c.batch.num_rows() as i64).sum();
 
-    let catalog = build_nova_mv_catalog(cfg)?;
-    let ident =
-        TableIdent::from_strs([db_name, mv_name]).map_err(|e| format!("table ident: {e}"))?;
+    let ident = iceberg_mv_table_ident(target)?;
     let new_snapshot_id = data_block_on(async {
-        let table = catalog
-            .load_table(&ident)
-            .await
-            .map_err(|e| format!("load iceberg mv table for rebuild failed: {e}"))?;
         let data_files = if chunks.iter().all(|c| c.batch.num_rows() == 0) {
             Vec::new()
         } else {
-            write_chunks_as_iceberg_data_files(&table, &chunks).await?
+            write_chunks_as_iceberg_data_files(target_table, &chunks).await?
         };
-        commit_overwrite_iceberg_mv(&table, &catalog, cfg, &ident, data_files).await
+        commit_overwrite_iceberg_mv(
+            target_table,
+            iceberg_catalog,
+            target_entry,
+            &ident,
+            data_files,
+        )
+        .await
     })??;
 
     let snapshots = base_snapshot_id
@@ -465,10 +633,13 @@ fn rebuild_iceberg_mv(
         iceberg_snapshot_id: new_snapshot_id,
     })?;
 
-    if let Err(e) = update_iceberg_mv_in_catalog(state, cfg, db_name, mv_name) {
+    if let Err(e) = register_iceberg_mv_target_in_catalog(state, target) {
         tracing::warn!(
-            "iceberg mv {db_name}.{mv_name}: catalog update after rebuild failed: {e}; \
-             SELECT may return stale results until server restart"
+            "iceberg mv {}.{}.{}: catalog update after rebuild failed: {e}; \
+             SELECT may return stale results until server restart",
+            target.catalog,
+            target.namespace,
+            target.table
         );
     }
 
@@ -478,7 +649,7 @@ fn rebuild_iceberg_mv(
 async fn commit_overwrite_iceberg_mv(
     table: &iceberg::table::Table,
     catalog: &Arc<dyn Catalog>,
-    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     ident: &TableIdent,
     data_files: Vec<DataFile>,
 ) -> Result<i64, String> {
@@ -506,30 +677,16 @@ async fn commit_overwrite_iceberg_mv(
         )?);
     }
 
-    let object_store_config = cfg.s3.to_object_store_config();
-    let fs = crate::fs::object_store::build_oss_operator(&object_store_config)
-        .map_err(|e| format!("build S3 operator for iceberg mv overwrite cleanup: {e}"))?;
-    let bucket = object_store_config.bucket.clone();
-    let path_mapper: CleanupPathMapper = Arc::new(move |path| {
-        crate::connector::iceberg::catalog::add_files::parse_s3_path(path)
-            .ok()
-            .and_then(|(actual_bucket, key)| {
-                if actual_bucket == bucket {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| path.to_string())
-    });
+    let abort_cleanup =
+        crate::engine::iceberg_writer::build_abort_cleanup_for_catalog_entry(entry)?;
 
     run_iceberg_commit(RunInput {
         collector,
         catalog: catalog.clone(),
         table: table.clone(),
-        fs,
+        fs: abort_cleanup.fs,
         file_io: table.file_io().clone(),
-        cleanup_path_mapper: Some(path_mapper),
+        cleanup_path_mapper: abort_cleanup.path_mapper,
         cow_update_rewrite: None,
         target_ref: "main".to_string(),
     })
@@ -554,10 +711,12 @@ async fn commit_overwrite_iceberg_mv(
 #[allow(clippy::too_many_arguments)]
 fn incremental_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
-    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
+    target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    iceberg_catalog: &Arc<dyn iceberg::Catalog>,
+    target_table: &iceberg::table::Table,
     metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
-    db_name: &str,
-    mv_name: &str,
+    current_database: &str,
     mv_row: &crate::connector::starrocks::managed::store::StoredMaterializedView,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
     previous_snapshot_id: i64,
@@ -572,14 +731,19 @@ fn incremental_refresh_iceberg_mv(
         Err(err) => match policy_signal_from_change_error(&err) {
             IcebergChangePolicySignal::FullRefresh { reason } => {
                 tracing::info!(
-                    "iceberg mv {db_name}.{mv_name}: incremental planner requested full refresh: {reason}"
+                    "iceberg mv {}.{}.{}: incremental planner requested full refresh: {reason}",
+                    target.catalog,
+                    target.namespace,
+                    target.table
                 );
                 return rebuild_iceberg_mv(
                     state,
-                    cfg,
+                    target,
+                    target_entry,
+                    iceberg_catalog,
+                    target_table,
                     metadata_store,
-                    db_name,
-                    mv_name,
+                    current_database,
                     mv_row,
                     base_ref,
                     Some(current_snapshot_id),
@@ -604,18 +768,23 @@ fn incremental_refresh_iceberg_mv(
         || !batch.deleted_data_files.is_empty()
     {
         tracing::info!(
-            "iceberg mv {db_name}.{mv_name}: falling back to full refresh for delete-bearing change batch: \
+            "iceberg mv {}.{}.{}: falling back to full refresh for delete-bearing change batch: \
              position_deletes={}, equality_deletes={}, deleted_data_files={}",
+            target.catalog,
+            target.namespace,
+            target.table,
             batch.deletes.len(),
             batch.equality_deletes.len(),
             batch.deleted_data_files.len()
         );
         return rebuild_iceberg_mv(
             state,
-            cfg,
+            target,
+            target_entry,
+            iceberg_catalog,
+            target_table,
             metadata_store,
-            db_name,
-            mv_name,
+            current_database,
             mv_row,
             base_ref,
             Some(current_snapshot_id),
@@ -645,7 +814,7 @@ fn incremental_refresh_iceberg_mv(
         .collect();
     let chunks = execute_query_for_mv_incremental_refresh(
         state,
-        db_name,
+        current_database,
         &mv_row.select_sql,
         base_ref,
         added_files,
@@ -659,8 +828,11 @@ fn incremental_refresh_iceberg_mv(
     // 3. Empty delta: no new rows → advance lineage without committing an empty snapshot.
     if added_rows == 0 {
         tracing::info!(
-            "iceberg mv {db_name}.{mv_name}: incremental refresh delta has 0 rows; \
-             advancing lineage to base snapshot {current_snapshot_id} without new iceberg snapshot"
+            "iceberg mv {}.{}.{}: incremental refresh delta has 0 rows; \
+             advancing lineage to base snapshot {current_snapshot_id} without new iceberg snapshot",
+            target.catalog,
+            target.namespace,
+            target.table
         );
         metadata_store.update_mv_iceberg_refresh_metadata(
             UpdateMvIcebergRefreshMetadataRequest {
@@ -668,37 +840,16 @@ fn incremental_refresh_iceberg_mv(
                 last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
                 snapshots: single_snapshot_map(base_ref, current_snapshot_id),
                 table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
-                iceberg_snapshot_id: mv_row.last_refreshed_iceberg_snapshot_id.unwrap_or(0),
+                iceberg_snapshot_id: recorded_target_snapshot_id(target, mv_row)?,
             },
         )?;
         return Ok(StatementResult::Ok);
     }
 
-    // 4. Write and commit — guarded by inconsistent-state check first.
-    let catalog = build_nova_mv_catalog(cfg)?;
-    let ident =
-        TableIdent::from_strs([db_name, mv_name]).map_err(|e| format!("table ident: {e}"))?;
+    // 4. Write and commit.
     let new_snapshot_id = data_block_on(async {
-        let table = catalog
-            .load_table(&ident)
-            .await
-            .map_err(|e| format!("load iceberg mv table for incremental refresh failed: {e}"))?;
-
-        // Inconsistent-state guard: the MV's iceberg current snapshot must match
-        // what SQLite recorded at the last refresh.  If they diverge, the metadata is
-        // out-of-sync (manual edit, prior crash, etc.) — fail fast rather than corrupt lineage.
-        let prior_snapshot = table.metadata().current_snapshot().map(|s| s.snapshot_id());
-        if prior_snapshot != mv_row.last_refreshed_iceberg_snapshot_id {
-            return Err(format!(
-                "iceberg mv `{db_name}.{mv_name}` is in inconsistent state: \
-                 sqlite recorded snapshot {:?} but iceberg current is {:?}; \
-                 manual reconcile required (drop and recreate)",
-                mv_row.last_refreshed_iceberg_snapshot_id, prior_snapshot,
-            ));
-        }
-
-        let written = write_chunks_as_iceberg_data_files(&table, &chunks).await?;
-        commit_fast_append(&table, &catalog, written).await
+        let written = write_chunks_as_iceberg_data_files(target_table, &chunks).await?;
+        commit_fast_append(target_table, iceberg_catalog, written).await
     })??;
 
     let new_total_rows = mv_row.last_refresh_rows.unwrap_or(0) + added_rows;
@@ -711,16 +862,22 @@ fn incremental_refresh_iceberg_mv(
     })?;
 
     // Update the in-memory catalog so subsequent SELECTs can read all data files.
-    if let Err(e) = update_iceberg_mv_in_catalog(state, cfg, db_name, mv_name) {
+    if let Err(e) = register_iceberg_mv_target_in_catalog(state, target) {
         tracing::warn!(
-            "iceberg mv {db_name}.{mv_name}: catalog update after incremental refresh failed: {e}; \
-             SELECT may return stale results until server restart"
+            "iceberg mv {}.{}.{}: catalog update after incremental refresh failed: {e}; \
+             SELECT may return stale results until server restart",
+            target.catalog,
+            target.namespace,
+            target.table
         );
     }
 
     tracing::info!(
-        "iceberg mv {db_name}.{mv_name}: incremental refresh complete: \
-         added_rows={added_rows} total_rows={new_total_rows} iceberg_snapshot={new_snapshot_id}"
+        "iceberg mv {}.{}.{}: incremental refresh complete: \
+         added_rows={added_rows} total_rows={new_total_rows} iceberg_snapshot={new_snapshot_id}",
+        target.catalog,
+        target.namespace,
+        target.table
     );
     Ok(StatementResult::Ok)
 }
@@ -768,87 +925,95 @@ pub(crate) async fn commit_fast_append(
 
 pub(crate) fn drop_iceberg_mv(
     state: &Arc<StandaloneState>,
+    current_catalog: Option<&str>,
     current_database: &str,
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
-    let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    let cfg = state
-        .managed_lake_config
-        .as_ref()
-        .ok_or_else(|| "managed lake config required".to_string())?
-        .clone();
+    let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
     let metadata_store = state
         .metadata_store
         .as_ref()
         .ok_or_else(|| "sqlite metadata store required".to_string())?;
-
-    // Look up the MV by its iceberg table identifier in SQLite.
-    let snapshot = metadata_store.load_snapshot()?.managed;
-    let expected_id = format!("{NOVA_MV_CATALOG_NAME}.{db_name}.{mv_name}");
-    let mv_row = snapshot
-        .materialized_views
-        .iter()
-        .find(|m| m.iceberg_table_identifier.as_deref() == Some(expected_id.as_str()))
-        .cloned();
-    let Some(mv_row) = mv_row else {
+    let Some(_mv_row) = metadata_store.find_iceberg_mv_by_target(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )?
+    else {
         if stmt.if_exists {
             return Ok(StatementResult::Ok);
         }
         return Err(format!(
-            "materialized view `{db_name}.{mv_name}` does not exist"
+            "materialized view does not exist: {}.{}.{}",
+            target.catalog, target.namespace, target.table
         ));
     };
 
-    // 1. Remove SQLite rows atomically (materialized_views + tables) first.
-    //    SQLite is the source of truth; iceberg drop follows.
-    metadata_store.delete_iceberg_mv_row(mv_row.mv_id)?;
-
-    // 2. Remove the in-memory catalog entry so subsequent queries do not
-    //    resolve the dropped MV.
-    {
-        let mut catalog = state
-            .catalog
-            .write()
-            .expect("standalone catalog write lock");
-        // Ignore "unknown table" errors — the entry may already be absent
-        // if the MV was registered in a prior session that did not survive.
-        if let Err(e) = catalog.drop_table(&db_name, &mv_name) {
-            tracing::warn!(
-                "iceberg mv {db_name}.{mv_name}: in-memory catalog drop_table returned error \
-                 (already gone or other): {e}"
-            );
-        }
+    let entry = {
+        let catalogs = state
+            .iceberg_catalogs
+            .read()
+            .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
+        catalogs.get(&target.catalog)?
+    };
+    crate::connector::iceberg::catalog::registry::drop_table(
+        &entry,
+        &target.namespace,
+        &target.table,
+    )?;
+    let dropped_relationship = metadata_store.drop_iceberg_mv_relationship(
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )?;
+    if !dropped_relationship {
+        return Err(format!(
+            "materialized view relationship disappeared during drop: {}.{}.{}",
+            target.catalog, target.namespace, target.table
+        ));
     }
+    crate::engine::delete_iceberg_table_if_needed(
+        state,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )?;
+    crate::engine::query_prep::drop_registered_external_table(
+        state,
+        &target.namespace,
+        &target.table,
+    )?;
 
-    // 3. Remove the stale entry from the in-memory managed_lake snapshot so
-    //    that a same-session second DROP or a CREATE-after-DROP does not
-    //    observe the old tables row.
-    {
-        let mut managed = state
-            .managed_lake
-            .write()
-            .expect("standalone managed lake write lock");
-        let mut snapshot = managed.snapshot.clone();
-        snapshot.tables.retain(|t| t.table_id != mv_row.mv_id);
-        managed.snapshot = snapshot;
-    }
-
-    // 4. Drop the iceberg table (deletes warehouse files best-effort via
-    //    HadoopFileSystemCatalog::drop_table → FileIO::delete_prefix; file
-    //    I/O errors are logged as warnings and do not propagate). The ??
-    //    here therefore only surfaces data_block_on infrastructure errors.
-    let catalog = build_nova_mv_catalog(&cfg)?;
-    let ident =
-        TableIdent::from_strs([&db_name, &mv_name]).map_err(|e| format!("table ident: {e}"))?;
-    data_block_on(async { catalog.drop_table(&ident).await.map_err(|e| e.to_string()) })??;
-
-    tracing::info!("iceberg mv {db_name}.{mv_name}: dropped successfully");
+    tracing::info!(
+        "iceberg mv {}.{}.{}: dropped successfully",
+        target.catalog,
+        target.namespace,
+        target.table
+    );
     Ok(StatementResult::Ok)
+}
+
+fn resolve_drop_target(
+    current_catalog: Option<&str>,
+    current_database: &str,
+    name: &ObjectName,
+) -> Result<IcebergMvTarget, String> {
+    let catalog = current_catalog.ok_or_else(|| {
+        "DROP MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
+            .to_string()
+    })?;
+    let (namespace, table) = resolve_mv_name(name, current_database)?;
+    Ok(IcebergMvTarget {
+        catalog: crate::engine::catalog::normalize_identifier(catalog)?,
+        namespace,
+        table,
+    })
 }
 
 /// Build an Iceberg `Schema` from the MV's analyzed output columns.
 /// Each column is mapped to a primitive Iceberg type; nullable columns become
 /// optional fields, non-nullable columns become required fields.
+#[cfg(test)]
 fn build_iceberg_schema_from_outputs(output_columns: &[OutputColumn]) -> Result<Schema, String> {
     let mut fields = Vec::with_capacity(output_columns.len());
     for (idx, col) in output_columns.iter().enumerate() {
@@ -869,6 +1034,7 @@ fn build_iceberg_schema_from_outputs(output_columns: &[OutputColumn]) -> Result<
 
 /// Map an Arrow `DataType` to an Iceberg `PrimitiveType`. Returns an error
 /// for types that cannot be represented as Iceberg primitive columns.
+#[cfg(test)]
 fn arrow_data_type_to_iceberg_primitive(
     arrow_type: &arrow::datatypes::DataType,
 ) -> Result<PrimitiveType, String> {
@@ -916,199 +1082,6 @@ fn arrow_data_type_to_iceberg_primitive(
     })
 }
 
-/// After a successful REFRESH, update `state.catalog` with the current Iceberg
-/// data files so that subsequent `SELECT * FROM mv` queries read the refreshed
-/// data rather than the empty `files: vec![]` placeholder set at CREATE time.
-///
-/// This function loads the MV iceberg table, enumerates its data files, and
-/// re-registers the MV in the in-memory catalog (overwrite allowed by
-/// `InMemoryCatalog::register`). Column metadata is read from the existing
-/// catalog entry that was set at CREATE time.
-fn update_iceberg_mv_in_catalog(
-    state: &Arc<StandaloneState>,
-    cfg: &crate::connector::starrocks::managed::config::ManagedLakeConfig,
-    db_name: &str,
-    mv_name: &str,
-) -> Result<(), String> {
-    // Read existing column metadata from the in-memory catalog (set at CREATE time).
-    let columns: Vec<ColumnDef> = {
-        let guard = state.catalog.read().expect("standalone catalog read lock");
-        match guard.get(db_name, mv_name) {
-            Ok(def) => def.columns,
-            Err(_) => {
-                // MV not yet registered (e.g. fresh session after restart).
-                // Derive columns from the iceberg table schema below.
-                vec![]
-            }
-        }
-    };
-
-    let nova_catalog = build_nova_mv_catalog(cfg)?;
-    let ident =
-        TableIdent::from_strs([db_name, mv_name]).map_err(|e| format!("table ident: {e}"))?;
-
-    // Load table and extract data files.
-    // `extract_data_files_with_stats` is a sync wrapper that calls `block_on_iceberg`
-    // internally. We call it outside of any outer `data_block_on` async block to avoid
-    // nested block_on usage.
-    let table = data_block_on(async {
-        nova_catalog
-            .load_table(&ident)
-            .await
-            .map_err(|e| format!("load mv table for catalog update: {e}"))
-    })??;
-    let data_files =
-        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats(&table)?;
-
-    // Build the appropriate TableStorage depending on whether the warehouse is S3 or local.
-    let warehouse = cfg.mv_iceberg_warehouse();
-    let is_s3 = warehouse.starts_with("s3://")
-        || warehouse.starts_with("s3a://")
-        || warehouse.starts_with("oss://");
-
-    let storage = if is_s3 {
-        let mut cloud_properties = std::collections::BTreeMap::new();
-        cloud_properties.insert("aws.s3.endpoint".to_string(), cfg.s3.endpoint.clone());
-        cloud_properties.insert(
-            "aws.s3.access_key".to_string(),
-            cfg.s3.access_key_id.clone(),
-        );
-        cloud_properties.insert(
-            "aws.s3.secret_key".to_string(),
-            cfg.s3.access_key_secret.clone(),
-        );
-        if let Some(true) = cfg.s3.enable_path_style_access {
-            cloud_properties.insert(
-                "aws.s3.enable_path_style_access".to_string(),
-                "true".to_string(),
-            );
-        }
-        TableStorage::S3ParquetFiles {
-            files: data_files
-                .into_iter()
-                .map(|f| S3FileInfo {
-                    path: f.path,
-                    size: f.size,
-                    row_count: f.record_count,
-                    column_stats: f.column_stats,
-                    partition_spec_id: f.partition_spec_id,
-                    partition_key: f.partition_key,
-                    first_row_id: f.first_row_id,
-                    data_sequence_number: f.data_sequence_number,
-                    delete_files: f.delete_files,
-                    manifest_path: None,
-                    partition_values: vec![],
-                })
-                .collect(),
-            cloud_properties,
-        }
-    } else {
-        // Local filesystem warehouse (file:// URI).
-        //
-        // We use S3ParquetFiles with empty cloud_properties instead of
-        // LocalParquetFile for two reasons:
-        //   1. LocalParquetFile is a single-path variant; after a second
-        //      incremental REFRESH writes a second Parquet file, all but
-        //      the first would be silently dropped.
-        //   2. The standalone scan path in fs/path.rs classifies "file://"
-        //      URIs as ScanPathScheme::Local and handles them correctly, so
-        //      S3ParquetFiles with file:// paths does not require any S3
-        //      credentials and reads from the local filesystem.
-        if data_files.is_empty() {
-            // No data files yet (empty delta) — leave unchanged.
-            tracing::debug!(
-                "update_iceberg_mv_in_catalog: {db_name}.{mv_name} has no data files after refresh; \
-                 catalog storage not updated"
-            );
-            return Ok(());
-        }
-        TableStorage::S3ParquetFiles {
-            files: data_files
-                .into_iter()
-                .map(|f| S3FileInfo {
-                    path: f.path,
-                    size: f.size,
-                    row_count: f.record_count,
-                    column_stats: f.column_stats,
-                    partition_spec_id: f.partition_spec_id,
-                    partition_key: f.partition_key,
-                    first_row_id: f.first_row_id,
-                    data_sequence_number: f.data_sequence_number,
-                    delete_files: f.delete_files,
-                    manifest_path: None,
-                    partition_values: vec![],
-                })
-                .collect(),
-            // No cloud credentials needed — the file:// scan path reads
-            // directly from the local filesystem.
-            cloud_properties: std::collections::BTreeMap::new(),
-        }
-    };
-
-    let table_def = TableDef {
-        name: mv_name.to_string(),
-        columns,
-        iceberg_row_lineage_metadata_columns: vec![],
-        iceberg_table: None,
-        storage,
-    };
-
-    let mut catalog_guard = state
-        .catalog
-        .write()
-        .expect("standalone catalog write lock");
-    // create_database is idempotent — ok if already exists.
-    let _ = catalog_guard.create_database(db_name);
-    catalog_guard
-        .register(db_name, table_def)
-        .map_err(|e| format!("update iceberg mv {db_name}.{mv_name} in standalone catalog: {e}"))
-}
-
-/// Allocate a managed-lake `tables` row for an Iceberg-backed MV so that
-/// `SHOW MATERIALIZED VIEWS` and the name-collision check work uniformly
-/// across both storage engines. No tablets, schemas, partitions, or
-/// indexes are allocated for the iceberg storage path.
-fn allocate_iceberg_mv_table_row(
-    state: &Arc<StandaloneState>,
-    db_name: &str,
-    mv_name: &str,
-) -> Result<i64, String> {
-    use crate::connector::starrocks::managed::ddl::{
-        initialize_global_meta_if_needed, reclaim_dropping_table_for_reuse,
-    };
-
-    let cfg = state
-        .managed_lake_config
-        .as_ref()
-        .ok_or_else(|| "managed lake config required".to_string())?;
-    let mut managed = state
-        .managed_lake
-        .write()
-        .expect("standalone managed lake write lock");
-    let mut snapshot = managed.snapshot.clone();
-    initialize_global_meta_if_needed(&mut snapshot, cfg);
-    let database = find_or_create_managed_database(&mut snapshot, db_name);
-    reclaim_dropping_table_for_reuse(&mut snapshot, database.db_id, mv_name)?;
-    let table_id = alloc_id(&mut snapshot.global.next_table_id);
-    snapshot.tables.push(StoredManagedTable {
-        table_id,
-        db_id: database.db_id,
-        name: mv_name.to_string(),
-        keys_type: "DUP_KEYS".to_string(),
-        bucket_num: 0,
-        current_schema_id: 0,
-        state: ManagedTableState::Active,
-        kind: ManagedTableKind::MaterializedView,
-    });
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "sqlite metadata store required".to_string())?;
-    metadata_store.replace_managed_snapshot(&snapshot)?;
-    managed.snapshot = snapshot;
-    Ok(table_id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +1089,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc as StdArc;
+    use tempfile::TempDir;
 
     fn output_col(name: &str, ty: DataType, nullable: bool) -> OutputColumn {
         OutputColumn {
@@ -1123,6 +1097,395 @@ mod tests {
             data_type: ty,
             nullable,
         }
+    }
+
+    struct IcebergMvTestState {
+        state: Arc<StandaloneState>,
+        current_db: String,
+        _metadata_dir: TempDir,
+        _warehouse_dir: TempDir,
+    }
+
+    fn parse_create_mv(sql: &str) -> CreateMaterializedViewStmt {
+        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
+        let crate::sql::parser::ast::Statement::CreateMaterializedView(stmt) = statements.remove(0)
+        else {
+            panic!("expected CREATE MATERIALIZED VIEW");
+        };
+        stmt
+    }
+
+    fn parse_refresh_mv(sql: &str) -> RefreshMaterializedViewStmt {
+        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
+        let crate::sql::parser::ast::Statement::RefreshMaterializedView(stmt) =
+            statements.remove(0)
+        else {
+            panic!("expected REFRESH MATERIALIZED VIEW");
+        };
+        stmt
+    }
+
+    fn parse_drop_mv(sql: &str) -> DropMaterializedViewStmt {
+        let mut statements = crate::sql::parser::parse_sql(sql).expect("parse");
+        let crate::sql::parser::ast::Statement::DropMaterializedView(stmt) = statements.remove(0)
+        else {
+            panic!("expected DROP MATERIALIZED VIEW");
+        };
+        stmt
+    }
+
+    fn open_test_state_with_iceberg_catalog(catalog: &str, current_db: &str) -> IcebergMvTestState {
+        let metadata_dir = TempDir::new().expect("metadata tempdir");
+        let warehouse_dir = TempDir::new().expect("warehouse tempdir");
+        let metadata_store =
+            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(
+                metadata_dir.path().join("standalone.sqlite"),
+            )
+            .expect("open sqlite store");
+        let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
+        snapshot.global.warehouse_uri =
+            format!("file://{}", warehouse_dir.path().join("managed").display());
+        snapshot.global.next_db_id = 1;
+        snapshot.global.next_table_id = 1;
+        metadata_store
+            .replace_managed_snapshot(&snapshot)
+            .expect("initialize metadata snapshot");
+        let state = Arc::new(StandaloneState {
+            metadata_store: Some(metadata_store),
+            ..StandaloneState::default()
+        });
+        crate::connector::register_standalone_backends(&state);
+        {
+            let mut catalogs = state.iceberg_catalogs.write().expect("iceberg catalogs");
+            catalogs
+                .create_catalog(
+                    catalog,
+                    &[
+                        ("type".to_string(), "iceberg".to_string()),
+                        ("iceberg.catalog.type".to_string(), "memory".to_string()),
+                        (
+                            "iceberg.catalog.warehouse".to_string(),
+                            warehouse_dir.path().display().to_string(),
+                        ),
+                    ],
+                )
+                .expect("create iceberg catalog");
+        }
+        IcebergMvTestState {
+            state,
+            current_db: current_db.to_string(),
+            _metadata_dir: metadata_dir,
+            _warehouse_dir: warehouse_dir,
+        }
+    }
+
+    fn create_base_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let columns = vec![
+            crate::sql::TableColumnDef {
+                name: "id".to_string(),
+                data_type: crate::sql::SqlType::Int,
+                nullable: false,
+                aggregation: None,
+                default: None,
+            },
+            crate::sql::TableColumnDef {
+                name: "name".to_string(),
+                data_type: crate::sql::SqlType::String,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            },
+        ];
+        crate::connector::iceberg::catalog::registry::create_table(
+            &entry,
+            namespace,
+            table,
+            &columns,
+            None,
+            &[],
+            &[("format-version".to_string(), "2".to_string())],
+        )
+        .expect("create iceberg table");
+    }
+
+    fn insert_into_iceberg_table(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str)],
+    ) {
+        let entry = {
+            let catalogs = state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get(catalog).expect("catalog")
+        };
+        let rows = rows
+            .iter()
+            .map(|(id, name)| {
+                vec![
+                    crate::sql::Literal::Int(i64::from(*id)),
+                    crate::sql::Literal::String((*name).to_string()),
+                ]
+            })
+            .collect::<Vec<_>>();
+        crate::connector::iceberg::catalog::registry::insert_rows(&entry, namespace, table, &rows)
+            .expect("insert iceberg rows");
+    }
+
+    fn create_base_table_with_rows(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        rows: &[(i32, &str)],
+    ) {
+        create_base_table(state, catalog, namespace, table);
+        insert_into_iceberg_table(state, catalog, namespace, table, rows);
+    }
+
+    fn create_mv_and_refresh_once(
+        state: &Arc<StandaloneState>,
+        current_catalog: Option<&str>,
+        current_db: &str,
+        mv_name: &str,
+    ) {
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW {mv_name}
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders"
+        ));
+        create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
+        let refresh = parse_refresh_mv(&format!("REFRESH MATERIALIZED VIEW {mv_name}"));
+        refresh_iceberg_mv(state, current_catalog, current_db, &refresh)
+            .expect("refresh iceberg mv");
+    }
+
+    fn create_mv_only(
+        state: &Arc<StandaloneState>,
+        current_catalog: Option<&str>,
+        current_db: &str,
+        mv_name: &str,
+    ) {
+        let stmt = parse_create_mv(&format!(
+            "CREATE MATERIALIZED VIEW {mv_name}
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders"
+        ));
+        create_iceberg_mv(state, current_catalog, current_db, &stmt).expect("create iceberg mv");
+    }
+
+    #[test]
+    fn create_iceberg_mv_uses_current_catalog_target_without_managed_table_row() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        crate::connector::starrocks::managed::mv_ddl::create_mv(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &stmt,
+        )
+        .expect("create iceberg mv through ddl");
+
+        let store = env.state.metadata_store.as_ref().expect("metadata store");
+        let snapshot = store.load_snapshot().expect("snapshot");
+        assert!(snapshot.managed.tables.is_empty());
+        assert!(
+            !snapshot.iceberg_tables.iter().any(|table| {
+                table.catalog == "ice"
+                    && table.namespace == "analytics"
+                    && table.table == "mv_orders"
+            }),
+            "Iceberg MV target must not be persisted as a generic Iceberg table"
+        );
+        let mv = store
+            .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
+            .expect("lookup")
+            .expect("mv relationship");
+        assert_eq!(mv.select_sql, "SELECT id, name FROM ice.sales.orders");
+        assert_eq!(mv.target_catalog.as_deref(), Some("ice"));
+        assert_eq!(mv.target_namespace.as_deref(), Some("analytics"));
+        assert_eq!(mv.target_table.as_deref(), Some("mv_orders"));
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+            .expect("target table");
+        let catalog = env.state.catalog.read().expect("standalone catalog");
+        catalog
+            .get("analytics", "mv_orders")
+            .expect("registered target");
+    }
+
+    #[test]
+    fn create_iceberg_mv_resolves_unqualified_base_in_current_catalog() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "analytics", "orders");
+
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM orders",
+        );
+
+        create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect("create iceberg mv");
+
+        let store = env.state.metadata_store.as_ref().expect("metadata store");
+        let mv = store
+            .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
+            .expect("lookup")
+            .expect("mv relationship");
+        assert_eq!(mv.base_table_refs.len(), 1);
+        assert_eq!(mv.base_table_refs[0].catalog, "ice");
+        assert_eq!(mv.base_table_refs[0].namespace, "analytics");
+        assert_eq!(mv.base_table_refs[0].table, "orders");
+    }
+
+    #[test]
+    fn drop_iceberg_mv_drops_target_table_and_relationship() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+
+        let stmt = parse_drop_mv("DROP MATERIALIZED VIEW mv_orders");
+        drop_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt).expect("drop mv");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        assert!(
+            crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+                .is_err()
+        );
+        let store = env.state.metadata_store.as_ref().expect("metadata store");
+        assert!(
+            store
+                .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
+                .expect("lookup")
+                .is_none()
+        );
+        let catalog = env.state.catalog.read().expect("standalone catalog");
+        assert!(catalog.get("analytics", "mv_orders").is_err());
+    }
+
+    #[test]
+    fn create_iceberg_mv_rejects_existing_target_table() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "analytics", "mv_orders");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("existing target should fail");
+        assert_eq!(
+            err,
+            "Iceberg MV target table ice.analytics.mv_orders already exists"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_if_not_exists_does_not_adopt_existing_target() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_base_table(&env.state, "ice", "analytics", "mv_orders");
+        register_iceberg_mv_target_in_catalog(
+            &env.state,
+            &IcebergMvTarget {
+                catalog: "ice".to_string(),
+                namespace: "analytics".to_string(),
+                table: "mv_orders".to_string(),
+            },
+        )
+        .expect("register existing target");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        let err = crate::connector::starrocks::managed::mv_ddl::create_mv(
+            &env.state,
+            Some("ice"),
+            &env.current_db,
+            &stmt,
+        )
+        .expect_err("existing target should fail even with IF NOT EXISTS");
+        assert_eq!(
+            err,
+            "Iceberg MV target table ice.analytics.mv_orders already exists"
+        );
+    }
+
+    #[test]
+    fn create_iceberg_mv_requires_current_iceberg_catalog() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        let stmt = parse_create_mv(
+            "CREATE MATERIALIZED VIEW mv_orders
+             DISTRIBUTED BY HASH(id) BUCKETS 1
+             PROPERTIES('storage_engine'='iceberg')
+             AS SELECT id, name FROM ice.sales.orders",
+        );
+
+        for current_catalog in [None, Some("default_catalog")] {
+            let err = create_iceberg_mv(&env.state, current_catalog, &env.current_db, &stmt)
+                .expect_err("non-iceberg catalog should fail");
+            assert_eq!(
+                err,
+                "storage_engine='iceberg' requires current catalog to be an Iceberg catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_iceberg_mv_fails_when_target_snapshot_was_modified_externally() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table_with_rows(&env.state, "ice", "sales", "orders", &[(1, "a")]);
+        create_mv_and_refresh_once(&env.state, Some("ice"), &env.current_db, "mv_orders");
+
+        insert_into_iceberg_table(
+            &env.state,
+            "ice",
+            "analytics",
+            "mv_orders",
+            &[(99, "external")],
+        );
+
+        let stmt = parse_refresh_mv("REFRESH MATERIALIZED VIEW mv_orders");
+        let err = refresh_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("external target write must fail");
+        assert!(
+            err.contains("target table ice.analytics.mv_orders was modified outside NovaRocks"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1198,8 +1561,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let warehouse = format!("file://{}/wh", dir.path().display());
 
-        // Build FileIO using LocalFsStorageFactory — same pattern as build_file_io
-        // in mv_iceberg_catalog.rs.
+        // Build FileIO using LocalFsStorageFactory so the test writes through
+        // the same local filesystem path shape as a Hadoop Iceberg catalog.
         let file_io = FileIOBuilder::new(
             StdArc::new(LocalFsStorageFactory) as StdArc<dyn iceberg::io::StorageFactory>
         )
