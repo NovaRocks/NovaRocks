@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-11
 **Status**: Accepted for design discussion; implementation plan pending user review
-**Scope**: Introduce an internal change-op row-stream contract for NovaRocks standalone IVM plans without changing the global `Chunk` ABI in the first phase.
+**Scope**: Introduce a direct delta scan/source that emits internal change-op row streams for NovaRocks standalone IVM plans without changing the global `Chunk` ABI in the first phase.
 
 ## Background
 
@@ -84,9 +84,11 @@ behavior when unsupported operators receive retractable deltas.
 
 ## Design Decision
 
-Use a staged design:
+Use a staged design, but make the first implementation converge at the source
+boundary rather than at an adapter after materialization:
 
-1. First introduce a plan-level internal change-op column for IVM delta plans.
+1. First introduce a direct IVM delta scan/source that emits a plan-level
+   internal change-op column.
 2. Do not change the global `Chunk` structure or ordinary scan path in phase 1.
 3. Treat `__change_op` as a special internal slot owned by the IVM planner and
    sink.
@@ -117,22 +119,31 @@ Scan(snapshot/files) -> ordinary rows
 IVM delta sources produce tagged rows:
 
 ```text
-IcebergChangeBatch / IvmChangeStream
+Iceberg delta scan/source
   added files or inserted rows  -> __change_op = +1
   deleted rows or removed files -> __change_op = -1
 ```
 
-For phase 1, NovaRocks can build this from the existing
-`IvmChangeStream { inserts, deletes }` shape:
+For phase 1, the implementation target is a real source-level contract:
 
 ```text
-insert QueryResult chunks -> append __change_op = +1
-delete QueryResult chunks -> append __change_op = -1
-union all into one internal delta stream
+IcebergChangeBatch
+  -> IvmDeltaSource / IcebergDeltaScan
+       reads added files or inserted rows with __change_op = +1
+       reads deleted rows or removed files with __change_op = -1
+  -> downstream ExecPlan operators
 ```
 
-This adapter is an implementation bridge. Long term, the same contract can move
-closer to a real Iceberg delta scan/source that directly emits tagged chunks.
+`IvmChangeStream { inserts, deletes }` may remain as a compatibility wrapper for
+old call sites while the refactor lands, but it is not the final semantic
+boundary for A4. The source itself must be able to emit tagged chunks, so later
+operators consume a single row-stream contract instead of reconstructing
+semantics from separate external `QueryResult` branches.
+
+An adapter that appends `__change_op` to already-materialized insert/delete
+results is acceptable only in focused unit tests or as a temporary migration
+shim hidden behind the new source API. It should not be the production shape
+that A4 claims complete.
 
 ## Operator Rules
 
@@ -196,11 +207,12 @@ The current code already has aggregate-specific machinery:
 - `negate_aggregate_state_chunks`
 - `merge_aggregate_state_batches`
 
-Phase 1 should let those paths consume a unified change-op stream instead of
-depending on an outer `inserts` / `deletes` branch boundary as the final semantic
-source. The implementation can still internally split positive and negative
-rows when applying existing state-merge code, but the ExecPlan-level contract is
-the tagged row stream.
+Phase 1 should let those paths consume the delta source's unified change-op
+stream instead of depending on an outer `inserts` / `deletes` branch boundary as
+the final semantic source. The implementation can still internally split
+positive and negative rows when applying existing state-merge code, but that
+split must happen after reading a tagged source stream, not before the data
+enters the source boundary.
 
 ## Join Semantics
 
@@ -248,8 +260,9 @@ Phase 1 does not include:
 
 ### Unit and Plan Tests
 
-1. Build an internal delta stream from insert/delete chunks and verify
-   `__change_op` is appended with the right values.
+1. Build an `IcebergChangeBatch` fixture and verify the delta source emits
+   chunks with `__change_op = +1` for inserted rows and `__change_op = -1` for
+   retracted rows.
 2. Verify filter preserves change-op alignment with filtered rows.
 3. Verify project keeps the internal slot even when user-visible output does not
    include it.
@@ -289,7 +302,7 @@ aggregate shape and assert it returns a clear unsupported-retract error.
 ## Acceptance Criteria
 
 - IVM delta plans have a documented internal `__change_op` slot contract.
-- Delta source or adapter can produce tagged insert and delete rows.
+- Delta source directly produces tagged insert and delete rows.
 - Safe operators preserve the tag.
 - IVM sinks consume the tag and validate illegal values.
 - Unsupported retractable operator paths fail fast.
