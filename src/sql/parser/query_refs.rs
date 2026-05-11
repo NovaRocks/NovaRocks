@@ -127,16 +127,33 @@ fn extract_table_names_from_subquery(query: &sqlparser::ast::Query, names: &mut 
 pub(crate) fn extract_three_part_table_refs(
     query: &sqlparser::ast::Query,
 ) -> Vec<(String, String, String)> {
-    let mut refs = Vec::new();
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            extract_three_part_refs_from_set_expr(cte.query.body.as_ref(), &mut refs);
-        }
-    }
-    extract_three_part_refs_from_set_expr(query.body.as_ref(), &mut refs);
+    let mut refs = extract_three_part_table_ref_occurrences(query);
     refs.sort();
     refs.dedup();
     refs
+}
+
+/// Extract every `(catalog, database, table)` occurrence from 3-part table
+/// references in a query AST. Unlike `extract_three_part_table_refs`, this
+/// preserves duplicates so callers can enforce cardinality before rewrites.
+pub(crate) fn extract_three_part_table_ref_occurrences(
+    query: &sqlparser::ast::Query,
+) -> Vec<(String, String, String)> {
+    let mut refs = Vec::new();
+    extract_three_part_refs_from_query(query, &mut refs);
+    refs
+}
+
+fn extract_three_part_refs_from_query(
+    query: &sqlparser::ast::Query,
+    refs: &mut Vec<(String, String, String)>,
+) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            extract_three_part_refs_from_query(&cte.query, refs);
+        }
+    }
+    extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
 }
 
 fn extract_three_part_refs_from_set_expr(
@@ -172,7 +189,7 @@ fn extract_three_part_refs_from_set_expr(
             extract_three_part_refs_from_set_expr(right, refs);
         }
         sqlparser::ast::SetExpr::Query(query) => {
-            extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
+            extract_three_part_refs_from_query(query, refs);
         }
         _ => {}
     }
@@ -188,10 +205,10 @@ fn extract_three_part_refs_from_expr(
         | Expr::Exists {
             subquery: query, ..
         } => {
-            extract_three_part_refs_from_set_expr(query.body.as_ref(), refs);
+            extract_three_part_refs_from_query(query, refs);
         }
         Expr::InSubquery { subquery, expr, .. } => {
-            extract_three_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+            extract_three_part_refs_from_query(subquery, refs);
             extract_three_part_refs_from_expr(expr, refs);
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -284,7 +301,7 @@ fn extract_three_part_refs_from_factor(
             }
         }
         sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-            extract_three_part_refs_from_set_expr(subquery.body.as_ref(), refs);
+            extract_three_part_refs_from_query(subquery, refs);
         }
         _ => {}
     }

@@ -11,7 +11,8 @@ use crate::sql::parser::ast::{
     ShowMaterializedViewsStmt,
 };
 use crate::sql::parser::query_refs::{
-    extract_three_part_table_refs, strip_catalog_from_three_part_names,
+    extract_three_part_table_ref_occurrences, extract_three_part_table_refs,
+    strip_catalog_from_three_part_names,
 };
 
 fn mv_backend(
@@ -190,65 +191,6 @@ fn normalize_incremental_mv_base_ref(
     ))
 }
 
-fn extract_three_part_table_ref_occurrences(
-    query: &sqlparser::ast::Query,
-) -> Vec<(String, String, String)> {
-    let mut refs = Vec::new();
-    extract_three_part_ref_occurrences_from_set_expr(query.body.as_ref(), &mut refs);
-    refs
-}
-
-fn extract_three_part_ref_occurrences_from_set_expr(
-    expr: &sqlparser::ast::SetExpr,
-    refs: &mut Vec<(String, String, String)>,
-) {
-    match expr {
-        sqlparser::ast::SetExpr::Select(select) => {
-            for from in &select.from {
-                extract_three_part_ref_occurrences_from_factor(&from.relation, refs);
-                for join in &from.joins {
-                    extract_three_part_ref_occurrences_from_factor(&join.relation, refs);
-                }
-            }
-        }
-        sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
-            extract_three_part_ref_occurrences_from_set_expr(left, refs);
-            extract_three_part_ref_occurrences_from_set_expr(right, refs);
-        }
-        sqlparser::ast::SetExpr::Query(query) => {
-            extract_three_part_ref_occurrences_from_set_expr(query.body.as_ref(), refs);
-        }
-        _ => {}
-    }
-}
-
-fn extract_three_part_ref_occurrences_from_factor(
-    factor: &sqlparser::ast::TableFactor,
-    refs: &mut Vec<(String, String, String)>,
-) {
-    match factor {
-        sqlparser::ast::TableFactor::Table { name, .. } => {
-            let parts: Vec<String> = name
-                .0
-                .iter()
-                .filter_map(|part| match part {
-                    sqlparser::ast::ObjectNamePart::Identifier(ident) => {
-                        Some(ident.value.to_lowercase())
-                    }
-                    _ => None,
-                })
-                .collect();
-            if parts.len() == 3 {
-                refs.push((parts[0].clone(), parts[1].clone(), parts[2].clone()));
-            }
-        }
-        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
-            extract_three_part_ref_occurrences_from_set_expr(subquery.body.as_ref(), refs);
-        }
-        _ => {}
-    }
-}
-
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
@@ -418,16 +360,11 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
     // Build a TableDef whose storage is the temp parquet file. Reuse
     // build_iceberg_table_def_with_files's column-shape logic by giving
     // it a one-element file list.
-    let delete_files = vec![IcebergFileForQuery {
-        path,
-        size: total_size,
-        record_count: total_rows,
-        partition_spec_id: None,
-        partition_key: None,
-        first_row_id: Some(0),
-        data_sequence_number: Some(0),
-        change_op: None,
-    }];
+    let delete_files = vec![
+        crate::engine::query_prep::delete_temp_iceberg_file_for_query(
+            path, total_size, total_rows, None,
+        ),
+    ];
 
     let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(
         state,
@@ -462,6 +399,70 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    fn parse_query(sql: &str) -> sqlparser::ast::Query {
+        let normalized =
+            crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize sql");
+        let statement =
+            crate::sql::parser::parse_normalized_sql_raw(&normalized).expect("parse sql");
+        let sqlparser::ast::Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        *query
+    }
+
+    fn base_ref() -> crate::connector::starrocks::managed::store::IcebergTableRef {
+        crate::connector::starrocks::managed::store::IcebergTableRef {
+            catalog: "ice".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+        }
+    }
+
+    #[test]
+    fn validate_incremental_mv_base_ref_rejects_projection_subquery_extra_ref() {
+        let query =
+            parse_query("select k, (select count(*) from ice.db.t) as c from ice.db.t where v > 0");
+        let err = super::validate_incremental_mv_base_ref(&query, &base_ref())
+            .expect_err("extra 3-part ref must fail");
+
+        assert!(err.contains("exactly one 3-part Iceberg table, got 2"));
+    }
+
+    #[test]
+    fn validate_incremental_mv_base_ref_rejects_where_subquery_extra_ref() {
+        let query =
+            parse_query("select k from ice.db.t where exists (select 1 from ice.db.t where v > 0)");
+        let err = super::validate_incremental_mv_base_ref(&query, &base_ref())
+            .expect_err("extra 3-part ref must fail");
+
+        assert!(err.contains("exactly one 3-part Iceberg table, got 2"));
+    }
+
+    #[test]
+    fn validate_incremental_mv_base_ref_rejects_having_subquery_extra_ref() {
+        let query = parse_query(
+            "select k, count(*) from ice.db.t group by k \
+             having count(*) > (select count(*) from ice.db.t)",
+        );
+        let err = super::validate_incremental_mv_base_ref(&query, &base_ref())
+            .expect_err("extra 3-part ref must fail");
+
+        assert!(err.contains("exactly one 3-part Iceberg table, got 2"));
+    }
+
+    #[test]
+    fn delete_temp_delta_file_omits_row_lineage_metadata() {
+        let file = crate::engine::query_prep::delete_temp_iceberg_file_for_query(
+            "file:///tmp/delete.parquet".to_string(),
+            128,
+            Some(1),
+            None,
+        );
+
+        assert_eq!(file.first_row_id, None);
+        assert_eq!(file.data_sequence_number, None);
+    }
 
     #[test]
     fn mv_delete_temp_parquet_preserves_iceberg_field_ids() {

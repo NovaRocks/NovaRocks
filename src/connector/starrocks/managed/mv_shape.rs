@@ -420,6 +420,10 @@ fn simple_aggregate_arg_expr(
     }
 }
 
+pub(crate) fn query_has_aggregate_surface(query: &sqlparser::ast::Query) -> bool {
+    is_probably_aggregate_query(query)
+}
+
 fn is_probably_aggregate_query(query: &sqlparser::ast::Query) -> bool {
     let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
         return false;

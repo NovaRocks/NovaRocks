@@ -98,16 +98,14 @@ pub(crate) fn build_delta_source_files(
                 &input.base_ref.table,
                 &deleted_rows,
             )?;
-            files.push(IcebergFileForQuery {
-                path,
-                size,
-                record_count,
-                partition_spec_id: None,
-                partition_key: None,
-                first_row_id: Some(0),
-                data_sequence_number: Some(0),
-                change_op: Some(CHANGE_OP_DELETE),
-            });
+            files.push(
+                crate::engine::query_prep::delete_temp_iceberg_file_for_query(
+                    path,
+                    size,
+                    record_count,
+                    Some(CHANGE_OP_DELETE),
+                ),
+            );
         }
     }
 
@@ -164,10 +162,21 @@ pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<Strin
         .map_err(|e| format!("projection_select_with_change_op normalize error: {e}"))?;
     let mut statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
         .map_err(|e| format!("projection_select_with_change_op parse error: {e}"))?;
+    if sql_mentions_identifier(&statement.to_string(), CHANGE_OP_COLUMN) {
+        return Err(format!(
+            "projection_select_with_change_op: {CHANGE_OP_COLUMN} is a reserved delta source column"
+        ));
+    }
 
     let Statement::Query(query) = &mut statement else {
         return Err("projection_select_with_change_op: expected SELECT query".to_string());
     };
+    if super::mv_shape::query_has_aggregate_surface(query.as_ref()) {
+        return Err(
+            "projection_select_with_change_op: projection/filter SELECT must not be aggregate"
+                .to_string(),
+        );
+    }
     let SetExpr::Select(select) = query.body.as_mut() else {
         return Err("projection_select_with_change_op: expected SELECT body".to_string());
     };
@@ -180,21 +189,44 @@ pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<Strin
     Ok(statement.to_string())
 }
 
+fn sql_mentions_identifier(sql: &str, identifier: &str) -> bool {
+    sql.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .any(|token| token.eq_ignore_ascii_case(identifier))
+}
+
 #[cfg(test)]
 mod tests {
     use super::projection_select_with_change_op;
 
     #[test]
-    fn projection_select_with_change_op_preserves_where_and_group_by() {
-        let rewritten = projection_select_with_change_op(
-            "select k, sum(v) as total from ice.db.t where v > 0 group by k",
-        )
-        .expect("rewrite");
+    fn projection_select_with_change_op_preserves_where_for_projection_filter() {
+        let rewritten =
+            projection_select_with_change_op("select k, v + 1 as v1 from ice.db.t where v > 0")
+                .expect("rewrite");
         let upper = rewritten.to_uppercase();
 
-        assert!(upper.starts_with("SELECT K, SUM(V) AS TOTAL, __CHANGE_OP FROM"));
-        assert!(upper.contains(" WHERE V > 0 "));
-        assert!(upper.contains(" GROUP BY K"));
+        assert!(upper.starts_with("SELECT K, V + 1 AS V1, __CHANGE_OP FROM"));
+        assert!(upper.contains(" WHERE V > 0"));
+    }
+
+    #[test]
+    fn projection_select_with_change_op_rejects_group_by_aggregate() {
+        let err = projection_select_with_change_op(
+            "select k, sum(v) as total from ice.db.t where v > 0 group by k",
+        )
+        .expect_err("aggregate SELECT must fail");
+
+        assert!(err.contains("projection/filter"));
+        assert!(err.contains("aggregate"));
+    }
+
+    #[test]
+    fn projection_select_with_change_op_rejects_existing_change_op() {
+        let err = projection_select_with_change_op("select k as __change_op from ice.db.t")
+            .expect_err("reserved output must fail");
+
+        assert!(err.contains("__change_op"));
+        assert!(err.contains("reserved"));
     }
 
     #[test]

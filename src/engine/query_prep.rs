@@ -27,6 +27,24 @@ pub(crate) struct IcebergFileForQuery {
     pub(crate) change_op: Option<i8>,
 }
 
+pub(crate) fn delete_temp_iceberg_file_for_query(
+    path: String,
+    size: i64,
+    record_count: Option<i64>,
+    change_op: Option<i8>,
+) -> IcebergFileForQuery {
+    IcebergFileForQuery {
+        path,
+        size,
+        record_count,
+        partition_spec_id: None,
+        partition_key: None,
+        first_row_id: None,
+        data_sequence_number: None,
+        change_op,
+    }
+}
+
 pub(crate) fn add_files(
     state: &Arc<StandaloneState>,
     sql: &str,
@@ -645,6 +663,13 @@ fn stamp_delta_table_def_change_ops(
             write_default: None,
         });
 
+    if change_ops.is_empty() && matches!(table_def.storage, TableStorage::LocalParquetFile { .. }) {
+        table_def.storage = TableStorage::S3ParquetFiles {
+            files: Vec::new(),
+            cloud_properties: Default::default(),
+        };
+    }
+
     let TableStorage::S3ParquetFiles { files, .. } = &mut table_def.storage else {
         return Err(
             "iceberg delta source requires S3 parquet file storage for synthetic files".to_string(),
@@ -739,5 +764,33 @@ mod tests {
             panic!("expected s3 parquet storage");
         };
         assert_eq!(files[0].ivm_change_op, Some(1));
+    }
+
+    #[test]
+    fn delta_table_builder_accepts_empty_local_storage() {
+        let mut table_def = TableDef {
+            name: "t".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![],
+            iceberg_table: None,
+            storage: TableStorage::LocalParquetFile {
+                path: std::env::temp_dir().join("empty-delta.parquet"),
+            },
+        };
+
+        super::stamp_delta_table_def_change_ops(&mut table_def, &[]).expect("stamp empty delta");
+
+        assert_eq!(
+            table_def
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .map(|col| (col.name.as_str(), &col.data_type, col.nullable))
+                .collect::<Vec<_>>(),
+            vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
+        );
+        let TableStorage::S3ParquetFiles { files, .. } = &table_def.storage else {
+            panic!("expected empty delta to use s3 parquet storage");
+        };
+        assert!(files.is_empty());
     }
 }
