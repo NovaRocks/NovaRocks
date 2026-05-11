@@ -1256,6 +1256,18 @@ impl<'a> AnalyzerContext<'a> {
                 scope.add_column(Some(qualifier), &gs.column_name, DataType::Int64, false);
                 Ok(())
             }
+            Relation::Unnest(unnest) => {
+                let qualifier = unnest.alias.as_deref().unwrap_or("unnest");
+                for col in &unnest.output_columns {
+                    scope.add_column(
+                        Some(qualifier),
+                        &col.name,
+                        col.data_type.clone(),
+                        col.nullable,
+                    );
+                }
+                Ok(())
+            }
             Relation::CTEConsume {
                 alias,
                 output_columns,

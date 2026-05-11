@@ -52,6 +52,7 @@ pub(crate) fn compute_cost(
         | Operator::LogicalExcept(_)
         | Operator::LogicalValues(_)
         | Operator::LogicalGenerateSeries(_)
+        | Operator::LogicalTableFunction(_)
         | Operator::LogicalSubqueryAlias(_)
         | Operator::LogicalRepeat(_)
         | Operator::LogicalCTEAnchor(_)
@@ -159,6 +160,7 @@ pub(crate) fn compute_cost(
         | Operator::PhysicalExcept(_)
         | Operator::PhysicalValues(_)
         | Operator::PhysicalGenerateSeries(_)
+        | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalSubqueryAlias(_)
         | Operator::PhysicalCTEProduce(_)
         | Operator::PhysicalCTEConsume(_) => own_stats.output_row_count * 0.01,

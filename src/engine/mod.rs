@@ -2184,6 +2184,7 @@ fn collect_scan_stats(
         LogicalPlan::Sort(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Limit(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::Window(n) => collect_scan_stats(&n.input, out),
+        LogicalPlan::TableFunction(n) => collect_scan_stats(&n.input, out),
         LogicalPlan::CTEAnchor(n) => {
             collect_scan_stats(&n.produce, out);
             collect_scan_stats(&n.consumer, out);

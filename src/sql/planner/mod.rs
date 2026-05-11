@@ -1184,14 +1184,49 @@ fn plan_relation_scoped(
             }))
         }
         Relation::Join(join_rel) => {
-            let left = plan_relation_scoped(join_rel.left, cte_registry)?;
-            let right = plan_relation_scoped(join_rel.right, cte_registry)?;
-            Ok(LogicalPlan::Join(JoinNode {
-                left: Box::new(left),
-                right: Box::new(right),
-                join_type: join_rel.join_type,
-                condition: join_rel.condition,
-            }))
+            let JoinRelation {
+                left,
+                right,
+                join_type,
+                condition,
+            } = *join_rel;
+            match right {
+                Relation::Unnest(unnest) => {
+                    let is_left_join = match join_type {
+                        JoinKind::Cross | JoinKind::Inner => false,
+                        JoinKind::LeftOuter => true,
+                        other => {
+                            return Err(format!(
+                                "LATERAL UNNEST supports CROSS/INNER/LEFT joins, got {other:?}"
+                            ));
+                        }
+                    };
+                    if !is_lateral_unnest_condition_supported(&condition) {
+                        return Err(
+                            "LATERAL UNNEST currently requires no condition or ON TRUE".into()
+                        );
+                    }
+                    let left = plan_relation_scoped(left, cte_registry)?;
+                    Ok(LogicalPlan::TableFunction(TableFunctionNode {
+                        input: Box::new(left),
+                        function_name: "unnest".to_string(),
+                        args: unnest.args,
+                        output_columns: unnest.output_columns,
+                        alias: unnest.alias,
+                        is_left_join,
+                    }))
+                }
+                right => {
+                    let left = plan_relation_scoped(left, cte_registry)?;
+                    let right = plan_relation_scoped(right, cte_registry)?;
+                    Ok(LogicalPlan::Join(JoinNode {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        join_type,
+                        condition,
+                    }))
+                }
+            }
         }
         Relation::GenerateSeries(gs) => Ok(LogicalPlan::GenerateSeries(GenerateSeriesNode {
             start: gs.start,
@@ -1200,6 +1235,7 @@ fn plan_relation_scoped(
             column_name: gs.column_name,
             alias: gs.alias,
         })),
+        Relation::Unnest(_) => Err("UNNEST is currently supported only in LATERAL JOIN".into()),
         Relation::CTEConsume {
             cte_id,
             alias,
@@ -1210,6 +1246,17 @@ fn plan_relation_scoped(
             output_columns,
         })),
         Relation::IcebergMetadataScan(rel) => plan_iceberg_metadata_scan(rel),
+    }
+}
+
+fn is_lateral_unnest_condition_supported(condition: &Option<TypedExpr>) -> bool {
+    match condition {
+        None => true,
+        Some(TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Bool(true)),
+            ..
+        }) => true,
+        _ => false,
     }
 }
 

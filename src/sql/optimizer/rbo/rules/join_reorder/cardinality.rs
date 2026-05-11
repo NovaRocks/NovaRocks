@@ -59,6 +59,18 @@ pub(crate) fn estimate_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        LogicalPlan::TableFunction(t) => {
+            let child = estimate_statistics(&t.input, table_stats);
+            let estimated_rows = child.output_row_count * 3.0;
+            Statistics {
+                output_row_count: if t.is_left_join {
+                    estimated_rows.max(child.output_row_count)
+                } else {
+                    estimated_rows.max(1.0)
+                },
+                column_statistics: HashMap::new(),
+            }
+        }
         LogicalPlan::CTEConsume(_) => Statistics {
             output_row_count: 1000.0,
             column_statistics: HashMap::new(),

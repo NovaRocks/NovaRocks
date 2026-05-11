@@ -45,6 +45,9 @@ pub(crate) fn derive_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        Operator::LogicalTableFunction(tf) => {
+            derive_table_function_stats(tf.is_left_join, expr, memo)
+        }
         Operator::LogicalCTEConsume(cte) => {
             // Look up the CTEProduce group's row count from the memo.
             if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
@@ -589,6 +592,9 @@ pub(crate) fn derive_statistics(
                 column_statistics: HashMap::new(),
             }
         }
+        Operator::PhysicalTableFunction(tf) => {
+            derive_table_function_stats(tf.is_left_join, expr, memo)
+        }
     }
 }
 
@@ -656,6 +662,19 @@ fn child_statistics(memo: &Memo, children: &[super::memo::GroupId], index: usize
             output_row_count: 10_000.0,
             column_statistics: HashMap::new(),
         }
+    }
+}
+
+fn derive_table_function_stats(is_left_join: bool, expr: &MExpr, memo: &Memo) -> Statistics {
+    let child = child_statistics(memo, &expr.children, 0);
+    let estimated_rows = child.output_row_count * 3.0;
+    Statistics {
+        output_row_count: if is_left_join {
+            estimated_rows.max(child.output_row_count)
+        } else {
+            estimated_rows.max(1.0)
+        },
+        column_statistics: HashMap::new(),
     }
 }
 
@@ -982,6 +1001,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 nullable: false,
             }]
         }
+        Operator::LogicalTableFunction(tf) => {
+            let mut cols = child_output_columns(memo, &expr.children, 0);
+            cols.extend(tf.output_columns.clone());
+            cols
+        }
 
         // Passthrough operators: inherit output columns from first child.
         Operator::LogicalFilter(_)
@@ -1055,6 +1079,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::sql::analy
                 data_type: arrow::datatypes::DataType::Int64,
                 nullable: false,
             }]
+        }
+        Operator::PhysicalTableFunction(tf) => {
+            let mut cols = child_output_columns(memo, &expr.children, 0);
+            cols.extend(tf.output_columns.clone());
+            cols
         }
         Operator::PhysicalFilter(_)
         | Operator::PhysicalSort(_)

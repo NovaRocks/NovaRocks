@@ -1187,7 +1187,40 @@ impl Rule for GenerateSeriesToPhysical {
 }
 
 // ---------------------------------------------------------------------------
-// 18. SubqueryAliasToPhysical
+// 18. TableFunctionToPhysical
+// ---------------------------------------------------------------------------
+
+pub(crate) struct TableFunctionToPhysical;
+
+impl Rule for TableFunctionToPhysical {
+    fn name(&self) -> &str {
+        "TableFunctionToPhysical"
+    }
+    fn rule_type(&self) -> RuleType {
+        RuleType::Implementation
+    }
+    fn matches(&self, op: &Operator) -> bool {
+        matches!(op, Operator::LogicalTableFunction(_))
+    }
+    fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        let Operator::LogicalTableFunction(op) = &expr.op else {
+            return vec![];
+        };
+        vec![NewExpr {
+            op: Operator::PhysicalTableFunction(PhysicalTableFunctionOp {
+                function_name: op.function_name.clone(),
+                args: op.args.clone(),
+                output_columns: op.output_columns.clone(),
+                alias: op.alias.clone(),
+                is_left_join: op.is_left_join,
+            }),
+            children: expr.children.clone(),
+        }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 19. SubqueryAliasToPhysical
 // ---------------------------------------------------------------------------
 
 pub(crate) struct SubqueryAliasToPhysical;

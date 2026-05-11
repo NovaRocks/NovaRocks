@@ -277,6 +277,7 @@ fn output_properties(op: &Operator) -> PhysicalPropertySet {
         | Operator::PhysicalProject(_)
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalSubqueryAlias(_)
+        | Operator::PhysicalTableFunction(_)
         | Operator::PhysicalCTEAnchor(_)
         | Operator::PhysicalCTEProduce(_)
         | Operator::PhysicalRepeat(_) => PhysicalPropertySet::any(),
@@ -534,10 +535,11 @@ pub(super) fn required_input_properties(
             vec![req]
         }
 
-        // Filter, Project, Limit: passthrough parent requirement.
-        Operator::PhysicalFilter(_) | Operator::PhysicalProject(_) | Operator::PhysicalLimit(_) => {
-            vec![parent_required.clone()]
-        }
+        // Filter, Project, Limit, TableFunction: passthrough parent requirement.
+        Operator::PhysicalFilter(_)
+        | Operator::PhysicalProject(_)
+        | Operator::PhysicalLimit(_)
+        | Operator::PhysicalTableFunction(_) => vec![parent_required.clone()],
 
         // SubqueryAlias, CTE Produce, Repeat: passthrough parent requirement.
         Operator::PhysicalSubqueryAlias(_)

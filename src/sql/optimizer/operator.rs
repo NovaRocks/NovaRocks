@@ -135,6 +135,15 @@ pub(crate) struct LogicalGenerateSeriesOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct LogicalTableFunctionOp {
+    pub function_name: String,
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub alias: Option<String>,
+    pub is_left_join: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LogicalSubqueryAliasOp {
     pub alias: String,
     pub output_columns: Vec<OutputColumn>,
@@ -311,6 +320,15 @@ pub(crate) struct PhysicalGenerateSeriesOp {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PhysicalTableFunctionOp {
+    pub function_name: String,
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub alias: Option<String>,
+    pub is_left_join: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PhysicalSubqueryAliasOp {
     pub alias: String,
     pub output_columns: Vec<OutputColumn>,
@@ -337,6 +355,7 @@ pub(crate) enum Operator {
     LogicalExcept(LogicalExceptOp),
     LogicalValues(LogicalValuesOp),
     LogicalGenerateSeries(LogicalGenerateSeriesOp),
+    LogicalTableFunction(LogicalTableFunctionOp),
     LogicalSubqueryAlias(LogicalSubqueryAliasOp),
     LogicalRepeat(LogicalRepeatOp),
     LogicalCTEAnchor(LogicalCTEAnchorOp),
@@ -364,6 +383,7 @@ pub(crate) enum Operator {
     PhysicalExcept(PhysicalExceptOp),
     PhysicalValues(PhysicalValuesOp),
     PhysicalGenerateSeries(PhysicalGenerateSeriesOp),
+    PhysicalTableFunction(PhysicalTableFunctionOp),
     PhysicalSubqueryAlias(PhysicalSubqueryAliasOp),
 }
 
@@ -385,6 +405,7 @@ impl Operator {
                 | Operator::LogicalExcept(_)
                 | Operator::LogicalValues(_)
                 | Operator::LogicalGenerateSeries(_)
+                | Operator::LogicalTableFunction(_)
                 | Operator::LogicalSubqueryAlias(_)
                 | Operator::LogicalRepeat(_)
                 | Operator::LogicalCTEAnchor(_)

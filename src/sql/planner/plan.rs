@@ -27,6 +27,7 @@ pub(crate) enum LogicalPlan {
     Except(ExceptNode),
     Values(ValuesNode),
     GenerateSeries(GenerateSeriesNode),
+    TableFunction(TableFunctionNode),
     Window(WindowNode),
     /// Wraps a subquery plan with an alias, so that the physical emitter
     /// can register qualified columns (e.g., `ctr1.ctr_customer_sk` for
@@ -120,6 +121,17 @@ pub(crate) struct GenerateSeriesNode {
     pub step: i64,
     pub column_name: String,
     pub alias: Option<String>,
+}
+
+/// Lateral table function evaluation over each input row.
+#[derive(Clone, Debug)]
+pub(crate) struct TableFunctionNode {
+    pub input: Box<LogicalPlan>,
+    pub function_name: String,
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
+    pub alias: Option<String>,
+    pub is_left_join: bool,
 }
 
 // ---------------------------------------------------------------------------

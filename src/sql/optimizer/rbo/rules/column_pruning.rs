@@ -240,6 +240,13 @@ fn prune_inner(plan: LogicalPlan, needed: Option<&HashSet<String>>) -> LogicalPl
 
         LogicalPlan::Values(node) => LogicalPlan::Values(node),
         LogicalPlan::GenerateSeries(node) => LogicalPlan::GenerateSeries(node),
+        LogicalPlan::TableFunction(node) => {
+            let input = prune_inner(*node.input, None);
+            LogicalPlan::TableFunction(TableFunctionNode {
+                input: Box::new(input),
+                ..node
+            })
+        }
         LogicalPlan::CTEAnchor(node) => {
             let produce = prune_inner(*node.produce, None);
             let consumer = prune_inner(*node.consumer, needed);

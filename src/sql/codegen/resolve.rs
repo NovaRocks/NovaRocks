@@ -86,6 +86,13 @@ impl ExprScope {
         self.ordered.iter().map(|(name, binding)| (name, binding))
     }
 
+    /// Iterate all qualified lookup aliases.
+    pub fn iter_qualified(&self) -> impl Iterator<Item = (&String, &String, &ColumnBinding)> {
+        self.qualified
+            .iter()
+            .map(|((qualifier, name), binding)| (qualifier, name, binding))
+    }
+
     /// Merge another scope into this one. Used for building JOIN output scopes.
     /// Qualified lookups are always added; unqualified lookups are added
     /// only if the column name is not already present (ambiguous columns

@@ -330,7 +330,14 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
         | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" => DataType::Int32,
 
-        // Conditional functions -> widened type of args
+        // Conditional functions -> widened type of value args.
+        "if" if arg_types.len() >= 2 => {
+            let mut result = arg_types[1].clone();
+            for t in &arg_types[2..] {
+                result = wider_type(&result, t);
+            }
+            result
+        }
         "if" | "ifnull" | "nullif" | "coalesce" | "nvl" => {
             if arg_types.is_empty() {
                 DataType::Null

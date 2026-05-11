@@ -204,6 +204,11 @@ pub(crate) fn collect_output_columns(plan: &LogicalPlan) -> HashSet<String> {
             cols.insert(g.column_name.to_lowercase());
             cols
         }
+        LogicalPlan::TableFunction(t) => {
+            let mut cols = collect_output_columns(&t.input);
+            cols.extend(t.output_columns.iter().map(|c| c.name.to_lowercase()));
+            cols
+        }
         LogicalPlan::CTEAnchor(a) => collect_output_columns(&a.consumer),
         LogicalPlan::CTEProduce(p) => p
             .output_columns
@@ -416,6 +421,15 @@ fn collect_qualified_output_columns_inner(plan: &LogicalPlan, out: &mut HashSet<
         }
         LogicalPlan::GenerateSeries(g) => {
             out.insert((None, g.column_name.to_lowercase()));
+        }
+        LogicalPlan::TableFunction(t) => {
+            collect_qualified_output_columns_inner(&t.input, out);
+            for col in &t.output_columns {
+                out.insert((
+                    t.alias.as_ref().map(|alias| alias.to_lowercase()),
+                    col.name.to_lowercase(),
+                ));
+            }
         }
         LogicalPlan::CTEAnchor(a) => {
             collect_qualified_output_columns_inner(&a.consumer, out);

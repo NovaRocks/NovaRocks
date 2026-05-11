@@ -16,7 +16,8 @@ impl<'a> super::AnalyzerContext<'a> {
         let (mut current_rel, mut current_scope) = self.analyze_table_factor(&twj.relation)?;
 
         for join in &twj.joins {
-            let (right_rel, right_scope) = self.analyze_table_factor(&join.relation)?;
+            let (right_rel, right_scope) =
+                self.analyze_table_factor_with_outer(&join.relation, Some(&current_scope))?;
 
             let (join_kind, constraint) = super::helpers::parse_join_operator(&join.join_operator)?;
 
@@ -99,6 +100,14 @@ impl<'a> super::AnalyzerContext<'a> {
     pub(super) fn analyze_table_factor(
         &self,
         factor: &sqlast::TableFactor,
+    ) -> Result<(Relation, AnalyzerScope), String> {
+        self.analyze_table_factor_with_outer(factor, None)
+    }
+
+    fn analyze_table_factor_with_outer(
+        &self,
+        factor: &sqlast::TableFactor,
+        outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), String> {
         match factor {
             sqlast::TableFactor::Table { name, alias, .. } => {
@@ -272,6 +281,57 @@ impl<'a> super::AnalyzerContext<'a> {
             sqlast::TableFactor::TableFunction { expr, alias } => {
                 self.analyze_table_function(expr, alias.as_ref())
             }
+            sqlast::TableFactor::Function {
+                lateral,
+                name,
+                args,
+                alias,
+            } => {
+                let func_name = name
+                    .0
+                    .last()
+                    .map(|p| p.to_string().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if func_name != "unnest" {
+                    return Err(format!("unsupported table function: {func_name}"));
+                }
+                if !*lateral {
+                    return Err("UNNEST is currently supported only in LATERAL JOIN".into());
+                }
+                let array_exprs = args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => {
+                            Ok(expr.clone())
+                        }
+                        other => Err(format!(
+                            "UNNEST expects positional expression args, got {other}"
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.analyze_unnest(
+                    &array_exprs,
+                    alias.as_ref(),
+                    false,
+                    None,
+                    false,
+                    outer_scope,
+                )
+            }
+            sqlast::TableFactor::UNNEST {
+                alias,
+                array_exprs,
+                with_offset,
+                with_offset_alias,
+                with_ordinality,
+            } => self.analyze_unnest(
+                array_exprs,
+                alias.as_ref(),
+                *with_offset,
+                with_offset_alias.as_ref(),
+                *with_ordinality,
+                outer_scope,
+            ),
             sqlast::TableFactor::NestedJoin {
                 table_with_joins,
                 alias,
@@ -283,6 +343,84 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             other => Err(format!("unsupported table factor: {other}")),
         }
+    }
+
+    fn analyze_unnest(
+        &self,
+        array_exprs: &[sqlast::Expr],
+        alias: Option<&sqlast::TableAlias>,
+        with_offset: bool,
+        with_offset_alias: Option<&sqlast::Ident>,
+        with_ordinality: bool,
+        outer_scope: Option<&AnalyzerScope>,
+    ) -> Result<(Relation, AnalyzerScope), String> {
+        if with_offset || with_offset_alias.is_some() || with_ordinality {
+            return Err("UNNEST WITH OFFSET/ORDINALITY is not yet supported".into());
+        }
+        if array_exprs.is_empty() {
+            return Err("UNNEST requires at least one ARRAY expression".into());
+        }
+        let Some(outer_scope) = outer_scope else {
+            return Err("UNNEST is currently supported only in LATERAL JOIN".into());
+        };
+
+        let alias_columns = alias
+            .map(|a| {
+                a.columns
+                    .iter()
+                    .map(|c| c.name.value.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !alias_columns.is_empty() && alias_columns.len() != array_exprs.len() {
+            return Err(format!(
+                "UNNEST alias has {} columns but produces {} columns",
+                alias_columns.len(),
+                array_exprs.len()
+            ));
+        }
+
+        let alias_name = alias.map(|a| a.name.value.clone());
+        let qualifier = alias_name.as_deref().unwrap_or("unnest");
+        let mut args = Vec::with_capacity(array_exprs.len());
+        let mut output_columns = Vec::with_capacity(array_exprs.len());
+        let mut scope = AnalyzerScope::new();
+
+        for (idx, expr) in array_exprs.iter().enumerate() {
+            let typed = self.analyze_expr(expr, outer_scope)?;
+            let DataType::List(item_field) = &typed.data_type else {
+                return Err(format!(
+                    "UNNEST argument {} must be ARRAY, got {:?}",
+                    idx + 1,
+                    typed.data_type
+                ));
+            };
+            let col_name = alias_columns.get(idx).cloned().unwrap_or_else(|| {
+                if array_exprs.len() == 1 {
+                    "unnest".to_string()
+                } else {
+                    format!("unnest_{}", idx + 1)
+                }
+            });
+            let data_type = item_field.data_type().clone();
+            let nullable = true;
+            scope.add_column(Some(qualifier), &col_name, data_type.clone(), nullable);
+            output_columns.push(OutputColumn {
+                name: col_name,
+                data_type,
+                nullable,
+            });
+            args.push(typed);
+        }
+
+        Ok((
+            Relation::Unnest(UnnestRelation {
+                args,
+                output_columns,
+                alias: alias_name,
+            }),
+            scope,
+        ))
     }
 
     /// Analyze a TABLE(...) table function reference.

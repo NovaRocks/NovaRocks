@@ -18,6 +18,7 @@ pub(crate) fn collect_cte_counts(plan: &LogicalPlan) -> CTEContext {
             LogicalPlan::Sort(node) => visit(&node.input, ctx),
             LogicalPlan::Limit(node) => visit(&node.input, ctx),
             LogicalPlan::Window(node) => visit(&node.input, ctx),
+            LogicalPlan::TableFunction(node) => visit(&node.input, ctx),
             LogicalPlan::SubqueryAlias(node) => visit(&node.input, ctx),
             LogicalPlan::Repeat(node) => visit(&node.input, ctx),
             LogicalPlan::Join(node) => {
@@ -65,6 +66,10 @@ pub(crate) fn inline_single_use_ctes(plan: LogicalPlan, ctx: &CTEContext) -> Log
         | LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)
         | LogicalPlan::CTEConsume(_) => plan,
+        LogicalPlan::TableFunction(node) => LogicalPlan::TableFunction(TableFunctionNode {
+            input: Box::new(inline_single_use_ctes(*node.input, ctx)),
+            ..node
+        }),
         LogicalPlan::Filter(node) => LogicalPlan::Filter(FilterNode {
             input: Box::new(inline_single_use_ctes(*node.input, ctx)),
             predicate: node.predicate,
@@ -178,6 +183,10 @@ fn replace_cte_consume(plan: LogicalPlan, cte_id: CteId, replacement: &LogicalPl
         | LogicalPlan::Values(_)
         | LogicalPlan::GenerateSeries(_)
         | LogicalPlan::CTEConsume(_) => plan,
+        LogicalPlan::TableFunction(node) => LogicalPlan::TableFunction(TableFunctionNode {
+            input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
+            ..node
+        }),
         LogicalPlan::Filter(node) => LogicalPlan::Filter(FilterNode {
             input: Box::new(replace_cte_consume(*node.input, cte_id, replacement)),
             predicate: node.predicate,

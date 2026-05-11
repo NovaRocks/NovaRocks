@@ -209,6 +209,15 @@ fn format_node(plan: &LogicalPlan, level: ExplainLevel, indent: usize, out: &mut
                 node.start, node.end, node.step
             ));
         }
+        LogicalPlan::TableFunction(node) => {
+            let join_type = if node.is_left_join { "LEFT" } else { "CROSS" };
+            out.push(format!(
+                "{pad}TABLE_FUNCTION [{} {}]",
+                join_type,
+                node.function_name.to_uppercase()
+            ));
+            format_node(&node.input, level, indent + 1, out);
+        }
         LogicalPlan::SubqueryAlias(node) => {
             out.push(format!("{pad}SUBQUERY ALIAS [{}]", node.alias));
             format_node(&node.input, level, indent + 1, out);
@@ -562,6 +571,17 @@ fn format_physical_node(
                 "{pad}GENERATE_SERIES({}, {}, {}){costs_suffix}",
                 op.start, op.end, op.step
             ));
+        }
+        Operator::PhysicalTableFunction(op) => {
+            let join_type = if op.is_left_join { "LEFT" } else { "CROSS" };
+            out.push(format!(
+                "{pad}TABLE_FUNCTION [{} {}]{costs_suffix}",
+                join_type,
+                op.function_name.to_uppercase()
+            ));
+            for child in &node.children {
+                format_physical_node(child, level, indent + 1, out);
+            }
         }
         Operator::PhysicalSubqueryAlias(op) => {
             out.push(format!("{pad}SUBQUERY ALIAS [{}]{costs_suffix}", op.alias));

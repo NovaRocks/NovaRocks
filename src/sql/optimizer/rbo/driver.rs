@@ -146,6 +146,13 @@ fn rewrite_children(
             let (input, ch) = rec!(n.input);
             (LogicalPlan::Window(WindowNode { input, ..n }), ch)
         }
+        LogicalPlan::TableFunction(n) => {
+            let (input, ch) = rec!(n.input);
+            (
+                LogicalPlan::TableFunction(TableFunctionNode { input, ..n }),
+                ch,
+            )
+        }
         LogicalPlan::SubqueryAlias(n) => {
             let (input, ch) = rec!(n.input);
             (

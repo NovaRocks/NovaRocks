@@ -16,6 +16,7 @@ use crate::exprs;
 use crate::lower::type_lowering::arrow_type_from_desc;
 use crate::partitions;
 use crate::plan_nodes;
+use crate::types;
 
 use crate::sql::analysis::cte::CteId;
 use crate::sql::catalog::CatalogProvider;
@@ -37,7 +38,8 @@ use crate::sql::optimizer::operator::{
     PhysicalDistributionOp, PhysicalExceptOp, PhysicalFilterOp, PhysicalGenerateSeriesOp,
     PhysicalHashAggregateOp, PhysicalHashJoinOp, PhysicalIntersectOp, PhysicalLimitOp,
     PhysicalNestLoopJoinOp, PhysicalProjectOp, PhysicalRepeatOp, PhysicalScanOp, PhysicalSortOp,
-    PhysicalSubqueryAliasOp, PhysicalTopNOp, PhysicalUnionOp, PhysicalValuesOp, PhysicalWindowOp,
+    PhysicalSubqueryAliasOp, PhysicalTableFunctionOp, PhysicalTopNOp, PhysicalUnionOp,
+    PhysicalValuesOp, PhysicalWindowOp,
 };
 use crate::sql::optimizer::physical_plan::PhysicalPlanNode;
 
@@ -312,6 +314,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             Operator::PhysicalWindow(op) => self.visit_window(op, node),
             Operator::PhysicalValues(op) => self.visit_values(op, node),
             Operator::PhysicalGenerateSeries(op) => self.visit_generate_series(op, node),
+            Operator::PhysicalTableFunction(op) => self.visit_table_function(op, node),
             Operator::PhysicalSubqueryAlias(op) => self.visit_subquery_alias(op, node),
             Operator::PhysicalRepeat(op) => self.visit_repeat(op, node),
             Operator::PhysicalDistribution(op) => self.visit_distribution(op, node),
@@ -1997,6 +2000,265 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         // Use a dummy node (visit_scan only reads the op, not the children)
         self.visit_scan(&scan_op, _node)
+    }
+
+    // -------------------------------------------------------------------
+    // visit_table_function
+    // -------------------------------------------------------------------
+
+    fn visit_table_function(
+        &mut self,
+        op: &PhysicalTableFunctionOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        if !op.function_name.eq_ignore_ascii_case("unnest") {
+            return Err(format!(
+                "unsupported standalone table function: {}",
+                op.function_name
+            ));
+        }
+        if node.children.len() != 1 {
+            return Err(format!(
+                "table function expects one child, got {}",
+                node.children.len()
+            ));
+        }
+        if op.args.len() != op.output_columns.len() {
+            return Err(format!(
+                "table function output column count mismatch: args={} outputs={}",
+                op.args.len(),
+                op.output_columns.len()
+            ));
+        }
+
+        let child = self.visit(&node.children[0])?;
+
+        let project_tuple_id = self.alloc_tuple();
+        let project_node_id = self.alloc_node();
+        let mut slot_map = BTreeMap::new();
+        let mut project_scope = ExprScope::new();
+        let mut remapped_child_bindings = HashMap::new();
+        let mut outer_columns = Vec::new();
+        let mut outer_slots = Vec::new();
+
+        let child_cols: Vec<(String, ColumnBinding)> = child
+            .scope
+            .iter_columns()
+            .map(|(name, binding)| (name.clone(), binding.clone()))
+            .collect();
+        for (idx, (name, binding)) in child_cols.iter().enumerate() {
+            let slot_id = self.alloc_slot();
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            self.desc_builder.add_slot_with_type_desc(
+                slot_id,
+                project_tuple_id,
+                name,
+                type_desc.clone(),
+                binding.nullable,
+                idx as i32,
+            );
+            slot_map.insert(
+                slot_id,
+                expr_compiler::build_slot_ref_texpr(
+                    binding.slot_id,
+                    binding.tuple_id,
+                    type_desc.clone(),
+                ),
+            );
+            let new_binding = ColumnBinding {
+                tuple_id: project_tuple_id,
+                slot_id,
+                data_type: binding.data_type.clone(),
+                type_desc: Some(type_desc),
+                nullable: binding.nullable,
+            };
+            project_scope.add_column(None, name.clone(), new_binding.clone());
+            remapped_child_bindings
+                .insert((binding.tuple_id, binding.slot_id), new_binding.clone());
+            outer_slots.push(slot_id);
+            outer_columns.push((name.clone(), new_binding));
+        }
+        for (qualifier, name, binding) in child.scope.iter_qualified() {
+            if let Some(new_binding) =
+                remapped_child_bindings.get(&(binding.tuple_id, binding.slot_id))
+            {
+                project_scope.add_qualified_alias(
+                    qualifier.clone(),
+                    name.clone(),
+                    new_binding.clone(),
+                );
+            }
+        }
+
+        let mut param_slots = Vec::with_capacity(op.args.len());
+        let mut param_type_descs = Vec::with_capacity(op.args.len());
+        for (idx, arg) in op.args.iter().enumerate() {
+            let mut compiler = ExprCompiler::new(&child.scope);
+            let texpr = compiler.compile_typed(arg)?;
+            let type_desc = texpr
+                .nodes
+                .first()
+                .map(|root| root.type_.clone())
+                .ok_or_else(|| format!("table function arg {idx} compiled to empty TExpr"))?;
+            let slot_id = self.alloc_slot();
+            self.desc_builder.add_slot_with_type_desc(
+                slot_id,
+                project_tuple_id,
+                &format!("__tf_arg_{idx}"),
+                type_desc.clone(),
+                arg.nullable,
+                (child_cols.len() + idx) as i32,
+            );
+            slot_map.insert(slot_id, texpr);
+            param_slots.push(slot_id);
+            param_type_descs.push(type_desc);
+        }
+        self.desc_builder.add_tuple(project_tuple_id, None);
+        let project_plan_node =
+            nodes::build_project_node(project_node_id, project_tuple_id, slot_map);
+
+        let output_tuple_id = self.alloc_tuple();
+        let table_fn_node_id = self.alloc_node();
+        let mut output_scope = ExprScope::new();
+        let mut output_outer_by_project_slot = HashMap::new();
+
+        for (idx, (name, binding)) in outer_columns.iter().enumerate() {
+            let type_desc = expr_compiler::binding_type_desc(binding)?;
+            self.desc_builder.add_slot_with_type_desc(
+                binding.slot_id,
+                output_tuple_id,
+                name,
+                type_desc.clone(),
+                binding.nullable,
+                idx as i32,
+            );
+            let output_binding = ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id: binding.slot_id,
+                data_type: binding.data_type.clone(),
+                type_desc: Some(type_desc),
+                nullable: binding.nullable,
+            };
+            output_scope.add_column(None, name.clone(), output_binding.clone());
+            output_outer_by_project_slot.insert(binding.slot_id, output_binding);
+        }
+        for (qualifier, name, binding) in project_scope.iter_qualified() {
+            if let Some(output_binding) = output_outer_by_project_slot.get(&binding.slot_id) {
+                output_scope.add_qualified_alias(
+                    qualifier.clone(),
+                    name.clone(),
+                    output_binding.clone(),
+                );
+            }
+        }
+
+        let mut fn_result_slots = Vec::with_capacity(op.output_columns.len());
+        let mut ret_type_descs = Vec::with_capacity(op.output_columns.len());
+        let result_qualifier = op.alias.clone().or_else(|| Some(op.function_name.clone()));
+        for (idx, col) in op.output_columns.iter().enumerate() {
+            let DataType::List(item_field) = &op.args[idx].data_type else {
+                return Err(format!(
+                    "UNNEST argument {} must be ARRAY, got {:?}",
+                    idx + 1,
+                    op.args[idx].data_type
+                ));
+            };
+            if item_field.data_type() != &col.data_type {
+                return Err(format!(
+                    "UNNEST result type mismatch for column {}: arg item={:?} output={:?}",
+                    col.name,
+                    item_field.data_type(),
+                    col.data_type
+                ));
+            }
+            let slot_id = self.alloc_slot();
+            let type_desc = type_infer::arrow_type_to_type_desc(&col.data_type)?;
+            self.desc_builder.add_slot_with_type_desc(
+                slot_id,
+                output_tuple_id,
+                &col.name,
+                type_desc.clone(),
+                true,
+                (outer_columns.len() + idx) as i32,
+            );
+            let binding = ColumnBinding {
+                tuple_id: output_tuple_id,
+                slot_id,
+                data_type: col.data_type.clone(),
+                type_desc: Some(type_desc.clone()),
+                nullable: true,
+            };
+            output_scope.add_column(result_qualifier.clone(), col.name.clone(), binding);
+            fn_result_slots.push(slot_id);
+            ret_type_descs.push(type_desc);
+        }
+        self.desc_builder.add_tuple(output_tuple_id, None);
+
+        let ret_type = ret_type_descs
+            .first()
+            .cloned()
+            .ok_or_else(|| "table function requires at least one return type".to_string())?;
+        let table_function_expr = exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: ret_type.clone(),
+            num_children: 0,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: op.function_name.clone(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: param_type_descs,
+                ret_type,
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: Some(types::TTableFunction::new(
+                    ret_type_descs,
+                    None::<String>,
+                    Some(op.is_left_join),
+                )),
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..expr_compiler::default_expr_node()
+        }]);
+
+        let mut table_fn_plan_node = nodes::default_plan_node();
+        table_fn_plan_node.node_id = table_fn_node_id;
+        table_fn_plan_node.node_type = plan_nodes::TPlanNodeType::TABLE_FUNCTION_NODE;
+        table_fn_plan_node.num_children = 1;
+        table_fn_plan_node.limit = -1;
+        table_fn_plan_node.row_tuples = vec![output_tuple_id];
+        table_fn_plan_node.nullable_tuples = vec![];
+        table_fn_plan_node.compact_data = true;
+        table_fn_plan_node.table_function_node = Some(plan_nodes::TTableFunctionNode::new(
+            Some(table_function_expr),
+            Some(param_slots),
+            Some(outer_slots),
+            Some(fn_result_slots),
+            Some(true),
+        ));
+
+        let mut plan_nodes = vec![table_fn_plan_node, project_plan_node];
+        plan_nodes.extend(child.plan_nodes);
+
+        Ok(VisitResult {
+            plan_nodes,
+            scope: output_scope,
+            tuple_ids: vec![output_tuple_id],
+            cte_exchange_nodes: child.cte_exchange_nodes,
+        })
     }
 
     // -------------------------------------------------------------------

@@ -354,11 +354,19 @@ impl<'a> ExprCompiler<'a> {
                     let type_desc = arrow_type_to_type_desc(&result_type)?;
                     self.nodes.push(exprs::TExprNode {
                         node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
-                        type_: type_desc,
+                        type_: type_desc.clone(),
                         opcode: Some(opcodes::TExprOpcode::MULTIPLY),
                         num_children: 2,
                         ..default_expr_node()
                     });
+                    if needs_arithmetic_cast(&DataType::Int64, &result_type) {
+                        self.nodes.push(exprs::TExprNode {
+                            node_type: exprs::TExprNodeType::CAST_EXPR,
+                            type_: type_desc,
+                            num_children: 1,
+                            ..default_expr_node()
+                        });
+                    }
                     self.nodes.push(int_literal_node(-1));
                     self.compile_typed_inner(inner)?;
                     self.last_type = result_type.clone();
@@ -1578,6 +1586,13 @@ fn infer_scalar_function_return_type(
         | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" => Ok(DataType::Int32),
 
         // Conditional
+        "if" if arg_types.len() >= 2 => {
+            let mut result = arg_types[1].clone();
+            for t in &arg_types[2..] {
+                result = wider_type(&result, t);
+            }
+            Ok(result)
+        }
         "if" | "ifnull" | "nullif" | "coalesce" | "nvl" | "case" => {
             if arg_types.is_empty() {
                 Ok(DataType::Null)

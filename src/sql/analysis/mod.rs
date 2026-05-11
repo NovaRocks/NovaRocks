@@ -109,6 +109,8 @@ pub(crate) enum Relation {
     Join(Box<JoinRelation>),
     /// `TABLE(generate_series(start, end[, step]))`.
     GenerateSeries(GenerateSeriesRelation),
+    /// `LATERAL UNNEST(array_expr[, ...])`.
+    Unnest(UnnestRelation),
     /// Reference to an analyzed non-recursive CTE definition.
     /// Inline vs reuse is decided later by Cascades.
     CTEConsume {
@@ -124,6 +126,13 @@ pub(crate) struct GenerateSeriesRelation {
     pub end: i64,
     pub step: i64,
     pub column_name: String,
+    pub alias: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UnnestRelation {
+    pub args: Vec<TypedExpr>,
+    pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
 }
 

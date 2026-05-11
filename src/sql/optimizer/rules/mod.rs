@@ -31,6 +31,7 @@ pub(crate) fn all_implementation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(implement::ExceptToPhysical),
         Box::new(implement::ValuesToPhysical),
         Box::new(implement::GenerateSeriesToPhysical),
+        Box::new(implement::TableFunctionToPhysical),
         Box::new(implement::SubqueryAliasToPhysical),
         Box::new(split_distinct_agg::SplitDistinctAgg),
     ]
