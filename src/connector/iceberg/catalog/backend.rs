@@ -270,6 +270,7 @@ fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats
         partition_key: file.partition_key,
         first_row_id: file.first_row_id,
         data_sequence_number: file.data_sequence_number,
+        ivm_change_op: None,
         delete_files: file.delete_files,
         manifest_path: file.manifest_path,
         partition_values: file.partition_field_values,

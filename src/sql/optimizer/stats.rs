@@ -1434,6 +1434,7 @@ mod tests {
                         partition_key: None,
                         first_row_id: None,
                         data_sequence_number: None,
+                        ivm_change_op: None,
                         delete_files: vec![],
                         manifest_path: None,
                         partition_values: vec![],

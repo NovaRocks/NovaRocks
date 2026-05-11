@@ -108,6 +108,7 @@ impl HdfsScanOp {
                 range.scan_range_id < 0
                     && range.first_row_id.is_none()
                     && range.data_sequence_number.is_none()
+                    && range.ivm_change_op.is_none()
                     && range.delete_files.is_empty()
             })
     }
@@ -128,6 +129,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id,
             first_row_id,
             data_sequence_number,
+            ivm_change_op,
             external_datacache,
             delete_files,
         } = morsel
@@ -142,6 +144,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id,
             first_row_id,
             data_sequence_number,
+            ivm_change_op,
             external_datacache: external_datacache.clone(),
             delete_files,
         }];
@@ -189,6 +192,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: r.scan_range_id,
                 first_row_id: r.first_row_id,
                 data_sequence_number: r.data_sequence_number,
+                ivm_change_op: r.ivm_change_op,
                 external_datacache: r.external_datacache.clone(),
                 delete_files: r.delete_files.clone(),
             });
@@ -302,6 +306,7 @@ impl ScanOp for HdfsScanOp {
             // incremental path). It is populated at initial lowering time from
             // the Iceberg manifest entry for V3 row-lineage tables.
             let data_sequence_number: Option<i64> = None;
+            let ivm_change_op: Option<i8> = None;
             morsels.push(ScanMorsel::FileRange {
                 path,
                 file_len,
@@ -310,6 +315,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id,
                 first_row_id,
                 data_sequence_number,
+                ivm_change_op,
                 external_datacache: build_external_datacache_options(hdfs_range),
                 delete_files,
             });
@@ -359,6 +365,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id: -1,
             first_row_id: None,
             data_sequence_number: None,
+            ivm_change_op: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -371,6 +378,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: -1,
                 first_row_id: None,
                 data_sequence_number: None,
+                ivm_change_op: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -437,6 +445,7 @@ impl ScanOp for HdfsScanOp {
             scan_range_id: -1,
             first_row_id: None,
             data_sequence_number: None,
+            ivm_change_op: None,
             external_datacache: None,
             delete_files: Vec::new(),
         });
@@ -449,6 +458,7 @@ impl ScanOp for HdfsScanOp {
                 scan_range_id: -1,
                 first_row_id: None,
                 data_sequence_number: None,
+                ivm_change_op: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             });
@@ -650,6 +660,7 @@ mod tests {
                 scan_range_id: 7,
                 first_row_id: Some(10),
                 data_sequence_number: None,
+                ivm_change_op: None,
                 external_datacache: None,
                 delete_files: Vec::new(),
             }],
@@ -709,6 +720,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
@@ -720,6 +732,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },
@@ -731,6 +744,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: None,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 },

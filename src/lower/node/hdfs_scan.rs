@@ -264,6 +264,48 @@ where
     Some(cfg)
 }
 
+fn extract_change_op_from_extended_columns(
+    node_id: i32,
+    hdfs_range: &plan_nodes::THdfsScanRange,
+    change_op_slot: Option<SlotId>,
+) -> Result<Option<i8>, String> {
+    let Some(slot) = change_op_slot else {
+        return Ok(None);
+    };
+    let slot_id = i32::try_from(slot.as_u32()).map_err(|_| {
+        format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot} exceeds i32")
+    })?;
+    let context = || format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot_id}");
+    let extended_columns = hdfs_range
+        .extended_columns
+        .as_ref()
+        .ok_or_else(|| format!("{} missing extended_columns", context()))?;
+    let expr = extended_columns
+        .get(&slot_id)
+        .ok_or_else(|| format!("{} missing extended_columns entry", context()))?;
+    let node = expr
+        .nodes
+        .first()
+        .ok_or_else(|| format!("{} has empty extended_columns expression", context()))?;
+    if node.node_type != crate::exprs::TExprNodeType::INT_LITERAL {
+        return Err(format!(
+            "{} expects INT_LITERAL extended column, got {:?}",
+            context(),
+            node.node_type
+        ));
+    }
+    let value = node
+        .int_literal
+        .as_ref()
+        .ok_or_else(|| format!("{} INT_LITERAL missing int payload", context()))?
+        .value;
+    let value = i8::try_from(value)
+        .map_err(|_| format!("{} value {} does not fit in int8", context(), value))?;
+    crate::exec::change_op::validate_change_op_value(value)
+        .map_err(|e| format!("{} invalid value: {e}", context()))?;
+    Ok(Some(value))
+}
+
 /// Lower a HDFS_SCAN_NODE plan node to a `Lowered` ExecNode.
 pub(crate) fn lower_hdfs_scan_node(
     node: &plan_nodes::TPlanNode,
@@ -381,10 +423,12 @@ pub(crate) fn lower_hdfs_scan_node(
     let mut iceberg_virtual_pos_slot: Option<SlotId> = None;
     let mut iceberg_virtual_row_id_slot: Option<SlotId> = None;
     let mut iceberg_virtual_last_updated_seq_slot: Option<SlotId> = None;
+    let mut iceberg_virtual_change_op_slot: Option<SlotId> = None;
     let mut iceberg_virtual_file_field: Option<arrow::datatypes::Field> = None;
     let mut iceberg_virtual_pos_field: Option<arrow::datatypes::Field> = None;
     let mut iceberg_virtual_row_id_field: Option<arrow::datatypes::Field> = None;
     let mut iceberg_virtual_last_updated_seq_field: Option<arrow::datatypes::Field> = None;
+    let mut iceberg_virtual_change_op_field: Option<arrow::datatypes::Field> = None;
 
     for (tuple_id, slot_id) in &out_layout.order {
         let slot_id = SlotId::try_from(*slot_id)?;
@@ -481,6 +525,18 @@ pub(crate) fn lower_hdfs_scan_node(
             }
             iceberg_virtual_last_updated_seq_slot = Some(slot_id);
             iceberg_virtual_last_updated_seq_field =
+                Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
+            continue;
+        }
+        if crate::exec::row_position::is_change_op(&name) {
+            if primitive != types::TPrimitiveType::TINYINT {
+                return Err(format!(
+                    "HDFS_SCAN_NODE node_id={} __change_op slot_id={} expects TINYINT, got {:?}",
+                    node.node_id, slot_id, primitive
+                ));
+            }
+            iceberg_virtual_change_op_slot = Some(slot_id);
+            iceberg_virtual_change_op_field =
                 Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
@@ -846,6 +902,11 @@ pub(crate) fn lower_hdfs_scan_node(
         // None, which is acceptable: the incremental morsel builder also
         // produces None for FE-driven ranges (see build_incremental_morsels).
         let data_sequence_number = hdfs_range.data_sequence_number;
+        let ivm_change_op = extract_change_op_from_extended_columns(
+            node.node_id,
+            hdfs_range,
+            iceberg_virtual_change_op_slot,
+        )?;
 
         if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
             ranges.push(FileScanRange {
@@ -856,6 +917,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 scan_range_id,
                 first_row_id,
                 data_sequence_number,
+                ivm_change_op,
                 external_datacache: external_datacache.clone(),
                 delete_files: iceberg_delete_files.clone(),
             });
@@ -882,6 +944,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 scan_range_id,
                 first_row_id,
                 data_sequence_number,
+                ivm_change_op,
                 external_datacache,
                 delete_files: iceberg_delete_files,
             });
@@ -1071,10 +1134,12 @@ pub(crate) fn lower_hdfs_scan_node(
             row_pos_slot: iceberg_virtual_pos_slot,
             row_id_slot: iceberg_virtual_row_id_slot,
             last_updated_seq_slot: iceberg_virtual_last_updated_seq_slot,
+            change_op_slot: iceberg_virtual_change_op_slot,
             file_path_field: iceberg_virtual_file_field,
             row_pos_field: iceberg_virtual_pos_field,
             row_id_field: iceberg_virtual_row_id_field,
             last_updated_seq_field: iceberg_virtual_last_updated_seq_field,
+            change_op_field: iceberg_virtual_change_op_field,
         }))
         .with_local_rf_waiting_set(local_rf_waiting_set(node));
     Ok(Lowered {
@@ -1118,9 +1183,13 @@ fn output_slots_from_layout(
 
 #[cfg(test)]
 mod tests {
-    use crate::internal_service::TQueryOptions;
+    use std::collections::BTreeMap;
 
-    use super::file_cache_flags_from_query_options;
+    use crate::common::ids::SlotId;
+    use crate::internal_service::TQueryOptions;
+    use crate::{exprs, plan_nodes, types};
+
+    use super::{extract_change_op_from_extended_columns, file_cache_flags_from_query_options};
 
     #[test]
     fn file_cache_flags_default_to_disabled_when_query_options_missing() {
@@ -1139,5 +1208,75 @@ mod tests {
         let (meta, page) = file_cache_flags_from_query_options(Some(&query_opts));
         assert!(meta);
         assert!(page);
+    }
+
+    fn int_expr(value: i64) -> exprs::TExpr {
+        exprs::TExpr::new(vec![exprs::TExprNode {
+            node_type: exprs::TExprNodeType::INT_LITERAL,
+            type_: crate::lower::type_lowering::scalar_type_desc(types::TPrimitiveType::BIGINT),
+            opcode: None,
+            num_children: 0,
+            agg_expr: None,
+            bool_literal: None,
+            case_expr: None,
+            date_literal: None,
+            float_literal: None,
+            int_literal: Some(exprs::TIntLiteral { value }),
+            in_predicate: None,
+            is_null_pred: None,
+            like_pred: None,
+            literal_pred: None,
+            slot_ref: None,
+            string_literal: None,
+            tuple_is_null_pred: None,
+            info_func: None,
+            decimal_literal: None,
+            output_scale: 0,
+            fn_call_expr: None,
+            large_int_literal: None,
+            output_column: None,
+            output_type: None,
+            vector_opcode: None,
+            fn_: None,
+            vararg_start_idx: None,
+            child_type: None,
+            vslot_ref: None,
+            used_subfield_names: None,
+            binary_literal: None,
+            copy_flag: None,
+            check_is_out_of_bounds: None,
+            use_vectorized: None,
+            has_nullable_child: None,
+            is_nullable: None,
+            child_type_desc: None,
+            is_monotonic: None,
+            dict_query_expr: None,
+            dictionary_get_expr: None,
+            is_index_only_filter: None,
+            is_nondeterministic: None,
+        }])
+    }
+
+    #[test]
+    fn extract_change_op_reads_int_literal_from_extended_columns() {
+        let mut range = plan_nodes::THdfsScanRange::default();
+        range.extended_columns = Some(BTreeMap::from([(9, int_expr(-1))]));
+
+        let value =
+            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap();
+
+        assert_eq!(value, Some(-1));
+    }
+
+    #[test]
+    fn extract_change_op_requires_extended_columns_entry() {
+        let range = plan_nodes::THdfsScanRange::default();
+
+        let error =
+            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap_err();
+
+        assert!(error.contains("__change_op"));
+        assert!(error.contains("node_id=7"));
+        assert!(error.contains("slot_id=9"));
     }
 }

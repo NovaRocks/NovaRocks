@@ -539,17 +539,20 @@ pub(crate) fn build_exec_params_multi(
                         file_len,
                         None,
                         None,
+                        None,
+                        None,
                         &[],
                     )?]
                 }
                 TableStorage::S3ParquetFiles { files, .. } => {
                     let file_predicates = scan_file_min_max_predicates(planned);
+                    let change_op_slot = planned_change_op_slot(planned);
                     let mut ranges = Vec::new();
                     for file in files
                         .iter()
                         .filter(|f| file_may_satisfy_min_max(f, &file_predicates))
                     {
-                        ranges.extend(build_hdfs_scan_range_params_for_file(file)?);
+                        ranges.extend(build_hdfs_scan_range_params_for_file(file, change_op_slot)?);
                     }
                     ranges
                 }
@@ -601,6 +604,18 @@ fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredica
         }
     }
     predicates
+}
+
+fn planned_change_op_slot(planned: &PlannedScanTable) -> Option<types::TSlotId> {
+    planned.slot_to_column.iter().find_map(|(slot_id, column)| {
+        column
+            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            .then_some(*slot_id)
+    })
+}
+
+fn int_literal_expr(value: i64) -> exprs::TExpr {
+    exprs::TExpr::new(vec![super::expr_compiler::int_literal_node(value)])
 }
 
 fn file_may_satisfy_min_max(file: &S3FileInfo, predicates: &[MinMaxPredicate]) -> bool {
@@ -847,6 +862,7 @@ fn decode_f64_bound(bytes: &[u8]) -> Option<f64> {
 
 fn build_hdfs_scan_range_params_for_file(
     file: &S3FileInfo,
+    change_op_slot: Option<types::TSlotId>,
 ) -> Result<Vec<internal_service::TScanRangeParams>, String> {
     validate_iceberg_delete_apply_cost(&file.path, &file.delete_files)?;
     let splits = plan_hdfs_file_splits(file);
@@ -860,6 +876,8 @@ fn build_hdfs_scan_range_params_for_file(
                 length,
                 file.first_row_id,
                 file.data_sequence_number,
+                file.ivm_change_op,
+                change_op_slot,
                 &file.delete_files,
             )
         })
@@ -966,6 +984,8 @@ fn build_hdfs_scan_range_params(
     length: i64,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    ivm_change_op: Option<i8>,
+    change_op_slot: Option<types::TSlotId>,
     delete_files: &[IcebergDeleteFileInfo],
 ) -> Result<internal_service::TScanRangeParams, String> {
     let mut parquet_delete_files = Vec::new();
@@ -1025,6 +1045,16 @@ fn build_hdfs_scan_range_params(
     } else {
         Some(parquet_delete_files)
     };
+    let extended_columns = match (ivm_change_op, change_op_slot) {
+        (Some(op), Some(slot_id)) => {
+            crate::exec::change_op::validate_change_op_value(op)?;
+            Some(BTreeMap::from([(slot_id, int_literal_expr(op as i64))]))
+        }
+        (Some(_), None) => {
+            return Err("IVM change-op file tag requires a __change_op scan slot".to_string());
+        }
+        (None, _) => None,
+    };
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
         Some(offset),
@@ -1053,7 +1083,7 @@ fn build_hdfs_scan_range_params(
         None::<String>,
         None::<String>,
         None::<plan_nodes::TPaimonDeletionFile>,
-        None::<BTreeMap<types::TSlotId, exprs::TExpr>>,
+        extended_columns,
         None::<descriptors::THdfsPartition>,
         None::<types::TTableId>,
         deletion_vector_descriptor,

@@ -209,6 +209,7 @@ struct IcebergVirtualState {
     next_row_offset: i64,
     first_row_id: Option<i64>,
     data_sequence_number: Option<i64>,
+    change_op: Option<i8>,
 }
 
 /// Iceberg v2 merge-on-read state owned by the scan runner.
@@ -631,6 +632,7 @@ impl ScanAsyncRunner {
             path,
             first_row_id,
             data_sequence_number,
+            ivm_change_op,
             ..
         } = morsel
         else {
@@ -642,6 +644,7 @@ impl ScanAsyncRunner {
             next_row_offset: 0,
             first_row_id: *first_row_id,
             data_sequence_number: *data_sequence_number,
+            change_op: *ivm_change_op,
         }))
     }
 
@@ -860,6 +863,19 @@ impl ScanAsyncRunner {
             .spec
             .last_updated_seq_slot
             .map(|_| Arc::new(Int64Array::from(seqs_vec)) as ArrayRef);
+        let change_op_array = if state.spec.change_op_slot.is_some() {
+            let value = state.change_op.ok_or_else(|| {
+                format!(
+                    "{} requested but morsel missing ivm_change_op",
+                    crate::exec::row_position::CHANGE_OP_COL
+                )
+            })?;
+            crate::exec::change_op::validate_change_op_value(value)?;
+            let op = crate::exec::change_op::ChangeOp::from_i8(value)?;
+            Some(crate::exec::change_op::change_op_array(op, row_count))
+        } else {
+            None
+        };
 
         let mut field_map = HashMap::new();
         let chunk_schema = chunk.schema();
@@ -956,6 +972,27 @@ impl ScanAsyncRunner {
                     field.name().clone(),
                     field.is_nullable(),
                     Some(scalar_type_desc(types::TPrimitiveType::BIGINT)),
+                    None,
+                ));
+                continue;
+            }
+            if Some(*slot_id) == state.spec.change_op_slot {
+                let field =
+                    state.spec.change_op_field.as_ref().ok_or_else(|| {
+                        "iceberg __change_op slot missing field metadata".to_string()
+                    })?;
+                fields.push(field.clone());
+                columns.push(
+                    change_op_array
+                        .as_ref()
+                        .expect("change_op_array built when slot exists")
+                        .clone(),
+                );
+                slot_schemas.push(ChunkSlotSchema::new(
+                    *slot_id,
+                    field.name().clone(),
+                    field.is_nullable(),
+                    Some(scalar_type_desc(types::TPrimitiveType::TINYINT)),
                     None,
                 ));
                 continue;
@@ -1497,7 +1534,7 @@ mod tests {
     use crate::exec::operators::scan::dispatch::ScanDispatchState;
     use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
     use crate::exec::row_position::IcebergVirtualSpec;
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::{Int8Array, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::collections::HashMap;
@@ -1726,6 +1763,7 @@ mod tests {
     #[derive(Clone)]
     struct ValuesScanOp {
         values: Vec<i32>,
+        ivm_change_op: Option<i8>,
     }
 
     impl ScanOp for ValuesScanOp {
@@ -1760,6 +1798,7 @@ mod tests {
                     scan_range_id: -1,
                     first_row_id: None,
                     data_sequence_number: None,
+                    ivm_change_op: self.ivm_change_op,
                     external_datacache: None,
                     delete_files: Vec::new(),
                 }],
@@ -1855,6 +1894,7 @@ mod tests {
 
         let scan = ScanNode::new(Arc::new(ValuesScanOp {
             values: vec![1, 3, 2, 4],
+            ivm_change_op: None,
         }))
         .with_node_id(1)
         .with_output_chunk_schema(chunk_schema_of(
@@ -1899,5 +1939,57 @@ mod tests {
             runner.next_chunk().expect("scan eof").is_none(),
             "runner should reach EOF after single morsel"
         );
+    }
+
+    #[test]
+    fn appends_change_op_virtual_column_from_morsel_metadata() {
+        let arena = Arc::new(ExprArena::default());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int32, false),
+            Field::new("__change_op", DataType::Int8, false),
+        ]));
+        let mut spec = IcebergVirtualSpec::default();
+        spec.change_op_slot = Some(SlotId::new(2));
+        spec.change_op_field = Some(Field::new("__change_op", DataType::Int8, false));
+        let scan = ScanNode::new(Arc::new(ValuesScanOp {
+            values: vec![1, 2, 3],
+            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_DELETE),
+        }))
+        .with_node_id(1)
+        .with_output_chunk_schema(chunk_schema_of(&schema, &[SlotId::new(1), SlotId::new(2)]))
+        .with_iceberg_virtual(Some(spec));
+        let morsels = scan.build_morsels().expect("build morsels");
+        let dispatch = Arc::new(ScanDispatchState::new(DynamicMorselQueue::new(
+            morsels.morsels,
+            morsels.has_more,
+        )));
+
+        let mut runner = ScanAsyncRunner::new(
+            "scan".to_string(),
+            scan,
+            dispatch,
+            None,
+            HashMap::new(),
+            0,
+            arena,
+            None,
+            0,
+        );
+
+        let chunk = runner
+            .next_chunk()
+            .expect("scan next chunk")
+            .expect("scan chunk");
+        let change_op_column = chunk
+            .column_by_slot_id(SlotId::new(2))
+            .expect("change op column");
+        let change_ops = change_op_column
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .expect("int8 change op values");
+        let actual = (0..change_ops.len())
+            .map(|idx| change_ops.value(idx))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, vec![-1, -1, -1]);
     }
 }

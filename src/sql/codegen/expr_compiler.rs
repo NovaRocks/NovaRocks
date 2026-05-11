@@ -1544,7 +1544,7 @@ fn slot_ref_node(slot_id: i32, tuple_id: i32, type_desc: types::TTypeDesc) -> ex
     }
 }
 
-fn int_literal_node(value: i64) -> exprs::TExprNode {
+pub(super) fn int_literal_node(value: i64) -> exprs::TExprNode {
     int_literal_node_typed(value, &DataType::Int64)
 }
 

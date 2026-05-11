@@ -484,6 +484,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 col.nullable,
                 col_pos,
             );
+            slot_to_column.insert(slot_id, col.name.clone());
             let binding = ColumnBinding {
                 tuple_id: scan_tuple_id,
                 slot_id,
@@ -3333,6 +3334,7 @@ mod tests {
             partition_key: None,
             first_row_id: None,
             data_sequence_number: Some(1),
+            ivm_change_op: None,
             delete_files: vec![],
             manifest_path: None,
             partition_values: vec![],
@@ -3349,6 +3351,7 @@ mod tests {
             partition_key: Some(format!("Struct([{id}])")),
             first_row_id: None,
             data_sequence_number: Some(1),
+            ivm_change_op: None,
             delete_files: vec![],
             manifest_path: Some(format!("manifest-{id}.avro")),
             partition_values: vec![IcebergPartitionFieldValue {
@@ -3421,6 +3424,7 @@ mod tests {
                     partition_key: None,
                     first_row_id: None,
                     data_sequence_number: Some(1),
+                    ivm_change_op: None,
                     delete_files,
                     manifest_path: None,
                     partition_values: vec![],

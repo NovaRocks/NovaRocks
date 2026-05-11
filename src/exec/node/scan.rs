@@ -46,6 +46,7 @@ pub enum ScanMorsel {
         /// belongs to. Used to synthesize `_last_updated_sequence_number`.
         /// None for non-row-lineage scans.
         data_sequence_number: Option<i64>,
+        ivm_change_op: Option<i8>,
         external_datacache: Option<ExternalDataCacheRangeOptions>,
         /// Iceberg v2 position-delete files that apply to this data file.
         /// Empty for append-only tables and for v1 scans.
@@ -77,10 +78,11 @@ impl ScanMorsel {
                 scan_range_id,
                 first_row_id,
                 data_sequence_number,
+                ivm_change_op,
                 external_datacache,
                 delete_files,
             } => format!(
-                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} external_datacache={:?} delete_files={}",
+                "path={} file_len={} offset={} length={} scan_range_id={} first_row_id={:?} data_sequence_number={:?} ivm_change_op={:?} external_datacache={:?} delete_files={}",
                 path,
                 file_len,
                 offset,
@@ -88,6 +90,7 @@ impl ScanMorsel {
                 scan_range_id,
                 first_row_id,
                 data_sequence_number,
+                ivm_change_op,
                 external_datacache,
                 delete_files.len()
             ),

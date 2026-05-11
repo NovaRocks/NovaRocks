@@ -33,6 +33,7 @@ pub struct FileScanRange {
     /// to. Used to synthesize `_last_updated_sequence_number` per-row.
     /// None for non-row-lineage scans.
     pub data_sequence_number: Option<i64>,
+    pub ivm_change_op: Option<i8>,
     pub external_datacache: Option<ExternalDataCacheRangeOptions>,
     /// Iceberg delete files attached to this data-file range. Empty for v1 or
     /// append-only scans. Populated by HDFS scan lowering and standalone

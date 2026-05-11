@@ -77,6 +77,7 @@ pub fn is_iceberg_row_pos(name: &str) -> bool {
 // Iceberg V3 row-lineage virtual column names.
 pub const ICEBERG_ROW_ID_COL: &str = "_row_id";
 pub const ICEBERG_LAST_UPDATED_SEQ_COL: &str = "_last_updated_sequence_number";
+pub const CHANGE_OP_COL: &str = crate::exec::change_op::CHANGE_OP_COLUMN;
 
 // Reserved Iceberg field IDs for V3 row-lineage metadata columns.
 pub const ICEBERG_RESERVED_FIELD_ID_ROW_ID: i32 = i32::MAX - 107;
@@ -88,6 +89,10 @@ pub fn is_iceberg_row_id(name: &str) -> bool {
 
 pub fn is_iceberg_last_updated_sequence_number(name: &str) -> bool {
     name.eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
+}
+
+pub fn is_change_op(name: &str) -> bool {
+    name.eq_ignore_ascii_case(CHANGE_OP_COL)
 }
 
 #[derive(Clone, Debug)]
@@ -108,10 +113,12 @@ pub struct IcebergVirtualSpec {
     pub row_pos_slot: Option<SlotId>,
     pub row_id_slot: Option<SlotId>,
     pub last_updated_seq_slot: Option<SlotId>,
+    pub change_op_slot: Option<SlotId>,
     pub file_path_field: Option<Field>,
     pub row_pos_field: Option<Field>,
     pub row_id_field: Option<Field>,
     pub last_updated_seq_field: Option<Field>,
+    pub change_op_field: Option<Field>,
 }
 
 impl IcebergVirtualSpec {
@@ -120,6 +127,7 @@ impl IcebergVirtualSpec {
             && self.row_pos_slot.is_none()
             && self.row_id_slot.is_none()
             && self.last_updated_seq_slot.is_none()
+            && self.change_op_slot.is_none()
     }
 }
 
@@ -173,6 +181,14 @@ mod tests {
         assert!(!is_iceberg_last_updated_sequence_number(
             "last_updated_sequence_number"
         ));
+    }
+
+    #[test]
+    fn is_change_op_recognizes_name_case_insensitive() {
+        assert!(is_change_op("__change_op"));
+        assert!(is_change_op("__CHANGE_OP"));
+        assert!(!is_change_op("change_op"));
+        assert!(!is_change_op("_change_op"));
     }
 
     #[test]

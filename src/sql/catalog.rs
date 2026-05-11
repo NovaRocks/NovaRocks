@@ -123,6 +123,8 @@ pub struct S3FileInfo {
     /// file belongs to.  Populated from the Iceberg manifest at catalog scan
     /// time.  None for non-Iceberg sources.
     pub data_sequence_number: Option<i64>,
+    /// IVM delta source tag for this file/range. None for ordinary scans.
+    pub ivm_change_op: Option<i8>,
     /// Iceberg position-delete / Puffin deletion-vector files that apply to
     /// this data file. Empty for append-only snapshots and non-Iceberg scans.
     pub delete_files: Vec<IcebergDeleteFileInfo>,
