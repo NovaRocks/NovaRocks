@@ -779,8 +779,8 @@ pub(crate) fn drop_mv(
         ));
     }
 
-    delete_mv_definition_by_id(state, runtime.table.table_id)?;
     crate::connector::starrocks::managed::ddl::drop_managed_table(state, &db_name, &mv_name)?;
+    delete_mv_definition_by_id(state, runtime.table.table_id)?;
     Ok(StatementResult::Ok)
 }
 
@@ -1633,7 +1633,9 @@ mod tests {
     use super::*;
     use crate::connector::starrocks::managed::catalog::ManagedTableRuntime;
     use crate::engine::catalog::InMemoryCatalog;
+    use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use arrow::array::Array;
+    use std::sync::RwLock;
     use tempfile::TempDir;
 
     fn parse_create_mv(sql: &str) -> crate::sql::parser::ast::CreateMaterializedViewStmt {
@@ -1665,6 +1667,235 @@ mod tests {
             ..StandaloneState::default()
         });
         (state, dir)
+    }
+
+    fn test_managed_config(warehouse_uri: String) -> super::super::config::ManagedLakeConfig {
+        super::super::config::ManagedLakeConfig {
+            warehouse_uri,
+            s3: S3StoreConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "test".to_string(),
+                root: "warehouse".to_string(),
+                access_key_id: "ak".to_string(),
+                access_key_secret: "sk".to_string(),
+                region: Some("us-east-1".to_string()),
+                enable_path_style_access: Some(true),
+            },
+            mv_default_storage_engine: "managed_lake".to_string(),
+        }
+    }
+
+    fn managed_mv_snapshot(warehouse_uri: String) -> super::super::store::ManagedSnapshot {
+        use super::super::store::{
+            ManagedGlobalMeta, ManagedIndexState, StoredManagedColumn, StoredManagedDatabase,
+        };
+
+        let request_schema = build_tablet_schema(
+            &[
+                TableColumnDef {
+                    name: "k1".to_string(),
+                    data_type: SqlType::Int,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                },
+                TableColumnDef {
+                    name: "v1".to_string(),
+                    data_type: SqlType::String,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+            ],
+            &TableKeyDesc {
+                kind: TableKeyKind::Duplicate,
+                columns: vec!["k1".to_string()],
+            },
+            100,
+        )
+        .expect("build request schema");
+        let tablet_schema_pb =
+            crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+                &request_schema,
+            )
+            .expect("build tablet schema pb")
+            .encode_to_vec();
+
+        super::super::store::ManagedSnapshot {
+            global: ManagedGlobalMeta {
+                warehouse_uri: warehouse_uri.clone(),
+                next_db_id: 2,
+                next_table_id: 11,
+                next_partition_id: 21,
+                next_index_id: 31,
+                next_tablet_id: 41,
+                next_txn_id: 51,
+            },
+            databases: vec![StoredManagedDatabase {
+                db_id: 1,
+                name: "analytics".to_string(),
+            }],
+            tables: vec![StoredManagedTable {
+                table_id: 10,
+                db_id: 1,
+                name: "orders_mv".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 1,
+                current_schema_id: 100,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::MaterializedView,
+            }],
+            schemas: vec![StoredManagedSchema {
+                schema_id: 100,
+                table_id: 10,
+                schema_version: 0,
+                tablet_schema_pb,
+            }],
+            columns: vec![
+                StoredManagedColumn {
+                    schema_id: 100,
+                    ordinal: 0,
+                    column_name: "k1".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                },
+                StoredManagedColumn {
+                    schema_id: 100,
+                    ordinal: 1,
+                    column_name: "v1".to_string(),
+                    logical_type: "STRING".to_string(),
+                    nullable: true,
+                    visible: true,
+                    is_key: false,
+                },
+            ],
+            partitions: vec![StoredManagedPartition {
+                partition_id: 20,
+                table_id: 10,
+                name: "p0".to_string(),
+                visible_version: 1,
+                next_version: 2,
+                state: ManagedPartitionState::Active,
+            }],
+            indexes: vec![StoredManagedIndex {
+                index_id: 30,
+                table_id: 10,
+                partition_id: 20,
+                index_type: "BASE".to_string(),
+                state: ManagedIndexState::Active,
+            }],
+            tablets: vec![StoredManagedTablet {
+                tablet_id: 40,
+                partition_id: 20,
+                index_id: 30,
+                bucket_seq: 0,
+                tablet_root_path: format!("{warehouse_uri}/db_1/table_10/partition_20"),
+            }],
+            txns: vec![
+                StoredManagedTxn {
+                    txn_id: 49,
+                    table_id: 10,
+                    partition_id: 20,
+                    base_version: 0,
+                    commit_version: 1,
+                    state: ManagedTxnState::Visible,
+                    retry_at_ms: None,
+                    updated_at_ms: 0,
+                },
+                StoredManagedTxn {
+                    txn_id: 50,
+                    table_id: 10,
+                    partition_id: 20,
+                    base_version: 1,
+                    commit_version: 2,
+                    state: ManagedTxnState::Prepared,
+                    retry_at_ms: None,
+                    updated_at_ms: 0,
+                },
+            ],
+            erase_jobs: Vec::new(),
+            materialized_views: vec![StoredMaterializedView {
+                mv_id: 10,
+                select_sql: "SELECT k1, v1 FROM ice.ns.orders".to_string(),
+                refresh_mode: ManagedMvRefreshMode::DeferredManual,
+                base_table_refs: vec![IcebergTableRef {
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders".to_string(),
+                }],
+                last_refresh_ms: None,
+                last_refresh_rows: None,
+                last_refresh_snapshots: Default::default(),
+                last_refresh_table_uuids: Default::default(),
+                primary_key_columns: Vec::new(),
+                created_at_ms: now_ms(),
+                storage_engine: ManagedMvStorageEngine::ManagedLake,
+                iceberg_table_identifier: None,
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
+                last_refreshed_iceberg_snapshot_id: None,
+                refresh_in_progress: false,
+                refresh_target_snapshots: Default::default(),
+            }],
+        }
+    }
+
+    fn state_with_inflight_managed_mv() -> (Arc<StandaloneState>, TempDir) {
+        let dir = TempDir::new().expect("metadata tempdir");
+        let metadata_path = dir.path().join("standalone.sqlite");
+        let metadata_store =
+            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(&metadata_path)
+                .expect("open sqlite store");
+        let metadata_provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
+        let warehouse_uri = format!("file://{}", dir.path().join("managed").display());
+        let config = test_managed_config(warehouse_uri.clone());
+        let snapshot = managed_mv_snapshot(warehouse_uri);
+        metadata_store
+            .replace_managed_snapshot(&snapshot)
+            .expect("initialize metadata snapshot");
+        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)
+            .expect("rebuild managed catalog");
+        let state = Arc::new(StandaloneState {
+            managed_lake: RwLock::new(managed),
+            managed_lake_config: Some(config),
+            metadata_provider: Some(Arc::new(metadata_provider)),
+            metadata_store: Some(metadata_store),
+            ..StandaloneState::default()
+        });
+        persist_mv_definition(
+            &state,
+            PersistMvDefinitionRequest {
+                mv_id: 10,
+                select_sql: "SELECT k1, v1 FROM ice.ns.orders".to_string(),
+                base_table_refs: vec![IcebergTableRef {
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders".to_string(),
+                }],
+                primary_key_columns: Vec::new(),
+                storage_engine: ManagedMvStorageEngine::ManagedLake,
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
+                created_at_ms: now_ms(),
+            },
+        )
+        .expect("persist mv definition");
+        (state, dir)
+    }
+
+    fn mv_definition_exists(state: &Arc<StandaloneState>, mv_id: i64) -> bool {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let txn = provider.begin_read().expect("open read txn");
+        state
+            .mv_repo
+            .load_by_id(txn.as_ref(), mv_id)
+            .expect("load mv definition")
+            .is_some()
     }
 
     fn insert_iceberg_mv_relationship(
@@ -1743,6 +1974,26 @@ mod tests {
 
         assert_query_result_contains(&result, "mv_orders");
         assert_query_result_contains(&result, "iceberg");
+    }
+
+    #[test]
+    fn drop_managed_mv_preserves_repo_definition_when_legacy_drop_rejects() {
+        let (state, _dir) = state_with_inflight_managed_mv();
+        assert!(mv_definition_exists(&state, 10));
+
+        let stmt = DropMaterializedViewStmt {
+            name: ObjectName {
+                parts: vec!["analytics".to_string(), "orders_mv".to_string()],
+            },
+            if_exists: false,
+        };
+        let err = drop_mv(&state, None, "analytics", &stmt).expect_err("drop should reject");
+
+        assert!(err.contains("inflight managed txns"), "err={err}");
+        assert!(
+            mv_definition_exists(&state, 10),
+            "legacy-owned MV must remain visible through repository reads when legacy drop rejects"
+        );
     }
 
     #[test]
