@@ -160,9 +160,23 @@ fn job_repository_claim_finish_and_fail_are_state_checked() -> Result<(), Box<dy
     };
 
     {
-        let mut txn = provider.begin_write("claim erase job")?;
+        let mut txn = provider.begin_write("claim and fail erase job")?;
         assert!(repository.claim_erase_job(txn.as_mut(), job_id, 1100)?);
+        repository.fail_erase_job(
+            txn.as_mut(),
+            job_id,
+            "object delete failed".to_string(),
+            Some(1150),
+            1120,
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("retry erase job")?;
+        assert!(repository.claim_erase_job(txn.as_mut(), job_id, 1150)?);
         repository.finish_erase_job(txn.as_mut(), job_id, 1200)?;
+        repository.finish_erase_job(txn.as_mut(), job_id, 1210)?;
         txn.commit()?;
     }
 
@@ -174,6 +188,275 @@ fn job_repository_claim_finish_and_fail_are_state_checked() -> Result<(), Box<dy
     assert_eq!(job.retry_at_ms, None);
     assert_eq!(job.updated_at_ms, 1200);
     assert_eq!(job.last_error, None);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_fail_requires_running_and_can_update_failed_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let pending_id = {
+        let mut txn = provider.begin_write("create pending erase job")?;
+        let job = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 10,
+                partition_id: Some(20),
+                root_path: "s3://bucket/db/table/partition".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        let err = repository
+            .fail_erase_job(
+                txn.as_mut(),
+                job.job_id,
+                "not running".to_string(),
+                Some(1300),
+                1200,
+            )
+            .expect_err("pending erase job should not fail");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+        txn.commit()?;
+        job.job_id
+    };
+
+    {
+        let read = provider.begin_read()?;
+        let job = repository
+            .load_erase_job(read.as_ref(), pending_id)?
+            .expect("pending job should exist");
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.updated_at_ms, 1000);
+    }
+
+    let failed_id = {
+        let mut txn = provider.begin_write("fail erase job")?;
+        let job = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 11,
+                partition_id: None,
+                root_path: "s3://bucket/db/table".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), job.job_id, 1100)?);
+        repository.fail_erase_job(
+            txn.as_mut(),
+            job.job_id,
+            "first failure".to_string(),
+            Some(1300),
+            1200,
+        )?;
+        repository.fail_erase_job(
+            txn.as_mut(),
+            job.job_id,
+            "retry later".to_string(),
+            Some(1400),
+            1250,
+        )?;
+        txn.commit()?;
+        job.job_id
+    };
+
+    let read = provider.begin_read()?;
+    let job = repository
+        .load_erase_job(read.as_ref(), failed_id)?
+        .expect("failed job should exist");
+    assert_eq!(job.state, JobState::Failed);
+    assert_eq!(job.retry_at_ms, Some(1400));
+    assert_eq!(job.updated_at_ms, 1250);
+    assert_eq!(job.last_error.as_deref(), Some("retry later"));
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_claim_failed_honors_retry_at() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let job_id = {
+        let mut txn = provider.begin_write("create failed erase job")?;
+        let job = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 10,
+                partition_id: Some(20),
+                root_path: "s3://bucket/db/table/partition".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), job.job_id, 1100)?);
+        repository.fail_erase_job(
+            txn.as_mut(),
+            job.job_id,
+            "retry later".to_string(),
+            Some(1500),
+            1200,
+        )?;
+        txn.commit()?;
+        job.job_id
+    };
+
+    {
+        let mut txn = provider.begin_write("claim failed job before retry")?;
+        assert!(!repository.claim_erase_job(txn.as_mut(), job_id, 1400)?);
+        txn.commit()?;
+    }
+    {
+        let read = provider.begin_read()?;
+        let job = repository
+            .load_erase_job(read.as_ref(), job_id)?
+            .expect("failed job should exist");
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.retry_at_ms, Some(1500));
+        assert_eq!(job.updated_at_ms, 1200);
+        assert_eq!(job.last_error.as_deref(), Some("retry later"));
+    }
+
+    {
+        let mut txn = provider.begin_write("claim failed job after retry")?;
+        assert!(repository.claim_erase_job(txn.as_mut(), job_id, 1500)?);
+        txn.commit()?;
+    }
+    let read = provider.begin_read()?;
+    let job = repository
+        .load_erase_job(read.as_ref(), job_id)?
+        .expect("running job should exist");
+    assert_eq!(job.state, JobState::Running);
+    assert_eq!(job.retry_at_ms, None);
+    assert_eq!(job.updated_at_ms, 1500);
+    assert_eq!(job.last_error, None);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_lists_pending_and_due_failed_jobs() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let (
+        pending_id,
+        failed_none_retry_id,
+        failed_due_id,
+        failed_future_id,
+        running_id,
+        finished_id,
+    ) = {
+        let mut txn = provider.begin_write("create runnable erase jobs")?;
+        let pending = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 10,
+                partition_id: Some(20),
+                root_path: "s3://bucket/db/table/pending".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        let failed_none_retry = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 11,
+                partition_id: Some(21),
+                root_path: "s3://bucket/db/table/failed-none".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), failed_none_retry.job_id, 1010)?);
+        repository.fail_erase_job(
+            txn.as_mut(),
+            failed_none_retry.job_id,
+            "retry immediately".to_string(),
+            None,
+            1020,
+        )?;
+        let failed_due = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 12,
+                partition_id: Some(22),
+                root_path: "s3://bucket/db/table/failed-due".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), failed_due.job_id, 1010)?);
+        repository.fail_erase_job(
+            txn.as_mut(),
+            failed_due.job_id,
+            "due".to_string(),
+            Some(1100),
+            1020,
+        )?;
+        let failed_future = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 13,
+                partition_id: Some(23),
+                root_path: "s3://bucket/db/table/failed-future".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), failed_future.job_id, 1010)?);
+        repository.fail_erase_job(
+            txn.as_mut(),
+            failed_future.job_id,
+            "future".to_string(),
+            Some(1300),
+            1020,
+        )?;
+        let running = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 14,
+                partition_id: Some(24),
+                root_path: "s3://bucket/db/table/running".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), running.job_id, 1010)?);
+        let finished = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 15,
+                partition_id: Some(25),
+                root_path: "s3://bucket/db/table/finished".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), finished.job_id, 1010)?);
+        repository.finish_erase_job(txn.as_mut(), finished.job_id, 1020)?;
+        txn.commit()?;
+        (
+            pending.job_id,
+            failed_none_retry.job_id,
+            failed_due.job_id,
+            failed_future.job_id,
+            running.job_id,
+            finished.job_id,
+        )
+    };
+
+    let read = provider.begin_read()?;
+    let runnable_ids = repository
+        .list_runnable_erase_jobs(read.as_ref(), 1200)?
+        .into_iter()
+        .map(|job| job.job_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        runnable_ids,
+        vec![pending_id, failed_none_retry_id, failed_due_id]
+    );
+    assert!(!runnable_ids.contains(&failed_future_id));
+    assert!(!runnable_ids.contains(&running_id));
+    assert!(!runnable_ids.contains(&finished_id));
 
     Ok(())
 }

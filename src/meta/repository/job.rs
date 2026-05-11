@@ -5,8 +5,8 @@ use crate::meta::repository::{
     RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
 };
 use crate::meta::{
-    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecord, MetaRecordKind, MetaRecordPut,
-    MetaRevision, MetaWriteTxn,
+    ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
+    MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
 
 const ERASE_JOB_KIND: &str = "job.erase";
@@ -92,7 +92,7 @@ impl JobMetaRepository {
             return Ok(false);
         };
         match stored.value.state {
-            JobState::Pending | JobState::Failed => {
+            JobState::Pending => {
                 stored.value.state = JobState::Running;
                 stored.value.retry_at_ms = None;
                 stored.value.updated_at_ms = now_ms;
@@ -104,6 +104,19 @@ impl JobMetaRepository {
                 )?;
                 Ok(true)
             }
+            JobState::Failed if is_retry_due(stored.value.retry_at_ms, now_ms) => {
+                stored.value.state = JobState::Running;
+                stored.value.retry_at_ms = None;
+                stored.value.updated_at_ms = now_ms;
+                stored.value.last_error = None;
+                put_erase_job(
+                    txn,
+                    &stored.value,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )?;
+                Ok(true)
+            }
+            JobState::Failed => Ok(false),
             JobState::Running | JobState::Finished => Ok(false),
         }
     }
@@ -128,14 +141,59 @@ impl JobMetaRepository {
                     ExpectedRevision::Exact(stored.record_revision),
                 )
             }
-            JobState::Pending | JobState::Failed | JobState::Finished => {
-                Err(RepositoryError::conflict(format!(
-                    "erase job {job_id} is {}, expected {}",
-                    state.as_str(),
-                    JobState::Running.as_str()
-                )))
-            }
+            JobState::Finished => Ok(()),
+            JobState::Pending | JobState::Failed => Err(RepositoryError::conflict(format!(
+                "erase job {job_id} is {}, expected {}",
+                state.as_str(),
+                JobState::Running.as_str()
+            ))),
         }
+    }
+
+    pub fn fail_erase_job(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        job_id: i64,
+        last_error: String,
+        retry_at_ms: Option<i64>,
+        now_ms: i64,
+    ) -> RepositoryResult<()> {
+        let mut stored = load_required_erase_job(txn, job_id)?;
+        let state = stored.value.state.clone();
+        match state {
+            JobState::Running | JobState::Failed => {
+                stored.value.state = JobState::Failed;
+                stored.value.retry_at_ms = retry_at_ms;
+                stored.value.updated_at_ms = now_ms;
+                stored.value.last_error = Some(last_error);
+                put_erase_job(
+                    txn,
+                    &stored.value,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )
+            }
+            JobState::Pending | JobState::Finished => Err(RepositoryError::conflict(format!(
+                "erase job {job_id} is {}, expected {}",
+                state.as_str(),
+                JobState::Running.as_str()
+            ))),
+        }
+    }
+
+    pub fn list_runnable_erase_jobs(
+        &self,
+        txn: &dyn MetaReadTxn,
+        now_ms: i64,
+    ) -> RepositoryResult<Vec<StoredEraseJob>> {
+        txn.scan(&key_prefix_erase_jobs()?, None)?
+            .into_iter()
+            .map(|record| decode_record_payload(&record, ERASE_JOB_KIND, ERASE_JOB_SCHEMA_VERSION))
+            .filter_map(|result| match result {
+                Ok(job) if is_runnable(&job, now_ms) => Some(Ok(job)),
+                Ok(_) => None,
+                Err(err) => Some(Err(err)),
+            })
+            .collect()
     }
 }
 
@@ -211,9 +269,25 @@ fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {
     Ok(MetaRecordKind::new(value)?)
 }
 
+fn is_runnable(job: &StoredEraseJob, now_ms: i64) -> bool {
+    match job.state {
+        JobState::Pending => true,
+        JobState::Failed => is_retry_due(job.retry_at_ms, now_ms),
+        JobState::Running | JobState::Finished => false,
+    }
+}
+
+fn is_retry_due(retry_at_ms: Option<i64>, now_ms: i64) -> bool {
+    retry_at_ms.map_or(true, |retry_at_ms| retry_at_ms <= now_ms)
+}
+
 fn key_erase_job(job_id: i64) -> RepositoryResult<MetaKey> {
     Ok(MetaKey::new(
         NS_JOB,
         ["erase".to_string(), job_id.to_string()],
     )?)
+}
+
+fn key_prefix_erase_jobs() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_JOB, ["erase"])?)
 }
