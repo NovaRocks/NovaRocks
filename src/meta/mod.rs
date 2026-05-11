@@ -1,7 +1,10 @@
 pub mod error;
 pub mod id;
+pub mod keys;
+pub mod payload;
 pub mod provider;
 pub mod record;
+pub mod repository;
 pub mod sqlite;
 
 pub use error::{MetaError, MetaErrorKind};
