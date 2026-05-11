@@ -3485,6 +3485,28 @@ enable_path_style_access = true
     }
 
     #[test]
+    fn embedded_query_counts_subquery_with_limit_offset_without_order_by() {
+        let parquet = write_parquet_file();
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+        engine
+            .register_parquet_table("tbl", parquet.path())
+            .expect("register table");
+
+        let session = engine.session();
+        let result = session
+            .query("SELECT count(*) FROM (SELECT * FROM tbl LIMIT 1, 1) x")
+            .expect("execute limit offset query");
+        assert_eq!(result.row_count(), 1);
+        let counts = result.chunks[0]
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count array");
+        assert_eq!(counts.value(0), 1);
+    }
+
+    #[test]
     fn embedded_query_executes_single_use_cte_through_cascades() {
         let parquet = write_parquet_file();
         let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
@@ -3502,6 +3524,28 @@ enable_path_style_access = true
         assert_eq!(result.row_count(), 2);
         let chunk = &result.chunks[0];
         assert_eq!(chunk.schema().field(0).name(), "name");
+    }
+
+    #[test]
+    fn embedded_query_executes_inline_values_cte_without_catalog_table() {
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+
+        let session = engine.session();
+        let result = session
+            .query("WITH t AS (SELECT 1 AS id UNION ALL SELECT 2) SELECT id FROM t ORDER BY id")
+            .expect("execute inline values CTE");
+        assert_eq!(result.row_count(), 2);
+    }
+
+    #[test]
+    fn embedded_query_math_function_accepts_negative_decimal_literal() {
+        let engine = StandaloneNovaRocks::open(StandaloneOptions::default()).expect("open engine");
+
+        let session = engine.session();
+        let result = session
+            .query("SELECT SQRT(-1.0) AS v")
+            .expect("execute math function with negative decimal literal");
+        assert_eq!(result.row_count(), 1);
     }
 
     #[test]

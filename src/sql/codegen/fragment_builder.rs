@@ -62,6 +62,13 @@ struct VisitResult {
     cte_exchange_nodes: Vec<(CteId, i32)>,
 }
 
+fn limit_child_can_apply_offset_locally(child: &PhysicalPlanNode) -> bool {
+    matches!(
+        &child.op,
+        Operator::PhysicalSort(_) | Operator::PhysicalTopN(_)
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Scan/join ownership metadata (used by RF planning)
 // ---------------------------------------------------------------------------
@@ -1408,6 +1415,17 @@ impl<'a> PlanFragmentBuilder<'a> {
         op: &PhysicalLimitOp,
         node: &PhysicalPlanNode,
     ) -> Result<VisitResult, String> {
+        if node.children.len() != 1 {
+            return Err(format!(
+                "PhysicalLimit expected exactly 1 child, got {}",
+                node.children.len()
+            ));
+        }
+
+        if op.offset.unwrap_or(0) > 0 && !limit_child_can_apply_offset_locally(&node.children[0]) {
+            return self.visit_limit_offset_exchange(op, node);
+        }
+
         let mut child = self.visit(&node.children[0])?;
 
         if let Some(top) = child.plan_nodes.first_mut() {
@@ -1422,13 +1440,79 @@ impl<'a> PlanFragmentBuilder<'a> {
                 if let Some(limit) = op.limit {
                     top.limit = limit;
                 }
-                if op.offset.is_some() {
+                if op.offset.unwrap_or(0) > 0 {
                     return Err("LIMIT/OFFSET without a SORT child is not supported".to_string());
                 }
             }
         }
 
         Ok(child)
+    }
+
+    fn visit_limit_offset_exchange(
+        &mut self,
+        op: &PhysicalLimitOp,
+        node: &PhysicalPlanNode,
+    ) -> Result<VisitResult, String> {
+        let parent_fragment_id = self.current_fragment_id()?;
+        let child_fragment_id = self.alloc_fragment_id();
+        self.fragment_stack.push(child_fragment_id);
+        let child_result = self.visit(&node.children[0]);
+        self.fragment_stack.pop();
+        let child = child_result?;
+        let VisitResult {
+            plan_nodes: child_plan_nodes,
+            scope: child_scope,
+            tuple_ids: child_tuple_ids,
+            cte_exchange_nodes,
+        } = child;
+
+        let gather_spec = crate::sql::optimizer::property::DistributionSpec::Gather;
+        let output_partition = self.build_output_partition(&gather_spec, &child_scope)?;
+        let exchange_partition_type = output_partition.type_;
+
+        self.completed_fragments.push(FragmentBuildResult {
+            fragment_id: child_fragment_id,
+            plan: plan_nodes::TPlan::new(child_plan_nodes),
+            desc_tbl: DescriptorTableBuilder::new().build(),
+            exec_params: nodes::build_exec_params_multi(&[])?,
+            output_sink: build_noop_sink(),
+            output_columns: node.children[0]
+                .output_columns
+                .iter()
+                .map(|c| OutputColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                })
+                .collect(),
+            cte_id: None,
+            cte_exchange_nodes,
+        });
+
+        let exchange_node_id = self.alloc_node();
+        let exchange_node = nodes::build_limit_exchange_node(
+            exchange_node_id,
+            child_tuple_ids.clone(),
+            exchange_partition_type,
+            op.limit,
+            op.offset,
+        );
+
+        self.completed_edges.push(FragmentEdge {
+            source_fragment_id: child_fragment_id,
+            target_fragment_id: parent_fragment_id,
+            target_exchange_node_id: exchange_node_id,
+            output_partition,
+            edge_kind: FragmentEdgeKind::Stream,
+        });
+
+        Ok(VisitResult {
+            plan_nodes: vec![exchange_node],
+            scope: child_scope,
+            tuple_ids: child_tuple_ids,
+            cte_exchange_nodes: Vec::new(),
+        })
     }
 
     // -------------------------------------------------------------------

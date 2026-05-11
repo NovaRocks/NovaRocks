@@ -353,22 +353,34 @@ impl<'a> ExprCompiler<'a> {
                 UnOp::Negate => {
                     let result_type = inner.data_type.clone();
                     let type_desc = arrow_type_to_type_desc(&result_type)?;
+                    let is_decimal = matches!(result_type, DataType::Decimal128(_, _));
                     self.nodes.push(exprs::TExprNode {
                         node_type: exprs::TExprNodeType::ARITHMETIC_EXPR,
                         type_: type_desc.clone(),
-                        opcode: Some(opcodes::TExprOpcode::MULTIPLY),
+                        opcode: Some(if is_decimal {
+                            opcodes::TExprOpcode::SUBTRACT
+                        } else {
+                            opcodes::TExprOpcode::MULTIPLY
+                        }),
                         num_children: 2,
                         ..default_expr_node()
                     });
-                    if needs_arithmetic_cast(&DataType::Int64, &result_type) {
-                        self.nodes.push(exprs::TExprNode {
-                            node_type: exprs::TExprNodeType::CAST_EXPR,
-                            type_: type_desc,
-                            num_children: 1,
-                            ..default_expr_node()
-                        });
+                    if is_decimal {
+                        self.compile_literal(
+                            &LiteralValue::Decimal("0".to_string()),
+                            &result_type,
+                        )?;
+                    } else {
+                        if needs_arithmetic_cast(&DataType::Int64, &result_type) {
+                            self.nodes.push(exprs::TExprNode {
+                                node_type: exprs::TExprNodeType::CAST_EXPR,
+                                type_: type_desc,
+                                num_children: 1,
+                                ..default_expr_node()
+                            });
+                        }
+                        self.nodes.push(int_literal_node(-1));
                     }
-                    self.nodes.push(int_literal_node(-1));
                     self.compile_typed_inner(inner)?;
                     self.last_type = result_type.clone();
                     Ok(result_type)

@@ -171,17 +171,67 @@ pub(crate) fn observe_query(
     query: &sqlast::Query,
     current_database: &str,
 ) -> Result<(), String> {
-    let sqlast::SetExpr::Select(select) = query.body.as_ref() else {
-        return Ok(());
-    };
+    observe_query_with_ctes(state, query, current_database, &BTreeSet::new())
+}
+
+fn observe_query_with_ctes(
+    state: &Arc<StandaloneState>,
+    query: &sqlast::Query,
+    current_database: &str,
+    inherited_ctes: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut visible_ctes = inherited_ctes.clone();
+    if let Some(with) = query.with.as_ref() {
+        for cte in &with.cte_tables {
+            visible_ctes.insert(normalize_name(&cte.alias.name.value)?);
+        }
+        for cte in &with.cte_tables {
+            observe_query_with_ctes(state, &cte.query, current_database, &visible_ctes)?;
+        }
+    }
+
+    observe_set_expr(state, query.body.as_ref(), current_database, &visible_ctes)
+}
+
+fn observe_set_expr(
+    state: &Arc<StandaloneState>,
+    set_expr: &sqlast::SetExpr,
+    current_database: &str,
+    visible_ctes: &BTreeSet<String>,
+) -> Result<(), String> {
+    match set_expr {
+        sqlast::SetExpr::Select(select) => {
+            observe_select(state, select, current_database, visible_ctes)
+        }
+        sqlast::SetExpr::SetOperation { left, right, .. } => {
+            observe_set_expr(state, left, current_database, visible_ctes)?;
+            observe_set_expr(state, right, current_database, visible_ctes)
+        }
+        sqlast::SetExpr::Query(query) => {
+            observe_query_with_ctes(state, query, current_database, visible_ctes)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn observe_select(
+    state: &Arc<StandaloneState>,
+    select: &sqlast::Select,
+    current_database: &str,
+    visible_ctes: &BTreeSet<String>,
+) -> Result<(), String> {
     let mut aliases = BTreeMap::new();
     for table in &select.from {
-        if let Some((key, alias)) = relation_table_key(&table.relation, current_database)? {
+        if let Some((key, alias)) =
+            relation_table_key(&table.relation, current_database, visible_ctes)?
+        {
             aliases.insert(alias.unwrap_or_else(|| key.table.clone()), key.clone());
             ensure_normal_usage(state, &key)?;
         }
         for join in &table.joins {
-            if let Some((key, alias)) = relation_table_key(&join.relation, current_database)? {
+            if let Some((key, alias)) =
+                relation_table_key(&join.relation, current_database, visible_ctes)?
+            {
                 aliases.insert(alias.unwrap_or_else(|| key.table.clone()), key.clone());
                 ensure_normal_usage(state, &key)?;
             }
@@ -1347,11 +1397,17 @@ fn mark_usage(
 fn relation_table_key(
     relation: &sqlast::TableFactor,
     current_database: &str,
+    visible_ctes: &BTreeSet<String>,
 ) -> Result<Option<(TableKey, Option<String>)>, String> {
     let sqlast::TableFactor::Table { name, alias, .. } = relation else {
         return Ok(None);
     };
     let parts = object_name_parts(name);
+    if let [table] = parts.as_slice()
+        && visible_ctes.contains(&normalize_name(table)?)
+    {
+        return Ok(None);
+    }
     if parts.iter().any(|part| {
         part.eq_ignore_ascii_case("information_schema") || part.eq_ignore_ascii_case("_statistics_")
     }) {

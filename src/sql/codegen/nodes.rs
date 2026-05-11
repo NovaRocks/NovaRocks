@@ -1172,6 +1172,33 @@ pub(crate) fn build_exchange_node(
     node
 }
 
+/// Build a non-ordering EXCHANGE_NODE whose receive side applies LIMIT/OFFSET.
+pub(crate) fn build_limit_exchange_node(
+    node_id: i32,
+    input_row_tuples: Vec<i32>,
+    partition_type: partitions::TPartitionType,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> plan_nodes::TPlanNode {
+    let mut node = default_plan_node();
+    node.node_id = node_id;
+    node.node_type = plan_nodes::TPlanNodeType::EXCHANGE_NODE;
+    node.num_children = 0;
+    node.limit = limit.unwrap_or(-1);
+    node.row_tuples = input_row_tuples.clone();
+    node.nullable_tuples = vec![];
+    node.compact_data = true;
+    node.exchange_node = Some(plan_nodes::TExchangeNode::new(
+        input_row_tuples,
+        None::<plan_nodes::TSortInfo>,
+        offset,
+        Some(partition_type),
+        None::<bool>,
+        None::<plan_nodes::TLateMaterializeMode>,
+    ));
+    node
+}
+
 /// Build a merging EXCHANGE_NODE. The receive side performs k-way merge
 /// over sorted input streams using `sort_info`, then applies offset/limit.
 /// Used for distributed TopN FINAL(split) and global ORDER BY.
