@@ -178,6 +178,7 @@ pub(crate) struct StandaloneState {
     pub(crate) statistics: RwLock<statistics::StandaloneStatistics>,
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
+    pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
     pub(crate) metadata_store: Option<SqliteMetadataStore>,
     pub(crate) exchange_port: u16,
     #[cfg(test)]
@@ -193,6 +194,7 @@ impl Default for StandaloneState {
             statistics: RwLock::new(statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: None,
+            metadata_provider: None,
             metadata_store: None,
             exchange_port: 0,
             #[cfg(test)]
@@ -255,15 +257,17 @@ impl StandaloneNovaRocks {
             }
         }
         let exchange_port = ensure_standalone_exchange_server()?;
-        let _metadata_provider = open_metadata_provider_from_config(&opts)?;
-        let metadata_store = resolve_metadata_store(
-            opts.metadata_db_path.as_deref(),
-            opts.config_path.as_deref(),
-        )?;
+        let metadata_backend = resolve_metadata_backend(&opts)?;
+        let metadata_provider = metadata_backend
+            .as_ref()
+            .map(open_metadata_provider)
+            .transpose()?;
+        let metadata_store = resolve_metadata_store(metadata_backend.as_ref())?;
         let managed_lake_config = resolve_managed_lake_config()?;
         let inner = Arc::new(StandaloneState {
             managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
             managed_lake_config,
+            metadata_provider,
             metadata_store,
             exchange_port,
             #[cfg(test)]
@@ -1668,51 +1672,84 @@ fn refresh_iceberg_tables_for_query(
 // Metadata persistence
 // ---------------------------------------------------------------------------
 
-fn resolve_metadata_store(
-    explicit_path: Option<&Path>,
-    config_path: Option<&Path>,
-) -> Result<Option<SqliteMetadataStore>, String> {
-    let resolved_path = match explicit_path {
-        Some(path) => Some(resolve_relative_path(path, config_path)?),
-        None => {
-            let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-            cfg.metadata
-                .as_ref()
-                .map(|metadata| resolve_relative_path(&metadata.path, config_path))
-                .or_else(|| {
-                    cfg.standalone_server
-                        .as_ref()
-                        .and_then(|standalone| standalone.metadata_db_path.as_deref())
-                        .map(|path| resolve_relative_path(path, config_path))
-                })
-                .transpose()?
-        }
-    };
-    resolved_path.map(SqliteMetadataStore::open).transpose()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataBackendSource {
+    ExplicitOptions,
+    MetadataConfig,
+    LegacyStandaloneConfig,
 }
 
-fn open_metadata_provider_from_config(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResolvedMetadataBackend {
+    provider: crate::common::app_config::MetadataProviderConfig,
+    path: PathBuf,
+    source: MetadataBackendSource,
+}
+
+fn resolve_metadata_backend(
     opts: &StandaloneOptions,
-) -> Result<Option<Arc<dyn crate::meta::MetaStoreProvider>>, String> {
+) -> Result<Option<ResolvedMetadataBackend>, String> {
     let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-    let Some(metadata) = cfg.metadata.as_ref() else {
+    if opts.metadata_db_path.is_some() && cfg.metadata.is_some() {
+        return Err(
+            "StandaloneOptions.metadata_db_path conflicts with [metadata]; remove one metadata source"
+                .to_string(),
+        );
+    }
+
+    if let Some(path) = opts.metadata_db_path.as_deref() {
+        return Ok(Some(ResolvedMetadataBackend {
+            provider: crate::common::app_config::MetadataProviderConfig::Sqlite,
+            path: resolve_relative_path(path, opts.config_path.as_deref())?,
+            source: MetadataBackendSource::ExplicitOptions,
+        }));
+    }
+
+    if let Some(metadata) = cfg.metadata.as_ref() {
+        return Ok(Some(ResolvedMetadataBackend {
+            provider: metadata.provider,
+            path: resolve_relative_path(&metadata.path, opts.config_path.as_deref())?,
+            source: MetadataBackendSource::MetadataConfig,
+        }));
+    }
+
+    cfg.standalone_server
+        .as_ref()
+        .and_then(|standalone| standalone.metadata_db_path.as_deref())
+        .map(|path| {
+            Ok(ResolvedMetadataBackend {
+                provider: crate::common::app_config::MetadataProviderConfig::Sqlite,
+                path: resolve_relative_path(path, opts.config_path.as_deref())?,
+                source: MetadataBackendSource::LegacyStandaloneConfig,
+            })
+        })
+        .transpose()
+}
+
+fn open_metadata_provider(
+    backend: &ResolvedMetadataBackend,
+) -> Result<Arc<dyn crate::meta::MetaStoreProvider>, String> {
+    match backend.provider {
+        crate::common::app_config::MetadataProviderConfig::Sqlite => {
+            let provider = crate::meta::SqliteMetaStoreProvider::open(&backend.path)
+                .map_err(|err| format!("open sqlite metadata provider failed: {err}"))?;
+            Ok(Arc::new(provider))
+        }
+    }
+}
+
+fn resolve_metadata_store(
+    backend: Option<&ResolvedMetadataBackend>,
+) -> Result<Option<SqliteMetadataStore>, String> {
+    let Some(backend) = backend else {
         return Ok(None);
     };
-    let path = if metadata.path.is_absolute() {
-        metadata.path.clone()
-    } else if let Some(config_path) = opts.config_path.as_ref() {
-        config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(&metadata.path)
-    } else {
-        metadata.path.clone()
-    };
-    match metadata.provider {
+    match backend.provider {
         crate::common::app_config::MetadataProviderConfig::Sqlite => {
-            let provider = crate::meta::SqliteMetaStoreProvider::open(path)
-                .map_err(|err| format!("open sqlite metadata provider failed: {err}"))?;
-            Ok(Some(Arc::new(provider)))
+            // Transitional bridge: managed-lake business flows still depend on
+            // SqliteMetadataStore until repository migration lands, but it
+            // must use the same resolved backend path as the MetaStoreProvider.
+            SqliteMetadataStore::open(&backend.path).map(Some)
         }
     }
 }
@@ -2716,6 +2753,123 @@ mod tests {
         writer.write(&batch).expect("write batch");
         writer.close().expect("close parquet writer");
         file
+    }
+
+    #[test]
+    fn metadata_backend_resolves_metadata_path_relative_to_config_parent() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_dir = dir.path().join("conf");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config_path = config_dir.join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+"#,
+        )
+        .expect("write config");
+
+        crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let backend = super::resolve_metadata_backend(&StandaloneOptions {
+            config_path: Some(config_path.clone()),
+            metadata_db_path: None,
+        })
+        .expect("resolve backend")
+        .expect("metadata backend");
+
+        assert_eq!(
+            backend.provider,
+            crate::common::app_config::MetadataProviderConfig::Sqlite
+        );
+        assert_eq!(backend.path, config_dir.join("meta/catalog.db"));
+        assert_eq!(backend.source, super::MetadataBackendSource::MetadataConfig);
+    }
+
+    #[test]
+    fn metadata_backend_uses_legacy_standalone_path_fallback() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[standalone_server]
+metadata_db_path = "legacy/catalog.db"
+"#,
+        )
+        .expect("write config");
+
+        crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let backend = super::resolve_metadata_backend(&StandaloneOptions {
+            config_path: Some(config_path.clone()),
+            metadata_db_path: None,
+        })
+        .expect("resolve backend")
+        .expect("metadata backend");
+
+        assert_eq!(backend.path, dir.path().join("legacy/catalog.db"));
+        assert_eq!(
+            backend.source,
+            super::MetadataBackendSource::LegacyStandaloneConfig
+        );
+    }
+
+    #[test]
+    fn metadata_backend_rejects_explicit_path_with_metadata_config() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+"#,
+        )
+        .expect("write config");
+
+        crate::novarocks_config::init_from_path(&config_path).expect("load config");
+        let err = super::resolve_metadata_backend(&StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: Some(dir.path().join("explicit.db")),
+        })
+        .expect_err("mixed metadata sources must fail");
+
+        assert!(err.contains("metadata_db_path"));
+        assert!(err.contains("[metadata]"));
+    }
+
+    #[test]
+    fn standalone_state_retains_metadata_provider_from_metadata_config() {
+        let _runtime_guard = lock_runtime_test_state();
+        let dir = TempDir::new().expect("create config dir");
+        let config_path = dir.path().join("novarocks.toml");
+        std::fs::write(
+            &config_path,
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+"#,
+        )
+        .expect("write config");
+
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+
+        assert!(engine.inner.metadata_provider.is_some());
+        assert_eq!(
+            engine
+                .inner
+                .metadata_provider
+                .as_ref()
+                .expect("metadata provider")
+                .provider_name(),
+            "sqlite"
+        );
     }
 
     #[test]

@@ -2584,6 +2584,7 @@ enable_path_style_access = true
             statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
+            metadata_provider: None,
             metadata_store: Some(store.clone()),
             exchange_port: 0,
             #[cfg(test)]
@@ -2650,6 +2651,7 @@ enable_path_style_access = true
             statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
+            metadata_provider: None,
             metadata_store: Some(store.clone()),
             exchange_port: 0,
             #[cfg(test)]
@@ -2915,6 +2917,7 @@ enable_path_style_access = true
             statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
+            metadata_provider: None,
             metadata_store: Some(store),
             exchange_port: 0,
             #[cfg(test)]
