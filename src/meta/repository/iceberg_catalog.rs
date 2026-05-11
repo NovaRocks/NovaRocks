@@ -1,1 +1,166 @@
-// Iceberg catalog repository APIs will be added by later tasks.
+use serde::{Deserialize, Serialize};
+
+use crate::meta::keys::{NS_ICEBERG_CATALOG, normalize_lookup_name};
+use crate::meta::repository::mv::MvMetaRepository;
+use crate::meta::repository::{RepositoryResult, encode_json_payload};
+use crate::meta::{
+    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecordKind, MetaRecordPut, MetaWriteTxn,
+};
+
+const ICEBERG_CATALOG_KIND: &str = "iceberg.catalog";
+const ICEBERG_NAMESPACE_KIND: &str = "iceberg.namespace";
+const ICEBERG_TABLE_KIND: &str = "iceberg.table_registration";
+const ICEBERG_CATALOG_SCHEMA_VERSION: i32 = 1;
+const ICEBERG_NAMESPACE_SCHEMA_VERSION: i32 = 1;
+const ICEBERG_TABLE_SCHEMA_VERSION: i32 = 1;
+
+#[derive(Default)]
+pub struct IcebergCatalogMetaRepository;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergCatalogProperties {
+    pub properties: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergNamespaceRecord {
+    pub catalog: String,
+    pub namespace: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergTableRecord {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+}
+
+impl IcebergCatalogMetaRepository {
+    pub fn upsert_catalog(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+        properties: IcebergCatalogProperties,
+    ) -> RepositoryResult<()> {
+        txn.put(MetaRecordPut::new(
+            key_catalog(catalog)?,
+            record_kind(ICEBERG_CATALOG_KIND)?,
+            ExpectedRevision::Any,
+            encode_json_payload(ICEBERG_CATALOG_SCHEMA_VERSION, &properties)?,
+        ))?;
+        Ok(())
+    }
+
+    pub fn catalog_exists(&self, txn: &dyn MetaReadTxn, catalog: &str) -> RepositoryResult<bool> {
+        Ok(txn.get(&key_catalog(catalog)?)?.is_some())
+    }
+
+    pub fn upsert_namespace(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+        namespace: &str,
+    ) -> RepositoryResult<()> {
+        let record = IcebergNamespaceRecord {
+            catalog: normalize_lookup_name(catalog),
+            namespace: normalize_lookup_name(namespace),
+        };
+        txn.put(MetaRecordPut::new(
+            key_namespace(catalog, namespace)?,
+            record_kind(ICEBERG_NAMESPACE_KIND)?,
+            ExpectedRevision::Any,
+            encode_json_payload(ICEBERG_NAMESPACE_SCHEMA_VERSION, &record)?,
+        ))?;
+        Ok(())
+    }
+
+    pub fn namespace_exists(
+        &self,
+        txn: &dyn MetaReadTxn,
+        catalog: &str,
+        namespace: &str,
+    ) -> RepositoryResult<bool> {
+        Ok(txn.get(&key_namespace(catalog, namespace)?)?.is_some())
+    }
+
+    pub fn upsert_table(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> RepositoryResult<()> {
+        let record = IcebergTableRecord {
+            catalog: normalize_lookup_name(catalog),
+            namespace: normalize_lookup_name(namespace),
+            table: normalize_lookup_name(table),
+        };
+        txn.put(MetaRecordPut::new(
+            key_table(catalog, namespace, table)?,
+            record_kind(ICEBERG_TABLE_KIND)?,
+            ExpectedRevision::Any,
+            encode_json_payload(ICEBERG_TABLE_SCHEMA_VERSION, &record)?,
+        ))?;
+        Ok(())
+    }
+
+    pub fn table_exists(
+        &self,
+        txn: &dyn MetaReadTxn,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> RepositoryResult<bool> {
+        Ok(txn.get(&key_table(catalog, namespace, table)?)?.is_some())
+    }
+
+    pub fn delete_table_and_mv_relationships(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_repo: &MvMetaRepository,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> RepositoryResult<()> {
+        txn.delete(
+            &key_table(catalog, namespace, table)?,
+            ExpectedRevision::Any,
+        )?;
+        mv_repo.drop_by_target(txn, catalog, namespace, table)?;
+        Ok(())
+    }
+}
+
+fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {
+    Ok(MetaRecordKind::new(value)?)
+}
+
+fn key_catalog(catalog: &str) -> RepositoryResult<MetaKey> {
+    Ok(MetaKey::new(
+        NS_ICEBERG_CATALOG,
+        ["catalog".to_string(), normalize_lookup_name(catalog)],
+    )?)
+}
+
+fn key_namespace(catalog: &str, namespace: &str) -> RepositoryResult<MetaKey> {
+    Ok(MetaKey::new(
+        NS_ICEBERG_CATALOG,
+        [
+            "namespace".to_string(),
+            normalize_lookup_name(catalog),
+            normalize_lookup_name(namespace),
+        ],
+    )?)
+}
+
+fn key_table(catalog: &str, namespace: &str, table: &str) -> RepositoryResult<MetaKey> {
+    Ok(MetaKey::new(
+        NS_ICEBERG_CATALOG,
+        [
+            "table".to_string(),
+            normalize_lookup_name(catalog),
+            normalize_lookup_name(namespace),
+            normalize_lookup_name(table),
+        ],
+    )?)
+}

@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use novarocks::meta::repository::iceberg_catalog::{
+    IcebergCatalogMetaRepository, IcebergCatalogProperties,
+};
 use novarocks::meta::repository::mv::{
     CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
     RefreshExternalOutcome,
@@ -348,6 +351,93 @@ fn mv_repository_rejects_definition_schema_version_mismatch()
     assert!(
         err.to_string()
             .contains("metadata record by-id/1 has schema version 999")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn iceberg_catalog_repository_registers_catalog_namespace_and_table()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergCatalogMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("register iceberg table")?;
+        repository.upsert_catalog(
+            txn.as_mut(),
+            "ice",
+            IcebergCatalogProperties {
+                properties: vec![("type".to_string(), "rest".to_string())],
+            },
+        )?;
+        repository.upsert_namespace(txn.as_mut(), "ice", "ns")?;
+        repository.upsert_table(txn.as_mut(), "ice", "ns", "orders")?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(repository.catalog_exists(read.as_ref(), "ICE")?);
+    assert!(repository.namespace_exists(read.as_ref(), "ice", "NS")?);
+    assert!(repository.table_exists(read.as_ref(), "ICE", "ns", "ORDERS")?);
+
+    Ok(())
+}
+
+#[test]
+fn iceberg_catalog_repository_deletes_table_and_related_mv_lookup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let catalog_repo = IcebergCatalogMetaRepository::default();
+    let mv_repo = MvMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("seed iceberg table and mv target")?;
+        catalog_repo.upsert_catalog(
+            txn.as_mut(),
+            "ice",
+            IcebergCatalogProperties {
+                properties: vec![("type".to_string(), "rest".to_string())],
+            },
+        )?;
+        catalog_repo.upsert_namespace(txn.as_mut(), "ice", "ns")?;
+        catalog_repo.upsert_table(txn.as_mut(), "ice", "ns", "orders_mv")?;
+        mv_repo.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id, amount FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("ns".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                created_at_ms: 11,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("delete iceberg table and mv lookup")?;
+        catalog_repo.delete_table_and_mv_relationships(
+            txn.as_mut(),
+            &mv_repo,
+            "ICE",
+            "NS",
+            "ORDERS_MV",
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(!catalog_repo.table_exists(read.as_ref(), "ICE", "ns", "ORDERS_MV")?);
+    assert!(
+        mv_repo
+            .find_by_target(read.as_ref(), "ice", "ns", "orders_mv")?
+            .is_none()
     );
 
     Ok(())

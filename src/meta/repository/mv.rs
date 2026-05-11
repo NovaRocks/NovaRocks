@@ -202,6 +202,28 @@ impl MvMetaRepository {
         self.load_by_id(txn, lookup.mv_id)
     }
 
+    pub fn drop_by_target(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> RepositoryResult<bool> {
+        let target_key = key_by_target(catalog, namespace, table)?;
+        let Some(record) = txn.get(&target_key)? else {
+            return Ok(false);
+        };
+        let lookup: MvTargetLookup = decode_record_payload(
+            &record,
+            MV_TARGET_LOOKUP_KIND,
+            MV_TARGET_LOOKUP_SCHEMA_VERSION,
+        )?;
+
+        txn.delete(&target_key, ExpectedRevision::Exact(record.revision))?;
+        txn.delete(&key_by_id(lookup.mv_id)?, ExpectedRevision::Any)?;
+        Ok(true)
+    }
+
     pub fn begin_refresh_intent(
         &self,
         txn: &mut dyn MetaWriteTxn,
