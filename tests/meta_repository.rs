@@ -6,7 +6,7 @@ use novarocks::meta::repository::iceberg_catalog::{
 };
 use novarocks::meta::repository::managed_lake::{
     CreateManagedDatabaseRequest, CreateManagedTableRequest, ManagedLakeMetaRepository,
-    ManagedPartitionState,
+    ManagedPartitionState, ManagedTableKind, ManagedTableState,
 };
 use novarocks::meta::repository::mv::{
     CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
@@ -93,6 +93,8 @@ fn managed_lake_repository_creates_database_table_and_active_partition()
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
+                state: ManagedTableState::Creating,
+                kind: ManagedTableKind::MaterializedView,
             },
         )?;
         repository.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
@@ -115,6 +117,8 @@ fn managed_lake_repository_creates_database_table_and_active_partition()
     assert_eq!(snapshot.tables[0].keys_type, "DUP_KEYS");
     assert_eq!(snapshot.tables[0].bucket_num, 2);
     assert_eq!(snapshot.tables[0].current_schema_id, 10);
+    assert_eq!(snapshot.tables[0].state, ManagedTableState::Creating);
+    assert_eq!(snapshot.tables[0].kind, ManagedTableKind::MaterializedView);
     assert_eq!(snapshot.partitions[0].table_id, snapshot.tables[0].table_id);
     assert_eq!(snapshot.partitions[0].name, "orders");
     assert_eq!(snapshot.partitions[0].state, ManagedPartitionState::Active);
@@ -147,6 +151,8 @@ fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn 
                 keys_type: "DUP_KEYS".to_string(),
                 bucket_num: 2,
                 current_schema_id: 10,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
             },
         )?;
         repository
@@ -158,6 +164,8 @@ fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn 
                     keys_type: "DUP_KEYS".to_string(),
                     bucket_num: 2,
                     current_schema_id: 10,
+                    state: ManagedTableState::Active,
+                    kind: ManagedTableKind::Table,
                 },
             )
             .expect_err("case-insensitive duplicate table name should fail")

@@ -57,6 +57,8 @@ pub struct StoredManagedTable {
     pub keys_type: String,
     pub bucket_num: i64,
     pub current_schema_id: i64,
+    pub state: ManagedTableState,
+    pub kind: ManagedTableKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +119,22 @@ pub enum ManagedPartitionState {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ManagedTableState {
+    Creating,
+    Active,
+    Dropping,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ManagedTableKind {
+    Table,
+    MaterializedView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ManagedIndexState {
     Creating,
     Active,
@@ -136,6 +154,8 @@ pub struct CreateManagedTableRequest {
     pub keys_type: String,
     pub bucket_num: i64,
     pub current_schema_id: i64,
+    pub state: ManagedTableState,
+    pub kind: ManagedTableKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +229,8 @@ impl ManagedLakeMetaRepository {
             keys_type: req.keys_type,
             bucket_num: req.bucket_num,
             current_schema_id: req.current_schema_id,
+            state: req.state,
+            kind: req.kind,
         };
         txn.put(MetaRecordPut::new(
             key_table(table.table_id)?,
