@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-11
 **Status**: Accepted for design discussion; implementation plan pending user review
-**Scope**: Introduce a direct delta scan/source that emits internal change-op row streams for NovaRocks standalone IVM plans without changing the global `Chunk` ABI in the first phase.
+**Scope**: Introduce a direct delta scan/source that emits internal change-op row streams, and make aggregate MV refresh consume that stream through a single state-aware delta aggregate plan for reversible aggregates.
 
 ## Background
 
@@ -84,16 +84,19 @@ behavior when unsupported operators receive retractable deltas.
 
 ## Design Decision
 
-Use a staged design, but make the first implementation converge at the source
-boundary rather than at an adapter after materialization:
+Use a staged design, but make the first implementation include both the source
+boundary and the first state-aware aggregate consumer:
 
 1. First introduce a direct IVM delta scan/source that emits a plan-level
    internal change-op column.
-2. Do not change the global `Chunk` structure or ordinary scan path in phase 1.
-3. Treat `__change_op` as a special internal slot owned by the IVM planner and
+2. Make aggregate MV refresh consume that source with one delta-state query for
+   reversible aggregates (`COUNT`, `SUM`, `AVG`), not two positive/negative
+   aggregate queries.
+3. Do not change the global `Chunk` structure or ordinary scan path in phase 1.
+4. Treat `__change_op` as a special internal slot owned by the IVM planner and
    sink.
-4. Preserve it through row-preserving operators.
-5. Require IVM-aware operators and sinks to consume it or explicitly reject it.
+5. Preserve it through row-preserving operators.
+6. Require IVM-aware operators and sinks to consume it or explicitly reject it.
 
 The first-phase contract is:
 
@@ -175,8 +178,9 @@ changes:
 - future join IVM rules and sinks
 
 Projection MV sinks route `+1` to insert/upsert and `-1` to delete. Aggregate MV
-paths treat `+1` rows as positive contribution and `-1` rows as negative
-contribution. Invalid values, nulls, or missing `__change_op` are hard errors.
+paths rewrite supported aggregate state expressions so `__change_op` becomes the
+sign of the delta contribution. Invalid values, nulls, or missing
+`__change_op` are hard errors.
 
 ### Reject
 
@@ -196,23 +200,46 @@ returning stale or incorrect MV data.
 
 ## Aggregate Semantics
 
-Phase 1 does not require a brand-new generic aggregate engine for all retractable
-aggregates. It should standardize how the existing aggregate MV path receives
-its delta input.
+Phase 1 includes state-aware aggregate delta evaluation for reversible
+aggregates. It should not materialize positive and negative aggregate states by
+running two filtered delta queries. Instead, it should run one state-shaped delta
+query over the tagged delta source.
 
 The current code already has aggregate-specific machinery:
 
 - `rewrite_select_sql_for_state`
 - `materialize_aggregate_result_chunks`
-- `negate_aggregate_state_chunks`
 - `merge_aggregate_state_batches`
 
-Phase 1 should let those paths consume the delta source's unified change-op
-stream instead of depending on an outer `inserts` / `deletes` branch boundary as
-the final semantic source. The implementation can still internally split
-positive and negative rows when applying existing state-merge code, but that
-split must happen after reading a tagged source stream, not before the data
-enters the source boundary.
+The new aggregate delta rewrite should reuse the layout/materialization/merge
+machinery, but replace the two-branch state production with signed state
+expressions:
+
+```text
+COUNT(*)    -> SUM(__change_op)
+COUNT(expr) -> SUM(CASE WHEN expr IS NOT NULL THEN __change_op ELSE 0 END)
+SUM(expr)   -> SUM(expr * __change_op)
+AVG(expr)   -> SUM(expr * __change_op), SUM(CASE WHEN expr IS NOT NULL THEN __change_op ELSE 0 END)
+```
+
+For the earlier example:
+
+```text
+DeltaScan:
+Alice, 100, -1
+Alice,  80, +1
+
+Delta state aggregate:
+Alice, SUM(amount * __change_op) = -20
+
+MV state merge:
+old 100 + delta -20 = 80
+```
+
+`MIN` and `MAX` are not supported by this signed-state rewrite when delete
+rows are present. Deleting the current extremum requires either recomputing from
+the base table or maintaining richer state. Phase 1 must fallback or reject
+these shapes rather than returning an incorrect value.
 
 ## Join Semantics
 
@@ -253,7 +280,7 @@ Phase 1 does not include:
 - Making ordinary scans aware of IVM change semantics.
 - Supporting every SQL operator under retractable deltas.
 - Full multi-table join IVM.
-- Replacing all current aggregate MV state-merge code.
+- Supporting `MIN` / `MAX` retract without fallback.
 - Exposing `__change_op` to user SQL.
 
 ## Testing
@@ -267,8 +294,12 @@ Phase 1 does not include:
 3. Verify project keeps the internal slot even when user-visible output does not
    include it.
 4. Verify union all merges child action columns correctly.
-5. Verify unsupported retractable plans fail with explicit errors.
-6. Verify ordinary SELECT output and schema do not include `__change_op`.
+5. Verify aggregate delta-state SQL rewrites `COUNT`, `SUM`, and `AVG` into
+   signed expressions over `__change_op`.
+6. Verify aggregate delta refresh does not execute separate positive and
+   negative aggregate queries.
+7. Verify unsupported retractable plans fail with explicit errors.
+8. Verify ordinary SELECT output and schema do not include `__change_op`.
 
 ### End-to-End Tests
 
@@ -304,6 +335,8 @@ aggregate shape and assert it returns a clear unsupported-retract error.
 - IVM delta plans have a documented internal `__change_op` slot contract.
 - Delta source directly produces tagged insert and delete rows.
 - Safe operators preserve the tag.
+- Aggregate MV refresh uses one signed delta-state query for supported
+  reversible aggregates.
 - IVM sinks consume the tag and validate illegal values.
 - Unsupported retractable operator paths fail fast.
 - Ordinary query paths remain schema-compatible and do not expose the internal

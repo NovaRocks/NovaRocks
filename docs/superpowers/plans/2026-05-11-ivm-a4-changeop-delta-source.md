@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an Iceberg IVM delta scan/source that emits one internal row stream tagged with `__change_op`, instead of exposing insert/delete as the production semantic boundary.
+**Goal:** Build an Iceberg IVM delta scan/source and make aggregate MV refresh consume it through one signed delta-state query for reversible aggregates.
 
-**Architecture:** Keep the global `Chunk` ABI unchanged and model `__change_op` as an Iceberg scan virtual column. The IVM delta source builds a synthetic internal `TableDef` whose file ranges are tagged `+1` for added rows and `-1` for removed rows; HDFS scan lowering carries that tag through scan ranges/morsels, and the scan runner synthesizes the column into output chunks. Current projection and aggregate MV refresh code then consumes the tagged source stream, splitting by op only after the delta source boundary.
+**Architecture:** Keep the global `Chunk` ABI unchanged and model `__change_op` as an Iceberg scan virtual column. The IVM delta source builds a synthetic internal `TableDef` whose file ranges are tagged `+1` for added rows and `-1` for removed rows; HDFS scan lowering carries that tag through scan ranges/morsels, and the scan runner synthesizes the column into output chunks. Projection MV maps the tagged stream to managed-lake `__op`; aggregate MV rewrites `COUNT`/`SUM`/`AVG` into signed state expressions over `__change_op`, executes one delta-state query, and then reuses existing MV state merge code.
 
 **Tech Stack:** Rust, Arrow `RecordBatch`/`Chunk`, existing NovaRocks standalone SQL analyzer/codegen, `THdfsScanRange.extended_columns`, Iceberg change planning, managed-lake MV refresh.
 
@@ -30,7 +30,7 @@ IcebergChangeBatch
        added data files            -> scan rows with __change_op = +1
        deleted row batches/files   -> scan rows with __change_op = -1
   -> standalone ExecPlan
-  -> projection/aggregate MV consumer
+  -> projection MV consumer or aggregate signed-state consumer
 ```
 
 The current `MaterializedChanges { inserts, deletes }` and `IvmChangeStream { inserts, deletes }` can remain temporarily for old call sites, but `src/connector/starrocks/managed/mv_refresh.rs` should stop using them for Iceberg-backed MV refresh once this plan is complete.
@@ -77,10 +77,14 @@ The current `MaterializedChanges { inserts, deletes }` and `IvmChangeStream { in
 - Create `src/connector/starrocks/managed/ivm_delta_source.rs`
   - Converts `IcebergChangeBatch` into tagged `IcebergFileForQuery` entries.
   - Writes delete-row batches to a temporary parquet file tagged with `-1`.
-  - Executes projection and aggregate-state SQL against the synthetic delta table.
+  - Executes projection and aggregate delta-state SQL against the synthetic delta table.
+
+- Create `src/connector/starrocks/managed/ivm_delta_aggregate.rs`
+  - Rewrites supported aggregate MV SQL into one signed state query over `__change_op`.
+  - Rejects `MIN` / `MAX` retract in the delete-bearing path so callers can fall back.
 
 - Modify `src/connector/starrocks/managed/mod.rs`
-  - Exports `ivm_delta_source`.
+  - Exports `ivm_delta_source` and `ivm_delta_aggregate`.
 
 - Modify `src/engine/mv_flow.rs`
   - Make existing validation and temp-parquet helpers `pub(crate)` so the new delta-source module can reuse them.
@@ -88,7 +92,7 @@ The current `MaterializedChanges { inserts, deletes }` and `IvmChangeStream { in
 
 - Modify `src/connector/starrocks/managed/mv_refresh.rs`
   - Projection MV: consume one tagged delta result and map `__change_op` to managed-lake `__op`.
-  - Aggregate MV: run positive and negative aggregate-state materialization by filtering the unified delta source on `__change_op`, then reuse existing negation/merge code.
+  - Aggregate MV: consume one signed delta-state result and reuse existing aggregate state materialization/merge code.
 
 - Modify `src/connector/starrocks/managed/mv_refresh_iceberg.rs`
   - Leave remaining insert-only Iceberg-backed MV refresh path explicitly marked as append-only compatibility if it does not need delete-bearing semantics.
@@ -759,7 +763,7 @@ fn delta_table_builder_rejects_untagged_files() {
 }
 ```
 
-This test is intentionally lightweight because building a real Iceberg catalog entry is already covered by existing `build_iceberg_table_def_with_files` integration tests. The real end-to-end verification lands in Task 7.
+This test is intentionally lightweight because building a real Iceberg catalog entry is already covered by existing `build_iceberg_table_def_with_files` integration tests. The real end-to-end verification lands in Task 8.
 
 - [ ] **Step 6: Run focused tests**
 
@@ -989,7 +993,7 @@ pub(crate) fn execute_delta_source_query(
 }
 ```
 
-- [ ] **Step 5: Add SQL rewrite helpers for op consumption**
+- [ ] **Step 5: Add projection SQL rewrite helper**
 
 Add a helper that appends `__change_op` to projection SQL:
 
@@ -1012,42 +1016,6 @@ pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<Strin
 }
 ```
 
-Add a helper that injects an op filter before aggregate grouping:
-
-```rust
-pub(crate) fn select_sql_filtered_by_change_op(select_sql: &str, op: i8) -> Result<String, String> {
-    crate::exec::change_op::validate_change_op_value(op)?;
-    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
-        .map_err(|e| format!("aggregate MV change-op SELECT normalize error: {e}"))?;
-    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
-        .map_err(|e| format!("aggregate MV change-op SELECT parse error: {e}"))?;
-    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
-        return Err("aggregate MV change-op SELECT expects a SELECT query".to_string());
-    };
-    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
-        return Err("aggregate MV change-op SELECT expects a SELECT body".to_string());
-    };
-    let predicate = sqlparser::ast::Expr::BinaryOp {
-        left: Box::new(sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new(
-            CHANGE_OP_COLUMN,
-        ))),
-        op: sqlparser::ast::BinaryOperator::Eq,
-        right: Box::new(sqlparser::ast::Expr::Value(
-            sqlparser::ast::Value::Number(op.to_string(), false).into(),
-        )),
-    };
-    select.selection = match select.selection.take() {
-        Some(existing) => Some(sqlparser::ast::Expr::BinaryOp {
-            left: Box::new(existing),
-            op: sqlparser::ast::BinaryOperator::And,
-            right: Box::new(predicate),
-        }),
-        None => Some(predicate),
-    };
-    Ok(stmt.to_string())
-}
-```
-
 - [ ] **Step 6: Export the module**
 
 In `src/connector/starrocks/managed/mod.rs`:
@@ -1062,18 +1030,17 @@ Add tests for:
 
 ```rust
 projection_select_with_change_op("select k, v from cat.db.t")
-select_sql_filtered_by_change_op("select k, sum(v) from cat.db.t where v > 0 group by k", -1)
 ```
 
-Expected output strings should contain `__change_op` and preserve the existing `WHERE` predicate with `AND`.
+Expected output string should contain `__change_op`.
 
 Run:
 
 ```bash
-cargo test projection_select_with_change_op select_sql_filtered_by_change_op
+cargo test projection_select_with_change_op
 ```
 
-Expected: both tests pass.
+Expected: test passes.
 
 - [ ] **Step 8: Commit**
 
@@ -1082,7 +1049,318 @@ git add src/connector/starrocks/managed/ivm_delta_source.rs src/connector/starro
 git commit -m "feat(ivm): add tagged iceberg delta source"
 ```
 
-## Task 6: Consume Delta Source in Managed MV Refresh
+## Task 6: Add State-Aware Aggregate Delta Rewrite
+
+**Files:**
+- Create: `src/connector/starrocks/managed/ivm_delta_aggregate.rs`
+- Modify: `src/connector/starrocks/managed/mod.rs`
+
+- [ ] **Step 1: Create the module skeleton**
+
+Create `src/connector/starrocks/managed/ivm_delta_aggregate.rs`:
+
+```rust
+use crate::connector::starrocks::managed::mv_shape::{
+    AggregateFunctionKind, AggregateInput, AggregateMvShape,
+};
+
+const CHANGE_OP_COLUMN: &str = crate::exec::change_op::CHANGE_OP_COLUMN;
+
+pub(crate) fn rewrite_select_sql_for_signed_delta_state(
+    select_sql: &str,
+    shape: &AggregateMvShape,
+) -> Result<String, String> {
+    reject_unsupported_delta_aggregates(shape)?;
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("rewrite signed delta aggregate normalize error: {e}"))?;
+    let mut stmt = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("rewrite signed delta aggregate parse error: {e}"))?;
+    let sqlparser::ast::Statement::Query(query) = &mut stmt else {
+        return Err("rewrite signed delta aggregate: expected Query statement".to_string());
+    };
+    let sqlparser::ast::SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("rewrite signed delta aggregate: expected SELECT body".to_string());
+    };
+    select.projection = build_signed_state_projection(shape)?;
+    Ok(stmt.to_string())
+}
+```
+
+- [ ] **Step 2: Reject non-reversible aggregate functions**
+
+Add:
+
+```rust
+fn reject_unsupported_delta_aggregates(shape: &AggregateMvShape) -> Result<(), String> {
+    for aggregate in &shape.aggregates {
+        if matches!(
+            aggregate.function,
+            AggregateFunctionKind::Min | AggregateFunctionKind::Max
+        ) {
+            return Err(
+                "MIN/MAX aggregate cannot consume delete-bearing delta state incrementally"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+```
+
+The caller should convert this error to full refresh or an existing unsupported policy, matching current MIN/MAX delete-retract behavior.
+
+- [ ] **Step 3: Build signed state projection**
+
+Add:
+
+```rust
+fn build_signed_state_projection(
+    shape: &AggregateMvShape,
+) -> Result<Vec<sqlparser::ast::SelectItem>, String> {
+    let mut projection = Vec::with_capacity(shape.visible_outputs.len() + shape.aggregates.len());
+    for visible in &shape.visible_outputs {
+        match visible {
+            crate::connector::starrocks::managed::mv_shape::VisibleAggregateOutput::GroupKey(idx) => {
+                let group_key = shape.group_keys.get(*idx).ok_or_else(|| {
+                    format!("group key index {idx} out of range for signed delta aggregate")
+                })?;
+                projection.push(sqlparser::ast::SelectItem::ExprWithAlias {
+                    expr: group_key.expr.clone(),
+                    alias: sqlparser::ast::Ident::new(group_key.output_name.clone()),
+                });
+            }
+            crate::connector::starrocks::managed::mv_shape::VisibleAggregateOutput::Aggregate(idx) => {
+                let aggregate = shape.aggregates.get(*idx).ok_or_else(|| {
+                    format!("aggregate index {idx} out of range for signed delta aggregate")
+                })?;
+                append_signed_aggregate_items(&mut projection, aggregate)?;
+            }
+        }
+    }
+    Ok(projection)
+}
+```
+
+- [ ] **Step 4: Rewrite supported aggregate calls**
+
+Add:
+
+```rust
+fn append_signed_aggregate_items(
+    projection: &mut Vec<sqlparser::ast::SelectItem>,
+    aggregate: &crate::connector::starrocks::managed::mv_shape::AggregateCallShape,
+) -> Result<(), String> {
+    match aggregate.function {
+        AggregateFunctionKind::Count => {
+            projection.push(make_aggregate_select_item(
+                "SUM",
+                count_delta_expr(&aggregate.input)?,
+                &aggregate.output_name,
+            ));
+        }
+        AggregateFunctionKind::Sum => {
+            let expr = aggregate_expr(&aggregate.input, "SUM")?;
+            projection.push(make_aggregate_select_item(
+                "SUM",
+                signed_expr(expr),
+                &aggregate.output_name,
+            ));
+        }
+        AggregateFunctionKind::Avg => {
+            let expr = aggregate_expr(&aggregate.input, "AVG")?;
+            let sanitized =
+                crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name(
+                    &aggregate.output_name,
+                );
+            projection.push(make_aggregate_select_item(
+                "SUM",
+                signed_expr(expr.clone()),
+                &format!("__agg_state_{sanitized}__sum"),
+            ));
+            projection.push(make_aggregate_select_item(
+                "SUM",
+                count_delta_expr(&aggregate.input)?,
+                &format!("__agg_state_{sanitized}__count"),
+            ));
+        }
+        AggregateFunctionKind::Min | AggregateFunctionKind::Max => {
+            return Err("MIN/MAX aggregate cannot consume signed delta state".to_string());
+        }
+    }
+    Ok(())
+}
+```
+
+Use helper expressions:
+
+```rust
+fn aggregate_expr(
+    input: &AggregateInput,
+    function_name: &str,
+) -> Result<sqlparser::ast::Expr, String> {
+    match input {
+        AggregateInput::Expr(expr) => Ok(expr.as_ref().clone()),
+        AggregateInput::Star => Err(format!("{function_name} aggregate requires an expression")),
+    }
+}
+
+fn change_op_expr() -> sqlparser::ast::Expr {
+    sqlparser::ast::Expr::Identifier(sqlparser::ast::Ident::new(CHANGE_OP_COLUMN))
+}
+
+fn signed_expr(expr: sqlparser::ast::Expr) -> sqlparser::ast::Expr {
+    sqlparser::ast::Expr::BinaryOp {
+        left: Box::new(expr),
+        op: sqlparser::ast::BinaryOperator::Multiply,
+        right: Box::new(change_op_expr()),
+    }
+}
+
+fn count_delta_expr(input: &AggregateInput) -> Result<sqlparser::ast::Expr, String> {
+    match input {
+        AggregateInput::Star => Ok(change_op_expr()),
+        AggregateInput::Expr(expr) => Ok(sqlparser::ast::Expr::Case {
+            case_token: None,
+            end_token: None,
+            operand: None,
+            conditions: vec![sqlparser::ast::CaseWhen {
+                condition: sqlparser::ast::Expr::IsNotNull(Box::new(expr.as_ref().clone())),
+                result: change_op_expr(),
+            }],
+            else_result: Some(Box::new(sqlparser::ast::Expr::Value(
+                sqlparser::ast::Value::Number("0".to_string(), false).into(),
+            ))),
+        }),
+    }
+}
+```
+
+Use the existing `make_aggregate_select_item` shape from `mv_shape.rs`. If it is private, either make it `pub(crate)` or copy the small helper into `ivm_delta_aggregate.rs`:
+
+```rust
+fn make_aggregate_select_item(
+    func_name: &str,
+    arg_expr: sqlparser::ast::Expr,
+    alias: &str,
+) -> sqlparser::ast::SelectItem {
+    sqlparser::ast::SelectItem::ExprWithAlias {
+        expr: sqlparser::ast::Expr::Function(sqlparser::ast::Function {
+            name: sqlparser::ast::ObjectName(vec![sqlparser::ast::ObjectNamePart::Identifier(
+                sqlparser::ast::Ident::new(func_name),
+            )]),
+            args: sqlparser::ast::FunctionArguments::List(
+                sqlparser::ast::FunctionArgumentList {
+                    duplicate_treatment: None,
+                    args: vec![sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
+                    )],
+                    clauses: vec![],
+                },
+            ),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: sqlparser::ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }),
+        alias: sqlparser::ast::Ident::new(alias),
+    }
+}
+```
+
+- [ ] **Step 5: Export the module**
+
+In `src/connector/starrocks/managed/mod.rs`:
+
+```rust
+pub(crate) mod ivm_delta_aggregate;
+```
+
+- [ ] **Step 6: Add rewrite tests**
+
+Add tests in `ivm_delta_aggregate.rs`:
+
+```rust
+#[test]
+fn signed_delta_rewrite_turns_sum_into_sum_times_change_op() {
+    let shape = parse_aggregate_shape(
+        "SELECT k, SUM(v) AS s FROM ice.ns.orders GROUP BY k",
+    );
+    let rewritten = rewrite_select_sql_for_signed_delta_state(
+        "SELECT k, SUM(v) AS s FROM ice.ns.orders GROUP BY k",
+        &shape,
+    )
+    .expect("rewrite");
+    assert!(rewritten.to_uppercase().contains("SUM(V * __CHANGE_OP)"), "{rewritten}");
+}
+
+#[test]
+fn signed_delta_rewrite_turns_count_star_into_sum_change_op() {
+    let shape = parse_aggregate_shape(
+        "SELECT k, COUNT(*) AS c FROM ice.ns.orders GROUP BY k",
+    );
+    let rewritten = rewrite_select_sql_for_signed_delta_state(
+        "SELECT k, COUNT(*) AS c FROM ice.ns.orders GROUP BY k",
+        &shape,
+    )
+    .expect("rewrite");
+    assert!(rewritten.to_uppercase().contains("SUM(__CHANGE_OP)"), "{rewritten}");
+}
+
+#[test]
+fn signed_delta_rewrite_expands_avg_to_signed_sum_and_count() {
+    let shape = parse_aggregate_shape(
+        "SELECT k, AVG(v) AS a FROM ice.ns.orders GROUP BY k",
+    );
+    let rewritten = rewrite_select_sql_for_signed_delta_state(
+        "SELECT k, AVG(v) AS a FROM ice.ns.orders GROUP BY k",
+        &shape,
+    )
+    .expect("rewrite");
+    let upper = rewritten.to_uppercase();
+    assert!(upper.contains("SUM(V * __CHANGE_OP)"), "{rewritten}");
+    assert!(upper.contains("__AGG_STATE_A__SUM"), "{rewritten}");
+    assert!(upper.contains("__AGG_STATE_A__COUNT"), "{rewritten}");
+}
+
+#[test]
+fn signed_delta_rewrite_rejects_min_max() {
+    let shape = parse_aggregate_shape(
+        "SELECT k, MIN(v) AS m FROM ice.ns.orders GROUP BY k",
+    );
+    let err = rewrite_select_sql_for_signed_delta_state(
+        "SELECT k, MIN(v) AS m FROM ice.ns.orders GROUP BY k",
+        &shape,
+    )
+    .expect_err("MIN must reject");
+    assert!(err.contains("MIN/MAX"), "err={err}");
+}
+```
+
+Implement `parse_aggregate_shape` inside the test module by parsing the SQL and calling `classify_incremental_mv_query`, then matching `IncrementalMvShape::Aggregate`.
+
+- [ ] **Step 7: Run focused tests**
+
+Run:
+
+```bash
+cargo test signed_delta_rewrite_turns_sum_into_sum_times_change_op
+cargo test signed_delta_rewrite_turns_count_star_into_sum_change_op
+cargo test signed_delta_rewrite_expands_avg_to_signed_sum_and_count
+cargo test signed_delta_rewrite_rejects_min_max
+```
+
+Expected: all pass.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add src/connector/starrocks/managed/ivm_delta_aggregate.rs src/connector/starrocks/managed/mod.rs
+git commit -m "feat(ivm): rewrite aggregate deltas as signed state"
+```
+
+## Task 7: Consume Delta Source in Managed MV Refresh
 
 **Files:**
 - Modify: `src/connector/starrocks/managed/mv_refresh.rs`
@@ -1190,43 +1468,26 @@ let source_files = super::ivm_delta_source::build_delta_source_files(
     ctx.change_batch,
     ctx.object_store_config,
 )?;
-let positive_sql = super::ivm_delta_source::select_sql_filtered_by_change_op(
-    &state_sql,
-    crate::exec::change_op::CHANGE_OP_INSERT,
-)?;
-let negative_sql = super::ivm_delta_source::select_sql_filtered_by_change_op(
-    &state_sql,
-    crate::exec::change_op::CHANGE_OP_DELETE,
-)?;
-let positive_result = super::ivm_delta_source::execute_delta_source_query(
-    ctx.to_delta_source_input(),
-    &positive_sql,
-    source_files.clone(),
-)?;
-let negative_result = super::ivm_delta_source::execute_delta_source_query(
-    ctx.to_delta_source_input(),
-    &negative_sql,
-    source_files,
-)?;
-```
-
-If cloning `source_files` is expensive because it includes a temp delete file path, derive `Clone` for `IvmDeltaSourceFiles`; it contains metadata strings, not open readers.
-
-Then reuse existing code:
-
-```rust
-let positive_chunks =
-    super::mv_agg_state::materialize_aggregate_result_chunks(positive_result, &layout, ctx.shape)?;
-let negative_chunks =
-    super::mv_agg_state::materialize_aggregate_result_chunks(negative_result, &layout, ctx.shape)?;
-let negative_chunks = super::mv_agg_state::negate_aggregate_state_chunks(
-    negative_chunks,
-    &layout,
+let signed_state_sql = super::ivm_delta_aggregate::rewrite_select_sql_for_signed_delta_state(
+    ctx.select_sql,
     ctx.shape,
 )?;
+let delta_result = super::ivm_delta_source::execute_delta_source_query(
+    ctx.to_delta_source_input(),
+    &signed_state_sql,
+    source_files,
+)?;
+let delta_chunks =
+    super::mv_agg_state::materialize_aggregate_result_chunks(delta_result, &layout, ctx.shape)?;
 ```
 
-- [ ] **Step 4: Keep old branch helpers only as compatibility**
+This path must not call `negate_aggregate_state_chunks`; the sign is already encoded in the delta-state SQL.
+
+- [ ] **Step 4: Preserve MIN/MAX fallback behavior**
+
+Before executing the signed delta query, keep the existing apply policy gate for delete-bearing changes and `MIN` / `MAX` aggregate state. If `rewrite_select_sql_for_signed_delta_state` returns the MIN/MAX retract error, route to `refresh_aggregate_mv_full` with the same style of tracing message used by the current apply-policy fallback.
+
+- [ ] **Step 5: Keep old branch helpers only as compatibility**
 
 Leave `materialize_iceberg_change_batch` and `IvmChangeStream` in place if other call sites still use them, but add a code comment above their managed MV call sites if any remain:
 
@@ -1235,7 +1496,7 @@ Leave `materialize_iceberg_change_batch` and `IvmChangeStream` in place if other
 // ivm_delta_source so change semantics enter through a tagged scan/source.
 ```
 
-- [ ] **Step 5: Run focused MV unit tests**
+- [ ] **Step 6: Run focused MV unit tests**
 
 Run:
 
@@ -1243,18 +1504,19 @@ Run:
 cargo test projection_delete_bearing_change_applies_deletes_before_upserts
 cargo test aggregate_mv_incremental_refresh_handles_base_delete
 cargo test aggregate_mv_incremental_refresh_treats_deleted_data_files_as_delete_bearing
+cargo test signed_delta_rewrite_turns_sum_into_sum_times_change_op
 ```
 
 Expected: all pass or skip only for existing unavailable object-store guards.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/connector/starrocks/managed/mv_refresh.rs src/connector/starrocks/managed/mv_refresh_iceberg.rs
-git commit -m "feat(ivm): consume tagged delta source in mv refresh"
+git commit -m "feat(ivm): consume signed delta state in mv refresh"
 ```
 
-## Task 7: End-to-End SQL Verification
+## Task 8: End-to-End SQL Verification
 
 **Files:**
 - Create: `sql-tests/iceberg-rest/sql/iceberg_rest_ivm_change_op_delta_source.sql`
@@ -1385,7 +1647,7 @@ git add tests/sql
 git commit -m "test(ivm): verify tagged delta source refresh"
 ```
 
-## Task 8: Full Local Validation
+## Task 9: Full Local Validation
 
 **Files:**
 - No code changes expected.
@@ -1418,6 +1680,7 @@ Run:
 cargo test change_op
 cargo test hdfs_scan
 cargo test ivm_delta_source
+cargo test signed_delta_rewrite
 cargo test aggregate_mv_incremental_refresh_handles_base_delete
 cargo test aggregate_mv_incremental_refresh_treats_deleted_data_files_as_delete_bearing
 ```
@@ -1453,4 +1716,5 @@ git commit -m "chore(ivm): finalize change-op delta source"
 - Do not treat missing `__change_op` as insert. Missing tags are correctness failures.
 - Do not copy StarRocks append-only `__ACTION__ = 0` behavior. NovaRocks needs `+1` and `-1` for COW/update/delete.
 - Keep delete-before-upsert ordering in projection MV writes after splitting tagged chunks.
-- Keep aggregate negation after source consumption. This plan standardizes the source boundary; it does not require a fully generic retractable aggregate engine in this PR.
+- Aggregate MV refresh must not call `negate_aggregate_state_chunks` for supported `COUNT` / `SUM` / `AVG` delta refresh. The signed delta-state SQL already encodes delete rows as negative contributions.
+- Keep `MIN` / `MAX` on the existing fallback or reject path when delete-bearing changes are present.
