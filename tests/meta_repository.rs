@@ -557,11 +557,10 @@ fn mv_repository_rejects_stale_target_lookup_without_deleting_wrong_definition()
     }
 
     let read = provider.begin_read()?;
-    assert!(
-        repository
-            .find_by_target(read.as_ref(), "ice", "ns", "orders_mv")?
-            .is_some()
-    );
+    let err = repository
+        .find_by_target(read.as_ref(), "ice", "ns", "orders_mv")
+        .expect_err("mismatched lookup read should be rejected");
+    assert_eq!(err.kind(), RepositoryErrorKind::Provider);
     assert!(repository.load_by_id(read.as_ref(), mv_id)?.is_some());
     assert!(
         repository

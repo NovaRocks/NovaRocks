@@ -199,7 +199,9 @@ impl MvMetaRepository {
             MV_TARGET_LOOKUP_KIND,
             MV_TARGET_LOOKUP_SCHEMA_VERSION,
         )?;
-        self.load_by_id(txn, lookup.mv_id)
+        let definition =
+            self.load_target_lookup_definition(txn, &lookup, catalog, namespace, table)?;
+        Ok(Some(definition.value))
     }
 
     pub fn drop_by_target(
@@ -218,23 +220,8 @@ impl MvMetaRepository {
             MV_TARGET_LOOKUP_KIND,
             MV_TARGET_LOOKUP_SCHEMA_VERSION,
         )?;
-        let definition = self
-            .load_versioned_by_id(txn, lookup.mv_id)?
-            .ok_or_else(|| {
-                RepositoryError::not_found(format!("mv definition {} not found", lookup.mv_id))
-            })?;
-        if !definition_target_matches(&definition.value, catalog, namespace, table) {
-            return Err(RepositoryError::provider(format!(
-                "mv target lookup {}/{}/{} points to definition {} with target {:?}.{:?}.{:?}",
-                normalize_lookup_name(catalog),
-                normalize_lookup_name(namespace),
-                normalize_lookup_name(table),
-                definition.value.mv_id,
-                definition.value.target_catalog,
-                definition.value.target_namespace,
-                definition.value.target_table
-            )));
-        }
+        let definition =
+            self.load_target_lookup_definition(txn, &lookup, catalog, namespace, table)?;
         if definition.value.refresh_in_progress || definition.value.active_refresh_id.is_some() {
             return Err(RepositoryError::conflict(format!(
                 "mv definition {} has refresh in progress",
@@ -248,6 +235,34 @@ impl MvMetaRepository {
             ExpectedRevision::Exact(definition.record_revision),
         )?;
         Ok(true)
+    }
+
+    fn load_target_lookup_definition(
+        &self,
+        txn: &dyn MetaReadTxn,
+        lookup: &MvTargetLookup,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> RepositoryResult<VersionedMvDefinition> {
+        let definition = self
+            .load_versioned_by_id(txn, lookup.mv_id)?
+            .ok_or_else(|| {
+                RepositoryError::provider(format!("mv definition {} not found", lookup.mv_id))
+            })?;
+        if !definition_target_matches(&definition.value, catalog, namespace, table) {
+            return Err(RepositoryError::provider(format!(
+                "mv target lookup {}/{}/{} points to definition {} with target {:?}.{:?}.{:?}",
+                normalize_lookup_name(catalog),
+                normalize_lookup_name(namespace),
+                normalize_lookup_name(table),
+                definition.value.mv_id,
+                definition.value.target_catalog,
+                definition.value.target_namespace,
+                definition.value.target_table
+            )));
+        }
+        Ok(definition)
     }
 
     pub fn begin_refresh_intent(
