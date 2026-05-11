@@ -218,9 +218,35 @@ impl MvMetaRepository {
             MV_TARGET_LOOKUP_KIND,
             MV_TARGET_LOOKUP_SCHEMA_VERSION,
         )?;
+        let definition = self
+            .load_versioned_by_id(txn, lookup.mv_id)?
+            .ok_or_else(|| {
+                RepositoryError::not_found(format!("mv definition {} not found", lookup.mv_id))
+            })?;
+        if !definition_target_matches(&definition.value, catalog, namespace, table) {
+            return Err(RepositoryError::provider(format!(
+                "mv target lookup {}/{}/{} points to definition {} with target {:?}.{:?}.{:?}",
+                normalize_lookup_name(catalog),
+                normalize_lookup_name(namespace),
+                normalize_lookup_name(table),
+                definition.value.mv_id,
+                definition.value.target_catalog,
+                definition.value.target_namespace,
+                definition.value.target_table
+            )));
+        }
+        if definition.value.refresh_in_progress || definition.value.active_refresh_id.is_some() {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {} has refresh in progress",
+                definition.value.mv_id
+            )));
+        }
 
         txn.delete(&target_key, ExpectedRevision::Exact(record.revision))?;
-        txn.delete(&key_by_id(lookup.mv_id)?, ExpectedRevision::Any)?;
+        txn.delete(
+            &key_by_id(lookup.mv_id)?,
+            ExpectedRevision::Exact(definition.record_revision),
+        )?;
         Ok(true)
     }
 
@@ -434,6 +460,29 @@ where
 
 fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {
     Ok(MetaRecordKind::new(value)?)
+}
+
+fn definition_target_matches(
+    definition: &StoredMvDefinition,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> bool {
+    definition
+        .target_catalog
+        .as_deref()
+        .map(normalize_lookup_name)
+        == Some(normalize_lookup_name(catalog))
+        && definition
+            .target_namespace
+            .as_deref()
+            .map(normalize_lookup_name)
+            == Some(normalize_lookup_name(namespace))
+        && definition
+            .target_table
+            .as_deref()
+            .map(normalize_lookup_name)
+            == Some(normalize_lookup_name(table))
 }
 
 fn key_by_id(mv_id: i64) -> RepositoryResult<MetaKey> {

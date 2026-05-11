@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::meta::keys::{NS_ICEBERG_CATALOG, normalize_lookup_name};
 use crate::meta::repository::mv::MvMetaRepository;
-use crate::meta::repository::{RepositoryResult, encode_json_payload};
+use crate::meta::repository::{
+    RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload,
+};
 use crate::meta::{
-    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecordKind, MetaRecordPut, MetaWriteTxn,
+    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecord, MetaRecordKind, MetaRecordPut, MetaWriteTxn,
 };
 
 const ICEBERG_CATALOG_KIND: &str = "iceberg.catalog";
@@ -52,7 +54,11 @@ impl IcebergCatalogMetaRepository {
     }
 
     pub fn catalog_exists(&self, txn: &dyn MetaReadTxn, catalog: &str) -> RepositoryResult<bool> {
-        Ok(txn.get(&key_catalog(catalog)?)?.is_some())
+        let Some(record) = txn.get(&key_catalog(catalog)?)? else {
+            return Ok(false);
+        };
+        decode_catalog_record(&record)?;
+        Ok(true)
     }
 
     pub fn upsert_namespace(
@@ -80,7 +86,11 @@ impl IcebergCatalogMetaRepository {
         catalog: &str,
         namespace: &str,
     ) -> RepositoryResult<bool> {
-        Ok(txn.get(&key_namespace(catalog, namespace)?)?.is_some())
+        let Some(record) = txn.get(&key_namespace(catalog, namespace)?)? else {
+            return Ok(false);
+        };
+        decode_namespace_record(&record)?;
+        Ok(true)
     }
 
     pub fn upsert_table(
@@ -111,7 +121,11 @@ impl IcebergCatalogMetaRepository {
         namespace: &str,
         table: &str,
     ) -> RepositoryResult<bool> {
-        Ok(txn.get(&key_table(catalog, namespace, table)?)?.is_some())
+        let Some(record) = txn.get(&key_table(catalog, namespace, table)?)? else {
+            return Ok(false);
+        };
+        decode_table_record(&record)?;
+        Ok(true)
     }
 
     pub fn delete_table_and_mv_relationships(
@@ -122,13 +136,54 @@ impl IcebergCatalogMetaRepository {
         namespace: &str,
         table: &str,
     ) -> RepositoryResult<()> {
+        mv_repo.drop_by_target(txn, catalog, namespace, table)?;
         txn.delete(
             &key_table(catalog, namespace, table)?,
             ExpectedRevision::Any,
         )?;
-        mv_repo.drop_by_target(txn, catalog, namespace, table)?;
         Ok(())
     }
+}
+
+fn decode_catalog_record(record: &MetaRecord) -> RepositoryResult<IcebergCatalogProperties> {
+    decode_record_payload(record, ICEBERG_CATALOG_KIND, ICEBERG_CATALOG_SCHEMA_VERSION)
+}
+
+fn decode_namespace_record(record: &MetaRecord) -> RepositoryResult<IcebergNamespaceRecord> {
+    decode_record_payload(
+        record,
+        ICEBERG_NAMESPACE_KIND,
+        ICEBERG_NAMESPACE_SCHEMA_VERSION,
+    )
+}
+
+fn decode_table_record(record: &MetaRecord) -> RepositoryResult<IcebergTableRecord> {
+    decode_record_payload(record, ICEBERG_TABLE_KIND, ICEBERG_TABLE_SCHEMA_VERSION)
+}
+
+fn decode_record_payload<T>(
+    record: &MetaRecord,
+    expected_kind: &str,
+    expected_schema_version: i32,
+) -> RepositoryResult<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if record.kind.as_str() != expected_kind {
+        return Err(RepositoryError::provider(format!(
+            "metadata record {} has kind {}, expected {expected_kind}",
+            record.key.canonical_path(),
+            record.kind.as_str()
+        )));
+    }
+    if record.payload.schema_version != expected_schema_version {
+        return Err(RepositoryError::provider(format!(
+            "metadata record {} has schema version {}, expected {expected_schema_version}",
+            record.key.canonical_path(),
+            record.payload.schema_version
+        )));
+    }
+    decode_json_payload(&record.payload)
 }
 
 fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {

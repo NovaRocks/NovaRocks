@@ -6,7 +6,7 @@ use novarocks::meta::repository::iceberg_catalog::{
 };
 use novarocks::meta::repository::mv::{
     CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
-    RefreshExternalOutcome,
+    MvTargetLookup, RefreshExternalOutcome,
 };
 use novarocks::meta::repository::{
     RepositoryError, RepositoryErrorKind, decode_json_payload, encode_json_payload, id_scopes,
@@ -438,6 +438,232 @@ fn iceberg_catalog_repository_deletes_table_and_related_mv_lookup()
         mv_repo
             .find_by_target(read.as_ref(), "ice", "ns", "orders_mv")?
             .is_none()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn iceberg_catalog_repository_rejects_delete_when_target_mv_refresh_is_active()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let catalog_repo = IcebergCatalogMetaRepository::default();
+    let mv_repo = MvMetaRepository::default();
+
+    let mv_id = {
+        let mut txn = provider.begin_write("seed active mv target")?;
+        catalog_repo.upsert_catalog(
+            txn.as_mut(),
+            "ice",
+            IcebergCatalogProperties {
+                properties: vec![("type".to_string(), "rest".to_string())],
+            },
+        )?;
+        catalog_repo.upsert_namespace(txn.as_mut(), "ice", "ns")?;
+        catalog_repo.upsert_table(txn.as_mut(), "ice", "ns", "orders_mv")?;
+        let definition = mv_repo.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id, amount FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("ns".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                created_at_ms: 11,
+            },
+        )?;
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    {
+        let mut txn = provider.begin_write("begin mv refresh")?;
+        let mut target_snapshots = BTreeMap::new();
+        target_snapshots.insert("ice.ns.orders_mv".to_string(), 100);
+        mv_repo.begin_refresh_intent(txn.as_mut(), mv_id, target_snapshots)?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("delete active mv target")?;
+        let err = catalog_repo
+            .delete_table_and_mv_relationships(txn.as_mut(), &mv_repo, "ICE", "NS", "ORDERS_MV")
+            .expect_err("active refresh should block target deletion");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    let read = provider.begin_read()?;
+    assert!(catalog_repo.table_exists(read.as_ref(), "ICE", "ns", "ORDERS_MV")?);
+    assert!(
+        mv_repo
+            .find_by_target(read.as_ref(), "ice", "ns", "orders_mv")?
+            .is_some()
+    );
+    let definition = mv_repo
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should be preserved");
+    assert!(definition.refresh_in_progress);
+    assert!(definition.active_refresh_id.is_some());
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_rejects_stale_target_lookup_without_deleting_wrong_definition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let mv_id = {
+        let mut txn = provider.begin_write("seed mismatched mv lookup")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id, amount FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("ns".to_string()),
+                target_table: Some("other_mv".to_string()),
+                created_at_ms: 11,
+            },
+        )?;
+        txn.put(MetaRecordPut::new(
+            MetaKey::new("mv", ["by-target", "ice", "ns", "orders_mv"])?,
+            MetaRecordKind::new("mv.target_lookup")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(
+                1,
+                &MvTargetLookup {
+                    mv_id: definition.mv_id,
+                },
+            )?,
+        ))?;
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    {
+        let mut txn = provider.begin_write("drop stale target lookup")?;
+        let err = repository
+            .drop_by_target(txn.as_mut(), "ice", "ns", "orders_mv")
+            .expect_err("mismatched lookup should be rejected");
+        assert_eq!(err.kind(), RepositoryErrorKind::Provider);
+    }
+
+    let read = provider.begin_read()?;
+    assert!(
+        repository
+            .find_by_target(read.as_ref(), "ice", "ns", "orders_mv")?
+            .is_some()
+    );
+    assert!(repository.load_by_id(read.as_ref(), mv_id)?.is_some());
+    assert!(
+        repository
+            .find_by_target(read.as_ref(), "ice", "ns", "other_mv")?
+            .is_some()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn iceberg_catalog_repository_rejects_wrong_kind_and_schema_in_exists_apis()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergCatalogMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("write invalid iceberg metadata records")?;
+        txn.put(MetaRecordPut::new(
+            MetaKey::new("iceberg_catalog", ["catalog", "ice"])?,
+            MetaRecordKind::new("iceberg.namespace")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(
+                1,
+                &IcebergCatalogProperties {
+                    properties: vec![("type".to_string(), "rest".to_string())],
+                },
+            )?,
+        ))?;
+        txn.put(MetaRecordPut::new(
+            MetaKey::new("iceberg_catalog", ["namespace", "ice", "bad_schema"])?,
+            MetaRecordKind::new("iceberg.namespace")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(
+                999,
+                &serde_json::json!({
+                    "catalog": "ice",
+                    "namespace": "bad_schema"
+                }),
+            )?,
+        ))?;
+        txn.put(MetaRecordPut::new(
+            MetaKey::new("iceberg_catalog", ["table", "ice", "ns", "orders"])?,
+            MetaRecordKind::new("iceberg.catalog")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(
+                1,
+                &serde_json::json!({
+                    "catalog": "ice",
+                    "namespace": "ns",
+                    "table": "orders"
+                }),
+            )?,
+        ))?;
+        txn.put(MetaRecordPut::new(
+            MetaKey::new("iceberg_catalog", ["table", "ice", "ns", "bad_schema"])?,
+            MetaRecordKind::new("iceberg.table_registration")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(
+                999,
+                &serde_json::json!({
+                    "catalog": "ice",
+                    "namespace": "ns",
+                    "table": "bad_schema"
+                }),
+            )?,
+        ))?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let err = repository
+        .catalog_exists(read.as_ref(), "ice")
+        .expect_err("wrong catalog kind should fail");
+    assert!(
+        err.to_string()
+            .contains("metadata record catalog/ice has kind iceberg.namespace")
+    );
+
+    let err = repository
+        .namespace_exists(read.as_ref(), "ice", "bad_schema")
+        .expect_err("wrong namespace schema should fail");
+    assert!(
+        err.to_string()
+            .contains("metadata record namespace/ice/bad_schema has schema version 999")
+    );
+
+    let err = repository
+        .table_exists(read.as_ref(), "ice", "ns", "orders")
+        .expect_err("wrong table kind should fail");
+    assert!(
+        err.to_string()
+            .contains("metadata record table/ice/ns/orders has kind iceberg.catalog")
+    );
+
+    let err = repository
+        .table_exists(read.as_ref(), "ice", "ns", "bad_schema")
+        .expect_err("wrong table schema should fail");
+    assert!(
+        err.to_string()
+            .contains("metadata record table/ice/ns/bad_schema has schema version 999")
     );
 
     Ok(())
