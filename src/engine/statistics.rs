@@ -8,7 +8,7 @@ use regex::Regex;
 use sqlparser::ast as sqlast;
 
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
-use crate::sql::parser::ast::{Expr, InsertSource, Literal, ObjectName, OverwriteMode};
+use crate::sql::parser::ast::{InsertSource, Literal, ObjectName, OverwriteMode};
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct TableKey {
@@ -895,7 +895,6 @@ fn observe_test_overwrite_stats_table(
         drop_column_stats_only(state, key);
     }
     let max = match source {
-        InsertSource::GenerateSeriesSelect(series) => series.end.to_string(),
         InsertSource::SelectLiteralRow(row) => row
             .first()
             .map(literal_to_stat_value)
@@ -1686,17 +1685,6 @@ fn estimated_source_row_count(source: &InsertSource) -> i64 {
     match source {
         InsertSource::Values(rows) => rows.len() as i64,
         InsertSource::SelectLiteralRow(_) => 1,
-        InsertSource::GenerateSeriesSelect(series) => {
-            if series.step == 0 {
-                0
-            } else if series.step > 0 && series.start <= series.end {
-                ((series.end - series.start) / series.step) + 1
-            } else if series.step < 0 && series.start >= series.end {
-                ((series.start - series.end) / series.step.abs()) + 1
-            } else {
-                0
-            }
-        }
         InsertSource::UnionAll(parts) => parts.iter().map(estimated_source_row_count).sum(),
         InsertSource::FromQuery(_) => 0,
     }
@@ -1728,12 +1716,6 @@ fn estimate_column_min_max(
                 (value.clone(), value)
             })
             .unwrap_or_default(),
-        InsertSource::GenerateSeriesSelect(series) => {
-            let Some(expr) = series.projection.get(column_idx) else {
-                return (String::new(), String::new());
-            };
-            estimate_generate_expr_min_max(expr, series.start, series.end, data_type)
-        }
         InsertSource::UnionAll(parts) => {
             let mut mins = Vec::new();
             let mut maxes = Vec::new();
@@ -1757,66 +1739,6 @@ fn estimate_column_min_max(
     }
 }
 
-fn estimate_generate_expr_min_max(
-    expr: &Expr,
-    start: i64,
-    end: i64,
-    data_type: &DataType,
-) -> (String, String) {
-    match expr {
-        Expr::Column(_) => (start.min(end).to_string(), start.max(end).to_string()),
-        Expr::Literal(literal) => {
-            let mut value = literal_to_stat_value(literal);
-            if matches!(data_type, DataType::Timestamp(_, _)) && value.len() == 10 {
-                value.push_str(" 00:00:00");
-            }
-            (value.clone(), value)
-        }
-        Expr::Cast { expr, .. } => estimate_generate_expr_min_max(expr, start, end, data_type),
-        Expr::ScalarFunction(func) if func.name.eq_ignore_ascii_case("date_add") => {
-            if func.args.len() == 2
-                && let Expr::Literal(Literal::String(base) | Literal::Date(base)) = &func.args[0]
-            {
-                return (
-                    add_days(base, start.min(end)).unwrap_or_default(),
-                    add_days(base, start.max(end)).unwrap_or_default(),
-                );
-            }
-            (String::new(), String::new())
-        }
-        Expr::ScalarFunction(func) if func.name.eq_ignore_ascii_case("minutes_add") => {
-            if func.args.len() == 2
-                && let Expr::Literal(Literal::String(base) | Literal::Date(base)) = &func.args[0]
-            {
-                return (
-                    add_minutes(base, start.min(end)).unwrap_or_default(),
-                    add_minutes(base, start.max(end)).unwrap_or_default(),
-                );
-            }
-            (String::new(), String::new())
-        }
-        _ => (String::new(), String::new()),
-    }
-}
-
-fn add_days(base: &str, days: i64) -> Option<String> {
-    let date = chrono::NaiveDate::parse_from_str(base, "%Y-%m-%d").ok()?;
-    Some(
-        (date + chrono::Duration::days(days))
-            .format("%Y-%m-%d")
-            .to_string(),
-    )
-}
-
-fn add_minutes(base: &str, minutes: i64) -> Option<String> {
-    let dt = chrono::NaiveDateTime::parse_from_str(base, "%Y-%m-%d %H:%M:%S").ok()?;
-    Some(
-        (dt + chrono::Duration::minutes(minutes))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string(),
-    )
-}
-
 fn literal_to_stat_value(literal: &Literal) -> String {
     match literal {
         Literal::Null => String::new(),
@@ -1828,24 +1750,14 @@ fn literal_to_stat_value(literal: &Literal) -> String {
     }
 }
 
-fn partition_name_for_source(key: &TableKey, source: &InsertSource, column_idx: usize) -> String {
+fn partition_name_for_source(key: &TableKey, _source: &InsertSource, column_idx: usize) -> String {
     if key.table == "test_first_load" {
         return "p20200101".to_string();
     }
     if key.table == "expr_range_partitioned_table" && column_idx == 0 {
         return "p20240101".to_string();
     }
-    match source {
-        InsertSource::GenerateSeriesSelect(series)
-            if series
-                .projection
-                .first()
-                .is_some_and(|expr| matches!(expr, Expr::Literal(_))) =>
-        {
-            key.table.clone()
-        }
-        _ => key.table.clone(),
-    }
+    key.table.clone()
 }
 
 fn auto_analyze_type(source: &InsertSource) -> &'static str {
