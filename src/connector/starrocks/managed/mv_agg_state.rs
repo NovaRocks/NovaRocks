@@ -289,15 +289,14 @@ pub(crate) fn load_aggregate_physical_rows(
 pub(crate) fn load_aggregate_physical_rows_for_delta(
     chunks: &[Chunk],
     layout: &AggregateMvLayout,
-) -> Result<HashMap<String, AggregatePhysicalRow>, String> {
-    let mut rows = HashMap::new();
+) -> Result<Vec<AggregatePhysicalRow>, String> {
+    let mut rows = Vec::new();
     for chunk in chunks {
-        load_aggregate_physical_rows_from_batch(
+        rows.extend(load_aggregate_physical_rows_from_batch_owned(
             &chunk.batch,
             layout,
-            &mut rows,
             /* allow_negative_counts */ true,
-        )?;
+        )?);
     }
     Ok(rows)
 }
@@ -322,7 +321,7 @@ pub(crate) fn merge_aggregate_state_batches(
 ) -> Result<Vec<Chunk>, String> {
     let mut merged = old_rows.clone();
     let delta_rows = load_aggregate_physical_rows_for_delta(delta_chunks, layout)?;
-    for delta in delta_rows.into_values() {
+    for delta in delta_rows {
         let row = merged
             .entry(delta.row_id.clone())
             .or_insert_with(|| zero_base_row(&delta, layout));
@@ -2117,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_rejects_duplicate_delta_row_id() {
+    fn merge_combines_duplicate_delta_row_id() {
         let shape = test_shape();
         let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
         let delta = materialize_aggregate_result_chunks(
@@ -2137,9 +2136,89 @@ mod tests {
         )
         .expect("delta physical");
 
-        let err = merge_aggregate_state_batches(&HashMap::new(), &delta, &layout)
-            .expect_err("duplicate delta rejected");
-        assert!(err.contains("duplicate row id"), "err={err}");
+        let merged =
+            merge_aggregate_state_batches(&HashMap::new(), &delta, &layout).expect("merge");
+        let batch = &merged[0].batch;
+        let c = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("c");
+        let s = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("s");
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(c.value(0), 5);
+        assert_eq!(s.value(0), 70);
+    }
+
+    #[test]
+    fn merge_combines_insert_and_delete_delta_for_same_row_id() {
+        let shape = test_shape();
+        let layout = build_aggregate_mv_layout(&shape, &output_columns()).expect("layout");
+        let old = materialize_aggregate_result_chunks(
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![
+                    record_batch_to_chunk(visible_result_batch(vec![1], vec![3], vec![130]))
+                        .expect("old chunk"),
+                ],
+            },
+            &layout,
+            &shape,
+        )
+        .expect("old physical");
+        let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
+        let insert_delta = materialize_aggregate_result_chunks(
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![
+                    record_batch_to_chunk(visible_result_batch(vec![1], vec![2], vec![320]))
+                        .expect("insert chunk"),
+                ],
+            },
+            &layout,
+            &shape,
+        )
+        .expect("insert delta");
+        let delete_delta_positive = materialize_aggregate_result_chunks(
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![
+                    record_batch_to_chunk(visible_result_batch(vec![1], vec![3], vec![130]))
+                        .expect("delete chunk"),
+                ],
+            },
+            &layout,
+            &shape,
+        )
+        .expect("delete delta");
+        let delete_delta =
+            negate_aggregate_state_chunks(delete_delta_positive, &layout).expect("negate");
+        let mut delta = Vec::new();
+        delta.extend(insert_delta);
+        delta.extend(delete_delta);
+
+        let merged = merge_aggregate_state_batches(&old_rows, &delta, &layout)
+            .expect("same-row insert/delete delta should merge");
+        let batch = &merged[0].batch;
+        let c = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("c");
+        let s = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("s");
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(c.value(0), 2);
+        assert_eq!(s.value(0), 320);
     }
 
     #[test]

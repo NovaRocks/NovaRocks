@@ -151,41 +151,6 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
     }
 
     let mut changed_deletes: HashMap<u32, RoaringBitmap> = HashMap::new();
-    if let (Some(new_rowset), Some(rowset_id)) = (&maybe_new_rowset, rowset_id_for_append)
-        && new_rowset.num_rows.unwrap_or(0) > 0
-    {
-        let new_segment_keys = scan_rowset_primary_key_rows(
-            new_rowset,
-            rowset_id,
-            tablet_schema,
-            tablet_root_path,
-            s3_config,
-            &key_output_schema,
-        )?;
-        for segment in &new_segment_keys {
-            for (row_idx, key) in segment.keys.iter().enumerate() {
-                let row_id = u32::try_from(row_idx).map_err(|_| {
-                    format!(
-                        "row id overflow while applying primary key rowset: segment_id={}, row_index={}",
-                        segment.segment_id, row_idx
-                    )
-                })?;
-                if let Some(old_ref) = visible_index.insert(
-                    key.clone(),
-                    SegmentRowRef {
-                        segment_id: segment.segment_id,
-                        row_id,
-                    },
-                ) {
-                    changed_deletes
-                        .entry(old_ref.segment_id)
-                        .or_default()
-                        .insert(old_ref.row_id);
-                }
-            }
-        }
-    }
-
     if !op_write.dels.is_empty() {
         let delete_keys =
             load_delete_keys_from_op_write_files(op_write, tablet_root_path, &key_output_schema)?;
@@ -222,6 +187,41 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
                 delete_misses,
                 changed_deletes.len()
             );
+        }
+    }
+
+    if let (Some(new_rowset), Some(rowset_id)) = (&maybe_new_rowset, rowset_id_for_append)
+        && new_rowset.num_rows.unwrap_or(0) > 0
+    {
+        let new_segment_keys = scan_rowset_primary_key_rows(
+            new_rowset,
+            rowset_id,
+            tablet_schema,
+            tablet_root_path,
+            s3_config,
+            &key_output_schema,
+        )?;
+        for segment in &new_segment_keys {
+            for (row_idx, key) in segment.keys.iter().enumerate() {
+                let row_id = u32::try_from(row_idx).map_err(|_| {
+                    format!(
+                        "row id overflow while applying primary key rowset: segment_id={}, row_index={}",
+                        segment.segment_id, row_idx
+                    )
+                })?;
+                if let Some(old_ref) = visible_index.insert(
+                    key.clone(),
+                    SegmentRowRef {
+                        segment_id: segment.segment_id,
+                        row_id,
+                    },
+                ) {
+                    changed_deletes
+                        .entry(old_ref.segment_id)
+                        .or_default()
+                        .insert(old_ref.row_id);
+                }
+            }
         }
     }
 
@@ -1150,12 +1150,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        attach_op_write_delete_files_to_rowset, build_delvec_file_name,
-        build_metadata_object_store_profile, build_primary_key_output_schema,
-        decode_delete_keys_payload, decode_delvec_bitmap, encode_delvec_bitmap,
-        encode_primary_keys_from_batch, load_segment_delvec_bitmap, persist_delvec_updates,
-        scan_rowset_primary_key_rows,
+        apply_primary_key_write_log_to_metadata, attach_op_write_delete_files_to_rowset,
+        build_delvec_file_name, build_metadata_object_store_profile,
+        build_primary_key_output_schema, decode_delete_keys_payload, decode_delvec_bitmap,
+        encode_delvec_bitmap, encode_primary_keys_from_batch, load_segment_delvec_bitmap,
+        persist_delvec_updates, scan_rowset_primary_key_rows,
     };
+    use crate::connector::starrocks::lake::delete_payload_codec::encode_delete_keys_payload;
     use crate::formats::starrocks::writer::layout::{DATA_DIR, join_tablet_path};
     use crate::formats::starrocks::writer::{io::write_bytes, write_parquet_file};
     use crate::service::grpc_client::proto::starrocks::{
@@ -1497,6 +1498,172 @@ mod tests {
         assert_eq!(
             segment_keys[0].keys,
             vec![11_i64.to_le_bytes().to_vec(), 22_i64.to_le_bytes().to_vec()]
+        );
+    }
+
+    #[test]
+    fn primary_key_publish_applies_same_txn_delete_before_upsert_for_same_key() {
+        let tmp = tempdir().expect("create tempdir");
+        let root_path = tmp.path().to_string_lossy().to_string();
+        let data_dir = join_tablet_path(&root_path, DATA_DIR).expect("data dir");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let tablet_schema = TabletSchemaPb {
+            keys_type: Some(KeysType::PrimaryKeys as i32),
+            column: vec![
+                ColumnPb {
+                    unique_id: 0,
+                    name: Some("id".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(true),
+                    aggregation: None,
+                    is_nullable: Some(false),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+                ColumnPb {
+                    unique_id: 1,
+                    name: Some("amount".to_string()),
+                    r#type: "BIGINT".to_string(),
+                    is_key: Some(false),
+                    aggregation: None,
+                    is_nullable: Some(true),
+                    default_value: None,
+                    precision: None,
+                    frac: None,
+                    length: None,
+                    index_length: None,
+                    is_bf_column: None,
+                    referenced_column_id: None,
+                    referenced_column: None,
+                    has_bitmap_index: None,
+                    visible: None,
+                    children_columns: Vec::new(),
+                    is_auto_increment: Some(false),
+                    agg_state_desc: None,
+                },
+            ],
+            num_short_key_columns: Some(1),
+            num_rows_per_row_block: None,
+            bf_fpp: None,
+            next_column_unique_id: Some(2),
+            deprecated_is_in_memory: None,
+            deprecated_id: None,
+            compression_type: None,
+            sort_key_idxes: vec![0],
+            schema_version: Some(0),
+            sort_key_unique_ids: vec![0],
+            table_indices: Vec::new(),
+            compression_level: None,
+            id: Some(9101),
+        };
+
+        let old_segment_name = "old.parquet".to_string();
+        let old_segment_path =
+            join_tablet_path(&root_path, &format!("{DATA_DIR}/{old_segment_name}"))
+                .expect("old path");
+        let old_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![10_i64, 20_i64])) as Arc<dyn Array>,
+            ],
+        )
+        .expect("old batch");
+        let old_size = write_parquet_file(&old_segment_path, &old_batch).expect("write old");
+
+        let new_segment_name = "new.parquet".to_string();
+        let new_segment_path =
+            join_tablet_path(&root_path, &format!("{DATA_DIR}/{new_segment_name}"))
+                .expect("new path");
+        let new_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("amount", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as Arc<dyn Array>,
+                Arc::new(Int64Array::from(vec![10_i64, 25_i64])) as Arc<dyn Array>,
+            ],
+        )
+        .expect("new batch");
+        let new_size = write_parquet_file(&new_segment_path, &new_batch).expect("write new");
+
+        let delete_key_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as Arc<dyn Array>],
+        )
+        .expect("delete keys");
+        let delete_payload = encode_delete_keys_payload(&delete_key_batch).expect("encode deletes");
+        let delete_file_name = "same_txn_delete.del".to_string();
+        let delete_file_path =
+            join_tablet_path(&root_path, &format!("{DATA_DIR}/{delete_file_name}"))
+                .expect("delete path");
+        write_bytes(&delete_file_path, delete_payload).expect("write deletes");
+
+        let mut metadata = TabletMetadataPb {
+            id: Some(777),
+            rowsets: vec![RowsetMetadataPb {
+                id: Some(100),
+                segments: vec![old_segment_name],
+                num_rows: Some(2),
+                segment_size: vec![old_size],
+                version: Some(1),
+                ..Default::default()
+            }],
+            next_rowset_id: Some(200),
+            ..Default::default()
+        };
+        let op_write = txn_log_pb::OpWrite {
+            rowset: Some(RowsetMetadataPb {
+                segments: vec![new_segment_name],
+                num_rows: Some(2),
+                segment_size: vec![new_size],
+                version: Some(2),
+                ..Default::default()
+            }),
+            txn_meta: None,
+            dels: vec![delete_file_name],
+            rewrite_segments: Vec::new(),
+            del_encryption_metas: Vec::new(),
+            ssts: Vec::new(),
+            schema_key: None,
+        };
+
+        apply_primary_key_write_log_to_metadata(
+            &mut metadata,
+            &op_write,
+            9101,
+            &tablet_schema,
+            &root_path,
+            None,
+            2,
+            88,
+        )
+        .expect("apply pk write");
+
+        let old_delvec =
+            load_segment_delvec_bitmap(&metadata, &root_path, 100).expect("old delvec");
+        assert!(old_delvec.contains(0));
+        assert!(old_delvec.contains(1));
+        let new_delvec =
+            load_segment_delvec_bitmap(&metadata, &root_path, 200).expect("new delvec");
+        assert!(
+            new_delvec.is_empty(),
+            "same-txn deletes must not retract rows inserted later in the same write"
         );
     }
 }
