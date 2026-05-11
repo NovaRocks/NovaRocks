@@ -70,13 +70,11 @@ pub(crate) fn run_insert(
                 target.backend_name
             ));
         }
-        // UnionAll and GenerateSeriesSelect are not supported for branch writes.
-        if matches!(
-            source,
-            InsertSource::UnionAll(_) | InsertSource::GenerateSeriesSelect(_)
-        ) {
+        // UnionAll is not supported for branch writes.
+        if matches!(source, InsertSource::UnionAll(_)) {
             return Err(
-                "iceberg ref: branch-qualified INSERT does not support UNION ALL or generate_series sources".to_string()
+                "iceberg ref: branch-qualified INSERT does not support UNION ALL sources"
+                    .to_string(),
             );
         }
     }
@@ -134,11 +132,6 @@ pub(crate) fn run_insert(
             let reordered =
                 reorder_insert_rows(std::slice::from_ref(row), columns, &resolved.columns)?;
             sink.append_rows(&resolved, &reordered)?;
-        }
-        InsertSource::GenerateSeriesSelect(source) => {
-            crate::engine::generate_series::insert_generate_series_rows_by_backend(
-                state, &target, &resolved, source, columns,
-            )?;
         }
         InsertSource::UnionAll(parts) => {
             for part in parts {

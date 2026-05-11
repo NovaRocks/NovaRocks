@@ -17,16 +17,14 @@ use crate::engine::{
 };
 use crate::sql::catalog::LegacyRangePartition;
 use crate::sql::parser::ast::{
-    CreateTableKind, DefaultLiteral, Expr, GenerateSeriesSelect, InsertSource, Literal, ObjectName,
-    SqlType,
+    CreateTableKind, DefaultLiteral, InsertSource, Literal, ObjectName, SqlType,
 };
 use crate::sql::parser::dialect::StarRocksDialect;
 use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::Token;
 
-use super::generate_series::parse_generate_series_function_expr;
-use super::sql_expr::{sqlparser_expr_to_custom_expr, sqlparser_expr_to_literal};
+use super::sql_expr::sqlparser_expr_to_literal;
 
 fn convert_set_expr_to_insert_source(
     body: &sqlparser::ast::SetExpr,
@@ -53,40 +51,8 @@ fn convert_set_expr_to_insert_source(
                     .map(|expr| expr.and_then(sqlparser_expr_to_literal))
                     .collect::<Result<_, _>>()?;
                 Ok(InsertSource::SelectLiteralRow(row))
-            } else if select.from.len() == 1 {
-                let table_with_joins = &select.from[0];
-                if table_with_joins.joins.is_empty() {
-                    if let sqlparser::ast::TableFactor::TableFunction {
-                        ref expr,
-                        ref alias,
-                    } = table_with_joins.relation
-                    {
-                        let (start, end, step) = parse_generate_series_function_expr(expr)?;
-                        let column_name = alias
-                            .as_ref()
-                            .and_then(|a| a.columns.first().map(|c| c.name.value.clone()))
-                            .unwrap_or_else(|| "generate_series".to_string());
-                        let projection: Vec<Expr> = select
-                            .projection
-                            .iter()
-                            .map(select_item_expr)
-                            .map(|expr| expr.and_then(sqlparser_expr_to_custom_expr))
-                            .collect::<Result<_, _>>()?;
-                        Ok(InsertSource::GenerateSeriesSelect(GenerateSeriesSelect {
-                            column_name,
-                            start,
-                            end,
-                            step,
-                            projection,
-                        }))
-                    } else {
-                        Err("unsupported INSERT SELECT source".into())
-                    }
-                } else {
-                    Err("INSERT SELECT with joins is not supported in this path".into())
-                }
             } else {
-                Err("INSERT SELECT with multiple tables is not supported".into())
+                Err("INSERT SELECT with FROM must use the query pipeline".into())
             }
         }
         sqlast::SetExpr::SetOperation {
@@ -153,12 +119,12 @@ fn flatten_union_all(
 
 /// Decide whether an INSERT's source Query should be executed via the full
 /// plan pipeline (returning `InsertSource::FromQuery`) instead of being
-/// collapsed into literal rows or a generate_series short-form.
+/// collapsed into literal rows.
 ///
 /// We route via the full pipeline whenever the Query carries clauses the
 /// literal fast path can't represent (WITH/ORDER BY/LIMIT/FETCH/locks), or
-/// when the body is a SELECT that reads from at least one real relation
-/// (i.e. something other than `TABLE(generate_series(...))`).
+/// when the body is a SELECT that reads from at least one relation, including
+/// table functions such as `TABLE(generate_series(...))`.
 fn should_route_insert_via_from_query(query: &sqlparser::ast::Query) -> bool {
     if query.with.is_some()
         || query.order_by.is_some()
@@ -168,32 +134,16 @@ fn should_route_insert_via_from_query(query: &sqlparser::ast::Query) -> bool {
     {
         return true;
     }
-    body_reads_from_real_relation(query.body.as_ref())
+    body_reads_from_relation(query.body.as_ref())
 }
 
-fn body_reads_from_real_relation(body: &sqlparser::ast::SetExpr) -> bool {
+fn body_reads_from_relation(body: &sqlparser::ast::SetExpr) -> bool {
     use sqlparser::ast as sqlast;
     match body {
-        sqlast::SetExpr::Select(select) => {
-            if select.from.is_empty() {
-                return false;
-            }
-            for table_with_joins in &select.from {
-                if !table_with_joins.joins.is_empty() {
-                    return true;
-                }
-                match &table_with_joins.relation {
-                    sqlast::TableFactor::TableFunction { .. } => {
-                        // generate_series is handled by the literal fast path.
-                    }
-                    _ => return true,
-                }
-            }
-            false
-        }
+        sqlast::SetExpr::Select(select) => !select.from.is_empty(),
         sqlast::SetExpr::Query(inner) => should_route_insert_via_from_query(inner.as_ref()),
         sqlast::SetExpr::SetOperation { left, right, .. } => {
-            body_reads_from_real_relation(left) || body_reads_from_real_relation(right)
+            body_reads_from_relation(left) || body_reads_from_relation(right)
         }
         _ => false,
     }
@@ -217,12 +167,11 @@ pub(crate) fn convert_sqlparser_insert_to_custom(
         .source
         .as_ref()
         .ok_or_else(|| "INSERT requires a source".to_string())?;
-    // If the body is a SELECT that reads from a real relation (not a
-    // generate_series table function), or carries a WITH/ORDER BY/LIMIT that
-    // the literal fast-path can't express, hand the whole Query to the
-    // analyzer/planner/pipeline stack via `FromQuery`. This keeps the INSERT
-    // entry point aligned with how StarRocks wraps INSERT ... SELECT as a
-    // normal plan with a sink, rather than evaluating SELECT here.
+    // If the source reads from a relation, including a table function, or
+    // carries clauses the literal fast path can't express, hand the whole
+    // Query to the analyzer/planner/pipeline stack via `FromQuery`. This keeps
+    // the INSERT entry point aligned with how StarRocks wraps INSERT ... SELECT
+    // as a normal plan with a sink, rather than evaluating SELECT here.
     let source = if should_route_insert_via_from_query(source_query) {
         crate::sql::parser::ast::InsertSource::FromQuery(source_query.clone())
     } else {
@@ -3426,6 +3375,20 @@ mod insert_overwrite_partitions_parser_tests {
             crate::sql::parser::ast::OverwriteMode::FullTable
         );
         assert_eq!(stmt.table.parts, vec!["t"]);
+    }
+
+    #[test]
+    fn insert_select_generate_series_routes_via_standard_query_plan() {
+        let stmt = parse_insert_overwrite(
+            "INSERT INTO t SELECT generate_series FROM TABLE(generate_series(1, 3))",
+        );
+        assert!(
+            matches!(
+                stmt.source,
+                crate::sql::parser::ast::InsertSource::FromQuery(_)
+            ),
+            "generate_series INSERT SELECT must use the standard table-function query plan"
+        );
     }
 
     #[test]

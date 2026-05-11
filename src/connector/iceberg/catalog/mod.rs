@@ -16,7 +16,7 @@ pub(crate) use backend::{
     build_iceberg_table_def_with_files, row_lineage_enabled,
 };
 pub(crate) use registry::{
-    IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace, insert_rows,
-    load_table, namespace_exists, register_existing_table,
+    IcebergCatalogEntry, IcebergCatalogRegistry, IcebergLoadedTable, create_namespace, load_table,
+    namespace_exists, register_existing_table,
 };
 pub(crate) use schema_update::{alter_table_properties, alter_table_schema};

@@ -34,7 +34,7 @@ use super::catalog::register_managed_table_in_catalog;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::engine::{
     ResolvedLocalTableName, StandaloneState, StatementResult, build_local_insert_batch,
-    execute_query, insert_generate_series_rows_local, record_batch_to_chunk, reorder_insert_rows,
+    execute_query, record_batch_to_chunk, reorder_insert_rows,
 };
 
 /// Insert rows into a standalone managed-lake table: prepare a txn in the
@@ -51,9 +51,6 @@ fn materialize_insert_rows(
         InsertSource::Values(rows) => reorder_insert_rows(rows, insert_columns, target_columns),
         InsertSource::SelectLiteralRow(row) => {
             reorder_insert_rows(std::slice::from_ref(row), insert_columns, target_columns)
-        }
-        InsertSource::GenerateSeriesSelect(gen_source) => {
-            insert_generate_series_rows_local(gen_source, insert_columns, target_columns)
         }
         InsertSource::UnionAll(parts) => {
             let mut out = Vec::new();

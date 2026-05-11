@@ -25,7 +25,6 @@ use crate::connector::{
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
 pub(crate) mod catalog;
-pub(crate) mod generate_series;
 pub(crate) mod iceberg_ctas;
 pub(crate) mod iceberg_ref_flow;
 pub(crate) mod information_schema;
@@ -42,7 +41,6 @@ pub(crate) mod stream_load;
 
 pub(crate) use self::name_resolve::ResolvedLocalTableName;
 
-pub(crate) use self::generate_series::insert_generate_series_rows_local;
 pub(crate) use self::insert::{build_local_insert_batch, reorder_insert_rows};
 #[cfg(test)]
 use self::sql_expr::sql_type_to_arrow_type;

@@ -64,14 +64,11 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
     let overwrite_full_table = matches!(overwrite_mode, OverwriteMode::FullTable);
     let overwrite_partitions = matches!(overwrite_mode, OverwriteMode::DynamicPartitions);
 
-    // Reject UNION ALL and generate_series on this path; caller enforces this
-    // for branch writes, and OVERWRITE with these sources is never valid.
-    if matches!(
-        source,
-        InsertSource::UnionAll(_) | InsertSource::GenerateSeriesSelect(_)
-    ) {
+    // Reject UNION ALL on this path; caller enforces this for branch writes,
+    // and OVERWRITE with this source is never valid.
+    if matches!(source, InsertSource::UnionAll(_)) {
         return Err(
-            "iceberg INSERT/OVERWRITE does not support UNION ALL or generate_series sources on this path".to_string()
+            "iceberg INSERT/OVERWRITE does not support UNION ALL sources on this path".to_string(),
         );
     }
 
@@ -152,7 +149,7 @@ pub(crate) fn execute_iceberg_insert_or_overwrite(
             )?;
             vec![crate::engine::record_batch_to_chunk(batch)?]
         }
-        InsertSource::UnionAll(_) | InsertSource::GenerateSeriesSelect(_) => {
+        InsertSource::UnionAll(_) => {
             unreachable!("rejected above")
         }
     };

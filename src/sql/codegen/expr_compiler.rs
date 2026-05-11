@@ -1709,6 +1709,7 @@ fn infer_scalar_function_return_type(
             _ => Ok(DataType::Null),
         },
         "array_join" | "array_to_string" => Ok(DataType::Utf8),
+        "assert_true" => Ok(DataType::Boolean),
         "__map_element_at" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
                 DataType::Struct(fields) if fields.len() == 2 => Ok(fields[1].data_type().clone()),
@@ -2129,7 +2130,10 @@ fn list_output_type(item_type: DataType) -> DataType {
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_arg_cast_type, infer_agg_function_types, infer_date_trunc_return_type};
+    use super::{
+        aggregate_arg_cast_type, infer_agg_function_types, infer_date_trunc_return_type,
+        infer_scalar_function_return_type,
+    };
     use arrow::datatypes::{DataType, TimeUnit};
 
     #[test]
@@ -2179,6 +2183,15 @@ mod tests {
         assert_eq!(
             infer_date_trunc_return_type(&[DataType::Utf8, DataType::Date32]),
             DataType::Date32
+        );
+    }
+
+    #[test]
+    fn assert_true_type_inference_returns_boolean() {
+        assert_eq!(
+            infer_scalar_function_return_type("assert_true", &[DataType::Boolean])
+                .expect("assert_true type inference"),
+            DataType::Boolean
         );
     }
 }

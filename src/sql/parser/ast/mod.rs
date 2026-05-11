@@ -255,26 +255,16 @@ pub(crate) struct MergeNotMatchedAction {
 pub(crate) enum InsertSource {
     Values(Vec<Vec<Literal>>),
     SelectLiteralRow(Vec<Literal>),
-    GenerateSeriesSelect(GenerateSeriesSelect),
     /// `a UNION ALL b` and chains thereof. Each sub-source is evaluated in
     /// order and their rows are concatenated. UNION (distinct) is not
     /// supported: INSERT-level deduplication would need table-side semantics
     /// we don't want to replicate at the parser layer.
     UnionAll(Vec<InsertSource>),
-    /// A full SELECT query that cannot be collapsed into literal rows or a
-    /// generate_series short-form. Carrying the raw sqlparser AST lets us
-    /// hand the SELECT back to the normal analyzer/planner/pipeline stack at
-    /// execution time instead of evaluating it in the parser layer.
+    /// A full SELECT query that cannot be collapsed into literal rows. Carrying
+    /// the raw sqlparser AST lets us hand the SELECT back to the normal
+    /// analyzer/planner/pipeline stack at execution time instead of evaluating
+    /// it in the parser layer.
     FromQuery(Box<sqlparser::ast::Query>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct GenerateSeriesSelect {
-    pub column_name: String,
-    pub start: i64,
-    pub end: i64,
-    pub step: i64,
-    pub projection: Vec<Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
