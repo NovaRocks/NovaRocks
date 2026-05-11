@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::meta::keys::NS_MANAGED_TXN;
 use crate::meta::repository::managed_lake::ManagedLakeMetaRepository;
 use crate::meta::repository::{
     RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
@@ -11,7 +12,6 @@ use crate::meta::{
 
 const MANAGED_TXN_KIND: &str = "managed.txn";
 const MANAGED_TXN_SCHEMA_VERSION: i32 = 1;
-const NS_MANAGED_TXN: &str = "managed.txn";
 
 #[derive(Default)]
 pub struct ManagedLakeTxnRepository;
@@ -69,12 +69,13 @@ impl ManagedLakeTxnRepository {
         }
 
         let base_version = partition.visible_version;
+        let commit_version = next_version(base_version, "commit")?;
         let stored = StoredManagedTxn {
             txn_id: txn.allocate_id(id_scopes::managed_txn())?,
             table_id,
             partition_id,
             base_version,
-            commit_version: base_version + 1,
+            commit_version,
             state: ManagedTxnState::Prepared,
             retry_at_ms: None,
             updated_at_ms: 0,
@@ -93,19 +94,23 @@ impl ManagedLakeTxnRepository {
 
     pub fn mark_written(&self, txn: &mut dyn MetaWriteTxn, txn_id: i64) -> RepositoryResult<()> {
         let mut stored = load_required_txn(txn, txn_id)?;
-        if stored.value.state != ManagedTxnState::Prepared {
-            return Err(RepositoryError::conflict(format!(
+        let state = stored.value.state.clone();
+        match state {
+            ManagedTxnState::Prepared => {
+                stored.value.state = ManagedTxnState::Written;
+                put_txn(
+                    txn,
+                    &stored.value,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )
+            }
+            ManagedTxnState::Written | ManagedTxnState::Visible => Ok(()),
+            ManagedTxnState::Aborted => Err(RepositoryError::conflict(format!(
                 "managed txn {txn_id} is {}, expected {}",
-                stored.value.state.as_str(),
+                state.as_str(),
                 ManagedTxnState::Prepared.as_str()
-            )));
+            ))),
         }
-        stored.value.state = ManagedTxnState::Written;
-        put_txn(
-            txn,
-            &stored.value,
-            ExpectedRevision::Exact(stored.record_revision),
-        )
     }
 
     pub fn mark_visible(
@@ -115,39 +120,68 @@ impl ManagedLakeTxnRepository {
         txn_id: i64,
     ) -> RepositoryResult<()> {
         let mut stored = load_required_txn(txn, txn_id)?;
-        if stored.value.state != ManagedTxnState::Written {
-            return Err(RepositoryError::conflict(format!(
-                "managed txn {txn_id} is {}, expected {}",
-                stored.value.state.as_str(),
-                ManagedTxnState::Written.as_str()
-            )));
+        let state = stored.value.state.clone();
+        match state {
+            ManagedTxnState::Written => {
+                validate_txn_versions(&stored.value)?;
+                let (partition_revision, mut partition) =
+                    load_checked_partition(meta_repo, txn, &stored.value)?;
+                if partition.visible_version != stored.value.base_version {
+                    return Err(RepositoryError::conflict(format!(
+                        "partition {} visible version is {}, expected {}",
+                        stored.value.partition_id,
+                        partition.visible_version,
+                        stored.value.base_version
+                    )));
+                }
+                if partition.next_version != stored.value.commit_version {
+                    return Err(RepositoryError::conflict(format!(
+                        "partition {} next version is {}, expected {}",
+                        stored.value.partition_id,
+                        partition.next_version,
+                        stored.value.commit_version
+                    )));
+                }
+
+                partition.visible_version = stored.value.commit_version;
+                partition.next_version = next_version(stored.value.commit_version, "next")?;
+                meta_repo.update_partition_exact(txn, &partition, partition_revision)?;
+
+                stored.value.state = ManagedTxnState::Visible;
+                put_txn(
+                    txn,
+                    &stored.value,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )
+            }
+            ManagedTxnState::Visible => {
+                validate_txn_versions(&stored.value)?;
+                let (_, partition) = load_checked_partition(meta_repo, txn, &stored.value)?;
+                if partition.visible_version != stored.value.commit_version {
+                    return Err(RepositoryError::conflict(format!(
+                        "partition {} visible version is {}, expected {}",
+                        stored.value.partition_id,
+                        partition.visible_version,
+                        stored.value.commit_version
+                    )));
+                }
+                let expected_next_version = next_version(stored.value.commit_version, "next")?;
+                if partition.next_version != expected_next_version {
+                    return Err(RepositoryError::conflict(format!(
+                        "partition {} next version is {}, expected {}",
+                        stored.value.partition_id, partition.next_version, expected_next_version
+                    )));
+                }
+                Ok(())
+            }
+            ManagedTxnState::Prepared | ManagedTxnState::Aborted => {
+                Err(RepositoryError::conflict(format!(
+                    "managed txn {txn_id} is {}, expected {}",
+                    state.as_str(),
+                    ManagedTxnState::Written.as_str()
+                )))
+            }
         }
-
-        let (partition_revision, mut partition) = meta_repo
-            .load_versioned_partition(txn, stored.value.partition_id)?
-            .ok_or_else(|| {
-                RepositoryError::not_found(format!(
-                    "partition {} not found",
-                    stored.value.partition_id
-                ))
-            })?;
-        if partition.visible_version != stored.value.base_version {
-            return Err(RepositoryError::conflict(format!(
-                "partition {} visible version is {}, expected {}",
-                stored.value.partition_id, partition.visible_version, stored.value.base_version
-            )));
-        }
-
-        partition.visible_version = stored.value.commit_version;
-        partition.next_version = stored.value.commit_version + 1;
-        meta_repo.update_partition_exact(txn, &partition, partition_revision)?;
-
-        stored.value.state = ManagedTxnState::Visible;
-        put_txn(
-            txn,
-            &stored.value,
-            ExpectedRevision::Exact(stored.record_revision),
-        )
     }
 
     pub fn mark_aborted(&self, txn: &mut dyn MetaWriteTxn, txn_id: i64) -> RepositoryResult<()> {
@@ -174,6 +208,45 @@ impl ManagedLakeTxnRepository {
 struct VersionedManagedTxn {
     record_revision: MetaRevision,
     value: StoredManagedTxn,
+}
+
+fn validate_txn_versions(stored: &StoredManagedTxn) -> RepositoryResult<()> {
+    let expected_commit_version = next_version(stored.base_version, "commit")?;
+    if stored.commit_version != expected_commit_version {
+        return Err(RepositoryError::provider(format!(
+            "managed txn {} commit version is {}, expected {}",
+            stored.txn_id, stored.commit_version, expected_commit_version
+        )));
+    }
+    Ok(())
+}
+
+fn next_version(version: i64, label: &str) -> RepositoryResult<i64> {
+    version
+        .checked_add(1)
+        .ok_or_else(|| RepositoryError::provider(format!("managed txn {label} version overflow")))
+}
+
+fn load_checked_partition(
+    meta_repo: &ManagedLakeMetaRepository,
+    txn: &dyn MetaReadTxn,
+    stored: &StoredManagedTxn,
+) -> RepositoryResult<(
+    MetaRevision,
+    crate::meta::repository::managed_lake::StoredManagedPartition,
+)> {
+    let (revision, partition) = meta_repo
+        .load_versioned_partition(txn, stored.partition_id)?
+        .ok_or_else(|| {
+            RepositoryError::not_found(format!("partition {} not found", stored.partition_id))
+        })?;
+    if partition.table_id != stored.table_id {
+        return Err(RepositoryError::conflict(format!(
+            "partition {} belongs to table {}, expected {}",
+            stored.partition_id, partition.table_id, stored.table_id
+        )));
+    }
+    Ok((revision, partition))
 }
 
 fn load_required_txn(txn: &dyn MetaReadTxn, txn_id: i64) -> RepositoryResult<VersionedManagedTxn> {

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use novarocks::meta::keys::NS_MANAGED_TXN;
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
@@ -8,7 +9,9 @@ use novarocks::meta::repository::managed_lake::{
     CreateManagedDatabaseRequest, CreateManagedTableRequest, ManagedLakeMetaRepository,
     ManagedPartitionState, ManagedTableKind, ManagedTableState,
 };
-use novarocks::meta::repository::managed_txn::{ManagedLakeTxnRepository, ManagedTxnState};
+use novarocks::meta::repository::managed_txn::{
+    ManagedLakeTxnRepository, ManagedTxnState, StoredManagedTxn,
+};
 use novarocks::meta::repository::mv::{
     CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
     MvTargetLookup, RefreshExternalOutcome,
@@ -26,6 +29,55 @@ use serde::{Deserialize, Serialize};
 struct SamplePayload {
     id: i64,
     name: String,
+}
+
+fn create_managed_table_with_partition(
+    provider: &SqliteMetaStoreProvider,
+    repository: &ManagedLakeMetaRepository,
+) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+    create_named_managed_table_with_partition(provider, repository, "orders")
+}
+
+fn create_named_managed_table_with_partition(
+    provider: &SqliteMetaStoreProvider,
+    repository: &ManagedLakeMetaRepository,
+    table_name: &str,
+) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+    let mut txn = provider.begin_write("create managed lake objects")?;
+    let database = repository.create_database(
+        txn.as_mut(),
+        CreateManagedDatabaseRequest {
+            name: format!("{table_name}_db"),
+        },
+    )?;
+    let table = repository.create_table(
+        txn.as_mut(),
+        CreateManagedTableRequest {
+            db_id: database.db_id,
+            name: table_name.to_string(),
+            keys_type: "DUP_KEYS".to_string(),
+            bucket_num: 2,
+            current_schema_id: 10,
+            state: ManagedTableState::Active,
+            kind: ManagedTableKind::Table,
+        },
+    )?;
+    let partition = repository.create_partition(txn.as_mut(), table.table_id, table_name, 1)?;
+    txn.commit()?;
+    Ok((table.table_id, partition.partition_id))
+}
+
+fn put_managed_txn_record(
+    txn: &mut dyn novarocks::meta::MetaWriteTxn,
+    managed_txn: StoredManagedTxn,
+) -> Result<(), Box<dyn std::error::Error>> {
+    txn.put(MetaRecordPut::new(
+        MetaKey::new(NS_MANAGED_TXN, [managed_txn.txn_id.to_string()])?,
+        MetaRecordKind::new("managed.txn")?,
+        ExpectedRevision::NotExists,
+        encode_json_payload(1, &managed_txn)?,
+    ))?;
+    Ok(())
 }
 
 #[test]
@@ -60,6 +112,11 @@ fn repository_id_scopes_are_stable_strings() {
         id_scopes::iceberg_optimize_job().as_str(),
         "job.iceberg_optimize"
     );
+}
+
+#[test]
+fn repository_namespaces_are_stable_strings() {
+    assert_eq!(NS_MANAGED_TXN, "managed.txn");
 }
 
 #[test]
@@ -290,6 +347,179 @@ fn managed_txn_repository_abort_does_not_advance_partition()
         .load_partition(read.as_ref(), partition_id)?
         .expect("partition should persist");
     assert_eq!(partition.visible_version, 1);
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_mark_written_is_retry_safe() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+
+    let txn_id = {
+        let mut txn = provider.begin_write("retry mark written")?;
+        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        txn.commit()?;
+        managed_txn.txn_id
+    };
+
+    let read = provider.begin_read()?;
+    let loaded = txn_repo
+        .load(read.as_ref(), txn_id)?
+        .expect("managed txn should persist");
+    assert_eq!(loaded.state, ManagedTxnState::Written);
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_mark_visible_is_retry_safe() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+
+    let txn_id = {
+        let mut txn = provider.begin_write("retry mark visible")?;
+        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        txn_repo.mark_visible(&meta_repo, txn.as_mut(), managed_txn.txn_id)?;
+        txn_repo.mark_visible(&meta_repo, txn.as_mut(), managed_txn.txn_id)?;
+        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        txn.commit()?;
+        managed_txn.txn_id
+    };
+
+    let read = provider.begin_read()?;
+    let loaded = txn_repo
+        .load(read.as_ref(), txn_id)?
+        .expect("managed txn should persist");
+    assert_eq!(loaded.state, ManagedTxnState::Visible);
+    let partition = meta_repo
+        .load_partition(read.as_ref(), partition_id)?
+        .expect("partition should persist");
+    assert_eq!(partition.visible_version, 2);
+    assert_eq!(partition.next_version, 3);
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_rejects_illegal_commit_version() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+
+    let txn_id = {
+        let mut txn = provider.begin_write("create invalid managed txn")?;
+        let txn_id = txn.allocate_id(id_scopes::managed_txn())?;
+        put_managed_txn_record(
+            txn.as_mut(),
+            StoredManagedTxn {
+                txn_id,
+                table_id,
+                partition_id,
+                base_version: 1,
+                commit_version: 3,
+                state: ManagedTxnState::Written,
+                retry_at_ms: None,
+                updated_at_ms: 0,
+            },
+        )?;
+        txn.commit()?;
+        txn_id
+    };
+
+    let mut txn = provider.begin_write("mark invalid managed txn visible")?;
+    let err = txn_repo
+        .mark_visible(&meta_repo, txn.as_mut(), txn_id)
+        .expect_err("illegal commit version should fail");
+    assert_eq!(err.kind(), RepositoryErrorKind::Provider);
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_rejects_partition_table_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+
+    let (table_id, other_partition_id) = {
+        let (table_id, _) = create_managed_table_with_partition(&provider, &meta_repo)?;
+        let (other_table_id, other_partition_id) =
+            create_named_managed_table_with_partition(&provider, &meta_repo, "lineitem")?;
+        assert_ne!(table_id, other_table_id);
+        (table_id, other_partition_id)
+    };
+
+    let txn_id = {
+        let mut txn = provider.begin_write("create mismatched managed txn")?;
+        let txn_id = txn.allocate_id(id_scopes::managed_txn())?;
+        put_managed_txn_record(
+            txn.as_mut(),
+            StoredManagedTxn {
+                txn_id,
+                table_id,
+                partition_id: other_partition_id,
+                base_version: 1,
+                commit_version: 2,
+                state: ManagedTxnState::Written,
+                retry_at_ms: None,
+                updated_at_ms: 0,
+            },
+        )?;
+        txn.commit()?;
+        txn_id
+    };
+
+    let mut txn = provider.begin_write("mark mismatched managed txn visible")?;
+    let err = txn_repo
+        .mark_visible(&meta_repo, txn.as_mut(), txn_id)
+        .expect_err("partition table mismatch should fail");
+    assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_rejects_partition_next_version_mismatch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+    let (table_id, partition_id) = create_managed_table_with_partition(&provider, &meta_repo)?;
+
+    let txn_id = {
+        let mut txn = provider.begin_write("prepare managed txn with stale partition next")?;
+        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        let (revision, mut partition) = meta_repo
+            .load_versioned_partition(txn.as_ref(), partition_id)?
+            .expect("partition should persist");
+        partition.next_version = 99;
+        meta_repo.update_partition_exact(txn.as_mut(), &partition, revision)?;
+        txn.commit()?;
+        managed_txn.txn_id
+    };
+
+    let mut txn = provider.begin_write("mark managed txn visible with stale partition next")?;
+    let err = txn_repo
+        .mark_visible(&meta_repo, txn.as_mut(), txn_id)
+        .expect_err("partition next_version mismatch should fail");
+    assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
 
     Ok(())
 }
