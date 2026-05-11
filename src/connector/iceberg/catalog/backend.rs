@@ -463,6 +463,7 @@ mod tests {
         assert_eq!(s3_file.partition_key.as_deref(), Some("city=A"));
         assert_eq!(s3_file.first_row_id, Some(100));
         assert_eq!(s3_file.data_sequence_number, Some(11));
+        assert_eq!(s3_file.ivm_change_op, None);
         assert_eq!(
             s3_file.manifest_path.as_deref(),
             Some("s3://bucket/table/metadata/manifest.avro")

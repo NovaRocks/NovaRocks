@@ -13,6 +13,7 @@ pub(crate) mod ddl;
 pub(crate) mod erase;
 pub(crate) mod ivm_change_stream;
 pub(crate) mod ivm_delta_aggregate;
+pub(crate) mod ivm_delta_source;
 pub(crate) mod ivm_row_identity;
 pub(crate) mod mv_agg_state;
 pub(crate) mod mv_apply_policy;

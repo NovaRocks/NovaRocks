@@ -249,7 +249,7 @@ fn extract_three_part_ref_occurrences_from_factor(
     }
 }
 
-fn validate_incremental_mv_base_ref(
+pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
     base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
@@ -337,7 +337,7 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
     )
 }
 
-fn write_mv_delete_temp_parquet(
+pub(crate) fn write_mv_delete_temp_parquet(
     namespace: &str,
     table_name: &str,
     deleted_rows: &[arrow::record_batch::RecordBatch],
@@ -426,6 +426,7 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
         partition_key: None,
         first_row_id: Some(0),
         data_sequence_number: Some(0),
+        change_op: None,
     }];
 
     let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(

@@ -840,6 +840,7 @@ fn incremental_refresh_iceberg_mv(
             partition_key: f.partition_key.clone(),
             first_row_id: f.first_row_id,
             data_sequence_number: f.data_sequence_number,
+            change_op: None,
         })
         .collect();
     let chunks = execute_query_for_mv_incremental_refresh(

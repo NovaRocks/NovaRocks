@@ -589,6 +589,7 @@ pub(crate) fn materialize_changes(
                 partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
+                change_op: None,
             })
             .collect();
         crate::engine::mv_flow::execute_query_for_mv_incremental_refresh(
@@ -658,7 +659,7 @@ pub(crate) fn materialize_changes(
     })
 }
 
-fn scan_equality_delete_rows_for_table(
+pub(crate) fn scan_equality_delete_rows_for_table(
     table: &iceberg::table::Table,
     equality_deletes: &[EqualityDeleteRef],
     factory: &crate::fs::opendal::OpendalRangeReaderFactory,
@@ -741,7 +742,7 @@ fn equality_change_to_delete_spec(
 /// content as `RecordBatch`es. The MV refresh path feeds these to
 /// `execute_query_for_mv_incremental_deletes`, so the MV SELECT projects the
 /// pre-overwrite rows using only standard Iceberg manifest diff information.
-fn scan_deleted_data_file_rows(
+pub(crate) fn scan_deleted_data_file_rows(
     base_table: &iceberg::table::Table,
     deleted_data_files: &[DeletedDataFileRef],
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
@@ -806,7 +807,7 @@ fn read_full_data_file(
 /// same `OpendalRangeReaderFactory` shape as the HDFS scan path
 /// (`build_fs_operator` for local FS, S3/cloud-credentialled operator
 /// when the catalog has cloud properties).
-fn build_factory_for_table(
+pub(crate) fn build_factory_for_table(
     table: &iceberg::table::Table,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<crate::fs::opendal::OpendalRangeReaderFactory, String> {
@@ -838,7 +839,7 @@ fn build_factory_for_table(
         .map_err(|e| format!("build opendal range reader factory: {e}"))
 }
 
-fn normalize_delete_projection_path(
+pub(crate) fn normalize_delete_projection_path(
     path: &str,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
 ) -> Result<String, ChangeError> {

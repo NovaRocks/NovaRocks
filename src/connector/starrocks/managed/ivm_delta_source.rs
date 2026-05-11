@@ -1,0 +1,207 @@
+use std::sync::Arc;
+
+use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
+
+use crate::connector::iceberg::changes::{
+    IcebergChangeBatch, build_factory_for_table, normalize_delete_projection_path,
+    scan_deleted_data_file_rows, scan_equality_delete_rows_for_table,
+};
+use crate::connector::starrocks::managed::store::IcebergTableRef;
+use crate::engine::catalog::InMemoryCatalog;
+use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
+use crate::engine::{QueryResult, StandaloneState, execute_query};
+use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
+
+#[allow(dead_code)]
+pub(crate) struct IvmDeltaSourceFiles {
+    pub previous_snapshot_id: i64,
+    pub current_snapshot_id: i64,
+    pub files: Vec<IcebergFileForQuery>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct IvmDeltaSourceInput<'a> {
+    pub state: &'a Arc<StandaloneState>,
+    pub current_database: &'a str,
+    pub base_ref: &'a IcebergTableRef,
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_delta_source_files(
+    input: IvmDeltaSourceInput<'_>,
+    batch: IcebergChangeBatch,
+) -> Result<IvmDeltaSourceFiles, String> {
+    let previous_snapshot_id = batch.previous_snapshot_id;
+    let current_snapshot_id = batch.current_snapshot_id;
+    let entry = {
+        let registry = input
+            .state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg registry read lock");
+        registry.get(&input.base_ref.catalog)?
+    };
+    let loaded = crate::connector::iceberg::catalog::load_table(
+        &entry,
+        &input.base_ref.namespace,
+        &input.base_ref.table,
+    )?;
+
+    let mut files: Vec<IcebergFileForQuery> = batch
+        .inserts
+        .iter()
+        .map(|f| IcebergFileForQuery {
+            path: f.path.clone(),
+            size: f.size,
+            record_count: f.record_count,
+            partition_spec_id: f.partition_spec_id,
+            partition_key: f.partition_key.clone(),
+            first_row_id: f.first_row_id,
+            data_sequence_number: f.data_sequence_number,
+            change_op: Some(CHANGE_OP_INSERT),
+        })
+        .collect();
+
+    let needs_delete_scan = !batch.deletes.is_empty()
+        || !batch.equality_deletes.is_empty()
+        || !batch.deleted_data_files.is_empty();
+    if needs_delete_scan {
+        let object_store_config = loaded.object_store_config.as_ref();
+        let factory = build_factory_for_table(&loaded.table, object_store_config)?;
+        let size_lookup = |path: &str| -> Option<u64> {
+            let _ = path;
+            None
+        };
+        let mut deleted_rows =
+            crate::connector::iceberg::scan_deletes::scan_deletes_with_path_normalizer(
+                &batch.deletes,
+                &factory,
+                loaded.table.file_io(),
+                size_lookup,
+                |path| normalize_delete_projection_path(path, object_store_config),
+            )
+            .map_err(|e| e.to_string())?;
+        deleted_rows.extend(scan_equality_delete_rows_for_table(
+            &loaded.table,
+            &batch.equality_deletes,
+            &factory,
+            object_store_config,
+        )?);
+        deleted_rows.extend(scan_deleted_data_file_rows(
+            &loaded.table,
+            &batch.deleted_data_files,
+            object_store_config,
+        )?);
+        if !deleted_rows.is_empty() {
+            let (path, size, record_count) = crate::engine::mv_flow::write_mv_delete_temp_parquet(
+                &input.base_ref.namespace,
+                &input.base_ref.table,
+                &deleted_rows,
+            )?;
+            files.push(IcebergFileForQuery {
+                path,
+                size,
+                record_count,
+                partition_spec_id: None,
+                partition_key: None,
+                first_row_id: Some(0),
+                data_sequence_number: Some(0),
+                change_op: Some(CHANGE_OP_DELETE),
+            });
+        }
+    }
+
+    Ok(IvmDeltaSourceFiles {
+        previous_snapshot_id,
+        current_snapshot_id,
+        files,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) async fn execute_delta_source_query(
+    input: IvmDeltaSourceInput<'_>,
+    select_sql: &str,
+    source_files: IvmDeltaSourceFiles,
+) -> Result<QueryResult, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)?;
+    let statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("sql parser error: {e}"))?;
+    let Statement::Query(query) = statement else {
+        return Err("IVM delta source SQL must be a SELECT query".to_string());
+    };
+
+    let (catalog_name, namespace, table_name) =
+        crate::engine::mv_flow::validate_incremental_mv_base_ref(&query, input.base_ref)?;
+    let table_def = build_iceberg_delta_table_def_with_files(
+        input.state,
+        &catalog_name,
+        &namespace,
+        &table_name,
+        source_files.files,
+    )?;
+
+    let mut delta_catalog = InMemoryCatalog::default();
+    delta_catalog.create_database(&namespace)?;
+    delta_catalog
+        .register(&namespace, table_def)
+        .map_err(|e| format!("register iceberg delta source table: {e}"))?;
+
+    let mut executable = query.as_ref().clone();
+    crate::sql::parser::query_refs::strip_catalog_from_three_part_names(&mut executable);
+    execute_query(
+        &executable,
+        &delta_catalog,
+        input.current_database,
+        input.state.exchange_port,
+        None,
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<String, String> {
+    let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
+        .map_err(|e| format!("projection_select_with_change_op normalize error: {e}"))?;
+    let mut statement = crate::sql::parser::parse_normalized_sql_raw(&normalized)
+        .map_err(|e| format!("projection_select_with_change_op parse error: {e}"))?;
+
+    let Statement::Query(query) = &mut statement else {
+        return Err("projection_select_with_change_op: expected SELECT query".to_string());
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return Err("projection_select_with_change_op: expected SELECT body".to_string());
+    };
+
+    select
+        .projection
+        .push(SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+            CHANGE_OP_COLUMN,
+        ))));
+    Ok(statement.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::projection_select_with_change_op;
+
+    #[test]
+    fn projection_select_with_change_op_preserves_where_and_group_by() {
+        let rewritten = projection_select_with_change_op(
+            "select k, sum(v) as total from ice.db.t where v > 0 group by k",
+        )
+        .expect("rewrite");
+        let upper = rewritten.to_uppercase();
+
+        assert!(upper.starts_with("SELECT K, SUM(V) AS TOTAL, __CHANGE_OP FROM"));
+        assert!(upper.contains(" WHERE V > 0 "));
+        assert!(upper.contains(" GROUP BY K"));
+    }
+
+    #[test]
+    fn projection_select_with_change_op_rejects_non_query() {
+        let err = projection_select_with_change_op("insert into t values (1)")
+            .expect_err("non-query must fail");
+
+        assert!(err.contains("expected SELECT query"));
+    }
+}

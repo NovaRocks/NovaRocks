@@ -4086,6 +4086,7 @@ enable_path_style_access = true
                 partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
+                change_op: None,
             })
             .collect();
 
@@ -4301,6 +4302,7 @@ enable_path_style_access = true
                 partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
+                change_op: None,
             })
             .collect();
         let first_delta_file = delta_files
