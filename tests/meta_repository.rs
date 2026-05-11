@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use novarocks::meta::keys::NS_MANAGED_TXN;
+use novarocks::meta::keys::{NS_JOB, NS_MANAGED_TXN};
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
+use novarocks::meta::repository::job::{CreateEraseJobRequest, JobMetaRepository, JobState};
 use novarocks::meta::repository::managed_lake::{
     CreateManagedDatabaseRequest, CreateManagedTableRequest, ManagedLakeMetaRepository,
     ManagedPartitionState, ManagedTableKind, ManagedTableState,
@@ -117,6 +118,7 @@ fn repository_id_scopes_are_stable_strings() {
 #[test]
 fn repository_namespaces_are_stable_strings() {
     assert_eq!(NS_MANAGED_TXN, "managed.txn");
+    assert_eq!(NS_JOB, "job");
 }
 
 #[test]
@@ -126,6 +128,158 @@ fn repository_error_display_is_domain_facing() {
         err.to_string(),
         "metadata repository conflict: managed txn state changed"
     );
+}
+
+#[test]
+fn job_repository_claim_finish_and_fail_are_state_checked() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let job_id = {
+        let mut txn = provider.begin_write("create erase job")?;
+        let job = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 10,
+                partition_id: Some(20),
+                root_path: "s3://bucket/db/table/partition".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert_eq!(job.table_id, 10);
+        assert_eq!(job.partition_id, Some(20));
+        assert_eq!(job.root_path, "s3://bucket/db/table/partition");
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.retry_at_ms, None);
+        assert_eq!(job.updated_at_ms, 1000);
+        assert_eq!(job.last_error, None);
+        txn.commit()?;
+        job.job_id
+    };
+
+    {
+        let mut txn = provider.begin_write("claim erase job")?;
+        assert!(repository.claim_erase_job(txn.as_mut(), job_id, 1100)?);
+        repository.finish_erase_job(txn.as_mut(), job_id, 1200)?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let job = repository
+        .load_erase_job(read.as_ref(), job_id)?
+        .expect("erase job should exist");
+    assert_eq!(job.state, JobState::Finished);
+    assert_eq!(job.retry_at_ms, None);
+    assert_eq!(job.updated_at_ms, 1200);
+    assert_eq!(job.last_error, None);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_claim_finished_returns_false_without_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let job_id = {
+        let mut txn = provider.begin_write("create and finish erase job")?;
+        let job = repository.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id: 10,
+                partition_id: Some(20),
+                root_path: "s3://bucket/db/table/partition".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        assert!(repository.claim_erase_job(txn.as_mut(), job.job_id, 1100)?);
+        repository.finish_erase_job(txn.as_mut(), job.job_id, 1200)?;
+        txn.commit()?;
+        job.job_id
+    };
+
+    {
+        let mut txn = provider.begin_write("claim finished erase job")?;
+        assert!(!repository.claim_erase_job(txn.as_mut(), job_id, 1300)?);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let job = repository
+        .load_erase_job(read.as_ref(), job_id)?
+        .expect("erase job should exist");
+    assert_eq!(job.state, JobState::Finished);
+    assert_eq!(job.updated_at_ms, 1200);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_finish_pending_returns_conflict() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let mut txn = provider.begin_write("finish pending erase job")?;
+    let job = repository.create_erase_job(
+        txn.as_mut(),
+        CreateEraseJobRequest {
+            table_id: 10,
+            partition_id: Some(20),
+            root_path: "s3://bucket/db/table/partition".to_string(),
+            now_ms: 1000,
+        },
+    )?;
+    let err = repository
+        .finish_erase_job(txn.as_mut(), job.job_id, 1200)
+        .expect_err("pending erase job should not finish");
+    assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_rejects_schema_version_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+    let key = MetaKey::new(NS_JOB, ["erase", "1"])?;
+    let payload = serde_json::json!({
+        "job_id": 1,
+        "table_id": 10,
+        "partition_id": 20,
+        "root_path": "s3://bucket/db/table/partition",
+        "state": "PENDING",
+        "retry_at_ms": null,
+        "updated_at_ms": 1000,
+        "last_error": null
+    });
+
+    {
+        let mut txn = provider.begin_write("write mismatched erase job")?;
+        txn.put(MetaRecordPut::new(
+            key,
+            MetaRecordKind::new("job.erase")?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(999, &payload)?,
+        ))?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let err = repository
+        .load_erase_job(read.as_ref(), 1)
+        .expect_err("schema version mismatch should fail");
+    assert!(
+        err.to_string()
+            .contains("metadata record erase/1 has schema version 999")
+    );
+
+    Ok(())
 }
 
 #[test]
