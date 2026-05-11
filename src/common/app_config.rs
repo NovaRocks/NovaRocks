@@ -126,6 +126,9 @@ pub struct NovaRocksConfig {
     pub jdbc: Option<JdbcConfig>,
 
     #[serde(default)]
+    pub metadata: Option<MetadataConfig>,
+
+    #[serde(default)]
     pub standalone_server: Option<StandaloneServerConfig>,
 
     #[serde(default)]
@@ -161,6 +164,7 @@ impl Default for NovaRocksConfig {
             runtime: RuntimeConfig::default(),
             debug: DebugConfig::default(),
             jdbc: None,
+            metadata: None,
             standalone_server: None,
             spill: SpillStorageConfig::default(),
             starrocks: StarRocksConfig::default(),
@@ -223,6 +227,20 @@ impl Default for ServerConfig {
 pub struct StandaloneTableConfig {
     pub name: String,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct MetadataConfig {
+    #[serde(default)]
+    pub provider: MetadataProviderConfig,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataProviderConfig {
+    #[default]
+    Sqlite,
 }
 
 #[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
@@ -1035,8 +1053,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig, StandaloneObjectStoreConfig,
-        StandaloneServerConfig,
+        MetadataProviderConfig, NovaRocksConfig, RuntimeConfig, StandaloneManagedLakeConfig,
+        StandaloneObjectStoreConfig, StandaloneServerConfig,
     };
 
     #[test]
@@ -1121,6 +1139,22 @@ starlet_port = 19070
                 tables: Vec::new(),
             })
         );
+    }
+
+    #[test]
+    fn test_metadata_config_parses_sqlite_provider() {
+        let toml = r#"
+[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+
+[standalone_server]
+mysql_port = 19030
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse config");
+        let metadata = cfg.metadata.expect("metadata config");
+        assert_eq!(metadata.provider, MetadataProviderConfig::Sqlite);
+        assert_eq!(metadata.path, PathBuf::from("meta/catalog.db"));
     }
 
     #[test]

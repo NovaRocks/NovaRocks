@@ -265,10 +265,13 @@ cat > "$runtime_dir/standalone-managed-lake.toml" <<EOF
 [server]
 host = "127.0.0.1"
 
+[metadata]
+provider = "sqlite"
+path = "$runtime_dir/standalone-managed-lake.sqlite"
+
 [standalone_server]
 mysql_port = $mysql_port
 user = "root"
-metadata_db_path = "$runtime_dir/standalone-managed-lake.sqlite"
 warehouse_uri = "$managed_warehouse"
 
 [standalone_server.object_store]

@@ -255,6 +255,7 @@ impl StandaloneNovaRocks {
             }
         }
         let exchange_port = ensure_standalone_exchange_server()?;
+        let _metadata_provider = open_metadata_provider_from_config(&opts)?;
         let metadata_store = resolve_metadata_store(
             opts.metadata_db_path.as_deref(),
             opts.config_path.as_deref(),
@@ -1675,14 +1676,45 @@ fn resolve_metadata_store(
         Some(path) => Some(resolve_relative_path(path, config_path)?),
         None => {
             let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
-            cfg.standalone_server
+            cfg.metadata
                 .as_ref()
-                .and_then(|standalone| standalone.metadata_db_path.as_deref())
-                .map(|path| resolve_relative_path(path, config_path))
+                .map(|metadata| resolve_relative_path(&metadata.path, config_path))
+                .or_else(|| {
+                    cfg.standalone_server
+                        .as_ref()
+                        .and_then(|standalone| standalone.metadata_db_path.as_deref())
+                        .map(|path| resolve_relative_path(path, config_path))
+                })
                 .transpose()?
         }
     };
     resolved_path.map(SqliteMetadataStore::open).transpose()
+}
+
+fn open_metadata_provider_from_config(
+    opts: &StandaloneOptions,
+) -> Result<Option<Arc<dyn crate::meta::MetaStoreProvider>>, String> {
+    let cfg = novarocks_config::config().map_err(|e| format!("read config failed: {e}"))?;
+    let Some(metadata) = cfg.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let path = if metadata.path.is_absolute() {
+        metadata.path.clone()
+    } else if let Some(config_path) = opts.config_path.as_ref() {
+        config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(&metadata.path)
+    } else {
+        metadata.path.clone()
+    };
+    match metadata.provider {
+        crate::common::app_config::MetadataProviderConfig::Sqlite => {
+            let provider = crate::meta::SqliteMetaStoreProvider::open(path)
+                .map_err(|err| format!("open sqlite metadata provider failed: {err}"))?;
+            Ok(Some(Arc::new(provider)))
+        }
+    }
 }
 
 fn resolve_managed_lake_config() -> Result<Option<ManagedLakeConfig>, String> {

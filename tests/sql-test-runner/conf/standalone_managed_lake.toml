@@ -12,10 +12,13 @@
 [server]
 host = "127.0.0.1"
 
+[metadata]
+provider = "sqlite"
+path = "tmp/standalone-managed-lake.sqlite"
+
 [standalone_server]
 mysql_port = 9030
 user = "root"
-metadata_db_path = "tmp/standalone-managed-lake.sqlite"
 warehouse_uri = "s3://novarocks/sql-tests-managed-lake"
 
 [standalone_server.object_store]
