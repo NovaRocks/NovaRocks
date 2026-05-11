@@ -4,6 +4,10 @@ use bytes::Bytes;
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
+use novarocks::meta::repository::managed_lake::{
+    CreateManagedDatabaseRequest, CreateManagedTableRequest, ManagedLakeMetaRepository,
+    ManagedPartitionState,
+};
 use novarocks::meta::repository::mv::{
     CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
     MvTargetLookup, RefreshExternalOutcome,
@@ -64,6 +68,104 @@ fn repository_error_display_is_domain_facing() {
         err.to_string(),
         "metadata repository conflict: managed txn state changed"
     );
+}
+
+#[test]
+fn managed_lake_repository_creates_database_table_and_active_partition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = ManagedLakeMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("create managed lake objects")?;
+        let database = repository.create_database(
+            txn.as_mut(),
+            CreateManagedDatabaseRequest {
+                name: "db1".to_string(),
+            },
+        )?;
+        let table = repository.create_table(
+            txn.as_mut(),
+            CreateManagedTableRequest {
+                db_id: database.db_id,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+            },
+        )?;
+        repository.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let snapshot = repository.load_snapshot(read.as_ref())?;
+    assert_eq!(snapshot.databases.len(), 1);
+    assert_eq!(snapshot.tables.len(), 1);
+    assert_eq!(snapshot.partitions.len(), 1);
+    assert!(snapshot.schemas.is_empty());
+    assert!(snapshot.columns.is_empty());
+    assert!(snapshot.indexes.is_empty());
+    assert!(snapshot.tablets.is_empty());
+
+    assert_eq!(snapshot.databases[0].name, "db1");
+    assert_eq!(snapshot.tables[0].db_id, snapshot.databases[0].db_id);
+    assert_eq!(snapshot.tables[0].name, "orders");
+    assert_eq!(snapshot.tables[0].keys_type, "DUP_KEYS");
+    assert_eq!(snapshot.tables[0].bucket_num, 2);
+    assert_eq!(snapshot.tables[0].current_schema_id, 10);
+    assert_eq!(snapshot.partitions[0].table_id, snapshot.tables[0].table_id);
+    assert_eq!(snapshot.partitions[0].name, "orders");
+    assert_eq!(snapshot.partitions[0].state, ManagedPartitionState::Active);
+    assert_eq!(snapshot.partitions[0].visible_version, 1);
+    assert_eq!(snapshot.partitions[0].next_version, 2);
+
+    Ok(())
+}
+
+#[test]
+fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = ManagedLakeMetaRepository::default();
+
+    let err = {
+        let mut txn = provider.begin_write("create duplicate managed lake table")?;
+        let database = repository.create_database(
+            txn.as_mut(),
+            CreateManagedDatabaseRequest {
+                name: "db1".to_string(),
+            },
+        )?;
+        repository.create_table(
+            txn.as_mut(),
+            CreateManagedTableRequest {
+                db_id: database.db_id,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+            },
+        )?;
+        repository
+            .create_table(
+                txn.as_mut(),
+                CreateManagedTableRequest {
+                    db_id: database.db_id,
+                    name: "ORDERS".to_string(),
+                    keys_type: "DUP_KEYS".to_string(),
+                    bucket_num: 2,
+                    current_schema_id: 10,
+                },
+            )
+            .expect_err("case-insensitive duplicate table name should fail")
+    };
+
+    assert!(err.to_string().contains("already exists"));
+
+    Ok(())
 }
 
 #[test]
