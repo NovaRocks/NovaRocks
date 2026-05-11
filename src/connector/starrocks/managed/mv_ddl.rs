@@ -13,6 +13,7 @@ use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_registered_external_table;
 use crate::engine::record_batch_to_chunk;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
+use crate::meta::repository::mv::CreateMvDefinitionRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution, ObjectName,
@@ -313,17 +314,18 @@ pub(crate) fn create_mv(
         retry_at_ms: None,
         updated_at_ms: 0,
     });
+    let created_at_ms = now_ms();
     snapshot.materialized_views.push(StoredMaterializedView {
         mv_id: table_id,
         select_sql: stmt.select_sql.clone(),
         refresh_mode: ManagedMvRefreshMode::DeferredManual,
-        base_table_refs: base_refs,
+        base_table_refs: base_refs.clone(),
         last_refresh_ms: None,
         last_refresh_rows: None,
         last_refresh_snapshots: Default::default(),
         last_refresh_table_uuids: Default::default(),
         primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
-        created_at_ms: now_ms(),
+        created_at_ms,
         storage_engine: ManagedMvStorageEngine::ManagedLake,
         iceberg_table_identifier: None,
         target_catalog: None,
@@ -335,7 +337,24 @@ pub(crate) fn create_mv(
     });
 
     let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot.clone())?;
-    metadata_store.replace_managed_snapshot(&snapshot)?;
+    persist_mv_definition(
+        state,
+        PersistMvDefinitionRequest {
+            mv_id: table_id,
+            select_sql: stmt.select_sql.clone(),
+            base_table_refs: base_refs,
+            primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
+            storage_engine: ManagedMvStorageEngine::ManagedLake,
+            target_catalog: None,
+            target_namespace: None,
+            target_table: None,
+            created_at_ms,
+        },
+    )?;
+    if let Err(err) = metadata_store.replace_managed_snapshot(&snapshot) {
+        let _ = delete_mv_definition_by_id(state, table_id);
+        return Err(err);
+    }
     rebuilt.re_register_active_tablet_runtimes()?;
     let runtime = rebuilt.table(&db_name, &mv_name)?.clone();
     *managed = rebuilt;
@@ -760,8 +779,77 @@ pub(crate) fn drop_mv(
         ));
     }
 
+    delete_mv_definition_by_id(state, runtime.table.table_id)?;
     crate::connector::starrocks::managed::ddl::drop_managed_table(state, &db_name, &mv_name)?;
     Ok(StatementResult::Ok)
+}
+
+pub(crate) struct PersistMvDefinitionRequest {
+    pub(crate) mv_id: i64,
+    pub(crate) select_sql: String,
+    pub(crate) base_table_refs: Vec<IcebergTableRef>,
+    pub(crate) primary_key_columns: Vec<String>,
+    pub(crate) storage_engine: ManagedMvStorageEngine,
+    pub(crate) target_catalog: Option<String>,
+    pub(crate) target_namespace: Option<String>,
+    pub(crate) target_table: Option<String>,
+    pub(crate) created_at_ms: i64,
+}
+
+pub(crate) fn persist_mv_definition(
+    state: &Arc<StandaloneState>,
+    req: PersistMvDefinitionRequest,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "metadata provider required for materialized view metadata".to_string())?;
+    let mut txn = provider
+        .begin_write("create materialized view definition")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .create_definition_with_id(
+            txn.as_mut(),
+            req.mv_id,
+            CreateMvDefinitionRequest {
+                select_sql: req.select_sql,
+                base_table_refs: iceberg_table_ref_fqns(&req.base_table_refs),
+                primary_key_columns: req.primary_key_columns,
+                storage_engine: req.storage_engine.as_sql_str().to_string(),
+                target_catalog: req.target_catalog,
+                target_namespace: req.target_namespace,
+                target_table: req.target_table,
+                created_at_ms: req.created_at_ms,
+            },
+        )
+        .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit materialized view definition failed: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn delete_mv_definition_by_id(
+    state: &Arc<StandaloneState>,
+    mv_id: i64,
+) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete materialized view definition")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .drop_by_id(txn.as_mut(), mv_id)
+        .map_err(|e| format!("delete materialized view definition failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit materialized view definition delete failed: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn iceberg_table_ref_fqns(base_refs: &[IcebergTableRef]) -> Vec<String> {
+    base_refs.iter().map(IcebergTableRef::fqn).collect()
 }
 
 pub(crate) fn list_mvs(
@@ -1558,11 +1646,12 @@ mod tests {
 
     fn open_state_with_sqlite_store() -> (Arc<StandaloneState>, TempDir) {
         let dir = TempDir::new().expect("metadata tempdir");
+        let metadata_path = dir.path().join("standalone.sqlite");
         let metadata_store =
-            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(
-                dir.path().join("standalone.sqlite"),
-            )
-            .expect("open sqlite store");
+            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(&metadata_path)
+                .expect("open sqlite store");
+        let metadata_provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
         let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
         snapshot.global.warehouse_uri = format!("file://{}", dir.path().join("managed").display());
         snapshot.global.next_db_id = 1;
@@ -1571,6 +1660,7 @@ mod tests {
             .replace_managed_snapshot(&snapshot)
             .expect("initialize metadata snapshot");
         let state = Arc::new(StandaloneState {
+            metadata_provider: Some(Arc::new(metadata_provider)),
             metadata_store: Some(metadata_store),
             ..StandaloneState::default()
         });

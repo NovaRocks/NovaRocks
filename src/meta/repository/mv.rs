@@ -121,6 +121,20 @@ impl MvMetaRepository {
         req: CreateMvDefinitionRequest,
     ) -> RepositoryResult<StoredMvDefinition> {
         let mv_id = txn.allocate_id(id_scopes::mv_id())?;
+        self.create_definition_with_id(txn, mv_id, req)
+    }
+
+    pub fn create_definition_with_id(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_id: i64,
+        req: CreateMvDefinitionRequest,
+    ) -> RepositoryResult<StoredMvDefinition> {
+        if mv_id <= 0 {
+            return Err(RepositoryError::invalid(format!(
+                "mv definition id must be positive, got {mv_id}"
+            )));
+        }
         let definition = StoredMvDefinition {
             mv_id,
             select_sql: req.select_sql,
@@ -243,6 +257,33 @@ impl MvMetaRepository {
         txn.delete(&target_key, ExpectedRevision::Exact(record.revision))?;
         txn.delete(
             &key_by_id(lookup.mv_id)?,
+            ExpectedRevision::Exact(definition.record_revision),
+        )?;
+        Ok(true)
+    }
+
+    pub fn drop_by_id(&self, txn: &mut dyn MetaWriteTxn, mv_id: i64) -> RepositoryResult<bool> {
+        let Some(definition) = self.load_versioned_by_id(txn, mv_id)? else {
+            return Ok(false);
+        };
+        if definition.value.refresh_in_progress || definition.value.active_refresh_id.is_some() {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {} has refresh in progress",
+                definition.value.mv_id
+            )));
+        }
+        if let (Some(catalog), Some(namespace), Some(table)) = (
+            definition.value.target_catalog.as_deref(),
+            definition.value.target_namespace.as_deref(),
+            definition.value.target_table.as_deref(),
+        ) {
+            txn.delete(
+                &key_by_target(catalog, namespace, table)?,
+                ExpectedRevision::Any,
+            )?;
+        }
+        txn.delete(
+            &key_by_id(mv_id)?,
             ExpectedRevision::Exact(definition.record_revision),
         )?;
         Ok(true)

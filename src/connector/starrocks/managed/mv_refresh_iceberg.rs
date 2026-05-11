@@ -17,9 +17,11 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
+use crate::connector::starrocks::managed::mv_ddl::PersistMvDefinitionRequest;
 use crate::connector::starrocks::managed::mv_ddl::{
     analyze_mv_select, canonicalize_iceberg_mv_select_query, extract_base_table_refs, now_ms,
-    output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
+    output_column_to_table_column, persist_mv_definition, resolve_mv_name,
+    validate_mv_partition_columns,
 };
 use crate::connector::starrocks::managed::mv_refresh::{
     load_current_iceberg_base_table, query_result_to_chunks, run_mv_full_select_chunks,
@@ -132,17 +134,20 @@ pub(crate) fn create_iceberg_mv(
         &[("format-version".to_string(), "2".to_string())],
     )?;
 
-    // 3. Persist only the MV relationship metadata in SQLite.
+    // 3. Persist MV metadata during the repository migration. The legacy row
+    // remains transitional until refresh/drop flows move fully to MvMetaRepository.
     let mv_id = metadata_store.allocate_materialized_view_id()?;
+    let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
+    let created_at_ms = now_ms();
     let insert_request = InsertIcebergMvRowRequest {
         mv_id,
         select_sql: canonical_select_sql,
-        base_table_refs: base_refs,
-        primary_key_columns: stmt.primary_key.clone().unwrap_or_default(),
+        base_table_refs: base_refs.clone(),
+        primary_key_columns: primary_key_columns.clone(),
         target_catalog: target.catalog.clone(),
         target_namespace: target.namespace.clone(),
         target_table: target.table.clone(),
-        created_at_ms: now_ms(),
+        created_at_ms,
     };
     if let Err(err) = metadata_store.insert_iceberg_mv_row(insert_request) {
         let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
@@ -155,6 +160,37 @@ pub(crate) fn create_iceberg_mv(
             Err(drop_err) => format!(
                 "create iceberg MV relationship metadata failed: {err}; orphan target table {}.{}.{} could not be dropped: {drop_err}",
                 target.catalog, target.namespace, target.table
+            ),
+        });
+    }
+    if let Err(err) = persist_mv_definition(
+        state,
+        PersistMvDefinitionRequest {
+            mv_id,
+            select_sql: canonical_select_query.to_string(),
+            base_table_refs: base_refs,
+            primary_key_columns,
+            storage_engine: ManagedMvStorageEngine::Iceberg,
+            target_catalog: Some(target.catalog.clone()),
+            target_namespace: Some(target.namespace.clone()),
+            target_table: Some(target.table.clone()),
+            created_at_ms,
+        },
+    ) {
+        let legacy_drop = metadata_store.drop_iceberg_mv_relationship(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        );
+        let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
+            &entry,
+            &target.namespace,
+            &target.table,
+        );
+        return Err(match (legacy_drop, drop_result) {
+            (Ok(_), Ok(())) => format!("create iceberg MV repository metadata failed: {err}"),
+            (legacy, drop) => format!(
+                "create iceberg MV repository metadata failed: {err}; legacy cleanup={legacy:?}; target cleanup={drop:?}"
             ),
         });
     }
@@ -1152,11 +1188,12 @@ mod tests {
     fn open_test_state_with_iceberg_catalog(catalog: &str, current_db: &str) -> IcebergMvTestState {
         let metadata_dir = TempDir::new().expect("metadata tempdir");
         let warehouse_dir = TempDir::new().expect("warehouse tempdir");
+        let metadata_path = metadata_dir.path().join("standalone.sqlite");
         let metadata_store =
-            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(
-                metadata_dir.path().join("standalone.sqlite"),
-            )
-            .expect("open sqlite store");
+            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(&metadata_path)
+                .expect("open sqlite store");
+        let metadata_provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
         let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
         snapshot.global.warehouse_uri =
             format!("file://{}", warehouse_dir.path().join("managed").display());
@@ -1166,6 +1203,7 @@ mod tests {
             .replace_managed_snapshot(&snapshot)
             .expect("initialize metadata snapshot");
         let state = Arc::new(StandaloneState {
+            metadata_provider: Some(Arc::new(metadata_provider)),
             metadata_store: Some(metadata_store),
             ..StandaloneState::default()
         });

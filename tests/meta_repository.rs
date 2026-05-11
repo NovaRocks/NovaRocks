@@ -1011,6 +1011,54 @@ fn mv_repository_creates_definition_and_target_lookup() -> Result<(), Box<dyn st
 }
 
 #[test]
+fn mv_repository_creates_and_drops_definition_with_explicit_id()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("create explicit mv definition")?;
+        let definition = repository.create_definition_with_id(
+            txn.as_mut(),
+            42,
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id FROM ice.sales.orders".to_string(),
+                base_table_refs: vec!["ice.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "managed_lake".to_string(),
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
+                created_at_ms: 7,
+            },
+        )?;
+        assert_eq!(definition.mv_id, 42);
+        txn.commit()?;
+    }
+
+    {
+        let read = provider.begin_read()?;
+        let definition = repository
+            .load_by_id(read.as_ref(), 42)?
+            .expect("explicit definition");
+        assert_eq!(definition.select_sql, "SELECT id FROM ice.sales.orders");
+        assert_eq!(definition.base_table_refs, vec!["ice.sales.orders"]);
+    }
+
+    {
+        let mut txn = provider.begin_write("drop explicit mv definition")?;
+        assert!(repository.drop_by_id(txn.as_mut(), 42)?);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(repository.load_by_id(read.as_ref(), 42)?.is_none());
+
+    Ok(())
+}
+
+#[test]
 fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;

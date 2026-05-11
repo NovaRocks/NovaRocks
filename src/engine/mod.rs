@@ -2001,6 +2001,12 @@ pub(crate) fn delete_iceberg_table_if_needed(
         .map_err(|e| format!("delete iceberg table metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit iceberg table metadata failed: {e}"))?;
+    // Transitional cleanup until all Iceberg MV drop/delete paths stop writing
+    // legacy materialized_views rows.
+    if let Some(store) = state.metadata_store.as_ref() {
+        store.drop_iceberg_mv_relationship(catalog_name, namespace_name, table_name)?;
+        store.delete_iceberg_table(catalog_name, namespace_name, table_name)?;
+    }
     Ok(())
 }
 
@@ -2026,6 +2032,11 @@ pub(crate) fn delete_iceberg_namespace_if_needed(
         .map_err(|e| format!("delete iceberg namespace metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit iceberg namespace metadata failed: {e}"))?;
+    // Transitional cleanup until managed-lake/MV DDL no longer writes legacy
+    // Iceberg namespace/table/MV rows.
+    if let Some(store) = state.metadata_store.as_ref() {
+        store.delete_iceberg_namespace(catalog_name, namespace_name)?;
+    }
     Ok(())
 }
 
@@ -2045,6 +2056,11 @@ pub(crate) fn delete_iceberg_catalog_if_needed(
         .map_err(|e| format!("delete iceberg catalog metadata failed: {e}"))?;
     txn.commit()
         .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
+    // Transitional cleanup until managed-lake/MV DDL no longer writes legacy
+    // Iceberg catalog/namespace/table/MV rows.
+    if let Some(store) = state.metadata_store.as_ref() {
+        store.delete_iceberg_catalog(catalog_name)?;
+    }
     Ok(())
 }
 
@@ -4860,6 +4876,13 @@ enable_path_style_access = true
                     .expect("create iceberg mv"),
                 StatementResult::Ok
             ));
+            let drop_column_err = session
+                .execute_in_database("ALTER TABLE ice.sales.orders DROP COLUMN name", "default")
+                .expect_err("MV base column dependency must block DROP COLUMN");
+            assert!(
+                drop_column_err.contains("materialized view"),
+                "err={drop_column_err}"
+            );
 
             let store = engine
                 .inner
@@ -4903,6 +4926,21 @@ enable_path_style_access = true
         };
         assert!(query_result_contains_string(&show, "mv_orders"));
         assert!(query_result_contains_string(&show, "iceberg"));
+
+        let info_schema = session
+            .execute_in_context(
+                "SELECT TABLE_NAME, IS_ACTIVE \
+                 FROM information_schema.materialized_views \
+                 WHERE TABLE_SCHEMA = 'analytics'",
+                Some("ice"),
+                "analytics",
+                None,
+            )
+            .expect("query information_schema materialized views");
+        let StatementResult::Query(info_schema) = info_schema else {
+            panic!("expected information_schema query result");
+        };
+        assert!(query_result_contains_string(&info_schema, "mv_orders"));
 
         let select = session
             .execute_in_context("SELECT * FROM mv_orders", Some("ice"), "analytics", None)
