@@ -9,13 +9,12 @@ use iceberg::TableIdent;
 use iceberg::spec::DataFile;
 #[cfg(test)]
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 
 use crate::connector::iceberg::changes::{
     IcebergChangePolicySignal, plan_changes, policy_signal_from_change_error,
 };
 use crate::connector::iceberg::commit::{
-    CommitOpKind, IcebergCommitCollector, RunInput, run_iceberg_commit,
+    CommitOpKind, CommitOutcome, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::connector::starrocks::managed::mv_ddl::{
@@ -450,6 +449,7 @@ pub(crate) fn refresh_iceberg_mv(
         (None, Some(cur)) => first_refresh_iceberg_mv(
             state,
             &target,
+            &target_entry,
             &iceberg_catalog,
             &target_loaded.table,
             metadata_store,
@@ -523,6 +523,7 @@ pub(crate) fn refresh_iceberg_mv(
 fn first_refresh_iceberg_mv(
     state: &Arc<StandaloneState>,
     target: &IcebergMvTarget,
+    target_entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     iceberg_catalog: &Arc<dyn iceberg::Catalog>,
     target_table: &iceberg::table::Table,
     metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
@@ -551,9 +552,19 @@ fn first_refresh_iceberg_mv(
     }
 
     // 2–3. Write data files and commit snapshot inside an async block.
+    let ident = iceberg_mv_table_ident(target)?;
     let new_snapshot_id = data_block_on(async {
         let data_files = write_chunks_as_iceberg_data_files(target_table, &chunks).await?;
-        commit_fast_append(target_table, iceberg_catalog, data_files).await
+        commit_iceberg_mv_target_files(
+            target_table,
+            iceberg_catalog,
+            target_entry,
+            &ident,
+            CommitOpKind::FastAppend,
+            data_files,
+        )
+        .await
+        .map(|outcome| outcome.new_snapshot_id)
     })??;
 
     // 4. Persist refresh metadata in SQLite.
@@ -653,6 +664,26 @@ async fn commit_overwrite_iceberg_mv(
     ident: &TableIdent,
     data_files: Vec<DataFile>,
 ) -> Result<i64, String> {
+    commit_iceberg_mv_target_files(
+        table,
+        catalog,
+        entry,
+        ident,
+        CommitOpKind::Overwrite,
+        data_files,
+    )
+    .await
+    .map(|outcome| outcome.new_snapshot_id)
+}
+
+async fn commit_iceberg_mv_target_files(
+    table: &iceberg::table::Table,
+    catalog: &Arc<dyn Catalog>,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
+    ident: &TableIdent,
+    op_kind: CommitOpKind,
+    data_files: Vec<DataFile>,
+) -> Result<CommitOutcome, String> {
     let metadata = table.metadata();
     let staging_dir = format!(
         "{}/data/_staging/{}",
@@ -660,7 +691,7 @@ async fn commit_overwrite_iceberg_mv(
         uuid::Uuid::new_v4()
     );
     let collector = Arc::new(IcebergCommitCollector::new(
-        CommitOpKind::Overwrite,
+        op_kind,
         ident.clone(),
         metadata.current_snapshot().map(|s| s.snapshot_id()),
         metadata.last_sequence_number(),
@@ -691,7 +722,6 @@ async fn commit_overwrite_iceberg_mv(
         target_ref: "main".to_string(),
     })
     .await
-    .map(|outcome| outcome.new_snapshot_id)
 }
 
 /// Execute the incremental refresh of an iceberg-backed MV.
@@ -847,9 +877,19 @@ fn incremental_refresh_iceberg_mv(
     }
 
     // 4. Write and commit.
+    let ident = iceberg_mv_table_ident(target)?;
     let new_snapshot_id = data_block_on(async {
         let written = write_chunks_as_iceberg_data_files(target_table, &chunks).await?;
-        commit_fast_append(target_table, iceberg_catalog, written).await
+        commit_iceberg_mv_target_files(
+            target_table,
+            iceberg_catalog,
+            target_entry,
+            &ident,
+            CommitOpKind::FastAppend,
+            written,
+        )
+        .await
+        .map(|outcome| outcome.new_snapshot_id)
     })??;
 
     let new_total_rows = mv_row.last_refresh_rows.unwrap_or(0) + added_rows;
@@ -895,32 +935,6 @@ pub(crate) async fn write_chunks_as_iceberg_data_files(
     chunks: &[crate::exec::chunk::Chunk],
 ) -> Result<Vec<iceberg::spec::DataFile>, String> {
     write_record_batches_as_data_files(table, chunks.iter().map(|chunk| chunk.batch.clone())).await
-}
-
-/// Commit a fast-append transaction adding `data_files` to `table`.
-///
-/// Returns the snapshot id of the newly created snapshot.
-pub(crate) async fn commit_fast_append(
-    table: &iceberg::table::Table,
-    catalog: &Arc<dyn iceberg::Catalog>,
-    data_files: Vec<iceberg::spec::DataFile>,
-) -> Result<i64, String> {
-    let txn = Transaction::new(table);
-    let action = txn.fast_append().add_data_files(data_files);
-    let txn = action
-        .apply(txn)
-        .map_err(|e| format!("iceberg fast_append apply failed: {e}"))?;
-    let updated_table = txn
-        .commit(catalog.as_ref())
-        .await
-        .map_err(|e| format!("iceberg transaction commit failed: {e}"))?;
-    updated_table
-        .metadata()
-        .current_snapshot()
-        .map(|s| s.snapshot_id())
-        .ok_or_else(|| {
-            "iceberg commit succeeded but resulting table has no current snapshot".to_string()
-        })
 }
 
 pub(crate) fn drop_iceberg_mv(
@@ -1554,23 +1568,22 @@ mod tests {
     /// a fast-append snapshot, then verify the snapshot is current after reload.
     #[test]
     fn write_chunks_round_trip_through_iceberg_table() {
-        use crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog;
-        use iceberg::Catalog;
-        use iceberg::io::{FileIOBuilder, LocalFsStorageFactory};
+        use crate::connector::iceberg::catalog::registry::{
+            build_catalog_entry, build_iceberg_catalog,
+        };
 
         let dir = tempfile::tempdir().expect("tempdir");
         let warehouse = format!("file://{}/wh", dir.path().display());
-
-        // Build FileIO using LocalFsStorageFactory so the test writes through
-        // the same local filesystem path shape as a Hadoop Iceberg catalog.
-        let file_io = FileIOBuilder::new(
-            StdArc::new(LocalFsStorageFactory) as StdArc<dyn iceberg::io::StorageFactory>
+        let entry = build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
+            ],
         )
-        .build();
-        let catalog: StdArc<dyn Catalog> = StdArc::new(HadoopFileSystemCatalog::new(
-            file_io.clone(),
-            warehouse.clone(),
-        ));
+        .expect("catalog entry");
+        let catalog = build_iceberg_catalog(&entry).expect("catalog");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -1635,14 +1648,22 @@ mod tests {
                 "at least one data file should be written"
             );
 
-            let snapshot_id = commit_fast_append(&table, &catalog, written).await.unwrap();
+            let ident = TableIdent::from_strs(["test_ns", "t"]).unwrap();
+            let snapshot_id = commit_iceberg_mv_target_files(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+            )
+            .await
+            .unwrap()
+            .new_snapshot_id;
             assert!(snapshot_id != 0, "snapshot id must be non-zero");
 
             // Reload from catalog and confirm snapshot matches.
-            let reloaded = catalog
-                .load_table(&iceberg::TableIdent::from_strs(["test_ns", "t"]).unwrap())
-                .await
-                .unwrap();
+            let reloaded = catalog.load_table(&ident).await.unwrap();
             assert_eq!(
                 reloaded
                     .metadata()
@@ -1654,22 +1675,103 @@ mod tests {
     }
 
     #[test]
+    fn iceberg_mv_fast_append_uses_collector_abort_cleanup() {
+        use crate::connector::iceberg::catalog::registry::{
+            build_catalog_entry, build_iceberg_catalog,
+        };
+        use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = format!("file://{}/wh", dir.path().display());
+        let entry = build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
+            ],
+        )
+        .expect("catalog entry");
+        let catalog = build_iceberg_catalog(&entry).expect("catalog");
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let ns = iceberg::NamespaceIdent::from_strs(["test_ns"]).unwrap();
+            catalog
+                .create_namespace(&ns, std::collections::HashMap::new())
+                .await
+                .unwrap();
+            let schema = iceberg::spec::Schema::builder()
+                .with_fields(vec![StdArc::new(iceberg::spec::NestedField::required(
+                    1,
+                    "k",
+                    iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap();
+            let table = catalog
+                .create_table(
+                    &ns,
+                    iceberg::TableCreation::builder()
+                        .name("mv_target".to_string())
+                        .schema(schema)
+                        .build(),
+                )
+                .await
+                .unwrap();
+            let ident = TableIdent::from_strs(["test_ns", "mv_target"]).unwrap();
+            let staged_path = dir.path().join("staged-position-delete.parquet");
+            std::fs::write(&staged_path, b"bad delete file").expect("write staged file");
+            let staged_uri = format!("file://{}", staged_path.display());
+            let bad_file = DataFileBuilder::default()
+                .content(DataContentType::PositionDeletes)
+                .file_path(staged_uri)
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::empty())
+                .partition_spec_id(0)
+                .record_count(1)
+                .file_size_in_bytes(15)
+                .referenced_data_file(Some("file:///base/data.parquet".to_string()))
+                .build()
+                .expect("bad data file");
+
+            let err = commit_iceberg_mv_target_files(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                vec![bad_file],
+            )
+            .await
+            .expect_err("position delete must not be fast-appended");
+            assert!(err.contains("abort cleanup ran"), "{err}");
+            assert!(
+                !staged_path.exists(),
+                "collector abort cleanup should delete the injected file"
+            );
+        });
+    }
+
+    #[test]
     fn write_chunks_populates_partition_data_for_partitioned_table() {
-        use crate::connector::iceberg::catalog::hadoop_catalog::HadoopFileSystemCatalog;
-        use iceberg::Catalog;
-        use iceberg::io::{FileIOBuilder, LocalFsStorageFactory};
+        use crate::connector::iceberg::catalog::registry::{
+            build_catalog_entry, build_iceberg_catalog,
+        };
         use iceberg::spec::{Transform, UnboundPartitionSpec};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let warehouse = format!("file://{}/wh", dir.path().display());
-        let file_io = FileIOBuilder::new(
-            StdArc::new(LocalFsStorageFactory) as StdArc<dyn iceberg::io::StorageFactory>
+        let entry = build_catalog_entry(
+            "ice",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
+                ("iceberg.catalog.warehouse".to_string(), warehouse.clone()),
+            ],
         )
-        .build();
-        let catalog: StdArc<dyn Catalog> = StdArc::new(HadoopFileSystemCatalog::new(
-            file_io.clone(),
-            warehouse.clone(),
-        ));
+        .expect("catalog entry");
+        let catalog = build_iceberg_catalog(&entry).expect("catalog");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -1744,7 +1846,18 @@ mod tests {
                     .all(|data_file| data_file.record_count() == 1)
             );
 
-            let snapshot_id = commit_fast_append(&table, &catalog, written).await.unwrap();
+            let ident = TableIdent::from_strs(["test_ns", "t"]).unwrap();
+            let snapshot_id = commit_iceberg_mv_target_files(
+                &table,
+                &catalog,
+                &entry,
+                &ident,
+                CommitOpKind::FastAppend,
+                written,
+            )
+            .await
+            .unwrap()
+            .new_snapshot_id;
             assert!(snapshot_id != 0, "snapshot id must be non-zero");
         });
     }

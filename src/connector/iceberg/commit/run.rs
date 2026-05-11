@@ -194,6 +194,7 @@ fn is_commit_unknown_message(err: &str) -> bool {
         "preconditionfailed",
         "catalog commit conflict",
         "catalogcommitconflict",
+        "expected data only",
         // pipeline-side errors are always definite
         "pipeline cancelled",
         "pipeline failed",
@@ -212,6 +213,9 @@ mod tests {
         ));
         assert!(!is_commit_unknown_message(
             "FastAppend commit failed: data invalid"
+        ));
+        assert!(!is_commit_unknown_message(
+            "FastAppendCommit received PositionDeletes content; expected Data only"
         ));
         assert!(!is_commit_unknown_message("pipeline cancelled mid-write"));
         assert!(!is_commit_unknown_message(
