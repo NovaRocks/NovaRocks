@@ -293,10 +293,49 @@ pub(super) fn is_aggregate_function(name: &str) -> bool {
 pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> DataType {
     match name {
         // String functions
-        "upper" | "lower" | "trim" | "ltrim" | "rtrim" | "reverse" | "replace" | "lpad"
-        | "rpad" | "concat" | "concat_ws" | "substr" | "substring" | "left" | "right"
-        | "repeat" | "space" | "hex" | "unhex" | "md5" | "sha2" | "to_base64" | "from_base64"
-        | "url_encode" | "url_decode" | "translate" | "initcap" => DataType::Utf8,
+        "upper"
+        | "lower"
+        | "trim"
+        | "ltrim"
+        | "rtrim"
+        | "reverse"
+        | "replace"
+        | "lpad"
+        | "rpad"
+        | "concat"
+        | "concat_ws"
+        | "substr"
+        | "substring"
+        | "left"
+        | "right"
+        | "repeat"
+        | "space"
+        | "hex"
+        | "unhex"
+        | "md5"
+        | "sha2"
+        | "to_base64"
+        | "from_base64"
+        | "url_encode"
+        | "url_decode"
+        | "translate"
+        | "initcap"
+        | "regexp_extract"
+        | "regexp_replace"
+        | "append_trailing_char_if_absent"
+        | "money_format"
+        | "char"
+        | "elt"
+        | "format"
+        | "strleft"
+        | "strright"
+        | "md5sum"
+        | "sm3"
+        | "group_concat"
+        | "string_agg"
+        | "substring_index"
+        | "parse_url"
+        | "str_to_map" => DataType::Utf8,
 
         // Math functions that return the same type as input
         "abs" => arg_types.first().cloned().unwrap_or(DataType::Float64),
@@ -347,9 +386,12 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         "now" | "current_timestamp" | "current_date" | "curdate" => {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
-        "date_format" | "from_unixtime" => DataType::Utf8,
+        "date_format" | "from_unixtime" | "time_format" => DataType::Utf8,
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
-        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub" => {
+        | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub"
+        | "timestampadd" | "sec_to_time" | "hours_add" | "hours_sub" | "minutes_add"
+        | "minutes_sub" | "seconds_add" | "seconds_sub" | "microseconds_add"
+        | "microseconds_sub" => {
             // Return the same type as the date/timestamp input argument.
             if let Some(dt) = arg_types.first() {
                 match dt {
@@ -363,9 +405,15 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         }
         "date_trunc" => infer_date_trunc_return_type(arg_types),
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "dayofweek"
-        | "dayofyear" | "weekofyear" | "quarter" => DataType::Int32,
-        "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff" => DataType::Int64,
-        "to_date" | "str_to_date" => DataType::Date32,
+        | "yearweek" | "dayofyear" | "weekofyear" | "quarter" | "hour_from_unixtime" => {
+            DataType::Int32
+        }
+        "unix_timestamp" | "to_unix_timestamp" | "datediff" | "timestampdiff" | "months_diff"
+        | "years_diff" | "weeks_diff" | "days_diff" | "hours_diff" | "minutes_diff"
+        | "seconds_diff" | "to_days" | "time_to_sec" => DataType::Int64,
+        "to_date" | "str_to_date" | "from_days" | "makedate" | "last_day" | "next_day" => {
+            DataType::Date32
+        }
 
         // Misc
         "version" | "database" | "current_user" | "user" | "uuid" | "bitmap_to_string" => {
@@ -373,6 +421,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         }
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
+        "md5sum_numeric" => DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
         "hll_hash"
         | "ds_hll_count_distinct_state"
         | "to_bitmap"

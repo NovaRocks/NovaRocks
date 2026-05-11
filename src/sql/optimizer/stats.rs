@@ -1255,6 +1255,7 @@ fn estimate_range_selectivity(
 fn extract_literal_f64(expr: &TypedExpr) -> Option<f64> {
     match &expr.kind {
         ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
+        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
         ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
         ExprKind::Literal(LiteralValue::Decimal(s)) => s.parse::<f64>().ok(),
         ExprKind::Cast { expr, .. } => extract_literal_f64(expr),

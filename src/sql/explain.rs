@@ -816,6 +816,7 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             LiteralValue::Null => "NULL".to_string(),
             LiteralValue::Bool(b) => b.to_string(),
             LiteralValue::Int(n) => n.to_string(),
+            LiteralValue::LargeInt(n) => n.to_string(),
             LiteralValue::Float(f) => f.to_string(),
             LiteralValue::Decimal(d) => d.clone(),
             LiteralValue::String(s) => format!("'{s}'"),

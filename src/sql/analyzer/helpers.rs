@@ -593,6 +593,10 @@ fn expr_display_name_with_parens(expr: &sqlast::Expr) -> String {
             expr_display_name(expr)
         }
         sqlast::Expr::Value(_) => expr_display_name(expr),
+        sqlast::Expr::UnaryOp {
+            op: sqlast::UnaryOperator::Minus,
+            expr: inner,
+        } if matches!(inner.as_ref(), sqlast::Expr::Value(_)) => expr_display_name(expr),
         sqlast::Expr::Nested(inner) => expr_display_name_with_parens(inner),
         _ => format!("({})", expr_display_name(expr)),
     }
@@ -616,6 +620,11 @@ fn format_cast_type(data_type: &sqlast::DataType) -> String {
             }
             sqlast::ExactNumberInfo::None => "DECIMAL128(38,0)".to_string(),
         },
+        sqlast::DataType::Custom(name, modifiers)
+            if name.to_string().eq_ignore_ascii_case("largeint") && modifiers.is_empty() =>
+        {
+            "LARGEINT".to_string()
+        }
         other => format!("{other}"),
     }
 }

@@ -167,6 +167,53 @@ fn decimal_value_fits_precision(unscaled: i128, precision: u8) -> bool {
     unscaled.unsigned_abs().to_string().len() <= precision as usize
 }
 
+fn to_decimal128_values(arr: &ArrayRef, context: &str) -> Result<(Vec<Option<i128>>, i32), String> {
+    match arr.data_type() {
+        DataType::Decimal128(_, scale) => {
+            let typed = arr
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| format!("{context}: failed to downcast Decimal128Array"))?;
+            let mut out = Vec::with_capacity(typed.len());
+            for row in 0..typed.len() {
+                if typed.is_null(row) {
+                    out.push(None);
+                } else {
+                    out.push(Some(typed.value(row)));
+                }
+            }
+            Ok((out, *scale as i32))
+        }
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            let casted = if matches!(arr.data_type(), DataType::Int64) {
+                arr.clone()
+            } else {
+                arrow::compute::cast(arr, &DataType::Int64).map_err(|e| {
+                    format!("{context}: failed to cast integer operand to Int64: {e}")
+                })?
+            };
+            let typed = casted
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| format!("{context}: failed to downcast Int64Array"))?;
+            let mut out = Vec::with_capacity(typed.len());
+            for row in 0..typed.len() {
+                if typed.is_null(row) {
+                    out.push(None);
+                } else {
+                    out.push(Some(typed.value(row) as i128));
+                }
+            }
+            Ok((out, 0))
+        }
+        DataType::Null => Ok((vec![None; arr.len()], 0)),
+        other => Err(format!(
+            "{context}: unsupported Decimal128 operand type: {:?}",
+            other
+        )),
+    }
+}
+
 fn to_decimal256_values(arr: &ArrayRef, context: &str) -> Result<(Vec<Option<i256>>, i32), String> {
     match arr.data_type() {
         DataType::Decimal256(_, scale) => {
@@ -300,38 +347,39 @@ fn eval_decimal_binop(
 ) -> Result<Option<ArrayRef>, String> {
     match output_type {
         DataType::Decimal128(out_precision, out_scale) => {
-            let (_lhs_precision, lhs_scale) = match lhs.data_type() {
-                DataType::Decimal128(p, s) => (*p, *s),
-                _ => return Ok(None),
-            };
-            let (_rhs_precision, rhs_scale) = match rhs.data_type() {
-                DataType::Decimal128(p, s) => (*p, *s),
-                _ => return Ok(None),
-            };
-            let lhs_arr = lhs
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-            let rhs_arr = rhs
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-            if lhs_arr.len() != rhs_arr.len() {
+            if !matches!(
+                lhs.data_type(),
+                DataType::Decimal128(_, _)
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Null
+            ) || !matches!(
+                rhs.data_type(),
+                DataType::Decimal128(_, _)
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Null
+            ) {
+                return Ok(None);
+            }
+            let (lhs_values, lhs_scale_i32) = to_decimal128_values(lhs, "decimal arithmetic lhs")?;
+            let (rhs_values, rhs_scale_i32) = to_decimal128_values(rhs, "decimal arithmetic rhs")?;
+            if lhs_values.len() != rhs_values.len() {
                 return Err("decimal arithmetic length mismatch".to_string());
             }
-            let len = lhs_arr.len();
+            let len = lhs_values.len();
             let mut values: Vec<Option<i128>> = Vec::with_capacity(len);
             let mut had_mul_overflow = false;
-            let lhs_scale_i32 = lhs_scale as i32;
-            let rhs_scale_i32 = rhs_scale as i32;
             let out_scale_i32 = *out_scale as i32;
             for row in 0..len {
-                if lhs_arr.is_null(row) || rhs_arr.is_null(row) {
+                let (Some(lhs_val), Some(rhs_val)) = (lhs_values[row], rhs_values[row]) else {
                     values.push(None);
                     continue;
-                }
-                let lhs_val = lhs_arr.value(row);
-                let rhs_val = rhs_arr.value(row);
+                };
                 let out_val = match op {
                     DecimalOp::Add | DecimalOp::Sub => {
                         if out_scale_i32 < lhs_scale_i32 || out_scale_i32 < rhs_scale_i32 {

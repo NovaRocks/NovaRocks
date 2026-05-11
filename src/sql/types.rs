@@ -2,6 +2,21 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
+fn is_largeint(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::FixedSizeBinary(width)
+            if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH
+    )
+}
+
+fn is_integer(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    )
+}
+
 /// Determine the result type for a Decimal binary arithmetic operation,
 /// taking the operator into account (multiply/divide need different scale rules).
 pub(crate) fn decimal_arithmetic_result_type(p1: u8, s1: i8, p2: u8, s2: i8, op: &str) -> DataType {
@@ -51,18 +66,15 @@ pub(crate) fn arithmetic_result_type_with_op(
 ) -> DataType {
     // StarRocks behavior: integer / integer → DOUBLE (not integer).
     let is_div = op == "div";
-    let both_integral = matches!(
-        left,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    ) && matches!(
-        right,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    );
+    let both_integral = is_integer(left) && is_integer(right);
     if is_div && both_integral {
         return DataType::Float64;
     }
 
     match (left, right) {
+        (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
+            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
+        }
         // Decimal + Decimal -> Decimal (op-specific precision/scale)
         (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => {
             decimal_arithmetic_result_type(*p1, *s1, *p2, *s2, op)
@@ -98,6 +110,9 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
     }
     match (a, b) {
         (DataType::Null, other) | (other, DataType::Null) => other.clone(),
+        (l, r) if (is_largeint(l) && is_integer(r)) || (is_integer(l) && is_largeint(r)) => {
+            DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH)
+        }
         (DataType::List(left_field), DataType::List(right_field)) => {
             DataType::List(Arc::new(Field::new(
                 left_field.name(),

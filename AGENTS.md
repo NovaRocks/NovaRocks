@@ -558,14 +558,15 @@ want to delete its shared MinIO volume.
 
 ### 8.2 Build Mode
 
-- **Debug build (`cargo build`)**: Use for bug investigation, functional fix verification, and fast iteration.
-  Debug builds have fast incremental compilation (~10-20s) but slow query execution (~5-10× slower than release).
-  **Use when**: fixing a specific bug and verifying the fix with 1-3 targeted queries.
-- **Release build (`cargo build --release`)**: Use for batch SQL suite testing (SSB, TPC-H, TPC-DS) and performance benchmarks.
+- **Debug build (`cargo build`)**: Use by default for bug investigation, functional fix verification,
+  Rust tests, and SQL suite pass/fail checks.
+  Debug builds have fast incremental compilation (~10-20s) but slow query execution (~5-10x slower than release).
+  **Use when**: checking correctness, running targeted queries, or verifying SQL suites for pass/fail status.
+- **Release build (`cargo build --release`)**: Use only when performance matters or the user explicitly asks for it.
   Release compilation is slow (~3-5 min full, ~30s incremental) but query execution is fast.
-  **Use when**: running a full test suite (`--suite tpc-ds`) or measuring query latency/throughput.
+  **Use when**: measuring query latency/throughput, running benchmarks, or investigating performance-sensitive suite behavior.
 
-**Rule of thumb**: debug for coding → release for testing suites.
+**Rule of thumb**: debug by default for tests; release only for performance or explicit user request.
 
 ### 8.3 Code Quality
 

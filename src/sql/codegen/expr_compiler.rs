@@ -885,16 +885,23 @@ impl<'a> ExprCompiler<'a> {
     ) -> Result<DataType, String> {
         match lit {
             LiteralValue::Null => {
-                let type_desc = scalar_type_desc(types::TPrimitiveType::NULL_TYPE);
+                let (type_desc, data_type) = if matches!(expr_type, DataType::Null) {
+                    (
+                        scalar_type_desc(types::TPrimitiveType::NULL_TYPE),
+                        DataType::Null,
+                    )
+                } else {
+                    (arrow_type_to_type_desc(expr_type)?, expr_type.clone())
+                };
                 self.nodes.push(exprs::TExprNode {
                     node_type: exprs::TExprNodeType::NULL_LITERAL,
                     type_: type_desc,
                     num_children: 0,
                     ..default_expr_node()
                 });
-                self.last_type = DataType::Null;
+                self.last_type = data_type.clone();
                 self.last_nullable = true;
-                Ok(DataType::Null)
+                Ok(data_type)
             }
             LiteralValue::Bool(b) => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::BOOLEAN);
@@ -934,6 +941,23 @@ impl<'a> ExprCompiler<'a> {
                 self.last_type = DataType::Int64;
                 self.last_nullable = false;
                 Ok(DataType::Int64)
+            }
+            LiteralValue::LargeInt(v) => {
+                let type_desc = scalar_type_desc(types::TPrimitiveType::LARGEINT);
+                self.nodes.push(exprs::TExprNode {
+                    node_type: exprs::TExprNodeType::LARGE_INT_LITERAL,
+                    type_: type_desc,
+                    num_children: 0,
+                    large_int_literal: Some(exprs::TLargeIntLiteral {
+                        value: v.to_string(),
+                    }),
+                    ..default_expr_node()
+                });
+                let data_type =
+                    DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH);
+                self.last_type = data_type.clone();
+                self.last_nullable = false;
+                Ok(data_type)
             }
             LiteralValue::Float(v) => {
                 let type_desc = scalar_type_desc(types::TPrimitiveType::DOUBLE);
@@ -1431,6 +1455,9 @@ pub(super) fn default_expr_node() -> exprs::TExprNode {
 /// `target` type for arithmetic operations.  This handles cases like
 /// Int64 * Decimal128 where the integer operand must be cast to Decimal.
 fn needs_comparison_cast(source: &DataType, target: &DataType) -> bool {
+    if needs_largeint_cast(source, target) {
+        return true;
+    }
     source != target
         && matches!(
             (source, target),
@@ -1448,7 +1475,21 @@ fn needs_comparison_cast(source: &DataType, target: &DataType) -> bool {
         )
 }
 
+fn needs_largeint_cast(source: &DataType, target: &DataType) -> bool {
+    source != target
+        && matches!(
+            (source, target),
+            (
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8,
+                DataType::FixedSizeBinary(width)
+            ) if *width == crate::common::largeint::LARGEINT_BYTE_WIDTH
+        )
+}
+
 fn needs_arithmetic_cast(source: &DataType, target: &DataType) -> bool {
+    if needs_largeint_cast(source, target) {
+        return true;
+    }
     source != target
         && matches!(
             (source, target),
@@ -1503,7 +1544,6 @@ fn infer_scalar_function_return_type(
         | "strleft"
         | "strright"
         | "md5sum"
-        | "md5sum_numeric"
         | "sm3"
         | "group_concat"
         | "string_agg"
@@ -1572,6 +1612,9 @@ fn infer_scalar_function_return_type(
         | "l2_distance" => Ok(DataType::Float64),
         "rand" | "random" => Ok(DataType::Float64),
         "crc32" => Ok(DataType::Int64),
+        "md5sum_numeric" => Ok(DataType::FixedSizeBinary(
+            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+        )),
 
         // String length/position
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"

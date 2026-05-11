@@ -702,6 +702,17 @@ impl<'a> super::AnalyzerContext<'a> {
                         data_type: DataType::Int64,
                         nullable: false,
                     })
+                } else if !n.contains('.') && !n.contains('e') && !n.contains('E') {
+                    let v = n
+                        .parse::<i128>()
+                        .map_err(|_| format!("invalid numeric literal: {n}"))?;
+                    Ok(TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::LargeInt(v)),
+                        data_type: DataType::FixedSizeBinary(
+                            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+                        ),
+                        nullable: false,
+                    })
                 } else if n.contains('.') && !n.contains('e') && !n.contains('E') {
                     // Number with decimal point (no scientific notation) → Decimal
                     // with precision/scale inferred from the literal text (e.g.
@@ -2093,11 +2104,13 @@ fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> Typed
 }
 
 fn cast_to_utf8_if_needed(expr: &mut TypedExpr) -> bool {
-    if matches!(
-        expr.data_type,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Null
-    ) {
+    if matches!(expr.data_type, DataType::Utf8 | DataType::LargeUtf8) {
         return false;
+    }
+    if matches!(expr.data_type, DataType::Null) {
+        expr.data_type = DataType::Utf8;
+        expr.nullable = true;
+        return true;
     }
     let nullable = expr.nullable;
     let inner = std::mem::replace(
@@ -2141,6 +2154,8 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
         | "split"
         | "starts_with"
         | "ends_with" => cast_utf8_args(args, &[0, 1]),
+        "regexp_extract" | "regexp_extract_all" => cast_utf8_args(args, &[0, 1]),
+        "regexp_replace" => cast_utf8_args(args, &[0, 1, 2]),
         "lpad" | "rpad" => cast_utf8_args(args, &[0, 2]),
         "replace" => cast_utf8_args(args, &[0, 1, 2]),
         "ascii" | "char_length" | "character_length" | "initcap" | "left" | "length" | "lower"
@@ -2558,6 +2573,7 @@ fn array_literal_items(expr: &TypedExpr) -> Option<&[TypedExpr]> {
 fn const_numeric_value(expr: &TypedExpr) -> Option<f64> {
     match &strip_casts(expr).kind {
         ExprKind::Literal(LiteralValue::Int(v)) => Some(*v as f64),
+        ExprKind::Literal(LiteralValue::LargeInt(v)) => Some(*v as f64),
         ExprKind::Literal(LiteralValue::Float(v)) => Some(*v),
         ExprKind::Literal(LiteralValue::Decimal(v)) => v.parse::<f64>().ok(),
         ExprKind::UnaryOp {

@@ -222,6 +222,13 @@ pub(super) fn array_value_to_mysql_value(
     {
         return timestamp_to_date_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
     }
+    if matches!(
+        declared.data_type,
+        DataType::Time32(_) | DataType::Time64(_)
+    ) && matches!(column.data_type(), DataType::Timestamp(_, _))
+    {
+        return timestamp_to_time_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
+    }
 
     let name_lower = declared.name.to_lowercase();
     if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
@@ -385,6 +392,9 @@ fn downcast_array<'a, T: 'static>(column: &'a ArrayRef, expected: &str) -> Resul
 }
 
 fn date32_to_mysql_value(days: i32) -> Result<StandaloneMysqlValue, String> {
+    if days == crate::exec::expr::function::date::zero_date_sentinel_date32() {
+        return Ok(StandaloneMysqlValue::Bytes(b"0000-00-00".to_vec()));
+    }
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
     let date = epoch
         .checked_add_signed(Duration::days(i64::from(days)))
@@ -397,6 +407,18 @@ fn timestamp_to_naive_datetime(
     unit: TimeUnit,
     row_idx: usize,
 ) -> Result<NaiveDateTime, String> {
+    let raw = timestamp_raw_micros(column, unit, row_idx)?;
+    let secs = raw.div_euclid(1_000_000);
+    let micros = raw.rem_euclid(1_000_000);
+    let secs = i64::try_from(secs).map_err(|_| format!("timestamp value out of range: {raw}"))?;
+    let micros =
+        u32::try_from(micros).map_err(|_| format!("timestamp micros out of range: {raw}"))?;
+    let dt = chrono::DateTime::<Utc>::from_timestamp(secs, micros * 1_000)
+        .ok_or_else(|| format!("timestamp value out of range: {raw}"))?;
+    Ok(dt.naive_utc())
+}
+
+fn timestamp_raw_micros(column: &ArrayRef, unit: TimeUnit, row_idx: usize) -> Result<i128, String> {
     let raw = match unit {
         TimeUnit::Second => {
             i128::from(
@@ -421,14 +443,7 @@ fn timestamp_to_naive_datetime(
             ) / 1_000
         }
     };
-    let secs = raw.div_euclid(1_000_000);
-    let micros = raw.rem_euclid(1_000_000);
-    let secs = i64::try_from(secs).map_err(|_| format!("timestamp value out of range: {raw}"))?;
-    let micros =
-        u32::try_from(micros).map_err(|_| format!("timestamp micros out of range: {raw}"))?;
-    let dt = chrono::DateTime::<Utc>::from_timestamp(secs, micros * 1_000)
-        .ok_or_else(|| format!("timestamp value out of range: {raw}"))?;
-    Ok(dt.naive_utc())
+    Ok(raw)
 }
 
 fn timestamp_to_mysql_value(
@@ -449,6 +464,14 @@ fn timestamp_to_date_mysql_value(
     Ok(StandaloneMysqlValue::Date(
         timestamp_to_naive_datetime(column, unit, row_idx)?.date(),
     ))
+}
+
+fn timestamp_to_time_mysql_value(
+    column: &ArrayRef,
+    unit: TimeUnit,
+    row_idx: usize,
+) -> Result<StandaloneMysqlValue, String> {
+    time_micros_to_mysql_value(timestamp_raw_micros(column, unit, row_idx)?)
 }
 
 fn time_to_mysql_value(
@@ -480,6 +503,10 @@ fn time_to_mysql_value(
         }
     };
 
+    time_micros_to_mysql_value(micros)
+}
+
+fn time_micros_to_mysql_value(micros: i128) -> Result<StandaloneMysqlValue, String> {
     let total_seconds = micros.div_euclid(1_000_000);
     let microseconds = micros.rem_euclid(1_000_000) as u32;
     let hours = total_seconds.div_euclid(3_600);

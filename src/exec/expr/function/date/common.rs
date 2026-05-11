@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::common::largeint;
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -25,6 +26,67 @@ use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, 
 
 pub const UNIX_EPOCH_DAY_OFFSET: i32 = 719163; // 1970-01-01 in Julian days
 pub const BC_EPOCH_JULIAN: i32 = 1721060; // from StarRocks time_types.h
+
+fn standardize_numeric_datetime_literal(value: i64) -> Option<i64> {
+    const YY_PART_YEAR: i64 = 70;
+    if value <= 0 {
+        return None;
+    }
+    if value >= 10000101000000 {
+        if value > 99999999999999 {
+            return None;
+        }
+        return Some(value);
+    }
+    if value < 101 {
+        return None;
+    }
+    if value <= (YY_PART_YEAR - 1) * 10000 + 1231 {
+        return Some((value + 20000000) * 1000000);
+    }
+    if value < YY_PART_YEAR * 10000 + 101 {
+        return None;
+    }
+    if value <= 991231 {
+        return Some((value + 19000000) * 1000000);
+    }
+    if value < 10000101 {
+        return None;
+    }
+    if value <= 99991231 {
+        return Some(value * 1000000);
+    }
+    if value < 101000000 {
+        return None;
+    }
+    if value <= (YY_PART_YEAR - 1) * 10000000000 + 1231235959 {
+        return Some(value + 20000000000000);
+    }
+    if value < YY_PART_YEAR * 10000000000 + 101000000 {
+        return None;
+    }
+    if value <= 991231235959 {
+        return Some(value + 19000000000000);
+    }
+    Some(value)
+}
+
+fn numeric_datetime_literal_to_naive(value: i64) -> Option<NaiveDateTime> {
+    let standardized = standardize_numeric_datetime_literal(value)?;
+    let date_part = standardized / 1_000_000;
+    let time_part = standardized % 1_000_000;
+
+    let year = (date_part / 10_000) as i32;
+    let month = ((date_part / 100) % 100) as u32;
+    let day = (date_part % 100) as u32;
+    let hour = (time_part / 10_000) as u32;
+    let minute = ((time_part / 100) % 100) as u32;
+    let second = (time_part % 100) as u32;
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+    Some(date.and_time(time))
+}
 
 pub fn date32_to_naive(days: i32) -> Option<NaiveDate> {
     NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
@@ -451,6 +513,23 @@ pub fn extract_datetime_array(array: &ArrayRef) -> Result<Vec<Option<NaiveDateTi
                             out.push(timestamp_to_naive(unit, arr.value(i)));
                         }
                     }
+                }
+            }
+            Ok(out)
+        }
+        DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
+            let arr = largeint::as_fixed_size_binary_array(array, "datetime LARGEINT input")?;
+            let mut out = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                if arr.is_null(i) {
+                    out.push(None);
+                } else {
+                    let value = largeint::value_at(arr, i)?;
+                    out.push(
+                        i64::try_from(value)
+                            .ok()
+                            .and_then(numeric_datetime_literal_to_naive),
+                    );
                 }
             }
             Ok(out)
