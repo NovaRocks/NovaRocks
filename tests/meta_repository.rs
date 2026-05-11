@@ -8,6 +8,7 @@ use novarocks::meta::repository::managed_lake::{
     CreateManagedDatabaseRequest, CreateManagedTableRequest, ManagedLakeMetaRepository,
     ManagedPartitionState, ManagedTableKind, ManagedTableState,
 };
+use novarocks::meta::repository::managed_txn::{ManagedLakeTxnRepository, ManagedTxnState};
 use novarocks::meta::repository::mv::{
     CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
     MvTargetLookup, RefreshExternalOutcome,
@@ -172,6 +173,123 @@ fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn 
     };
 
     assert!(err.to_string().contains("already exists"));
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_prepare_written_visible_advances_partition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+
+    let (table_id, partition_id) = {
+        let mut txn = provider.begin_write("create managed lake objects")?;
+        let database = meta_repo.create_database(
+            txn.as_mut(),
+            CreateManagedDatabaseRequest {
+                name: "db1".to_string(),
+            },
+        )?;
+        let table = meta_repo.create_table(
+            txn.as_mut(),
+            CreateManagedTableRequest {
+                db_id: database.db_id,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
+            },
+        )?;
+        let partition = meta_repo.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
+        txn.commit()?;
+        (table.table_id, partition.partition_id)
+    };
+
+    let txn_id = {
+        let mut txn = provider.begin_write("commit managed lake txn")?;
+        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        assert_eq!(managed_txn.table_id, table_id);
+        assert_eq!(managed_txn.partition_id, partition_id);
+        assert_eq!(managed_txn.base_version, 1);
+        assert_eq!(managed_txn.commit_version, 2);
+        assert_eq!(managed_txn.state, ManagedTxnState::Prepared);
+        txn_repo.mark_written(txn.as_mut(), managed_txn.txn_id)?;
+        txn_repo.mark_visible(&meta_repo, txn.as_mut(), managed_txn.txn_id)?;
+        txn.commit()?;
+        managed_txn.txn_id
+    };
+
+    let read = provider.begin_read()?;
+    let loaded = txn_repo
+        .load(read.as_ref(), txn_id)?
+        .expect("managed txn should persist");
+    assert_eq!(loaded.state, ManagedTxnState::Visible);
+
+    let partition = meta_repo
+        .load_partition(read.as_ref(), partition_id)?
+        .expect("partition should persist");
+    assert_eq!(partition.visible_version, 2);
+    assert_eq!(partition.next_version, 3);
+
+    Ok(())
+}
+
+#[test]
+fn managed_txn_repository_abort_does_not_advance_partition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let meta_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+
+    let (table_id, partition_id) = {
+        let mut txn = provider.begin_write("create managed lake objects")?;
+        let database = meta_repo.create_database(
+            txn.as_mut(),
+            CreateManagedDatabaseRequest {
+                name: "db1".to_string(),
+            },
+        )?;
+        let table = meta_repo.create_table(
+            txn.as_mut(),
+            CreateManagedTableRequest {
+                db_id: database.db_id,
+                name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::Table,
+            },
+        )?;
+        let partition = meta_repo.create_partition(txn.as_mut(), table.table_id, "orders", 1)?;
+        txn.commit()?;
+        (table.table_id, partition.partition_id)
+    };
+
+    let txn_id = {
+        let mut txn = provider.begin_write("abort managed lake txn")?;
+        let managed_txn = txn_repo.prepare(&meta_repo, txn.as_mut(), table_id, partition_id)?;
+        txn_repo.mark_aborted(txn.as_mut(), managed_txn.txn_id)?;
+        txn.commit()?;
+        managed_txn.txn_id
+    };
+
+    let read = provider.begin_read()?;
+    let loaded = txn_repo
+        .load(read.as_ref(), txn_id)?
+        .expect("managed txn should persist");
+    assert_eq!(loaded.state, ManagedTxnState::Aborted);
+
+    let partition = meta_repo
+        .load_partition(read.as_ref(), partition_id)?
+        .expect("partition should persist");
+    assert_eq!(partition.visible_version, 1);
 
     Ok(())
 }
