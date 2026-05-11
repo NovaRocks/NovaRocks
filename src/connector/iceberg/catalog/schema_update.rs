@@ -3309,25 +3309,29 @@ fn managed_mv_dependencies_for_target(
     state: &Arc<StandaloneState>,
     target: &crate::engine::backend_resolver::TargetBackend,
 ) -> Result<Vec<ManagedMvDependency>, String> {
-    let Some(store) = state.metadata_store.as_ref() else {
+    let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(Vec::new());
     };
-    let snapshot = store.load_snapshot()?.managed;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
     let target_key_lower = target_key.to_ascii_lowercase();
     let target = ManagedMvTarget::from_backend(target)?;
-    Ok(snapshot
-        .materialized_views
+    Ok(definitions
         .into_iter()
         .filter(|mv| {
-            mv.base_table_refs.iter().any(|base| {
-                base.catalog.eq_ignore_ascii_case(&target.catalog)
-                    && base.namespace.eq_ignore_ascii_case(&target.namespace)
-                    && base.table.eq_ignore_ascii_case(&target.table)
-            }) || mv
-                .select_sql
-                .to_ascii_lowercase()
-                .contains(&target_key_lower)
+            mv.base_table_refs
+                .iter()
+                .any(|base| base.eq_ignore_ascii_case(&target_key))
+                || mv
+                    .select_sql
+                    .to_ascii_lowercase()
+                    .contains(&target_key_lower)
         })
         .map(|mv| ManagedMvDependency {
             select_sql: mv.select_sql,

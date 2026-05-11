@@ -7,8 +7,8 @@ use crate::meta::repository::{
     RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
 };
 use crate::meta::{
-    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecord, MetaRecordKind, MetaRecordPut,
-    MetaRevision, MetaWriteTxn,
+    ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
+    MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
 
 const MV_DEFINITION_KIND: &str = "mv.definition";
@@ -182,6 +182,17 @@ impl MvMetaRepository {
         txn.get(&key_by_id(mv_id)?)?
             .map(decode_definition_record)
             .transpose()
+    }
+
+    pub fn list_definitions(
+        &self,
+        txn: &dyn MetaReadTxn,
+    ) -> RepositoryResult<Vec<StoredMvDefinition>> {
+        txn.scan(&key_prefix_by_id()?, None)?
+            .into_iter()
+            .map(decode_definition_record)
+            .map(|result| result.map(|versioned| versioned.value))
+            .collect()
     }
 
     pub fn find_by_target(
@@ -505,6 +516,10 @@ fn key_by_id(mv_id: i64) -> RepositoryResult<MetaKey> {
         NS_MV,
         ["by-id".to_string(), mv_id.to_string()],
     )?)
+}
+
+fn key_prefix_by_id() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_MV, ["by-id"])?)
 }
 
 fn key_by_target(catalog: &str, namespace: &str, table: &str) -> RepositoryResult<MetaKey> {

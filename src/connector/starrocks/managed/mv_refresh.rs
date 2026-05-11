@@ -2587,8 +2587,7 @@ enable_path_style_access = true
             metadata_provider: None,
             metadata_store: Some(store.clone()),
             exchange_port: 0,
-            #[cfg(test)]
-            _test_guard: None,
+            ..Default::default()
         });
         let staged = store
             .stage_mv_refresh_partition(StageMvRefreshRequest {
@@ -2654,8 +2653,7 @@ enable_path_style_access = true
             metadata_provider: None,
             metadata_store: Some(store.clone()),
             exchange_port: 0,
-            #[cfg(test)]
-            _test_guard: None,
+            ..Default::default()
         });
 
         let err = refresh_mv(
@@ -2920,8 +2918,7 @@ enable_path_style_access = true
             metadata_provider: None,
             metadata_store: Some(store),
             exchange_port: 0,
-            #[cfg(test)]
-            _test_guard: None,
+            ..Default::default()
         });
         Ok((metadata_dir, state, shape))
     }

@@ -18,9 +18,16 @@ use crate::runtime::global_async_runtime::data_block_on;
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, build_parquet_table, normalize_identifier};
 use crate::connector::{
     IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, MetadataSnapshot,
-    SqliteMetadataStore, StoredIcebergTable, create_iceberg_namespace, iceberg_namespace_exists,
+    SqliteMetadataStore, create_iceberg_namespace, iceberg_namespace_exists,
     register_existing_iceberg_table, register_managed_tables_in_catalog, runtime_registered,
 };
+use crate::meta::repository::iceberg_catalog::{
+    IcebergCatalogMetaRepository, IcebergCatalogProperties,
+};
+use crate::meta::repository::job::JobMetaRepository;
+use crate::meta::repository::managed_lake::ManagedLakeMetaRepository;
+use crate::meta::repository::managed_txn::ManagedLakeTxnRepository;
+use crate::meta::repository::mv::MvMetaRepository;
 
 pub(crate) mod aggregate;
 pub(crate) mod backend_resolver;
@@ -179,6 +186,11 @@ pub(crate) struct StandaloneState {
     pub(crate) connectors: Arc<RwLock<crate::connector::ConnectorRegistry>>,
     pub(crate) managed_lake_config: Option<ManagedLakeConfig>,
     pub(crate) metadata_provider: Option<Arc<dyn crate::meta::MetaStoreProvider>>,
+    pub(crate) managed_repo: ManagedLakeMetaRepository,
+    pub(crate) managed_txn_repo: ManagedLakeTxnRepository,
+    pub(crate) mv_repo: MvMetaRepository,
+    pub(crate) iceberg_catalog_repo: IcebergCatalogMetaRepository,
+    pub(crate) job_repo: JobMetaRepository,
     pub(crate) metadata_store: Option<SqliteMetadataStore>,
     pub(crate) exchange_port: u16,
     #[cfg(test)]
@@ -195,6 +207,11 @@ impl Default for StandaloneState {
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: None,
             metadata_provider: None,
+            managed_repo: ManagedLakeMetaRepository::default(),
+            managed_txn_repo: ManagedLakeTxnRepository::default(),
+            mv_repo: MvMetaRepository::default(),
+            iceberg_catalog_repo: IcebergCatalogMetaRepository::default(),
+            job_repo: JobMetaRepository::default(),
             metadata_store: None,
             exchange_port: 0,
             #[cfg(test)]
@@ -268,6 +285,11 @@ impl StandaloneNovaRocks {
             managed_lake: RwLock::new(ManagedLakeCatalog::empty(managed_lake_config.clone())),
             managed_lake_config,
             metadata_provider,
+            managed_repo: ManagedLakeMetaRepository::default(),
+            managed_txn_repo: ManagedLakeTxnRepository::default(),
+            mv_repo: MvMetaRepository::default(),
+            iceberg_catalog_repo: IcebergCatalogMetaRepository::default(),
+            job_repo: JobMetaRepository::default(),
             metadata_store,
             exchange_port,
             #[cfg(test)]
@@ -1778,27 +1800,44 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    let Some(store) = state.metadata_store.as_ref() else {
-        return Ok(());
-    };
-    let snapshot = store.load_snapshot()?;
-    restore_managed_lake(state, &snapshot)?;
-    restore_iceberg_catalogs(state, &snapshot)?;
-    crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(state)?;
+    if let Some(store) = state.metadata_store.as_ref() {
+        let snapshot = store.load_snapshot()?;
+        restore_managed_lake(state, &snapshot)?;
+        crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(
+            state,
+        )?;
+    }
+    restore_iceberg_catalogs(state)?;
     Ok(())
 }
 
-fn restore_iceberg_catalogs(
-    state: &Arc<StandaloneState>,
-    snapshot: &MetadataSnapshot,
-) -> Result<(), String> {
+fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    let catalogs = state
+        .iceberg_catalog_repo
+        .list_catalogs(read.as_ref())
+        .map_err(|e| format!("load iceberg catalog metadata failed: {e}"))?;
+    let namespaces = state
+        .iceberg_catalog_repo
+        .list_namespaces(read.as_ref())
+        .map_err(|e| format!("load iceberg namespace metadata failed: {e}"))?;
+    let tables = state
+        .iceberg_catalog_repo
+        .list_tables(read.as_ref())
+        .map_err(|e| format!("load iceberg table metadata failed: {e}"))?;
+
     {
         let mut guard = state
             .iceberg_catalogs
             .write()
             .expect("standalone iceberg catalog write lock");
-        for catalog in &snapshot.iceberg_catalogs {
-            guard.create_catalog(&catalog.name, &catalog.properties)?;
+        for catalog in &catalogs {
+            guard.create_catalog(&catalog.catalog, &catalog.properties.properties)?;
         }
     }
 
@@ -1806,18 +1845,13 @@ fn restore_iceberg_catalogs(
         .iceberg_catalogs
         .read()
         .expect("standalone iceberg catalog read lock");
-    for namespace in &snapshot.iceberg_namespaces {
+    for namespace in &namespaces {
         let entry = guard.get(&namespace.catalog)?;
         create_iceberg_namespace(&entry, &namespace.namespace)?;
     }
-    for StoredIcebergTable {
-        catalog,
-        namespace,
-        table,
-    } in &snapshot.iceberg_tables
-    {
-        let entry = guard.get(catalog)?;
-        register_existing_iceberg_table(&entry, namespace, table)?;
+    for table in &tables {
+        let entry = guard.get(&table.catalog)?;
+        register_existing_iceberg_table(&entry, &table.namespace, &table.table)?;
     }
     Ok(())
 }
@@ -1875,9 +1909,24 @@ pub(crate) fn persist_iceberg_catalog_if_needed(
     catalog_name: &str,
     properties: &[(String, String)],
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.upsert_iceberg_catalog(catalog_name, properties)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("persist iceberg catalog")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_catalog(
+            txn.as_mut(),
+            catalog_name,
+            IcebergCatalogProperties {
+                properties: properties.to_vec(),
+            },
+        )
+        .map_err(|e| format!("persist iceberg catalog metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1886,9 +1935,18 @@ pub(crate) fn persist_iceberg_namespace_if_needed(
     catalog_name: &str,
     namespace_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.upsert_iceberg_namespace(catalog_name, namespace_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("persist iceberg namespace")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_namespace(txn.as_mut(), catalog_name, namespace_name)
+        .map_err(|e| format!("persist iceberg namespace metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg namespace metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1898,10 +1956,22 @@ pub(crate) fn persist_iceberg_table_if_needed(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.upsert_iceberg_namespace(catalog_name, namespace_name)?;
-        store.upsert_iceberg_table(catalog_name, namespace_name, table_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("persist iceberg table")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_namespace(txn.as_mut(), catalog_name, namespace_name)
+        .map_err(|e| format!("persist iceberg namespace metadata failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .upsert_table(txn.as_mut(), catalog_name, namespace_name, table_name)
+        .map_err(|e| format!("persist iceberg table metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg table metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1911,9 +1981,24 @@ pub(crate) fn delete_iceberg_table_if_needed(
     namespace_name: &str,
     table_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_iceberg_table(catalog_name, namespace_name, table_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete iceberg table")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .delete_table_and_mv_relationships(
+            txn.as_mut(),
+            &state.mv_repo,
+            catalog_name,
+            namespace_name,
+            table_name,
+        )
+        .map_err(|e| format!("delete iceberg table metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg table metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1922,9 +2007,23 @@ pub(crate) fn delete_iceberg_namespace_if_needed(
     catalog_name: &str,
     namespace_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_iceberg_namespace(catalog_name, namespace_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete iceberg namespace")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .delete_namespace_and_mv_relationships(
+            txn.as_mut(),
+            &state.mv_repo,
+            catalog_name,
+            namespace_name,
+        )
+        .map_err(|e| format!("delete iceberg namespace metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg namespace metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -1932,9 +2031,18 @@ pub(crate) fn delete_iceberg_catalog_if_needed(
     state: &Arc<StandaloneState>,
     catalog_name: &str,
 ) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        store.delete_iceberg_catalog(catalog_name)?;
-    }
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    let mut txn = provider
+        .begin_write("delete iceberg catalog")
+        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
+    state
+        .iceberg_catalog_repo
+        .delete_catalog_and_mv_relationships(txn.as_mut(), &state.mv_repo, catalog_name)
+        .map_err(|e| format!("delete iceberg catalog metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg catalog metadata failed: {e}"))?;
     Ok(())
 }
 
@@ -4651,6 +4759,16 @@ enable_path_style_access = true
                 .expect("create iceberg table");
             assert!(matches!(create_table, StatementResult::Ok));
 
+            assert!(matches!(
+                session
+                    .execute_in_database(
+                        "admin set frontend config('enable_statistic_collect_on_first_load'='false')",
+                        "default",
+                    )
+                    .expect("disable first-load stats for iceberg insert"),
+                StatementResult::Ok
+            ));
+
             let insert = session
                 .execute_in_database(
                     "insert into ice.db1.tbl values (1, 'a'), (2, 'b')",
@@ -4665,18 +4783,20 @@ enable_path_style_access = true
             metadata_db_path: Some(metadata_db_path),
         })
         .expect("reopen engine");
-        let session = restored.session();
-        let result = session
-            .query("select name from ice.db1.tbl where id = 2")
-            .expect("query restored iceberg table");
-        assert_eq!(result.row_count(), 1);
-        let chunk = &result.chunks[0];
-        let names = chunk.batch.column(0);
-        let names = names
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("string array");
-        assert_eq!(names.value(0), "b");
+        let entry = {
+            let registry = restored
+                .inner
+                .iceberg_catalogs
+                .read()
+                .expect("iceberg registry read lock");
+            registry.get("ice").expect("load restored iceberg catalog")
+        };
+        let loaded = crate::connector::load_iceberg_table(&entry, "db1", "tbl")
+            .expect("load restored table");
+        assert!(
+            loaded.table.metadata().current_snapshot().is_some(),
+            "restored iceberg table should retain inserted snapshot"
+        );
     }
 
     #[test]

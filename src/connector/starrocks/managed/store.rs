@@ -2058,6 +2058,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn upsert_iceberg_catalog(
         &self,
         catalog_name: &str,
@@ -2076,6 +2077,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn upsert_iceberg_namespace(
         &self,
         catalog_name: &str,
@@ -2092,6 +2094,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn upsert_iceberg_table(
         &self,
         catalog_name: &str,
@@ -2109,6 +2112,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete_iceberg_table(
         &self,
         catalog_name: &str,
@@ -2362,6 +2366,7 @@ impl SqliteMetadataStore {
         load_iceberg_optimize_jobs(&conn, None)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete_iceberg_namespace(
         &self,
         catalog_name: &str,
@@ -2391,6 +2396,7 @@ impl SqliteMetadataStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn delete_iceberg_catalog(&self, catalog_name: &str) -> Result<(), String> {
         let conn = self.connection()?;
         conn.execute(

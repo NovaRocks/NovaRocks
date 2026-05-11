@@ -5,9 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::connector::starrocks::managed::store::{
-    ManagedMvStorageEngine, ManagedTableKind, ManagedTableState,
-};
+use crate::connector::starrocks::managed::store::{ManagedTableKind, ManagedTableState};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 #[derive(Clone, Debug)]
@@ -136,13 +134,25 @@ pub(crate) fn try_update_be_configs(
 fn materialized_view_rows(
     state: &Arc<StandaloneState>,
 ) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let Some(metadata_store) = state.metadata_store.as_ref() else {
+    let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(Vec::new());
     };
-    let snapshot = metadata_store.load_snapshot()?.managed;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open metadata read transaction failed: {e}"))?;
+    let definitions = state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
+    let snapshot = state
+        .managed_lake
+        .read()
+        .expect("standalone managed lake read lock")
+        .snapshot
+        .clone();
     let mut rows = Vec::new();
-    for mv in &snapshot.materialized_views {
-        if mv.storage_engine == ManagedMvStorageEngine::Iceberg {
+    for mv in &definitions {
+        if mv.storage_engine.eq_ignore_ascii_case("iceberg") {
             let (Some(table_schema), Some(table_name)) =
                 (mv.target_namespace.clone(), mv.target_table.clone())
             else {

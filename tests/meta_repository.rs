@@ -1281,6 +1281,71 @@ fn iceberg_catalog_repository_registers_catalog_namespace_and_table()
 }
 
 #[test]
+fn iceberg_catalog_repository_lists_registered_catalog_objects()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = IcebergCatalogMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("register iceberg objects")?;
+        repository.upsert_catalog(
+            txn.as_mut(),
+            "ice",
+            IcebergCatalogProperties {
+                properties: vec![("type".to_string(), "rest".to_string())],
+            },
+        )?;
+        repository.upsert_catalog(
+            txn.as_mut(),
+            "warehouse",
+            IcebergCatalogProperties {
+                properties: vec![("type".to_string(), "hadoop".to_string())],
+            },
+        )?;
+        repository.upsert_namespace(txn.as_mut(), "ice", "sales")?;
+        repository.upsert_namespace(txn.as_mut(), "ice", "finance")?;
+        repository.upsert_table(txn.as_mut(), "ice", "sales", "orders")?;
+        repository.upsert_table(txn.as_mut(), "ice", "finance", "payments")?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let catalogs = repository.list_catalogs(read.as_ref())?;
+    assert_eq!(catalogs.len(), 2);
+    assert_eq!(catalogs[0].catalog, "ice");
+    assert_eq!(
+        catalogs[0].properties.properties,
+        vec![("type".to_string(), "rest".to_string())]
+    );
+    assert_eq!(catalogs[1].catalog, "warehouse");
+
+    let namespaces = repository.list_namespaces(read.as_ref())?;
+    assert_eq!(
+        namespaces
+            .iter()
+            .map(|namespace| (namespace.catalog.as_str(), namespace.namespace.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("ice", "finance"), ("ice", "sales")]
+    );
+
+    let tables = repository.list_tables(read.as_ref())?;
+    assert_eq!(
+        tables
+            .iter()
+            .map(|table| (
+                table.catalog.as_str(),
+                table.namespace.as_str(),
+                table.table.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("ice", "finance", "payments"), ("ice", "sales", "orders")]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn iceberg_catalog_repository_deletes_table_and_related_mv_lookup()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -1462,6 +1527,55 @@ fn mv_repository_rejects_stale_target_lookup_without_deleting_wrong_definition()
             .find_by_target(read.as_ref(), "ice", "ns", "other_mv")?
             .is_some()
     );
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("create mv definitions")?;
+        repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT * FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("sales".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                created_at_ms: 11,
+            },
+        )?;
+        repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT * FROM local_table".to_string(),
+                base_table_refs: vec!["local_table".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "managed".to_string(),
+                target_catalog: None,
+                target_namespace: None,
+                target_table: None,
+                created_at_ms: 12,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let definitions = repository.list_definitions(read.as_ref())?;
+    assert_eq!(definitions.len(), 2);
+    assert_eq!(
+        definitions[0].select_sql,
+        "SELECT * FROM iceberg.sales.orders"
+    );
+    assert_eq!(definitions[1].select_sql, "SELECT * FROM local_table");
 
     Ok(())
 }

@@ -6,7 +6,8 @@ use crate::meta::repository::{
     RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload,
 };
 use crate::meta::{
-    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecord, MetaRecordKind, MetaRecordPut, MetaWriteTxn,
+    ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
+    MetaRecordPut, MetaWriteTxn,
 };
 
 const ICEBERG_CATALOG_KIND: &str = "iceberg.catalog";
@@ -22,6 +23,12 @@ pub struct IcebergCatalogMetaRepository;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IcebergCatalogProperties {
     pub properties: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcebergCatalogRecord {
+    pub catalog: String,
+    pub properties: IcebergCatalogProperties,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +68,23 @@ impl IcebergCatalogMetaRepository {
         Ok(true)
     }
 
+    pub fn list_catalogs(
+        &self,
+        txn: &dyn MetaReadTxn,
+    ) -> RepositoryResult<Vec<IcebergCatalogRecord>> {
+        txn.scan(&key_prefix_catalogs()?, None)?
+            .into_iter()
+            .map(|record| {
+                let catalog = record_path_component(&record, 1, "iceberg catalog")?;
+                let properties = decode_catalog_record(&record)?;
+                Ok(IcebergCatalogRecord {
+                    catalog,
+                    properties,
+                })
+            })
+            .collect()
+    }
+
     pub fn upsert_namespace(
         &self,
         txn: &mut dyn MetaWriteTxn,
@@ -91,6 +115,16 @@ impl IcebergCatalogMetaRepository {
         };
         decode_namespace_record(&record)?;
         Ok(true)
+    }
+
+    pub fn list_namespaces(
+        &self,
+        txn: &dyn MetaReadTxn,
+    ) -> RepositoryResult<Vec<IcebergNamespaceRecord>> {
+        txn.scan(&key_prefix_namespaces()?, None)?
+            .into_iter()
+            .map(|record| decode_namespace_record(&record))
+            .collect()
     }
 
     pub fn upsert_table(
@@ -128,6 +162,13 @@ impl IcebergCatalogMetaRepository {
         Ok(true)
     }
 
+    pub fn list_tables(&self, txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<IcebergTableRecord>> {
+        txn.scan(&key_prefix_tables()?, None)?
+            .into_iter()
+            .map(|record| decode_table_record(&record))
+            .collect()
+    }
+
     pub fn delete_table_and_mv_relationships(
         &self,
         txn: &mut dyn MetaWriteTxn,
@@ -141,6 +182,79 @@ impl IcebergCatalogMetaRepository {
             &key_table(catalog, namespace, table)?,
             ExpectedRevision::Any,
         )?;
+        Ok(())
+    }
+
+    pub fn delete_namespace_and_mv_relationships(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_repo: &MvMetaRepository,
+        catalog: &str,
+        namespace: &str,
+    ) -> RepositoryResult<()> {
+        for mv in mv_repo.list_definitions(txn)? {
+            if mv.target_catalog.as_deref().map(normalize_lookup_name)
+                == Some(normalize_lookup_name(catalog))
+                && mv.target_namespace.as_deref().map(normalize_lookup_name)
+                    == Some(normalize_lookup_name(namespace))
+                && let (Some(target_catalog), Some(target_namespace), Some(target_table)) = (
+                    mv.target_catalog.as_deref(),
+                    mv.target_namespace.as_deref(),
+                    mv.target_table.as_deref(),
+                )
+            {
+                mv_repo.drop_by_target(txn, target_catalog, target_namespace, target_table)?;
+            }
+        }
+        for table in self.list_tables(txn)? {
+            if table.catalog == normalize_lookup_name(catalog)
+                && table.namespace == normalize_lookup_name(namespace)
+            {
+                txn.delete(
+                    &key_table(&table.catalog, &table.namespace, &table.table)?,
+                    ExpectedRevision::Any,
+                )?;
+            }
+        }
+        txn.delete(&key_namespace(catalog, namespace)?, ExpectedRevision::Any)?;
+        Ok(())
+    }
+
+    pub fn delete_catalog_and_mv_relationships(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_repo: &MvMetaRepository,
+        catalog: &str,
+    ) -> RepositoryResult<()> {
+        for mv in mv_repo.list_definitions(txn)? {
+            if mv.target_catalog.as_deref().map(normalize_lookup_name)
+                == Some(normalize_lookup_name(catalog))
+                && let (Some(target_catalog), Some(target_namespace), Some(target_table)) = (
+                    mv.target_catalog.as_deref(),
+                    mv.target_namespace.as_deref(),
+                    mv.target_table.as_deref(),
+                )
+            {
+                mv_repo.drop_by_target(txn, target_catalog, target_namespace, target_table)?;
+            }
+        }
+        for table in self.list_tables(txn)? {
+            if table.catalog == normalize_lookup_name(catalog) {
+                txn.delete(
+                    &key_table(&table.catalog, &table.namespace, &table.table)?,
+                    ExpectedRevision::Any,
+                )?;
+            }
+        }
+        for namespace in self.list_namespaces(txn)? {
+            if namespace.catalog == normalize_lookup_name(catalog) {
+                txn.delete(
+                    &key_namespace(&namespace.catalog, &namespace.namespace)?,
+                    ExpectedRevision::Any,
+                )?;
+            }
+        }
+        txn.delete(&key_catalog(catalog)?, ExpectedRevision::Any)?;
         Ok(())
     }
 }
@@ -190,11 +304,42 @@ fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {
     Ok(MetaRecordKind::new(value)?)
 }
 
+fn record_path_component(
+    record: &MetaRecord,
+    index: usize,
+    description: &str,
+) -> RepositoryResult<String> {
+    record
+        .key
+        .canonical_path()
+        .split('/')
+        .nth(index)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            RepositoryError::provider(format!(
+                "metadata record {} is not a valid {description} key",
+                record.key.canonical_path()
+            ))
+        })
+}
+
 fn key_catalog(catalog: &str) -> RepositoryResult<MetaKey> {
     Ok(MetaKey::new(
         NS_ICEBERG_CATALOG,
         ["catalog".to_string(), normalize_lookup_name(catalog)],
     )?)
+}
+
+fn key_prefix_catalogs() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_ICEBERG_CATALOG, ["catalog"])?)
+}
+
+fn key_prefix_namespaces() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_ICEBERG_CATALOG, ["namespace"])?)
+}
+
+fn key_prefix_tables() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_ICEBERG_CATALOG, ["table"])?)
 }
 
 fn key_namespace(catalog: &str, namespace: &str) -> RepositoryResult<MetaKey> {
