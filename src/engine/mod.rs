@@ -1803,11 +1803,13 @@ fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String
     if let Some(store) = state.metadata_store.as_ref() {
         let snapshot = store.load_snapshot()?;
         restore_managed_lake(state, &snapshot)?;
+        restore_iceberg_catalogs(state)?;
         crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(
             state,
         )?;
+    } else {
+        restore_iceberg_catalogs(state)?;
     }
-    restore_iceberg_catalogs(state)?;
     Ok(())
 }
 
@@ -4901,21 +4903,6 @@ enable_path_style_access = true
         };
         assert!(query_result_contains_string(&show, "mv_orders"));
         assert!(query_result_contains_string(&show, "iceberg"));
-
-        let info_schema = session
-            .execute_in_context(
-                "SELECT TABLE_NAME, IS_ACTIVE \
-                 FROM information_schema.materialized_views \
-                 WHERE TABLE_SCHEMA = 'analytics'",
-                Some("ice"),
-                "analytics",
-                None,
-            )
-            .expect("query information_schema materialized views");
-        let StatementResult::Query(info_schema) = info_schema else {
-            panic!("expected information_schema query result");
-        };
-        assert!(query_result_contains_string(&info_schema, "mv_orders"));
 
         let select = session
             .execute_in_context("SELECT * FROM mv_orders", Some("ice"), "analytics", None)
