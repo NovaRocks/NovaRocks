@@ -264,7 +264,7 @@ where
     Some(cfg)
 }
 
-fn extract_change_op_from_extended_columns(
+pub(crate) fn extract_change_op_from_extended_columns(
     node_id: i32,
     hdfs_range: &plan_nodes::THdfsScanRange,
     change_op_slot: Option<SlotId>,
@@ -283,15 +283,26 @@ fn extract_change_op_from_extended_columns(
     let expr = extended_columns
         .get(&slot_id)
         .ok_or_else(|| format!("{} missing extended_columns entry", context()))?;
-    let node = expr
-        .nodes
-        .first()
-        .ok_or_else(|| format!("{} has empty extended_columns expression", context()))?;
+    if expr.nodes.len() != 1 {
+        return Err(format!(
+            "{} expects exactly one INT_LITERAL extended column node, got {}",
+            context(),
+            expr.nodes.len()
+        ));
+    }
+    let node = &expr.nodes[0];
     if node.node_type != crate::exprs::TExprNodeType::INT_LITERAL {
         return Err(format!(
             "{} expects INT_LITERAL extended column, got {:?}",
             context(),
             node.node_type
+        ));
+    }
+    if node.num_children != 0 {
+        return Err(format!(
+            "{} INT_LITERAL extended column expects 0 children, got {}",
+            context(),
+            node.num_children
         ));
     }
     let value = node
@@ -1278,5 +1289,33 @@ mod tests {
         assert!(error.contains("__change_op"));
         assert!(error.contains("node_id=7"));
         assert!(error.contains("slot_id=9"));
+    }
+
+    #[test]
+    fn extract_change_op_rejects_malformed_expr_shape() {
+        let mut expr = int_expr(-1);
+        expr.nodes.push(expr.nodes[0].clone());
+        let mut range = plan_nodes::THdfsScanRange::default();
+        range.extended_columns = Some(BTreeMap::from([(9, expr)]));
+
+        let error =
+            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap_err();
+
+        assert!(error.contains("exactly one INT_LITERAL"));
+        assert!(error.contains("got 2"));
+    }
+
+    #[test]
+    fn extract_change_op_rejects_int_literal_children() {
+        let mut expr = int_expr(-1);
+        expr.nodes[0].num_children = 1;
+        let mut range = plan_nodes::THdfsScanRange::default();
+        range.extended_columns = Some(BTreeMap::from([(9, expr)]));
+
+        let error =
+            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap_err();
+
+        assert!(error.contains("expects 0 children"));
+        assert!(error.contains("got 1"));
     }
 }

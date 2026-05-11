@@ -1050,10 +1050,7 @@ fn build_hdfs_scan_range_params(
             crate::exec::change_op::validate_change_op_value(op)?;
             Some(BTreeMap::from([(slot_id, int_literal_expr(op as i64))]))
         }
-        (Some(_), None) => {
-            return Err("IVM change-op file tag requires a __change_op scan slot".to_string());
-        }
-        (None, _) => None,
+        _ => None,
     };
     let hdfs_scan_range = plan_nodes::THdfsScanRange::new(
         None::<String>,
@@ -1172,6 +1169,62 @@ fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangePar
         Some(false),
         Some(false),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_hdfs_scan_range_params;
+
+    fn hdfs_range(
+        params: &crate::internal_service::TScanRangeParams,
+    ) -> &crate::plan_nodes::THdfsScanRange {
+        params
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .expect("hdfs scan range")
+    }
+
+    #[test]
+    fn change_op_tag_without_projected_slot_does_not_emit_extended_columns() {
+        let params = build_hdfs_scan_range_params(
+            "s3://bucket/path/file.parquet",
+            1024,
+            0,
+            1024,
+            None,
+            None,
+            Some(crate::exec::change_op::CHANGE_OP_INSERT),
+            None,
+            &[],
+        )
+        .expect("tagged file without __change_op projection should scan ordinary columns");
+
+        assert!(hdfs_range(&params).extended_columns.is_none());
+    }
+
+    #[test]
+    fn change_op_tag_with_projected_slot_emits_extended_columns() {
+        let params = build_hdfs_scan_range_params(
+            "s3://bucket/path/file.parquet",
+            1024,
+            0,
+            1024,
+            None,
+            None,
+            Some(crate::exec::change_op::CHANGE_OP_DELETE),
+            Some(9),
+            &[],
+        )
+        .expect("tagged file with __change_op projection should emit metadata");
+
+        let extended_columns = hdfs_range(&params)
+            .extended_columns
+            .as_ref()
+            .expect("extended_columns");
+        assert_eq!(extended_columns.len(), 1);
+        assert!(extended_columns.contains_key(&9));
+    }
 }
 
 // ---------------------------------------------------------------------------
