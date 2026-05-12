@@ -12,21 +12,18 @@ use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_d
 use crate::engine::{QueryResult, StandaloneState, execute_query};
 use crate::exec::change_op::{CHANGE_OP_COLUMN, CHANGE_OP_DELETE, CHANGE_OP_INSERT};
 
-#[allow(dead_code)]
 pub(crate) struct IvmDeltaSourceFiles {
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
     pub files: Vec<IcebergFileForQuery>,
 }
 
-#[allow(dead_code)]
 pub(crate) struct IvmDeltaSourceInput<'a> {
     pub state: &'a Arc<StandaloneState>,
     pub current_database: &'a str,
     pub base_ref: &'a IcebergTableRef,
 }
 
-#[allow(dead_code)]
 pub(crate) fn build_delta_source_files(
     input: IvmDeltaSourceInput<'_>,
     batch: IcebergChangeBatch,
@@ -116,8 +113,7 @@ pub(crate) fn build_delta_source_files(
     })
 }
 
-#[allow(dead_code)]
-pub(crate) async fn execute_delta_source_query(
+pub(crate) fn execute_delta_source_query(
     input: IvmDeltaSourceInput<'_>,
     select_sql: &str,
     source_files: IvmDeltaSourceFiles,
@@ -156,7 +152,6 @@ pub(crate) async fn execute_delta_source_query(
     )
 }
 
-#[allow(dead_code)]
 pub(crate) fn projection_select_with_change_op(select_sql: &str) -> Result<String, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(select_sql)
         .map_err(|e| format!("projection_select_with_change_op normalize error: {e}"))?;

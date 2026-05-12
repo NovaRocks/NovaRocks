@@ -565,6 +565,7 @@ pub(crate) fn plan_changes(
 ///
 /// The `_pk_columns` parameter is reserved for future delete-side row-id
 /// computation when aggregate apply-changes needs stable row identity.
+#[allow(dead_code)]
 pub(crate) fn materialize_changes(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     current_database: &str,
