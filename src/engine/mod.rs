@@ -1630,6 +1630,7 @@ fn iceberg_optimize_state_name(state: IcebergOptimizeJobState) -> &'static str {
 // ---------------------------------------------------------------------------
 
 pub(crate) mod delete_flow;
+pub(crate) mod delete_predicate_translate;
 pub(crate) mod equality_delete_flow;
 pub(crate) mod iceberg_expire_snapshots;
 pub(crate) mod iceberg_remove_orphan_files;
