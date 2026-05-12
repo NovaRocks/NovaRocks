@@ -4,7 +4,7 @@
 -- Test Point:
 --   Validate managed-lake MV refresh over an Iceberg REST v3 row-lineage table
 --   uses tagged delta source semantics for both projection and signed aggregate
---   SUM overwrite changes.
+--   SUM overwrite changes, including full aggregate-group retraction.
 
 -- query 1
 -- @skip_result_check=true
@@ -77,6 +77,31 @@ FROM orders_sum_mv_${uuid0}
 ORDER BY customer;
 
 -- query 10
+-- @skip_result_check=true
+INSERT OVERWRITE iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
+VALUES (2, 'Bob', 40);
+
+-- query 11
+SELECT id, customer, amount
+FROM iceberg_rest_${suite_uuid0}.ivm_${uuid0}.orders_${uuid0}
+ORDER BY id;
+
+-- query 12
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW orders_projection_mv_${uuid0};
+REFRESH MATERIALIZED VIEW orders_sum_mv_${uuid0};
+
+-- query 13
+SELECT id, amount
+FROM orders_projection_mv_${uuid0}
+ORDER BY id;
+
+-- query 14
+SELECT customer, total_amount
+FROM orders_sum_mv_${uuid0}
+ORDER BY customer;
+
+-- query 15
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_sum_mv_${uuid0};
 DROP MATERIALIZED VIEW orders_projection_mv_${uuid0};

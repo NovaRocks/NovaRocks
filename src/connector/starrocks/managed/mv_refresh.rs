@@ -615,8 +615,7 @@ fn refresh_aggregate_mv_incremental(
         &layout,
         MvRefreshWriteMetadata {
             table_id: ctx.table_id,
-            // Upsert writes the full merged active aggregate state, not an append delta.
-            previous_refresh_rows: 0,
+            previous_refresh_rows: ctx.previous_refresh_rows,
             snapshots,
             table_uuids,
         },
@@ -1359,7 +1358,7 @@ mod tests {
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
-    use arrow::array::Int64Array;
+    use arrow::array::{Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use prost::Message;
@@ -1731,6 +1730,11 @@ mod tests {
             ],
             "MV state after full refresh must reflect the 3 seeded base rows"
         );
+        assert_eq!(
+            show_mv_last_refresh_rows(&session, "agg_mv").expect("show full refresh rows"),
+            Some(2),
+            "full refresh metadata row count tracks MV group count"
+        );
 
         // Trigger a DELETE-bearing snapshot on the base.
         session
@@ -1769,6 +1773,11 @@ mod tests {
             ],
             "MV state after delete-bearing incremental refresh must drop \
              count and sum for the affected group; other groups untouched"
+        );
+        assert_eq!(
+            show_mv_last_refresh_rows(&session, "agg_mv").expect("show incremental refresh rows"),
+            Some(2),
+            "incremental refresh metadata row count tracks active MV rows, not the row delta"
         );
 
         drop(engine);
@@ -2420,6 +2429,53 @@ mod tests {
             }
         }
         Ok(out)
+    }
+
+    fn show_mv_last_refresh_rows(
+        session: &crate::engine::StandaloneSession,
+        mv_name: &str,
+    ) -> Result<Option<i64>, String> {
+        let result = session.execute_in_context(
+            "show materialized views from analytics",
+            None,
+            "analytics",
+            None,
+        )?;
+        let crate::engine::StatementResult::Query(query_result) = result else {
+            return Err("show materialized views must return rows".to_string());
+        };
+        for chunk in &query_result.chunks {
+            let names = chunk
+                .batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| "SHOW MATERIALIZED VIEWS Name column not Utf8".to_string())?;
+            let refresh_rows = chunk
+                .batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    "SHOW MATERIALIZED VIEWS LastRefreshRows column not Utf8".to_string()
+                })?;
+            for row in 0..chunk.batch.num_rows() {
+                if names.value(row).eq_ignore_ascii_case(mv_name) {
+                    if refresh_rows.is_null(row) {
+                        return Ok(None);
+                    }
+                    return refresh_rows.value(row).parse::<i64>().map(Some).map_err(|e| {
+                        format!(
+                            "SHOW MATERIALIZED VIEWS LastRefreshRows value `{}` is not i64: {e}",
+                            refresh_rows.value(row)
+                        )
+                    });
+                }
+            }
+        }
+        Err(format!(
+            "SHOW MATERIALIZED VIEWS did not return `{mv_name}`"
+        ))
     }
 
     /// Build a TOML config file that points the standalone server at

@@ -390,6 +390,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut scope = ExprScope::new();
         let qualifier = op.alias.as_deref().or(Some(&op.table.name));
         let mut slot_to_column = HashMap::new();
+        let mut iceberg_metadata_pseudo_column_slots = BTreeSet::new();
 
         // Determine which columns to emit
         let mut required: Option<std::collections::HashSet<String>> = op
@@ -485,6 +486,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 col_pos,
             );
             slot_to_column.insert(slot_id, col.name.clone());
+            iceberg_metadata_pseudo_column_slots.insert(slot_id);
             let binding = ColumnBinding {
                 tuple_id: scan_tuple_id,
                 slot_id,
@@ -537,6 +539,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             resolved,
             min_max_conjuncts: pushed_conjuncts,
             slot_to_column,
+            iceberg_metadata_pseudo_column_slots,
         });
 
         // Track tuple -> scan node ownership for runtime filter planning.

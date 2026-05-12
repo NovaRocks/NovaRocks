@@ -276,13 +276,13 @@ pub(crate) fn extract_change_op_from_extended_columns(
         format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot} exceeds i32")
     })?;
     let context = || format!("HDFS_SCAN_NODE node_id={node_id} __change_op slot_id={slot_id}");
-    let extended_columns = hdfs_range
+    let Some(expr) = hdfs_range
         .extended_columns
         .as_ref()
-        .ok_or_else(|| format!("{} missing extended_columns", context()))?;
-    let expr = extended_columns
-        .get(&slot_id)
-        .ok_or_else(|| format!("{} missing extended_columns entry", context()))?;
+        .and_then(|extended_columns| extended_columns.get(&slot_id))
+    else {
+        return Ok(None);
+    };
     if expr.nodes.len() != 1 {
         return Err(format!(
             "{} expects exactly one INT_LITERAL extended column node, got {}",
@@ -315,6 +315,22 @@ pub(crate) fn extract_change_op_from_extended_columns(
     crate::exec::change_op::validate_change_op_value(value)
         .map_err(|e| format!("{} invalid value: {e}", context()))?;
     Ok(Some(value))
+}
+
+fn scan_ranges_have_extended_column(
+    scan_ranges: &[internal_service::TScanRangeParams],
+    slot_id: SlotId,
+) -> Result<bool, String> {
+    let slot_id = i32::try_from(slot_id.as_u32())
+        .map_err(|_| format!("extended column slot_id={slot_id} exceeds i32"))?;
+    Ok(scan_ranges.iter().any(|params| {
+        params
+            .scan_range
+            .hdfs_scan_range
+            .as_ref()
+            .and_then(|range| range.extended_columns.as_ref())
+            .is_some_and(|extended_columns| extended_columns.contains_key(&slot_id))
+    }))
 }
 
 /// Lower a HDFS_SCAN_NODE plan node to a `Lowered` ExecNode.
@@ -417,6 +433,14 @@ pub(crate) fn lower_hdfs_scan_node(
         crate::exec::row_position::is_row_source_id(name)
             || crate::exec::row_position::is_scan_range_id(name)
     });
+
+    let Some(exec_params) = exec_params else {
+        return Err("HDFS_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
+    };
+    let scan_ranges = exec_params
+        .per_node_scan_ranges
+        .get(&node.node_id)
+        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
 
     let mut slot_ids = Vec::with_capacity(out_layout.order.len());
     let mut data_columns = Vec::new();
@@ -539,7 +563,9 @@ pub(crate) fn lower_hdfs_scan_node(
                 Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
-        if crate::exec::row_position::is_change_op(&name) {
+        if crate::exec::row_position::is_change_op(&name)
+            && scan_ranges_have_extended_column(scan_ranges, slot_id)?
+        {
             if primitive != types::TPrimitiveType::TINYINT {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} __change_op slot_id={} expects TINYINT, got {:?}",
@@ -638,13 +664,6 @@ pub(crate) fn lower_hdfs_scan_node(
         }
     }
 
-    let Some(exec_params) = exec_params else {
-        return Err("HDFS_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
-    };
-    let scan_ranges = exec_params
-        .per_node_scan_ranges
-        .get(&node.node_id)
-        .ok_or_else(|| format!("missing per_node_scan_ranges for node_id={}", node.node_id))?;
     let limit = node.limit;
     let limit = (limit >= 0).then_some(limit as usize);
     let connector_io_tasks_per_scan_operator =
@@ -918,6 +937,12 @@ pub(crate) fn lower_hdfs_scan_node(
             hdfs_range,
             iceberg_virtual_change_op_slot,
         )?;
+        if iceberg_virtual_change_op_slot.is_some() && ivm_change_op.is_none() {
+            return Err(format!(
+                "HDFS_SCAN_NODE node_id={} __change_op virtual slot requires every scan range to carry extended_columns",
+                node.node_id
+            ));
+        }
 
         if let Some(fp) = hdfs_range.full_path.as_ref().filter(|s| !s.is_empty()) {
             ranges.push(FileScanRange {
@@ -1280,15 +1305,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_change_op_requires_extended_columns_entry() {
+    fn extract_change_op_ignores_missing_extended_columns_entry() {
         let range = plan_nodes::THdfsScanRange::default();
 
-        let error =
-            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap_err();
+        let value =
+            extract_change_op_from_extended_columns(7, &range, Some(SlotId::new(9))).unwrap();
 
-        assert!(error.contains("__change_op"));
-        assert!(error.contains("node_id=7"));
-        assert!(error.contains("slot_id=9"));
+        assert_eq!(value, None);
     }
 
     #[test]

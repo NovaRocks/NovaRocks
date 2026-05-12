@@ -22,3 +22,15 @@ id	amount
 customer	total_amount
 Alice	80
 Bob	40
+
+-- query 11
+id	customer	amount
+2	Bob	40
+
+-- query 13
+id	amount
+2	40
+
+-- query 14
+customer	total_amount
+Bob	40

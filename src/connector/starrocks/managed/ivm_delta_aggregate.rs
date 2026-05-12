@@ -1,4 +1,7 @@
-use crate::connector::starrocks::managed::mv_agg_state::sanitize_state_column_name;
+use crate::connector::starrocks::managed::mv_agg_state::{
+    AGG_RETRACTION_COUNT_STATE_COLUMN, aggregate_shape_needs_retraction_count_state,
+    sanitize_state_column_name,
+};
 use crate::connector::starrocks::managed::mv_shape::{
     AggregateFunctionKind, AggregateInput, AggregateMvShape, VisibleAggregateOutput,
 };
@@ -113,6 +116,13 @@ pub(crate) fn rewrite_select_sql_for_signed_delta_state(
             }
         }
     }
+    if aggregate_shape_needs_retraction_count_state(shape) {
+        projection.push(make_aggregate_select_item(
+            "SUM",
+            change_op_expr(),
+            AGG_RETRACTION_COUNT_STATE_COLUMN,
+        ));
+    }
     select.projection = projection;
 
     Ok(stmt.to_string())
@@ -200,6 +210,10 @@ mod tests {
             "got: {rewritten}"
         );
         assert!(upper.contains("AS S"), "got: {rewritten}");
+        assert!(
+            upper.contains("SUM(__CHANGE_OP) AS __AGG_STATE___IVM_ROW_COUNT"),
+            "got: {rewritten}"
+        );
     }
 
     #[test]

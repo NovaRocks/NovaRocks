@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::common::min_max_predicate::MinMaxPredicate;
 use crate::descriptors;
@@ -26,6 +26,7 @@ pub(crate) struct PlannedScanTable {
     pub(crate) resolved: ResolvedTable,
     pub(crate) min_max_conjuncts: Vec<exprs::TExpr>,
     pub(crate) slot_to_column: HashMap<types::TSlotId, String>,
+    pub(crate) iceberg_metadata_pseudo_column_slots: BTreeSet<types::TSlotId>,
 }
 
 const ICEBERG_SCAN_SPLIT_TARGET_BYTES: i64 = 128 * 1024 * 1024;
@@ -607,11 +608,15 @@ fn scan_file_min_max_predicates(planned: &PlannedScanTable) -> Vec<MinMaxPredica
 }
 
 fn planned_change_op_slot(planned: &PlannedScanTable) -> Option<types::TSlotId> {
-    planned.slot_to_column.iter().find_map(|(slot_id, column)| {
-        column
-            .eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
-            .then_some(*slot_id)
-    })
+    planned
+        .iceberg_metadata_pseudo_column_slots
+        .iter()
+        .copied()
+        .find(|slot_id| {
+            planned.slot_to_column.get(slot_id).is_some_and(|column| {
+                column.eq_ignore_ascii_case(crate::exec::change_op::CHANGE_OP_COLUMN)
+            })
+        })
 }
 
 fn int_literal_expr(value: i64) -> exprs::TExpr {
@@ -1173,7 +1178,13 @@ fn build_iceberg_metadata_scan_range_params() -> internal_service::TScanRangePar
 
 #[cfg(test)]
 mod tests {
-    use super::build_hdfs_scan_range_params;
+    use std::collections::{BTreeMap, HashMap};
+
+    use arrow::datatypes::DataType;
+
+    use super::{PlannedScanTable, build_exec_params_multi, build_hdfs_scan_range_params};
+    use crate::sql::catalog::{ColumnDef, S3FileInfo, TableDef, TableStorage};
+    use crate::sql::codegen::resolve::ResolvedTable;
 
     fn hdfs_range(
         params: &crate::internal_service::TScanRangeParams,
@@ -1222,6 +1233,120 @@ mod tests {
             .extended_columns
             .as_ref()
             .expect("extended_columns");
+        assert_eq!(extended_columns.len(), 1);
+        assert!(extended_columns.contains_key(&9));
+    }
+
+    #[test]
+    fn physical_change_op_column_does_not_emit_extended_columns() {
+        let planned = PlannedScanTable {
+            scan_node_id: 3,
+            resolved: ResolvedTable {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![ColumnDef {
+                        name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                        write_default: None,
+                    }],
+                    iceberg_row_lineage_metadata_columns: vec![],
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![S3FileInfo {
+                            path: "s3://bucket/path/file.parquet".to_string(),
+                            size: 1024,
+                            row_count: Some(1),
+                            column_stats: None,
+                            partition_spec_id: None,
+                            partition_key: None,
+                            first_row_id: None,
+                            data_sequence_number: None,
+                            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+                            delete_files: vec![],
+                            manifest_path: None,
+                            partition_values: vec![],
+                        }],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                physical_layout: None,
+                alias: None,
+            },
+            min_max_conjuncts: vec![],
+            slot_to_column: HashMap::from([(
+                9,
+                crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            )]),
+            iceberg_metadata_pseudo_column_slots: Default::default(),
+        };
+
+        let params = build_exec_params_multi(&[planned]).expect("build scan ranges");
+        let ranges = params
+            .per_node_scan_ranges
+            .get(&3)
+            .expect("scan node ranges");
+
+        assert_eq!(ranges.len(), 1);
+        assert!(hdfs_range(&ranges[0]).extended_columns.is_none());
+    }
+
+    #[test]
+    fn metadata_change_op_column_emits_extended_columns() {
+        let planned = PlannedScanTable {
+            scan_node_id: 3,
+            resolved: ResolvedTable {
+                database: "default".to_string(),
+                table: TableDef {
+                    name: "t".to_string(),
+                    columns: vec![],
+                    iceberg_row_lineage_metadata_columns: vec![ColumnDef {
+                        name: crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                        write_default: None,
+                    }],
+                    iceberg_table: None,
+                    storage: TableStorage::S3ParquetFiles {
+                        files: vec![S3FileInfo {
+                            path: "s3://bucket/path/file.parquet".to_string(),
+                            size: 1024,
+                            row_count: Some(1),
+                            column_stats: None,
+                            partition_spec_id: None,
+                            partition_key: None,
+                            first_row_id: None,
+                            data_sequence_number: None,
+                            ivm_change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
+                            delete_files: vec![],
+                            manifest_path: None,
+                            partition_values: vec![],
+                        }],
+                        cloud_properties: BTreeMap::new(),
+                    },
+                },
+                physical_layout: None,
+                alias: None,
+            },
+            min_max_conjuncts: vec![],
+            slot_to_column: HashMap::from([(
+                9,
+                crate::exec::change_op::CHANGE_OP_COLUMN.to_string(),
+            )]),
+            iceberg_metadata_pseudo_column_slots: [9].into(),
+        };
+
+        let params = build_exec_params_multi(&[planned]).expect("build scan ranges");
+        let ranges = params
+            .per_node_scan_ranges
+            .get(&3)
+            .expect("scan node ranges");
+        let extended_columns = hdfs_range(&ranges[0])
+            .extended_columns
+            .as_ref()
+            .expect("extended columns");
+
         assert_eq!(extended_columns.len(), 1);
         assert!(extended_columns.contains_key(&9));
     }

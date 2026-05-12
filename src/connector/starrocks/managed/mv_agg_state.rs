@@ -23,6 +23,7 @@ use crate::sql::parser::ast::SqlType;
 
 pub(crate) const ROW_ID_COLUMN: &str = "__row_id__";
 pub(crate) const AGG_STATE_PREFIX: &str = "__agg_state_";
+pub(crate) const AGG_RETRACTION_COUNT_STATE_COLUMN: &str = "__agg_state___ivm_row_count";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateMvLayout {
@@ -70,6 +71,8 @@ pub(crate) enum AggregateStateRole {
     AvgSum,
     /// AVG count sub-state (always Int64).
     AvgCount,
+    /// Hidden row-count state used only to decide whether a group has been fully retracted.
+    RetractionCount,
 }
 
 #[derive(Clone, Debug)]
@@ -77,6 +80,12 @@ pub(crate) struct AggregatePhysicalRow {
     pub(crate) row_id: String,
     pub(crate) visible_values: Vec<Option<AggScalarValue>>,
     pub(crate) state_values: Vec<Option<AggScalarValue>>,
+}
+
+pub(crate) struct AggregateMergeResult {
+    pub(crate) upsert_chunks: Vec<Chunk>,
+    pub(crate) delete_chunks: Vec<Chunk>,
+    pub(crate) row_delta: i64,
 }
 
 pub(crate) fn build_aggregate_mv_layout(
@@ -228,12 +237,46 @@ pub(crate) fn build_aggregate_mv_layout(
         }
     }
 
+    if aggregate_shape_needs_retraction_count_state(shape) {
+        validate_state_column_type(
+            AggregateFunctionKind::Count,
+            AggregateStateRole::RetractionCount,
+            &DataType::Int64,
+            AGG_RETRACTION_COUNT_STATE_COLUMN,
+        )?;
+        physical_columns.push(managed_physical_column(
+            AGG_RETRACTION_COUNT_STATE_COLUMN.to_string(),
+            SqlType::BigInt,
+            false,
+            false,
+            false,
+        ));
+        state_columns.push(AggregateStateColumn {
+            name: AGG_RETRACTION_COUNT_STATE_COLUMN.to_string(),
+            data_type: DataType::Int64,
+            sql_type: SqlType::BigInt,
+            nullable: false,
+            visible_source_index: 0,
+            aggregate_index: shape.aggregates.len(),
+            function: AggregateFunctionKind::Count,
+            state_role: AggregateStateRole::RetractionCount,
+            count_star: true,
+        });
+    }
+
     Ok(AggregateMvLayout {
         row_id_column,
         visible_columns,
         state_columns,
         group_key_source_indexes,
         physical_columns,
+    })
+}
+
+pub(crate) fn aggregate_shape_needs_retraction_count_state(shape: &AggregateMvShape) -> bool {
+    !shape.aggregates.iter().any(|aggregate| {
+        aggregate.function == AggregateFunctionKind::Count
+            && matches!(aggregate.input, AggregateInput::Star)
     })
 }
 
@@ -314,11 +357,24 @@ pub(crate) fn build_old_state_map(
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn merge_aggregate_state_batches(
     old_rows: &HashMap<String, AggregatePhysicalRow>,
     delta_chunks: &[Chunk],
     layout: &AggregateMvLayout,
 ) -> Result<Vec<Chunk>, String> {
+    Ok(
+        merge_aggregate_state_batches_with_retractions(old_rows, delta_chunks, layout)?
+            .upsert_chunks,
+    )
+}
+
+pub(crate) fn merge_aggregate_state_batches_with_retractions(
+    old_rows: &HashMap<String, AggregatePhysicalRow>,
+    delta_chunks: &[Chunk],
+    layout: &AggregateMvLayout,
+) -> Result<AggregateMergeResult, String> {
+    let old_row_count = old_rows.len();
     let mut merged = old_rows.clone();
     let delta_rows = load_aggregate_physical_rows_for_delta(delta_chunks, layout)?;
     for delta in delta_rows {
@@ -346,27 +402,46 @@ pub(crate) fn merge_aggregate_state_batches(
         // Step B: derive visible values per-aggregate (Single = direct copy of state)
         update_visible_values_from_state(row, layout)?;
     }
-    // Drop merged rows whose every count-state column has reached zero
-    // — the group has been fully retracted by deletes and should
-    // disappear from the MV.
-    let merged_kept: Vec<AggregatePhysicalRow> = merged
-        .into_values()
-        .filter(|row| !all_count_states_zero(row, layout))
-        .collect();
-    physical_rows_to_chunks(merged_kept, layout)
+    let mut merged_kept = Vec::new();
+    let mut merged_deleted = Vec::new();
+    for row in merged.into_values() {
+        if all_count_states_zero(&row, layout) {
+            merged_deleted.push(row);
+        } else {
+            merged_kept.push(row);
+        }
+    }
+    let row_delta = i64::try_from(merged_kept.len())
+        .and_then(|new_count| i64::try_from(old_row_count).map(|old_count| new_count - old_count))
+        .map_err(|_| "aggregate MV row count overflow".to_string())?;
+    Ok(AggregateMergeResult {
+        upsert_chunks: physical_rows_to_chunks(merged_kept, layout)?,
+        delete_chunks: physical_rows_to_chunks(merged_deleted, layout)?,
+        row_delta,
+    })
 }
 
-/// Return true when every count-state column on the row has merged to
-/// zero (sum-only states do not influence the decision; sum=0 with
-/// count=N>0 is a valid "this group has N rows whose sum happens to
-/// total 0" state we MUST keep).
+/// Return true when every row-cardinality state on the row has merged to zero.
+/// SUM/AVG-count/COUNT(expr) states do not influence the decision: a visible
+/// aggregate can be zero or NULL while the group still has remaining rows.
 fn all_count_states_zero(row: &AggregatePhysicalRow, layout: &AggregateMvLayout) -> bool {
     let mut saw_count = false;
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let is_count_role = matches!(
-            (state_column.function, state_column.state_role),
-            (AggregateFunctionKind::Count, AggregateStateRole::Single)
-                | (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount)
+            (
+                state_column.function,
+                state_column.state_role,
+                state_column.count_star
+            ),
+            (
+                AggregateFunctionKind::Count,
+                AggregateStateRole::Single,
+                true
+            ) | (
+                AggregateFunctionKind::Count,
+                AggregateStateRole::RetractionCount,
+                true
+            )
         );
         if !is_count_role {
             continue;
@@ -562,11 +637,18 @@ fn compute_batch_col_indexes(
     }
 
     let mut state_col_batch_col = vec![0usize; layout.state_columns.len()];
+    let mut trailing_state_batch_col = batch_col;
     for (sc_idx, sc) in layout.state_columns.iter().enumerate() {
-        let start = agg_batch_col_start[sc.aggregate_index];
         state_col_batch_col[sc_idx] = match sc.state_role {
-            AggregateStateRole::Single | AggregateStateRole::AvgSum => start,
-            AggregateStateRole::AvgCount => start + 1,
+            AggregateStateRole::RetractionCount => {
+                let col = trailing_state_batch_col;
+                trailing_state_batch_col += 1;
+                col
+            }
+            AggregateStateRole::Single | AggregateStateRole::AvgSum => {
+                agg_batch_col_start[sc.aggregate_index]
+            }
+            AggregateStateRole::AvgCount => agg_batch_col_start[sc.aggregate_index] + 1,
         };
     }
 
@@ -767,7 +849,8 @@ fn merge_state_value(
     state_column: &AggregateStateColumn,
 ) -> Result<Option<AggScalarValue>, String> {
     match (state_column.function, state_column.state_role) {
-        (AggregateFunctionKind::Count, AggregateStateRole::Single) => {
+        (AggregateFunctionKind::Count, AggregateStateRole::Single)
+        | (AggregateFunctionKind::Count, AggregateStateRole::RetractionCount) => {
             merge_count_state_value(old, delta, state_column)
         }
         (AggregateFunctionKind::Sum, AggregateStateRole::Single) => {
@@ -1020,7 +1103,8 @@ fn nullable_decimal128_state_value(
 
 fn zero_state_value(state_column: &AggregateStateColumn) -> Option<AggScalarValue> {
     match (state_column.function, state_column.state_role) {
-        (AggregateFunctionKind::Count, AggregateStateRole::Single) => {
+        (AggregateFunctionKind::Count, AggregateStateRole::Single)
+        | (AggregateFunctionKind::Count, AggregateStateRole::RetractionCount) => {
             Some(AggScalarValue::Int64(0))
         }
         (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount) => {
@@ -1075,6 +1159,10 @@ fn validate_loaded_physical_row(
             (state_column.function, state_column.state_role),
             (AggregateFunctionKind::Count, AggregateStateRole::Single)
                 | (AggregateFunctionKind::Avg, AggregateStateRole::AvgCount)
+                | (
+                    AggregateFunctionKind::Count,
+                    AggregateStateRole::RetractionCount
+                )
         );
         if is_count_role {
             validate_loaded_count_state(
@@ -1227,7 +1315,8 @@ fn validate_state_column_type(
     state_name: &str,
 ) -> Result<(), String> {
     match (function, state_role) {
-        (AggregateFunctionKind::Count, AggregateStateRole::Single) => match data_type {
+        (AggregateFunctionKind::Count, AggregateStateRole::Single)
+        | (AggregateFunctionKind::Count, AggregateStateRole::RetractionCount) => match data_type {
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(()),
             other => Err(format!(
                 "aggregate MV COUNT state type is unsupported for column `{state_name}`: {other:?}"
@@ -1449,6 +1538,9 @@ fn update_visible_values_from_state(
     // Group state column indexes by aggregate_index.
     let mut by_aggregate: HashMap<usize, Vec<usize>> = HashMap::new();
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
+        if state_column.state_role == AggregateStateRole::RetractionCount {
+            continue;
+        }
         by_aggregate
             .entry(state_column.aggregate_index)
             .or_default()
@@ -1497,6 +1589,11 @@ fn avg_state_indexes(
             AggregateStateRole::Single => {
                 return Err(format!(
                     "internal: AVG aggregate has Single state_role on state column index {i}"
+                ));
+            }
+            AggregateStateRole::RetractionCount => {
+                return Err(format!(
+                    "internal: AVG aggregate has RetractionCount state_role on state column index {i}"
                 ));
             }
         }
@@ -1608,6 +1705,17 @@ mod tests {
         shape
     }
 
+    fn sum_only_shape() -> AggregateMvShape {
+        let shape = classify_incremental_mv_query(&parse_query(
+            "select k1, sum(v1) as s from ice.ns.orders group by k1",
+        ))
+        .expect("classify");
+        let IncrementalMvShape::Aggregate(shape) = shape else {
+            panic!("expected aggregate shape");
+        };
+        shape
+    }
+
     fn parse_query(sql: &str) -> sqlparser::ast::Query {
         let normalized =
             crate::sql::parser::dialect::normalize_for_raw_parse(sql).expect("normalize");
@@ -1668,6 +1776,21 @@ mod tests {
         ]
     }
 
+    fn sum_only_output_columns() -> Vec<OutputColumn> {
+        vec![
+            OutputColumn {
+                name: "k1".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+            },
+            OutputColumn {
+                name: "s".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+            },
+        ]
+    }
+
     fn visible_result_batch(k1: Vec<i64>, c: Vec<i64>, s: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -1704,6 +1827,22 @@ mod tests {
         .expect("batch")
     }
 
+    fn sum_only_state_result_batch(k1: Vec<i64>, s: Vec<i64>, row_count: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k1", DataType::Int64, false),
+                Field::new("s", DataType::Int64, true),
+                Field::new("__agg_state___ivm_row_count", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(k1)),
+                Arc::new(Int64Array::from(s)),
+                Arc::new(Int64Array::from(row_count)),
+            ],
+        )
+        .expect("batch")
+    }
+
     fn aggregate_first_result_batch(c: Vec<i64>, k1: Vec<i64>) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -1719,14 +1858,17 @@ mod tests {
     }
 
     fn count_expr_result_batch(k1: Vec<i64>, c: Vec<i64>) -> RecordBatch {
+        let rows = k1.len();
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k1", DataType::Int64, false),
                 Field::new("c", DataType::Int64, false),
+                Field::new("__agg_state___ivm_row_count", DataType::Int64, false),
             ])),
             vec![
                 Arc::new(Int64Array::from(k1)),
                 Arc::new(Int64Array::from(c)),
+                Arc::new(Int64Array::from(vec![1_i64; rows])),
             ],
         )
         .expect("batch")
@@ -2356,6 +2498,64 @@ mod tests {
         assert_eq!(kept_rows, 1, "non-zero count row should be retained");
     }
 
+    #[test]
+    fn build_sum_only_layout_adds_hidden_retraction_count_state() {
+        let shape = sum_only_shape();
+        let layout = build_aggregate_mv_layout(&shape, &sum_only_output_columns()).expect("layout");
+
+        assert_eq!(layout.state_columns.len(), 2);
+        let hidden = layout
+            .state_columns
+            .iter()
+            .find(|column| column.name == "__agg_state___ivm_row_count")
+            .expect("hidden retraction count state");
+        assert_eq!(hidden.data_type, DataType::Int64);
+        assert_eq!(hidden.state_role, AggregateStateRole::RetractionCount);
+    }
+
+    #[test]
+    fn merge_sum_only_state_drops_group_when_retraction_count_reaches_zero() {
+        let shape = sum_only_shape();
+        let layout = build_aggregate_mv_layout(&shape, &sum_only_output_columns()).expect("layout");
+        let old = materialize_aggregate_result_chunks(
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![
+                    record_batch_to_chunk(sum_only_state_result_batch(vec![1], vec![100], vec![1]))
+                        .expect("old chunk"),
+                ],
+            },
+            &layout,
+            &shape,
+        )
+        .expect("old physical");
+        let old_rows = load_aggregate_physical_rows(&old, &layout).expect("old rows");
+        let delta = materialize_aggregate_result_chunks(
+            QueryResult {
+                columns: Vec::new(),
+                chunks: vec![
+                    record_batch_to_chunk(sum_only_state_result_batch(
+                        vec![1],
+                        vec![-100],
+                        vec![-1],
+                    ))
+                    .expect("delta chunk"),
+                ],
+            },
+            &layout,
+            &shape,
+        )
+        .expect("delta physical");
+
+        let merged =
+            merge_aggregate_state_batches(&old_rows, &delta, &layout).expect("merged chunks");
+        let total_rows: usize = merged.iter().map(|chunk| chunk.batch.num_rows()).sum();
+        assert_eq!(
+            total_rows, 0,
+            "fully retracted SUM-only group must be dropped"
+        );
+    }
+
     // ---- AVG helper layout ----
 
     fn make_avg_layout_int_to_double() -> AggregateMvLayout {
@@ -2461,7 +2661,7 @@ mod tests {
     // ---- AVG layout tests ----
 
     #[test]
-    fn build_layout_avg_produces_two_state_columns() {
+    fn build_layout_avg_produces_state_columns_with_hidden_retraction_count() {
         use crate::connector::starrocks::managed::mv_shape::{
             AggregateCallShape, AggregateInput, AggregateMvShape, GroupKeyShape,
             VisibleAggregateOutput,
@@ -2497,7 +2697,7 @@ mod tests {
             },
         ];
         let layout = build_aggregate_mv_layout(&shape, &outputs).expect("layout build");
-        assert_eq!(layout.state_columns.len(), 2);
+        assert_eq!(layout.state_columns.len(), 3);
         assert_eq!(
             layout.state_columns[0].state_role,
             AggregateStateRole::AvgSum
@@ -2516,6 +2716,14 @@ mod tests {
         assert_eq!(layout.state_columns[1].name, "__agg_state_a__count");
         assert_eq!(layout.state_columns[1].data_type, DataType::Int64);
         assert_eq!(layout.state_columns[1].aggregate_index, 0);
+        assert_eq!(
+            layout.state_columns[2].state_role,
+            AggregateStateRole::RetractionCount
+        );
+        assert_eq!(
+            layout.state_columns[2].name,
+            AGG_RETRACTION_COUNT_STATE_COLUMN
+        );
 
         let float_outputs = vec![
             OutputColumn {
@@ -2533,6 +2741,7 @@ mod tests {
             build_aggregate_mv_layout(&shape, &float_outputs).expect("Float64 AVG visible layout");
         assert_eq!(float_layout.state_columns[0].data_type, DataType::Int64);
         assert_eq!(float_layout.state_columns[1].data_type, DataType::Int64);
+        assert_eq!(float_layout.state_columns[2].data_type, DataType::Int64);
     }
 
     // ---- AVG visible derivation tests ----
@@ -2698,17 +2907,19 @@ mod tests {
         ];
         let layout = build_aggregate_mv_layout(&shape, &output_columns).expect("layout");
 
-        // State-shaped input: [k1, __agg_state_a__sum, __agg_state_a__count]
-        // (visible_outputs = [GroupKey(0), Aggregate(0)] → batch cols [k1, sum, count])
+        // State-shaped input: [k1, __agg_state_a__sum, __agg_state_a__count, row_count]
+        // (visible_outputs = [GroupKey(0), Aggregate(0)] plus hidden retraction count)
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("k1", DataType::Int64, false),
                 Field::new("__agg_state_a__sum", DataType::Int64, true),
                 Field::new("__agg_state_a__count", DataType::Int64, false),
+                Field::new(AGG_RETRACTION_COUNT_STATE_COLUMN, DataType::Int64, false),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![30_i64])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![4_i64])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![4_i64])) as ArrayRef,
             ],
         )
@@ -2731,7 +2942,8 @@ mod tests {
                 "k1",
                 "a",
                 "__agg_state_a__sum",
-                "__agg_state_a__count"
+                "__agg_state_a__count",
+                AGG_RETRACTION_COUNT_STATE_COLUMN
             ],
             "unexpected schema"
         );
@@ -3020,8 +3232,8 @@ mod tests {
             "AvgSum state column must use visible scale (10)"
         );
 
-        // State-shaped input batch from executor: [k1, sum_col, count_col].
-        // visible_outputs = [GroupKey(0), Aggregate(0)] -> batch cols [k1, sum, count].
+        // State-shaped input batch from executor: [k1, sum_col, count_col, row_count].
+        // visible_outputs = [GroupKey(0), Aggregate(0)] plus hidden retraction count.
         // sum = 3005000 at scale 4 represents 300.5000 (SUM keeps input scale)
         // count = 2
         let batch = RecordBatch::try_new(
@@ -3029,6 +3241,7 @@ mod tests {
                 Field::new("k1", DataType::Int64, false),
                 Field::new("__agg_state_a__sum", DataType::Decimal128(38, 4), true),
                 Field::new("__agg_state_a__count", DataType::Int64, false),
+                Field::new(AGG_RETRACTION_COUNT_STATE_COLUMN, DataType::Int64, false),
             ])),
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])) as ArrayRef,
@@ -3037,6 +3250,7 @@ mod tests {
                         .with_precision_and_scale(38, 4)
                         .expect("precision/scale"),
                 ) as ArrayRef,
+                Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef,
                 Arc::new(Int64Array::from(vec![2_i64])) as ArrayRef,
             ],
         )

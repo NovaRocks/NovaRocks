@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, UInt32Array, new_null_array};
-use arrow::datatypes::{Field, Schema};
+use arrow::array::{ArrayRef, Int8Array, UInt32Array, new_null_array};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::common::ids::SlotId;
@@ -358,6 +358,7 @@ pub(crate) fn write_chunks_into_managed_partition(
     write_chunks_into_managed_partition_inner(state, plan, chunks, VisibleCommitAction::Plain)
 }
 
+#[allow(dead_code)]
 pub(crate) fn write_chunks_into_managed_partition_for_mv_refresh(
     state: &Arc<StandaloneState>,
     plan: ManagedInsertPlan,
@@ -459,9 +460,76 @@ pub(crate) fn write_chunks_into_managed_partition_for_aggregate_mv_upsert(
 
     let old_chunks = read_active_managed_physical_chunks(state, &plan)?;
     let old_rows = mv_agg_state::build_old_state_map(&old_chunks, layout)?;
-    let merged_chunks =
-        mv_agg_state::merge_aggregate_state_batches(&old_rows, delta_chunks, layout)?;
-    write_chunks_into_managed_partition_for_mv_refresh(state, plan, &merged_chunks, metadata)
+    let merge_result = mv_agg_state::merge_aggregate_state_batches_with_retractions(
+        &old_rows,
+        delta_chunks,
+        layout,
+    )?;
+    let mut publish_chunks = Vec::new();
+    publish_chunks.extend(append_primary_key_op_column(
+        &merge_result.upsert_chunks,
+        MANAGED_PK_OP_UPSERT,
+    )?);
+    publish_chunks.extend(append_primary_key_op_column(
+        &merge_result.delete_chunks,
+        MANAGED_PK_OP_DELETE,
+    )?);
+    write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
+        state,
+        plan,
+        &publish_chunks,
+        metadata,
+        merge_result.row_delta,
+    )
+}
+
+const MANAGED_PK_OP_COLUMN: &str = "__op";
+const MANAGED_PK_OP_UPSERT: i8 = 0;
+const MANAGED_PK_OP_DELETE: i8 = 1;
+
+fn append_primary_key_op_column(chunks: &[Chunk], op: i8) -> Result<Vec<Chunk>, String> {
+    chunks
+        .iter()
+        .filter(|chunk| chunk.len() > 0)
+        .map(|chunk| {
+            let mut fields = chunk
+                .batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect::<Vec<_>>();
+            if fields
+                .iter()
+                .any(|field| field.name().eq_ignore_ascii_case(MANAGED_PK_OP_COLUMN))
+            {
+                return Err(format!(
+                    "aggregate MV incremental write result contains reserved column `{MANAGED_PK_OP_COLUMN}`"
+                ));
+            }
+            fields.push(Field::new(MANAGED_PK_OP_COLUMN, DataType::Int8, false));
+            let mut columns = chunk.batch.columns().to_vec();
+            columns.push(Arc::new(Int8Array::from(vec![op; chunk.len()])) as ArrayRef);
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .map_err(|e| format!("append managed PK op column failed: {e}"))?;
+            let mut slot_ids = chunk
+                .chunk_schema()
+                .slots()
+                .iter()
+                .map(|slot| slot.slot_id())
+                .collect::<Vec<_>>();
+            let next_slot = slot_ids
+                .iter()
+                .map(|slot| slot.as_u32())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            slot_ids.push(SlotId::new(next_slot));
+            let chunk_schema =
+                ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
+            Ok(Chunk::new_with_chunk_schema(batch, chunk_schema))
+        })
+        .collect()
 }
 
 enum VisibleCommitAction {
@@ -1584,7 +1652,7 @@ mod mv_target_tests {
             &layout,
             MvRefreshWriteMetadata {
                 table_id: 10,
-                previous_refresh_rows: 0,
+                previous_refresh_rows: 1,
                 snapshots: BTreeMap::new(),
                 table_uuids: Default::default(),
             },
@@ -1645,6 +1713,85 @@ mod mv_target_tests {
             .find(|mv| mv.mv_id == 10)
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(1));
+    }
+
+    #[test]
+    fn aggregate_mv_upsert_deletes_fully_retracted_primary_key_row() {
+        let _guard = lock_runtime_test_state();
+        let fixture = seed_state_with_aggregate_primary_key_mv();
+        let (layout, old_chunks) = aggregate_physical_chunks(&[1], &[2], &[30]);
+        let old_plan = load_physical_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("old physical plan");
+        write_chunks_into_managed_partition(&fixture.state, old_plan, &old_chunks)
+            .expect("write old row");
+
+        let delta_chunks = aggregate_physical_chunks(&[1], &[-2], &[-30]).1;
+        let upsert_plan = load_physical_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("upsert physical plan");
+        write_chunks_into_managed_partition_for_aggregate_mv_upsert(
+            &fixture.state,
+            upsert_plan,
+            &delta_chunks,
+            &layout,
+            MvRefreshWriteMetadata {
+                table_id: 10,
+                previous_refresh_rows: 1,
+                snapshots: BTreeMap::new(),
+                table_uuids: Default::default(),
+            },
+        )
+        .expect("aggregate upsert");
+
+        let read_plan = load_physical_insert_plan(
+            &fixture.state,
+            &ResolvedLocalTableName {
+                database: "analytics".to_string(),
+                table: "orders_mv".to_string(),
+            },
+            PartitionTarget::Active,
+        )
+        .expect("read physical plan");
+        let active_chunks =
+            read_active_managed_physical_chunks(&fixture.state, &read_plan).expect("read active");
+        let total_rows = active_chunks.iter().map(Chunk::len).sum::<usize>();
+        assert_eq!(
+            total_rows, 0,
+            "fully retracted aggregate group must be deleted from the PK table"
+        );
+
+        let store = fixture.state.metadata_store.as_ref().expect("store");
+        let loaded = store.load_snapshot().expect("snapshot").managed;
+        let mv = loaded
+            .materialized_views
+            .iter()
+            .find(|mv| mv.mv_id == 10)
+            .expect("mv");
+        assert_eq!(mv.last_refresh_rows, Some(0));
+    }
+
+    #[test]
+    fn aggregate_mv_pk_op_append_rejects_reserved_column_name() {
+        let chunk = single_i32_chunk(MANAGED_PK_OP_COLUMN, &[1]);
+        let err = append_primary_key_op_column(&[chunk], MANAGED_PK_OP_UPSERT)
+            .expect_err("reserved __op column should be rejected");
+        assert_eq!(
+            err,
+            "aggregate MV incremental write result contains reserved column `__op`"
+        );
     }
 
     struct MvTestFixture {

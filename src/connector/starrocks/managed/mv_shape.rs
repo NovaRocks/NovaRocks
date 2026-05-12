@@ -1068,6 +1068,8 @@ fn aggregate_expr_error(_err: String) -> String {
 /// - Followed by  `COUNT(expr) AS __agg_state_<sanitized(alias)>__count`
 ///
 /// COUNT, SUM, MIN, MAX projections are passed through unchanged (their visible == state).
+/// If the MV does not expose a `COUNT(*)` aggregate, append a hidden `COUNT(*)`
+/// state column so incremental deletes can tell when a group has no remaining rows.
 /// Group keys and WHERE/HAVING clauses are unchanged.
 ///
 /// The returned SQL string can be fed directly to the executor to produce a state-shaped
@@ -1078,12 +1080,13 @@ pub(crate) fn rewrite_select_sql_for_state(
 ) -> Result<String, String> {
     use sqlparser::ast::{SelectItem, SetExpr, Statement};
 
-    // Check if there are any AVG aggregates; if not, return the SQL unchanged.
-    if shape
+    let has_avg = shape
         .aggregates
         .iter()
-        .all(|agg| agg.function != AggregateFunctionKind::Avg)
-    {
+        .any(|agg| agg.function == AggregateFunctionKind::Avg);
+    let needs_retraction_count =
+        crate::connector::starrocks::managed::mv_agg_state::aggregate_shape_needs_retraction_count_state(shape);
+    if !has_avg && !needs_retraction_count {
         return Ok(select_sql.to_string());
     }
 
@@ -1122,6 +1125,11 @@ pub(crate) fn rewrite_select_sql_for_state(
                 new_projection.push(item);
             }
         }
+    }
+    if needs_retraction_count {
+        new_projection.push(make_count_star_select_item(
+            crate::connector::starrocks::managed::mv_agg_state::AGG_RETRACTION_COUNT_STATE_COLUMN,
+        ));
     }
     select.projection = new_projection;
 
@@ -1195,6 +1203,31 @@ fn make_aggregate_select_item(
         args: FunctionArguments::List(FunctionArgumentList {
             duplicate_treatment: None,
             args: vec![FunctionArg::Unnamed(FunctionArgExpr::Expr(arg))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+    };
+    SelectItem::ExprWithAlias {
+        expr: sqlparser::ast::Expr::Function(function),
+        alias: Ident::new(alias),
+    }
+}
+
+fn make_count_star_select_item(alias: &str) -> sqlparser::ast::SelectItem {
+    use sqlparser::ast::{
+        Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident,
+        ObjectName, ObjectNamePart, SelectItem,
+    };
+    let function = Function {
+        name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("COUNT"))]),
+        uses_odbc_syntax: false,
+        parameters: FunctionArguments::None,
+        args: FunctionArguments::List(FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![FunctionArg::Unnamed(FunctionArgExpr::Wildcard)],
             clauses: vec![],
         }),
         filter: None,
@@ -1568,14 +1601,26 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_select_sql_no_avg_is_passthrough() {
+    fn rewrite_select_sql_count_sum_keeps_original_state_shape() {
         let original = "SELECT k1, COUNT(*) AS c, SUM(v2) AS s FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
-        // No AVG → original SQL returned unchanged.
-        assert_eq!(
-            rewritten, original,
-            "no-AVG case should return original SQL"
+        assert_eq!(rewritten, original, "COUNT already carries row cardinality");
+    }
+
+    #[test]
+    fn rewrite_select_sql_sum_only_adds_hidden_retraction_count() {
+        let original = "SELECT k1, SUM(v2) AS s FROM ice.ns.orders GROUP BY k1";
+        let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
+        let rewritten = rewrite_select_sql_for_state(original, &shape).expect("rewrite");
+        let upper = rewritten.to_uppercase();
+        assert!(
+            upper.contains("COUNT(*) AS __AGG_STATE___IVM_ROW_COUNT"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("SUM(V2) AS S") || upper.contains("SUM(v2) AS s"),
+            "got: {rewritten}"
         );
     }
 
