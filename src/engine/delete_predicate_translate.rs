@@ -14,7 +14,7 @@ use sqlparser::ast as sqlast;
 
 use crate::sql::catalog::ColumnDef;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -22,6 +22,22 @@ pub enum CmpOp {
     Le,
     Gt,
     Ge,
+}
+
+impl CmpOp {
+    /// Swap the operand sides: `a OP b` becomes `b OP.flipped() a`.
+    /// Used when the column is on the right side of a comparison so the
+    /// resulting `BinaryTerm` (which is always `column OP value`) encodes
+    /// the same predicate.
+    fn flipped(self) -> Self {
+        match self {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            CmpOp::Eq | CmpOp::Ne => self,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -103,11 +119,9 @@ fn flatten_and(expr: &sqlast::Expr) -> Result<Vec<&sqlast::Expr>, String> {
             sqlast::Expr::BinaryOp {
                 op: sqlast::BinaryOperator::Or,
                 ..
-            } => Err(
-                "DELETE on this table model does not support OR; \
+            } => Err("DELETE on this table model does not support OR; \
                  use only AND of comparisons / IN / IS NULL"
-                    .to_string(),
-            ),
+                .to_string()),
             sqlast::Expr::Nested(inner) => walk(inner, out),
             _ => {
                 out.push(e);
@@ -141,7 +155,8 @@ fn translate_atom(
                     ));
                 }
             };
-            let (col_name, lit_expr) = extract_col_lit(left, right)?;
+            let (col_name, lit_expr, swapped) = extract_col_lit(left, right)?;
+            let cmp = if swapped { cmp.flipped() } else { cmp };
             let column = column_or_err(schema, &col_name)?;
             check_keys(&col_name, &column, keys, keys_type)?;
             if is_float_type(&column.data_type) && matches!(cmp, CmpOp::Eq | CmpOp::Ne) {
@@ -207,12 +222,12 @@ fn translate_atom(
 fn extract_col_lit<'a>(
     left: &'a sqlast::Expr,
     right: &'a sqlast::Expr,
-) -> Result<(String, &'a sqlast::Expr), String> {
+) -> Result<(String, &'a sqlast::Expr, bool /* swapped */), String> {
     if let Ok(name) = expr_to_col_name(left) {
-        return Ok((name, right));
+        return Ok((name, right, false));
     }
     if let Ok(name) = expr_to_col_name(right) {
-        return Ok((name, left));
+        return Ok((name, left, true));
     }
     Err("DELETE WHERE comparison must have exactly one column and one literal side".to_string())
 }
@@ -268,10 +283,12 @@ fn serialize_literal(
             op: sqlast::UnaryOperator::Minus,
             expr,
         } => {
-            if let Expr::Value(ValueWithSpan { value, .. }) = expr.as_ref() {
-                if let Value::Number(n, _) = value {
-                    return Ok(format!("-{n}"));
-                }
+            if let Expr::Value(ValueWithSpan {
+                value: Value::Number(n, _),
+                ..
+            }) = expr.as_ref()
+            {
+                return Ok(format!("-{n}"));
             }
             return Err(format!(
                 "unsupported negated literal for column '{column_name}'"
@@ -411,5 +428,135 @@ mod tests {
             KeysType::Dup,
         )
         .expect("dup allows non-key");
+    }
+
+    #[test]
+    fn binary_gt_right_side_column() {
+        // Regression test for the I1 bug: `5 < id` must translate to `id > 5`,
+        // not `id < 5`. The comparator must be flipped when the column is on
+        // the right side of a non-symmetric comparison.
+        let w = parse_where("5 < id");
+        let t = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .expect("translate");
+        assert_eq!(t.binary[0].column, "id");
+        assert_eq!(t.binary[0].op, CmpOp::Gt, "comparator must be flipped");
+        assert_eq!(t.binary[0].value, "5");
+    }
+
+    #[test]
+    fn binary_le_right_side_column_flips_to_ge() {
+        let w = parse_where("100 >= id");
+        let t = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .expect("translate");
+        assert_eq!(t.binary[0].op, CmpOp::Le);
+    }
+
+    #[test]
+    fn in_list_basic() {
+        let w = parse_where("id IN (1, 2, 3)");
+        let t = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .expect("translate");
+        assert_eq!(t.in_list.len(), 1);
+        assert_eq!(t.in_list[0].column, "id");
+        assert!(!t.in_list[0].is_not_in);
+        assert_eq!(t.in_list[0].values, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn not_in_list() {
+        let w = parse_where("id NOT IN (1, 2)");
+        let t = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .expect("translate");
+        assert!(t.in_list[0].is_not_in);
+    }
+
+    #[test]
+    fn is_null_term() {
+        let w = parse_where("name IS NULL");
+        let t = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .expect("translate");
+        assert_eq!(t.is_null.len(), 1);
+        assert_eq!(t.is_null[0].column, "name");
+        assert!(!t.is_null[0].is_not_null);
+    }
+
+    #[test]
+    fn is_not_null_term() {
+        let w = parse_where("name IS NOT NULL");
+        let t = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .expect("translate");
+        assert!(t.is_null[0].is_not_null);
+    }
+
+    #[test]
+    fn float_column_equality_rejected() {
+        // Schema with a Float64 column to trigger is_float_type rejection.
+        let schema = vec![ColumnDef {
+            name: "v".to_string(),
+            data_type: arrow::datatypes::DataType::Float64,
+            nullable: false,
+            write_default: None,
+        }];
+        let w = parse_where("v = 1.0");
+        let err = translate_to_delete_predicate(&w, &schema, &["v".to_string()], KeysType::Dup)
+            .unwrap_err();
+        assert!(err.contains("float"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_column_rejected() {
+        let w = parse_where("nonexistent = 1");
+        let err = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Dup,
+        )
+        .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn agg_keys_non_key_rejected() {
+        // Mirror unique_non_key_rejected but for AGG_KEYS.
+        let w = parse_where("name = 'x'");
+        let err = translate_to_delete_predicate(
+            &w,
+            &dup_schema_int_str(),
+            &["id".to_string()],
+            KeysType::Agg,
+        )
+        .unwrap_err();
+        assert!(err.contains("key column"), "got: {err}");
     }
 }
