@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
@@ -13,22 +15,65 @@ use super::type_infer::{arithmetic_result_type_with_op, arrow_type_to_type_desc,
 use crate::sql::analysis::{BinOp, ExprKind, LiteralValue, TypedExpr, UnOp};
 use crate::sql::planner::plan::AggregateCall;
 
+/// Shared counter used to allocate fresh slot ids for lambda parameters. The
+/// counter is owned by the fragment builder so that ids stay globally unique
+/// across the query.
+pub(crate) type SlotAllocator = Rc<RefCell<i32>>;
+
+/// One frame of the lambda-binding stack. Maps a lambda parameter name to the
+/// slot id allocated for it and the parameter's element data type.
+#[derive(Clone, Debug)]
+struct LambdaBinding {
+    name: String,
+    slot_id: i32,
+    data_type: DataType,
+    nullable: bool,
+}
+
 /// Compiles sqlparser expressions into Thrift TExpr (flattened pre-order TExprNode list).
 pub(crate) struct ExprCompiler<'a> {
     scope: &'a ExprScope,
     nodes: Vec<exprs::TExprNode>,
     last_type: DataType,
     last_nullable: bool,
+    /// Shared slot id allocator. Always points at the fragment builder's
+    /// counter so that any lambda parameter slots emitted while compiling an
+    /// expression remain unique across the whole query.
+    slot_alloc: SlotAllocator,
+    /// Active lambda parameter bindings (innermost last). Inside a lambda
+    /// body, an unqualified `ColumnRef` whose name matches a binding becomes a
+    /// `SLOT_REF` to the allocated slot id.
+    lambda_stack: Vec<LambdaBinding>,
 }
 
 impl<'a> ExprCompiler<'a> {
-    pub fn new(scope: &'a ExprScope) -> Self {
+    /// Build a new expression compiler bound to `scope`. The slot allocator
+    /// is shared with the fragment builder so that any lambda parameter slots
+    /// emitted inside this compiler stay unique across the entire query.
+    pub fn new(slot_alloc: SlotAllocator, scope: &'a ExprScope) -> Self {
         Self {
             scope,
             nodes: Vec::new(),
             last_type: DataType::Null,
             last_nullable: true,
+            slot_alloc,
+            lambda_stack: Vec::new(),
         }
+    }
+
+    fn alloc_slot_id(&self) -> i32 {
+        let mut next = self.slot_alloc.borrow_mut();
+        let id = *next;
+        *next += 1;
+        id
+    }
+
+    fn lookup_lambda_binding(&self, qualifier: Option<&str>, name: &str) -> Option<&LambdaBinding> {
+        if qualifier.is_some() {
+            return None;
+        }
+        let target = name.to_lowercase();
+        self.lambda_stack.iter().rev().find(|b| b.name == target)
     }
 
     /// Compile a TypedExpr (from the analyzer/planner IR) into a TExpr.
@@ -324,6 +369,19 @@ impl<'a> ExprCompiler<'a> {
     fn compile_typed_inner(&mut self, expr: &TypedExpr) -> Result<DataType, String> {
         match &expr.kind {
             ExprKind::ColumnRef { qualifier, column } => {
+                // Inside a lambda body, parameter references resolve to the
+                // allocated lambda-arg slot ids (tuple_id = 0, since they do
+                // not belong to any tuple descriptor).
+                if let Some(binding) = self.lookup_lambda_binding(qualifier.as_deref(), column) {
+                    let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
+                    let data_type = binding.data_type.clone();
+                    let nullable = binding.nullable;
+                    self.nodes
+                        .push(slot_ref_node(binding.slot_id, 0, type_desc));
+                    self.last_type = data_type.clone();
+                    self.last_nullable = nullable;
+                    return Ok(data_type);
+                }
                 let binding = self.scope.resolve_column(qualifier.as_deref(), column)?;
                 let type_desc = binding_type_desc(binding)?;
                 self.nodes
@@ -734,6 +792,16 @@ impl<'a> ExprCompiler<'a> {
                      subquery rewriting may have failed"
                 ))
             }
+            ExprKind::Lambda { .. } => {
+                // Lambdas only make sense as direct arguments of a
+                // higher-order function. The corresponding caller emits the
+                // LAMBDA_FUNCTION_EXPR node explicitly so this expression
+                // should never be reached directly.
+                Err(
+                    "lambda expression appeared outside of a higher-order function call"
+                        .to_string(),
+                )
+            }
         }
     }
 
@@ -1046,6 +1114,20 @@ impl<'a> ExprCompiler<'a> {
             return self.compile_map_function_call_with_hint(parent_idx, args, type_hint);
         }
 
+        // Higher-order functions: the first argument is a lambda. Emit the
+        // shape expected by the execution-layer array_map / array_filter
+        // operators: parent FUNCTION_CALL with children
+        // [LAMBDA_FUNCTION_EXPR, array_arg_0, ..., array_arg_{n-1}], where the
+        // LAMBDA_FUNCTION_EXPR node has children [body, slot_ref_0, ..., slot_ref_{n-1}].
+        if is_higher_order_function(name)
+            && let Some(TypedExpr {
+                kind: ExprKind::Lambda { .. },
+                ..
+            }) = args.first()
+        {
+            return self.compile_higher_order_function_call(parent_idx, name, args, type_hint);
+        }
+
         let mut arg_types = Vec::new();
         for arg in args {
             let t = self.compile_typed_inner(arg)?;
@@ -1104,6 +1186,149 @@ impl<'a> ExprCompiler<'a> {
                 binary_type: types::TFunctionBinaryType::BUILTIN,
                 arg_types: fn_arg_types,
                 ret_type: ret_type_desc,
+                has_var_args: false,
+                comment: None,
+                signature: None,
+                hdfs_location: None,
+                scalar_fn: None,
+                aggregate_fn: None,
+                id: None,
+                checksum: None,
+                agg_state_desc: None,
+                fid: None,
+                table_fn: None,
+                could_apply_dict_optimize: None,
+                ignore_nulls: None,
+                isolated: None,
+                input_type: None,
+                content: None,
+            }),
+            ..default_expr_node()
+        };
+        self.last_type = return_type.clone();
+        self.last_nullable = true;
+        Ok(return_type)
+    }
+
+    /// Emit a higher-order function call (e.g. `array_map`, `array_filter`).
+    ///
+    /// Lambda parameters are bound to freshly-allocated, query-global-unique
+    /// slot ids. Inside the body, a `ColumnRef` whose name matches a parameter
+    /// resolves to a `SLOT_REF` pointing at that slot; outer column references
+    /// continue to resolve through `ExprScope` as captures. Common-sub-expr
+    /// extraction is not yet performed in the standalone path, so the lambda
+    /// node always has `output_column = 0`.
+    fn compile_higher_order_function_call(
+        &mut self,
+        parent_idx: usize,
+        name: &str,
+        args: &[TypedExpr],
+        type_hint: &DataType,
+    ) -> Result<DataType, String> {
+        let (lambda_params, lambda_body) = match &args[0].kind {
+            ExprKind::Lambda { params, body } => (params.clone(), body.as_ref().clone()),
+            _ => unreachable!("compile_higher_order_function_call called without lambda first arg"),
+        };
+        let array_args = &args[1..];
+
+        if lambda_params.len() != array_args.len() {
+            return Err(format!(
+                "{name} lambda parameter count ({}) does not match array argument count ({})",
+                lambda_params.len(),
+                array_args.len()
+            ));
+        }
+
+        // Determine each lambda parameter's element type from its array arg.
+        let mut param_bindings = Vec::with_capacity(lambda_params.len());
+        for (param_name, array_arg) in lambda_params.iter().zip(array_args.iter()) {
+            let (elem_type, elem_nullable) = match &array_arg.data_type {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::FixedSizeList(field, _) => (
+                    field.data_type().clone(),
+                    field.is_nullable() || array_arg.nullable,
+                ),
+                other => {
+                    return Err(format!("{name} expects ARRAY arguments, got {:?}", other));
+                }
+            };
+            let slot_id = self.alloc_slot_id();
+            param_bindings.push(LambdaBinding {
+                name: param_name.to_lowercase(),
+                slot_id,
+                data_type: elem_type,
+                nullable: elem_nullable,
+            });
+        }
+
+        // Push the parent FUNCTION_CALL placeholder is already at parent_idx.
+        // Now emit the LAMBDA_FUNCTION_EXPR node and its children.
+        let lambda_idx = self.nodes.len();
+        self.nodes.push(default_expr_node()); // placeholder for lambda node
+
+        // Compile the body under the new lambda scope.
+        let stack_depth_before = self.lambda_stack.len();
+        self.lambda_stack.extend(param_bindings.iter().cloned());
+        let body_type = self.compile_typed_inner(&lambda_body)?;
+        self.lambda_stack.truncate(stack_depth_before);
+
+        // Then emit one SLOT_REF child per lambda parameter.
+        for binding in &param_bindings {
+            let type_desc = arrow_type_to_type_desc(&binding.data_type)?;
+            self.nodes
+                .push(slot_ref_node(binding.slot_id, 0, type_desc));
+        }
+
+        // Patch the LAMBDA_FUNCTION_EXPR header. The return type matches the
+        // body type.
+        let lambda_type_desc = arrow_type_to_type_desc(&body_type)?;
+        self.nodes[lambda_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::LAMBDA_FUNCTION_EXPR,
+            type_: lambda_type_desc,
+            num_children: 1 + param_bindings.len() as i32,
+            output_column: Some(0),
+            ..default_expr_node()
+        };
+
+        // Now compile each array argument as a regular child of the parent
+        // FUNCTION_CALL.
+        let mut array_arg_types = Vec::with_capacity(array_args.len());
+        for array_arg in array_args {
+            let t = self.compile_typed_inner(array_arg)?;
+            array_arg_types.push(t);
+        }
+
+        // Determine return type. Analyzer should already have computed it.
+        let return_type = if *type_hint != DataType::Null {
+            type_hint.clone()
+        } else {
+            higher_order_return_type(name, &body_type, &array_arg_types)
+        };
+        let return_type_desc = arrow_type_to_type_desc(&return_type)?;
+
+        // Build the parent FUNCTION_CALL fn_ payload. arg_types lists the
+        // declared arrow types of each child of the FUNCTION_CALL (lambda
+        // followed by array args). This mirrors the FE-compatible shape.
+        let lambda_fn_arg_type = arrow_type_to_type_desc(&body_type)?;
+        let mut fn_arg_types = Vec::with_capacity(1 + array_arg_types.len());
+        fn_arg_types.push(lambda_fn_arg_type);
+        for t in &array_arg_types {
+            fn_arg_types.push(arrow_type_to_type_desc(t)?);
+        }
+
+        self.nodes[parent_idx] = exprs::TExprNode {
+            node_type: exprs::TExprNodeType::FUNCTION_CALL,
+            type_: return_type_desc.clone(),
+            num_children: 1 + array_args.len() as i32,
+            fn_: Some(types::TFunction {
+                name: types::TFunctionName {
+                    db_name: None,
+                    function_name: name.to_string(),
+                },
+                binary_type: types::TFunctionBinaryType::BUILTIN,
+                arg_types: fn_arg_types,
+                ret_type: return_type_desc,
                 has_var_args: false,
                 comment: None,
                 signature: None,
@@ -1255,6 +1480,29 @@ pub(crate) fn build_cast_texpr(child: exprs::TExpr, target_type: types::TTypeDes
     let mut nodes = vec![cast_node];
     nodes.extend(child.nodes);
     exprs::TExpr::new(nodes)
+}
+
+/// Names of higher-order functions whose first argument is a lambda.
+fn is_higher_order_function(name: &str) -> bool {
+    matches!(name, "array_map" | "transform" | "array_filter" | "filter")
+}
+
+/// Default return type inference for higher-order functions, used only when
+/// the analyzer did not provide a more specific type hint.
+fn higher_order_return_type(
+    name: &str,
+    body_type: &DataType,
+    array_arg_types: &[DataType],
+) -> DataType {
+    match name {
+        "array_map" | "transform" => DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            body_type.clone(),
+            true,
+        ))),
+        "array_filter" | "filter" => array_arg_types.first().cloned().unwrap_or(DataType::Null),
+        _ => DataType::Null,
+    }
 }
 
 fn slot_ref_node(slot_id: i32, tuple_id: i32, type_desc: types::TTypeDesc) -> exprs::TExprNode {

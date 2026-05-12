@@ -306,6 +306,16 @@ pub(crate) enum ExprKind {
         kind: SubqueryKind,
         data_type: DataType,
     },
+    /// Lambda expression used by higher-order functions (e.g. array_map,
+    /// array_filter). Produced only inside a higher-order function call's
+    /// arguments; not a free-standing expression elsewhere.
+    Lambda {
+        /// Parameter names in declaration order (lower-cased).
+        params: Vec<String>,
+        /// Lambda body, analyzed under a scope that binds each `params[i]` to
+        /// the corresponding higher-order function's element type.
+        body: Box<TypedExpr>,
+    },
 }
 
 /// The kind of subquery encountered in an expression.

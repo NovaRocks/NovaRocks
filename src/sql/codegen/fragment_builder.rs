@@ -5,9 +5,11 @@
 //! `PhysicalCTEProduce` / `PhysicalCTEConsume` create multicast fragments
 //! whose sinks are wired by the `ExecutionCoordinator` after building.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use arrow::datatypes::DataType;
 
@@ -133,7 +135,11 @@ pub(crate) struct PlanFragmentBuilder<'a> {
     desc_builder: DescriptorTableBuilder,
     scan_tables: Vec<nodes::PlannedScanTable>,
     next_node_id: i32,
-    next_slot_id: i32,
+    /// Slot ids are shared with `ExprCompiler` so that lambda-parameter slot
+    /// ids stay unique across the entire query. Wrapped in `Rc<RefCell<_>>`
+    /// to allow handing out an allocator handle without borrowing the whole
+    /// builder.
+    next_slot_id: Rc<RefCell<i32>>,
     next_tuple_id: i32,
     next_fragment_id: FragmentId,
     /// Fragment ids for current visit context. Top is active fragment id.
@@ -169,7 +175,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             desc_builder: DescriptorTableBuilder::new(),
             scan_tables: Vec::new(),
             next_node_id: 1,
-            next_slot_id: 1,
+            next_slot_id: Rc::new(RefCell::new(1)),
             next_tuple_id: 1,
             next_fragment_id: 0,
             fragment_stack: Vec::new(),
@@ -279,9 +285,17 @@ impl<'a> PlanFragmentBuilder<'a> {
     }
 
     fn alloc_slot(&mut self) -> i32 {
-        let id = self.next_slot_id;
-        self.next_slot_id += 1;
+        let mut next = self.next_slot_id.borrow_mut();
+        let id = *next;
+        *next += 1;
         id
+    }
+
+    /// Return a shared handle to the slot id allocator. Hand this to
+    /// `ExprCompiler::new_with_slot_alloc` so lambda parameter slots are
+    /// allocated from the same monotonic counter as physical tuple slots.
+    fn slot_allocator(&self) -> expr_compiler::SlotAllocator {
+        Rc::clone(&self.next_slot_id)
     }
 
     fn alloc_tuple(&mut self) -> i32 {
@@ -355,7 +369,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let conjuncts = split_and_conjuncts_typed(predicate);
         let mut results = Vec::new();
         for conj in conjuncts {
-            let mut compiler = ExprCompiler::new(scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), scope);
             results.push(compiler.compile_typed(conj)?);
         }
         Ok(results)
@@ -497,7 +511,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         } else {
             let mut conjuncts = Vec::new();
             for pred in &op.predicates {
-                let mut compiler = ExprCompiler::new(&scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &scope);
                 conjuncts.push(compiler.compile_typed(pred)?);
             }
             conjuncts
@@ -598,7 +612,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut project_scope = ExprScope::new();
 
         for item in &op.items {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let texpr = compiler.compile_typed(&item.expr)?;
             let data_type = item.expr.data_type.clone();
             let nullable = item.expr.nullable;
@@ -710,11 +724,11 @@ impl<'a> PlanFragmentBuilder<'a> {
             let expr_a = &eq.left;
             let expr_b = &eq.right;
             // Try natural order: expr_a on left, expr_b on right.
-            let natural = ExprCompiler::new(&left.scope)
+            let natural = ExprCompiler::new(self.slot_allocator(), &left.scope)
                 .compile_typed(expr_a)
                 .ok()
                 .and_then(|lt| {
-                    ExprCompiler::new(&right.scope)
+                    ExprCompiler::new(self.slot_allocator(), &right.scope)
                         .compile_typed(expr_b)
                         .ok()
                         .map(|rt| (lt, rt))
@@ -723,11 +737,11 @@ impl<'a> PlanFragmentBuilder<'a> {
             // Needed when JoinCommutativity swapped children but the
             // eq_condition columns still reference the original order.
             let result = natural.or_else(|| {
-                ExprCompiler::new(&left.scope)
+                ExprCompiler::new(self.slot_allocator(), &left.scope)
                     .compile_typed(expr_b)
                     .ok()
                     .and_then(|lt| {
-                        ExprCompiler::new(&right.scope)
+                        ExprCompiler::new(self.slot_allocator(), &right.scope)
                             .compile_typed(expr_a)
                             .ok()
                             .map(|rt| (lt, rt))
@@ -768,7 +782,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             let mut merged = ExprScope::new();
             merged.merge(&left.scope);
             merged.merge(&right.scope);
-            let mut compiler = ExprCompiler::new(&merged);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &merged);
             for demoted in &demoted_eq_exprs {
                 other_join_conjuncts.push(compiler.compile_typed(demoted)?);
             }
@@ -871,7 +885,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             let conjuncts = split_and_conjuncts_typed(cond);
             let mut results = Vec::new();
             for conj in conjuncts {
-                let mut compiler = ExprCompiler::new(&merged);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &merged);
                 results.push(compiler.compile_typed(conj)?);
             }
             results
@@ -960,7 +974,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Compile GROUP BY expressions (same for all modes — the child scope
         // has the correct columns for both scan-level and Local-output contexts).
         for (idx, gb_expr) in op.group_by.iter().enumerate() {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let texpr = compiler.compile_typed(gb_expr)?;
             let data_type = gb_expr.data_type.clone();
             let nullable = gb_expr.nullable;
@@ -1023,7 +1037,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                         child_col_idx
                     )
                 })?;
-                let mut compiler = ExprCompiler::new(&child.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
                 compiler.compile_merge_aggregate_call(
                     agg_call,
                     binding.slot_id,
@@ -1032,7 +1046,7 @@ impl<'a> PlanFragmentBuilder<'a> {
                 )?
             } else {
                 // Single or Local: compile against child scope normally.
-                let mut compiler = ExprCompiler::new(&child.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
                 compiler.compile_aggregate_call_typed(agg_call).map_err(|err| {
                     let available = child
                         .scope
@@ -1153,7 +1167,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut nulls_first_list = Vec::new();
 
         for item in &op.items {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let texpr = compiler.compile_typed(&item.expr)?;
             ordering_exprs.push(texpr);
             is_asc.push(item.asc);
@@ -1252,7 +1266,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut nulls_first_list = Vec::new();
 
         for item in &op.items {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let texpr = compiler.compile_typed(&item.expr)?;
             ordering_exprs.push(texpr);
             is_asc.push(item.asc);
@@ -1544,13 +1558,13 @@ impl<'a> PlanFragmentBuilder<'a> {
 
         let mut partition_exprs = Vec::new();
         for expr in &first_win.partition_by {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             partition_exprs.push(compiler.compile_typed(expr)?);
         }
 
         let mut order_by_exprs = Vec::new();
         for item in &first_win.order_by {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let texpr = compiler.compile_typed(&item.expr)?;
             order_by_exprs.push(texpr);
         }
@@ -1558,7 +1572,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         // Compile analytic functions
         let mut analytic_functions = Vec::new();
         for win_expr in &op.window_exprs {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let agg_call = AggregateCall {
                 name: win_expr.name.clone(),
                 args: win_expr.args.clone(),
@@ -1736,13 +1750,13 @@ impl<'a> PlanFragmentBuilder<'a> {
             let mut sort_is_asc = Vec::new();
             let mut sort_nulls_first_list = Vec::new();
             for expr in &first_win.partition_by {
-                let mut compiler = ExprCompiler::new(&current.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
                 sort_ordering.push(compiler.compile_typed(expr)?);
                 sort_is_asc.push(true);
                 sort_nulls_first_list.push(true);
             }
             for item in &first_win.order_by {
-                let mut compiler = ExprCompiler::new(&current.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
                 sort_ordering.push(compiler.compile_typed(&item.expr)?);
                 sort_is_asc.push(item.asc);
                 sort_nulls_first_list.push(item.nulls_first);
@@ -1771,18 +1785,18 @@ impl<'a> PlanFragmentBuilder<'a> {
 
             let mut partition_exprs = Vec::new();
             for expr in &first_win.partition_by {
-                let mut compiler = ExprCompiler::new(&current.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
                 partition_exprs.push(compiler.compile_typed(expr)?);
             }
             let mut order_by_exprs = Vec::new();
             for item in &first_win.order_by {
-                let mut compiler = ExprCompiler::new(&current.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
                 order_by_exprs.push(compiler.compile_typed(&item.expr)?);
             }
 
             let mut analytic_functions = Vec::new();
             for win_expr in &group_exprs {
-                let mut compiler = ExprCompiler::new(&current.scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &current.scope);
                 let agg_call = AggregateCall {
                     name: win_expr.name.clone(),
                     args: win_expr.args.clone(),
@@ -1975,7 +1989,7 @@ impl<'a> PlanFragmentBuilder<'a> {
             }
             let mut exprs = Vec::with_capacity(row.len());
             for expr in row {
-                let mut compiler = ExprCompiler::new(&empty_scope);
+                let mut compiler = ExprCompiler::new(self.slot_allocator(), &empty_scope);
                 exprs.push(compiler.compile_typed(expr)?);
             }
             const_expr_lists.push(exprs);
@@ -2177,7 +2191,7 @@ impl<'a> PlanFragmentBuilder<'a> {
         let mut param_slots = Vec::with_capacity(op.args.len());
         let mut param_type_descs = Vec::with_capacity(op.args.len());
         for (idx, arg) in op.args.iter().enumerate() {
-            let mut compiler = ExprCompiler::new(&child.scope);
+            let mut compiler = ExprCompiler::new(self.slot_allocator(), &child.scope);
             let texpr = compiler.compile_typed(arg)?;
             let type_desc = texpr
                 .nodes

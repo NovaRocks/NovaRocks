@@ -44,10 +44,45 @@ impl<'a> super::AnalyzerContext<'a> {
 
             sqlast::Expr::Array(array) => self.analyze_array_literal(array, scope),
 
-            // Binary operations
+            // Binary operations. The `->` arrow operator is treated as a
+            // JSON-path access (StarRocks/MySQL semantics) when it appears
+            // outside of a higher-order function argument. Higher-order
+            // function arguments are inspected before they reach this
+            // generic path — see `analyze_higher_order_lambda_arguments`.
+            //
+            // sqlparser parses `->` with low precedence (PgOther = 16), below
+            // comparison operators (`=` = 20). That makes
+            // `v8 -> '$.a.b' = v9 -> '$.a'` parse as
+            // `Arrow(Arrow(v8, Eq('$.a.b', v9)), '$.a')` rather than the
+            // intended `Eq(Arrow(v8, '$.a.b'), Arrow(v9, '$.a'))`. We
+            // pre-rotate Arrow nodes here so the analyzer always sees the
+            // semantically intended tree.
             sqlast::Expr::BinaryOp { left, op, right } => {
+                if matches!(op, sqlast::BinaryOperator::Arrow) {
+                    // Rebalance the whole arrow-rooted subtree before
+                    // analyzing so that comparison/logical operators which
+                    // sqlparser placed above `->` end up at the root.
+                    let rebalanced = rebalance_arrow_tree(left, right);
+                    return match rebalanced {
+                        sqlast::Expr::BinaryOp {
+                            left: l,
+                            op: sqlast::BinaryOperator::Arrow,
+                            right: r,
+                        } => self.analyze_json_arrow(&l, &r, scope),
+                        other => self.analyze_expr(&other, scope),
+                    };
+                }
                 self.analyze_binary_op(left, op, right, scope)
             }
+
+            // The StarRocks dialect does not enable sqlparser's generic
+            // lambda parsing, so `Expr::Lambda` is normally unreachable here.
+            // Reject it defensively so we don't silently miscompile if a
+            // dialect change ever flips that flag back on.
+            sqlast::Expr::Lambda(_) => Err(
+                "lambda expressions are only allowed inside higher-order function calls"
+                    .to_string(),
+            ),
 
             // Unary NOT
             sqlast::Expr::UnaryOp {
@@ -780,6 +815,35 @@ impl<'a> super::AnalyzerContext<'a> {
         })
     }
 
+    /// Analyze `left -> right` as a JSON path operator. StarRocks treats
+    /// `json_col -> '$.a.b'` as `json_query(json_col, '$.a.b')` returning a
+    /// JSON value. Other operand types fall back to `get_json_string` so the
+    /// expression remains usable.
+    fn analyze_json_arrow(
+        &self,
+        left: &sqlast::Expr,
+        right: &sqlast::Expr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, String> {
+        let left_typed = self.analyze_expr(left, scope)?;
+        let right_typed = self.analyze_expr(right, scope)?;
+        let nullable = true;
+        let fn_name = "json_query";
+        // Use json_query for JSON inputs; otherwise still return Utf8 via
+        // get_json_string semantics. The runtime function name "json_query"
+        // is registered in connector/codegen and returns a JSON-valued column
+        // (mapped to Utf8 at the analyzer level for downstream operators).
+        Ok(TypedExpr {
+            kind: ExprKind::FunctionCall {
+                name: fn_name.to_string(),
+                args: vec![left_typed, right_typed],
+                distinct: false,
+            },
+            data_type: DataType::Utf8,
+            nullable,
+        })
+    }
+
     /// Analyze a binary operation.
     fn analyze_binary_op(
         &self,
@@ -1042,10 +1106,6 @@ impl<'a> super::AnalyzerContext<'a> {
                 );
             }
         }
-        if let Some(rewritten) = self.try_analyze_array_map_cast_lambda(&name, &arg_exprs, scope)? {
-            return Ok(rewritten);
-        }
-
         // Analyze arguments. For the narrow standalone lambda support needed by
         // aggregate suite, rewrite `array_sortby((x) -> x.field, arr)` into
         // `array_sortby(arr, __array_struct_subfield(arr, 'field'))`.
@@ -1056,6 +1116,8 @@ impl<'a> super::AnalyzerContext<'a> {
                 .is_some()
         {
             self.analyze_array_sortby_lambda_arguments(&arg_exprs, scope)?
+        } else if is_higher_order_function_with_lambda(&name, &arg_exprs) {
+            self.analyze_higher_order_lambda_arguments(&name, &arg_exprs, scope)?
         } else {
             let mut args_typed = Vec::with_capacity(arg_exprs.len());
             let mut arg_types = Vec::with_capacity(arg_exprs.len());
@@ -1488,48 +1550,81 @@ impl<'a> super::AnalyzerContext<'a> {
         })
     }
 
-    fn try_analyze_array_map_cast_lambda(
+    /// Analyze the arguments of a higher-order function whose first argument
+    /// is a lambda (e.g. `array_map(x -> ..., arr)` or
+    /// `array_filter((x, y) -> ..., arr1, arr2)`).
+    ///
+    /// The lambda parameter count must match the number of trailing array
+    /// arguments. Each parameter is bound to the element type of the
+    /// corresponding array. Captures (outer columns referenced from the body)
+    /// are resolved by merging the lambda scope onto the outer scope.
+    fn analyze_higher_order_lambda_arguments(
         &self,
         name: &str,
         arg_exprs: &[&sqlast::Expr],
         scope: &AnalyzerScope,
-    ) -> Result<Option<TypedExpr>, String> {
-        if !matches!(name, "array_map" | "transform") {
-            return Ok(None);
-        }
-        if arg_exprs.len() != 2 {
-            return Ok(None);
-        }
-
-        let Some((param_name, lambda_body)) = parse_array_sortby_lambda(arg_exprs[0]) else {
-            return Ok(None);
-        };
-        if !lambda_body_casts_param_to_utf8(lambda_body, &param_name) {
-            return Err(
-                "array_map lambda rewrite currently supports x -> CAST(x AS STRING)".to_string(),
-            );
-        }
-
-        let array_expr = self.analyze_expr(arg_exprs[1], scope)?;
-        if !matches!(array_expr.data_type, DataType::List(_)) {
+    ) -> Result<(Vec<TypedExpr>, Vec<DataType>), String> {
+        if arg_exprs.len() < 2 {
             return Err(format!(
-                "array_map lambda expects ARRAY input, got {:?}",
-                array_expr.data_type
+                "{name} expects a lambda and at least one array argument"
             ));
         }
-        let target = DataType::List(Arc::new(arrow::datatypes::Field::new(
-            "item",
-            DataType::Utf8,
-            true,
-        )));
-        Ok(Some(TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(array_expr),
-                target: target.clone(),
+        let (param_names, body_expr) = parse_multi_param_lambda(arg_exprs[0])
+            .ok_or_else(|| format!("{name} expects a lambda function as its first argument"))?;
+        let array_count = arg_exprs.len() - 1;
+        if param_names.len() != array_count {
+            return Err(format!(
+                "{name} lambda has {} parameter(s) but {} array argument(s) were supplied",
+                param_names.len(),
+                array_count
+            ));
+        }
+
+        // Analyze each array argument first so we know its element type.
+        let mut analyzed_arrays = Vec::with_capacity(array_count);
+        let mut element_types = Vec::with_capacity(array_count);
+        for sql_expr in &arg_exprs[1..] {
+            let typed = self.analyze_expr(sql_expr, scope)?;
+            let elem_type = match &typed.data_type {
+                DataType::List(field)
+                | DataType::LargeList(field)
+                | DataType::FixedSizeList(field, _) => field.data_type().clone(),
+                DataType::Null => DataType::Null,
+                other => {
+                    return Err(format!("{name} expects ARRAY arguments, got {:?}", other));
+                }
+            };
+            element_types.push(elem_type);
+            analyzed_arrays.push(typed);
+        }
+
+        // Build a scope that contains outer columns plus the lambda params.
+        let mut inner_scope = scope.clone();
+        for (param_name, elem_type) in param_names.iter().zip(element_types.iter()) {
+            inner_scope.add_column(None, param_name, elem_type.clone(), true);
+        }
+        let body_typed = self.analyze_expr(body_expr, &inner_scope)?;
+        let body_type = body_typed.data_type.clone();
+        let body_nullable = body_typed.nullable;
+
+        let lambda_typed = TypedExpr {
+            kind: ExprKind::Lambda {
+                params: param_names.iter().map(|p| p.to_lowercase()).collect(),
+                body: Box::new(body_typed),
             },
-            data_type: target,
-            nullable: true,
-        }))
+            data_type: body_type,
+            nullable: body_nullable,
+        };
+
+        let mut args_typed = Vec::with_capacity(arg_exprs.len());
+        let mut arg_types = Vec::with_capacity(arg_exprs.len());
+        arg_types.push(lambda_typed.data_type.clone());
+        args_typed.push(lambda_typed);
+        for arr in analyzed_arrays {
+            arg_types.push(arr.data_type.clone());
+            args_typed.push(arr);
+        }
+        Ok((args_typed, arg_types))
     }
 
     fn validate_percentile_arguments(&self, name: &str, args: &[TypedExpr]) -> Result<(), String> {
@@ -2675,27 +2770,263 @@ fn parse_array_sortby_lambda_param(expr: &sqlast::Expr) -> Option<String> {
     }
 }
 
-fn lambda_body_casts_param_to_utf8(expr: &sqlast::Expr, param_name: &str) -> bool {
-    match expr {
-        sqlast::Expr::Nested(inner) => lambda_body_casts_param_to_utf8(inner, param_name),
-        sqlast::Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } if lambda_expr_is_param(inner, param_name) => {
-            matches!(
-                sql_type_to_arrow(data_type),
-                Ok(DataType::Utf8 | DataType::LargeUtf8)
-            )
+/// Repeatedly apply Arrow-precedence rotations on a `Arrow(left, right)`
+/// expression until the tree is stable. Returns either an unchanged
+/// `BinaryOp { op: Arrow }` (when no rotation is possible) or the rotated
+/// expression that the caller must analyze instead.
+///
+/// Two rotation rules are applied iteratively:
+///   1. `Arrow(L, BinaryOp(a, op, b))` where `op` ranks below the intended
+///      arrow precedence (Eq/comparison/AND/OR/etc) becomes
+///      `BinaryOp(Arrow(L, a), op, b)`.
+///   2. `Arrow(BinaryOp(L, op, R), Y)` where `op` ranks below the intended
+///      arrow precedence becomes `BinaryOp(L, op, Arrow(R, Y))`.
+///
+/// Bot rules can produce a new expression whose root is no longer an Arrow,
+/// so the caller may need to re-analyze through a different code path.
+fn rebalance_arrow_tree(left: &sqlast::Expr, right: &sqlast::Expr) -> sqlast::Expr {
+    // First normalize the left subtree. The outer Arrow's left operand may
+    // itself be an Arrow that needs rotation; once we lift comparisons /
+    // logical ops out of it, the outer Arrow can apply rule 2 to push itself
+    // further inward.
+    let normalized_left = normalize_arrow_subtree(left);
+    let mut expr = sqlast::Expr::BinaryOp {
+        left: Box::new(normalized_left),
+        op: sqlast::BinaryOperator::Arrow,
+        right: Box::new(right.clone()),
+    };
+    // Bounded iteration: each rotation strictly increases the depth of the
+    // non-arrow root, so a small upper bound is more than enough.
+    for _ in 0..64 {
+        match rotate_arrow_once(expr) {
+            (next, true) => expr = next,
+            (next, false) => return next,
         }
-        _ => false,
+    }
+    expr
+}
+
+/// Normalize an arbitrary expression so that any `Arrow` nodes inside it are
+/// re-balanced. Non-Arrow expressions are returned unchanged.
+fn normalize_arrow_subtree(expr: &sqlast::Expr) -> sqlast::Expr {
+    match expr {
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        } => rebalance_arrow_tree(left, right),
+        _ => expr.clone(),
     }
 }
 
-fn lambda_expr_is_param(expr: &sqlast::Expr, param_name: &str) -> bool {
-    match expr {
-        sqlast::Expr::Identifier(ident) => ident.value.eq_ignore_ascii_case(param_name),
-        sqlast::Expr::Nested(inner) => lambda_expr_is_param(inner, param_name),
-        _ => false,
+fn rotate_arrow_once(expr: sqlast::Expr) -> (sqlast::Expr, bool) {
+    let sqlast::Expr::BinaryOp {
+        left,
+        op: sqlast::BinaryOperator::Arrow,
+        right,
+    } = expr
+    else {
+        return (expr, false);
+    };
+    // Rule 1: push Arrow inside RHS.
+    if let sqlast::Expr::BinaryOp {
+        left: rhs_left,
+        op: rhs_op,
+        right: rhs_right,
+    } = *right
+    {
+        if op_is_below_arrow(&rhs_op) {
+            let new_left = sqlast::Expr::BinaryOp {
+                left,
+                op: sqlast::BinaryOperator::Arrow,
+                right: rhs_left,
+            };
+            return (
+                sqlast::Expr::BinaryOp {
+                    left: Box::new(new_left),
+                    op: rhs_op,
+                    right: rhs_right,
+                },
+                true,
+            );
+        }
+        // Restore right since we destructured it.
+        let restored_right = sqlast::Expr::BinaryOp {
+            left: rhs_left,
+            op: rhs_op,
+            right: rhs_right,
+        };
+        // Now try rule 2 on LHS.
+        if let sqlast::Expr::BinaryOp {
+            left: lhs_left,
+            op: lhs_op,
+            right: lhs_right,
+        } = *left
+        {
+            if op_is_below_arrow(&lhs_op) {
+                let new_right = sqlast::Expr::BinaryOp {
+                    left: lhs_right,
+                    op: sqlast::BinaryOperator::Arrow,
+                    right: Box::new(restored_right),
+                };
+                return (
+                    sqlast::Expr::BinaryOp {
+                        left: lhs_left,
+                        op: lhs_op,
+                        right: Box::new(new_right),
+                    },
+                    true,
+                );
+            }
+            // Reconstruct LHS for the no-op return.
+            let restored_left = sqlast::Expr::BinaryOp {
+                left: lhs_left,
+                op: lhs_op,
+                right: lhs_right,
+            };
+            return (
+                sqlast::Expr::BinaryOp {
+                    left: Box::new(restored_left),
+                    op: sqlast::BinaryOperator::Arrow,
+                    right: Box::new(restored_right),
+                },
+                false,
+            );
+        }
+        return (
+            sqlast::Expr::BinaryOp {
+                left,
+                op: sqlast::BinaryOperator::Arrow,
+                right: Box::new(restored_right),
+            },
+            false,
+        );
     }
+    // Right wasn't a BinaryOp. Try rule 2 on LHS only.
+    if let sqlast::Expr::BinaryOp {
+        left: lhs_left,
+        op: lhs_op,
+        right: lhs_right,
+    } = *left
+    {
+        if op_is_below_arrow(&lhs_op) {
+            let new_right = sqlast::Expr::BinaryOp {
+                left: lhs_right,
+                op: sqlast::BinaryOperator::Arrow,
+                right,
+            };
+            return (
+                sqlast::Expr::BinaryOp {
+                    left: lhs_left,
+                    op: lhs_op,
+                    right: Box::new(new_right),
+                },
+                true,
+            );
+        }
+        let restored_left = sqlast::Expr::BinaryOp {
+            left: lhs_left,
+            op: lhs_op,
+            right: lhs_right,
+        };
+        return (
+            sqlast::Expr::BinaryOp {
+                left: Box::new(restored_left),
+                op: sqlast::BinaryOperator::Arrow,
+                right,
+            },
+            false,
+        );
+    }
+    (
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        },
+        false,
+    )
+}
+
+/// Operators whose default sqlparser precedence is below where the JSON
+/// `->` operator should bind. Arithmetic operators (`+`, `*`, ...) sit
+/// ABOVE arrow in user mental model and are excluded so that lambdas like
+/// `x -> length(x) + v2` keep the natural body grouping.
+fn op_is_below_arrow(op: &sqlast::BinaryOperator) -> bool {
+    matches!(
+        op,
+        sqlast::BinaryOperator::Eq
+            | sqlast::BinaryOperator::NotEq
+            | sqlast::BinaryOperator::Lt
+            | sqlast::BinaryOperator::LtEq
+            | sqlast::BinaryOperator::Gt
+            | sqlast::BinaryOperator::GtEq
+            | sqlast::BinaryOperator::Spaceship
+            | sqlast::BinaryOperator::And
+            | sqlast::BinaryOperator::Or
+    )
+}
+
+/// Parse a lambda with one or more parameters. The StarRocks dialect leaves
+/// `supports_lambda_functions` off because enabling sqlparser's generic
+/// lambda parsing also intercepts the `->` JSON-path operator. As a result,
+/// the parser produces these AST shapes:
+///   - `Expr::Lambda { params, body }` (rare; only when sqlparser emits it
+///     directly, e.g. for some keyword-style inputs)
+///   - `Expr::BinaryOp { op: Arrow }` for `x -> body`, `(x) -> body`, or
+///     `(x, y, z) -> body`. The left operand carries the parameter list as
+///     either an `Identifier`, a `Nested(Identifier)`, or a `Tuple(...)`.
+fn parse_multi_param_lambda(expr: &sqlast::Expr) -> Option<(Vec<String>, &sqlast::Expr)> {
+    match expr {
+        sqlast::Expr::Lambda(lambda) => Some((
+            lambda
+                .params
+                .iter()
+                .map(|p| p.value.to_lowercase())
+                .collect(),
+            lambda.body.as_ref(),
+        )),
+        sqlast::Expr::BinaryOp {
+            left,
+            op: sqlast::BinaryOperator::Arrow,
+            right,
+        } => parse_lambda_param_list(left).map(|params| (params, right.as_ref())),
+        sqlast::Expr::Nested(inner) => parse_multi_param_lambda(inner),
+        _ => None,
+    }
+}
+
+fn parse_lambda_param_list(expr: &sqlast::Expr) -> Option<Vec<String>> {
+    match expr {
+        sqlast::Expr::Identifier(ident) => Some(vec![ident.value.to_lowercase()]),
+        sqlast::Expr::Nested(inner) => parse_lambda_param_list(inner),
+        // sqlparser emits `Tuple(idents)` for `(x, y, z)` when lambda support
+        // is disabled. We accept it as a multi-parameter lambda header here.
+        sqlast::Expr::Tuple(items) => {
+            let mut params = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    sqlast::Expr::Identifier(ident) => params.push(ident.value.to_lowercase()),
+                    sqlast::Expr::Nested(inner) => {
+                        let mut inner_params = parse_lambda_param_list(inner)?;
+                        params.append(&mut inner_params);
+                    }
+                    _ => return None,
+                }
+            }
+            Some(params)
+        }
+        _ => None,
+    }
+}
+
+/// Returns true if `name` is a higher-order function (variadic by lambda arity)
+/// and the first argument is a parseable lambda. Used to dispatch into the
+/// dedicated analyzer that binds lambda parameters before walking the body.
+fn is_higher_order_function_with_lambda(name: &str, arg_exprs: &[&sqlast::Expr]) -> bool {
+    matches!(name, "array_map" | "transform" | "array_filter" | "filter")
+        && arg_exprs
+            .first()
+            .and_then(|expr| parse_multi_param_lambda(expr))
+            .is_some()
 }

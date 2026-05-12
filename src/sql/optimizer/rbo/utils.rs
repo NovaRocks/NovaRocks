@@ -133,6 +133,21 @@ fn collect_column_refs_inner<'a>(expr: &'a TypedExpr, out: &mut Vec<&'a str>) {
         // SubqueryPlaceholder should be rewritten before reaching here,
         // but handle gracefully as a no-op.
         ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::Lambda { params, body } => {
+            // Walk the body but drop lambda-bound parameter names so we do not
+            // misclassify them as outer-column references. Outer column refs
+            // remain visible (`x + v2` inside `array_map(x -> x + v2, ...)`
+            // must still report `v2`).
+            let mut nested: Vec<&'a str> = Vec::new();
+            collect_column_refs_inner(body, &mut nested);
+            let bound: std::collections::HashSet<String> =
+                params.iter().map(|p| p.to_lowercase()).collect();
+            for name in nested {
+                if !bound.contains(&name.to_lowercase()) {
+                    out.push(name);
+                }
+            }
+        }
     }
 }
 
@@ -345,6 +360,18 @@ fn collect_qualified_column_refs_inner(expr: &TypedExpr, out: &mut Vec<Qualified
             }
         }
         ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::Lambda { params, body } => {
+            // Filter out lambda-bound parameter names from collected refs.
+            let mut nested = Vec::new();
+            collect_qualified_column_refs_inner(body, &mut nested);
+            let bound: std::collections::HashSet<String> =
+                params.iter().map(|p| p.to_lowercase()).collect();
+            for (qual, name) in nested {
+                if qual.is_some() || !bound.contains(&name) {
+                    out.push((qual, name));
+                }
+            }
+        }
     }
 }
 

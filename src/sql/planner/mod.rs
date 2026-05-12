@@ -1063,6 +1063,10 @@ fn collect_aggregates(expr: &TypedExpr, out: &mut Vec<AggregateCall>) {
         }
         // SubqueryPlaceholder should be rewritten before reaching the planner
         ExprKind::SubqueryPlaceholder { .. } => {}
+        // Higher-order function body is evaluated per element by array_map etc.;
+        // any aggregate inside a lambda body would be a semantic error, so
+        // walking is unnecessary. Treat as a leaf for aggregate collection.
+        ExprKind::Lambda { .. } => {}
     }
 }
 

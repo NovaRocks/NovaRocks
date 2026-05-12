@@ -959,6 +959,10 @@ fn format_expr_kind(kind: &ExprKind) -> String {
             format!("{name}({})", args_str.join(", "))
         }
         ExprKind::SubqueryPlaceholder { id, .. } => format!("<subquery_{id}>"),
+        ExprKind::Lambda { params, body } => match params.as_slice() {
+            [single] => format!("{} -> {}", single, format_expr(body)),
+            many => format!("({}) -> {}", many.join(", "), format_expr(body)),
+        },
     }
 }
 

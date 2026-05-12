@@ -122,6 +122,18 @@ fn walk_column_refs(expr: &TypedExpr, out: &mut HashSet<String>) {
             }
         }
         ExprKind::Literal(_) | ExprKind::SubqueryPlaceholder { .. } => {}
+        ExprKind::Lambda { params, body } => {
+            // Walk the body but drop lambda-bound parameter names from the
+            // collected outer refs.
+            let mut nested = HashSet::new();
+            walk_column_refs(body, &mut nested);
+            let bound: HashSet<String> = params.iter().map(|p| p.to_lowercase()).collect();
+            for name in nested {
+                if !bound.contains(&name) {
+                    out.insert(name);
+                }
+            }
+        }
     }
 }
 

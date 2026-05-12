@@ -446,10 +446,26 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             Some(DataType::List(item)) => item.data_type().clone(),
             _ => DataType::Null,
         },
+        // `array_map(lambda, arr_1, ...)`: the result is `Array<typeof(body)>`.
+        // The lambda is the first argument and its analyzer-supplied
+        // `data_type` is the body's return type.
+        "array_map" | "transform" => match arg_types.first() {
+            Some(body_type) => DataType::List(Arc::new(arrow::datatypes::Field::new(
+                "item",
+                body_type.clone(),
+                true,
+            ))),
+            None => DataType::Null,
+        },
+        // `array_filter(lambda, arr)`: filters elements of `arr`. The result
+        // type matches the input array (the second positional arg).
+        "array_filter" | "filter" => arg_types
+            .get(1)
+            .cloned()
+            .or_else(|| arg_types.first().cloned())
+            .unwrap_or(DataType::Null),
         "array_sort" | "array_sortby" | "array_reverse" | "array_slice" | "array_remove"
-        | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
-            arg_types.first().cloned().unwrap_or(DataType::Null)
-        }
+        | "array_flatten" | "array_concat" => arg_types.first().cloned().unwrap_or(DataType::Null),
         "array_repeat" => DataType::List(Arc::new(arrow::datatypes::Field::new(
             "item",
             arg_types.first().cloned().unwrap_or(DataType::Null),

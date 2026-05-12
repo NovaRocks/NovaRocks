@@ -155,8 +155,7 @@ fn body_requires_pipeline(body: &sqlparser::ast::SetExpr) -> bool {
 fn select_projection_requires_pipeline(select: &sqlparser::ast::Select) -> bool {
     use sqlparser::ast as sqlast;
     select.projection.iter().any(|item| match item {
-        sqlast::SelectItem::UnnamedExpr(expr)
-        | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
+        sqlast::SelectItem::UnnamedExpr(expr) | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
             sqlparser_expr_to_literal(expr).is_err()
         }
         // Wildcards have no expression to fold; if we ever see one without a
