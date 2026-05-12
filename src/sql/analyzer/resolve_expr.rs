@@ -199,10 +199,16 @@ impl<'a> super::AnalyzerContext<'a> {
                 list,
                 negated,
             } => {
+                use super::literal_coercion::coerce_literal_for_comparison;
                 let expr_typed = self.analyze_expr(in_expr, scope)?;
+                // StarRocks-aligned implicit literal coercion: when the IN
+                // expression is `column IN (lit, lit, ...)`, coerce each
+                // string literal to the column's type before emitting the
+                // InList. Mirrors the binary-op comparison coercion.
                 let mut list_typed = Vec::with_capacity(list.len());
                 for item in list {
-                    list_typed.push(self.analyze_expr(item, scope)?);
+                    let item_typed = self.analyze_expr(item, scope)?;
+                    list_typed.push(coerce_literal_for_comparison(&expr_typed, item_typed));
                 }
                 Ok(TypedExpr {
                     kind: ExprKind::InList {
@@ -222,13 +228,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 low,
                 high,
             } => {
+                use super::literal_coercion::coerce_literal_for_comparison;
                 let expr_typed = self.analyze_expr(between_expr, scope)?;
                 let low_typed = self.analyze_expr(low, scope)?;
                 let high_typed = self.analyze_expr(high, scope)?;
-                // Implicit cast: when comparing date/timestamp with string,
-                // cast the string to the date/timestamp type.
-                let low_typed = coerce_to_target_type(low_typed, &expr_typed.data_type);
-                let high_typed = coerce_to_target_type(high_typed, &expr_typed.data_type);
+                // StarRocks-aligned implicit literal coercion: for
+                // `column BETWEEN lit AND lit`, coerce each string literal
+                // to the column's type. The helper gates on the LHS being a
+                // column ref (same convention as binary-op comparisons), so
+                // `expr_typed BETWEEN ...` where the LHS is a non-column
+                // expression is left unchanged.
+                let low_typed = coerce_literal_for_comparison(&expr_typed, low_typed);
+                let high_typed = coerce_literal_for_comparison(&expr_typed, high_typed);
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),

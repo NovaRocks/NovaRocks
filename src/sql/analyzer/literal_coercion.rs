@@ -54,9 +54,16 @@ pub(crate) fn is_coercible_target(data_type: &DataType) -> bool {
 /// coercible target type, return `right` coerced to `left`'s type.
 /// Otherwise return `right` unchanged.
 ///
-/// Currently the only caller is `analyze_binary_op` for `=/!=/<...>=`. The
-/// IN-list and BETWEEN integrations are scheduled to land in M2.T2; update
-/// this comment when those callers are wired in.
+/// Current callers (all in `src/sql/analyzer/resolve_expr.rs`):
+/// - `analyze_binary_op` for `=`, `!=`, `<`, `<=`, `>`, `>=`, `<=>` — coerces
+///   each side against the other.
+/// - The IN-list arm of `analyze_expr` — coerces each list item against the
+///   `IN` expression.
+/// - The BETWEEN arm of `analyze_expr` — coerces both bounds against the
+///   `BETWEEN` expression.
+///
+/// In all cases the LHS gate (`is_column_ref`) means a non-column LHS short
+/// circuits and returns the right operand unchanged.
 pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) -> TypedExpr {
     if !is_column_ref(left) {
         return right;
