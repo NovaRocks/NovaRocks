@@ -22,6 +22,7 @@ pub(crate) struct IvmDeltaSourceInput<'a> {
     pub state: &'a Arc<StandaloneState>,
     pub current_database: &'a str,
     pub base_ref: &'a IcebergTableRef,
+    pub loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
 }
 
 pub(crate) fn build_delta_source_files(
@@ -30,19 +31,6 @@ pub(crate) fn build_delta_source_files(
 ) -> Result<IvmDeltaSourceFiles, String> {
     let previous_snapshot_id = batch.previous_snapshot_id;
     let current_snapshot_id = batch.current_snapshot_id;
-    let entry = {
-        let registry = input
-            .state
-            .iceberg_catalogs
-            .read()
-            .expect("iceberg registry read lock");
-        registry.get(&input.base_ref.catalog)?
-    };
-    let loaded = crate::connector::iceberg::catalog::load_table(
-        &entry,
-        &input.base_ref.namespace,
-        &input.base_ref.table,
-    )?;
 
     let mut files: Vec<IcebergFileForQuery> = batch
         .inserts
@@ -63,8 +51,8 @@ pub(crate) fn build_delta_source_files(
         || !batch.equality_deletes.is_empty()
         || !batch.deleted_data_files.is_empty();
     if needs_delete_scan {
-        let object_store_config = loaded.object_store_config.as_ref();
-        let factory = build_factory_for_table(&loaded.table, object_store_config)?;
+        let object_store_config = input.loaded.object_store_config.as_ref();
+        let factory = build_factory_for_table(&input.loaded.table, object_store_config)?;
         let size_lookup = |path: &str| -> Option<u64> {
             let _ = path;
             None
@@ -73,19 +61,19 @@ pub(crate) fn build_delta_source_files(
             crate::connector::iceberg::scan_deletes::scan_deletes_with_path_normalizer(
                 &batch.deletes,
                 &factory,
-                loaded.table.file_io(),
+                input.loaded.table.file_io(),
                 size_lookup,
                 |path| normalize_delete_projection_path(path, object_store_config),
             )
             .map_err(|e| e.to_string())?;
         deleted_rows.extend(scan_equality_delete_rows_for_table(
-            &loaded.table,
+            &input.loaded.table,
             &batch.equality_deletes,
             &factory,
             object_store_config,
         )?);
         deleted_rows.extend(scan_deleted_data_file_rows(
-            &loaded.table,
+            &input.loaded.table,
             &batch.deleted_data_files,
             object_store_config,
         )?);
@@ -127,11 +115,19 @@ pub(crate) fn execute_delta_source_query(
 
     let (catalog_name, namespace, table_name) =
         crate::engine::mv_flow::validate_incremental_mv_base_ref(&query, input.base_ref)?;
+    let entry = {
+        let registry = input
+            .state
+            .iceberg_catalogs
+            .read()
+            .expect("iceberg registry read lock");
+        registry.get(&catalog_name)?
+    };
     let table_def = build_iceberg_delta_table_def_with_files(
-        input.state,
-        &catalog_name,
+        &entry,
         &namespace,
         &table_name,
+        input.loaded.clone(),
         source_files.files,
     )?;
 

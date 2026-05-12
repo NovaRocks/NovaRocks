@@ -594,17 +594,43 @@ pub(crate) fn build_iceberg_table_def_with_files(
 }
 
 pub(crate) fn build_iceberg_delta_table_def_with_files(
-    state: &Arc<StandaloneState>,
-    catalog_name: &str,
+    entry: &crate::connector::iceberg::catalog::IcebergCatalogEntry,
     namespace: &str,
     table_name: &str,
+    loaded: crate::connector::iceberg::catalog::IcebergLoadedTable,
     data_files: Vec<IcebergFileForQuery>,
 ) -> Result<TableDef, String> {
     let change_ops = validate_delta_file_change_ops(&data_files)?;
-    let mut table_def =
-        build_iceberg_table_def_with_files(state, catalog_name, namespace, table_name, data_files)?;
+    let data_files = iceberg_files_for_query_to_stats(data_files);
+    let mut table_def = crate::connector::iceberg::catalog::build_iceberg_table_def_with_files(
+        entry, namespace, table_name, loaded, data_files,
+    )?;
     stamp_delta_table_def_change_ops(&mut table_def, &change_ops)?;
     Ok(table_def)
+}
+
+fn iceberg_files_for_query_to_stats(
+    data_files: Vec<IcebergFileForQuery>,
+) -> Vec<crate::connector::iceberg::catalog::registry::DataFileWithStats> {
+    data_files
+        .into_iter()
+        .map(
+            |file| crate::connector::iceberg::catalog::registry::DataFileWithStats {
+                path: file.path,
+                size: file.size,
+                record_count: file.record_count,
+                column_stats: None,
+                partition_spec_id: file.partition_spec_id,
+                partition_key: file.partition_key,
+                partition_values: None,
+                manifest_path: None,
+                partition_field_values: vec![],
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                delete_files: vec![],
+            },
+        )
+        .collect()
 }
 
 fn validate_delta_file_change_ops(data_files: &[IcebergFileForQuery]) -> Result<Vec<i8>, String> {
@@ -653,6 +679,7 @@ fn stamp_delta_table_def_change_ops(
         ));
     }
 
+    table_def.iceberg_row_lineage_metadata_columns.clear();
     let field = crate::exec::change_op::change_op_field();
     table_def
         .iceberg_row_lineage_metadata_columns
@@ -764,6 +791,73 @@ mod tests {
             panic!("expected s3 parquet storage");
         };
         assert_eq!(files[0].ivm_change_op, Some(1));
+    }
+
+    #[test]
+    fn delta_table_builder_suppresses_inherited_row_lineage_metadata() {
+        let mut table_def = TableDef {
+            name: "t".to_string(),
+            columns: vec![],
+            iceberg_row_lineage_metadata_columns: vec![
+                crate::sql::catalog::ColumnDef {
+                    name: "_file".to_string(),
+                    data_type: arrow::datatypes::DataType::Utf8,
+                    nullable: false,
+                    write_default: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "_pos".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "_row_id".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                },
+                crate::sql::catalog::ColumnDef {
+                    name: "_last_updated_sequence_number".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
+                    write_default: None,
+                },
+            ],
+            iceberg_table: None,
+            storage: TableStorage::S3ParquetFiles {
+                files: vec![crate::sql::catalog::S3FileInfo {
+                    path: "file:///tmp/data.parquet".to_string(),
+                    size: 10,
+                    row_count: Some(1),
+                    column_stats: None,
+                    partition_spec_id: None,
+                    partition_key: None,
+                    first_row_id: None,
+                    data_sequence_number: None,
+                    ivm_change_op: None,
+                    delete_files: vec![],
+                    manifest_path: None,
+                    partition_values: vec![],
+                }],
+                cloud_properties: Default::default(),
+            },
+        };
+
+        super::stamp_delta_table_def_change_ops(&mut table_def, &[-1]).expect("stamp");
+
+        assert_eq!(
+            table_def
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .map(|col| (col.name.as_str(), &col.data_type, col.nullable))
+                .collect::<Vec<_>>(),
+            vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
+        );
+        let TableStorage::S3ParquetFiles { files, .. } = &table_def.storage else {
+            panic!("expected s3 parquet storage");
+        };
+        assert_eq!(files[0].ivm_change_op, Some(-1));
     }
 
     #[test]

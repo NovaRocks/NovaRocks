@@ -256,9 +256,33 @@ pub(crate) fn refresh_mv(
                     state,
                     current_database: &db_name,
                     base_ref,
+                    loaded: &loaded,
                 },
                 batch,
             )?;
+            if source_files.previous_snapshot_id != previous_snapshot_id
+                || source_files.current_snapshot_id != current_snapshot_id
+            {
+                return Err(format!(
+                    "projection/filter MV incremental refresh delta source snapshot window mismatch: expected {} -> {}, got {} -> {}",
+                    previous_snapshot_id,
+                    current_snapshot_id,
+                    source_files.previous_snapshot_id,
+                    source_files.current_snapshot_id
+                ));
+            }
+            if source_files.files.is_empty() {
+                advance_mv_refresh_metadata_without_writes(
+                    metadata_store,
+                    runtime.table.table_id,
+                    base_ref,
+                    current_snapshot_id,
+                    &current_table_uuid,
+                    mv_row.last_refresh_rows.unwrap_or(0),
+                )?;
+                refresh_managed_catalog(state)?;
+                return Ok(StatementResult::Ok);
+            }
             let physical_select_sql =
                 projection_mv_physical_select_sql(&mv_row.select_sql, &mv_row.primary_key_columns)?;
             let tagged_select_sql = projection_select_with_change_op(&physical_select_sql)?;
@@ -267,6 +291,7 @@ pub(crate) fn refresh_mv(
                     state,
                     current_database: &db_name,
                     base_ref,
+                    loaded: &loaded,
                 },
                 &tagged_select_sql,
                 source_files,
@@ -345,6 +370,7 @@ pub(crate) fn refresh_mv(
                 previous_snapshot_id,
                 current_snapshot_id,
                 current_table_uuid: current_table_uuid.clone(),
+                loaded: &loaded,
             })
         },
     )
@@ -458,6 +484,7 @@ struct AggregateMvIncrementalRefreshContext<'a> {
     previous_snapshot_id: i64,
     current_snapshot_id: i64,
     current_table_uuid: String,
+    loaded: &'a crate::connector::iceberg::catalog::IcebergLoadedTable,
 }
 
 fn refresh_aggregate_mv_incremental(
@@ -493,6 +520,7 @@ fn refresh_aggregate_mv_incremental(
             state: ctx.state,
             current_database: ctx.database,
             base_ref: ctx.base_ref,
+            loaded: ctx.loaded,
         },
         ctx.change_batch,
     )?;
@@ -562,6 +590,7 @@ fn refresh_aggregate_mv_incremental(
             state: ctx.state,
             current_database: ctx.database,
             base_ref: ctx.base_ref,
+            loaded: ctx.loaded,
         },
         &signed_state_sql,
         source_files,
@@ -1818,6 +1847,77 @@ mod tests {
         assert_eq!(chunks[0].batch.num_columns(), 2);
         assert_eq!(op_value(&chunks[0]), MV_OP_DELETE);
         assert_eq!(op_value(&chunks[1]), MV_OP_UPSERT);
+    }
+
+    #[test]
+    fn projection_change_op_can_be_non_last_and_is_removed_before_mv_op() {
+        use arrow::array::{Int8Array, StringArray};
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    crate::exec::change_op::CHANGE_OP_COLUMN,
+                    DataType::Int8,
+                    false,
+                ),
+                Field::new("name", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![1, -1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b"])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let result = QueryResult {
+            columns: Vec::new(),
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let (chunks, row_delta) = tagged_projection_change_chunks(result).expect("chunks");
+
+        assert_eq!(row_delta, 0);
+        assert_eq!(chunks.len(), 2);
+        for chunk in chunks {
+            let names = chunk
+                .batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names, vec!["id", "name", MV_OP_COLUMN]);
+        }
+    }
+
+    #[test]
+    fn projection_change_op_rejects_null_value() {
+        use arrow::array::Int8Array;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    crate::exec::change_op::CHANGE_OP_COLUMN,
+                    DataType::Int8,
+                    true,
+                ),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![10, 20])) as ArrayRef,
+                Arc::new(Int8Array::from(vec![Some(1), None])) as ArrayRef,
+            ],
+        )
+        .expect("record batch");
+        let result = QueryResult {
+            columns: Vec::new(),
+            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+        };
+
+        let err = tagged_projection_change_chunks(result).expect_err("null op must fail");
+
+        assert!(err.contains("contains NULL"));
     }
 
     #[test]
