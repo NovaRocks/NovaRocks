@@ -306,10 +306,6 @@ pub(crate) fn create_mv(
     let created_at_ms = now_ms();
     state
         .mv_repo
-        .reserve_definition_id(txn.as_mut(), created.table.table_id)
-        .map_err(|e| format!("reserve materialized view definition id failed: {e}"))?;
-    state
-        .mv_repo
         .create_definition_with_id(
             txn.as_mut(),
             created.table.table_id,

@@ -1495,6 +1495,67 @@ fn mv_repository_reserves_explicit_ids_for_future_allocation()
 }
 
 #[test]
+fn mv_repository_shares_id_allocator_with_managed_tables() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let mv_repository = MvMetaRepository::default();
+    let managed_repository = ManagedLakeMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("create iceberg mv then managed mv")?;
+        let iceberg_mv = mv_repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id FROM ice.sales.orders".to_string(),
+                base_table_refs: vec!["ice.sales.orders".to_string()],
+                primary_key_columns: Vec::new(),
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("analytics".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                created_at_ms: 7,
+            },
+        )?;
+        assert_eq!(iceberg_mv.mv_id, 1);
+
+        let database = managed_repository.create_database(
+            txn.as_mut(),
+            CreateManagedDatabaseRequest {
+                name: "analytics".to_string(),
+            },
+        )?;
+        let managed_mv_table = managed_repository.create_table(
+            txn.as_mut(),
+            CreateManagedTableRequest {
+                db_id: database.db_id,
+                name: "managed_orders_mv".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                current_schema_id: 10,
+                state: ManagedTableState::Active,
+                kind: ManagedTableKind::MaterializedView,
+            },
+        )?;
+        assert_eq!(managed_mv_table.table_id, 2);
+
+        let managed_mv = mv_repository.create_definition_with_id(
+            txn.as_mut(),
+            managed_mv_table.table_id,
+            sample_mv_definition_request("SELECT id FROM ice.sales.lineitem"),
+        )?;
+        assert_eq!(managed_mv.mv_id, managed_mv_table.table_id);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(mv_repository.load_by_id(read.as_ref(), 1)?.is_some());
+    assert!(mv_repository.load_by_id(read.as_ref(), 2)?.is_some());
+
+    Ok(())
+}
+
+#[test]
 fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;

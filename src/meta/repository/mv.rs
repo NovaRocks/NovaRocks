@@ -130,7 +130,7 @@ impl MvMetaRepository {
         req: CreateMvDefinitionRequest,
     ) -> RepositoryResult<StoredMvDefinition> {
         loop {
-            let mv_id = txn.allocate_id(id_scopes::mv_id())?;
+            let mv_id = txn.allocate_id(id_scopes::managed_table())?;
             if self.load_by_id(txn, mv_id)?.is_none() {
                 return self.create_definition_with_id(txn, mv_id, req);
             }
@@ -153,7 +153,7 @@ impl MvMetaRepository {
             )));
         }
         loop {
-            let reserved = txn.allocate_id(id_scopes::mv_id())?;
+            let reserved = txn.allocate_id(id_scopes::managed_table())?;
             if reserved >= mv_id {
                 return Ok(());
             }

@@ -980,24 +980,9 @@ pub(crate) fn drop_iceberg_mv(
     stmt: &DropMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let target = resolve_drop_target(current_catalog, current_database, &stmt.name)?;
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "sqlite metadata store required".to_string())?;
-    let Some(_mv_row) = metadata_store.find_iceberg_mv_by_target(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?
-    else {
-        if stmt.if_exists {
-            return Ok(StatementResult::Ok);
-        }
-        return Err(format!(
-            "materialized view does not exist: {}.{}.{}",
-            target.catalog, target.namespace, target.table
-        ));
-    };
+    if !preflight_iceberg_mv_drop(state, &target, stmt.if_exists)? {
+        return Ok(StatementResult::Ok);
+    }
 
     let entry = {
         let catalogs = state
@@ -1011,23 +996,26 @@ pub(crate) fn drop_iceberg_mv(
         &target.namespace,
         &target.table,
     )?;
-    let dropped_relationship = metadata_store.drop_iceberg_mv_relationship(
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
-    if !dropped_relationship {
-        return Err(format!(
-            "materialized view relationship disappeared during drop: {}.{}.{}",
-            target.catalog, target.namespace, target.table
-        ));
+    if state.metadata_provider.is_some() {
+        crate::engine::delete_iceberg_table_if_needed(
+            state,
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )?;
+    } else if let Some(metadata_store) = state.metadata_store.as_ref() {
+        let dropped_relationship = metadata_store.drop_iceberg_mv_relationship(
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )?;
+        if !dropped_relationship {
+            return Err(format!(
+                "materialized view relationship disappeared during drop: {}.{}.{}",
+                target.catalog, target.namespace, target.table
+            ));
+        }
     }
-    crate::engine::delete_iceberg_table_if_needed(
-        state,
-        &target.catalog,
-        &target.namespace,
-        &target.table,
-    )?;
     crate::engine::query_prep::drop_registered_external_table(
         state,
         &target.namespace,
@@ -1041,6 +1029,61 @@ pub(crate) fn drop_iceberg_mv(
         target.table
     );
     Ok(StatementResult::Ok)
+}
+
+fn preflight_iceberg_mv_drop(
+    state: &Arc<StandaloneState>,
+    target: &IcebergMvTarget,
+    if_exists: bool,
+) -> Result<bool, String> {
+    if let Some(provider) = state.metadata_provider.as_ref() {
+        let txn = provider
+            .begin_read()
+            .map_err(|e| format!("open iceberg mv drop preflight transaction failed: {e}"))?;
+        let Some(definition) = state
+            .mv_repo
+            .find_by_target(
+                txn.as_ref(),
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+            )
+            .map_err(|e| format!("load iceberg mv definition for drop failed: {e}"))?
+        else {
+            if if_exists {
+                return Ok(false);
+            }
+            return Err(format!(
+                "materialized view does not exist: {}.{}.{}",
+                target.catalog, target.namespace, target.table
+            ));
+        };
+        if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
+            return Err(format!(
+                "cannot drop materialized view {}.{}.{}: refresh in progress",
+                target.catalog, target.namespace, target.table
+            ));
+        }
+        return Ok(true);
+    }
+
+    let metadata_store = state
+        .metadata_store
+        .as_ref()
+        .ok_or_else(|| "sqlite metadata store required".to_string())?;
+    if metadata_store
+        .find_iceberg_mv_by_target(&target.catalog, &target.namespace, &target.table)?
+        .is_none()
+    {
+        if if_exists {
+            return Ok(false);
+        }
+        return Err(format!(
+            "materialized view does not exist: {}.{}.{}",
+            target.catalog, target.namespace, target.table
+        ));
+    }
+    Ok(true)
 }
 
 fn resolve_drop_target(
@@ -1441,6 +1484,62 @@ mod tests {
         );
         let catalog = env.state.catalog.read().expect("standalone catalog");
         assert!(catalog.get("analytics", "mv_orders").is_err());
+    }
+
+    #[test]
+    fn drop_iceberg_mv_rejects_active_refresh_before_external_drop() {
+        let env = open_test_state_with_iceberg_catalog("ice", "analytics");
+        create_base_table(&env.state, "ice", "sales", "orders");
+        create_mv_only(&env.state, Some("ice"), &env.current_db, "mv_orders");
+
+        let mv_id = {
+            let provider = env
+                .state
+                .metadata_provider
+                .as_ref()
+                .expect("metadata provider");
+            let read = provider.begin_read().expect("open read txn");
+            env.state
+                .mv_repo
+                .find_by_target(read.as_ref(), "ice", "analytics", "mv_orders")
+                .expect("find mv target")
+                .expect("mv definition")
+                .mv_id
+        };
+        {
+            let provider = env
+                .state
+                .metadata_provider
+                .as_ref()
+                .expect("metadata provider");
+            let mut txn = provider
+                .begin_write("begin active mv refresh")
+                .expect("write");
+            env.state
+                .mv_repo
+                .begin_refresh_intent(txn.as_mut(), mv_id, std::collections::BTreeMap::new())
+                .expect("begin refresh");
+            txn.commit().expect("commit refresh intent");
+        }
+
+        let stmt = parse_drop_mv("DROP MATERIALIZED VIEW mv_orders");
+        let err = drop_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
+            .expect_err("active refresh should block drop before external table drop");
+        assert!(err.contains("refresh in progress"), "err={err}");
+
+        let entry = {
+            let catalogs = env.state.iceberg_catalogs.read().expect("iceberg catalogs");
+            catalogs.get("ice").expect("catalog")
+        };
+        crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
+            .expect("target table should remain after rejected drop");
+        let store = env.state.metadata_store.as_ref().expect("metadata store");
+        assert!(
+            store
+                .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
+                .expect("lookup")
+                .is_some()
+        );
     }
 
     #[test]
