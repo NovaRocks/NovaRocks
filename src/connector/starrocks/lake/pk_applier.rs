@@ -151,6 +151,49 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
     }
 
     let mut changed_deletes: HashMap<u32, RoaringBitmap> = HashMap::new();
+
+    // Apply the new rowset's rows to the visible index BEFORE the op_write
+    // deletes. A Mixed-routing batch (UPSERT then DELETE on the same key)
+    // is split by the writer into `upsert_batch` (in op_write.rowset) and
+    // `delete_key_batch` (in op_write.dels); to preserve the user-intended
+    // ordering where a same-batch DELETE shadows the just-inserted UPSERT,
+    // the new rowset's rows must enter visible_index first, so the DELETE
+    // can find them and record a delvec bit on the new rowset's own segment.
+    if let (Some(new_rowset), Some(rowset_id)) = (&maybe_new_rowset, rowset_id_for_append)
+        && new_rowset.num_rows.unwrap_or(0) > 0
+    {
+        let new_segment_keys = scan_rowset_primary_key_rows(
+            new_rowset,
+            rowset_id,
+            tablet_schema,
+            tablet_root_path,
+            s3_config,
+            &key_output_schema,
+        )?;
+        for segment in &new_segment_keys {
+            for (row_idx, key) in segment.keys.iter().enumerate() {
+                let row_id = u32::try_from(row_idx).map_err(|_| {
+                    format!(
+                        "row id overflow while applying primary key rowset: segment_id={}, row_index={}",
+                        segment.segment_id, row_idx
+                    )
+                })?;
+                if let Some(old_ref) = visible_index.insert(
+                    key.clone(),
+                    SegmentRowRef {
+                        segment_id: segment.segment_id,
+                        row_id,
+                    },
+                ) {
+                    changed_deletes
+                        .entry(old_ref.segment_id)
+                        .or_default()
+                        .insert(old_ref.row_id);
+                }
+            }
+        }
+    }
+
     if !op_write.dels.is_empty() {
         let delete_keys =
             load_delete_keys_from_op_write_files(op_write, tablet_root_path, &key_output_schema)?;
@@ -187,41 +230,6 @@ pub(crate) fn apply_primary_key_write_log_to_metadata(
                 delete_misses,
                 changed_deletes.len()
             );
-        }
-    }
-
-    if let (Some(new_rowset), Some(rowset_id)) = (&maybe_new_rowset, rowset_id_for_append)
-        && new_rowset.num_rows.unwrap_or(0) > 0
-    {
-        let new_segment_keys = scan_rowset_primary_key_rows(
-            new_rowset,
-            rowset_id,
-            tablet_schema,
-            tablet_root_path,
-            s3_config,
-            &key_output_schema,
-        )?;
-        for segment in &new_segment_keys {
-            for (row_idx, key) in segment.keys.iter().enumerate() {
-                let row_id = u32::try_from(row_idx).map_err(|_| {
-                    format!(
-                        "row id overflow while applying primary key rowset: segment_id={}, row_index={}",
-                        segment.segment_id, row_idx
-                    )
-                })?;
-                if let Some(old_ref) = visible_index.insert(
-                    key.clone(),
-                    SegmentRowRef {
-                        segment_id: segment.segment_id,
-                        row_id,
-                    },
-                ) {
-                    changed_deletes
-                        .entry(old_ref.segment_id)
-                        .or_default()
-                        .insert(old_ref.row_id);
-                }
-            }
         }
     }
 
@@ -1502,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_key_publish_applies_same_txn_delete_before_upsert_for_same_key() {
+    fn primary_key_publish_same_txn_delete_retracts_same_key_upsert_and_prior_row() {
         let tmp = tempdir().expect("create tempdir");
         let root_path = tmp.path().to_string_lossy().to_string();
         let data_dir = join_tablet_path(&root_path, DATA_DIR).expect("data dir");
@@ -1655,15 +1663,22 @@ mod tests {
         )
         .expect("apply pk write");
 
+        // Same-txn UPSERT + DELETE for the same key: the apply order is
+        // upsert-first / delete-second (see the matching comment in
+        // `apply_primary_key_write_log_to_metadata`). The new rowset's
+        // upsert displaces the prior visible reference (so the OLD
+        // segment gets the prior row marked deleted), and the DELETE
+        // then retracts the just-inserted upsert (so the NEW segment
+        // also gets its row marked deleted). The end state is "the key
+        // is gone", consistent with how a single Mixed user batch
+        // `[UPSERT k, DELETE k]` is supposed to settle.
         let old_delvec =
             load_segment_delvec_bitmap(&metadata, &root_path, 100).expect("old delvec");
         assert!(old_delvec.contains(0));
         assert!(old_delvec.contains(1));
         let new_delvec =
             load_segment_delvec_bitmap(&metadata, &root_path, 200).expect("new delvec");
-        assert!(
-            new_delvec.is_empty(),
-            "same-txn deletes must not retract rows inserted later in the same write"
-        );
+        assert!(new_delvec.contains(0));
+        assert!(new_delvec.contains(1));
     }
 }

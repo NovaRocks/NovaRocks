@@ -976,9 +976,18 @@ fn estimate_insert_source_stats(
     insert_columns: &[String],
     source: &InsertSource,
 ) -> Result<Option<Vec<ColumnStatRow>>, String> {
+    // Stats estimation is only meaningful for tables registered in the
+    // in-memory local catalog (managed-lake tables register themselves on
+    // CREATE; iceberg external tables register themselves at query-prep
+    // time per SELECT). For INSERTs that target an iceberg table without
+    // any prior SELECT, the local catalog has no entry — silently skip
+    // stats estimation in that case rather than aborting the INSERT.
     let table = {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
-        catalog.get(&key.db, &key.table)?
+        match catalog.get(&key.db, &key.table) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        }
     };
     let target_columns = table.columns;
     let row_count = estimated_source_row_count(source);
@@ -1220,9 +1229,19 @@ fn add_analyze_status(
 }
 
 fn ensure_normal_usage(state: &Arc<StandaloneState>, key: &TableKey) -> Result<(), String> {
+    // Column-usage tracking is only meaningful for tables registered in the
+    // in-memory local catalog (managed-lake tables register on CREATE;
+    // iceberg external tables register at query-prep time). For SELECTs
+    // against iceberg tables that haven't been seen yet — e.g. the very
+    // first SELECT after CREATE TABLE — observe_query runs before
+    // register_external_tables_for_query, so the local catalog has no
+    // entry. Silently skip column-usage tracking in that case.
     let table = {
         let catalog = state.catalog.read().expect("standalone catalog read lock");
-        catalog.get(&key.db, &key.table)?
+        match catalog.get(&key.db, &key.table) {
+            Ok(table) => table,
+            Err(_) => return Ok(()),
+        }
     };
     let mut stats = state
         .statistics
