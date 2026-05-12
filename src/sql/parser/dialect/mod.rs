@@ -53,6 +53,14 @@ impl sqlparser::dialect::Dialect for StarRocksDialect {
     fn supports_window_function_null_treatment_arg(&self) -> bool {
         true
     }
+
+    /// StarRocks follows MySQL string-literal semantics, where backslash is an
+    /// escape character: `'\\'` → a single backslash, `'\n'` → newline, etc.
+    /// Without this, sqlparser preserves backslashes verbatim and INSERTs such
+    /// as `'e\\f'` end up storing 4 bytes instead of 3.
+    fn supports_string_literal_backslash_escape(&self) -> bool {
+        true
+    }
 }
 
 /// Peek at a token by offset and check if it matches a word (case-insensitive).
@@ -242,7 +250,169 @@ pub(crate) fn normalize_for_raw_parse(sql: &str) -> Result<String, String> {
     let sql = rewrite_iceberg_metadata_suffix(&sql)?;
     let sql = rewrite_overwrite_partitions(&sql)?;
     let sql = rewrite_inline_null_treatment(&sql);
+    let sql = strip_join_hints(&sql);
     Ok(rewrite_create_table_nested_generic_closers(&sql))
+}
+
+/// Strip StarRocks-style join hints written as `JOIN [broadcast]`,
+/// `JOIN[shuffle]`, `LEFT JOIN [skew|t1.c(1,2,3)]`, etc.
+///
+/// Standalone NovaRocks has no notion of broadcast/shuffle/bucket/colocate
+/// dispatch and no skew hint optimizer, so these hints carry no semantics for
+/// the engine. sqlparser does not recognize `[...]` after JOIN at all, so
+/// leaving them in produces "Expected: identifier, found: [" or
+/// "Expected: joined table, ..." parse errors. Stripping them lets the rest
+/// of the JOIN clause parse normally.
+///
+/// Detection rule: any `JOIN` keyword at a word boundary, followed by
+/// optional ASCII whitespace and an opening `[`. We scan to the matching `]`
+/// (allowing nested brackets defensively) and drop the bracketed range,
+/// emitting a single space in its place.
+fn strip_join_hints(sql: &str) -> String {
+    if !sql.contains('[') {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len());
+    let mut idx = 0usize;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut backtick = false;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        // Pass UTF-8 multi-byte sequences through verbatim.
+        if byte >= 0x80 {
+            let len = utf8_sequence_len(byte);
+            let end = (idx + len).min(bytes.len());
+            output.push_str(&sql[idx..end]);
+            idx = end;
+            continue;
+        }
+
+        if single_quote {
+            if byte == b'\'' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                single_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if double_quote {
+            if byte == b'"' && bytes.get(idx.wrapping_sub(1)).copied() != Some(b'\\') {
+                double_quote = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        if backtick {
+            if byte == b'`' {
+                backtick = false;
+            }
+            output.push(byte as char);
+            idx += 1;
+            continue;
+        }
+        match byte {
+            b'\'' => {
+                single_quote = true;
+                output.push('\'');
+                idx += 1;
+                continue;
+            }
+            b'"' => {
+                double_quote = true;
+                output.push('"');
+                idx += 1;
+                continue;
+            }
+            b'`' => {
+                backtick = true;
+                output.push('`');
+                idx += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // Line comment: emit through end of line.
+        if byte == b'-' && bytes.get(idx + 1) == Some(&b'-') {
+            while idx < bytes.len() && bytes[idx] != b'\n' {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            continue;
+        }
+        // Block comment: emit through closing `*/`.
+        if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+            output.push_str("/*");
+            idx += 2;
+            while idx + 1 < bytes.len() && !(bytes[idx] == b'*' && bytes[idx + 1] == b'/') {
+                if bytes[idx] >= 0x80 {
+                    let len = utf8_sequence_len(bytes[idx]);
+                    let end = (idx + len).min(bytes.len());
+                    output.push_str(&sql[idx..end]);
+                    idx = end;
+                } else {
+                    output.push(bytes[idx] as char);
+                    idx += 1;
+                }
+            }
+            if idx + 1 < bytes.len() {
+                output.push_str("*/");
+                idx += 2;
+            }
+            continue;
+        }
+
+        if starts_with_keyword(bytes, idx, "join")
+            && !is_identifier_byte(bytes.get(idx.wrapping_sub(1)).copied())
+            && !is_identifier_byte(bytes.get(idx + "join".len()).copied())
+        {
+            // Emit JOIN keyword verbatim, then look for an optional `[...]` hint.
+            let join_end = idx + "join".len();
+            output.push_str(&sql[idx..join_end]);
+            let after_ws = skip_ascii_whitespace(bytes, join_end);
+            if bytes.get(after_ws) == Some(&b'[') {
+                output.push(' ');
+                let mut p = after_ws + 1;
+                let mut depth = 1usize;
+                while p < bytes.len() {
+                    match bytes[p] {
+                        b'[' => depth += 1,
+                        b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                p += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    p += 1;
+                }
+                idx = p;
+                continue;
+            }
+            // No hint — preserve any whitespace we already saw.
+            output.push_str(&sql[join_end..after_ws]);
+            idx = after_ws;
+            continue;
+        }
+
+        output.push(byte as char);
+        idx += 1;
+    }
+    output
 }
 
 /// Move `IGNORE NULLS` / `RESPECT NULLS` from before a comma to the end of

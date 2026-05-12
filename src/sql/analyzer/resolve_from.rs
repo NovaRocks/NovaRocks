@@ -61,8 +61,12 @@ impl<'a> super::AnalyzerContext<'a> {
                             data_type: dt,
                             nullable,
                         };
-                        // USING produces a single equality on the same unqualified column
-                        // Both sides resolve through the merged scope
+                        // The eq is intentionally unqualified on both sides.
+                        // The codegen compiles each operand against the
+                        // matching child's scope (left operand → left child,
+                        // right operand → right child), so the resolution
+                        // there produces the cross-side `left.col = right.col`
+                        // physical equality, not a tautology.
                         conds.push(TypedExpr {
                             data_type: DataType::Boolean,
                             nullable: false,
@@ -97,7 +101,57 @@ impl<'a> super::AnalyzerContext<'a> {
                 Some(sqlast::JoinConstraint::None) | None => None,
             };
 
-            current_scope.merge(&right_scope);
+            // SEMI / ANTI joins only expose the surviving side's columns to
+            // the outer scope — the other side is consumed by the join itself
+            // and is not visible to WHERE/SELECT or downstream joins. The ON
+            // condition above was already analyzed against the merged scope.
+            // This must match `fragment_builder::merged_scope` so that
+            // analyzer-emitted projections agree with codegen scope.
+            match join_kind {
+                JoinKind::LeftSemi | JoinKind::LeftAnti => {
+                    // outer scope = left scope unchanged. USING-clause
+                    // reordering still applies: even though right columns
+                    // are not exposed, the surviving USING columns should
+                    // sit at the front of the SELECT * column list.
+                    if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                        let using_names: Vec<String> =
+                            using_cols_ast.iter().map(|c| c.to_string()).collect();
+                        current_scope.apply_using_layout(&using_names, false);
+                    }
+                }
+                JoinKind::RightSemi | JoinKind::RightAnti => {
+                    current_scope = right_scope;
+                    if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                        let using_names: Vec<String> =
+                            using_cols_ast.iter().map(|c| c.to_string()).collect();
+                        current_scope.apply_using_layout(&using_names, false);
+                    }
+                }
+                _ => {
+                    current_scope.merge(&right_scope);
+                    // USING-clause column hiding: each USING column appears
+                    // once in SELECT * and at the head of the column list.
+                    // For RIGHT joins the preserved side is right, so the
+                    // surviving column resolves to the right binding.
+                    //
+                    // We intentionally skip the dedup / reorder transform
+                    // for FULL OUTER USING: the BE-side FULL OUTER hash
+                    // join exhibits a null-pad bug on the surviving side
+                    // when the projection list goes through a COALESCE
+                    // alias path. Leaving both sides exposed for FULL
+                    // OUTER USING preserves the baseline behaviour (each
+                    // join column appears twice in SELECT *) until the
+                    // BE bug is addressed.
+                    if matches!(join_kind, JoinKind::FullOuter) {
+                        // no-op
+                    } else if let Some(sqlast::JoinConstraint::Using(using_cols_ast)) = constraint {
+                        let using_names: Vec<String> =
+                            using_cols_ast.iter().map(|c| c.to_string()).collect();
+                        let prefer_right = matches!(join_kind, JoinKind::RightOuter);
+                        current_scope.apply_using_layout(&using_names, prefer_right);
+                    }
+                }
+            }
             current_rel = Relation::Join(Box::new(JoinRelation {
                 left: current_rel,
                 right: right_rel,

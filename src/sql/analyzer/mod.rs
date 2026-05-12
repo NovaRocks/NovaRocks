@@ -1361,13 +1361,22 @@ impl<'a> AnalyzerContext<'a> {
                 }
                 sqlast::SelectItem::Wildcard(_) => {
                     for (qualifier, col_name, data_type, nullable) in scope.iter_columns() {
-                        let typed = TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                qualifier: qualifier.clone(),
-                                column: col_name.clone(),
-                            },
-                            data_type: data_type.clone(),
-                            nullable: *nullable,
+                        // FULL OUTER USING columns are exposed as a synthetic
+                        // `COALESCE(left.col, right.col)` expression. SELECT *
+                        // expansion must use that expression instead of the
+                        // raw left-side ColumnRef so right-only rows show
+                        // the right-side value.
+                        let typed = if let Some(expr) = scope.computed_column_for(col_name) {
+                            expr.clone()
+                        } else {
+                            TypedExpr {
+                                kind: ExprKind::ColumnRef {
+                                    qualifier: qualifier.clone(),
+                                    column: col_name.clone(),
+                                },
+                                data_type: data_type.clone(),
+                                nullable: *nullable,
+                            }
                         };
                         output_columns.push(OutputColumn {
                             name: col_name.clone(),
@@ -1660,9 +1669,25 @@ impl<'a> AnalyzerContext<'a> {
                                 }
                                 _ => continue,
                             };
-                            if ast_expr_text == ob_text
-                                || ir_item.output_name.to_lowercase() == ob_text
-                            {
+                            // Exact AST match means the user wrote the
+                            // same expression as the SELECT item: reuse the
+                            // analyzed expression directly so qualifiers and
+                            // sub-expressions are preserved. Without this,
+                            // `SELECT a.c, b.c ... ORDER BY a.c, b.c` would
+                            // produce two unqualified `c` refs and collapse
+                            // both keys onto the first projection slot.
+                            if ast_expr_text == ob_text {
+                                matched_alias = Some(ir_item.expr.clone());
+                                break;
+                            }
+                            // Output-name (alias) match: the user is
+                            // referring to the projection's *output* column
+                            // by name. Use a synthetic unqualified ColumnRef
+                            // so post-aggregation contexts (GROUP BY,
+                            // HAVING) can resolve the alias against the
+                            // projection-output scope rather than against
+                            // the pre-aggregation FROM-scope.
+                            if ir_item.output_name.to_lowercase() == ob_text {
                                 matched_alias = Some(TypedExpr {
                                     kind: ExprKind::ColumnRef {
                                         qualifier: None,

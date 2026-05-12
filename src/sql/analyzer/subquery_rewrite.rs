@@ -264,7 +264,8 @@ impl<'a> AnalyzerContext<'a> {
 
         let lhs_typed = self.analyze_expr(in_expr_ast, scope)?;
 
-        let resolved_sub = self.analyze_query_in_scope(&sq_info.subquery, scope)?;
+        let (resolved_sub, inner_scope) =
+            self.analyze_query_in_scope_with_inner(&sq_info.subquery, scope)?;
 
         if resolved_sub.output_columns.is_empty() {
             return Err("IN subquery must produce at least one column".into());
@@ -280,6 +281,30 @@ impl<'a> AnalyzerContext<'a> {
             .map(|f| is_placeholder_inside_or(f, sq_info.id))
             .unwrap_or(false);
 
+        // Correlated subquery: if any predicate in the subquery WHERE references
+        // an outer-scope column (e.g. `WHERE t.x = outer.y`), the wrapped
+        // `Relation::Subquery` would isolate the inner SELECT and the outer
+        // reference would no longer resolve. We must lift the subquery's WHERE
+        // up into the SEMI/ANTI join's ON condition — same pattern as EXISTS.
+        let is_correlated = match resolved_sub.body {
+            QueryBody::Select(ref sel) => sel
+                .filter
+                .as_ref()
+                .map(|f| !extract_correlation_predicates(f, &inner_scope, scope).is_empty())
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        if is_correlated && !inside_or {
+            return self.rewrite_correlated_in_subquery(
+                select,
+                lhs_typed,
+                resolved_sub,
+                sq_info.id,
+                negated,
+            );
+        }
+
         let sq_alias = format!("__sq_{}", sq_info.id);
 
         // For IN subquery eq condition: use the subquery alias as qualifier
@@ -292,25 +317,38 @@ impl<'a> AnalyzerContext<'a> {
         let rhs_needs_qualifier =
             lhs_col_name.as_deref() == Some(&sub_output_col.name.to_lowercase());
 
-        let eq_cond = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
-            kind: ExprKind::BinaryOp {
-                left: Box::new(lhs_typed),
-                op: BinOp::Eq,
-                right: Box::new(TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        qualifier: if rhs_needs_qualifier {
-                            Some(sq_alias.clone())
-                        } else {
-                            None
-                        },
-                        column: sub_output_col.name.clone(),
-                    },
-                    data_type: sub_output_col.data_type.clone(),
-                    nullable: sub_output_col.nullable,
-                }),
+        let rhs_ref = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                qualifier: if rhs_needs_qualifier {
+                    Some(sq_alias.clone())
+                } else {
+                    None
+                },
+                column: sub_output_col.name.clone(),
             },
+            data_type: sub_output_col.data_type.clone(),
+            nullable: sub_output_col.nullable,
+        };
+
+        // For IN (semi), plain equality is correct: NULLs never satisfy `=`
+        // so they're already excluded. For NOT IN (anti) we need null-aware
+        // equality so the LEFT ANTI join matches whenever either operand is
+        // NULL, matching SQL's "x NOT IN S returns UNKNOWN if x is NULL or
+        // S contains NULL" semantics. The previous approach of filtering
+        // NULLs out of the subquery was wrong: it produced TRUE for left
+        // rows that should yield UNKNOWN.
+        let eq_cond = if negated && !inside_or {
+            null_aware_eq(lhs_typed, rhs_ref)
+        } else {
+            TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(lhs_typed),
+                    op: BinOp::Eq,
+                    right: Box::new(rhs_ref),
+                },
+            }
         };
 
         scope.add_column(
@@ -395,51 +433,14 @@ impl<'a> AnalyzerContext<'a> {
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &is_null_expr);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &is_null_expr);
         } else {
-            // Standard case: SEMI / ANTI JOIN
+            // Standard case: SEMI / ANTI JOIN. NULL handling for NOT IN is
+            // baked into `eq_cond` above (null-aware equality), so the
+            // subquery is wrapped as-is.
             let join_type = if negated {
                 JoinKind::LeftAnti
             } else {
                 JoinKind::LeftSemi
             };
-
-            // For NOT IN (negated=true), add IS NOT NULL filter on the
-            // subquery output column. In standard SQL, NOT IN returns
-            // UNKNOWN when any subquery value is NULL, effectively
-            // filtering out all rows. By excluding NULLs from the
-            // subquery result, LEFT ANTI JOIN produces correct NOT IN
-            // semantics (matching StarRocks FE's null-aware anti join).
-            let mut resolved_sub = resolved_sub;
-            if negated {
-                let not_null_pred = TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::IsNull {
-                        expr: Box::new(TypedExpr {
-                            kind: ExprKind::ColumnRef {
-                                qualifier: None,
-                                column: sub_output_col.name.clone(),
-                            },
-                            data_type: sub_output_col.data_type.clone(),
-                            nullable: sub_output_col.nullable,
-                        }),
-                        negated: true, // IS NOT NULL
-                    },
-                };
-                if let QueryBody::Select(ref mut sel) = resolved_sub.body {
-                    sel.filter = Some(match sel.filter.take() {
-                        Some(existing) => TypedExpr {
-                            data_type: DataType::Boolean,
-                            nullable: false,
-                            kind: ExprKind::BinaryOp {
-                                left: Box::new(existing),
-                                op: BinOp::And,
-                                right: Box::new(not_null_pred),
-                            },
-                        },
-                        None => not_null_pred,
-                    });
-                }
-            }
 
             let output_columns = resolved_sub.output_columns.clone();
             let sub_rel = Relation::Subquery {
@@ -457,6 +458,86 @@ impl<'a> AnalyzerContext<'a> {
             Self::remove_placeholder_from_filter(&mut select.having, sq_info.id);
         }
 
+        Ok(())
+    }
+
+    /// Rewrite a correlated `IN (...)` / `NOT IN (...)` subquery into a
+    /// SEMI / ANTI JOIN, hoisting the subquery's WHERE clause (which contains
+    /// the correlation predicates) up into the JOIN ON condition.
+    ///
+    /// Unlike the uncorrelated path, we cannot leave the subquery wrapped as
+    /// a `Relation::Subquery` because outer-scope column references in the
+    /// inner WHERE would no longer resolve. Instead, we mirror the EXISTS
+    /// path: take the subquery's FROM as the join's right side, and place
+    /// the subquery's full WHERE plus the eq_cond into the join condition.
+    fn rewrite_correlated_in_subquery(
+        &self,
+        select: &mut ResolvedSelect,
+        lhs_typed: TypedExpr,
+        resolved_sub: ResolvedQuery,
+        sq_id: usize,
+        negated: bool,
+    ) -> Result<(), String> {
+        let (sub_from, sub_filter, sub_projection) = match resolved_sub.body {
+            QueryBody::Select(sel) => (sel.from, sel.filter, sel.projection),
+            _ => return Err("correlated IN subquery must be a SELECT".into()),
+        };
+
+        if sub_projection.is_empty() {
+            return Err("IN subquery must produce a column".into());
+        }
+        let rhs_expr = sub_projection[0].expr.clone();
+        let sub_rel = sub_from.ok_or("IN subquery must have a FROM clause".to_string())?;
+
+        // For correlated NOT IN, use null-aware equality so the LEFT ANTI join
+        // matches whenever either side is NULL within the correlation group —
+        // the row is then excluded from the outer result, matching SQL's
+        // "x NOT IN S returns UNKNOWN when x is NULL or S contains NULL"
+        // semantics. For IN (semi), a plain equality is correct: NULLs never
+        // satisfy IN and the row stays out.
+        let key_cond = if negated {
+            null_aware_eq(lhs_typed, rhs_expr)
+        } else {
+            TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(lhs_typed),
+                    op: BinOp::Eq,
+                    right: Box::new(rhs_expr),
+                },
+            }
+        };
+
+        let join_cond = match sub_filter {
+            Some(f) => Some(TypedExpr {
+                data_type: DataType::Boolean,
+                nullable: false,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(key_cond),
+                    op: BinOp::And,
+                    right: Box::new(f),
+                },
+            }),
+            None => Some(key_cond),
+        };
+
+        let join_type = if negated {
+            JoinKind::LeftAnti
+        } else {
+            JoinKind::LeftSemi
+        };
+
+        let current_from = take_from_or_synthesize_single_row(&mut select.from);
+        select.from = Some(Relation::Join(Box::new(JoinRelation {
+            left: current_from,
+            right: sub_rel,
+            join_type,
+            condition: join_cond,
+        })));
+
+        Self::remove_placeholder_from_filter(&mut select.filter, sq_id);
+        Self::remove_placeholder_from_filter(&mut select.having, sq_id);
         Ok(())
     }
 
@@ -617,16 +698,6 @@ impl<'a> AnalyzerContext<'a> {
     // Subquery analysis helpers
     // -----------------------------------------------------------------------
 
-    /// Analyze a query in the context of an outer scope, allowing correlated references.
-    fn analyze_query_in_scope(
-        &self,
-        query: &sqlparser::ast::Query,
-        outer_scope: &AnalyzerScope,
-    ) -> Result<ResolvedQuery, String> {
-        let (resolved, _inner_scope) =
-            self.analyze_query_in_scope_with_inner(query, outer_scope)?;
-        Ok(resolved)
-    }
 
     /// Analyze a query with outer scope, also returning the inner scope.
     fn analyze_query_in_scope_with_inner(
@@ -1043,6 +1114,58 @@ pub(super) struct CorrelationPred {
 /// A correlation predicate is an equality (or comparison) where one side
 /// references an outer-scope column (resolves in outer_scope but NOT in inner_scope)
 /// and the other side references an inner-scope column.
+/// Build `(lhs = rhs) OR (lhs IS NULL) OR (rhs IS NULL)`. Used as the join
+/// key condition for null-aware `NOT IN`: the LEFT ANTI JOIN must match
+/// (and thus exclude the outer row) whenever either operand is NULL,
+/// because SQL's NOT IN returns UNKNOWN under those conditions.
+fn null_aware_eq(lhs: TypedExpr, rhs: TypedExpr) -> TypedExpr {
+    let lhs_clone = lhs.clone();
+    let rhs_clone = rhs.clone();
+    let eq = TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::BinaryOp {
+            left: Box::new(lhs),
+            op: BinOp::Eq,
+            right: Box::new(rhs),
+        },
+    };
+    let lhs_is_null = TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::IsNull {
+            expr: Box::new(lhs_clone),
+            negated: false,
+        },
+    };
+    let rhs_is_null = TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::IsNull {
+            expr: Box::new(rhs_clone),
+            negated: false,
+        },
+    };
+    let or1 = TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::BinaryOp {
+            left: Box::new(eq),
+            op: BinOp::Or,
+            right: Box::new(lhs_is_null),
+        },
+    };
+    TypedExpr {
+        data_type: DataType::Boolean,
+        nullable: false,
+        kind: ExprKind::BinaryOp {
+            left: Box::new(or1),
+            op: BinOp::Or,
+            right: Box::new(rhs_is_null),
+        },
+    }
+}
+
 fn extract_correlation_predicates(
     expr: &TypedExpr,
     inner_scope: &AnalyzerScope,

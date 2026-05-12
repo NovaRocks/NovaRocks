@@ -45,10 +45,22 @@ impl<'a> super::AnalyzerContext<'a> {
                         nullable: param.nullable,
                     });
                 }
+                // If the scope has a synthetic expression for this name
+                // (FULL OUTER USING column → COALESCE), return that
+                // expression directly so the merged value is computed.
+                if let Some(expr) = scope.computed_column_for(&ident.value) {
+                    return Ok(expr.clone());
+                }
                 let (data_type, nullable) = scope.resolve(None, &ident.value)?;
+                // If the scope tracks a canonical qualifier for this column
+                // name (USING-join shared column resolves to one specific
+                // side), normalize the ColumnRef to be qualified so the
+                // codegen layer picks the correct physical slot — its
+                // own ExprScope merge keeps left-first by default.
+                let qualifier = scope.canonical_qualifier_for(&ident.value);
                 Ok(TypedExpr {
                     kind: ExprKind::ColumnRef {
-                        qualifier: None,
+                        qualifier,
                         column: ident.value.to_lowercase(),
                     },
                     data_type,

@@ -43,8 +43,8 @@ pub(crate) fn lower_nestloop_join_node(
     }
 
     let mut it = children.into_iter();
-    let left = it.next().expect("left");
-    let right = it.next().expect("right");
+    let left_in = it.next().expect("left");
+    let right_in = it.next().expect("right");
     let Some(nl) = node.nestloop_join_node.as_ref() else {
         return Err("NESTLOOP_JOIN_NODE missing nestloop_join_node payload".to_string());
     };
@@ -52,18 +52,36 @@ pub(crate) fn lower_nestloop_join_node(
     let op = nl
         .join_op
         .ok_or_else(|| "NESTLOOP_JOIN_NODE missing join_op".to_string())?;
-    let join_type = match op {
-        plan_nodes::TJoinOp::INNER_JOIN => NestedLoopJoinType::Inner,
-        plan_nodes::TJoinOp::CROSS_JOIN => NestedLoopJoinType::Cross,
-        plan_nodes::TJoinOp::LEFT_OUTER_JOIN => NestedLoopJoinType::LeftOuter,
-        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN => NestedLoopJoinType::RightOuter,
-        plan_nodes::TJoinOp::FULL_OUTER_JOIN => NestedLoopJoinType::FullOuter,
-        plan_nodes::TJoinOp::LEFT_SEMI_JOIN => NestedLoopJoinType::LeftSemi,
-        plan_nodes::TJoinOp::LEFT_ANTI_JOIN => NestedLoopJoinType::LeftAnti,
-        plan_nodes::TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => NestedLoopJoinType::NullAwareLeftAnti,
+    // RIGHT_SEMI / RIGHT_ANTI for nestloop are implemented by swapping the
+    // probe and build inputs and reusing the LEFT_SEMI / LEFT_ANTI code path.
+    // Semantics match: "output rows from side X that have any matching row on
+    // side Y" is symmetric — flipping which side is probe gives the same
+    // result. The join conjuncts are lowered against the merged layout below
+    // and naturally pick up the swapped column ordering.
+    let (left, right, join_type) = match op {
+        plan_nodes::TJoinOp::INNER_JOIN => (left_in, right_in, NestedLoopJoinType::Inner),
+        plan_nodes::TJoinOp::CROSS_JOIN => (left_in, right_in, NestedLoopJoinType::Cross),
+        plan_nodes::TJoinOp::LEFT_OUTER_JOIN => (left_in, right_in, NestedLoopJoinType::LeftOuter),
+        plan_nodes::TJoinOp::RIGHT_OUTER_JOIN => {
+            (left_in, right_in, NestedLoopJoinType::RightOuter)
+        }
+        plan_nodes::TJoinOp::FULL_OUTER_JOIN => {
+            (left_in, right_in, NestedLoopJoinType::FullOuter)
+        }
+        plan_nodes::TJoinOp::LEFT_SEMI_JOIN => (left_in, right_in, NestedLoopJoinType::LeftSemi),
+        plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (left_in, right_in, NestedLoopJoinType::LeftAnti),
+        plan_nodes::TJoinOp::RIGHT_SEMI_JOIN => {
+            (right_in, left_in, NestedLoopJoinType::LeftSemi)
+        }
+        plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
+            (right_in, left_in, NestedLoopJoinType::LeftAnti)
+        }
+        plan_nodes::TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
+            (left_in, right_in, NestedLoopJoinType::NullAwareLeftAnti)
+        }
         other => {
             return Err(format!(
-                "unsupported NESTLOOP_JOIN_NODE join_op={other:?} (supported: INNER/CROSS/LEFT_OUTER/RIGHT_OUTER/FULL_OUTER/LEFT_SEMI/LEFT_ANTI/NULL_AWARE_LEFT_ANTI)"
+                "unsupported NESTLOOP_JOIN_NODE join_op={other:?} (supported: INNER/CROSS/LEFT_OUTER/RIGHT_OUTER/FULL_OUTER/LEFT_SEMI/RIGHT_SEMI/LEFT_ANTI/RIGHT_ANTI/NULL_AWARE_LEFT_ANTI)"
             ));
         }
     };
