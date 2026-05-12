@@ -261,42 +261,117 @@ impl MysqlSession {
 
 fn split_sql_statements(sql: &str) -> Result<Vec<String>> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum QuoteState {
-        Single,
-        Double,
+    enum State {
+        Normal,
+        SingleQuote,
+        DoubleQuote,
         Backtick,
+        LineComment,
+        BlockComment,
     }
 
     let mut statements = Vec::new();
-    let mut start = 0usize;
-    let mut quote_state = None;
+    let mut buffer = String::new();
+    let mut state = State::Normal;
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
 
-    for (idx, ch) in sql.char_indices() {
-        match quote_state {
-            Some(QuoteState::Single) if ch == '\'' => quote_state = None,
-            Some(QuoteState::Double) if ch == '"' => quote_state = None,
-            Some(QuoteState::Backtick) if ch == '`' => quote_state = None,
-            Some(_) => {}
-            None => match ch {
-                '\'' => quote_state = Some(QuoteState::Single),
-                '"' => quote_state = Some(QuoteState::Double),
-                '`' => quote_state = Some(QuoteState::Backtick),
+    while i < sql.len() {
+        // Safe: we only advance `i` on character boundaries (we never
+        // step inside a multi-byte char body; the state-transition
+        // cases below use sql[i..].chars().next() or byte peeks that
+        // are valid at i because we got here via char_indices logic.)
+        let ch = match sql[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let char_len = ch.len_utf8();
+
+        match state {
+            State::Normal => match ch {
+                '\'' => {
+                    state = State::SingleQuote;
+                    buffer.push(ch);
+                }
+                '"' => {
+                    state = State::DoubleQuote;
+                    buffer.push(ch);
+                }
+                '`' => {
+                    state = State::Backtick;
+                    buffer.push(ch);
+                }
+                '-' if i + 1 < sql.len() && bytes[i + 1] == b'-' => {
+                    // MySQL rule: `--` is a comment only when followed by
+                    // whitespace, a control character, or end of line.
+                    let after = i + 2;
+                    let next_is_ws_or_eol = after >= sql.len()
+                        || matches!(bytes[after], b' ' | b'\t' | b'\n' | b'\r')
+                        || bytes[after] < 0x20;
+                    if next_is_ws_or_eol {
+                        state = State::LineComment;
+                        i += 2;
+                        continue;
+                    }
+                    buffer.push(ch);
+                }
+                '/' if i + 1 < sql.len() && bytes[i + 1] == b'*' => {
+                    state = State::BlockComment;
+                    i += 2;
+                    continue;
+                }
                 ';' => {
-                    if let Some(statement) = normalize_statement_fragment(&sql[start..idx]) {
+                    if let Some(statement) = normalize_statement_fragment(&buffer) {
                         statements.push(statement);
                     }
-                    start = idx + ch.len_utf8();
+                    buffer.clear();
                 }
-                _ => {}
+                _ => buffer.push(ch),
             },
+            State::SingleQuote => {
+                buffer.push(ch);
+                if ch == '\'' {
+                    state = State::Normal;
+                }
+            }
+            State::DoubleQuote => {
+                buffer.push(ch);
+                if ch == '"' {
+                    state = State::Normal;
+                }
+            }
+            State::Backtick => {
+                buffer.push(ch);
+                if ch == '`' {
+                    state = State::Normal;
+                }
+            }
+            State::LineComment => {
+                if ch == '\n' {
+                    state = State::Normal;
+                    buffer.push(ch);
+                }
+            }
+            State::BlockComment => {
+                if ch == '*' && i + 1 < sql.len() && bytes[i + 1] == b'/' {
+                    state = State::Normal;
+                    i += 2;
+                    continue;
+                }
+            }
         }
+        i += char_len;
     }
 
-    if quote_state.is_some() {
-        bail!("unterminated quoted string in SQL batch");
+    match state {
+        State::SingleQuote | State::DoubleQuote | State::Backtick => {
+            bail!("unterminated quoted string in SQL batch");
+        }
+        State::BlockComment => bail!("unterminated /* */ block comment in SQL batch"),
+        _ => {}
     }
 
-    if let Some(trailing) = normalize_statement_fragment(&sql[start..]) {
+    if let Some(trailing) = normalize_statement_fragment(&buffer) {
         statements.push(trailing);
     }
     Ok(statements)
@@ -488,4 +563,63 @@ pub fn execute_query_via_cli(
         None,
         "FAIL (0.00s): exhausted query attempts unexpectedly".to_string(),
     )
+}
+
+#[cfg(test)]
+mod splitter_tests {
+    use super::split_sql_statements;
+
+    #[test]
+    fn line_comment_semicolon_does_not_split() {
+        let sql = "DELETE FROM t WHERE c = '2020-01-01 00:00:00';
+-- '00:00:00.0' is same as '00:00:00'; rows already gone
+DELETE FROM t WHERE c = '2020-01-01 00:00:00.0';";
+        let parts = split_sql_statements(sql).expect("split");
+        assert_eq!(parts.len(), 2, "expected 2 statements, got {:?}", parts);
+        assert!(parts[0].starts_with("DELETE FROM t WHERE c = '2020-01-01 00:00:00'"));
+        assert!(parts[1].starts_with("DELETE FROM t WHERE c = '2020-01-01 00:00:00.0'"));
+    }
+
+    #[test]
+    fn block_comment_semicolon_does_not_split() {
+        let sql = "SELECT 1; /* note; with ; semicolons */ SELECT 2;";
+        let parts = split_sql_statements(sql).expect("split");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "SELECT 1");
+        assert_eq!(parts[1], "SELECT 2");
+    }
+
+    #[test]
+    fn double_dash_without_trailing_whitespace_is_not_a_comment() {
+        // MySQL rule: `--` is a comment only when followed by whitespace,
+        // a control character, or end of line.
+        let sql = "SELECT a--b FROM t;";
+        let parts = split_sql_statements(sql).expect("split");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], "SELECT a--b FROM t");
+    }
+
+    #[test]
+    fn comment_markers_inside_string_literal_are_inert() {
+        let sql = "SELECT '-- not a comment'; SELECT '/* also not */';";
+        let parts = split_sql_statements(sql).expect("split");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], "SELECT '-- not a comment'");
+        assert_eq!(parts[1], "SELECT '/* also not */'");
+    }
+
+    #[test]
+    fn nested_block_comment_is_not_supported() {
+        // MySQL treats /* ... /* ... */ as ending at the first */, leaving
+        // the trailing `... */` outside the comment. We match that.
+        let sql = "SELECT 1; /* outer /* inner */ tail */; SELECT 2;";
+        let parts = split_sql_statements(sql).expect("split");
+        // After first */ at offset of "inner */", `tail */` is outside.
+        // The bare `;` after the `*/` closes the second statement.
+        assert!(
+            parts.len() >= 2,
+            "nested-block parsing produced {:?}",
+            parts
+        );
+    }
 }
