@@ -19,6 +19,7 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Decimal128Array, PrimitiveArray, StringArray,
 };
+use arrow::compute::kernels::cast;
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type,
     Int32Type, Int64Type, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
@@ -28,16 +29,50 @@ use std::sync::Arc;
 
 pub fn eval_nullif(
     arena: &ExprArena,
-    _expr: ExprId,
+    expr: ExprId,
     left: ExprId,
     right: ExprId,
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let left_arr = arena.eval(left, chunk)?;
     let right_arr = arena.eval(right, chunk)?;
-    if left_arr.data_type() != right_arr.data_type() {
-        return Err("nullif requires arguments with same type".to_string());
-    }
+
+    // Auto-coerce both sides to a common type so callers may pass mixed
+    // integer widths, decimal precisions, etc. Mirrors ifnull/coalesce.
+    let target_type = match arena.data_type(expr) {
+        Some(t) if !matches!(t, DataType::Null) => t.clone(),
+        _ => {
+            if matches!(left_arr.data_type(), DataType::Null) {
+                right_arr.data_type().clone()
+            } else {
+                left_arr.data_type().clone()
+            }
+        }
+    };
+    let left_arr = if left_arr.data_type() != &target_type {
+        cast(left_arr.as_ref(), &target_type).map_err(|e| {
+            format!(
+                "nullif failed to cast left {:?} -> {:?}: {}",
+                left_arr.data_type(),
+                target_type,
+                e
+            )
+        })?
+    } else {
+        left_arr
+    };
+    let right_arr = if right_arr.data_type() != &target_type {
+        cast(right_arr.as_ref(), &target_type).map_err(|e| {
+            format!(
+                "nullif failed to cast right {:?} -> {:?}: {}",
+                right_arr.data_type(),
+                target_type,
+                e
+            )
+        })?
+    } else {
+        right_arr
+    };
     match left_arr.data_type() {
         DataType::Int64 => eval_nullif_primitive::<Int64Type>(&left_arr, &right_arr),
         DataType::Int32 => eval_nullif_primitive::<Int32Type>(&left_arr, &right_arr),

@@ -335,12 +335,16 @@ impl<'a> AnalyzerContext<'a> {
             let (rel, scope) = self.analyze_from(&select.from[0])?;
             (Some(rel), scope)
         } else {
-            // Multiple comma-separated FROM items → implicit CROSS JOIN
+            // Multiple comma-separated FROM items → implicit CROSS JOIN.
+            // Subsequent entries see the accumulated left-hand scope so
+            // table-valued functions (e.g. `unnest(t.arr)`) can reference
+            // earlier sibling columns (StarRocks implicit-lateral semantics).
             let mut iter = select.from.iter();
             let first = iter.next().unwrap();
             let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
             for twj in iter {
-                let (right_rel, right_scope) = self.analyze_from(twj)?;
+                let (right_rel, right_scope) =
+                    self.analyze_from_with_outer(twj, Some(&current_scope))?;
                 current_scope.merge(&right_scope);
                 current_rel = Relation::Join(Box::new(JoinRelation {
                     left: current_rel,

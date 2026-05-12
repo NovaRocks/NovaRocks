@@ -1399,9 +1399,19 @@ fn relation_table_key(
     current_database: &str,
     visible_ctes: &BTreeSet<String>,
 ) -> Result<Option<(TableKey, Option<String>)>, String> {
-    let sqlast::TableFactor::Table { name, alias, .. } = relation else {
+    let sqlast::TableFactor::Table {
+        name, alias, args, ..
+    } = relation
+    else {
         return Ok(None);
     };
+    // Table-valued function calls (e.g. `unnest(...)`, `generate_series(...)`)
+    // are parsed as TableFactor::Table with a populated args list because the
+    // sqlparser dialect we use does not recognize UNNEST/TABLE as keywords.
+    // They are not real catalog tables, so stats collection must skip them.
+    if args.is_some() {
+        return Ok(None);
+    }
     let parts = object_name_parts(name);
     if let [table] = parts.as_slice()
         && visible_ctes.contains(&normalize_name(table)?)

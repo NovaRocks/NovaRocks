@@ -751,7 +751,12 @@ impl<'a> AnalyzerContext<'a> {
             let first = iter.next().unwrap();
             let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
             for twj in iter {
-                let (right_rel, right_scope) = self.analyze_from(twj)?;
+                // Comma-separated FROM entries are implicit CROSS JOINs.
+                // Expose the accumulated left-hand scope so that table-valued
+                // functions like `unnest(...)` can reference earlier sibling
+                // columns (StarRocks implicit-lateral semantics).
+                let (right_rel, right_scope) =
+                    self.analyze_from_with_outer(twj, Some(&current_scope))?;
                 current_scope.merge(&right_scope);
                 current_rel = Relation::Join(Box::new(JoinRelation {
                     left: current_rel,

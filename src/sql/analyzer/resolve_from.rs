@@ -13,7 +13,20 @@ impl<'a> super::AnalyzerContext<'a> {
         &self,
         twj: &sqlast::TableWithJoins,
     ) -> Result<(Relation, AnalyzerScope), String> {
-        let (mut current_rel, mut current_scope) = self.analyze_table_factor(&twj.relation)?;
+        self.analyze_from_with_outer(twj, None)
+    }
+
+    /// Analyze a FROM clause with an optional outer scope visible to the
+    /// first relation. Used when comma-separated FROM entries (each parsed as
+    /// its own TableWithJoins) need to see earlier sibling scopes so that
+    /// table-valued functions like `unnest(...)` can reference outer columns.
+    pub(super) fn analyze_from_with_outer(
+        &self,
+        twj: &sqlast::TableWithJoins,
+        outer_scope: Option<&AnalyzerScope>,
+    ) -> Result<(Relation, AnalyzerScope), String> {
+        let (mut current_rel, mut current_scope) =
+            self.analyze_table_factor_with_outer(&twj.relation, outer_scope)?;
 
         for join in &twj.joins {
             let (right_rel, right_scope) =
@@ -96,21 +109,15 @@ impl<'a> super::AnalyzerContext<'a> {
         Ok((current_rel, current_scope))
     }
 
-    /// Analyze a single table factor (table reference, subquery, etc.).
-    pub(super) fn analyze_table_factor(
-        &self,
-        factor: &sqlast::TableFactor,
-    ) -> Result<(Relation, AnalyzerScope), String> {
-        self.analyze_table_factor_with_outer(factor, None)
-    }
-
     fn analyze_table_factor_with_outer(
         &self,
         factor: &sqlast::TableFactor,
         outer_scope: Option<&AnalyzerScope>,
     ) -> Result<(Relation, AnalyzerScope), String> {
         match factor {
-            sqlast::TableFactor::Table { name, alias, .. } => {
+            sqlast::TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let parts: Vec<String> = name
                     .0
                     .iter()
@@ -119,6 +126,38 @@ impl<'a> super::AnalyzerContext<'a> {
                         _ => None,
                     })
                     .collect();
+
+                // StarRocks dialect allows `FROM t, unnest(arr_expr) [AS u(cols)]`
+                // as an implicit lateral table function. The standard sqlparser
+                // dialect we use does not recognize UNNEST as a keyword, so the
+                // parser produces a TableFactor::Table with name "unnest" and a
+                // populated args list. Detect that here and route to the unnest
+                // analyzer using the outer scope from the preceding comma-join.
+                if parts.len() == 1
+                    && parts[0].eq_ignore_ascii_case("unnest")
+                    && let Some(table_function_args) = args
+                {
+                    let array_exprs = table_function_args
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(expr)) => {
+                                Ok(expr.clone())
+                            }
+                            other => Err(format!(
+                                "UNNEST expects positional expression args, got {other}"
+                            )),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return self.analyze_unnest(
+                        &array_exprs,
+                        alias.as_ref(),
+                        false,
+                        None,
+                        false,
+                        outer_scope,
+                    );
+                }
 
                 // Iceberg metadata-table dispatch: parser pre-rewrites
                 // `<tbl>$<metatype>` into `<tbl>.__nr_meta_<metatype>__` so we

@@ -1774,6 +1774,11 @@ fn infer_scalar_function_return_type(
         | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
             Ok(arg_types.first().cloned().unwrap_or(DataType::Null))
         }
+        "array_repeat" => Ok(DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arg_types.first().cloned().unwrap_or(DataType::Null),
+            true,
+        )))),
         "array_generate" => Ok(infer_array_generate_return_type(arg_types)),
         "__array_element_at" => match arg_types.first() {
             Some(DataType::List(item)) => Ok(item.data_type().clone()),

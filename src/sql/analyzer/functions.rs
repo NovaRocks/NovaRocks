@@ -450,6 +450,11 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "array_filter" | "array_map" | "array_flatten" | "array_concat" => {
             arg_types.first().cloned().unwrap_or(DataType::Null)
         }
+        "array_repeat" => DataType::List(Arc::new(arrow::datatypes::Field::new(
+            "item",
+            arg_types.first().cloned().unwrap_or(DataType::Null),
+            true,
+        ))),
         "array_generate" => infer_array_generate_return_type(arg_types),
         "map_keys" => match arg_types.first() {
             Some(DataType::Map(entries, _)) => match entries.data_type() {
