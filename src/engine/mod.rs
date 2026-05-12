@@ -752,7 +752,6 @@ impl StandaloneSession {
                 {
                     return Ok(StatementResult::Query(result));
                 }
-                self::statistics::observe_query(&self.inner, query, current_database)?;
                 if let Some(result) =
                     self::information_schema::try_query_materialized_views(&self.inner, query)?
                 {
@@ -805,6 +804,7 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
@@ -854,6 +854,7 @@ impl StandaloneSession {
                         .read()
                         .expect("standalone catalog read lock")
                         .clone();
+                    self::statistics::observe_query(&self.inner, &rewritten, current_database)?;
                     let result = execute_query(
                         &rewritten,
                         &catalog_snapshot,
@@ -873,6 +874,7 @@ impl StandaloneSession {
                     .read()
                     .expect("standalone catalog read lock")
                     .clone();
+                self::statistics::observe_query(&self.inner, query, current_database)?;
                 let result = execute_query(
                     query,
                     &catalog_snapshot,
@@ -1804,7 +1806,9 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
         .expect("standalone iceberg catalog read lock");
     for namespace in &namespaces {
         let entry = guard.get(&namespace.catalog)?;
-        create_iceberg_namespace(&entry, &namespace.namespace)?;
+        if !iceberg_namespace_exists(&entry, &namespace.namespace)? {
+            create_iceberg_namespace(&entry, &namespace.namespace)?;
+        }
     }
     for table in &tables {
         let entry = guard.get(&table.catalog)?;
@@ -4242,6 +4246,13 @@ enable_path_style_access = true
             .execute_in_database("create table ice.db1.tbl (id int, name string)", "default")
             .expect("create iceberg table");
         assert!(matches!(create_table, StatementResult::Ok));
+
+        let empty_result = session
+            .query("select id, name from ice.db1.tbl limit 0")
+            .expect("query empty iceberg table");
+        assert_eq!(empty_result.row_count(), 0);
+        assert_eq!(empty_result.columns[0].name, "id");
+        assert_eq!(empty_result.columns[1].name, "name");
 
         let insert = session
             .execute_in_database(
