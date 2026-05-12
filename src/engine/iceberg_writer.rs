@@ -43,8 +43,8 @@ use crate::connector::iceberg::commit::{
     run_iceberg_commit,
 };
 use crate::connector::starrocks::managed::mv_refresh::query_result_to_chunks;
-use crate::connector::starrocks::managed::mv_refresh_iceberg::write_chunks_as_iceberg_data_files;
 use crate::engine::backend_resolver::TargetBackend;
+use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use crate::engine::{StandaloneState, StatementResult};
 use crate::exec::chunk::Chunk;
 use crate::sql::parser::ast::InsertSource;

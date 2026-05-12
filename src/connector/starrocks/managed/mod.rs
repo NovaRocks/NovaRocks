@@ -19,7 +19,6 @@ pub(crate) mod mv_agg_state;
 pub(crate) mod mv_apply_policy;
 pub(crate) mod mv_ddl;
 pub(crate) mod mv_refresh;
-pub(crate) mod mv_refresh_iceberg;
 pub(crate) mod mv_refresh_strategy;
 pub(crate) mod mv_shape;
 pub(crate) mod store;

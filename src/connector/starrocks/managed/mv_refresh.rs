@@ -56,12 +56,11 @@ pub(crate) fn refresh_mv(
     let _refresh_guard = acquire_mv_refresh_lock()?;
 
     if current_catalog.is_some() {
-        let target =
-            crate::connector::starrocks::managed::mv_refresh_iceberg::resolve_refresh_target(
-                current_catalog,
-                current_database,
-                &stmt.name,
-            )?;
+        let target = crate::engine::mv::iceberg_refresh::resolve_refresh_target(
+            current_catalog,
+            current_database,
+            &stmt.name,
+        )?;
         if load_mv_definition_by_target(state, &target.catalog, &target.namespace, &target.table)?
             .as_ref()
             .is_some_and(|mv| {
@@ -70,7 +69,7 @@ pub(crate) fn refresh_mv(
             })
         {
             drop(_refresh_guard);
-            return crate::connector::starrocks::managed::mv_refresh_iceberg::refresh_iceberg_mv(
+            return crate::engine::mv::iceberg_refresh::refresh_iceberg_mv(
                 state,
                 current_catalog,
                 current_database,

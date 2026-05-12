@@ -140,7 +140,7 @@ pub(crate) fn create_mv(
     }
 
     if storage_engine == ManagedMvStorageEngine::Iceberg {
-        return crate::connector::starrocks::managed::mv_refresh_iceberg::create_iceberg_mv(
+        return crate::engine::mv::iceberg_refresh::create_iceberg_mv(
             state,
             current_catalog,
             current_database,
@@ -770,7 +770,7 @@ pub(crate) fn drop_mv(
                     .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
             })
         {
-            return crate::connector::starrocks::managed::mv_refresh_iceberg::drop_iceberg_mv(
+            return crate::engine::mv::iceberg_refresh::drop_iceberg_mv(
                 state,
                 current_catalog,
                 current_database,

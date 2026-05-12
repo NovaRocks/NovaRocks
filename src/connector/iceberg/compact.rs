@@ -36,7 +36,6 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
 };
-use crate::connector::starrocks::managed::mv_refresh_iceberg::write_chunks_as_iceberg_data_files;
 use crate::connector::starrocks::managed::store::{
     IcebergOptimizeJobOutcome, IcebergOptimizeJobState, SqliteMetadataStore,
     StoredIcebergOptimizeJob,
@@ -47,6 +46,7 @@ use crate::engine::iceberg_writer::{
     build_abort_cleanup_for_catalog_entry, data_file_to_written_file, invalidate_iceberg_caches,
     run_select_to_chunks,
 };
+use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use crate::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 
 const OPTIMIZE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);

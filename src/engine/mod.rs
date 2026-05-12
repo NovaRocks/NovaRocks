@@ -38,6 +38,7 @@ pub(crate) mod information_schema;
 pub(crate) mod insert;
 pub(crate) mod insert_flow;
 pub(crate) mod mutation_flow;
+pub(crate) mod mv;
 pub(crate) mod mv_flow;
 pub(crate) mod name_resolve;
 pub(crate) mod parquet;
@@ -1802,7 +1803,7 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
     restore_managed_lake(state)?;
     restore_iceberg_catalogs(state)?;
-    crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(state)?;
+    crate::engine::mv::iceberg_refresh::restore_iceberg_mv_targets(state)?;
     Ok(())
 }
 
