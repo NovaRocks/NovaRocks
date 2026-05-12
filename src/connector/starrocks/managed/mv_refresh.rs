@@ -34,9 +34,7 @@ use crate::connector::starrocks::managed::ddl::{
     bootstrap_empty_partition_for_tablets, build_create_tablet_request, request_schema_from_runtime,
 };
 use crate::connector::starrocks::managed::store::{
-    ActivateMvRefreshRequest, BeginMvRefreshRequest, IcebergTableRef, ManagedPartitionState,
-    ManagedTableKind, SqliteMetadataStore, StageMvRefreshRequest, StagedMvRefresh,
-    UpdateMvRefreshMetadataRequest,
+    IcebergTableRef, ManagedMvStorageEngine, ManagedPartitionState, ManagedTableKind,
 };
 use crate::connector::starrocks::managed::txn::{
     MvRefreshWriteMetadata, PartitionTarget, load_insert_plan, load_physical_insert_plan,
@@ -44,6 +42,9 @@ use crate::connector::starrocks::managed::txn::{
     write_chunks_into_managed_partition_for_aggregate_mv_upsert,
     write_chunks_into_managed_partition_for_mv_refresh_with_row_delta,
 };
+use crate::meta::repository::job::CreateEraseJobRequest;
+use crate::meta::repository::managed_lake::{StageManagedMvRefreshRequest, StagedManagedMvRefresh};
+use crate::meta::repository::mv::{StoredMvDefinition, UpdateManagedMvRefreshSummaryRequest};
 
 pub(crate) fn refresh_mv(
     state: &Arc<StandaloneState>,
@@ -52,10 +53,6 @@ pub(crate) fn refresh_mv(
     stmt: &RefreshMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let (db_name, mv_name) = resolve_mv_name(&stmt.name, current_database)?;
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "managed lake mv refresh requires sqlite metadata store".to_string())?;
     let _refresh_guard = acquire_mv_refresh_lock()?;
 
     if current_catalog.is_some() {
@@ -65,9 +62,12 @@ pub(crate) fn refresh_mv(
                 current_database,
                 &stmt.name,
             )?;
-        if metadata_store
-            .find_iceberg_mv_by_target(&target.catalog, &target.namespace, &target.table)?
-            .is_some()
+        if load_mv_definition_by_target(state, &target.catalog, &target.namespace, &target.table)?
+            .as_ref()
+            .is_some_and(|mv| {
+                mv.storage_engine
+                    .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+            })
         {
             drop(_refresh_guard);
             return crate::connector::starrocks::managed::mv_refresh_iceberg::refresh_iceberg_mv(
@@ -90,27 +90,22 @@ pub(crate) fn refresh_mv(
         return Err(format!("`{db_name}.{mv_name}` is not a materialized view"));
     }
 
-    let snapshot = metadata_store.load_snapshot()?.managed;
-    let mut mv_row = snapshot
-        .materialized_views
-        .iter()
-        .find(|mv| mv.mv_id == runtime.table.table_id)
-        .cloned()
-        .ok_or_else(|| {
-            format!("materialized view {db_name}.{mv_name} has no materialized_views row")
-        })?;
-    if mv_row.refresh_in_progress {
+    let mut mv_definition = load_mv_definition_by_id(state, runtime.table.table_id)?
+        .ok_or_else(|| format!("materialized view {db_name}.{mv_name} has no MV definition"))?;
+    if mv_definition.refresh_in_progress || mv_definition.active_refresh_id.is_some() {
         tracing::warn!(
             "materialized view {db_name}.{mv_name}: clearing stale refresh progress before retry; target_snapshots={:?}",
-            mv_row.refresh_target_snapshots
+            mv_definition.refresh_target_snapshots
         );
-        metadata_store.clear_mv_refresh_progress(runtime.table.table_id)?;
-        mv_row.refresh_in_progress = false;
-        mv_row.refresh_target_snapshots.clear();
+        clear_mv_refresh_progress(state, runtime.table.table_id)?;
+        mv_definition.refresh_in_progress = false;
+        mv_definition.active_refresh_id = None;
+        mv_definition.refresh_target_snapshots.clear();
     }
 
-    let mv_shape = validate_incremental_mv_select(&mv_row.select_sql)?;
-    let [base_ref] = mv_row.base_table_refs.as_slice() else {
+    let mv_shape = validate_incremental_mv_select(&mv_definition.select_sql)?;
+    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
+    let [base_ref] = base_refs.as_slice() else {
         return Err(
             "incremental materialized view refresh requires a single Iceberg base table"
                 .to_string(),
@@ -125,9 +120,12 @@ pub(crate) fn refresh_mv(
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());
     let current_table_uuid = loaded.table.metadata().uuid().to_string();
-    let previous_snapshot_id = mv_row.last_refresh_snapshots.get(&base_ref.fqn()).copied();
+    let previous_snapshot_id = mv_definition
+        .last_refresh_snapshots
+        .get(&base_ref.fqn())
+        .copied();
     let mut policy = choose_snapshot_refresh_policy(previous_snapshot_id, current_snapshot_id)?;
-    if let Some(previous_uuid) = mv_row.last_refresh_table_uuids.get(&base_ref.fqn())
+    if let Some(previous_uuid) = mv_definition.last_refresh_table_uuids.get(&base_ref.fqn())
         && previous_uuid != &current_table_uuid
     {
         policy = MvRefreshPolicy::FullRefresh {
@@ -154,14 +152,11 @@ pub(crate) fn refresh_mv(
         let target_snapshots = current_snapshot_id
             .map(|snapshot_id| single_snapshot_map(base_ref, snapshot_id))
             .unwrap_or_default();
-        metadata_store.begin_mv_refresh(BeginMvRefreshRequest {
-            table_id: runtime.table.table_id,
-            target_snapshots,
-        })?;
+        begin_mv_refresh_intent(state, runtime.table.table_id, target_snapshots)?;
     }
 
     let projection_apply_shape = mv_shape.clone();
-    let projection_full_primary_key_columns = mv_row.primary_key_columns.clone();
+    let projection_full_primary_key_columns = mv_definition.primary_key_columns.clone();
     dispatch_mv_refresh_strategy(
         &mv_shape,
         policy,
@@ -174,12 +169,13 @@ pub(crate) fn refresh_mv(
         |current_snapshot_id| {
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
-            metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
-                table_id: runtime.table.table_id,
-                last_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
+            update_managed_mv_refresh_summary(
+                state,
+                runtime.table.table_id,
+                mv_definition.last_refresh_rows.unwrap_or(0),
                 snapshots,
                 table_uuids,
-            })?;
+            )?;
             refresh_managed_catalog(state)?;
             Ok(StatementResult::Ok)
         },
@@ -188,7 +184,7 @@ pub(crate) fn refresh_mv(
                 &loaded.table,
                 previous_snapshot_id,
                 current_snapshot_id,
-                &mv_row.primary_key_columns,
+                &mv_definition.primary_key_columns,
             ) {
                 Ok(batch) => batch,
                 Err(err) => match policy_from_change_error(err) {
@@ -202,7 +198,7 @@ pub(crate) fn refresh_mv(
                             reason = %reason,
                             "mv_refresh fall-back to Full from projection incremental planner"
                         );
-                        let primary_key_columns = mv_row.primary_key_columns.clone();
+                        let primary_key_columns = mv_definition.primary_key_columns.clone();
                         return refresh_mv_full_with_executor(
                             state,
                             &db_name,
@@ -230,7 +226,7 @@ pub(crate) fn refresh_mv(
                 &projection_apply_shape,
                 has_inserts,
                 has_deletes,
-                !mv_row.primary_key_columns.is_empty(),
+                !mv_definition.primary_key_columns.is_empty(),
             );
             match apply_policy {
                 MvApplyPolicy::Incremental => {}
@@ -244,7 +240,7 @@ pub(crate) fn refresh_mv(
                         reason = %reason,
                         "mv_refresh fall-back to Full from projection apply policy"
                     );
-                    let primary_key_columns = mv_row.primary_key_columns.clone();
+                    let primary_key_columns = mv_definition.primary_key_columns.clone();
                     return refresh_mv_full_with_executor(state, &db_name, &mv_name, move |ctx| {
                         run_projection_mv_select_and_chunks(ctx, &primary_key_columns)
                     });
@@ -273,18 +269,20 @@ pub(crate) fn refresh_mv(
             }
             if source_files.files.is_empty() {
                 advance_mv_refresh_metadata_without_writes(
-                    metadata_store,
+                    state,
                     runtime.table.table_id,
                     base_ref,
                     current_snapshot_id,
                     &current_table_uuid,
-                    mv_row.last_refresh_rows.unwrap_or(0),
+                    mv_definition.last_refresh_rows.unwrap_or(0),
                 )?;
                 refresh_managed_catalog(state)?;
                 return Ok(StatementResult::Ok);
             }
-            let physical_select_sql =
-                projection_mv_physical_select_sql(&mv_row.select_sql, &mv_row.primary_key_columns)?;
+            let physical_select_sql = projection_mv_physical_select_sql(
+                &mv_definition.select_sql,
+                &mv_definition.primary_key_columns,
+            )?;
             let tagged_select_sql = projection_select_with_change_op(&physical_select_sql)?;
             let delta_result = execute_delta_source_query(
                 IvmDeltaSourceInput {
@@ -301,12 +299,12 @@ pub(crate) fn refresh_mv(
                 database: db_name.clone(),
                 table: mv_name.clone(),
             };
-            let plan = if mv_row.primary_key_columns.is_empty() {
+            let plan = if mv_definition.primary_key_columns.is_empty() {
                 load_insert_plan(state, &resolved_mv, PartitionTarget::Active)
             } else {
                 load_physical_insert_plan(state, &resolved_mv, PartitionTarget::Active)
             }?;
-            let previous_rows = mv_row.last_refresh_rows.unwrap_or(0);
+            let previous_rows = mv_definition.last_refresh_rows.unwrap_or(0);
             let snapshots = single_snapshot_map(base_ref, current_snapshot_id);
             let table_uuids = single_table_uuid_map(base_ref, &current_table_uuid);
             write_chunks_into_managed_partition_for_mv_refresh_with_row_delta(
@@ -329,7 +327,7 @@ pub(crate) fn refresh_mv(
                 &loaded.table,
                 previous_snapshot_id,
                 current_snapshot_id,
-                &mv_row.primary_key_columns,
+                &mv_definition.primary_key_columns,
             ) {
                 Ok(batch) => batch,
                 Err(err) => match policy_from_change_error(err) {
@@ -362,11 +360,11 @@ pub(crate) fn refresh_mv(
                 database: &db_name,
                 mv_name: &mv_name,
                 table_id: runtime.table.table_id,
-                select_sql: &mv_row.select_sql,
+                select_sql: &mv_definition.select_sql,
                 base_ref,
                 shape,
                 change_batch,
-                previous_refresh_rows: mv_row.last_refresh_rows.unwrap_or(0),
+                previous_refresh_rows: mv_definition.last_refresh_rows.unwrap_or(0),
                 previous_snapshot_id,
                 current_snapshot_id,
                 current_table_uuid: current_table_uuid.clone(),
@@ -539,12 +537,8 @@ fn refresh_aggregate_mv_incremental(
 
     // Empty-input early return: nothing to merge, just advance lineage.
     if source_files.files.is_empty() {
-        let metadata_store =
-            ctx.state.metadata_store.as_ref().ok_or_else(|| {
-                "managed lake mv refresh requires sqlite metadata store".to_string()
-            })?;
         advance_mv_refresh_metadata_without_writes(
-            metadata_store,
+            ctx.state,
             ctx.table_id,
             ctx.base_ref,
             ctx.current_snapshot_id,
@@ -625,19 +619,20 @@ fn refresh_aggregate_mv_incremental(
 }
 
 fn advance_mv_refresh_metadata_without_writes(
-    metadata_store: &SqliteMetadataStore,
+    state: &Arc<StandaloneState>,
     table_id: i64,
     base_ref: &IcebergTableRef,
     current_snapshot_id: i64,
     current_table_uuid: &str,
     last_refresh_rows: i64,
 ) -> Result<(), String> {
-    metadata_store.update_mv_refresh_metadata(UpdateMvRefreshMetadataRequest {
+    update_managed_mv_refresh_summary(
+        state,
         table_id,
         last_refresh_rows,
-        snapshots: single_snapshot_map(base_ref, current_snapshot_id),
-        table_uuids: single_table_uuid_map(base_ref, current_table_uuid),
-    })
+        single_snapshot_map(base_ref, current_snapshot_id),
+        single_table_uuid_map(base_ref, current_table_uuid),
+    )
 }
 
 pub(crate) fn refresh_mv_full_with_executor<F>(
@@ -653,10 +648,6 @@ where
         .managed_lake_config
         .clone()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "managed lake mv refresh requires sqlite metadata store".to_string())?;
 
     let runtime = {
         let managed = state
@@ -669,15 +660,8 @@ where
         return Err(format!("`{database}.{mv_name}` is not a materialized view"));
     }
 
-    let snapshot = metadata_store.load_snapshot()?.managed;
-    let mv_row = snapshot
-        .materialized_views
-        .iter()
-        .find(|mv| mv.mv_id == runtime.table.table_id)
-        .cloned()
-        .ok_or_else(|| {
-            format!("materialized view {database}.{mv_name} has no materialized_views row")
-        })?;
+    let mv_definition = load_mv_definition_by_id(state, runtime.table.table_id)?
+        .ok_or_else(|| format!("materialized view {database}.{mv_name} has no MV definition"))?;
     let active_partition = runtime
         .partitions
         .iter()
@@ -690,22 +674,15 @@ where
         active_partition.partition_id,
     );
 
-    let staged = metadata_store.stage_mv_refresh_partition(StageMvRefreshRequest {
-        table_id: runtime.table.table_id,
-        db_id: runtime.table.db_id,
-        bucket_num: runtime.table.bucket_num,
-        partition_name: active_partition.name.clone(),
-        warehouse_uri: managed_config.warehouse_uri.clone(),
-    })?;
+    let staged = stage_managed_mv_refresh_partition(
+        state,
+        &runtime,
+        &active_partition.name,
+        &managed_config.warehouse_uri,
+    )?;
 
     if let Err(err) = refresh_managed_catalog(state) {
-        cleanup_staged_partition(
-            state,
-            metadata_store,
-            runtime.table.table_id,
-            &staged,
-            false,
-        )?;
+        cleanup_staged_partition(state, runtime.table.table_id, &staged, false)?;
         return Err(format!("mv refresh catalog refresh failed: {err}"));
     }
 
@@ -715,24 +692,18 @@ where
         staged.partition_id,
         &staged.tablet_ids,
     ) {
-        cleanup_staged_partition(
-            state,
-            metadata_store,
-            runtime.table.table_id,
-            &staged,
-            false,
-        )?;
+        cleanup_staged_partition(state, runtime.table.table_id, &staged, false)?;
         return Err(format!("mv refresh bootstrap failed: {err}"));
     }
 
     let chunks = match executor(MvRefreshContext {
         state: Arc::clone(state),
         database: database.to_string(),
-        select_sql: mv_row.select_sql.clone(),
+        select_sql: mv_definition.select_sql.clone(),
     }) {
         Ok(chunks) => chunks,
         Err(err) => {
-            cleanup_staged_partition(state, metadata_store, runtime.table.table_id, &staged, true)?;
+            cleanup_staged_partition(state, runtime.table.table_id, &staged, true)?;
             return Err(format!("mv refresh execute failed: {err}"));
         }
     };
@@ -751,7 +722,7 @@ where
     ) {
         Ok(plan) => plan,
         Err(err) => {
-            cleanup_staged_partition(state, metadata_store, runtime.table.table_id, &staged, true)?;
+            cleanup_staged_partition(state, runtime.table.table_id, &staged, true)?;
             return Err(format!("mv refresh plan load failed: {err}"));
         }
     };
@@ -759,29 +730,28 @@ where
     let rows_written = match write_chunks_into_managed_partition(state, plan, &chunks) {
         Ok(rows_written) => rows_written,
         Err(err) => {
-            cleanup_staged_partition(state, metadata_store, runtime.table.table_id, &staged, true)?;
+            cleanup_staged_partition(state, runtime.table.table_id, &staged, true)?;
             return Err(format!("mv refresh write failed: {err}"));
         }
     };
 
+    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
     let base_metadata = collect_current_base_metadata_or_cleanup_staged_partition(
         state,
-        metadata_store,
         runtime.table.table_id,
         &staged,
-        &mv_row.base_table_refs,
+        &base_refs,
     )?;
-    if let Err(err) = metadata_store.activate_mv_refresh_partition(ActivateMvRefreshRequest {
-        table_id: runtime.table.table_id,
-        old_partition_id: active_partition.partition_id,
-        new_partition_id: staged.partition_id,
-        new_index_id: staged.index_id,
-        retired_root_path,
+    if let Err(err) = activate_managed_mv_refresh_partition(
+        state,
+        runtime.table.table_id,
+        active_partition.partition_id,
+        &retired_root_path,
+        &staged,
         rows_written,
-        snapshots: base_metadata.snapshots,
-        table_uuids: base_metadata.table_uuids,
-    }) {
-        cleanup_staged_partition(state, metadata_store, runtime.table.table_id, &staged, true)?;
+        base_metadata,
+    ) {
+        cleanup_staged_partition(state, runtime.table.table_id, &staged, true)?;
         return Err(format!("mv refresh activate failed: {err}"));
     }
 
@@ -1222,17 +1192,14 @@ fn collect_current_base_metadata(
 
 fn collect_current_base_metadata_or_cleanup_staged_partition(
     state: &Arc<StandaloneState>,
-    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
-    staged: &StagedMvRefresh,
+    staged: &StagedManagedMvRefresh,
     refs: &[IcebergTableRef],
 ) -> Result<CurrentBaseMetadata, String> {
     match collect_current_base_metadata(state, refs) {
         Ok(metadata) => Ok(metadata),
         Err(err) => {
-            if let Err(cleanup_err) =
-                cleanup_staged_partition(state, metadata_store, table_id, staged, true)
-            {
+            if let Err(cleanup_err) = cleanup_staged_partition(state, table_id, staged, true) {
                 return Err(format!(
                     "mv refresh snapshot collection failed: {err}; cleanup failed: {cleanup_err}"
                 ));
@@ -1242,7 +1209,7 @@ fn collect_current_base_metadata_or_cleanup_staged_partition(
     }
 }
 
-fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
+pub(crate) fn acquire_mv_refresh_lock() -> Result<MutexGuard<'static, ()>, String> {
     static MV_REFRESH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     lock_mv_refresh_mutex(MV_REFRESH_LOCK.get_or_init(|| Mutex::new(())))
 }
@@ -1254,33 +1221,275 @@ fn lock_mv_refresh_mutex(lock: &Mutex<()>) -> Result<MutexGuard<'_, ()>, String>
 
 fn cleanup_staged_partition(
     state: &Arc<StandaloneState>,
-    metadata_store: &crate::connector::starrocks::managed::store::SqliteMetadataStore,
     table_id: i64,
-    staged: &StagedMvRefresh,
+    staged: &StagedManagedMvRefresh,
     enqueue_erase_job: bool,
 ) -> Result<(), String> {
     for tablet_id in &staged.tablet_ids {
         let _ = remove_tablet_runtime(*tablet_id);
     }
-    metadata_store.delete_creating_partition(staged.partition_id)?;
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake MV refresh cleanup requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("cleanup managed lake mv refresh partition")
+        .map_err(|e| format!("open managed mv refresh cleanup transaction failed: {e}"))?;
+    state
+        .managed_repo
+        .delete_creating_partition(txn.as_mut(), staged.partition_id)
+        .map_err(|e| format!("delete staged mv refresh partition failed: {e}"))?;
     if enqueue_erase_job {
-        metadata_store.enqueue_erase_job_for_partition_root(
-            table_id,
-            staged.partition_id,
-            &staged.partition_root_path,
-        )?;
+        state
+            .job_repo
+            .create_erase_job(
+                txn.as_mut(),
+                CreateEraseJobRequest {
+                    table_id,
+                    partition_id: Some(staged.partition_id),
+                    root_path: staged.partition_root_path.clone(),
+                    now_ms: super::mv_ddl::now_ms(),
+                },
+            )
+            .map_err(|e| format!("enqueue staged mv refresh erase job failed: {e}"))?;
     }
+    txn.commit()
+        .map_err(|e| format!("commit managed mv refresh cleanup failed: {e}"))?;
     refresh_managed_catalog(state)?;
     Ok(())
 }
 
-fn refresh_managed_catalog(state: &Arc<StandaloneState>) -> Result<(), String> {
-    let metadata_store = state
-        .metadata_store
+fn load_mv_definition_by_id(
+    state: &Arc<StandaloneState>,
+    mv_id: i64,
+) -> Result<Option<StoredMvDefinition>, String> {
+    let provider = state
+        .metadata_provider
         .as_ref()
-        .ok_or_else(|| "managed lake catalog refresh requires sqlite metadata store".to_string())?;
-    let snapshot = metadata_store.load_snapshot()?.managed;
-    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), snapshot.clone())?;
+        .ok_or_else(|| "materialized view metadata provider is not configured".to_string())?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open mv definition read transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .load_by_id(read.as_ref(), mv_id)
+        .map_err(|e| format!("load mv definition failed: {e}"))
+}
+
+fn load_mv_definition_by_target(
+    state: &Arc<StandaloneState>,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Option<StoredMvDefinition>, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "materialized view metadata provider is not configured".to_string())?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open mv target read transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .find_by_target(read.as_ref(), catalog, namespace, table)
+        .map_err(|e| format!("load mv target definition failed: {e}"))
+}
+
+fn begin_mv_refresh_intent(
+    state: &Arc<StandaloneState>,
+    mv_id: i64,
+    target_snapshots: BTreeMap<String, i64>,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "materialized view refresh requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("begin materialized view refresh")
+        .map_err(|e| format!("open mv refresh transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .begin_refresh_intent(txn.as_mut(), mv_id, target_snapshots)
+        .map_err(|e| format!("begin mv refresh intent failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit mv refresh intent failed: {e}"))?;
+    Ok(())
+}
+
+fn clear_mv_refresh_progress(state: &Arc<StandaloneState>, mv_id: i64) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "materialized view refresh requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("clear materialized view refresh progress")
+        .map_err(|e| format!("open mv refresh cleanup transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .clear_refresh_progress(txn.as_mut(), mv_id)
+        .map_err(|e| format!("clear mv refresh progress failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit mv refresh cleanup failed: {e}"))?;
+    Ok(())
+}
+
+fn update_managed_mv_refresh_summary(
+    state: &Arc<StandaloneState>,
+    mv_id: i64,
+    last_refresh_rows: i64,
+    base_snapshots: BTreeMap<String, i64>,
+    base_table_uuids: BTreeMap<String, String>,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "materialized view refresh requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("update managed materialized view refresh summary")
+        .map_err(|e| format!("open mv refresh summary transaction failed: {e}"))?;
+    state
+        .mv_repo
+        .update_managed_refresh_summary_if_present(
+            txn.as_mut(),
+            UpdateManagedMvRefreshSummaryRequest {
+                mv_id,
+                last_refresh_ms: super::mv_ddl::now_ms(),
+                last_refresh_rows,
+                base_snapshots,
+                base_table_uuids,
+            },
+        )
+        .map_err(|e| format!("update mv refresh summary failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit mv refresh summary failed: {e}"))?;
+    Ok(())
+}
+
+fn stage_managed_mv_refresh_partition(
+    state: &Arc<StandaloneState>,
+    runtime: &ManagedTableRuntime,
+    partition_name: &str,
+    warehouse_uri: &str,
+) -> Result<StagedManagedMvRefresh, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake MV refresh requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("stage managed lake mv refresh partition")
+        .map_err(|e| format!("open managed mv refresh stage transaction failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .ensure_no_inflight_for_table(txn.as_ref(), runtime.table.table_id)
+        .map_err(|e| format!("validate managed mv refresh failed: {e}"))?;
+    let staged = state
+        .managed_repo
+        .stage_mv_refresh_partition(
+            txn.as_mut(),
+            StageManagedMvRefreshRequest {
+                table_id: runtime.table.table_id,
+                db_id: runtime.table.db_id,
+                bucket_num: runtime.table.bucket_num,
+                partition_name: partition_name.to_string(),
+                warehouse_uri: warehouse_uri.to_string(),
+            },
+        )
+        .map_err(|e| format!("stage managed mv refresh metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed mv refresh stage metadata failed: {e}"))?;
+    Ok(staged)
+}
+
+fn activate_managed_mv_refresh_partition(
+    state: &Arc<StandaloneState>,
+    table_id: i64,
+    old_partition_id: i64,
+    retired_root_path: &str,
+    staged: &StagedManagedMvRefresh,
+    rows_written: i64,
+    base_metadata: CurrentBaseMetadata,
+) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake MV refresh requires metadata provider".to_string())?;
+    let mut txn = provider
+        .begin_write("activate managed lake mv refresh partition")
+        .map_err(|e| format!("open managed mv refresh activate transaction failed: {e}"))?;
+    state
+        .managed_repo
+        .activate_mv_refresh_partition(
+            txn.as_mut(),
+            table_id,
+            old_partition_id,
+            staged.partition_id,
+            staged.index_id,
+        )
+        .map_err(|e| format!("activate managed mv refresh metadata failed: {e}"))?;
+    state
+        .job_repo
+        .create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id,
+                partition_id: Some(old_partition_id),
+                root_path: retired_root_path.to_string(),
+                now_ms: super::mv_ddl::now_ms(),
+            },
+        )
+        .map_err(|e| format!("enqueue managed mv refresh erase job failed: {e}"))?;
+    state
+        .mv_repo
+        .update_managed_refresh_summary_if_present(
+            txn.as_mut(),
+            UpdateManagedMvRefreshSummaryRequest {
+                mv_id: table_id,
+                last_refresh_ms: super::mv_ddl::now_ms(),
+                last_refresh_rows: rows_written,
+                base_snapshots: base_metadata.snapshots,
+                base_table_uuids: base_metadata.table_uuids,
+            },
+        )
+        .map_err(|e| format!("update managed mv refresh summary failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed mv refresh activate metadata failed: {e}"))?;
+    Ok(())
+}
+
+pub(crate) fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<IcebergTableRef>, String> {
+    refs.iter()
+        .map(|fqn| {
+            let parts = fqn.split('.').collect::<Vec<_>>();
+            let [catalog, namespace, table] = parts.as_slice() else {
+                return Err(format!(
+                    "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
+                ));
+            };
+            Ok(IcebergTableRef {
+                catalog: crate::engine::catalog::normalize_identifier(catalog)?,
+                namespace: crate::engine::catalog::normalize_identifier(namespace)?,
+                table: crate::engine::catalog::normalize_identifier(table)?,
+            })
+        })
+        .collect()
+}
+
+fn refresh_managed_catalog(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake catalog refresh requires metadata provider".to_string())?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed catalog refresh transaction failed: {e}"))?;
+    let snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("load managed catalog metadata failed: {e}"))?;
+    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(
+        state.managed_lake_config.clone(),
+        snapshot.clone(),
+    )?;
     {
         let mut catalog = state
             .catalog
@@ -1355,6 +1564,7 @@ mod tests {
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
+    use crate::meta::MetaStoreProvider;
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::analysis::OutputColumn;
     use crate::sql::parser::ast::{TableKeyDesc, TableKeyKind};
@@ -1428,29 +1638,25 @@ mod tests {
 
     #[test]
     fn advance_empty_change_stream_updates_metadata_without_writing() {
-        let (_dir, store) = seed_mv_refresh_store();
+        let (_dir, state, table_id) = seed_mv_refresh_state();
         let base_ref = IcebergTableRef {
             catalog: "missing_catalog".to_string(),
             namespace: "ns".to_string(),
             table: "orders".to_string(),
         };
         let snapshots = single_snapshot_map(&base_ref, 42);
-        store
-            .begin_mv_refresh(BeginMvRefreshRequest {
-                table_id: 10,
-                target_snapshots: snapshots.clone(),
-            })
-            .expect("begin refresh");
+        begin_mv_refresh_intent(&state, table_id, snapshots.clone()).expect("begin refresh");
 
-        advance_mv_refresh_metadata_without_writes(&store, 10, &base_ref, 42, "uuid-1", 17)
+        advance_mv_refresh_metadata_without_writes(&state, table_id, &base_ref, 42, "uuid-1", 17)
             .expect("advance metadata");
 
-        let snapshot = store.load_snapshot().expect("load snapshot").managed;
-        let mv = snapshot
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
-            .expect("mv row");
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("read");
+        let mv = state
+            .mv_repo
+            .load_by_id(read.as_ref(), table_id)
+            .expect("load mv")
+            .expect("mv definition");
         assert_eq!(mv.last_refresh_rows, Some(17));
         assert_eq!(mv.last_refresh_snapshots, snapshots);
         assert!(!mv.refresh_in_progress);
@@ -1559,13 +1765,19 @@ mod tests {
             panic!("full refresh: {err}");
         }
 
-        let metadata_store = state.metadata_store.as_ref().expect("store");
-        let snapshot = metadata_store.load_snapshot().expect("snapshot").managed;
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("metadata read");
+        let snapshot = state
+            .managed_repo
+            .load_snapshot(read.as_ref())
+            .expect("repository snapshot");
         let active_partition = snapshot
             .partitions
             .iter()
             .find(|partition| {
-                partition.table_id == 10 && partition.state == ManagedPartitionState::Active
+                partition.table_id == 10
+                    && partition.state
+                        == crate::meta::repository::managed_lake::ManagedPartitionState::Active
             })
             .expect("active partition");
         assert_ne!(active_partition.partition_id, 20);
@@ -2573,31 +2785,21 @@ enable_path_style_access = true
 
     #[test]
     fn collect_current_snapshots_cleans_staged_partition_on_failure() {
-        let (_dir, store) = seed_mv_refresh_store();
-        let config = test_managed_config();
-        let snapshot = store.load_snapshot().expect("load snapshot").managed;
-        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild");
-        let state = Arc::new(StandaloneState {
-            catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
-            managed_lake: RwLock::new(managed),
-            statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
-            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
-            managed_lake_config: Some(config),
-            metadata_provider: None,
-            metadata_store: Some(store.clone()),
-            exchange_port: 0,
-            ..Default::default()
-        });
-        let staged = store
-            .stage_mv_refresh_partition(StageMvRefreshRequest {
-                table_id: 10,
-                db_id: 1,
-                bucket_num: 2,
-                partition_name: "p0".to_string(),
-                warehouse_uri: "s3://test/warehouse".to_string(),
-            })
-            .expect("stage");
+        let (_dir, state, table_id) = seed_mv_refresh_state();
+        let runtime = {
+            let managed = state.managed_lake.read().expect("managed lake");
+            managed
+                .table("analytics", "orders_mv")
+                .expect("runtime")
+                .clone()
+        };
+        let staged = stage_managed_mv_refresh_partition(
+            &state,
+            &runtime,
+            "p0",
+            &test_managed_config().warehouse_uri,
+        )
+        .expect("stage");
         let refs = vec![IcebergTableRef {
             catalog: "missing_catalog".to_string(),
             namespace: "ns".to_string(),
@@ -2605,7 +2807,7 @@ enable_path_style_access = true
         }];
 
         let err = collect_current_base_metadata_or_cleanup_staged_partition(
-            &state, &store, 10, &staged, &refs,
+            &state, table_id, &staged, &refs,
         )
         .expect_err("snapshot collection should fail");
 
@@ -2613,48 +2815,34 @@ enable_path_style_access = true
             err.contains("mv refresh snapshot collection failed"),
             "err={err}"
         );
-        let loaded = store.load_snapshot().expect("reload").managed;
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("read");
+        let loaded = state
+            .managed_repo
+            .load_snapshot(read.as_ref())
+            .expect("reload");
         assert!(
             !loaded
                 .partitions
                 .iter()
                 .any(|partition| partition.partition_id == staged.partition_id)
         );
-        let erase_job = loaded
-            .erase_jobs
-            .iter()
+        let erase_job = state
+            .job_repo
+            .list_runnable_erase_jobs(read.as_ref(), super::super::mv_ddl::now_ms())
+            .expect("erase jobs")
+            .into_iter()
             .find(|job| job.partition_id == Some(staged.partition_id))
             .expect("staged partition erase job");
-        assert_eq!(erase_job.table_id, 10);
+        assert_eq!(erase_job.table_id, table_id);
     }
 
     #[test]
     fn refresh_mv_clears_stale_progress_before_retry() {
-        let (_dir, store) = seed_mv_refresh_store();
+        let (_dir, state, table_id) = seed_mv_refresh_state();
         let mut target = BTreeMap::new();
         target.insert("missing_catalog.ns.orders".to_string(), 99);
-        store
-            .begin_mv_refresh(BeginMvRefreshRequest {
-                table_id: 10,
-                target_snapshots: target,
-            })
-            .expect("begin stale refresh");
-
-        let config = test_managed_config();
-        let snapshot = store.load_snapshot().expect("load snapshot").managed;
-        let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot).expect("rebuild");
-        let state = Arc::new(StandaloneState {
-            catalog: RwLock::new(InMemoryCatalog::default()),
-            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
-            managed_lake: RwLock::new(managed),
-            statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
-            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
-            managed_lake_config: Some(config),
-            metadata_provider: None,
-            metadata_store: Some(store.clone()),
-            exchange_port: 0,
-            ..Default::default()
-        });
+        begin_mv_refresh_intent(&state, table_id, target).expect("begin stale refresh");
 
         let err = refresh_mv(
             &state,
@@ -2669,12 +2857,13 @@ enable_path_style_access = true
         .expect_err("missing iceberg catalog should fail after stale progress cleanup");
         assert!(err.contains("missing_catalog"), "err={err}");
 
-        let loaded = store.load_snapshot().expect("reload").managed;
-        let mv = loaded
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
-            .expect("mv");
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("read");
+        let mv = state
+            .mv_repo
+            .load_by_id(read.as_ref(), table_id)
+            .expect("load mv")
+            .expect("mv definition");
         assert!(!mv.refresh_in_progress);
         assert!(mv.refresh_target_snapshots.is_empty());
     }
@@ -2700,84 +2889,87 @@ enable_path_style_access = true
         assert!(err.contains("poisoned"), "err={err}");
     }
 
-    fn seed_mv_refresh_store() -> (tempfile::TempDir, SqliteMetadataStore) {
+    fn seed_mv_refresh_state() -> (tempfile::TempDir, Arc<StandaloneState>, i64) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open");
-        let mut snapshot = ManagedSnapshot {
-            global: ManagedGlobalMeta {
-                warehouse_uri: "s3://test/warehouse".to_string(),
-                next_db_id: 2,
-                next_table_id: 11,
-                next_partition_id: 21,
-                next_index_id: 31,
-                next_tablet_id: 41,
-                next_txn_id: 1,
-            },
-            ..Default::default()
+        let metadata_path = dir.path().join("standalone.sqlite");
+        let store = SqliteMetadataStore::open(&metadata_path).expect("open legacy store");
+        let provider =
+            crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
+        let config = test_managed_config();
+        let managed_repo =
+            crate::meta::repository::managed_lake::ManagedLakeMetaRepository::default();
+        let mv_repo = crate::meta::repository::mv::MvMetaRepository::default();
+        let table_id = {
+            let mut txn = provider
+                .begin_write("seed mv refresh state")
+                .expect("write");
+            let database = managed_repo
+                .get_or_create_database(txn.as_mut(), "analytics")
+                .expect("database");
+            let created = managed_repo
+                .create_table_layout(
+                    txn.as_mut(),
+                    crate::meta::repository::managed_lake::CreateManagedTableLayoutRequest {
+                        db_id: database.db_id,
+                        table_name: "orders_mv".to_string(),
+                        keys_type: "DUP_KEYS".to_string(),
+                        bucket_num: 2,
+                        kind: crate::meta::repository::managed_lake::ManagedTableKind::MaterializedView,
+                        schema_version: 0,
+                        tablet_schema_pb: crate::service::grpc_client::proto::starrocks::TabletSchemaPb::default()
+                            .encode_to_vec(),
+                        columns: vec![crate::meta::repository::managed_lake::CreateManagedColumnRequest {
+                            column_name: "id".to_string(),
+                            logical_type: "INT".to_string(),
+                            nullable: false,
+                            visible: true,
+                            is_key: true,
+                        }],
+                        partition_name: "p0".to_string(),
+                        warehouse_uri: config.warehouse_uri.clone(),
+                    },
+                )
+                .expect("managed mv layout");
+            mv_repo
+                .create_definition_with_id(
+                    txn.as_mut(),
+                    created.table.table_id,
+                    crate::meta::repository::mv::CreateMvDefinitionRequest {
+                        select_sql: "SELECT id FROM missing_catalog.ns.orders".to_string(),
+                        base_table_refs: vec!["missing_catalog.ns.orders".to_string()],
+                        primary_key_columns: Vec::new(),
+                        storage_engine: ManagedMvStorageEngine::ManagedLake
+                            .as_sql_str()
+                            .to_string(),
+                        target_catalog: None,
+                        target_namespace: None,
+                        target_table: None,
+                        created_at_ms: super::super::mv_ddl::now_ms(),
+                    },
+                )
+                .expect("mv definition");
+            txn.commit().expect("commit seed");
+            created.table.table_id
         };
-        snapshot.databases.push(StoredManagedDatabase {
-            db_id: 1,
-            name: "analytics".to_string(),
+        let read = provider.begin_read().expect("read");
+        let snapshot = managed_repo
+            .load_snapshot(read.as_ref())
+            .expect("load managed snapshot");
+        let managed = ManagedLakeCatalog::rebuild_from_repository(Some(config.clone()), snapshot)
+            .expect("rebuild managed catalog");
+        let state = Arc::new(StandaloneState {
+            catalog: RwLock::new(InMemoryCatalog::default()),
+            iceberg_catalogs: Arc::new(RwLock::new(IcebergCatalogRegistry::default())),
+            managed_lake: RwLock::new(managed),
+            statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
+            connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
+            managed_lake_config: Some(config),
+            metadata_provider: Some(Arc::new(provider)),
+            metadata_store: Some(store),
+            exchange_port: 0,
+            ..Default::default()
         });
-        snapshot.tables.push(StoredManagedTable {
-            table_id: 10,
-            db_id: 1,
-            name: "orders_mv".to_string(),
-            keys_type: "DUP_KEYS".to_string(),
-            bucket_num: 2,
-            current_schema_id: 100,
-            state: ManagedTableState::Active,
-            kind: ManagedTableKind::MaterializedView,
-        });
-        snapshot.schemas.push(StoredManagedSchema {
-            schema_id: 100,
-            table_id: 10,
-            schema_version: 0,
-            tablet_schema_pb: vec![],
-        });
-        snapshot.partitions.push(StoredManagedPartition {
-            partition_id: 20,
-            table_id: 10,
-            name: "p0".to_string(),
-            visible_version: 1,
-            next_version: 2,
-            state: ManagedPartitionState::Active,
-        });
-        snapshot.indexes.push(StoredManagedIndex {
-            index_id: 30,
-            table_id: 10,
-            partition_id: 20,
-            index_type: "BASE".to_string(),
-            state: ManagedIndexState::Active,
-        });
-        snapshot.materialized_views.push(StoredMaterializedView {
-            mv_id: 10,
-            select_sql: "SELECT k1 FROM missing_catalog.ns.orders".to_string(),
-            refresh_mode: ManagedMvRefreshMode::DeferredManual,
-            base_table_refs: vec![IcebergTableRef {
-                catalog: "missing_catalog".to_string(),
-                namespace: "ns".to_string(),
-                table: "orders".to_string(),
-            }],
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots: BTreeMap::new(),
-            last_refresh_table_uuids: Default::default(),
-            primary_key_columns: Vec::new(),
-            created_at_ms: 1,
-            storage_engine: ManagedMvStorageEngine::ManagedLake,
-            iceberg_table_identifier: None,
-            target_catalog: None,
-            target_namespace: None,
-            target_table: None,
-            last_refreshed_iceberg_snapshot_id: None,
-            refresh_in_progress: false,
-            refresh_target_snapshots: Default::default(),
-        });
-        store
-            .replace_managed_snapshot(&snapshot)
-            .expect("persist snapshot");
-        (dir, store)
+        (dir, state, table_id)
     }
 
     fn seed_aggregate_mv_refresh_state(
@@ -2793,6 +2985,8 @@ enable_path_style_access = true
         let metadata_dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
         let metadata_path = metadata_dir.path().join("standalone.sqlite");
         let store = SqliteMetadataStore::open(&metadata_path)?;
+        let provider = crate::meta::SqliteMetaStoreProvider::open(&metadata_path)
+            .map_err(|e| format!("open meta provider failed: {e}"))?;
         let shape = aggregate_mv_shape()?;
         let output_columns = aggregate_output_columns();
         let layout =
@@ -2904,6 +3098,7 @@ enable_path_style_access = true
             }],
         };
         store.replace_managed_snapshot(&snapshot)?;
+        seed_repository_snapshot_for_mv_refresh(&provider, &snapshot)?;
         let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)?;
         let mut catalog = InMemoryCatalog::default();
         catalog.create_database("analytics")?;
@@ -2915,12 +3110,200 @@ enable_path_style_access = true
             statistics: RwLock::new(crate::engine::statistics::StandaloneStatistics::default()),
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
-            metadata_provider: None,
+            metadata_provider: Some(Arc::new(provider)),
             metadata_store: Some(store),
             exchange_port: 0,
             ..Default::default()
         });
         Ok((metadata_dir, state, shape))
+    }
+
+    fn seed_repository_snapshot_for_mv_refresh(
+        provider: &crate::meta::SqliteMetaStoreProvider,
+        snapshot: &ManagedSnapshot,
+    ) -> Result<(), String> {
+        let mut txn = provider
+            .begin_write("seed mv refresh repositories")
+            .map_err(|e| format!("begin seed repositories failed: {e}"))?;
+        for database in &snapshot.databases {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["database".to_string(), database.db_id.to_string()],
+                "managed.database",
+                serde_json::json!({ "db_id": database.db_id, "name": database.name }),
+            )?;
+        }
+        for table in &snapshot.tables {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["table".to_string(), table.table_id.to_string()],
+                "managed.table",
+                serde_json::json!({
+                    "table_id": table.table_id,
+                    "db_id": table.db_id,
+                    "name": table.name,
+                    "keys_type": table.keys_type,
+                    "bucket_num": table.bucket_num,
+                    "current_schema_id": table.current_schema_id,
+                    "state": managed_table_state_sql(table.state),
+                    "kind": managed_table_kind_sql(table.kind),
+                }),
+            )?;
+        }
+        for schema in &snapshot.schemas {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["schema".to_string(), schema.schema_id.to_string()],
+                "managed.schema",
+                serde_json::json!({
+                    "schema_id": schema.schema_id,
+                    "table_id": schema.table_id,
+                    "schema_version": schema.schema_version,
+                    "tablet_schema_pb": schema.tablet_schema_pb,
+                }),
+            )?;
+        }
+        for column in &snapshot.columns {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec![
+                    "column".to_string(),
+                    column.schema_id.to_string(),
+                    column.ordinal.to_string(),
+                ],
+                "managed.column",
+                serde_json::json!({
+                    "schema_id": column.schema_id,
+                    "ordinal": column.ordinal,
+                    "column_name": column.column_name,
+                    "logical_type": column.logical_type,
+                    "nullable": column.nullable,
+                    "visible": column.visible,
+                    "is_key": column.is_key,
+                }),
+            )?;
+        }
+        for partition in &snapshot.partitions {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["partition".to_string(), partition.partition_id.to_string()],
+                "managed.partition",
+                serde_json::json!({
+                    "partition_id": partition.partition_id,
+                    "table_id": partition.table_id,
+                    "name": partition.name,
+                    "visible_version": partition.visible_version,
+                    "next_version": partition.next_version,
+                    "state": managed_partition_state_sql(partition.state),
+                }),
+            )?;
+        }
+        for index in &snapshot.indexes {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["index".to_string(), index.index_id.to_string()],
+                "managed.index",
+                serde_json::json!({
+                    "index_id": index.index_id,
+                    "table_id": index.table_id,
+                    "partition_id": index.partition_id,
+                    "index_type": index.index_type,
+                    "state": managed_index_state_sql(index.state),
+                }),
+            )?;
+        }
+        for tablet in &snapshot.tablets {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["tablet".to_string(), tablet.tablet_id.to_string()],
+                "managed.tablet",
+                serde_json::json!({
+                    "tablet_id": tablet.tablet_id,
+                    "partition_id": tablet.partition_id,
+                    "index_id": tablet.index_id,
+                    "bucket_seq": tablet.bucket_seq,
+                    "tablet_root_path": tablet.tablet_root_path,
+                }),
+            )?;
+        }
+        for mv in &snapshot.materialized_views {
+            crate::meta::repository::mv::MvMetaRepository::default()
+                .create_definition_with_id(
+                    txn.as_mut(),
+                    mv.mv_id,
+                    crate::meta::repository::mv::CreateMvDefinitionRequest {
+                        select_sql: mv.select_sql.clone(),
+                        base_table_refs: mv.base_table_refs.iter().map(|r| r.fqn()).collect(),
+                        primary_key_columns: mv.primary_key_columns.clone(),
+                        storage_engine: mv.storage_engine.as_sql_str().to_string(),
+                        target_catalog: mv.target_catalog.clone(),
+                        target_namespace: mv.target_namespace.clone(),
+                        target_table: mv.target_table.clone(),
+                        created_at_ms: mv.created_at_ms,
+                    },
+                )
+                .map_err(|e| format!("seed mv definition failed: {e}"))?;
+        }
+        txn.commit()
+            .map_err(|e| format!("commit seed repositories failed: {e}"))?;
+        Ok(())
+    }
+
+    fn put_seed_record(
+        txn: &mut dyn crate::meta::MetaWriteTxn,
+        namespace: &str,
+        path: Vec<String>,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        txn.put(crate::meta::MetaRecordPut::new(
+            crate::meta::MetaKey::new(namespace, path).map_err(|e| e.to_string())?,
+            crate::meta::MetaRecordKind::new(kind).map_err(|e| e.to_string())?,
+            crate::meta::ExpectedRevision::NotExists,
+            crate::meta::repository::encode_json_payload(1, &payload).map_err(|e| e.to_string())?,
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    fn managed_table_state_sql(state: ManagedTableState) -> &'static str {
+        match state {
+            ManagedTableState::Creating => "CREATING",
+            ManagedTableState::Active => "ACTIVE",
+            ManagedTableState::Dropping => "DROPPING",
+            ManagedTableState::Failed => "FAILED",
+        }
+    }
+
+    fn managed_table_kind_sql(kind: ManagedTableKind) -> &'static str {
+        match kind {
+            ManagedTableKind::Table => "TABLE",
+            ManagedTableKind::MaterializedView => "MATERIALIZED_VIEW",
+        }
+    }
+
+    fn managed_partition_state_sql(state: ManagedPartitionState) -> &'static str {
+        match state {
+            ManagedPartitionState::Creating => "CREATING",
+            ManagedPartitionState::Active => "ACTIVE",
+            ManagedPartitionState::Retired => "RETIRED",
+            ManagedPartitionState::Failed => "FAILED",
+        }
+    }
+
+    fn managed_index_state_sql(state: ManagedIndexState) -> &'static str {
+        match state {
+            ManagedIndexState::Creating => "CREATING",
+            ManagedIndexState::Active => "ACTIVE",
+            ManagedIndexState::Retired => "RETIRED",
+            ManagedIndexState::Failed => "FAILED",
+        }
     }
 
     fn aggregate_select_sql() -> &'static str {
