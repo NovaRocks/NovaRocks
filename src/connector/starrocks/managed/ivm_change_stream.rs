@@ -3,6 +3,8 @@ use crate::connector::iceberg::changes::{
 };
 use crate::engine::QueryResult;
 
+// Compatibility wrapper for the older two-branch materialized change stream.
+#[allow(dead_code)]
 pub(crate) struct IvmChangeStream {
     pub(crate) previous_snapshot_id: i64,
     pub(crate) current_snapshot_id: i64,
@@ -10,6 +12,7 @@ pub(crate) struct IvmChangeStream {
     pub(crate) deletes: QueryResult,
 }
 
+#[allow(dead_code)]
 impl IvmChangeStream {
     pub(crate) fn from_materialized(changes: MaterializedChanges) -> Self {
         Self {

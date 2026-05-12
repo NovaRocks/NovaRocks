@@ -694,6 +694,7 @@ fn physical_rows_to_chunks(
 ///
 /// Visible columns and the row-id column are unchanged. Only the
 /// state columns get sign-flipped.
+#[allow(dead_code)]
 pub(crate) fn negate_aggregate_state_chunks(
     chunks: Vec<Chunk>,
     layout: &AggregateMvLayout,
@@ -738,6 +739,7 @@ pub(crate) fn negate_aggregate_state_chunks(
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn negate_state_array(
     array: &ArrayRef,
     state_column: &AggregateStateColumn,
