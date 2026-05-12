@@ -11,9 +11,14 @@
 //! StarRocks-aligned literal coercion at analyzer level.
 //!
 //! When a comparison / IN / BETWEEN has `column op literal` where the column
-//! is a typed reference (DATETIME, DATE, DECIMAL, INT family) and the literal
-//! is a STRING, the literal must be coerced to the column's type *before*
-//! comparison. Mirrors StarRocks' `LiteralExprFactory.create(value, columnType)`.
+//! is a typed reference and the literal is a STRING, the literal must be
+//! coerced to the column's type *before* comparison. Mirrors StarRocks'
+//! `LiteralExprFactory.create(value, columnType)`.
+//!
+//! Today this helper only covers DATE / TIMESTAMP targets because the
+//! underlying `coerce_to_target_type` plumbing only emits a `Cast` for those.
+//! DECIMAL / INT family targets are tracked as a TODO on
+//! `is_coercible_target`.
 //!
 //! For DATETIME with microsecond scale, this preserves up to 6 fractional
 //! digits; longer fractions error rather than silently truncate (matching
@@ -30,21 +35,18 @@ pub(crate) fn is_column_ref(expr: &TypedExpr) -> bool {
 }
 
 /// Returns `true` if `data_type` is one we want to coerce string literals into.
+///
+/// Must stay in sync with the targets `coerce_to_target_type`
+/// (`src/sql/analyzer/resolve_expr.rs`) actually wraps in a `Cast`. Today that
+/// is only DATE / TIMESTAMP — string-to-Decimal / string-to-Int return the
+/// literal unchanged, so claiming them here would silently lie.
+///
+/// TODO: extend with Int / Decimal targets once `coerce_to_target_type`
+/// supports them.
 pub(crate) fn is_coercible_target(data_type: &DataType) -> bool {
-    use arrow::datatypes::TimeUnit;
     matches!(
         data_type,
-        DataType::Date32
-            | DataType::Date64
-            | DataType::Timestamp(TimeUnit::Microsecond, _)
-            | DataType::Timestamp(TimeUnit::Millisecond, _)
-            | DataType::Timestamp(TimeUnit::Second, _)
-            | DataType::Timestamp(TimeUnit::Nanosecond, _)
-            | DataType::Decimal128(_, _)
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
+        DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
     )
 }
 
@@ -52,8 +54,9 @@ pub(crate) fn is_coercible_target(data_type: &DataType) -> bool {
 /// coercible target type, return `right` coerced to `left`'s type.
 /// Otherwise return `right` unchanged.
 ///
-/// Caller is `analyze_binary_op` for `=/!=/<...>=`, `analyze_in_list`,
-/// `analyze_between`.
+/// Currently the only caller is `analyze_binary_op` for `=/!=/<...>=`. The
+/// IN-list and BETWEEN integrations are scheduled to land in M2.T2; update
+/// this comment when those callers are wired in.
 pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) -> TypedExpr {
     if !is_column_ref(left) {
         return right;
@@ -65,8 +68,6 @@ pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) 
         return right;
     }
     // Reuse the existing coercion that already handles STRING → DATE / TIMESTAMP.
-    // Decimal128 / Int* coercion still produces a Cast expression that the
-    // evaluator handles at runtime; analyzer-level we just attach the cast.
     super::resolve_expr::coerce_to_target_type(right, &left.data_type)
 }
 
@@ -129,7 +130,13 @@ mod coercion_tests {
     }
 
     #[test]
-    fn does_not_coerce_when_right_already_typed() {
+    fn does_not_coerce_when_right_is_already_non_string_typed() {
+        // The helper's right-side gate is purely a data_type check
+        // (`!matches!(right.data_type, Utf8 | LargeUtf8)`), so this test
+        // exercises the same gate as the other "non-Utf8 right" cases. It is
+        // kept for documentation: any right operand whose data_type is not
+        // Utf8/LargeUtf8 — including an already-typed Timestamp literal or an
+        // analyzer-produced Cast — short-circuits before any re-coercion.
         let left = column(DataType::Timestamp(TimeUnit::Microsecond, None));
         let right = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1_672_531_200_000_000)),
