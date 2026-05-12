@@ -122,9 +122,10 @@ fn flatten_union_all(
 /// collapsed into literal rows.
 ///
 /// We route via the full pipeline whenever the Query carries clauses the
-/// literal fast path can't represent (WITH/ORDER BY/LIMIT/FETCH/locks), or
-/// when the body is a SELECT that reads from at least one relation, including
-/// table functions such as `TABLE(generate_series(...))`.
+/// literal fast path can't represent (WITH/ORDER BY/LIMIT/FETCH/locks), the
+/// body reads from a relation (incl. table functions like
+/// `TABLE(generate_series(...))`), or any SELECT projection item is an
+/// expression the constant folder cannot reduce to a `Literal`.
 fn should_route_insert_via_from_query(query: &sqlparser::ast::Query) -> bool {
     if query.with.is_some()
         || query.order_by.is_some()
@@ -134,19 +135,35 @@ fn should_route_insert_via_from_query(query: &sqlparser::ast::Query) -> bool {
     {
         return true;
     }
-    body_reads_from_relation(query.body.as_ref())
+    body_requires_pipeline(query.body.as_ref())
 }
 
-fn body_reads_from_relation(body: &sqlparser::ast::SetExpr) -> bool {
+fn body_requires_pipeline(body: &sqlparser::ast::SetExpr) -> bool {
     use sqlparser::ast as sqlast;
     match body {
-        sqlast::SetExpr::Select(select) => !select.from.is_empty(),
+        sqlast::SetExpr::Select(select) => {
+            !select.from.is_empty() || select_projection_requires_pipeline(select)
+        }
         sqlast::SetExpr::Query(inner) => should_route_insert_via_from_query(inner.as_ref()),
         sqlast::SetExpr::SetOperation { left, right, .. } => {
-            body_reads_from_relation(left) || body_reads_from_relation(right)
+            body_requires_pipeline(left) || body_requires_pipeline(right)
         }
         _ => false,
     }
+}
+
+fn select_projection_requires_pipeline(select: &sqlparser::ast::Select) -> bool {
+    use sqlparser::ast as sqlast;
+    select.projection.iter().any(|item| match item {
+        sqlast::SelectItem::UnnamedExpr(expr)
+        | sqlast::SelectItem::ExprWithAlias { expr, .. } => {
+            sqlparser_expr_to_literal(expr).is_err()
+        }
+        // Wildcards have no expression to fold; if we ever see one without a
+        // FROM the analyzer will reject it anyway, so it doesn't matter which
+        // path picks it up.
+        _ => false,
+    })
 }
 
 /// Convert a sqlparser INSERT AST to our custom InsertStmt.

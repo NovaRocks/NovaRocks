@@ -4,7 +4,7 @@ k1	v1
 2	b
 
 -- query 4
-count()
+count(*)
 0
 
 -- query 6
