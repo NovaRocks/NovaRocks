@@ -3,7 +3,8 @@
 pub(crate) mod ast;
 pub(crate) mod dialect;
 pub(crate) mod query_refs;
-mod raw;
+pub(crate) mod raw;
+pub(crate) mod recursive_cte;
 
 use sqlparser::parser::Parser;
 

@@ -1,4 +1,5 @@
 use crate::sql::parser::dialect::StarRocksDialect;
+use crate::sql::parser::recursive_cte;
 use sqlparser::parser::Parser;
 
 /// Parse SQL into a raw sqlparser AST without converting to the custom AST.
@@ -17,6 +18,10 @@ pub(crate) fn parse_normalized_sql_raw(sql: &str) -> Result<sqlparser::ast::Stat
     let stmt = parser
         .parse_statement()
         .map_err(|e| normalize_raw_parse_error(sql, &e.to_string()))?;
+    let max_depth = recursive_cte::extract_recursive_cte_max_depth(sql)
+        .unwrap_or(recursive_cte::DEFAULT_MAX_DEPTH);
+    let mut stmt = stmt;
+    recursive_cte::rewrite_statement(&mut stmt, max_depth)?;
     Ok(stmt)
 }
 
