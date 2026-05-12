@@ -12,9 +12,7 @@ use crate::sql::parser::ast::{
 };
 
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
-use super::store::{
-    ManagedPartitionState, ManagedSnapshot, ManagedTableState, StoredManagedColumn,
-};
+use super::store::{ManagedPartitionState, StoredManagedColumn};
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::{StandaloneState, StatementResult};
@@ -728,82 +726,6 @@ where
         .expect("standalone catalog write lock");
     register_managed_table_in_catalog(&mut catalog, &updated_runtime)?;
     Ok(StatementResult::Ok)
-}
-
-pub(crate) fn initialize_global_meta_if_needed(
-    snapshot: &mut ManagedSnapshot,
-    config: &ManagedLakeConfig,
-) {
-    if snapshot.global == Default::default() {
-        snapshot.global.warehouse_uri = config.warehouse_uri.clone();
-        snapshot.global.next_db_id = 1;
-        snapshot.global.next_table_id = 1;
-        snapshot.global.next_partition_id = 1;
-        snapshot.global.next_index_id = 1;
-        snapshot.global.next_tablet_id = 1;
-        snapshot.global.next_txn_id = 1;
-    }
-}
-
-/// If the snapshot has a `tables` row with `state=DROPPING` at
-/// `(db_id, name)`, drop it (and its associated schema / column / partition /
-/// index / tablet / erase_job / txn rows) so a subsequent ACTIVE insert doesn't
-/// trip the `UNIQUE(db_id, name)` constraint during snapshot replay.
-pub(crate) fn reclaim_dropping_table_for_reuse(
-    snapshot: &mut ManagedSnapshot,
-    db_id: i64,
-    table_name: &str,
-) -> Result<(), String> {
-    let target = normalize_identifier(table_name)?;
-    let stale_ids: Vec<i64> = snapshot
-        .tables
-        .iter()
-        .filter(|tbl| {
-            tbl.db_id == db_id
-                && tbl.state == ManagedTableState::Dropping
-                && normalize_identifier(&tbl.name).ok().as_deref() == Some(target.as_str())
-        })
-        .map(|tbl| tbl.table_id)
-        .collect();
-    if stale_ids.is_empty() {
-        return Ok(());
-    }
-    let stale_set: HashSet<i64> = stale_ids.iter().copied().collect();
-    snapshot
-        .tables
-        .retain(|tbl| !stale_set.contains(&tbl.table_id));
-    let stale_partition_ids: HashSet<i64> = snapshot
-        .partitions
-        .iter()
-        .filter(|p| stale_set.contains(&p.table_id))
-        .map(|p| p.partition_id)
-        .collect();
-    snapshot
-        .partitions
-        .retain(|p| !stale_set.contains(&p.table_id));
-    snapshot
-        .indexes
-        .retain(|i| !stale_set.contains(&i.table_id));
-    snapshot
-        .tablets
-        .retain(|t| !stale_partition_ids.contains(&t.partition_id));
-    snapshot.txns.retain(|t| !stale_set.contains(&t.table_id));
-    let stale_schema_ids: HashSet<i64> = snapshot
-        .schemas
-        .iter()
-        .filter(|s| stale_set.contains(&s.table_id))
-        .map(|s| s.schema_id)
-        .collect();
-    snapshot
-        .schemas
-        .retain(|s| !stale_set.contains(&s.table_id));
-    snapshot
-        .columns
-        .retain(|c| !stale_schema_ids.contains(&c.schema_id));
-    snapshot
-        .erase_jobs
-        .retain(|j| !stale_set.contains(&j.table_id));
-    Ok(())
 }
 
 fn current_time_ms() -> i64 {
