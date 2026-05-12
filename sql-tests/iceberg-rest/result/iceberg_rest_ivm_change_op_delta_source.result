@@ -1,0 +1,24 @@
+-- query 3
+id	amount
+1	100
+2	40
+
+-- query 4
+customer	total_amount
+Alice	100
+Bob	40
+
+-- query 6
+id	customer	amount
+1	Alice	80
+2	Bob	40
+
+-- query 8
+id	amount
+1	80
+2	40
+
+-- query 9
+customer	total_amount
+Alice	80
+Bob	40
