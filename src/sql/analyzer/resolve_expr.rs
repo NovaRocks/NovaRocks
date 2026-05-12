@@ -904,6 +904,30 @@ impl<'a> super::AnalyzerContext<'a> {
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
+        // StarRocks-aligned implicit literal coercion: when a comparison has
+        // (column, literal) we coerce the literal to the column's type before
+        // emitting the BinaryOp. Mirrors LiteralExprFactory.create(value, ty).
+        let (left_typed, right_typed) = {
+            use super::literal_coercion::coerce_literal_for_comparison;
+            let coerce_for_compare = matches!(
+                op,
+                sqlast::BinaryOperator::Eq
+                    | sqlast::BinaryOperator::NotEq
+                    | sqlast::BinaryOperator::Lt
+                    | sqlast::BinaryOperator::LtEq
+                    | sqlast::BinaryOperator::Gt
+                    | sqlast::BinaryOperator::GtEq
+                    | sqlast::BinaryOperator::Spaceship
+            );
+            if coerce_for_compare {
+                let right_coerced = coerce_literal_for_comparison(&left_typed, right_typed);
+                let left_coerced = coerce_literal_for_comparison(&right_coerced, left_typed);
+                (left_coerced, right_coerced)
+            } else {
+                (left_typed, right_typed)
+            }
+        };
+
         let (bin_op, result_type) = match op {
             // Comparison operators -> Boolean
             sqlast::BinaryOperator::Eq => (BinOp::Eq, DataType::Boolean),
@@ -2496,7 +2520,7 @@ fn infer_decimal_precision_scale(s: &str) -> (u8, i8) {
 /// wrap `expr` in a Cast to the target type. This matches StarRocks FE
 /// behavior where string literals are implicitly cast to date/timestamp
 /// in comparison contexts (BETWEEN, WHERE, etc.).
-fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
+pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
     let needs_cast = matches!(expr.data_type, DataType::Utf8 | DataType::LargeUtf8)
         && matches!(
             target,

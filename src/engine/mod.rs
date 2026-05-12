@@ -6510,4 +6510,39 @@ enable_path_style_access = true
 
         drop(engine);
     }
+
+    #[test]
+    fn select_with_datetime_literal_matches_microsecond_precision() {
+        let _runtime_guard = lock_runtime_test_state();
+        let Some((_dir, config_path, _metadata_db_path)) = maybe_managed_lake_config() else {
+            return;
+        };
+
+        let engine = StandaloneNovaRocks::open(StandaloneOptions {
+            config_path: Some(config_path),
+            metadata_db_path: None,
+        })
+        .expect("open engine");
+        let session = engine.session();
+
+        session
+            .execute(
+                "CREATE TABLE t_dt_coerce (c1 INT, c2 DATETIME) \
+                 DUPLICATE KEY(c1) DISTRIBUTED BY HASH(c1) BUCKETS 1 \
+                 PROPERTIES('replication_num'='1')",
+            )
+            .expect("create table");
+        session
+            .execute("INSERT INTO t_dt_coerce VALUES (4, '2020-01-01 00:00:00.012')")
+            .expect("insert row");
+
+        let r = session
+            .query("SELECT c1 FROM t_dt_coerce WHERE c2 = '2020-01-01 00:00:00.012'")
+            .expect("query with datetime literal");
+        assert_eq!(
+            r.row_count(),
+            1,
+            "implicit STRING→DATETIME coercion should match"
+        );
+    }
 }

@@ -5,6 +5,7 @@
 
 mod functions;
 mod helpers;
+mod literal_coercion;
 mod resolve_expr;
 mod resolve_from;
 mod scope;
