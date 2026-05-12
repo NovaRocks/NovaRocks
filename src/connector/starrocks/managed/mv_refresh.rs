@@ -33,7 +33,7 @@ use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::connector::starrocks::managed::ddl::{
     bootstrap_empty_partition_for_tablets, build_create_tablet_request, request_schema_from_runtime,
 };
-use crate::connector::starrocks::managed::store::{
+use crate::connector::starrocks::managed::model::{
     IcebergTableRef, ManagedMvStorageEngine, ManagedPartitionState, ManagedTableKind,
 };
 use crate::connector::starrocks::managed::txn::{
@@ -1553,13 +1553,13 @@ mod tests {
         patch_tablet_schema_column_flags, stored_columns_from_physical_columns,
         table_columns_from_physical_columns,
     };
-    use crate::connector::starrocks::managed::mv_refresh_strategy::FullRefreshReason;
-    use crate::connector::starrocks::managed::store::{
+    use crate::connector::starrocks::managed::model::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
-        ManagedSnapshot, ManagedTableKind, ManagedTableState, SqliteMetadataStore,
-        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
+        ManagedSnapshot, ManagedTableKind, ManagedTableState, StoredManagedDatabase,
+        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
+        StoredManagedTablet, StoredMaterializedView,
     };
+    use crate::connector::starrocks::managed::mv_refresh_strategy::FullRefreshReason;
     use crate::engine::catalog::InMemoryCatalog;
     use crate::engine::{QueryResult, QueryResultColumn, record_batch_to_chunk};
     use crate::formats::starrocks::metadata::load_tablet_snapshot;
@@ -1853,7 +1853,6 @@ mod tests {
         let engine = match crate::engine::StandaloneNovaRocks::open(
             crate::engine::StandaloneOptions {
                 config_path: Some(config_path),
-                metadata_db_path: None,
             },
         ) {
             Ok(engine) => engine,
@@ -2152,7 +2151,6 @@ mod tests {
         let engine = match crate::engine::StandaloneNovaRocks::open(
             crate::engine::StandaloneOptions {
                 config_path: Some(config_path),
-                metadata_db_path: None,
             },
         ) {
             Ok(engine) => engine,
@@ -2319,7 +2317,6 @@ mod tests {
         let engine = match crate::engine::StandaloneNovaRocks::open(
             crate::engine::StandaloneOptions {
                 config_path: Some(config_path),
-                metadata_db_path: None,
             },
         ) {
             Ok(engine) => engine,
@@ -2466,7 +2463,6 @@ mod tests {
         let engine = match crate::engine::StandaloneNovaRocks::open(
             crate::engine::StandaloneOptions {
                 config_path: Some(config_path),
-                metadata_db_path: None,
             },
         ) {
             Ok(engine) => engine,
@@ -2726,9 +2722,12 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                r#"[standalone_server]
+                r#"[metadata]
+provider = "sqlite"
+path = "meta/standalone.sqlite"
+
+[standalone_server]
 user = "root"
-metadata_db_path = "meta/standalone.sqlite"
 warehouse_uri = "{warehouse_uri}"
 
 [standalone_server.object_store]
@@ -2891,7 +2890,6 @@ enable_path_style_access = true
     fn seed_mv_refresh_state() -> (tempfile::TempDir, Arc<StandaloneState>, i64) {
         let dir = tempfile::tempdir().expect("tempdir");
         let metadata_path = dir.path().join("standalone.sqlite");
-        let store = SqliteMetadataStore::open(&metadata_path).expect("open legacy store");
         let provider =
             crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
         let config = test_managed_config();
@@ -2964,7 +2962,6 @@ enable_path_style_access = true
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
             metadata_provider: Some(Arc::new(provider)),
-            metadata_store: Some(store),
             exchange_port: 0,
             ..Default::default()
         });
@@ -2983,7 +2980,6 @@ enable_path_style_access = true
     > {
         let metadata_dir = tempfile::tempdir().map_err(|e| format!("tempdir failed: {e}"))?;
         let metadata_path = metadata_dir.path().join("standalone.sqlite");
-        let store = SqliteMetadataStore::open(&metadata_path)?;
         let provider = crate::meta::SqliteMetaStoreProvider::open(&metadata_path)
             .map_err(|e| format!("open meta provider failed: {e}"))?;
         let shape = aggregate_mv_shape()?;
@@ -3096,7 +3092,6 @@ enable_path_style_access = true
                 refresh_target_snapshots: Default::default(),
             }],
         };
-        store.replace_managed_snapshot(&snapshot)?;
         seed_repository_snapshot_for_mv_refresh(&provider, &snapshot)?;
         let managed = ManagedLakeCatalog::rebuild(Some(config.clone()), snapshot)?;
         let mut catalog = InMemoryCatalog::default();
@@ -3110,7 +3105,6 @@ enable_path_style_access = true
             connectors: Arc::new(RwLock::new(crate::connector::ConnectorRegistry::default())),
             managed_lake_config: Some(config),
             metadata_provider: Some(Arc::new(provider)),
-            metadata_store: Some(store),
             exchange_port: 0,
             ..Default::default()
         });

@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use sqlparser::ast as sqlast;
 
-use crate::connector::starrocks::managed::store::{ManagedTableKind, ManagedTableState};
+use crate::connector::starrocks::managed::model::{ManagedTableKind, ManagedTableState};
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
 #[derive(Clone, Debug)]

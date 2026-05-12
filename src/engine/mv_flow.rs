@@ -182,7 +182,7 @@ pub(crate) fn execute_query_for_mv_refresh(
 }
 
 fn normalize_incremental_mv_base_ref(
-    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     Ok((
         normalize_identifier(&base_ref.catalog)?,
@@ -193,7 +193,7 @@ fn normalize_incremental_mv_base_ref(
 
 pub(crate) fn validate_incremental_mv_base_ref(
     query: &sqlparser::ast::Query,
-    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
 ) -> Result<(String, String, String), String> {
     let refs = extract_three_part_table_ref_occurrences(query);
     if refs.len() != 1 {
@@ -231,7 +231,7 @@ pub(crate) fn execute_query_for_mv_incremental_refresh(
     state: &Arc<StandaloneState>,
     current_database: &str,
     sql: &str,
-    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
     delta_files: Vec<IcebergFileForQuery>,
 ) -> Result<QueryResult, String> {
     let normalized = crate::sql::parser::dialect::normalize_for_raw_parse(sql)?;
@@ -339,7 +339,7 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
     state: &Arc<StandaloneState>,
     current_database: &str,
     sql: &str,
-    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
     deleted_rows: Vec<arrow::record_batch::RecordBatch>,
 ) -> Result<QueryResult, String> {
     if deleted_rows.is_empty() {
@@ -411,8 +411,8 @@ mod tests {
         *query
     }
 
-    fn base_ref() -> crate::connector::starrocks::managed::store::IcebergTableRef {
-        crate::connector::starrocks::managed::store::IcebergTableRef {
+    fn base_ref() -> crate::connector::starrocks::managed::model::IcebergTableRef {
+        crate::connector::starrocks::managed::model::IcebergTableRef {
             catalog: "ice".to_string(),
             namespace: "db".to_string(),
             table: "t".to_string(),

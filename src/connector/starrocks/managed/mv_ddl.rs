@@ -38,12 +38,12 @@ use crate::connector::starrocks::managed::ddl::{
     managed_physical_column, patch_tablet_schema_column_flags,
     stored_columns_from_physical_columns, table_columns_from_physical_columns,
 };
-use crate::connector::starrocks::managed::mv_shape::{
-    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
-};
-use crate::connector::starrocks::managed::store::{
+use crate::connector::starrocks::managed::model::{
     IcebergTableRef, ManagedMvRefreshMode, ManagedMvStorageEngine, ManagedTableKind,
     ManagedTableState,
+};
+use crate::connector::starrocks::managed::mv_shape::{
+    AggregateFunctionKind, AggregateMvShape, IncrementalMvShape, VisibleAggregateOutput,
 };
 use crate::engine::{QueryResult, QueryResultColumn, StandaloneState, StatementResult};
 
@@ -824,25 +824,6 @@ pub(crate) fn drop_mv(
         },
     )?;
     Ok(StatementResult::Ok)
-}
-
-pub(crate) fn delete_mv_definition_by_id(
-    state: &Arc<StandaloneState>,
-    mv_id: i64,
-) -> Result<(), String> {
-    let Some(provider) = state.metadata_provider.as_ref() else {
-        return Ok(());
-    };
-    let mut txn = provider
-        .begin_write("delete materialized view definition")
-        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
-    state
-        .mv_repo
-        .drop_by_id(txn.as_mut(), mv_id)
-        .map_err(|e| format!("delete materialized view definition failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit materialized view definition delete failed: {e}"))?;
-    Ok(())
 }
 
 fn find_mv_definition_by_target(
@@ -1643,7 +1624,7 @@ fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::StoredManagedTable;
+    use super::super::model::StoredManagedTable;
     use super::*;
     use crate::connector::starrocks::managed::catalog::ManagedTableRuntime;
     use crate::engine::catalog::InMemoryCatalog;
@@ -1664,21 +1645,10 @@ mod tests {
     fn open_state_with_sqlite_store() -> (Arc<StandaloneState>, TempDir) {
         let dir = TempDir::new().expect("metadata tempdir");
         let metadata_path = dir.path().join("standalone.sqlite");
-        let metadata_store =
-            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(&metadata_path)
-                .expect("open sqlite store");
         let metadata_provider =
             crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
-        let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
-        snapshot.global.warehouse_uri = format!("file://{}", dir.path().join("managed").display());
-        snapshot.global.next_db_id = 1;
-        snapshot.global.next_table_id = 1;
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .expect("initialize metadata snapshot");
         let state = Arc::new(StandaloneState {
             metadata_provider: Some(Arc::new(metadata_provider)),
-            metadata_store: Some(metadata_store),
             ..StandaloneState::default()
         });
         (state, dir)
@@ -1703,9 +1673,6 @@ mod tests {
     fn state_with_inflight_managed_mv() -> (Arc<StandaloneState>, TempDir) {
         let dir = TempDir::new().expect("metadata tempdir");
         let metadata_path = dir.path().join("standalone.sqlite");
-        let metadata_store =
-            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(&metadata_path)
-                .expect("open sqlite store");
         let metadata_provider =
             crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
         let warehouse_uri = format!("file://{}", dir.path().join("managed").display());
@@ -1820,7 +1787,6 @@ mod tests {
             managed_lake: RwLock::new(managed),
             managed_lake_config: Some(config),
             metadata_provider: Some(Arc::new(metadata_provider)),
-            metadata_store: Some(metadata_store),
             ..StandaloneState::default()
         });
         (state, dir)

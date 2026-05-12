@@ -570,7 +570,7 @@ pub(crate) fn materialize_changes(
     state: &std::sync::Arc<crate::engine::StandaloneState>,
     current_database: &str,
     sql: &str,
-    base_ref: &crate::connector::starrocks::managed::store::IcebergTableRef,
+    base_ref: &crate::connector::starrocks::managed::model::IcebergTableRef,
     base_table: &iceberg::table::Table,
     batch: IcebergChangeBatch,
     object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,

@@ -36,10 +36,6 @@ use crate::connector::iceberg::commit::{
 use crate::connector::iceberg::data_writer::{
     RowLineageColumns, RowLineageWriteBatch, write_row_lineage_batches_as_data_files,
 };
-use crate::connector::starrocks::managed::store::{
-    IcebergOptimizeJobOutcome, IcebergOptimizeJobState, SqliteMetadataStore,
-    StoredIcebergOptimizeJob,
-};
 use crate::engine::StandaloneState;
 use crate::engine::backend_resolver::TargetBackend;
 use crate::engine::iceberg_writer::{
@@ -48,15 +44,18 @@ use crate::engine::iceberg_writer::{
 };
 use crate::engine::mv::iceberg_refresh::write_chunks_as_iceberg_data_files;
 use crate::exec::row_position::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
+use crate::meta::repository::job::{
+    IcebergOptimizeJobOutcome, IcebergOptimizeJobState, StoredIcebergOptimizeJob,
+};
 
 const OPTIMIZE_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) fn spawn_optimize_worker(state: Arc<StandaloneState>) {
-    let Some(store) = state.metadata_store.as_ref() else {
+    if state.metadata_provider.is_none() {
         return;
-    };
+    }
 
-    match reconcile_running_optimize_jobs_once(store) {
+    match reconcile_running_optimize_jobs_once(&state) {
         Ok(failed) if failed > 0 => {
             tracing::warn!(
                 failed,
@@ -83,11 +82,11 @@ fn optimize_worker_loop(state: Weak<StandaloneState>) {
         let Some(strong) = state.upgrade() else {
             return;
         };
-        let Some(store) = strong.metadata_store.clone() else {
+        if strong.metadata_provider.is_none() {
             return;
-        };
+        }
 
-        if let Err(err) = run_optimize_jobs_once(&strong, &store) {
+        if let Err(err) = run_optimize_jobs_once(&strong) {
             tracing::warn!("iceberg optimize worker iteration failed: {err}");
         }
         drop(strong);
@@ -95,14 +94,11 @@ fn optimize_worker_loop(state: Weak<StandaloneState>) {
     }
 }
 
-pub(crate) fn run_optimize_jobs_once(
-    state: &Arc<StandaloneState>,
-    store: &SqliteMetadataStore,
-) -> Result<(), String> {
-    finish_recorded_running_outcomes_once(store)?;
-    let jobs = store.list_pending_iceberg_optimize_jobs()?;
+pub(crate) fn run_optimize_jobs_once(state: &Arc<StandaloneState>) -> Result<(), String> {
+    finish_recorded_running_outcomes_once(state)?;
+    let jobs = list_pending_iceberg_optimize_jobs(state)?;
     for job in jobs {
-        let running = match store.claim_iceberg_optimize_job(job.id, now_ms()) {
+        let running = match claim_iceberg_optimize_job(state, job.id) {
             Ok(running) => running,
             Err(err) => {
                 tracing::warn!(
@@ -117,22 +113,20 @@ pub(crate) fn run_optimize_jobs_once(
         };
         match run_one_optimize_job(state, &running) {
             Ok(outcome) => {
-                store
-                    .record_iceberg_optimize_job_outcome(running.id, now_ms(), outcome.clone())
-                    .map_err(|err| {
+                record_iceberg_optimize_job_outcome(state, running.id, outcome.clone()).map_err(
+                    |err| {
                         format!(
                             "iceberg optimize job {} completed but persisting commit outcome failed: {err}",
                             running.id
                         )
-                    })?;
-                store
-                    .finish_iceberg_optimize_job(running.id, now_ms(), outcome)
-                    .map_err(|err| {
-                        format!(
-                            "iceberg optimize job {} completed but persisting FINISHED state failed: {err}",
-                            running.id
-                        )
-                    })?;
+                    },
+                )?;
+                finish_iceberg_optimize_job(state, running.id, outcome).map_err(|err| {
+                    format!(
+                        "iceberg optimize job {} completed but persisting FINISHED state failed: {err}",
+                        running.id
+                    )
+                })?;
             }
             Err(err) => {
                 tracing::warn!(
@@ -142,7 +136,7 @@ pub(crate) fn run_optimize_jobs_once(
                     table = running.table,
                     "iceberg optimize job failed: {err}"
                 );
-                store.fail_iceberg_optimize_job(running.id, now_ms(), &err)?;
+                fail_iceberg_optimize_job(state, running.id, err)?;
             }
         }
     }
@@ -150,25 +144,152 @@ pub(crate) fn run_optimize_jobs_once(
 }
 
 pub(crate) fn reconcile_running_optimize_jobs_once(
-    store: &SqliteMetadataStore,
+    state: &Arc<StandaloneState>,
 ) -> Result<usize, String> {
-    let finished = finish_recorded_running_outcomes_once(store)?;
-    let failed = store.fail_running_iceberg_optimize_jobs_on_startup(now_ms())?;
+    let finished = finish_recorded_running_outcomes_once(state)?;
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let mut txn = provider
+        .begin_write("fail running iceberg optimize jobs on startup")
+        .map_err(|e| format!("open iceberg optimize startup transaction failed: {e}"))?;
+    let failed = state
+        .job_repo
+        .fail_running_iceberg_optimize_jobs_on_startup(txn.as_mut(), now_ms())
+        .map_err(|e| format!("fail running iceberg optimize jobs on startup failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg optimize startup transaction failed: {e}"))?;
     Ok(finished + failed)
 }
 
-fn finish_recorded_running_outcomes_once(store: &SqliteMetadataStore) -> Result<usize, String> {
+fn finish_recorded_running_outcomes_once(state: &Arc<StandaloneState>) -> Result<usize, String> {
     let mut finished = 0usize;
-    for job in store.show_iceberg_optimize_jobs()? {
+    for job in show_iceberg_optimize_jobs(state)? {
         if job.state != IcebergOptimizeJobState::Running {
             continue;
         }
         if let Some(outcome) = job.outcome.clone() {
-            store.finish_iceberg_optimize_job(job.id, now_ms(), outcome)?;
+            finish_iceberg_optimize_job(state, job.id, outcome)?;
             finished += 1;
         }
     }
     Ok(finished)
+}
+
+fn list_pending_iceberg_optimize_jobs(
+    state: &Arc<StandaloneState>,
+) -> Result<Vec<StoredIcebergOptimizeJob>, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg optimize job read transaction failed: {e}"))?;
+    state
+        .job_repo
+        .list_pending_iceberg_optimize_jobs(read.as_ref())
+        .map_err(|e| format!("list pending iceberg optimize jobs failed: {e}"))
+}
+
+fn show_iceberg_optimize_jobs(
+    state: &Arc<StandaloneState>,
+) -> Result<Vec<StoredIcebergOptimizeJob>, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg optimize job show transaction failed: {e}"))?;
+    state
+        .job_repo
+        .show_iceberg_optimize_jobs(read.as_ref())
+        .map_err(|e| format!("show iceberg optimize jobs failed: {e}"))
+}
+
+fn claim_iceberg_optimize_job(
+    state: &Arc<StandaloneState>,
+    job_id: i64,
+) -> Result<StoredIcebergOptimizeJob, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let mut txn = provider
+        .begin_write("claim iceberg optimize job")
+        .map_err(|e| format!("open iceberg optimize claim transaction failed: {e}"))?;
+    let job = state
+        .job_repo
+        .claim_iceberg_optimize_job(txn.as_mut(), job_id, now_ms())
+        .map_err(|e| format!("claim iceberg optimize job failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg optimize claim transaction failed: {e}"))?;
+    Ok(job)
+}
+
+fn record_iceberg_optimize_job_outcome(
+    state: &Arc<StandaloneState>,
+    job_id: i64,
+    outcome: IcebergOptimizeJobOutcome,
+) -> Result<StoredIcebergOptimizeJob, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let mut txn = provider
+        .begin_write("record iceberg optimize job outcome")
+        .map_err(|e| format!("open iceberg optimize outcome transaction failed: {e}"))?;
+    let job = state
+        .job_repo
+        .record_iceberg_optimize_job_outcome(txn.as_mut(), job_id, now_ms(), outcome)
+        .map_err(|e| format!("record iceberg optimize job outcome failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg optimize outcome transaction failed: {e}"))?;
+    Ok(job)
+}
+
+fn finish_iceberg_optimize_job(
+    state: &Arc<StandaloneState>,
+    job_id: i64,
+    outcome: IcebergOptimizeJobOutcome,
+) -> Result<StoredIcebergOptimizeJob, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let mut txn = provider
+        .begin_write("finish iceberg optimize job")
+        .map_err(|e| format!("open iceberg optimize finish transaction failed: {e}"))?;
+    let job = state
+        .job_repo
+        .finish_iceberg_optimize_job(txn.as_mut(), job_id, now_ms(), outcome)
+        .map_err(|e| format!("finish iceberg optimize job failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg optimize finish transaction failed: {e}"))?;
+    Ok(job)
+}
+
+fn fail_iceberg_optimize_job(
+    state: &Arc<StandaloneState>,
+    job_id: i64,
+    error_message: String,
+) -> Result<StoredIcebergOptimizeJob, String> {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "iceberg optimize metadata provider is not configured".to_string())?;
+    let mut txn = provider
+        .begin_write("fail iceberg optimize job")
+        .map_err(|e| format!("open iceberg optimize fail transaction failed: {e}"))?;
+    let job = state
+        .job_repo
+        .fail_iceberg_optimize_job(txn.as_mut(), job_id, now_ms(), error_message)
+        .map_err(|e| format!("fail iceberg optimize job failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit iceberg optimize fail transaction failed: {e}"))?;
+    Ok(job)
 }
 
 pub(crate) fn run_one_optimize_job(
@@ -552,9 +673,13 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::connector::starrocks::managed::store::{
-        IcebergOptimizeJobOutcome, IcebergOptimizeJobState, SqliteMetadataStore,
+    use std::sync::Arc;
+
+    use crate::engine::StandaloneState;
+    use crate::meta::repository::job::{
+        CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome, IcebergOptimizeJobState,
     };
+    use crate::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
 
     use super::{quote_ident, reconcile_running_optimize_jobs_once};
 
@@ -567,13 +692,31 @@ mod tests {
     #[test]
     fn reconcile_running_optimize_jobs_finishes_recorded_outcome() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            SqliteMetadataStore::open(dir.path().join("metadata.sqlite")).expect("open store");
-        let job = store
-            .create_iceberg_optimize_job("ice", "ns", "orders", 10, 1_000)
+        let provider = Arc::new(
+            SqliteMetaStoreProvider::open(dir.path().join("metadata.sqlite"))
+                .expect("open provider"),
+        );
+        let state = Arc::new(StandaloneState {
+            metadata_provider: Some(provider.clone()),
+            ..Default::default()
+        });
+        let mut txn = provider.begin_write("create optimize job").expect("write");
+        let job = state
+            .job_repo
+            .create_iceberg_optimize_job(
+                txn.as_mut(),
+                CreateIcebergOptimizeJobRequest {
+                    catalog: "ice".to_string(),
+                    namespace: "ns".to_string(),
+                    table: "orders".to_string(),
+                    base_snapshot_id: 10,
+                    now_ms: 1_000,
+                },
+            )
             .expect("create job");
-        store
-            .claim_iceberg_optimize_job(job.id, 1_100)
+        state
+            .job_repo
+            .claim_iceberg_optimize_job(txn.as_mut(), job.id, 1_100)
             .expect("claim job");
         let outcome = IcebergOptimizeJobOutcome {
             target_snapshot_id: Some(11),
@@ -582,14 +725,20 @@ mod tests {
             added_data_files: 1,
             output_record_count: 7,
         };
-        store
-            .record_iceberg_optimize_job_outcome(job.id, 1_200, outcome.clone())
+        state
+            .job_repo
+            .record_iceberg_optimize_job_outcome(txn.as_mut(), job.id, 1_200, outcome.clone())
             .expect("record outcome");
+        txn.commit().expect("commit seed");
 
-        let changed = reconcile_running_optimize_jobs_once(&store).expect("reconcile");
+        let changed = reconcile_running_optimize_jobs_once(&state).expect("reconcile");
 
         assert_eq!(changed, 1);
-        let jobs = store.show_iceberg_optimize_jobs().expect("show jobs");
+        let read = provider.begin_read().expect("read");
+        let jobs = state
+            .job_repo
+            .show_iceberg_optimize_jobs(read.as_ref())
+            .expect("show jobs");
         assert_eq!(jobs[0].state, IcebergOptimizeJobState::Finished);
         assert_eq!(jobs[0].outcome, Some(outcome));
     }

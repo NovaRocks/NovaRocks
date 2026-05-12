@@ -177,7 +177,7 @@ mod tests {
 
     use super::run_erase_jobs_once_with;
     use crate::connector::starrocks::managed::config::ManagedLakeConfig;
-    use crate::connector::starrocks::managed::store::{
+    use crate::connector::starrocks::managed::model::{
         ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
         ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
         ManagedTxnState, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,

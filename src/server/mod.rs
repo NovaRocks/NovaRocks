@@ -58,7 +58,6 @@ pub fn run_standalone_server(opts: StandaloneServerOptions) -> Result<(), String
     let resolved = resolve_server_options(&opts)?;
     let engine = StandaloneNovaRocks::open(StandaloneOptions {
         config_path: resolved.config_path.clone(),
-        metadata_db_path: None,
     })?;
     preload_tables(&engine, &resolved.tables)?;
     crate::engine::register_stream_load_engine(engine.clone());

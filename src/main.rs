@@ -212,7 +212,6 @@ fn parse_standalone_server_args(
 fn run_standalone(cli: StandaloneCliArgs) -> Result<(), String> {
     let engine = StandaloneNovaRocks::open(StandaloneOptions {
         config_path: cli.config_path.map(Into::into),
-        metadata_db_path: None,
     })?;
     engine.register_parquet_table(&cli.table_name, &cli.parquet_path)?;
     let session = engine.session();

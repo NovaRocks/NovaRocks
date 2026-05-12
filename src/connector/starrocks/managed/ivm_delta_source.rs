@@ -6,7 +6,7 @@ use crate::connector::iceberg::changes::{
     IcebergChangeBatch, build_factory_for_table, normalize_delete_projection_path,
     scan_deleted_data_file_rows, scan_equality_delete_rows_for_table,
 };
-use crate::connector::starrocks::managed::store::IcebergTableRef;
+use crate::connector::starrocks::managed::model::IcebergTableRef;
 use crate::engine::catalog::InMemoryCatalog;
 use crate::engine::query_prep::{IcebergFileForQuery, build_iceberg_delta_table_def_with_files};
 use crate::engine::{QueryResult, StandaloneState, execute_query};

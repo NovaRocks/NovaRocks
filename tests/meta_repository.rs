@@ -5,7 +5,10 @@ use novarocks::meta::keys::{NS_JOB, NS_MANAGED_TXN};
 use novarocks::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
 };
-use novarocks::meta::repository::job::{CreateEraseJobRequest, JobMetaRepository, JobState};
+use novarocks::meta::repository::job::{
+    CreateEraseJobRequest, CreateIcebergOptimizeJobRequest, IcebergOptimizeJobOutcome,
+    IcebergOptimizeJobState, JobMetaRepository, JobState,
+};
 use novarocks::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedDatabaseRequest, CreateManagedTableLayoutRequest,
     CreateManagedTableRequest, ManagedIndexState, ManagedLakeMetaRepository, ManagedPartitionState,
@@ -202,6 +205,174 @@ fn job_repository_claim_finish_and_fail_are_state_checked() -> Result<(), Box<dy
     assert_eq!(job.retry_at_ms, None);
     assert_eq!(job.updated_at_ms, 1200);
     assert_eq!(job.last_error, None);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_runs_iceberg_optimize_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+    let outcome = IcebergOptimizeJobOutcome {
+        target_snapshot_id: Some(42),
+        rewritten_data_files: 3,
+        deleted_data_files: 2,
+        added_data_files: 1,
+        output_record_count: 99,
+    };
+
+    let job_id = {
+        let mut txn = provider.begin_write("create iceberg optimize job")?;
+        let job = repository.create_iceberg_optimize_job(
+            txn.as_mut(),
+            CreateIcebergOptimizeJobRequest {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+                base_snapshot_id: 7,
+                now_ms: 1000,
+            },
+        )?;
+        assert_eq!(job.state, IcebergOptimizeJobState::Pending);
+        assert_eq!(job.created_at_ms, 1000);
+        assert_eq!(job.started_at_ms, None);
+        assert_eq!(job.finished_at_ms, None);
+        let duplicate = repository
+            .create_iceberg_optimize_job(
+                txn.as_mut(),
+                CreateIcebergOptimizeJobRequest {
+                    catalog: "ice".to_string(),
+                    namespace: "sales".to_string(),
+                    table: "orders".to_string(),
+                    base_snapshot_id: 8,
+                    now_ms: 1001,
+                },
+            )
+            .expect_err("active optimize job should block duplicate");
+        assert_eq!(duplicate.kind(), RepositoryErrorKind::Conflict);
+        txn.commit()?;
+        job.id
+    };
+
+    {
+        let read = provider.begin_read()?;
+        let pending = repository.list_pending_iceberg_optimize_jobs(read.as_ref())?;
+        assert_eq!(
+            pending.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![job_id]
+        );
+    }
+
+    {
+        let mut txn = provider.begin_write("claim and record iceberg optimize")?;
+        let claimed = repository.claim_iceberg_optimize_job(txn.as_mut(), job_id, 1100)?;
+        assert_eq!(claimed.state, IcebergOptimizeJobState::Running);
+        assert_eq!(claimed.started_at_ms, Some(1100));
+        let recorded = repository.record_iceberg_optimize_job_outcome(
+            txn.as_mut(),
+            job_id,
+            1200,
+            outcome.clone(),
+        )?;
+        assert_eq!(recorded.state, IcebergOptimizeJobState::Running);
+        assert_eq!(recorded.finished_at_ms, Some(1200));
+        assert_eq!(recorded.outcome, Some(outcome.clone()));
+        let finished =
+            repository.finish_iceberg_optimize_job(txn.as_mut(), job_id, 1300, outcome.clone())?;
+        assert_eq!(finished.state, IcebergOptimizeJobState::Finished);
+        assert_eq!(finished.finished_at_ms, Some(1300));
+        assert_eq!(finished.outcome, Some(outcome));
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("create optimize job after finish")?;
+        let next = repository.create_iceberg_optimize_job(
+            txn.as_mut(),
+            CreateIcebergOptimizeJobRequest {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+                base_snapshot_id: 9,
+                now_ms: 1400,
+            },
+        )?;
+        assert_ne!(next.id, job_id);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let shown = repository.show_iceberg_optimize_jobs(read.as_ref())?;
+    assert_eq!(shown.len(), 2);
+    assert_eq!(shown[0].id, job_id);
+    assert_eq!(shown[0].state, IcebergOptimizeJobState::Finished);
+    assert_eq!(shown[1].state, IcebergOptimizeJobState::Pending);
+
+    Ok(())
+}
+
+#[test]
+fn job_repository_fails_running_iceberg_optimize_jobs_on_startup()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = JobMetaRepository::default();
+
+    let (running_id, pending_id) = {
+        let mut txn = provider.begin_write("seed iceberg optimize jobs")?;
+        let running = repository.create_iceberg_optimize_job(
+            txn.as_mut(),
+            CreateIcebergOptimizeJobRequest {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "orders".to_string(),
+                base_snapshot_id: 7,
+                now_ms: 1000,
+            },
+        )?;
+        repository.claim_iceberg_optimize_job(txn.as_mut(), running.id, 1100)?;
+        let pending = repository.create_iceberg_optimize_job(
+            txn.as_mut(),
+            CreateIcebergOptimizeJobRequest {
+                catalog: "ice".to_string(),
+                namespace: "sales".to_string(),
+                table: "lineitem".to_string(),
+                base_snapshot_id: 8,
+                now_ms: 1001,
+            },
+        )?;
+        txn.commit()?;
+        (running.id, pending.id)
+    };
+
+    {
+        let mut txn = provider.begin_write("fail running optimize jobs on startup")?;
+        let changed =
+            repository.fail_running_iceberg_optimize_jobs_on_startup(txn.as_mut(), 2000)?;
+        assert_eq!(changed, 1);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let shown = repository.show_iceberg_optimize_jobs(read.as_ref())?;
+    let running = shown
+        .iter()
+        .find(|job| job.id == running_id)
+        .expect("running job");
+    assert_eq!(running.state, IcebergOptimizeJobState::Failed);
+    assert_eq!(running.finished_at_ms, Some(2000));
+    assert!(
+        running
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("running during metadata store startup"))
+    );
+    let pending = shown
+        .iter()
+        .find(|job| job.id == pending_id)
+        .expect("pending job");
+    assert_eq!(pending.state, IcebergOptimizeJobState::Pending);
 
     Ok(())
 }

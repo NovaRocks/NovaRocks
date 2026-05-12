@@ -17,6 +17,7 @@ use crate::connector::iceberg::commit::{
     CommitOpKind, CommitOutcome, IcebergCommitCollector, RunInput, run_iceberg_commit,
 };
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
+use crate::connector::starrocks::managed::model::{IcebergTableRef, ManagedMvStorageEngine};
 use crate::connector::starrocks::managed::mv_ddl::{
     analyze_mv_select, canonicalize_iceberg_mv_select_query, extract_base_table_refs, now_ms,
     output_column_to_table_column, resolve_mv_name, validate_mv_partition_columns,
@@ -27,10 +28,6 @@ use crate::connector::starrocks::managed::mv_refresh::{
 };
 use crate::connector::starrocks::managed::mv_shape::{
     IncrementalMvShape, classify_incremental_mv_query,
-};
-use crate::connector::starrocks::managed::store::{
-    IcebergTableRef, InsertIcebergMvRowRequest, ManagedMvStorageEngine,
-    UpdateMvIcebergRefreshMetadataRequest,
 };
 use crate::engine::mv_flow::execute_query_for_mv_incremental_refresh;
 use crate::engine::query_prep::IcebergFileForQuery;
@@ -59,10 +56,6 @@ pub(crate) fn create_iceberg_mv(
     stmt: &CreateMaterializedViewStmt,
 ) -> Result<StatementResult, String> {
     let target = resolve_iceberg_mv_target(state, current_catalog, current_database, stmt)?;
-    let metadata_store = state
-        .metadata_store
-        .as_ref()
-        .ok_or_else(|| "sqlite metadata store required for iceberg mv".to_string())?;
     let entry = {
         let catalogs = state
             .iceberg_catalogs
@@ -80,7 +73,6 @@ pub(crate) fn create_iceberg_mv(
     // 1. Analyze and classify shape — phase4a only accepts projection/filter.
     let canonical_select_query =
         canonicalize_iceberg_mv_select_query(&stmt.select_query, current_catalog, current_database);
-    let canonical_select_sql = canonical_select_query.to_string();
     let analysis = analyze_mv_select(
         state,
         current_catalog,
@@ -135,12 +127,10 @@ pub(crate) fn create_iceberg_mv(
         &[("format-version".to_string(), "2".to_string())],
     )?;
 
-    // 3. Persist MV metadata during the repository migration. The repository
-    // owns MV id allocation; the legacy row mirrors that id only for the
-    // remaining transitional refresh/drop paths.
+    // 3. Persist MV metadata in the repository.
     let primary_key_columns = stmt.primary_key.clone().unwrap_or_default();
     let created_at_ms = now_ms();
-    let mv_definition = {
+    if let Err(err) = (|| {
         let provider = state
             .metadata_provider
             .as_ref()
@@ -148,7 +138,7 @@ pub(crate) fn create_iceberg_mv(
         let mut txn = provider
             .begin_write("create iceberg materialized view definition")
             .map_err(|e| format!("open iceberg mv definition transaction failed: {e}"))?;
-        let created = state
+        state
             .mv_repo
             .create_definition(
                 txn.as_mut(),
@@ -166,34 +156,16 @@ pub(crate) fn create_iceberg_mv(
             .map_err(|e| format!("create iceberg MV repository metadata failed: {e}"))?;
         txn.commit()
             .map_err(|e| format!("commit iceberg MV repository metadata failed: {e}"))?;
-        created
-    };
-    let insert_request = InsertIcebergMvRowRequest {
-        mv_id: mv_definition.mv_id,
-        select_sql: canonical_select_sql.clone(),
-        base_table_refs: base_refs.clone(),
-        primary_key_columns: primary_key_columns.clone(),
-        target_catalog: target.catalog.clone(),
-        target_namespace: target.namespace.clone(),
-        target_table: target.table.clone(),
-        created_at_ms,
-    };
-    if let Err(err) = metadata_store.insert_iceberg_mv_row(insert_request) {
-        let repo_drop = crate::connector::starrocks::managed::mv_ddl::delete_mv_definition_by_id(
-            state,
-            mv_definition.mv_id,
-        );
+        Ok::<(), String>(())
+    })() {
         let drop_result = crate::connector::iceberg::catalog::registry::drop_table(
             &entry,
             &target.namespace,
             &target.table,
         );
-        return Err(match (repo_drop, drop_result) {
-            (Ok(()), Ok(())) => format!("create iceberg MV relationship metadata failed: {err}"),
-            (repo, drop) => format!(
-                "create iceberg MV relationship metadata failed: {err}; repository cleanup={repo:?}; target cleanup={drop:?}"
-            ),
-        });
+        return Err(format!(
+            "create iceberg MV repository metadata failed: {err}; target cleanup={drop_result:?}"
+        ));
     }
     register_iceberg_mv_target_in_catalog(state, &target)?;
 
@@ -293,28 +265,31 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
 }
 
 pub(crate) fn restore_iceberg_mv_targets(state: &Arc<StandaloneState>) -> Result<(), String> {
-    let Some(store) = state.metadata_store.as_ref() else {
+    let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(());
     };
-    let snapshot = store.load_snapshot()?;
-    for mv in snapshot
-        .managed
-        .materialized_views
-        .iter()
-        .filter(|mv| mv.storage_engine == ManagedMvStorageEngine::Iceberg)
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg MV restore transaction failed: {e}"))?;
+    for mv in state
+        .mv_repo
+        .list_definitions(read.as_ref())
+        .map_err(|e| format!("load MV definitions for iceberg restore failed: {e}"))?
+        .into_iter()
+        .filter(|mv| {
+            mv.storage_engine
+                .eq_ignore_ascii_case(ManagedMvStorageEngine::Iceberg.as_sql_str())
+        })
     {
         let target = IcebergMvTarget {
             catalog: mv
                 .target_catalog
-                .clone()
                 .ok_or_else(|| format!("iceberg MV {} missing target_catalog", mv.mv_id))?,
             namespace: mv
                 .target_namespace
-                .clone()
                 .ok_or_else(|| format!("iceberg MV {} missing target_namespace", mv.mv_id))?,
             table: mv
                 .target_table
-                .clone()
                 .ok_or_else(|| format!("iceberg MV {} missing target_table", mv.mv_id))?,
         };
         register_iceberg_mv_target_in_catalog(state, &target)?;
@@ -525,14 +500,6 @@ pub(crate) fn refresh_iceberg_mv(
                 table_uuids.clone(),
                 target_snapshot_id,
             )?;
-            update_legacy_iceberg_mv_refresh_metadata_if_present(
-                state,
-                mv_definition.mv_id,
-                mv_definition.last_refresh_rows.unwrap_or(0),
-                snapshots,
-                table_uuids,
-                target_snapshot_id,
-            )?;
             Ok(StatementResult::Ok)
         }
 
@@ -684,26 +651,6 @@ fn finalize_iceberg_mv_refresh(
     Ok(())
 }
 
-fn update_legacy_iceberg_mv_refresh_metadata_if_present(
-    state: &Arc<StandaloneState>,
-    mv_id: i64,
-    last_refresh_rows: i64,
-    snapshots: std::collections::BTreeMap<String, i64>,
-    table_uuids: std::collections::BTreeMap<String, String>,
-    iceberg_snapshot_id: i64,
-) -> Result<(), String> {
-    let Some(metadata_store) = state.metadata_store.as_ref() else {
-        return Ok(());
-    };
-    metadata_store.update_mv_iceberg_refresh_metadata(UpdateMvIcebergRefreshMetadataRequest {
-        table_id: mv_id,
-        last_refresh_rows,
-        snapshots,
-        table_uuids,
-        iceberg_snapshot_id,
-    })
-}
-
 /// Execute the first refresh of an iceberg-backed MV.
 ///
 /// Steps:
@@ -788,15 +735,6 @@ fn first_refresh_iceberg_mv(
         table_uuids.clone(),
         new_snapshot_id,
     )?;
-    update_legacy_iceberg_mv_refresh_metadata_if_present(
-        state,
-        mv_definition.mv_id,
-        total_rows,
-        snapshots,
-        table_uuids,
-        new_snapshot_id,
-    )?;
-
     // 5. Update the in-memory catalog so subsequent SELECTs can read the data.
     if let Err(e) = register_iceberg_mv_target_in_catalog(state, target) {
         tracing::warn!(
@@ -877,15 +815,6 @@ fn rebuild_iceberg_mv(
         table_uuids.clone(),
         new_snapshot_id,
     )?;
-    update_legacy_iceberg_mv_refresh_metadata_if_present(
-        state,
-        mv_definition.mv_id,
-        total_rows,
-        snapshots,
-        table_uuids,
-        new_snapshot_id,
-    )?;
-
     if let Err(e) = register_iceberg_mv_target_in_catalog(state, target) {
         tracing::warn!(
             "iceberg mv {}.{}.{}: catalog update after rebuild failed: {e}; \
@@ -1125,14 +1054,6 @@ fn incremental_refresh_iceberg_mv(
             table_uuids.clone(),
             target_snapshot_id,
         )?;
-        update_legacy_iceberg_mv_refresh_metadata_if_present(
-            state,
-            mv_definition.mv_id,
-            mv_definition.last_refresh_rows.unwrap_or(0),
-            snapshots,
-            table_uuids,
-            target_snapshot_id,
-        )?;
         return Ok(StatementResult::Ok);
     }
 
@@ -1169,15 +1090,6 @@ fn incremental_refresh_iceberg_mv(
         table_uuids.clone(),
         new_snapshot_id,
     )?;
-    update_legacy_iceberg_mv_refresh_metadata_if_present(
-        state,
-        mv_definition.mv_id,
-        new_total_rows,
-        snapshots,
-        table_uuids,
-        new_snapshot_id,
-    )?;
-
     // Update the in-memory catalog so subsequent SELECTs can read all data files.
     if let Err(e) = register_iceberg_mv_target_in_catalog(state, target) {
         tracing::warn!(
@@ -1238,26 +1150,12 @@ pub(crate) fn drop_iceberg_mv(
         &target.namespace,
         &target.table,
     )?;
-    if state.metadata_provider.is_some() {
-        crate::engine::delete_iceberg_table_if_needed(
-            state,
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        )?;
-    } else if let Some(metadata_store) = state.metadata_store.as_ref() {
-        let dropped_relationship = metadata_store.drop_iceberg_mv_relationship(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        )?;
-        if !dropped_relationship {
-            return Err(format!(
-                "materialized view relationship disappeared during drop: {}.{}.{}",
-                target.catalog, target.namespace, target.table
-            ));
-        }
-    }
+    crate::engine::delete_iceberg_table_if_needed(
+        state,
+        &target.catalog,
+        &target.namespace,
+        &target.table,
+    )?;
     crate::engine::query_prep::drop_registered_external_table(
         state,
         &target.namespace,
@@ -1278,50 +1176,34 @@ fn preflight_iceberg_mv_drop(
     target: &IcebergMvTarget,
     if_exists: bool,
 ) -> Result<bool, String> {
-    if let Some(provider) = state.metadata_provider.as_ref() {
-        let txn = provider
-            .begin_read()
-            .map_err(|e| format!("open iceberg mv drop preflight transaction failed: {e}"))?;
-        let Some(definition) = state
-            .mv_repo
-            .find_by_target(
-                txn.as_ref(),
-                &target.catalog,
-                &target.namespace,
-                &target.table,
-            )
-            .map_err(|e| format!("load iceberg mv definition for drop failed: {e}"))?
-        else {
-            if if_exists {
-                return Ok(false);
-            }
-            return Err(format!(
-                "materialized view does not exist: {}.{}.{}",
-                target.catalog, target.namespace, target.table
-            ));
-        };
-        if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-            return Err(format!(
-                "cannot drop materialized view {}.{}.{}: refresh in progress",
-                target.catalog, target.namespace, target.table
-            ));
-        }
-        return Ok(true);
-    }
-
-    let metadata_store = state
-        .metadata_store
+    let provider = state
+        .metadata_provider
         .as_ref()
-        .ok_or_else(|| "sqlite metadata store required".to_string())?;
-    if metadata_store
-        .find_iceberg_mv_by_target(&target.catalog, &target.namespace, &target.table)?
-        .is_none()
-    {
+        .ok_or_else(|| "metadata provider required for iceberg mv drop".to_string())?;
+    let txn = provider
+        .begin_read()
+        .map_err(|e| format!("open iceberg mv drop preflight transaction failed: {e}"))?;
+    let Some(definition) = state
+        .mv_repo
+        .find_by_target(
+            txn.as_ref(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+        )
+        .map_err(|e| format!("load iceberg mv definition for drop failed: {e}"))?
+    else {
         if if_exists {
             return Ok(false);
         }
         return Err(format!(
             "materialized view does not exist: {}.{}.{}",
+            target.catalog, target.namespace, target.table
+        ));
+    };
+    if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
+        return Err(format!(
+            "cannot drop materialized view {}.{}.{}: refresh in progress",
             target.catalog, target.namespace, target.table
         ));
     }
@@ -1473,22 +1355,10 @@ mod tests {
         let metadata_dir = TempDir::new().expect("metadata tempdir");
         let warehouse_dir = TempDir::new().expect("warehouse tempdir");
         let metadata_path = metadata_dir.path().join("standalone.sqlite");
-        let metadata_store =
-            crate::connector::starrocks::managed::store::SqliteMetadataStore::open(&metadata_path)
-                .expect("open sqlite store");
         let metadata_provider =
             crate::meta::SqliteMetaStoreProvider::open(&metadata_path).expect("open meta provider");
-        let mut snapshot = crate::connector::starrocks::managed::store::ManagedSnapshot::default();
-        snapshot.global.warehouse_uri =
-            format!("file://{}", warehouse_dir.path().join("managed").display());
-        snapshot.global.next_db_id = 1;
-        snapshot.global.next_table_id = 1;
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .expect("initialize metadata snapshot");
         let state = Arc::new(StandaloneState {
             metadata_provider: Some(Arc::new(metadata_provider)),
-            metadata_store: Some(metadata_store),
             ..StandaloneState::default()
         });
         crate::connector::register_standalone_backends(&state);
@@ -1514,6 +1384,20 @@ mod tests {
             _metadata_dir: metadata_dir,
             _warehouse_dir: warehouse_dir,
         }
+    }
+
+    fn find_iceberg_mv_definition(
+        state: &Arc<StandaloneState>,
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Option<StoredMvDefinition> {
+        let provider = state.metadata_provider.as_ref().expect("metadata provider");
+        let read = provider.begin_read().expect("open read txn");
+        state
+            .mv_repo
+            .find_by_target(read.as_ref(), catalog, namespace, table)
+            .expect("lookup mv definition")
     }
 
     fn create_base_table(
@@ -1642,20 +1526,7 @@ mod tests {
         )
         .expect("create iceberg mv through ddl");
 
-        let store = env.state.metadata_store.as_ref().expect("metadata store");
-        let snapshot = store.load_snapshot().expect("snapshot");
-        assert!(snapshot.managed.tables.is_empty());
-        assert!(
-            !snapshot.iceberg_tables.iter().any(|table| {
-                table.catalog == "ice"
-                    && table.namespace == "analytics"
-                    && table.table == "mv_orders"
-            }),
-            "Iceberg MV target must not be persisted as a generic Iceberg table"
-        );
-        let mv = store
-            .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
-            .expect("lookup")
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv relationship");
         assert_eq!(mv.select_sql, "SELECT id, name FROM ice.sales.orders");
         assert_eq!(mv.target_catalog.as_deref(), Some("ice"));
@@ -1689,15 +1560,10 @@ mod tests {
         create_iceberg_mv(&env.state, Some("ice"), &env.current_db, &stmt)
             .expect("create iceberg mv");
 
-        let store = env.state.metadata_store.as_ref().expect("metadata store");
-        let mv = store
-            .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
-            .expect("lookup")
+        let mv = find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders")
             .expect("mv relationship");
         assert_eq!(mv.base_table_refs.len(), 1);
-        assert_eq!(mv.base_table_refs[0].catalog, "ice");
-        assert_eq!(mv.base_table_refs[0].namespace, "analytics");
-        assert_eq!(mv.base_table_refs[0].table, "orders");
+        assert_eq!(mv.base_table_refs[0], "ice.analytics.orders");
     }
 
     #[test]
@@ -1717,13 +1583,7 @@ mod tests {
             crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
                 .is_err()
         );
-        let store = env.state.metadata_store.as_ref().expect("metadata store");
-        assert!(
-            store
-                .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
-                .expect("lookup")
-                .is_none()
-        );
+        assert!(find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_none());
         let catalog = env.state.catalog.read().expect("standalone catalog");
         assert!(catalog.get("analytics", "mv_orders").is_err());
     }
@@ -1775,13 +1635,7 @@ mod tests {
         };
         crate::connector::iceberg::catalog::load_table(&entry, "analytics", "mv_orders")
             .expect("target table should remain after rejected drop");
-        let store = env.state.metadata_store.as_ref().expect("metadata store");
-        assert!(
-            store
-                .find_iceberg_mv_by_target("ice", "analytics", "mv_orders")
-                .expect("lookup")
-                .is_some()
-        );
+        assert!(find_iceberg_mv_definition(&env.state, "ice", "analytics", "mv_orders").is_some());
     }
 
     #[test]

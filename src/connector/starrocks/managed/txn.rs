@@ -223,7 +223,7 @@ fn load_insert_plan_with_column_mode(
             let partition = runtime
                 .partitions
                 .iter()
-                .find(|partition| partition.state == super::store::ManagedPartitionState::Active)
+                .find(|partition| partition.state == super::model::ManagedPartitionState::Active)
                 .cloned()
                 .ok_or_else(|| {
                     format!(
@@ -236,7 +236,7 @@ fn load_insert_plan_with_column_mode(
                 .iter()
                 .find(|index| {
                     index.partition_id == partition.partition_id
-                        && index.state == super::store::ManagedIndexState::Active
+                        && index.state == super::model::ManagedIndexState::Active
                 })
                 .cloned()
                 .ok_or_else(|| {
@@ -781,7 +781,7 @@ fn revalidate_insert_plan_visible_version(
         })?;
     if matches!(
         partition.state,
-        super::store::ManagedPartitionState::Retired
+        super::model::ManagedPartitionState::Retired
     ) {
         return Err(format!(
             "managed insert target partition {} for table {} is no longer writable",
@@ -860,7 +860,7 @@ fn derive_column_defs_from_runtime(
 
 fn derive_distributed_slot_ids<'a>(
     columns: &[ColumnDef],
-    stored_columns: impl IntoIterator<Item = &'a super::store::StoredManagedColumn>,
+    stored_columns: impl IntoIterator<Item = &'a super::model::StoredManagedColumn>,
 ) -> Vec<SlotId> {
     let mut slot_ids = Vec::new();
     for column in stored_columns {
@@ -1412,11 +1412,11 @@ mod mv_target_tests {
         TabletWriteContext, lock_runtime_test_state, register_tablet_runtime,
     };
     use crate::connector::starrocks::lake::txn_log::read_txn_log_if_exists;
-    use crate::connector::starrocks::managed::store::{
+    use crate::connector::starrocks::managed::model::{
         ManagedGlobalMeta, ManagedIndexState, ManagedMvRefreshMode, ManagedMvStorageEngine,
         ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
-        SqliteMetadataStore, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
-        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredMaterializedView,
     };
     use crate::connector::starrocks::managed::{
         ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog,
@@ -1505,14 +1505,24 @@ mod mv_target_tests {
             vec![SlotId::new(1), SlotId::new(3)],
         );
 
-        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
-        let prepared = metadata_store
-            .prepare_txn(
-                physical_plan.table_id,
-                physical_plan.partition_id,
-                physical_plan.base_version,
-            )
-            .expect("prepare txn");
+        let prepared = {
+            let provider = fixture.state.metadata_provider.as_ref().expect("provider");
+            let mut txn = provider
+                .begin_write("prepare hidden key txn")
+                .expect("write");
+            let prepared = fixture
+                .state
+                .managed_txn_repo
+                .prepare(
+                    &fixture.state.managed_repo,
+                    txn.as_mut(),
+                    physical_plan.table_id,
+                    physical_plan.partition_id,
+                )
+                .expect("prepare txn");
+            txn.commit().expect("commit prepared txn");
+            prepared
+        };
         let chunk = physical_hidden_key_chunk(&[1, 2, 3], &[101, 102, 103]);
         let mut next_file_seq = 0_u64;
         let written_tablet_ids = write_routed_chunks(
@@ -1615,10 +1625,24 @@ mod mv_target_tests {
         .expect("plan");
         assert_eq!(plan.tablets.len(), 2);
 
-        let metadata_store = fixture.state.metadata_store.as_ref().expect("store");
-        let prepared = metadata_store
-            .prepare_txn(plan.table_id, plan.partition_id, plan.base_version)
-            .expect("prepare txn");
+        let prepared = {
+            let provider = fixture.state.metadata_provider.as_ref().expect("provider");
+            let mut txn = provider
+                .begin_write("prepare mv refresh txn")
+                .expect("write");
+            let prepared = fixture
+                .state
+                .managed_txn_repo
+                .prepare(
+                    &fixture.state.managed_repo,
+                    txn.as_mut(),
+                    plan.table_id,
+                    plan.partition_id,
+                )
+                .expect("prepare txn");
+            txn.commit().expect("commit prepared txn");
+            prepared
+        };
         let chunk = single_i32_chunk("k1", &[1]);
         let mut next_file_seq = 0_u64;
         let mut written_tablet_ids = write_routed_chunks(
@@ -2195,7 +2219,7 @@ mod mv_target_tests {
         let active_tablet_root = format!("{metadata_root}/db_1/table_10/partition_20");
         let tablet_schema = aggregate_primary_key_tablet_schema();
         let columns = vec![
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 0,
                 column_name: "__row_id__".to_string(),
@@ -2204,7 +2228,7 @@ mod mv_target_tests {
                 visible: false,
                 is_key: true,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 1,
                 column_name: "k1".to_string(),
@@ -2213,7 +2237,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 2,
                 column_name: "c".to_string(),
@@ -2222,7 +2246,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 3,
                 column_name: "s".to_string(),
@@ -2231,7 +2255,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 4,
                 column_name: "__agg_state_c".to_string(),
@@ -2240,7 +2264,7 @@ mod mv_target_tests {
                 visible: false,
                 is_key: false,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 5,
                 column_name: "__agg_state_s".to_string(),
@@ -2337,12 +2361,6 @@ mod mv_target_tests {
             }],
         };
 
-        let metadata_store =
-            SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
-                .expect("open store");
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .expect("persist snapshot");
         let metadata_provider =
             SqliteMetaStoreProvider::open(format!("{metadata_root}/standalone.sqlite"))
                 .expect("open provider");
@@ -2382,7 +2400,6 @@ mod mv_target_tests {
                 catalog: std::sync::RwLock::new(catalog),
                 managed_lake: std::sync::RwLock::new(managed),
                 managed_lake_config: Some(config),
-                metadata_store: Some(metadata_store),
                 metadata_provider: Some(Arc::new(metadata_provider)),
                 ..Default::default()
             }),
@@ -2655,7 +2672,7 @@ mod mv_target_tests {
         }
 
         let mut columns = vec![
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 0,
                 column_name: "k1".to_string(),
@@ -2664,7 +2681,7 @@ mod mv_target_tests {
                 visible: true,
                 is_key: visible_key,
             },
-            crate::connector::starrocks::managed::store::StoredManagedColumn {
+            crate::connector::starrocks::managed::model::StoredManagedColumn {
                 schema_id: 100,
                 ordinal: 1,
                 column_name: "total".to_string(),
@@ -2676,7 +2693,7 @@ mod mv_target_tests {
         ];
         if include_hidden_physical_column {
             columns.push(
-                crate::connector::starrocks::managed::store::StoredManagedColumn {
+                crate::connector::starrocks::managed::model::StoredManagedColumn {
                     schema_id: 100,
                     ordinal: 2,
                     column_name: "__nr_shadow_total".to_string(),
@@ -2811,12 +2828,6 @@ mod mv_target_tests {
             },
         };
 
-        let metadata_store =
-            SqliteMetadataStore::open(format!("{metadata_root}/standalone.sqlite"))
-                .map_err(|e| format!("open store failed: {e}"))?;
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .map_err(|e| format!("persist snapshot failed: {e}"))?;
         let metadata_provider =
             SqliteMetaStoreProvider::open(format!("{metadata_root}/standalone.sqlite"))
                 .map_err(|e| format!("open provider failed: {e}"))?;
@@ -2860,7 +2871,6 @@ mod mv_target_tests {
                 catalog: std::sync::RwLock::new(catalog),
                 managed_lake: std::sync::RwLock::new(managed),
                 managed_lake_config: Some(config),
-                metadata_store: Some(metadata_store),
                 metadata_provider: Some(Arc::new(metadata_provider)),
                 ..Default::default()
             }),

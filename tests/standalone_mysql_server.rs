@@ -10,6 +10,10 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
+use novarocks::meta::repository::managed_lake::{
+    ManagedLakeMetaRepository, ManagedPartitionState, StageManagedTruncateRequest,
+};
+use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
 use parquet::arrow::ArrowWriter;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -267,10 +271,13 @@ fn maybe_write_managed_lake_config(mysql_port: u16) -> Option<(TempDir, PathBuf)
     std::fs::write(
         &config_path,
         format!(
-            r#"[standalone_server]
+            r#"[metadata]
+provider = "sqlite"
+path = "meta/catalog.db"
+
+[standalone_server]
 mysql_port = {mysql_port}
 user = "root"
-metadata_db_path = "meta/catalog.db"
 warehouse_uri = "{warehouse_uri}"
 
 [standalone_server.object_store]
@@ -285,7 +292,7 @@ enable_path_style_access = true
     Some((config_dir, config_path))
 }
 
-fn metadata_db_path_for_managed_config(config_path: &Path) -> PathBuf {
+fn metadata_path_for_managed_config(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .expect("managed config path has parent")
@@ -686,15 +693,6 @@ fn standalone_mysql_server_supports_multi_statement_iceberg_steps() {
         )
         .expect("execute multi-statement iceberg step");
     assert_eq!(rows, vec![(Some("b".to_string()),)]);
-}
-
-#[test]
-fn standalone_mysql_server_does_not_restore_external_preloaded_parquet_tables_from_sqlite_config() {
-    // The local-parquet backend that used to persist CREATE TABLE PROPERTIES
-    // references in sqlite has been removed. This test is kept as a thin
-    // placeholder so the module keeps the behaviour-name for git blame; the
-    // real coverage now lives in the managed-lake round-trip test which
-    // exercises restart-time metadata restoration.
 }
 
 // `standalone_mysql_server_supports_json_stream_load_for_local_tables` is
@@ -1107,14 +1105,12 @@ fn standalone_mysql_server_mv_create_rejects_non_iceberg_base_table() {
 
 #[test]
 fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
-    use rusqlite::{Connection as SqliteConn, params};
-
     let port = alloc_port();
     let Some((_config_dir, config_path)) = maybe_write_managed_lake_config(port) else {
         return;
     };
     let iceberg_warehouse = unique_iceberg_warehouse("mv_reopen");
-    let metadata_db_path = metadata_db_path_for_managed_config(&config_path);
+    let metadata_path = metadata_path_for_managed_config(&config_path);
 
     let args = vec![
         "standalone-server".to_string(),
@@ -1146,77 +1142,32 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
     }
 
     {
-        let sqlite = SqliteConn::open(&metadata_db_path).expect("sqlite open");
-        let (table_id, db_id, warehouse_uri, partition_id, index_id, tablet_id): (
-            i64,
-            i64,
-            String,
-            i64,
-            i64,
-            i64,
-        ) = sqlite
-            .query_row(
-                "SELECT t.table_id,
-                        t.db_id,
-                        g.warehouse_uri,
-                        g.next_partition_id,
-                        g.next_index_id,
-                        g.next_tablet_id
-                 FROM tables t, global_meta g
-                 WHERE t.name = 'orders_mv'
-                   AND t.kind = 'MATERIALIZED_VIEW'
-                   AND g.singleton = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .expect("mv metadata");
-        sqlite
-            .execute(
-                "UPDATE global_meta
-                 SET next_partition_id = ?1,
-                     next_index_id = ?2,
-                     next_tablet_id = ?3
-                 WHERE singleton = 1",
-                params![partition_id + 1, index_id + 1, tablet_id + 1],
-            )
-            .expect("bump ids");
-        sqlite
-            .execute(
-                "INSERT INTO partitions(partition_id, table_id, name, visible_version, next_version, state)
-                 VALUES (?1, ?2, 'p0', 1, 2, 'CREATING')",
-                params![partition_id, table_id],
-            )
-            .expect("inject creating partition");
-        sqlite
-            .execute(
-                "INSERT INTO indexes(index_id, table_id, partition_id, index_type, state)
-                 VALUES (?1, ?2, ?3, 'BASE', 'CREATING')",
-                params![index_id, table_id, partition_id],
-            )
-            .expect("inject creating index");
-        let root_path = format!(
-            "{}/db_{}/table_{}/partition_{}",
-            warehouse_uri.trim_end_matches('/'),
-            db_id,
-            table_id,
-            partition_id
-        );
-        sqlite
-            .execute(
-                "INSERT INTO tablets(tablet_id, partition_id, index_id, bucket_seq, tablet_root_path)
-                 VALUES (?1, ?2, ?3, 0, ?4)",
-                params![tablet_id, partition_id, index_id, root_path],
-            )
-            .expect("inject creating tablet");
+        let provider = SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
+        let mut write = provider
+            .begin_write("inject creating mv refresh partition")
+            .expect("begin metadata write");
+        let repo = ManagedLakeMetaRepository::default();
+        let snapshot = repo
+            .load_snapshot(write.as_ref())
+            .expect("load managed metadata");
+        let table = snapshot
+            .tables
+            .iter()
+            .find(|table| table.name == "orders_mv")
+            .cloned()
+            .expect("orders_mv metadata");
+        repo.stage_truncate_partition(
+            write.as_mut(),
+            StageManagedTruncateRequest {
+                table_id: table.table_id,
+                db_id: table.db_id,
+                bucket_num: table.bucket_num,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://test/warehouse".to_string(),
+            },
+        )
+        .expect("inject creating partition");
+        write.commit().expect("commit metadata injection");
     }
 
     {
@@ -1228,14 +1179,16 @@ fn standalone_mysql_server_mv_reopen_recovers_after_crashed_refresh() {
             .expect("select after reopen");
         assert_eq!(rows, vec![(Some(1),), (Some(2),)]);
 
-        let sqlite = SqliteConn::open(&metadata_db_path).expect("sqlite reopen");
-        let creating_count: i64 = sqlite
-            .query_row(
-                "SELECT COUNT(*) FROM partitions WHERE state = 'CREATING'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count creating partitions");
-        assert_eq!(creating_count, 0);
+        let provider = SqliteMetaStoreProvider::open(&metadata_path).expect("open provider");
+        let read = provider.begin_read().expect("begin metadata read");
+        let snapshot = ManagedLakeMetaRepository::default()
+            .load_snapshot(read.as_ref())
+            .expect("load managed metadata");
+        assert!(
+            !snapshot
+                .partitions
+                .iter()
+                .any(|partition| partition.state == ManagedPartitionState::Creating)
+        );
     }
 }

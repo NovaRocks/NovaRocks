@@ -14,7 +14,7 @@ use crate::sql::parser::ast::{
 };
 
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
-use super::store::{ManagedPartitionState, StoredManagedColumn};
+use super::model::{ManagedPartitionState, StoredManagedColumn};
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::{StandaloneState, StatementResult};
@@ -1353,11 +1353,11 @@ mod tests {
     use crate::connector::starrocks::managed::catalog::{
         ManagedTableRuntime, register_managed_table_in_catalog,
     };
-    use crate::connector::starrocks::managed::store::{
+    use crate::connector::starrocks::managed::model::{
         ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
-        ManagedTableKind, ManagedTableState, ManagedTxnState, SqliteMetadataStore,
-        StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition,
-        StoredManagedSchema, StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
+        ManagedTableKind, ManagedTableState, ManagedTxnState, StoredManagedColumn,
+        StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
+        StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
     };
     use crate::connector::starrocks::managed::{ManagedLakeCatalog, ManagedLakeConfig};
     use crate::engine::StandaloneState;
@@ -1833,12 +1833,7 @@ mod tests {
 
     fn seeded_state() -> (tempfile::TempDir, Arc<StandaloneState>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let metadata_store =
-            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
         let snapshot = snapshot_seed();
-        metadata_store
-            .replace_managed_snapshot(&snapshot)
-            .expect("persist managed snapshot");
         let metadata_provider = SqliteMetaStoreProvider::open(dir.path().join("standalone.sqlite"))
             .expect("open provider");
         seed_repository_snapshot(&metadata_provider, &snapshot).expect("seed repositories");
@@ -1856,7 +1851,6 @@ mod tests {
             catalog: RwLock::new(catalog),
             managed_lake: RwLock::new(managed),
             managed_lake_config: Some(test_managed_config()),
-            metadata_store: Some(metadata_store),
             metadata_provider: Some(Arc::new(metadata_provider)),
             ..StandaloneState::default()
         });

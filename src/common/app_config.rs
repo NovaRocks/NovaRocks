@@ -264,8 +264,6 @@ pub struct StandaloneServerConfig {
     #[serde(default = "default_standalone_server_user")]
     pub user: String,
     #[serde(default)]
-    pub metadata_db_path: Option<PathBuf>,
-    #[serde(default)]
     pub warehouse_uri: Option<String>,
     #[serde(default)]
     pub object_store: Option<StandaloneObjectStoreConfig>,
@@ -288,7 +286,6 @@ impl Default for StandaloneServerConfig {
         Self {
             mysql_port: default_standalone_server_mysql_port(),
             user: default_standalone_server_user(),
-            metadata_db_path: None,
             warehouse_uri: None,
             object_store: None,
             mv_default_storage_engine: None,
@@ -1132,7 +1129,6 @@ starlet_port = 19070
             Some(StandaloneServerConfig {
                 mysql_port: 9030,
                 user: "root".to_string(),
-                metadata_db_path: None,
                 warehouse_uri: None,
                 object_store: None,
                 mv_default_storage_engine: None,
@@ -1164,7 +1160,6 @@ mysql_port = 19030
 [standalone_server]
 mysql_port = 19030
 user = "root"
-metadata_db_path = "meta/catalog.db"
 
 [[standalone_server.tables]]
 name = "tbl"
@@ -1175,10 +1170,6 @@ path = "data/tbl.parquet"
         let standalone = cfg.standalone_server.expect("standalone server config");
         assert_eq!(standalone.mysql_port, 19030);
         assert_eq!(standalone.user, "root");
-        assert_eq!(
-            standalone.metadata_db_path,
-            Some(PathBuf::from("meta/catalog.db"))
-        );
         assert_eq!(standalone.tables.len(), 1);
         assert_eq!(standalone.tables[0].name, "tbl");
         assert_eq!(standalone.tables[0].path, PathBuf::from("data/tbl.parquet"));
@@ -1191,7 +1182,6 @@ path = "data/tbl.parquet"
 [standalone_server]
 mysql_port = 9030
 user = "root"
-metadata_db_path = "meta/standalone.sqlite"
 warehouse_uri = "s3://novarocks/standalone"
 
 [standalone_server.object_store]
