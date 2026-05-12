@@ -6,7 +6,9 @@ use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::create_lake_tablet_from_req;
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::formats::starrocks::metadata::load_tablet_snapshot;
+use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::parser::ast::{
     ColumnAggregation, ObjectName, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
 };
@@ -284,21 +286,34 @@ pub(crate) fn create_managed_table(
             Some(managed_config.s3.clone()),
             |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
         ) {
-            for tablet_id in bootstrapped_tablet_ids {
-                let _ = remove_tablet_runtime(tablet_id);
-            }
+            cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
             let _ = txn.abort();
             return Err(err);
         }
         bootstrapped_tablet_ids.push(tablet.tablet_id);
-        let runtime_schema = get_tablet_runtime(tablet.tablet_id)?.schema;
-        let loaded = load_tablet_snapshot(
+        let runtime_schema = match get_tablet_runtime(tablet.tablet_id) {
+            Ok(runtime) => runtime.schema,
+            Err(err) => {
+                cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+                let _ = txn.abort();
+                return Err(err);
+            }
+        };
+        let loaded = match load_tablet_snapshot(
             tablet.tablet_id,
             1,
             &tablet.tablet_root_path,
             Some(&object_store_profile),
-        )?;
+        ) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+                let _ = txn.abort();
+                return Err(err);
+            }
+        };
         if loaded.tablet_schema != runtime_schema {
+            cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
             let _ = txn.abort();
             return Err(format!(
                 "managed tablet schema mismatch after bootstrap: tablet_id={}",
@@ -306,8 +321,10 @@ pub(crate) fn create_managed_table(
             ));
         }
     }
-    txn.commit()
-        .map_err(|e| format!("commit managed table metadata failed: {e}"))?;
+    if let Err(err) = txn.commit() {
+        cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+        return Err(format!("commit managed table metadata failed: {err}"));
+    }
 
     let read = provider
         .begin_read()
@@ -439,6 +456,18 @@ pub(crate) fn drop_managed_table(
     database_name: &str,
     table_name: &str,
 ) -> Result<StatementResult, String> {
+    drop_managed_table_with_metadata(state, database_name, table_name, |_, _| Ok(()))
+}
+
+pub(crate) fn drop_managed_table_with_metadata<F>(
+    state: &Arc<StandaloneState>,
+    database_name: &str,
+    table_name: &str,
+    update_metadata: F,
+) -> Result<StatementResult, String>
+where
+    F: FnOnce(&mut dyn crate::meta::MetaWriteTxn, i64) -> Result<(), String>,
+{
     let mut managed = state
         .managed_lake
         .write()
@@ -464,6 +493,7 @@ pub(crate) fn drop_managed_table(
         .managed_txn_repo
         .ensure_no_inflight_for_table(txn.as_ref(), runtime.table.table_id)
         .map_err(|e| format!("validate managed table drop failed: {e}"))?;
+    update_metadata(txn.as_mut(), runtime.table.table_id)?;
     state
         .managed_repo
         .mark_table_dropping(txn.as_mut(), runtime.table.table_id)
@@ -734,6 +764,24 @@ fn current_time_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
+    if tablet_ids.is_empty() {
+        return;
+    }
+    if let Err(err) = delete_tablet(&DeleteTabletRequest {
+        tablet_ids: tablet_ids.to_vec(),
+    }) {
+        tracing::warn!(
+            "managed table create cleanup failed to delete bootstrapped tablets: tablet_ids={:?} error={}",
+            tablet_ids,
+            err
+        );
+        for tablet_id in tablet_ids {
+            let _ = remove_tablet_runtime(*tablet_id);
+        }
+    }
 }
 
 fn cleanup_staged_truncate(

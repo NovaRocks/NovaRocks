@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::connector::starrocks::ObjectStoreProfile;
 use crate::connector::starrocks::lake::context::{get_tablet_runtime, remove_tablet_runtime};
 use crate::connector::starrocks::lake::schema::create_lake_tablet_from_req_with_schema_patch;
+use crate::connector::starrocks::lake::transactions::delete_tablet;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::query_prep::drop_registered_external_table;
 use crate::engine::record_batch_to_chunk;
@@ -18,6 +19,7 @@ use crate::meta::repository::managed_lake::{
     ManagedTableKind as RepoManagedTableKind,
 };
 use crate::meta::repository::mv::{CreateMvDefinitionRequest, StoredMvDefinition};
+use crate::service::grpc_client::proto::starrocks::DeleteTabletRequest;
 use crate::sql::analysis::{ExprKind, OutputColumn, QueryBody, ResolvedQuery};
 use crate::sql::parser::ast::{
     CreateMaterializedViewStmt, DropMaterializedViewStmt, MaterializedViewDistribution, ObjectName,
@@ -304,6 +306,10 @@ pub(crate) fn create_mv(
     let created_at_ms = now_ms();
     state
         .mv_repo
+        .reserve_definition_id(txn.as_mut(), created.table.table_id)
+        .map_err(|e| format!("reserve materialized view definition id failed: {e}"))?;
+    state
+        .mv_repo
         .create_definition_with_id(
             txn.as_mut(),
             created.table.table_id,
@@ -335,21 +341,34 @@ pub(crate) fn create_mv(
             Some(managed_config.s3.clone()),
             |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
         ) {
-            for tablet_id in bootstrapped_tablet_ids {
-                let _ = remove_tablet_runtime(tablet_id);
-            }
+            cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
             let _ = txn.abort();
             return Err(err);
         }
         bootstrapped_tablet_ids.push(tablet.tablet_id);
-        let runtime_schema = get_tablet_runtime(tablet.tablet_id)?.schema;
-        let loaded = load_tablet_snapshot(
+        let runtime_schema = match get_tablet_runtime(tablet.tablet_id) {
+            Ok(runtime) => runtime.schema,
+            Err(err) => {
+                cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+                let _ = txn.abort();
+                return Err(err);
+            }
+        };
+        let loaded = match load_tablet_snapshot(
             tablet.tablet_id,
             1,
             &tablet.tablet_root_path,
             Some(&object_store_profile),
-        )?;
+        ) {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+                let _ = txn.abort();
+                return Err(err);
+            }
+        };
         if loaded.tablet_schema != runtime_schema {
+            cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
             let _ = txn.abort();
             return Err(format!(
                 "managed tablet schema mismatch after bootstrap: tablet_id={}",
@@ -357,8 +376,12 @@ pub(crate) fn create_mv(
             ));
         }
     }
-    txn.commit()
-        .map_err(|e| format!("commit managed materialized view metadata failed: {e}"))?;
+    if let Err(err) = txn.commit() {
+        cleanup_bootstrapped_tablets(&bootstrapped_tablet_ids);
+        return Err(format!(
+            "commit managed materialized view metadata failed: {err}"
+        ));
+    }
 
     let read = provider
         .begin_read()
@@ -792,54 +815,19 @@ pub(crate) fn drop_mv(
         ));
     }
 
-    crate::connector::starrocks::managed::ddl::drop_managed_table(state, &db_name, &mv_name)?;
-    delete_mv_definition_by_id(state, runtime.table.table_id)?;
+    crate::connector::starrocks::managed::ddl::drop_managed_table_with_metadata(
+        state,
+        &db_name,
+        &mv_name,
+        |txn, table_id| {
+            state
+                .mv_repo
+                .drop_by_id(txn, table_id)
+                .map_err(|e| format!("delete materialized view definition failed: {e}"))?;
+            Ok(())
+        },
+    )?;
     Ok(StatementResult::Ok)
-}
-
-pub(crate) struct PersistMvDefinitionRequest {
-    pub(crate) mv_id: i64,
-    pub(crate) select_sql: String,
-    pub(crate) base_table_refs: Vec<IcebergTableRef>,
-    pub(crate) primary_key_columns: Vec<String>,
-    pub(crate) storage_engine: ManagedMvStorageEngine,
-    pub(crate) target_catalog: Option<String>,
-    pub(crate) target_namespace: Option<String>,
-    pub(crate) target_table: Option<String>,
-    pub(crate) created_at_ms: i64,
-}
-
-pub(crate) fn persist_mv_definition(
-    state: &Arc<StandaloneState>,
-    req: PersistMvDefinitionRequest,
-) -> Result<(), String> {
-    let provider = state
-        .metadata_provider
-        .as_ref()
-        .ok_or_else(|| "metadata provider required for materialized view metadata".to_string())?;
-    let mut txn = provider
-        .begin_write("create materialized view definition")
-        .map_err(|e| format!("open metadata write transaction failed: {e}"))?;
-    state
-        .mv_repo
-        .create_definition_with_id(
-            txn.as_mut(),
-            req.mv_id,
-            CreateMvDefinitionRequest {
-                select_sql: req.select_sql,
-                base_table_refs: iceberg_table_ref_fqns(&req.base_table_refs),
-                primary_key_columns: req.primary_key_columns,
-                storage_engine: req.storage_engine.as_sql_str().to_string(),
-                target_catalog: req.target_catalog,
-                target_namespace: req.target_namespace,
-                target_table: req.target_table,
-                created_at_ms: req.created_at_ms,
-            },
-        )
-        .map_err(|e| format!("persist materialized view definition failed: {e}"))?;
-    txn.commit()
-        .map_err(|e| format!("commit materialized view definition failed: {e}"))?;
-    Ok(())
 }
 
 pub(crate) fn delete_mv_definition_by_id(
@@ -1637,6 +1625,24 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+fn cleanup_bootstrapped_tablets(tablet_ids: &[i64]) {
+    if tablet_ids.is_empty() {
+        return;
+    }
+    if let Err(err) = delete_tablet(&DeleteTabletRequest {
+        tablet_ids: tablet_ids.to_vec(),
+    }) {
+        tracing::warn!(
+            "managed materialized view create cleanup failed to delete bootstrapped tablets: tablet_ids={:?} error={}",
+            tablet_ids,
+            err
+        );
+        for tablet_id in tablet_ids {
+            let _ = remove_tablet_runtime(*tablet_id);
+        }
+    }
 }
 
 #[cfg(test)]

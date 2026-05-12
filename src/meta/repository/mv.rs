@@ -129,8 +129,35 @@ impl MvMetaRepository {
         txn: &mut dyn MetaWriteTxn,
         req: CreateMvDefinitionRequest,
     ) -> RepositoryResult<StoredMvDefinition> {
-        let mv_id = txn.allocate_id(id_scopes::mv_id())?;
-        self.create_definition_with_id(txn, mv_id, req)
+        loop {
+            let mv_id = txn.allocate_id(id_scopes::mv_id())?;
+            if self.load_by_id(txn, mv_id)?.is_none() {
+                return self.create_definition_with_id(txn, mv_id, req);
+            }
+        }
+    }
+
+    pub fn reserve_definition_id(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_id: i64,
+    ) -> RepositoryResult<()> {
+        if mv_id <= 0 {
+            return Err(RepositoryError::invalid(format!(
+                "mv definition id must be positive, got {mv_id}"
+            )));
+        }
+        if self.load_by_id(txn, mv_id)?.is_some() {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {mv_id} already exists"
+            )));
+        }
+        loop {
+            let reserved = txn.allocate_id(id_scopes::mv_id())?;
+            if reserved >= mv_id {
+                return Ok(());
+            }
+        }
     }
 
     pub fn create_definition_with_id(
@@ -463,6 +490,53 @@ impl MvMetaRepository {
         definition.value.last_refresh_rows = Some(req.last_refresh_rows);
         definition.value.last_refresh_snapshots = req.base_snapshots;
         definition.value.last_refresh_table_uuids = req.base_table_uuids;
+        definition.value.refresh_in_progress = false;
+        if let Some(refresh_id) = definition.value.active_refresh_id.take()
+            && let Some(mut refresh) = load_versioned_refresh(txn, refresh_id)?
+        {
+            refresh.value.state = MvRefreshState::Finalized;
+            put_refresh(
+                txn,
+                &refresh.value,
+                ExpectedRevision::Exact(refresh.record_revision),
+            )?;
+        }
+        definition.value.refresh_target_snapshots.clear();
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(true)
+    }
+
+    pub fn clear_refresh_progress(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        mv_id: i64,
+    ) -> RepositoryResult<bool> {
+        let Some(mut definition) = self.load_versioned_by_id(txn, mv_id)? else {
+            return Ok(false);
+        };
+        if !definition.value.refresh_in_progress && definition.value.active_refresh_id.is_none() {
+            return Ok(true);
+        }
+        if let Some(refresh_id) = definition.value.active_refresh_id.take()
+            && let Some(mut refresh) = load_versioned_refresh(txn, refresh_id)?
+            && !matches!(
+                refresh.value.state,
+                MvRefreshState::Finalized | MvRefreshState::Aborted
+            )
+        {
+            refresh.value.state = MvRefreshState::Aborted;
+            put_refresh(
+                txn,
+                &refresh.value,
+                ExpectedRevision::Exact(refresh.record_revision),
+            )?;
+        }
+        definition.value.refresh_in_progress = false;
+        definition.value.refresh_target_snapshots.clear();
         put_definition(
             txn,
             &definition,

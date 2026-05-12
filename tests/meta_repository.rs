@@ -8,8 +8,8 @@ use novarocks::meta::repository::iceberg_catalog::{
 use novarocks::meta::repository::job::{CreateEraseJobRequest, JobMetaRepository, JobState};
 use novarocks::meta::repository::managed_lake::{
     CreateManagedColumnRequest, CreateManagedDatabaseRequest, CreateManagedTableLayoutRequest,
-    CreateManagedTableRequest, ManagedLakeMetaRepository, ManagedPartitionState, ManagedTableKind,
-    ManagedTableState, StageManagedTruncateRequest,
+    CreateManagedTableRequest, ManagedIndexState, ManagedLakeMetaRepository, ManagedPartitionState,
+    ManagedTableKind, ManagedTableState, StageManagedMvRefreshRequest, StageManagedTruncateRequest,
 };
 use novarocks::meta::repository::managed_txn::{
     ManagedLakeTxnRepository, ManagedTxnState, StoredManagedTxn,
@@ -80,6 +80,19 @@ fn put_managed_txn_record(
         encode_json_payload(1, &managed_txn)?,
     ))?;
     Ok(())
+}
+
+fn sample_mv_definition_request(select_sql: &str) -> CreateMvDefinitionRequest {
+    CreateMvDefinitionRequest {
+        select_sql: select_sql.to_string(),
+        base_table_refs: vec!["ice.sales.orders".to_string()],
+        primary_key_columns: vec!["id".to_string()],
+        storage_engine: "managed_lake".to_string(),
+        target_catalog: None,
+        target_namespace: None,
+        target_table: None,
+        created_at_ms: 7,
+    }
 }
 
 #[test]
@@ -916,6 +929,149 @@ fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
 }
 
 #[test]
+fn managed_lake_repository_stages_and_activates_mv_refresh_partition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let managed_repo = ManagedLakeMetaRepository::default();
+    let job_repo = JobMetaRepository::default();
+
+    let (table_id, db_id, old_partition_id) = {
+        let mut txn = provider.begin_write("create managed mv layout")?;
+        let database = managed_repo.get_or_create_database(txn.as_mut(), "analytics")?;
+        let created = managed_repo.create_table_layout(
+            txn.as_mut(),
+            CreateManagedTableLayoutRequest {
+                db_id: database.db_id,
+                table_name: "orders_mv".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                kind: ManagedTableKind::MaterializedView,
+                schema_version: 0,
+                tablet_schema_pb: vec![1, 2, 3],
+                columns: vec![CreateManagedColumnRequest {
+                    column_name: "id".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                }],
+                partition_name: "orders_mv".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            },
+        )?;
+        txn.commit()?;
+        (
+            created.table.table_id,
+            database.db_id,
+            created.partition.partition_id,
+        )
+    };
+
+    let staged = {
+        let mut txn = provider.begin_write("stage managed mv refresh partition")?;
+        let staged = managed_repo.stage_mv_refresh_partition(
+            txn.as_mut(),
+            StageManagedMvRefreshRequest {
+                table_id,
+                db_id,
+                bucket_num: 2,
+                partition_name: "orders_mv".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            },
+        )?;
+        txn.commit()?;
+        staged
+    };
+
+    {
+        let mut txn = provider.begin_write("reject overlapping managed mv refresh")?;
+        let err = managed_repo
+            .stage_mv_refresh_partition(
+                txn.as_mut(),
+                StageManagedMvRefreshRequest {
+                    table_id,
+                    db_id,
+                    bucket_num: 2,
+                    partition_name: "orders_mv".to_string(),
+                    warehouse_uri: "s3://bucket/warehouse".to_string(),
+                },
+            )
+            .expect_err("creating partition should block overlapping refresh");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    {
+        let read = provider.begin_read()?;
+        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        let staged_partition = snapshot
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == staged.partition_id)
+            .expect("staged partition");
+        assert_eq!(staged_partition.state, ManagedPartitionState::Creating);
+        assert_eq!(staged.tablet_ids.len(), 2);
+        assert_eq!(
+            staged.partition_root_path,
+            format!(
+                "s3://bucket/warehouse/db_{db_id}/table_{table_id}/partition_{}",
+                staged.partition_id
+            )
+        );
+    }
+
+    {
+        let mut txn = provider.begin_write("activate managed mv refresh partition")?;
+        managed_repo.activate_mv_refresh_partition(
+            txn.as_mut(),
+            table_id,
+            old_partition_id,
+            staged.partition_id,
+            staged.index_id,
+        )?;
+        job_repo.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id,
+                partition_id: Some(old_partition_id),
+                root_path: format!(
+                    "s3://bucket/warehouse/db_{db_id}/table_{table_id}/partition_{old_partition_id}"
+                ),
+                now_ms: 1100,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+    let old_partition = snapshot
+        .partitions
+        .iter()
+        .find(|partition| partition.partition_id == old_partition_id)
+        .expect("old partition");
+    let new_partition = snapshot
+        .partitions
+        .iter()
+        .find(|partition| partition.partition_id == staged.partition_id)
+        .expect("new partition");
+    assert_eq!(old_partition.state, ManagedPartitionState::Retired);
+    assert_eq!(new_partition.state, ManagedPartitionState::Active);
+    assert_eq!(new_partition.visible_version, 2);
+    assert_eq!(new_partition.next_version, 3);
+    let new_index = snapshot
+        .indexes
+        .iter()
+        .find(|index| index.index_id == staged.index_id)
+        .expect("new index");
+    assert_eq!(new_index.state, ManagedIndexState::Active);
+    let jobs = job_repo.list_runnable_erase_jobs(read.as_ref(), 1100)?;
+    assert_eq!(jobs[0].partition_id, Some(old_partition_id));
+
+    Ok(())
+}
+
+#[test]
 fn managed_txn_repository_prepare_written_visible_advances_partition()
 -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
@@ -1298,6 +1454,42 @@ fn mv_repository_creates_and_drops_definition_with_explicit_id()
 
     let read = provider.begin_read()?;
     assert!(repository.load_by_id(read.as_ref(), 42)?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_reserves_explicit_ids_for_future_allocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    {
+        let mut txn = provider.begin_write("reserve explicit mv definition id")?;
+        repository.reserve_definition_id(txn.as_mut(), 42)?;
+        let definition = repository.create_definition_with_id(
+            txn.as_mut(),
+            42,
+            sample_mv_definition_request("SELECT id FROM ice.sales.orders"),
+        )?;
+        assert_eq!(definition.mv_id, 42);
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("create auto mv definition after reservation")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            sample_mv_definition_request("SELECT id FROM ice.sales.lineitem"),
+        )?;
+        assert_eq!(definition.mv_id, 43);
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    assert!(repository.load_by_id(read.as_ref(), 42)?.is_some());
+    assert!(repository.load_by_id(read.as_ref(), 43)?.is_some());
 
     Ok(())
 }

@@ -209,6 +209,23 @@ pub struct StagedManagedTruncate {
     pub partition_root_path: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageManagedMvRefreshRequest {
+    pub table_id: i64,
+    pub db_id: i64,
+    pub bucket_num: i64,
+    pub partition_name: String,
+    pub warehouse_uri: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedManagedMvRefresh {
+    pub partition_id: i64,
+    pub index_id: i64,
+    pub tablet_ids: Vec<i64>,
+    pub partition_root_path: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct IdLookup {
     id: i64,
@@ -756,6 +773,7 @@ impl ManagedLakeMetaRepository {
             )));
         }
 
+        let mut saw_new_index = false;
         for (revision, mut index) in self.load_versioned_indexes_for_table(txn, table_id)? {
             if index.index_id == new_index_id {
                 if index.state != ManagedIndexState::Creating {
@@ -765,6 +783,7 @@ impl ManagedLakeMetaRepository {
                     )));
                 }
                 index.state = ManagedIndexState::Active;
+                saw_new_index = true;
                 put_index(txn, &index, ExpectedRevision::Exact(revision))?;
             } else if index.partition_id == old_partition_id
                 && index.state == ManagedIndexState::Active
@@ -772,6 +791,181 @@ impl ManagedLakeMetaRepository {
                 index.state = ManagedIndexState::Retired;
                 put_index(txn, &index, ExpectedRevision::Exact(revision))?;
             }
+        }
+        if !saw_new_index {
+            return Err(RepositoryError::not_found(format!(
+                "managed index {new_index_id} not found"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn stage_mv_refresh_partition(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: StageManagedMvRefreshRequest,
+    ) -> RepositoryResult<StagedManagedMvRefresh> {
+        if req.bucket_num <= 0 {
+            return Err(RepositoryError::invalid(format!(
+                "managed materialized view bucket_num must be positive, got {}",
+                req.bucket_num
+            )));
+        }
+        let table = self.load_table(txn, req.table_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("managed table {} not found", req.table_id))
+        })?;
+        if table.kind != ManagedTableKind::MaterializedView {
+            return Err(RepositoryError::conflict(format!(
+                "table {} is not a materialized view",
+                req.table_id
+            )));
+        }
+        if table.state != ManagedTableState::Active {
+            return Err(RepositoryError::conflict(format!(
+                "materialized view {} is {:?}, expected Active",
+                req.table_id, table.state
+            )));
+        }
+        if self.load_snapshot(txn)?.partitions.iter().any(|partition| {
+            partition.table_id == req.table_id && partition.state == ManagedPartitionState::Creating
+        }) {
+            return Err(RepositoryError::conflict(format!(
+                "cannot refresh materialized view {}: refresh already in progress",
+                req.table_id
+            )));
+        }
+
+        let partition_id = txn.allocate_id(id_scopes::managed_partition())?;
+        let index_id = txn.allocate_id(id_scopes::managed_index())?;
+        let partition_root_path =
+            tablet_root_path(&req.warehouse_uri, req.db_id, req.table_id, partition_id);
+
+        let partition = StoredManagedPartition {
+            partition_id,
+            table_id: req.table_id,
+            name: req.partition_name,
+            visible_version: 1,
+            next_version: 2,
+            state: ManagedPartitionState::Creating,
+        };
+        put_partition(txn, &partition, ExpectedRevision::NotExists)?;
+
+        let index = StoredManagedIndex {
+            index_id,
+            table_id: req.table_id,
+            partition_id,
+            index_type: "BASE".to_string(),
+            state: ManagedIndexState::Creating,
+        };
+        put_index(txn, &index, ExpectedRevision::NotExists)?;
+
+        let mut tablet_ids = Vec::new();
+        for bucket_seq in 0..req.bucket_num {
+            let tablet_id = txn.allocate_id(id_scopes::managed_tablet())?;
+            let tablet = StoredManagedTablet {
+                tablet_id,
+                partition_id,
+                index_id,
+                bucket_seq,
+                tablet_root_path: partition_root_path.clone(),
+            };
+            put_tablet(txn, &tablet, ExpectedRevision::NotExists)?;
+            tablet_ids.push(tablet_id);
+        }
+
+        Ok(StagedManagedMvRefresh {
+            partition_id,
+            index_id,
+            tablet_ids,
+            partition_root_path,
+        })
+    }
+
+    pub fn activate_mv_refresh_partition(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        table_id: i64,
+        old_partition_id: i64,
+        new_partition_id: i64,
+        new_index_id: i64,
+    ) -> RepositoryResult<()> {
+        let partitions = self.load_versioned_partitions_for_table(txn, table_id)?;
+        let mut saw_old = false;
+        let mut saw_new = false;
+        for (revision, mut partition) in partitions {
+            if partition.partition_id == new_partition_id {
+                match partition.state {
+                    ManagedPartitionState::Creating => {
+                        partition.state = ManagedPartitionState::Active;
+                        partition.visible_version = 2;
+                        partition.next_version = 3;
+                        put_partition(txn, &partition, ExpectedRevision::Exact(revision))?;
+                    }
+                    ManagedPartitionState::Active => {
+                        if partition.visible_version != 2 || partition.next_version != 3 {
+                            return Err(RepositoryError::conflict(format!(
+                                "managed partition {new_partition_id} active versions are {}/{}, expected 2/3",
+                                partition.visible_version, partition.next_version
+                            )));
+                        }
+                    }
+                    _ => {
+                        return Err(RepositoryError::conflict(format!(
+                            "managed partition {new_partition_id} is {:?}, expected Creating",
+                            partition.state
+                        )));
+                    }
+                }
+                saw_new = true;
+            } else if partition.partition_id == old_partition_id {
+                if partition.state == ManagedPartitionState::Active {
+                    partition.state = ManagedPartitionState::Retired;
+                    put_partition(txn, &partition, ExpectedRevision::Exact(revision))?;
+                }
+                saw_old = true;
+            }
+        }
+        if !saw_old {
+            return Err(RepositoryError::not_found(format!(
+                "managed partition {old_partition_id} not found"
+            )));
+        }
+        if !saw_new {
+            return Err(RepositoryError::not_found(format!(
+                "managed partition {new_partition_id} not found"
+            )));
+        }
+
+        let mut saw_new_index = false;
+        for (revision, mut index) in self.load_versioned_indexes_for_table(txn, table_id)? {
+            if index.index_id == new_index_id {
+                match index.state {
+                    ManagedIndexState::Creating => {
+                        index.state = ManagedIndexState::Active;
+                        saw_new_index = true;
+                        put_index(txn, &index, ExpectedRevision::Exact(revision))?;
+                    }
+                    ManagedIndexState::Active => {
+                        saw_new_index = true;
+                    }
+                    _ => {
+                        return Err(RepositoryError::conflict(format!(
+                            "managed index {new_index_id} is {:?}, expected Creating",
+                            index.state
+                        )));
+                    }
+                }
+            } else if index.partition_id == old_partition_id
+                && index.state == ManagedIndexState::Active
+            {
+                index.state = ManagedIndexState::Retired;
+                put_index(txn, &index, ExpectedRevision::Exact(revision))?;
+            }
+        }
+        if !saw_new_index {
+            return Err(RepositoryError::not_found(format!(
+                "managed index {new_index_id} not found"
+            )));
         }
         Ok(())
     }
