@@ -1,9 +1,11 @@
 # Managed-Lake DELETE 与 StarRocks 对齐设计
 
-- **日期**:2026-05-12
+- **日期**:2026-05-12(原设计);**2026-05-13 实施前现状核验更新见 §10**
 - **任务**:INT-2 managed-lake DELETE 支持
 - **作者**:Claude (Opus 4.7) + Harbor Liu
-- **状态**:设计完成,待 review
+- **状态**:设计完成 + 现状核验完成,待实施
+
+> **重要**:写 plan 时做了一次代码核验,发现 NovaRocks 已经实现的基础设施远多于设计期预估。**§4 / §5 / §8 涉及"新建文件"和"代码量/时间估计"的部分,以 §10 为准**。前面章节保留设计意图与决策记录,§10 列出与现状对照的具体修正。
 
 ---
 
@@ -149,6 +151,8 @@ pub fn coerce_predicate_literals(expr: &mut Expr, schema: &Schema, options: Coer
 
 ## 4. 项 A — DUP/UNIQUE/AGG via DeletePredicate
 
+> **现状核验(2026-05-13)**:`DeletePredicatePb` 写端、FFI 入口、tablet txn_log 写入、publish 识别均**已实现**。FE-compatible 模式(StarRocks FE → Shim → FFI)走 `delete_data` RPC 端到端贯通。Standalone(SQL)模式只缺 FE 端的 WHERE → `DeletePredicatePb` 翻译,以及调用入口。具体清单见 §10.2。
+
 ### 4.1 路径概览
 
 ```
@@ -284,17 +288,18 @@ pub fn append_lake_txn_log_delete_predicate(
 - `managed_dup_delete_is_null` — `IS NULL`
 - `datetime_microsecond_precision_delete`(已有)— §3 + 本节落地后应当全绿
 
-### 4.8 代码量
+### 4.8 代码量(更正后,见 §10.2)
 
 | 模块 | 估计 |
 |---|---|
-| `delete_predicate_translate.rs` | ~400 |
-| `delete_predicate_proto.rs` | ~150 |
-| `txn_log.rs` 新 entry + publish 子路径 | ~250 |
-| `delete_flow.rs` 重写 | ~150 |
-| 单元测试 | ~500 |
+| `delete_predicate_translate.rs`(WHERE → terms + literal 序列化) | ~400 |
+| `delete_predicate_proto.rs`(terms → `DeletePredicatePb`)| ~80(比原估的 150 少,因为只是 proto 字段填充,不涉及 publish 路径)|
+| `delete_flow.rs` DUP/UNIQUE/AGG 分支 + dispatch 到现有 `transactions::delete_data` | ~150 |
+| 单元测试 | ~450 |
 | 集成测试 | 7 用例 |
-| **合计** | **~1450 行 + 7 用例** |
+| **合计** | **~1080 行 + 7 用例** |
+
+**省去**:`txn_log.rs` 新 entry + publish 子路径 — **完全不需要新建**,`transactions::delete_data` + `applier.rs` 现有 publish 已经识别 `delete_predicate.is_some()`(applier.rs:101)。
 
 ### 4.9 风险
 
@@ -305,6 +310,8 @@ pub fn append_lake_txn_log_delete_predicate(
 ---
 
 ## 5. 项 B — PRIMARY KEY via `__op` + sink
+
+> **现状核验(2026-05-13)**:`__op` 列识别 / 按值拆 chunk / `.del` 文件编码 / `OpWrite { rowset, dels[] }` 构造 / PK encoder / publish 路径 — **全部已经实现**。NovaRocks 已经能从 stream load 视角处理混合 upsert+delete batch。Standalone SQL DELETE 缺的只是 FE 端把 `DELETE FROM pk_t WHERE cond` 改写为带 `__op = 1` 的 chunk 并发送给现有 sink。`__op` 列在 SQL analyzer/optimizer 路径上**目前完全没碰过**,需要新加最小保护机制(name-based helper + 防御性单测)。具体清单见 §10.3。
 
 ### 5.1 设计意图
 
@@ -477,19 +484,19 @@ TxnLog {
 - **PK index 每次 publish 全量重建**(`pk_applier` 当前实现):大表 DELETE 慢。本 spec **不优化**,纳入未来工作("PK persistent index" 单独立项)
 - **`__op` 值域当前 2 值**:未来 MERGE/UPDATE 时扩 sink 分支,不改 wire format
 
-### 5.10 代码量
+### 5.10 代码量(更正后,见 §10.3)
 
 | 模块 | 估计 |
 |---|---|
-| `load_op_column.rs` + `ColumnKind::LoadOp` | ~200 |
-| 各优化器 pass 短路集成 | ~80 |
-| `delete_flow::execute_managed_pk_delete` + plan 构造 | ~250 |
-| `sink/operator.rs::process_chunk` 拆分 | ~150 |
-| `del_file_writer.rs` | ~250 |
-| `pk_encoder.rs`(若需新建)| ~200 |
-| 单元测试 | ~600 |
+| `load_op_column.rs`(name helper + LoadOp enum) | ~80 |
+| `__op` 列 analyzer/optimizer 防御性单测 + minimal 集成 | ~80 |
+| `delete_flow::execute_managed_pk_delete` + plan 改写(走 standalone 现有 SELECT pipeline → sink)| ~300 |
+| 删 CoW + 删旧单测 | ~30 |
+| 单元测试 | ~400 |
 | 集成测试 | 5 用例 |
-| **合计** | **~1730 行 + 5 用例** |
+| **合计** | **~890 行 + 5 用例** |
+
+**省去**:`del_file_writer.rs`(已存在 [src/connector/starrocks/lake/delete_payload_codec.rs](src/connector/starrocks/lake/delete_payload_codec.rs))、`pk_encoder.rs`(已存在 [src/connector/starrocks/lake/pk_applier.rs:573-595](src/connector/starrocks/lake/pk_applier.rs#L573))、`sink/operator.rs::process_chunk` 拆分逻辑(已存在 [txn_log.rs:1394 parse_op_batch](src/connector/starrocks/lake/txn_log.rs#L1394) + 集成到 [sink/operator.rs:1071](src/connector/starrocks/sink/operator.rs#L1071) → [txn_log.rs:75 append_lake_txn_log_with_chunk_rowset](src/connector/starrocks/lake/txn_log.rs#L75))。
 
 ### 5.11 风险
 
@@ -723,17 +730,21 @@ CI 无 BE 镜像时,手工脚本一次性验证,implementation notes 记录,**�
 | **G4** 全 suite 回归 | M2、M3、M4 各落地后 | hard block 任何回归 |
 | **G5** CoW 删除时机 | M4 B.4 内 | 不可预删 |
 
-### 8.5 时间估计
+### 8.5 时间估计(更正后)
 
 | 里程碑 | 工程天 |
 |---|---|
 | M1 D | 0.5 |
 | M2 C | 2-3 |
-| M3 A | 4-5 |
-| M4 B | 8-10 |
-| **总计** | **15-19 工程天** |
+| M3 A | 3-4(简化,见 §4.8 更正)|
+| M4 B | 4-6(大幅简化,见 §5.10 更正)|
+| **总计** | **9.5-13.5 工程天** |
 
-不含 review wait time、不含 BE 字节格式调研可能 spike。
+不含 review wait time。
+
+**简化原因**:写 plan 时核验代码,发现 `.del` 文件编码、`__op` 列拆分、`DeletePredicatePb` 写入路径、PK encoder 均已实现(详见 §10)。原估计基于"全新建"假设,过保守。
+
+**G1 字节兼容 gate 风险大幅降低**:`encode_delete_keys_payload` 已经存在并有完整单测覆盖 ([delete_payload_codec.rs:653-779](src/connector/starrocks/lake/delete_payload_codec.rs#L653))。实施时仅需做一次"现有实现是否真的字节兼容 StarRocks BE"的回归验证,不需要从零写编码器。
 
 ### 8.6 失败模式与决策点
 
@@ -755,3 +766,134 @@ CI 无 BE 镜像时,手工脚本一次性验证,implementation notes 记录,**�
 | 6 | `__op` 列在优化器中处理 | 集中到 `load_op_column.rs` + `ColumnKind::LoadOp` + clippy lint | 控制类型污染回归面 |
 | 7 | `__op` 值域 | 当前 2 值(`0=upsert, 1=delete`)+ enum 预留 4 槽位 | 对齐 StarRocks PK stream load 协议,wire format 不破坏 |
 | 8 | Sink 拆分位置 | `sink/operator.rs::process_chunk` | 离 chunk 来源最近,内存压力低,模块内聚 |
+
+---
+
+## 10. 实施前现状核验 — 现有基础设施清单与修正
+
+写 plan 阶段(2026-05-13)做了一次代码核验,目的是把 spec 假设的"新建"与现实区分清楚。本节是 §4 / §5 / §8 的事实修正,**优先于前面章节的代码量与"新建文件"描述**。
+
+### 10.1 NovaRocks 已实现的 DELETE 相关基础设施
+
+#### 编码 / 序列化
+
+| 能力 | 状态 | 位置 |
+|---|---|---|
+| PK encoder(单列 + 多列) | ✅ 已实现 | `encode_primary_keys_from_batch`、`encode_primary_key_cell` — [src/connector/starrocks/lake/pk_applier.rs:573-595](src/connector/starrocks/lake/pk_applier.rs#L573);`encode_primary_keys_from_key_batch` — [src/connector/starrocks/lake/txn_log.rs:1916](src/connector/starrocks/lake/txn_log.rs#L1916) |
+| `.del` 文件 payload 编码 | ✅ 已实现 + 已测 | `encode_delete_keys_payload` + 5 个 round-trip 单测 — [src/connector/starrocks/lake/delete_payload_codec.rs:28](src/connector/starrocks/lake/delete_payload_codec.rs#L28) |
+| `.del` 文件 payload 解码 | ✅ 已实现 | `decode_delete_keys_payload` — 同文件 |
+
+#### `__op` 列处理
+
+| 能力 | 状态 | 位置 |
+|---|---|---|
+| `LOAD_OP_COLUMN = "__op"` 常量 | ✅ 已定义 | [sink/operator.rs:70](src/connector/starrocks/sink/operator.rs#L70)、[sink/factory.rs:71](src/connector/starrocks/sink/factory.rs#L71) |
+| `parse_op_batch` 按 `__op` 拆 chunk(Int8/Int32,NULL 校验,Upsert/Delete/Mixed 三种)| ✅ 已实现 | [txn_log.rs:1394](src/connector/starrocks/lake/txn_log.rs#L1394) |
+| `strip_last_op_control_column` 剥离 `__op` 列 | ✅ 已实现 | [txn_log.rs:1506](src/connector/starrocks/lake/txn_log.rs#L1506) |
+| Sink schema 识别 `__op`(`is_load_op_column` 等价逻辑分散在 sink) | ✅ 已实现 | [operator.rs:345, 890, 2523, 2590](src/connector/starrocks/sink/operator.rs#L345) |
+
+#### TxnLog / OpWrite / publish
+
+| 能力 | 状态 | 位置 |
+|---|---|---|
+| `OpWrite { rowset, dels[] }` 完整 schema | ✅ 已实现 | proto `idl/proto/lake_types.proto`;Rust 入口 [txn_log.rs:75 append_lake_txn_log_with_chunk_rowset](src/connector/starrocks/lake/txn_log.rs#L75) |
+| 自动按 `__op` 把 chunk 拆成 rowset(upsert) + dels(delete) | ✅ 已实现 | `append_lake_txn_log_with_chunk_rowset` 内部调 `parse_op_batch` |
+| `DeletePredicatePb` proto 类型 + 写端 RPC handler | ✅ 已实现 | `delete_data` — [transactions.rs:926](src/connector/starrocks/lake/transactions.rs#L926);`append_delete_data_txn_log` — [transactions.rs:958](src/connector/starrocks/lake/transactions.rs#L958) |
+| `DeleteDataRequest` FFI 入口(FE-compatible 路径) | ✅ 已实现 | `novarocks_rs_lake_delete_data` — [service/engine_ffi.rs:656](src/service/engine_ffi.rs#L656) |
+| publish 识别 `rowset.delete_predicate.is_some()` | ✅ 已实现 | [applier.rs:101](src/connector/starrocks/lake/applier.rs#L101) |
+| publish 识别 `op_write.dels[]` + PK index 查找 + delvec 生成 | ✅ 已实现 | `apply_primary_key_write_log_to_metadata` — [pk_applier.rs:68](src/connector/starrocks/lake/pk_applier.rs#L68);`persist_delvec_updates` — [pk_applier.rs:935](src/connector/starrocks/lake/pk_applier.rs#L935) |
+
+#### 读端
+
+| 能力 | 状态 | 位置 |
+|---|---|---|
+| `DeletePredicatePb` scan-time 应用 | ✅ 已实现 | `apply_delete_term_to_mask` — [formats/starrocks/reader/record_batch.rs:1164-1429](src/formats/starrocks/reader/record_batch.rs#L1164) |
+| `.delvec` 文件读取 + 应用 | ✅ 已实现 | reader 已经按 delvec metadata 跳行 |
+| `collect_delete_predicates` 元数据收集 | ✅ 已实现 | [formats/starrocks/metadata.rs:757-859](src/formats/starrocks/metadata.rs#L757) |
+
+### 10.2 §4 项 A 修正(DUP/UNIQUE/AGG)
+
+**spec 原描述**:新建 `delete_predicate_proto.rs`、`txn_log.rs` 新 entry、publish 子路径,共 ~550 行底层 + ~400 行 FE。
+
+**实际剩余工作**:
+- `delete_predicate_proto.rs`(~80 行):只是 `DeletePredicateTerms` → `DeletePredicatePb` 字段填充,**不写新 publish 路径**
+- `delete_predicate_translate.rs`(~400 行,无变化):WHERE → terms,literal 序列化为 StarRocks 兼容字符串
+- `delete_flow.rs` DUP/UNIQUE/AGG 分支(~150 行):构造 `DeleteDataRequest` 或直接构造 `DeletePredicatePb` 并调用 `transactions::delete_data` 等价路径
+- 单测 + 集成测(7 用例,~450 行)
+
+**对应 spec §4.5 "新增 publish 子路径 `apply_dup_predicate_write_log_to_metadata`"**:**取消**。`applier.rs:101` 现有路径 + `delete_data` 已经覆盖。`delete_flow` 直接调用 `transactions::delete_data`(可能要包一个 standalone-mode-friendly 的入口,见 plan)。
+
+**G2 gate(空 rowset publish 路径未走过)**:**风险降低**。`transactions.rs:926 delete_data` 已经能写入并 publish,且有读端测试(`txn_log.rs:6128 partial_update_snapshot_uses_lake_rowset_visibility_and_delete_predicates`)。需要做的是**确认 standalone-mode publish 链路同 FFI 链路走的是同一段** publish 代码,不走的话补一个 standalone 入口包装。
+
+**A.1 / A.2 子 PR 拆分调整**:
+- A.1:`delete_predicate_translate.rs` + `delete_predicate_proto.rs` + 单测(纯翻译层,无 publish 路径变更)
+- A.2:`delete_flow.rs` DUP/UNIQUE/AGG 分支 + 调用 `transactions::delete_data` 等价路径 + 集成测 + sql-test 用例
+
+### 10.3 §5 项 B 修正(PRIMARY KEY)
+
+**spec 原描述**:新建 `pk_encoder.rs` (~200)、`del_file_writer.rs` (~250)、sink `process_chunk` 拆分 (~150)、`load_op_column.rs` + `ColumnKind::LoadOp` (~200) + 各优化器 pass 短路 (~80),共 ~880 行底层 + ~250 行 FE 改写 + ~600 单测。
+
+**实际剩余工作**:
+- `load_op_column.rs`(~80 行):name helper(`is_load_op_column`)+ `LoadOp` enum(对外协议字段)。**不需要 `ColumnKind` 枚举改动** — NovaRocks 没有顶层 `ColumnKind` enum(只有 `OutputColumnKind` 在 reader 内部),sink 现状用 name 比较已经够。
+- 优化器 pass 防御性单测(~80 行):写测试**验证** `__op` projection 不会被 `column_pruning_rules` ([src/sql/optimizer/rbo/rules/column_pruning.rs](src/sql/optimizer/rbo/rules/column_pruning.rs)) 误裁、不会被 `predicate_pushdown_rbo_rules` 误推。**当前 pass 应当不会误碰**(因为 `__op` 是 plan 顶层 const projection 而非 scan 列),但写测试锁定这个行为。**预计 0 行 production 代码改动**;如果测试失败再补保护。
+- `delete_flow::execute_managed_pk_delete`(~300 行):
+  - 改写为带 `__op = 1` 列的 chunk(plan 改写 + 执行 + 走现有 sink)
+  - 复用 standalone INSERT 现有 plan 流程(`insert_flow::execute_insert_from_query_on_pipeline` 类似入口),不绕过 sink
+- 删 CoW + 删旧单测(~30 行净减)
+- 单测 + 集成测(5 用例,~400 行)
+
+**对应 spec §5.4 "Sink 内部按 `__op` 拆 chunk"**:**已经实现**,无需新写。spec §5.4 的伪代码描述的是**已存在**的 [txn_log.rs:1394 parse_op_batch](src/connector/starrocks/lake/txn_log.rs#L1394) 等价行为。
+
+**对应 spec §5.5 "`.del` 文件写入 + PK encoder"**:**全部已经实现**。`encode_delete_keys_payload` + `encode_primary_keys_from_batch` 已经构成完整路径。
+
+**对应 spec §5.6 "TxnLog 形态"**:**完全自动**。Sink 传 chunk 给 `append_lake_txn_log_with_chunk_rowset`,内部按 `__op` 拆分填 `rowset.segments` / `dels[]`。
+
+**G1 gate(`.del` 字节兼容 StarRocks)风险大幅降低**:
+- `delete_payload_codec.rs` 有 5 个 round-trip 单测覆盖 SLICE_ESCAPE 规则
+- 复用 NovaRocks 现有 `pk_applier::encode_primary_key_cell` 已经在 PK INSERT 路径上跑过
+- **实施时验证**:跑一次"NovaRocks 写 `.del` → StarRocks BE 读取"的字节级回归,确认现有实现真的字节兼容(理论上是 — 它就是为了 stream load + PK INSERT 的 conflict 处理写的)
+
+**B.1-B.4 子 PR 拆分调整**:
+- B.1:**取消**(`.del` + PK encoder 已存在,作为 G1 验证一次性检查就够)
+- B.2:`load_op_column.rs`(name helper + LoadOp enum)+ 防御性单测
+- B.3:**取消**(sink `__op` 拆分已存在);改为"**验证现有 sink 路径在 DELETE 入口下行为正确**"的集成测试
+- B.4:`delete_flow::execute_managed_pk_delete` + 删 CoW + 5 个 sql-test 用例 + 全 suite 回归
+
+**实质上 M4 缩短为 B.2 + B.4 两个子 PR**。
+
+### 10.4 §8 时间估计已更新
+
+见 §8.5(已就地更新)。9.5-13.5 工程天(对比原 15-19)。
+
+### 10.5 风险评估调整
+
+| 原风险 ID | 状态 |
+|---|---|
+| R1 `.del` 字节兼容 | 降级(基础设施已通过单测验证,只需 StarRocks BE 互操作回归)|
+| R3 Sink 改造引入 INSERT 回归 | **大幅降级** — 不再改 sink,只在 sink 上加 DELETE 入口 |
+| R4 `DeletePredicatePb` 空 rowset publish 未走过 | 降级 — 已经走过(`transactions::delete_data` + `applier.rs:101`)|
+| R2 `__op` 列污染优化器 | **降级** — 当前 NovaRocks plan optimizer **完全没碰过** `__op`,只需要写防御性单测锁定现有行为 |
+| R5 / R6 / R7 / R8 / R9 / R10 | 无变化 |
+
+### 10.6 实施时仍要做的事
+
+虽然底层就绪,以下事项不可跳过:
+
+1. **standalone 模式 `delete_data` 调用入口的形态**:
+   `transactions::delete_data(&DeleteDataRequest)` 设计给 FFI / RPC 使用,接受 proto 类型;standalone 模式可以直接调,但要核对 `tablet_ids`、`txn_id` 分配、`schema_key` 来源 — 这些通常 FE 提供。实施时要选:
+   - (a) 直接复用 `delete_data`,在 `delete_flow` 里构造 `DeleteDataRequest`,自分配 `txn_id`
+   - (b) 抽出一个 `transactions::delete_data_with_predicate(tablet_ids, predicate, schema_key)` 内部入口,FFI 和 standalone 各调一个适配层
+2. **PK DELETE 复用 standalone 现有 INSERT pipeline 的可行性**:[src/engine/insert_flow.rs:183 execute_insert_from_query_on_pipeline](src/engine/insert_flow.rs#L183) 是否能接受 `SELECT pk_cols, 1 AS __op` 的 plan、是否能感知"目标表是 PK 表"并把 chunk 走到 sink。实施时实测,如果不能,补一个 `execute_pk_delete_on_pipeline` 适配层。
+3. **literal coercion (§3) 在 SELECT/DELETE 共用 analyzer 入口处的接入**:仍是新工作,无变化。
+4. **splitter (§2)**:无变化。
+5. **全 suite 回归**:无变化,所有 hard gate 仍存在。
+
+### 10.7 总代码量更正
+
+| 项 | 原估 | 更正后 |
+|---|---|---|
+| D | ~60 | ~60 |
+| C | ~450 | ~450 |
+| A | ~1450 + 7 用例 | ~1080 + 7 用例 |
+| B | ~1730 + 5 用例 | ~890 + 5 用例 |
+| **合计** | **~3690 + 12 用例** | **~2480 + 12 用例** |
