@@ -101,6 +101,9 @@ pub fn eval_aes_encrypt(
         let aad_bytes = aad
             .as_ref()
             .and_then(|arr| (!arr.is_null(row)).then_some(arr.bytes(row)));
+        if aad_bytes.is_some() && !mode.is_gcm() {
+            return Err("aes_encrypt: requires GCM mode to use AAD parameter".to_string());
+        }
 
         out.push(super::common::aes_encrypt_raw(
             mode,

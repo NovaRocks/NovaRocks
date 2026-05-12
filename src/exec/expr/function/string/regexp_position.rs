@@ -27,16 +27,11 @@ pub fn eval_regexp_position(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let _ = expr;
+    let len = chunk.len();
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
-    let s_arr = str_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp_position expects string".to_string())?;
-    let p_arr = pat_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp_position expects string".to_string())?;
+    let s_arr = downcast_string_or_null(&str_arr, "regexp_position")?;
+    let p_arr = downcast_string_or_null(&pat_arr, "regexp_position")?;
 
     let start_arr_ref = if args.len() >= 3 {
         Some(arena.eval(args[2], chunk)?)
@@ -45,6 +40,7 @@ pub fn eval_regexp_position(
     };
     let start_arr = start_arr_ref
         .as_ref()
+        .filter(|a| !matches!(a.data_type(), arrow::datatypes::DataType::Null))
         .map(|arr| super::common::downcast_int_arg_array(arr, "regexp_position"))
         .transpose()?;
 
@@ -55,12 +51,27 @@ pub fn eval_regexp_position(
     };
     let occurrence_arr = occurrence_arr_ref
         .as_ref()
+        .filter(|a| !matches!(a.data_type(), arrow::datatypes::DataType::Null))
         .map(|arr| super::common::downcast_int_arg_array(arr, "regexp_position"))
         .transpose()?;
 
-    let mut out = Vec::with_capacity(s_arr.len());
-    for row in 0..s_arr.len() {
-        if s_arr.is_null(row) || p_arr.is_null(row) {
+    // A NULL literal arrives as a typed-Null array. If the user passed
+    // start/occurrence but its array is Null-typed, the result is NULL on
+    // every row; encode that as the array being `None` here.
+    let start_is_null = args.len() >= 3 && start_arr.is_none();
+    let occurrence_is_null = args.len() >= 4 && occurrence_arr.is_none();
+
+    let mut out = Vec::with_capacity(len);
+    for row in 0..len {
+        let Some(s) = string_value_at(&s_arr, row) else {
+            out.push(None);
+            continue;
+        };
+        let Some(p) = string_value_at(&p_arr, row) else {
+            out.push(None);
+            continue;
+        };
+        if start_is_null || occurrence_is_null {
             out.push(None);
             continue;
         }
@@ -73,11 +84,34 @@ pub fn eval_regexp_position(
 
         let start_pos = start_arr.as_ref().map_or(1, |arr| arr.value(row));
         let occurrence = occurrence_arr.as_ref().map_or(1, |arr| arr.value(row));
-        let pos = eval_row(s_arr.value(row), p_arr.value(row), start_pos, occurrence)?;
+        let pos = eval_row(s, p, start_pos, occurrence)?;
         out.push(Some(pos as i32));
     }
 
     Ok(Arc::new(Int32Array::from(out)) as ArrayRef)
+}
+
+fn downcast_string_or_null<'a>(
+    arr: &'a ArrayRef,
+    fname: &str,
+) -> Result<Option<&'a StringArray>, String> {
+    if matches!(arr.data_type(), arrow::datatypes::DataType::Null) {
+        return Ok(None);
+    }
+    let s = arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("{fname} expects string"))?;
+    Ok(Some(s))
+}
+
+fn string_value_at<'a>(arr: &Option<&'a StringArray>, row: usize) -> Option<&'a str> {
+    let arr = arr.as_ref()?;
+    if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row))
+    }
 }
 
 fn eval_row(input: &str, pattern: &str, start_pos: i64, occurrence: i64) -> Result<i64, String> {

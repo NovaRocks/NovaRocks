@@ -172,6 +172,10 @@ pub(crate) fn wider_type(a: &DataType, b: &DataType) -> DataType {
             };
             DataType::Decimal128(p, s)
         }
+        // DATE + DATETIME -> DATETIME (StarRocks: only DATETIME signatures exist
+        // for comparison/greatest/least/coalesce with mixed date+datetime input).
+        (DataType::Timestamp(u, tz), DataType::Date32)
+        | (DataType::Date32, DataType::Timestamp(u, tz)) => DataType::Timestamp(*u, tz.clone()),
         (DataType::Float64, _) | (_, DataType::Float64) => DataType::Float64,
         (DataType::Float32, _) | (_, DataType::Float32) => DataType::Float64,
         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,

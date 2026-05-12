@@ -71,6 +71,14 @@ pub(super) fn to_owned_bytes_array(
     if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
         return Ok(OwnedBytesArray::Binary(arr.clone()));
     }
+    // A typed-Null literal arrives as a NullArray; treat it as a VARCHAR
+    // column whose every row is NULL so the per-row logic below collapses
+    // the result to NULL rather than failing the static check.
+    if matches!(array.data_type(), DataType::Null) {
+        let len = array.len();
+        let all_null: Vec<Option<&str>> = (0..len).map(|_| None).collect();
+        return Ok(OwnedBytesArray::Utf8(StringArray::from(all_null)));
+    }
     Err(format!(
         "{}: arg{} must be VARCHAR or VARBINARY",
         fn_name, arg_idx

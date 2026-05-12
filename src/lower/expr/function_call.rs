@@ -1221,6 +1221,10 @@ pub(crate) fn lower_function_call(
         if let function::FunctionKind::Encryption(name) = kind {
             let is_varchar_or_binary =
                 |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::Binary);
+            // NULL literal args (typed-Null) are valid; they propagate to
+            // per-row NULL rather than tripping the static type check.
+            let is_varchar_binary_or_null =
+                |dt: &DataType| matches!(dt, DataType::Utf8 | DataType::Binary | DataType::Null);
             let is_integer = |dt: &DataType| {
                 matches!(
                     dt,
@@ -1248,10 +1252,10 @@ pub(crate) fn lower_function_call(
                         let mode_ty = arena
                             .data_type(children[3])
                             .ok_or_else(|| format!("{} missing arg3 type", name))?;
-                        if !is_varchar_or_binary(iv_ty) {
+                        if !is_varchar_binary_or_null(iv_ty) {
                             return Err(format!("{} arg2 must be VARCHAR/VARBINARY", name));
                         }
-                        if !is_varchar_or_binary(mode_ty) {
+                        if !is_varchar_binary_or_null(mode_ty) {
                             return Err(format!("{} arg3 must be VARCHAR/VARBINARY", name));
                         }
                     }
@@ -1259,7 +1263,7 @@ pub(crate) fn lower_function_call(
                         let aad_ty = arena
                             .data_type(children[4])
                             .ok_or_else(|| format!("{} missing arg4 type", name))?;
-                        if !is_varchar_or_binary(aad_ty) {
+                        if !is_varchar_binary_or_null(aad_ty) {
                             return Err(format!("{} arg4 must be VARCHAR/VARBINARY", name));
                         }
                     }

@@ -493,6 +493,99 @@ impl<'a> AnalyzerContext<'a> {
         self.substitute_select_aliases_inner(expr, projection, false)
     }
 
+    /// Like [`substitute_select_aliases`] but only rewrites a `ColumnRef`
+    /// when the name does NOT also resolve as a column from the FROM scope.
+    /// SELECT items reference table columns far more often than they
+    /// reference earlier aliases, so suppress the rewrite whenever the
+    /// FROM column is in scope to avoid breaking semantics for queries
+    /// like `SELECT n + 1 AS n, (n + 1) * (n + 1) AS sq FROM t`.
+    fn substitute_select_aliases_for_select(
+        &self,
+        expr: TypedExpr,
+        projection: &[ProjectItem],
+        from_scope: &AnalyzerScope,
+    ) -> TypedExpr {
+        self.substitute_select_aliases_for_select_inner(expr, projection, from_scope, false)
+    }
+
+    fn substitute_select_aliases_for_select_inner(
+        &self,
+        expr: TypedExpr,
+        projection: &[ProjectItem],
+        from_scope: &AnalyzerScope,
+        inside_agg: bool,
+    ) -> TypedExpr {
+        match expr.kind {
+            ExprKind::ColumnRef {
+                ref qualifier,
+                ref column,
+            } if qualifier.is_none() && !inside_agg => {
+                if from_scope.resolve(None, column).is_ok() {
+                    // The FROM clause already binds this column; do not
+                    // shadow it with an earlier SELECT alias.
+                    return expr;
+                }
+                let col_lower = column.to_lowercase();
+                for item in projection {
+                    if item.output_name.to_lowercase() == col_lower {
+                        return item.expr.clone();
+                    }
+                }
+                expr
+            }
+            ExprKind::BinaryOp { left, op, right } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *left, projection, from_scope, inside_agg,
+                    )),
+                    op,
+                    right: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *right, projection, from_scope, inside_agg,
+                    )),
+                },
+            },
+            ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
+                data_type: expr.data_type,
+                nullable: expr.nullable,
+                kind: ExprKind::UnaryOp {
+                    op,
+                    expr: Box::new(self.substitute_select_aliases_for_select_inner(
+                        *inner, projection, from_scope, inside_agg,
+                    )),
+                },
+            },
+            ExprKind::FunctionCall {
+                name,
+                args,
+                distinct,
+            } => {
+                let is_agg = crate::sql::analyzer::functions::is_aggregate_function(&name);
+                TypedExpr {
+                    data_type: expr.data_type,
+                    nullable: expr.nullable,
+                    kind: ExprKind::FunctionCall {
+                        name,
+                        args: args
+                            .into_iter()
+                            .map(|arg| {
+                                self.substitute_select_aliases_for_select_inner(
+                                    arg,
+                                    projection,
+                                    from_scope,
+                                    inside_agg || is_agg,
+                                )
+                            })
+                            .collect(),
+                        distinct,
+                    },
+                }
+            }
+            _ => expr,
+        }
+    }
+
     fn substitute_select_aliases_inner(
         &self,
         expr: TypedExpr,
@@ -1065,13 +1158,22 @@ impl<'a> AnalyzerContext<'a> {
         items: &[sqlast::SelectItem],
         scope: &AnalyzerScope,
     ) -> Result<(Vec<ProjectItem>, Vec<OutputColumn>), String> {
-        let mut projection = Vec::new();
+        let mut projection: Vec<ProjectItem> = Vec::new();
         let mut output_columns = Vec::new();
+        // StarRocks allows later SELECT items to reference earlier item
+        // aliases by name. Track those aliases in a parallel scope so name
+        // resolution succeeds; afterwards we rewrite every `ColumnRef` that
+        // matches an earlier alias to the alias's already-analyzed
+        // expression, so the codegen sees inlined expressions instead of
+        // unbound projection slot references.
+        let mut effective_scope = scope.clone();
 
         for item in items {
             match item {
                 sqlast::SelectItem::UnnamedExpr(expr) => {
-                    let typed = self.analyze_expr(expr, scope)?;
+                    let typed = self.analyze_expr(expr, &effective_scope)?;
+                    let typed =
+                        self.substitute_select_aliases_for_select(typed, &projection, scope);
                     let name = match &typed.kind {
                         ExprKind::ColumnRef { column, .. } => column.clone(),
                         _ => expr_display_name(expr),
@@ -1087,13 +1189,29 @@ impl<'a> AnalyzerContext<'a> {
                     });
                 }
                 sqlast::SelectItem::ExprWithAlias { expr, alias } => {
-                    let typed = self.analyze_expr(expr, scope)?;
+                    let typed = self.analyze_expr(expr, &effective_scope)?;
+                    let typed =
+                        self.substitute_select_aliases_for_select(typed, &projection, scope);
                     let name = alias.value.clone();
                     output_columns.push(OutputColumn {
                         name: name.clone(),
                         data_type: typed.data_type.clone(),
                         nullable: typed.nullable,
                     });
+                    // Make the alias visible to later items in the same
+                    // projection list, but only if it does not already
+                    // collide with a column from the FROM scope; otherwise
+                    // the alias would shadow the underlying column and
+                    // future items would resolve to the alias expression
+                    // instead of the FROM column.
+                    if scope.resolve(None, &name).is_err() {
+                        effective_scope.add_column(
+                            None,
+                            &name,
+                            typed.data_type.clone(),
+                            typed.nullable,
+                        );
+                    }
                     projection.push(ProjectItem {
                         expr: typed,
                         output_name: name,

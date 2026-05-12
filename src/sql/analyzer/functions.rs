@@ -106,6 +106,7 @@ pub(super) fn validate_scalar_function_call(
         "cardinality" | "array_length" | "map_size" | "map_keys" | "map_values" | "array_min"
         | "array_max" => Some(1usize),
         "__array_struct_subfield" => Some(2usize),
+        "translate" => Some(3usize),
         _ => None,
     };
     if let Some(expected) = expected_arity
@@ -322,7 +323,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "translate"
         | "initcap"
         | "regexp_extract"
+        | "regexp_extract_all"
         | "regexp_replace"
+        | "bar"
         | "append_trailing_char_if_absent"
         | "money_format"
         | "char"
@@ -335,14 +338,27 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         | "group_concat"
         | "string_agg"
         | "substring_index"
-        | "parse_url"
-        | "str_to_map" => DataType::Utf8,
+        | "parse_url" => DataType::Utf8,
+        "str_to_map" => DataType::Map(
+            Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Utf8, true)),
+                        Arc::new(arrow::datatypes::Field::new("value", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
 
         // Math functions that return the same type as input
         "abs" => arg_types.first().cloned().unwrap_or(DataType::Float64),
 
         // Math functions that return Int64
-        "ceil" | "ceiling" | "floor" => DataType::Int64,
+        "ceil" | "ceiling" | "dceil" | "floor" | "dfloor" => DataType::Int64,
 
         // round/truncate:
         // - Decimal input -> Decimal128 with adjusted scale
@@ -362,13 +378,55 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         },
 
         // Math functions that return Float64
-        "mod" | "pow" | "power" | "sqrt" | "exp" | "ln" | "log" | "log2" | "log10" | "sin"
-        | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "radians" | "degrees" | "pi"
-        | "e" | "sign" | "rand" | "random" => DataType::Float64,
+        "mod"
+        | "pmod"
+        | "fmod"
+        | "pow"
+        | "fpow"
+        | "dpow"
+        | "power"
+        | "sqrt"
+        | "dsqrt"
+        | "cbrt"
+        | "exp"
+        | "dexp"
+        | "ln"
+        | "log"
+        | "log2"
+        | "log10"
+        | "dlog10"
+        | "dlog1"
+        | "dround"
+        | "sin"
+        | "cos"
+        | "tan"
+        | "asin"
+        | "acos"
+        | "atan"
+        | "atan2"
+        | "cot"
+        | "radians"
+        | "degrees"
+        | "degress"
+        | "pi"
+        | "e"
+        | "sign"
+        | "rand"
+        | "random"
+        | "square"
+        | "positive"
+        | "cosine_similarity"
+        | "cosine_similarity_norm"
+        | "approx_cosine_similarity"
+        | "l2_distance"
+        | "approx_l2_distance" => DataType::Float64,
 
         // String length/position -> Int32
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
-        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" => DataType::Int32,
+        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" | "regexp_position" => {
+            DataType::Int32
+        }
+        "regexp_count" | "equiwidth_bucket" => DataType::Int64,
 
         // Conditional functions -> widened type of value args.
         "if" if arg_types.len() >= 2 => {
@@ -378,7 +436,7 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
             }
             result
         }
-        "if" | "ifnull" | "nullif" | "coalesce" | "nvl" => {
+        "if" | "ifnull" | "nullif" | "coalesce" | "nvl" | "greatest" | "least" => {
             if arg_types.is_empty() {
                 DataType::Null
             } else {
@@ -386,15 +444,29 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
                 for t in &arg_types[1..] {
                     result = wider_type(&result, t);
                 }
+                // StarRocks only registers DATETIME signatures for
+                // greatest/least, so pure DATE inputs are widened to DATETIME.
+                if matches!(name, "greatest" | "least") && matches!(result, DataType::Date32) {
+                    result = DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None);
+                }
                 result
             }
         }
 
         // Date/time
-        "now" | "current_timestamp" | "current_date" | "curdate" => {
+        "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" | "to_datetime"
+        | "to_datetime_ntz" | "timestamp" => {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         }
+        "date" => DataType::Date32,
+        // time_slice / date_slice mirror their first input type.
+        "time_slice" | "date_slice" => arg_types.first().cloned().unwrap_or(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
         "date_format" | "from_unixtime" | "time_format" => DataType::Utf8,
+        // `add_months` always returns DATETIME.
+        "add_months" => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
         | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub"
         | "timestampadd" | "sec_to_time" | "hours_add" | "hours_sub" | "minutes_add"
@@ -429,6 +501,31 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         }
         "sleep" => DataType::Boolean,
         "murmur_hash3_32" => DataType::Int32,
+        "xx_hash3_64" => DataType::Int64,
+        "xx_hash3_128" => DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
+        // Symmetric ciphers / hashes: aes_*/encode_* return BE-style VARCHAR
+        // (raw bytes interpreted as latin-1); to_base64 wraps them in tests.
+        "aes_encrypt" | "aes_decrypt" | "encode_sort_key" => DataType::Utf8,
+        "encode_fingerprint_sha256" => DataType::Binary,
+        // Iceberg internal transform functions.
+        "__iceberg_transform_identity" => arg_types.first().cloned().unwrap_or(DataType::Null),
+        "__iceberg_transform_void" => DataType::Null,
+        "__iceberg_transform_year"
+        | "__iceberg_transform_month"
+        | "__iceberg_transform_day"
+        | "__iceberg_transform_hour"
+        | "__iceberg_transform_bucket" => DataType::Int32,
+        "__iceberg_transform_truncate" => arg_types.first().cloned().unwrap_or(DataType::Null),
+        // Bitwise functions return the same integer width as the first
+        // argument; mirror codegen so the lowering layer's integer-only
+        // requirement is satisfied (e.g. shift on LARGEINT).
+        "bitnot"
+        | "bitand"
+        | "bitor"
+        | "bitxor"
+        | "bit_shift_left"
+        | "bit_shift_right"
+        | "bit_shift_right_logical" => arg_types.first().cloned().unwrap_or(DataType::Int64),
         "md5sum_numeric" => DataType::FixedSizeBinary(crate::common::largeint::LARGEINT_BYTE_WIDTH),
         "hll_hash"
         | "ds_hll_count_distinct_state"

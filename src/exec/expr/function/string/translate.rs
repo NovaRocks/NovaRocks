@@ -115,33 +115,26 @@ pub fn eval_translate(
     let src_arr = arena.eval(args[0], chunk)?;
     let from_arr = arena.eval(args[1], chunk)?;
     let to_arr = arena.eval(args[2], chunk)?;
+    let len = chunk.len();
 
-    let src_arr = src_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "translate expects string".to_string())?;
-    let from_arr = from_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "translate expects string".to_string())?;
-    let to_arr = to_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "translate expects string".to_string())?;
+    // A NULL literal argument arrives as a NullArray; treat it as
+    // always-null so the result is NULL for every row without erroring.
+    let src_str = downcast_string_or_null(&src_arr)?;
+    let from_str = downcast_string_or_null(&from_arr)?;
+    let to_str = downcast_string_or_null(&to_arr)?;
 
-    let len = src_arr.len();
     let mut out = Vec::with_capacity(len);
     for row in 0..len {
-        if src_arr.is_null(row) || from_arr.is_null(row) || to_arr.is_null(row) {
+        let (Some(src), Some(from_s), Some(to_s)) = (
+            value_at(&src_str, row),
+            value_at(&from_str, row),
+            value_at(&to_str, row),
+        ) else {
             out.push(None);
             continue;
-        }
+        };
 
-        let src = src_arr.value(row);
-        let from_str = from_arr.value(row);
-        let to_str = to_arr.value(row);
-
-        let translated = match build_translate_map(from_str, to_str) {
+        let translated = match build_translate_map(from_s, to_s) {
             TranslateMap::Ascii(map) => Some(translate_ascii(src, &map)),
             TranslateMap::Utf8(map) => translate_utf8(src, &map),
         };
@@ -149,4 +142,24 @@ pub fn eval_translate(
     }
 
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+}
+
+fn downcast_string_or_null(arr: &ArrayRef) -> Result<Option<&StringArray>, String> {
+    if matches!(arr.data_type(), arrow::datatypes::DataType::Null) {
+        return Ok(None);
+    }
+    let s = arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| "translate expects string".to_string())?;
+    Ok(Some(s))
+}
+
+fn value_at<'a>(arr: &Option<&'a StringArray>, row: usize) -> Option<&'a str> {
+    let arr = arr.as_ref()?;
+    if arr.is_null(row) {
+        None
+    } else {
+        Some(arr.value(row))
+    }
 }

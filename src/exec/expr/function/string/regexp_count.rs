@@ -27,23 +27,29 @@ pub fn eval_regexp_count(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let _ = expr;
+    let len = chunk.len();
     let str_arr = arena.eval(args[0], chunk)?;
     let pat_arr = arena.eval(args[1], chunk)?;
-    let s_arr = str_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp_count expects string".to_string())?;
-    let p_arr = pat_arr
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "regexp_count expects string".to_string())?;
+    // A NULL literal arrives as a typed-Null array; treat it as a column
+    // whose every row is NULL so we collapse the result to NULL rather than
+    // failing the static downcast.
+    let s_arr_opt = downcast_string_or_null(&str_arr, "regexp_count")?;
+    let p_arr_opt = downcast_string_or_null(&pat_arr, "regexp_count")?;
     let pattern_is_constant = matches!(
         arena.node(args[1]),
         Some(ExprNode::Literal(LiteralValue::Utf8(_)))
     );
 
-    let mut out = Vec::with_capacity(s_arr.len());
-    for row in 0..s_arr.len() {
+    let mut out = Vec::with_capacity(len);
+    for row in 0..len {
+        let Some(s_arr) = s_arr_opt else {
+            out.push(None);
+            continue;
+        };
+        let Some(p_arr) = p_arr_opt else {
+            out.push(None);
+            continue;
+        };
         if s_arr.is_null(row) || p_arr.is_null(row) {
             out.push(None);
             continue;
@@ -73,4 +79,17 @@ pub fn eval_regexp_count(
     }
 
     Ok(Arc::new(Int64Array::from(out)) as ArrayRef)
+}
+
+fn downcast_string_or_null<'a>(
+    arr: &'a ArrayRef,
+    fname: &str,
+) -> Result<Option<&'a StringArray>, String> {
+    if matches!(arr.data_type(), arrow::datatypes::DataType::Null) {
+        return Ok(None);
+    }
+    arr.as_any()
+        .downcast_ref::<StringArray>()
+        .map(Some)
+        .ok_or_else(|| format!("{fname} expects string"))
 }

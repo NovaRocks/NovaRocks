@@ -582,7 +582,7 @@ impl StandaloneSession {
         let dialect = StarRocksDialect;
         let mut parser = sqlparser::parser::Parser::new(&dialect)
             .try_with_sql(&parse_sql)
-            .map_err(|e| format!("sql parser error: {e}"))?;
+            .map_err(|e| format_parser_error(&e.to_string()))?;
 
         // StarRocks DDL: token-level parsing (sqlparser cannot handle these)
         if looks_like_create_table(&parser) {
@@ -654,7 +654,7 @@ impl StandaloneSession {
 
         // Standard SQL: let sqlparser parse the full statement
         let stmt = crate::sql::parser::parse_normalized_sql_raw(&parse_sql)
-            .map_err(|e| format!("sql parser error: {e}"))?;
+            .map_err(|e| format_parser_error(&e.to_string()))?;
         match stmt {
             sqlast::Statement::Explain {
                 statement,
@@ -2530,6 +2530,27 @@ fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
         idx += 1;
     }
     None
+}
+
+/// Wrap a sqlparser error message in the `sql parser error: ...` envelope
+/// and append a StarRocks-style `Unexpected input '<token>'` clause when
+/// the underlying error mentions the offending token (`found: <token>`),
+/// so tests can assert against the StarRocks-FE-style wording.
+fn format_parser_error(raw: &str) -> String {
+    let mut out = format!("sql parser error: {raw}");
+    if let Some(start) = raw.find("found: ") {
+        let after = &raw[start + "found: ".len()..];
+        let token = after
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches(|c: char| c == '`' || c == '"');
+        if !token.is_empty() {
+            out.push_str(&format!(" Unexpected input '{token}'."));
+        }
+    }
+    out
 }
 
 fn split_explain_costs_sql(sql: &str) -> Option<(String, crate::sql::explain::ExplainLevel)> {

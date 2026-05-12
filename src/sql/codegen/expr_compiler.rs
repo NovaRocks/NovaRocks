@@ -1107,6 +1107,35 @@ impl<'a> ExprCompiler<'a> {
         args: &[TypedExpr],
         type_hint: &DataType,
     ) -> Result<DataType, String> {
+        // SUBSTR/SUBSTRING reject BIGINT literal pos/length values that
+        // overflow INT (i32); column overflow is handled per-row at runtime.
+        if matches!(name, "substr" | "substring") {
+            for arg in args.iter().skip(1) {
+                if let Some(v) = constant_i64_value(arg) {
+                    if i32::try_from(v).is_err() {
+                        return Err(format!("Cast argument {} to int type failed", v));
+                    }
+                }
+            }
+        }
+
+        // typeof(x) is evaluated at compile time: the result is the SQL type
+        // name of `x` as a VARCHAR literal. The argument is not evaluated.
+        if name == "typeof" && args.len() == 1 {
+            let type_name = starrocks_type_name(&args[0].data_type);
+            let type_desc = scalar_type_desc(types::TPrimitiveType::VARCHAR);
+            self.nodes.push(exprs::TExprNode {
+                node_type: exprs::TExprNodeType::STRING_LITERAL,
+                type_: type_desc,
+                num_children: 0,
+                string_literal: Some(exprs::TStringLiteral { value: type_name }),
+                ..default_expr_node()
+            });
+            self.last_type = DataType::Utf8;
+            self.last_nullable = false;
+            return Ok(DataType::Utf8);
+        }
+
         let parent_idx = self.nodes.len();
         self.nodes.push(default_expr_node()); // placeholder
 
@@ -1516,7 +1545,17 @@ fn slot_ref_node(slot_id: i32, tuple_id: i32, type_desc: types::TTypeDesc) -> ex
 }
 
 fn int_literal_node(value: i64) -> exprs::TExprNode {
-    let type_desc = scalar_type_desc(types::TPrimitiveType::BIGINT);
+    int_literal_node_typed(value, &DataType::Int64)
+}
+
+fn int_literal_node_typed(value: i64, expr_type: &DataType) -> exprs::TExprNode {
+    let prim = match expr_type {
+        DataType::Int8 => types::TPrimitiveType::TINYINT,
+        DataType::Int16 => types::TPrimitiveType::SMALLINT,
+        DataType::Int32 => types::TPrimitiveType::INT,
+        _ => types::TPrimitiveType::BIGINT,
+    };
+    let type_desc = scalar_type_desc(prim);
     exprs::TExprNode {
         node_type: exprs::TExprNodeType::INT_LITERAL,
         type_: type_desc,
@@ -1804,7 +1843,9 @@ fn infer_scalar_function_return_type(
         | "initcap"
         | "split_part"
         | "regexp_extract"
+        | "regexp_extract_all"
         | "regexp_replace"
+        | "bar"
         | "append_trailing_char_if_absent"
         | "money_format"
         | "char"
@@ -1817,12 +1858,25 @@ fn infer_scalar_function_return_type(
         | "group_concat"
         | "string_agg"
         | "substring_index"
-        | "parse_url"
-        | "str_to_map" => Ok(DataType::Utf8),
+        | "parse_url" => Ok(DataType::Utf8),
+        "str_to_map" => Ok(DataType::Map(
+            Arc::new(arrow::datatypes::Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Utf8, true)),
+                        Arc::new(arrow::datatypes::Field::new("value", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        )),
 
         // Numeric functions
         "abs" | "negative" => Ok(arg_types.first().cloned().unwrap_or(DataType::Float64)),
-        "ceil" | "ceiling" | "floor" => Ok(DataType::Int64),
+        "ceil" | "ceiling" | "dceil" | "floor" | "dfloor" => Ok(DataType::Int64),
         // round/truncate:
         // - Decimal input -> Decimal128 with adjusted scale
         // - Non-decimal without explicit scale -> Int64
@@ -1853,16 +1907,24 @@ fn infer_scalar_function_return_type(
             _ => DataType::Int64,
         }),
         "mod"
+        | "pmod"
         | "fmod"
         | "pow"
+        | "fpow"
+        | "dpow"
         | "power"
         | "sqrt"
+        | "dsqrt"
         | "cbrt"
         | "exp"
+        | "dexp"
         | "ln"
         | "log"
         | "log2"
         | "log10"
+        | "dlog10"
+        | "dlog1"
+        | "dround"
         | "sin"
         | "cos"
         | "tan"
@@ -1872,13 +1934,18 @@ fn infer_scalar_function_return_type(
         | "atan2"
         | "radians"
         | "degrees"
+        | "degress"
         | "pi"
         | "e"
         | "sign"
         | "cot"
+        | "square"
+        | "positive"
         | "cosine_similarity"
         | "cosine_similarity_norm"
-        | "l2_distance" => Ok(DataType::Float64),
+        | "approx_cosine_similarity"
+        | "l2_distance"
+        | "approx_l2_distance" => Ok(DataType::Float64),
         "rand" | "random" => Ok(DataType::Float64),
         "crc32" => Ok(DataType::Int64),
         "md5sum_numeric" => Ok(DataType::FixedSizeBinary(
@@ -1887,7 +1954,10 @@ fn infer_scalar_function_return_type(
 
         // String length/position
         "length" | "char_length" | "character_length" | "bit_length" | "instr" | "locate"
-        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" => Ok(DataType::Int32),
+        | "position" | "find_in_set" | "strcmp" | "ascii" | "ord" | "field" | "regexp_position" => {
+            Ok(DataType::Int32)
+        }
+        "regexp_count" | "equiwidth_bucket" => Ok(DataType::Int64),
 
         // Conditional
         "if" if arg_types.len() >= 2 => {
@@ -1910,10 +1980,19 @@ fn infer_scalar_function_return_type(
         }
 
         // Date/time
-        "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" => Ok(
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-        ),
+        "now" | "current_timestamp" | "current_date" | "curdate" | "convert_tz" | "to_datetime"
+        | "timestamp" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
         "date_format" | "from_unixtime" | "time_format" => Ok(DataType::Utf8),
+        // `add_months` always returns DATETIME in StarRocks regardless of
+        // input width, so handle it separately from the other date-shift
+        // functions which preserve the first-arg type.
+        "add_months" => Ok(DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            None,
+        )),
         "date_add" | "date_sub" | "adddate" | "subdate" | "days_add" | "days_sub" | "weeks_add"
         | "weeks_sub" | "months_add" | "months_sub" | "years_add" | "years_sub"
         | "timestampadd" | "sec_to_time" | "hours_add" | "hours_sub" | "minutes_add"
@@ -1996,13 +2075,31 @@ fn infer_scalar_function_return_type(
         "uuid" | "typeof" => Ok(DataType::Utf8),
         "murmur_hash3_32" => Ok(DataType::Int32),
         "hll_hash" | "ds_hll_count_distinct_state" | "to_bitmap" => Ok(DataType::Binary),
-        "xx_hash3_64" | "xx_hash3_128" => Ok(DataType::Int64),
+        "xx_hash3_64" => Ok(DataType::Int64),
+        "xx_hash3_128" => Ok(DataType::FixedSizeBinary(
+            crate::common::largeint::LARGEINT_BYTE_WIDTH,
+        )),
         "to_binary" | "encode_row_id" => Ok(DataType::Binary),
+        "aes_encrypt" | "aes_decrypt" | "encode_sort_key" => Ok(DataType::Utf8),
+        "encode_fingerprint_sha256" => Ok(DataType::Binary),
+        "__iceberg_transform_identity" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
+        "__iceberg_transform_void" => Ok(DataType::Null),
+        "__iceberg_transform_year"
+        | "__iceberg_transform_month"
+        | "__iceberg_transform_day"
+        | "__iceberg_transform_hour"
+        | "__iceberg_transform_bucket" => Ok(DataType::Int32),
+        "__iceberg_transform_truncate" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "to_datetime_ntz" => Ok(DataType::Timestamp(
             arrow::datatypes::TimeUnit::Microsecond,
             None,
         )),
         "date" => Ok(DataType::Date32),
+        // time_slice / date_slice return a DATETIME/DATE aligned to the
+        // requested interval boundary; the result mirrors the first arg type.
+        "time_slice" | "date_slice" => Ok(arg_types.first().cloned().unwrap_or(
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )),
         "greatest" | "least" => Ok(arg_types.first().cloned().unwrap_or(DataType::Null)),
         "array_length" | "array_position" | "cardinality" | "map_size" => Ok(DataType::Int32),
         "grouping" | "grouping_id" => Ok(DataType::Int64),
@@ -2458,6 +2555,67 @@ fn list_output_type(item_type: DataType) -> DataType {
     DataType::List(Arc::new(arrow::datatypes::Field::new(
         "item", item_type, true,
     )))
+}
+
+/// Fold a constant `BIGINT` expression — literal or `-literal` — to its
+/// `i64` value, used for compile-time validation of literal arguments.
+fn constant_i64_value(expr: &TypedExpr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(LiteralValue::Int(v)) => Some(*v),
+        ExprKind::UnaryOp {
+            op: UnOp::Negate,
+            expr: inner,
+        } => constant_i64_value(inner).and_then(i64::checked_neg),
+        _ => None,
+    }
+}
+
+/// Render an arrow `DataType` as the lowercase StarRocks type name, used by
+/// `typeof()`. Returns the canonical FE-facing name (e.g. `int`, `datetime`).
+fn starrocks_type_name(dt: &DataType) -> String {
+    match dt {
+        DataType::Boolean => "boolean".to_string(),
+        DataType::Int8 => "tinyint".to_string(),
+        DataType::Int16 => "smallint".to_string(),
+        DataType::Int32 => "int".to_string(),
+        DataType::Int64 => "bigint".to_string(),
+        DataType::UInt8 => "tinyint unsigned".to_string(),
+        DataType::UInt16 => "smallint unsigned".to_string(),
+        DataType::UInt32 => "int unsigned".to_string(),
+        DataType::UInt64 => "bigint unsigned".to_string(),
+        DataType::Float32 => "float".to_string(),
+        DataType::Float64 => "double".to_string(),
+        DataType::Decimal128(p, s) => format!("decimal128({}, {})", p, s),
+        DataType::FixedSizeBinary(w)
+            if *w == crate::common::largeint::LARGEINT_BYTE_WIDTH as i32 =>
+        {
+            "largeint".to_string()
+        }
+        DataType::Utf8 | DataType::LargeUtf8 => "varchar".to_string(),
+        DataType::Binary | DataType::LargeBinary => "varbinary".to_string(),
+        DataType::FixedSizeBinary(_) => "varbinary".to_string(),
+        DataType::Date32 => "date".to_string(),
+        DataType::Timestamp(_, _) => "datetime".to_string(),
+        DataType::Time32(_) | DataType::Time64(_) => "time".to_string(),
+        DataType::List(field) => format!("array<{}>", starrocks_type_name(field.data_type())),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) if fields.len() == 2 => format!(
+                "map<{},{}>",
+                starrocks_type_name(fields[0].data_type()),
+                starrocks_type_name(fields[1].data_type())
+            ),
+            _ => "map".to_string(),
+        },
+        DataType::Struct(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{} {}", f.name(), starrocks_type_name(f.data_type())))
+                .collect();
+            format!("struct<{}>", parts.join(", "))
+        }
+        DataType::Null => "null".to_string(),
+        other => format!("{:?}", other).to_lowercase(),
+    }
 }
 
 #[cfg(test)]

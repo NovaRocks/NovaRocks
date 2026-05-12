@@ -152,6 +152,26 @@ pub fn eval_substring(
         _ => return Err("substring: third argument must be a numeric array".to_string()),
     };
 
+    // StarRocks SUBSTR narrows BIGINT pos/length to INT (i32); column values
+    // that overflow i32 yield NULL rather than failing the whole query.
+    let user_supplied_length = length_expr.is_some();
+    let mut start_values = start_values;
+    let mut length_values = length_values;
+    for i in 0..len {
+        if let Some(v) = start_values[i] {
+            if i32::try_from(v).is_err() {
+                start_values[i] = None;
+            }
+        }
+        if user_supplied_length {
+            if let Some(v) = length_values[i] {
+                if i32::try_from(v).is_err() {
+                    length_values[i] = None;
+                }
+            }
+        }
+    }
+
     // Process each row
     // Aligned with StarRocks BE implementation:
     // - pos > 0: count from left (1-based), pos=1 means first character

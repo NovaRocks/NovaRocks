@@ -626,6 +626,17 @@ fn format_cast_type(data_type: &sqlast::DataType) -> String {
         {
             "LARGEINT".to_string()
         }
+        // `STRING` is a StarRocks alias for `VARCHAR(65533)`; FE-side display
+        // canonicalises it to `VARCHAR(65533)` in result column names.
+        sqlast::DataType::Custom(name, modifiers)
+            if name.to_string().eq_ignore_ascii_case("string") && modifiers.is_empty() =>
+        {
+            "VARCHAR(65533)".to_string()
+        }
+        sqlast::DataType::String(_) => "VARCHAR(65533)".to_string(),
+        // `BINARY` and `BINARY(N)` are spelled `VARBINARY` in StarRocks FE
+        // display because BE only has the variable-length variant.
+        sqlast::DataType::Binary(_) => "VARBINARY".to_string(),
         other => format!("{other}"),
     }
 }

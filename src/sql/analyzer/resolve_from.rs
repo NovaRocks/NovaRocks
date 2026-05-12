@@ -484,25 +484,122 @@ impl<'a> super::AnalyzerContext<'a> {
         let sqlast::FunctionArguments::List(ref arg_list) = function.args else {
             return Err("generate_series requires parenthesized arguments".into());
         };
-        let values: Vec<i64> = arg_list
+
+        // StarRocks allows `name = value` for named function arguments. Our
+        // dialect parses `=` as a binary comparison instead, so reinterpret a
+        // positional `Identifier = expr` here as a named argument before the
+        // mixed-mode check.
+        let normalized_args: Vec<sqlast::FunctionArg> = arg_list
             .args
             .iter()
-            .map(|arg| match arg {
-                sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => eval_const_i64(e),
-                other => Err(format!(
-                    "generate_series expects positional args, got {other}"
-                )),
-            })
-            .collect::<Result<_, _>>()?;
-        let (start, end, step) = match values.as_slice() {
-            [s, e] => (*s, *e, 1i64),
-            [s, e, st] => {
-                if *st == 0 {
-                    return Err("generate_series step must not be zero".into());
+            .map(|arg| {
+                if let sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(
+                    sqlast::Expr::BinaryOp { left, op, right },
+                )) = arg
+                    && matches!(op, sqlast::BinaryOperator::Eq)
+                    && let sqlast::Expr::Identifier(ident) = left.as_ref()
+                {
+                    return sqlast::FunctionArg::Named {
+                        name: ident.clone(),
+                        arg: sqlast::FunctionArgExpr::Expr(right.as_ref().clone()),
+                        operator: sqlast::FunctionArgOperator::Equals,
+                    };
                 }
-                (*s, *e, *st)
+                arg.clone()
+            })
+            .collect();
+
+        // Detect whether the call uses named args (start=>2, end=>5, ...).
+        // Mixing named and positional is disallowed; StarRocks's FE rejects
+        // the first positional token after a named one as `Unexpected input
+        // '<token>'`, which the SQL test suite asserts against verbatim.
+        let any_named = normalized_args
+            .iter()
+            .any(|a| matches!(a, sqlast::FunctionArg::Named { .. }));
+        let any_positional = normalized_args
+            .iter()
+            .any(|a| matches!(a, sqlast::FunctionArg::Unnamed(_)));
+        if any_named && any_positional {
+            // Surface the first stray positional token in the canonical
+            // `Unexpected input '<token>'` form.
+            if let Some(sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e))) =
+                normalized_args
+                    .iter()
+                    .find(|a| matches!(a, sqlast::FunctionArg::Unnamed(_)))
+            {
+                return Err(format!("Unexpected input '{e}'."));
             }
-            _ => return Err("generate_series expects 2 or 3 arguments".into()),
+            return Err("Unknown table function: generate_series".into());
+        }
+
+        let (start, end, step) = if any_named {
+            let mut start_v: Option<Option<i64>> = None;
+            let mut end_v: Option<Option<i64>> = None;
+            let mut step_v: Option<Option<i64>> = None;
+            for arg in &normalized_args {
+                let sqlast::FunctionArg::Named {
+                    name,
+                    arg: arg_expr,
+                    operator: _,
+                } = arg
+                else {
+                    return Err("Unknown table function: generate_series".into());
+                };
+                let key = name.value.to_ascii_lowercase();
+                let expr = match arg_expr {
+                    sqlast::FunctionArgExpr::Expr(e) => e,
+                    _ => return Err("Unknown table function: generate_series".into()),
+                };
+                let value = if is_null_literal(expr) {
+                    None
+                } else {
+                    Some(eval_const_i64(expr)?)
+                };
+                let slot = match key.as_str() {
+                    "start" => &mut start_v,
+                    "end" => &mut end_v,
+                    "step" => &mut step_v,
+                    _ => return Err(format!("Unknown table function: generate_series ({key})")),
+                };
+                if slot.is_some() {
+                    return Err("Unknown table function: generate_series".into());
+                }
+                *slot = Some(value);
+            }
+            let start =
+                start_v.ok_or_else(|| "Unknown table function: generate_series".to_string())?;
+            let end = end_v.ok_or_else(|| "Unknown table function: generate_series".to_string())?;
+            // Named args do not allow NULL values for any parameter.
+            if start.is_none() || end.is_none() || matches!(step_v, Some(None)) {
+                return Err("table function not support null parameter".into());
+            }
+            let step = step_v.flatten().unwrap_or(1);
+            if step == 0 {
+                return Err("generate_series step must not be zero".into());
+            }
+            (start.unwrap(), end.unwrap(), step)
+        } else {
+            let values: Vec<i64> = normalized_args
+                .iter()
+                .map(|arg| match arg {
+                    sqlast::FunctionArg::Unnamed(sqlast::FunctionArgExpr::Expr(e)) => {
+                        eval_const_i64(e)
+                    }
+                    other => Err(format!(
+                        "generate_series expects positional args, got {other}"
+                    )),
+                })
+                .collect::<Result<_, _>>()?;
+            match values.as_slice() {
+                [s, e] => (*s, *e, 1i64),
+                [s, e, st] => {
+                    if *st == 0 {
+                        return Err("generate_series step must not be zero".into());
+                    }
+                    (*s, *e, *st)
+                }
+                _ => return Err("Unknown table function: generate_series".into()),
+            }
         };
 
         // Determine output column name from alias or default
@@ -524,6 +621,13 @@ impl<'a> super::AnalyzerContext<'a> {
         });
         Ok((relation, scope))
     }
+}
+
+fn is_null_literal(expr: &sqlast::Expr) -> bool {
+    matches!(
+        expr,
+        sqlast::Expr::Value(v) if matches!(v.value, sqlast::Value::Null)
+    )
 }
 
 fn derived_table_output_columns(

@@ -469,7 +469,7 @@ static DATE_METADATA: &[FunctionMeta] = &[
     },
     FunctionMeta {
         name: "time_slice",
-        min_args: 3,
+        min_args: 2,
         max_args: 4,
     },
     FunctionMeta {
