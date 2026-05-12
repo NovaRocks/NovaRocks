@@ -29,6 +29,6 @@ pub(crate) use backend::{
     ManagedLakeBackend, ManagedLakeMvBackend, ManagedLakeTableSink, ManagedLakeTableSource,
 };
 pub(crate) use catalog::{
-    ManagedLakeCatalog, reconcile_on_open, register_managed_tables_in_catalog, runtime_registered,
+    ManagedLakeCatalog, register_managed_tables_in_catalog, runtime_registered,
 };
 pub(crate) use config::ManagedLakeConfig;

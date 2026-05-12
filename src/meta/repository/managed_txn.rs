@@ -6,8 +6,8 @@ use crate::meta::repository::{
     RepositoryError, RepositoryResult, decode_json_payload, encode_json_payload, id_scopes,
 };
 use crate::meta::{
-    ExpectedRevision, MetaKey, MetaReadTxn, MetaRecord, MetaRecordKind, MetaRecordPut,
-    MetaRevision, MetaWriteTxn,
+    ExpectedRevision, MetaKey, MetaKeyPrefix, MetaReadTxn, MetaRecord, MetaRecordKind,
+    MetaRecordPut, MetaRevision, MetaWriteTxn,
 };
 
 const MANAGED_TXN_KIND: &str = "managed.txn";
@@ -90,6 +90,86 @@ impl ManagedLakeTxnRepository {
         txn_id: i64,
     ) -> RepositoryResult<Option<StoredManagedTxn>> {
         Ok(load_versioned_txn(txn, txn_id)?.map(|versioned| versioned.value))
+    }
+
+    pub fn list_all(&self, txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<StoredManagedTxn>> {
+        txn.scan(&key_prefix_txns()?, None)?
+            .into_iter()
+            .map(|record| {
+                decode_record_payload(&record, MANAGED_TXN_KIND, MANAGED_TXN_SCHEMA_VERSION)
+            })
+            .collect()
+    }
+
+    pub fn ensure_no_inflight_for_table(
+        &self,
+        txn: &dyn MetaReadTxn,
+        table_id: i64,
+    ) -> RepositoryResult<()> {
+        if self.list_all(txn)?.into_iter().any(|stored| {
+            stored.table_id == table_id
+                && matches!(
+                    stored.state,
+                    ManagedTxnState::Prepared | ManagedTxnState::Written
+                )
+        }) {
+            return Err(RepositoryError::conflict(format!(
+                "cannot mutate managed table {table_id}: inflight managed txns exist"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn delete_for_table(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        table_id: i64,
+    ) -> RepositoryResult<()> {
+        for stored in load_versioned_txns(txn)? {
+            if stored.value.table_id == table_id {
+                txn.delete(
+                    &key_txn(stored.value.txn_id)?,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn delete_for_partition(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        partition_id: i64,
+    ) -> RepositoryResult<()> {
+        for stored in load_versioned_txns(txn)? {
+            if stored.value.partition_id == partition_id {
+                txn.delete(
+                    &key_txn(stored.value.txn_id)?,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_visible_bootstrap(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        table_id: i64,
+        partition_id: i64,
+    ) -> RepositoryResult<StoredManagedTxn> {
+        let stored = StoredManagedTxn {
+            txn_id: txn.allocate_id(id_scopes::managed_txn())?,
+            table_id,
+            partition_id,
+            base_version: 0,
+            commit_version: 1,
+            state: ManagedTxnState::Visible,
+            retry_at_ms: None,
+            updated_at_ms: 0,
+        };
+        put_txn(txn, &stored, ExpectedRevision::NotExists)?;
+        Ok(stored)
     }
 
     pub fn mark_written(&self, txn: &mut dyn MetaWriteTxn, txn_id: i64) -> RepositoryResult<()> {
@@ -270,6 +350,20 @@ fn load_versioned_txn(
         .transpose()
 }
 
+fn load_versioned_txns(txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<VersionedManagedTxn>> {
+    txn.scan(&key_prefix_txns()?, None)?
+        .into_iter()
+        .map(|record| {
+            let value =
+                decode_record_payload(&record, MANAGED_TXN_KIND, MANAGED_TXN_SCHEMA_VERSION)?;
+            Ok(VersionedManagedTxn {
+                record_revision: record.revision,
+                value,
+            })
+        })
+        .collect()
+}
+
 fn put_txn(
     txn: &mut dyn MetaWriteTxn,
     stored: &StoredManagedTxn,
@@ -315,4 +409,8 @@ fn record_kind(value: &str) -> RepositoryResult<MetaRecordKind> {
 
 fn key_txn(txn_id: i64) -> RepositoryResult<MetaKey> {
     Ok(MetaKey::new(NS_MANAGED_TXN, [txn_id.to_string()])?)
+}
+
+fn key_prefix_txns() -> RepositoryResult<MetaKeyPrefix> {
+    Ok(MetaKeyPrefix::new(NS_MANAGED_TXN, Vec::<String>::new())?)
 }

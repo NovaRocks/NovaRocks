@@ -114,6 +114,15 @@ pub struct MvRefreshFinalizeRequest {
     pub target_snapshot_id: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateManagedMvRefreshSummaryRequest {
+    pub mv_id: i64,
+    pub last_refresh_ms: i64,
+    pub last_refresh_rows: i64,
+    pub base_snapshots: BTreeMap<String, i64>,
+    pub base_table_uuids: BTreeMap<String, String>,
+}
+
 impl MvMetaRepository {
     pub fn create_definition(
         &self,
@@ -440,6 +449,26 @@ impl MvMetaRepository {
             &refresh.value,
             ExpectedRevision::Exact(refresh.record_revision),
         )
+    }
+
+    pub fn update_managed_refresh_summary_if_present(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: UpdateManagedMvRefreshSummaryRequest,
+    ) -> RepositoryResult<bool> {
+        let Some(mut definition) = self.load_versioned_by_id(txn, req.mv_id)? else {
+            return Ok(false);
+        };
+        definition.value.last_refresh_ms = Some(req.last_refresh_ms);
+        definition.value.last_refresh_rows = Some(req.last_refresh_rows);
+        definition.value.last_refresh_snapshots = req.base_snapshots;
+        definition.value.last_refresh_table_uuids = req.base_table_uuids;
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+        Ok(true)
     }
 }
 

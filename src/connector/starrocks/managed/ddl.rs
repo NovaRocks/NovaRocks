@@ -13,14 +13,15 @@ use crate::sql::parser::ast::{
 
 use super::catalog::{ManagedLakeCatalog, ManagedTableRuntime, register_managed_table_in_catalog};
 use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
-    ManagedTxnState, StageManagedTruncateRequest, StagedManagedTruncate, StoredManagedColumn,
-    StoredManagedDatabase, StoredManagedIndex, StoredManagedPartition, StoredManagedSchema,
-    StoredManagedTable, StoredManagedTablet, StoredManagedTxn,
+    ManagedPartitionState, ManagedSnapshot, ManagedTableState, StoredManagedColumn,
 };
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::engine::catalog::normalize_identifier;
 use crate::engine::{StandaloneState, StatementResult};
+use crate::meta::repository::managed_lake::{
+    CreateManagedColumnRequest, CreateManagedTableLayoutRequest,
+    ManagedTableKind as RepoManagedTableKind, StageManagedTruncateRequest, StagedManagedTruncate,
+};
 
 /// Default bucket count when the user omits `DISTRIBUTED BY ... BUCKETS <n>`.
 const DEFAULT_MANAGED_BUCKET_COUNT: u32 = 1;
@@ -135,9 +136,10 @@ pub(crate) fn create_managed_table(
         .clone()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
     let defaults = resolve_managed_create_defaults(columns, key_desc, bucket_count)?;
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed standalone CREATE TABLE requires sqlite metadata store".to_string()
-    })?;
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed standalone CREATE TABLE requires metadata provider".to_string())?;
 
     let mut guard = state
         .managed_lake
@@ -149,23 +151,6 @@ pub(crate) fn create_managed_table(
             resolved.database, resolved.table
         ));
     }
-
-    let mut snapshot = guard.snapshot.clone();
-    initialize_global_meta_if_needed(&mut snapshot, &managed_config);
-    let database = find_or_create_database(&mut snapshot, &resolved.database);
-    // DROP TABLE leaves the old row in the `tables` rel with state=DROPPING so
-    // an async erase worker can clean it up. The table is considered non-Active
-    // (so `contains_table()` returns false above), but the row still occupies
-    // `(db_id, name)`. Without removing it here the subsequent
-    // `replace_managed_snapshot` would hit the UNIQUE constraint when it
-    // re-inserts both the old and the new row. Reclaim the name synchronously
-    // by dropping the DROPPING entry and its per-schema/column rows, since we
-    // don't rely on the async erase worker in standalone mode.
-    reclaim_dropping_table_for_reuse(&mut snapshot, database.db_id, &resolved.table)?;
-    let table_id = alloc_id(&mut snapshot.global.next_table_id);
-    let schema_id = table_id;
-    let partition_id = alloc_id(&mut snapshot.global.next_partition_id);
-    let index_id = alloc_id(&mut snapshot.global.next_index_id);
 
     let key_column_set = defaults
         .key_desc
@@ -185,15 +170,90 @@ pub(crate) fn create_managed_table(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let request_columns = table_columns_from_physical_columns(&physical_columns);
-    let request_schema = build_tablet_schema(&request_columns, &defaults.key_desc, schema_id)?;
+    let stored_columns =
+        stored_columns_from_physical_columns(0, &defaults.key_desc, &physical_columns)
+            .into_iter()
+            .map(|column| CreateManagedColumnRequest {
+                column_name: column.column_name,
+                logical_type: column.logical_type,
+                nullable: column.nullable,
+                visible: column.visible,
+                is_key: column.is_key,
+            })
+            .collect::<Vec<_>>();
+
+    let mut txn = provider
+        .begin_write("create managed lake table")
+        .map_err(|e| format!("open managed table create transaction failed: {e}"))?;
+    let database = state
+        .managed_repo
+        .get_or_create_database(txn.as_mut(), &resolved.database)
+        .map_err(|e| format!("create managed database metadata failed: {e}"))?;
+    let reclaimed = state
+        .managed_repo
+        .purge_dropping_table_for_reuse(txn.as_mut(), database.db_id, &resolved.table)
+        .map_err(|e| format!("reclaim dropping managed table metadata failed: {e}"))?;
+    for table_id in &reclaimed {
+        state
+            .managed_txn_repo
+            .delete_for_table(txn.as_mut(), *table_id)
+            .map_err(|e| format!("delete reclaimed managed txns failed: {e}"))?;
+        state
+            .job_repo
+            .delete_for_table(txn.as_mut(), *table_id)
+            .map_err(|e| format!("delete reclaimed erase jobs failed: {e}"))?;
+    }
+
+    let created = state
+        .managed_repo
+        .create_table_layout(
+            txn.as_mut(),
+            CreateManagedTableLayoutRequest {
+                db_id: database.db_id,
+                table_name: resolved.table.clone(),
+                keys_type: keys_type_name(defaults.key_desc.kind).to_string(),
+                bucket_num: defaults.bucket_num,
+                kind: RepoManagedTableKind::Table,
+                schema_version: 0,
+                tablet_schema_pb: Vec::new(),
+                columns: stored_columns,
+                partition_name: "p0".to_string(),
+                warehouse_uri: managed_config.warehouse_uri.clone(),
+            },
+        )
+        .map_err(|e| format!("create managed table metadata failed: {e}"))?;
+    let request_schema = build_tablet_schema(
+        &request_columns,
+        &defaults.key_desc,
+        created.schema.schema_id,
+    )?;
+    let mut tablet_schema_pb =
+        crate::connector::starrocks::lake::schema::build_tablet_schema_pb_from_thrift(
+            &request_schema,
+        )?;
+    patch_tablet_schema_column_flags(&mut tablet_schema_pb, &physical_columns)?;
+    state
+        .managed_repo
+        .update_schema_payload(
+            txn.as_mut(),
+            created.schema.schema_id,
+            tablet_schema_pb.encode_to_vec(),
+        )
+        .map_err(|e| format!("update managed table schema metadata failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .record_visible_bootstrap(
+            txn.as_mut(),
+            created.table.table_id,
+            created.partition.partition_id,
+        )
+        .map_err(|e| format!("create managed table bootstrap txn metadata failed: {e}"))?;
+
     let object_store_profile = ObjectStoreProfile::from_s3_store_config(&managed_config.s3)?;
-    let mut tablets = Vec::new();
-    for bucket_seq in 0..defaults.bucket_num {
-        let tablet_id = alloc_id(&mut snapshot.global.next_tablet_id);
-        let tablet_root_path =
-            managed_config.tablet_root_path(database.db_id, table_id, partition_id);
+    let mut bootstrapped_tablet_ids = Vec::new();
+    for tablet in &created.tablets {
         let request = crate::agent_service::TCreateTabletReq {
-            tablet_id,
+            tablet_id: tablet.tablet_id,
             tablet_schema: request_schema.clone(),
             version: None,
             version_hash: None,
@@ -201,8 +261,8 @@ pub(crate) fn create_managed_table(
             in_restore_mode: None,
             base_tablet_id: None,
             base_schema_hash: None,
-            table_id: Some(table_id),
-            partition_id: Some(partition_id),
+            table_id: Some(created.table.table_id),
+            partition_id: Some(created.partition.partition_id),
             allocation_term: None,
             is_eco_mode: None,
             storage_format: None,
@@ -220,84 +280,46 @@ pub(crate) fn create_managed_table(
             flat_json_config: None,
             compaction_strategy: None,
         };
-        create_lake_tablet_from_req_with_schema_patch(
+        if let Err(err) = create_lake_tablet_from_req_with_schema_patch(
             &request,
-            &tablet_root_path,
+            &tablet.tablet_root_path,
             Some(managed_config.s3.clone()),
             |schema| patch_tablet_schema_column_flags(schema, &physical_columns),
+        ) {
+            for tablet_id in bootstrapped_tablet_ids {
+                let _ = remove_tablet_runtime(tablet_id);
+            }
+            let _ = txn.abort();
+            return Err(err);
+        }
+        bootstrapped_tablet_ids.push(tablet.tablet_id);
+        let runtime_schema = get_tablet_runtime(tablet.tablet_id)?.schema;
+        let loaded = load_tablet_snapshot(
+            tablet.tablet_id,
+            1,
+            &tablet.tablet_root_path,
+            Some(&object_store_profile),
         )?;
-        let runtime_schema = get_tablet_runtime(tablet_id)?.schema;
-        let loaded =
-            load_tablet_snapshot(tablet_id, 1, &tablet_root_path, Some(&object_store_profile))?;
         if loaded.tablet_schema != runtime_schema {
+            let _ = txn.abort();
             return Err(format!(
-                "managed tablet schema mismatch after bootstrap: tablet_id={tablet_id}"
+                "managed tablet schema mismatch after bootstrap: tablet_id={}",
+                tablet.tablet_id
             ));
         }
-        tablets.push(StoredManagedTablet {
-            tablet_id,
-            partition_id,
-            index_id,
-            bucket_seq,
-            tablet_root_path,
-        });
     }
+    txn.commit()
+        .map_err(|e| format!("commit managed table metadata failed: {e}"))?;
 
-    snapshot.tables.push(StoredManagedTable {
-        table_id,
-        db_id: database.db_id,
-        name: resolved.table.clone(),
-        keys_type: keys_type_name(defaults.key_desc.kind).to_string(),
-        bucket_num: defaults.bucket_num,
-        current_schema_id: schema_id,
-        state: ManagedTableState::Active,
-        kind: ManagedTableKind::Table,
-    });
-    snapshot.schemas.push(StoredManagedSchema {
-        schema_id,
-        table_id,
-        schema_version: 0,
-        tablet_schema_pb: get_tablet_runtime(tablets[0].tablet_id)?
-            .schema
-            .encode_to_vec(),
-    });
-    snapshot
-        .columns
-        .extend(stored_columns_from_physical_columns(
-            schema_id,
-            &defaults.key_desc,
-            &physical_columns,
-        ));
-    snapshot.partitions.push(StoredManagedPartition {
-        partition_id,
-        table_id,
-        name: "p0".to_string(),
-        visible_version: 1,
-        next_version: 2,
-        state: ManagedPartitionState::Active,
-    });
-    snapshot.indexes.push(StoredManagedIndex {
-        index_id,
-        table_id,
-        partition_id,
-        index_type: "BASE".to_string(),
-        state: ManagedIndexState::Active,
-    });
-    snapshot.tablets.extend(tablets);
-    let txn_id = alloc_id(&mut snapshot.global.next_txn_id);
-    snapshot.txns.push(StoredManagedTxn {
-        txn_id,
-        table_id,
-        partition_id,
-        base_version: 0,
-        commit_version: 1,
-        state: ManagedTxnState::Visible,
-        retry_at_ms: None,
-        updated_at_ms: 0,
-    });
-
-    let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot.clone())?;
-    metadata_store.replace_managed_snapshot(&snapshot)?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed table reload transaction failed: {e}"))?;
+    let snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("reload managed table metadata failed: {e}"))?;
+    let rebuilt =
+        ManagedLakeCatalog::rebuild_from_repository(Some(managed_config), snapshot.clone())?;
     rebuilt.re_register_active_tablet_runtimes()?;
     *guard = rebuilt;
     let runtime = guard.table(&resolved.database, &resolved.table)?.clone();
@@ -428,21 +450,53 @@ pub(crate) fn drop_managed_table(
         .managed_lake_config
         .as_ref()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed standalone DROP TABLE requires sqlite metadata store".to_string()
-    })?;
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed standalone DROP TABLE requires metadata provider".to_string())?;
     let table_root_path = managed_table_root_path(
         &managed_config.warehouse_uri,
         runtime.table.db_id,
         runtime.table.table_id,
     );
-    metadata_store.drop_managed_table(runtime.table.table_id, &table_root_path)?;
+    let mut txn = provider
+        .begin_write("drop managed lake table")
+        .map_err(|e| format!("open managed table drop transaction failed: {e}"))?;
+    state
+        .managed_txn_repo
+        .ensure_no_inflight_for_table(txn.as_ref(), runtime.table.table_id)
+        .map_err(|e| format!("validate managed table drop failed: {e}"))?;
+    state
+        .managed_repo
+        .mark_table_dropping(txn.as_mut(), runtime.table.table_id)
+        .map_err(|e| format!("mark managed table dropping failed: {e}"))?;
+    state
+        .job_repo
+        .create_erase_job(
+            txn.as_mut(),
+            crate::meta::repository::job::CreateEraseJobRequest {
+                table_id: runtime.table.table_id,
+                partition_id: None,
+                root_path: table_root_path,
+                now_ms: current_time_ms(),
+            },
+        )
+        .map_err(|e| format!("enqueue managed table erase job failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed table drop metadata failed: {e}"))?;
     for tablet in &runtime.tablets {
         remove_tablet_runtime(tablet.tablet_id)?;
     }
 
-    let snapshot = metadata_store.load_snapshot()?.managed;
-    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), snapshot)?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed table drop reload transaction failed: {e}"))?;
+    let snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("reload managed table metadata failed: {e}"))?;
+    let rebuilt =
+        ManagedLakeCatalog::rebuild_from_repository(state.managed_lake_config.clone(), snapshot)?;
     *managed = rebuilt;
     let mut catalog = state
         .catalog
@@ -466,25 +520,35 @@ pub(crate) fn drop_managed_database_entry(
         .managed_lake_config
         .clone()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed standalone DROP DATABASE requires sqlite metadata store".to_string()
-    })?;
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed standalone DROP DATABASE requires metadata provider".to_string())?;
 
-    let normalized = normalize_identifier(database_name)?;
     let mut guard = state
         .managed_lake
         .write()
         .expect("standalone managed lake write lock");
-    let mut snapshot = guard.snapshot.clone();
-    let before = snapshot.databases.len();
-    snapshot
-        .databases
-        .retain(|db| normalize_identifier(&db.name).ok().as_deref() != Some(&normalized));
-    if snapshot.databases.len() == before {
+    let mut txn = provider
+        .begin_write("drop managed lake database entry")
+        .map_err(|e| format!("open managed database drop transaction failed: {e}"))?;
+    let dropped = state
+        .managed_repo
+        .drop_database_entry(txn.as_mut(), database_name)
+        .map_err(|e| format!("drop managed database metadata failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed database drop metadata failed: {e}"))?;
+    if !dropped {
         return Ok(());
     }
-    metadata_store.replace_managed_snapshot(&snapshot)?;
-    let rebuilt = ManagedLakeCatalog::rebuild(Some(managed_config), snapshot)?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed database reload transaction failed: {e}"))?;
+    let snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("reload managed database metadata failed: {e}"))?;
+    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(Some(managed_config), snapshot)?;
     *guard = rebuilt;
     Ok(())
 }
@@ -553,8 +617,8 @@ where
         .managed_lake_config
         .as_ref()
         .ok_or_else(|| "standalone managed lake config is missing".to_string())?;
-    let metadata_store = state.metadata_store.as_ref().ok_or_else(|| {
-        "managed standalone TRUNCATE TABLE requires sqlite metadata store".to_string()
+    let provider = state.metadata_provider.as_ref().ok_or_else(|| {
+        "managed standalone TRUNCATE TABLE requires metadata provider".to_string()
     })?;
     let active_partition = runtime
         .partitions
@@ -567,15 +631,33 @@ where
                 database_name, table_name
             )
         })?;
-    let staged = metadata_store.stage_truncate_partition(StageManagedTruncateRequest {
-        table_id: runtime.table.table_id,
-        db_id: runtime.table.db_id,
-        bucket_num: runtime.table.bucket_num,
-        partition_name: active_partition.name.clone(),
-        warehouse_uri: managed_config.warehouse_uri.clone(),
-    })?;
+    let staged = {
+        let mut txn = provider
+            .begin_write("stage managed lake truncate partition")
+            .map_err(|e| format!("open managed truncate stage transaction failed: {e}"))?;
+        state
+            .managed_txn_repo
+            .ensure_no_inflight_for_table(txn.as_ref(), runtime.table.table_id)
+            .map_err(|e| format!("validate managed truncate failed: {e}"))?;
+        let staged = state
+            .managed_repo
+            .stage_truncate_partition(
+                txn.as_mut(),
+                StageManagedTruncateRequest {
+                    table_id: runtime.table.table_id,
+                    db_id: runtime.table.db_id,
+                    bucket_num: runtime.table.bucket_num,
+                    partition_name: active_partition.name.clone(),
+                    warehouse_uri: managed_config.warehouse_uri.clone(),
+                },
+            )
+            .map_err(|e| format!("stage managed truncate metadata failed: {e}"))?;
+        txn.commit()
+            .map_err(|e| format!("commit managed truncate stage metadata failed: {e}"))?;
+        staged
+    };
     if let Err(err) = bootstrap(&runtime, managed_config, &staged) {
-        cleanup_staged_truncate(metadata_store, &staged)?;
+        cleanup_staged_truncate(state, &staged)?;
         return Err(format!(
             "bootstrap truncate partition failed for {}.{}: {err}",
             database_name, table_name
@@ -586,14 +668,37 @@ where
         runtime.table.table_id,
         active_partition.partition_id,
     );
-    if let Err(err) = metadata_store.activate_truncate_partition(
-        runtime.table.table_id,
-        active_partition.partition_id,
-        staged.partition_id,
-        staged.index_id,
-        &retired_root_path,
-    ) {
-        cleanup_staged_truncate(metadata_store, &staged)?;
+    if let Err(err) = (|| {
+        let mut txn = provider
+            .begin_write("activate managed lake truncate partition")
+            .map_err(|e| format!("open managed truncate activate transaction failed: {e}"))?;
+        state
+            .managed_repo
+            .activate_truncate_partition(
+                txn.as_mut(),
+                runtime.table.table_id,
+                active_partition.partition_id,
+                staged.partition_id,
+                staged.index_id,
+            )
+            .map_err(|e| format!("activate managed truncate metadata failed: {e}"))?;
+        state
+            .job_repo
+            .create_erase_job(
+                txn.as_mut(),
+                crate::meta::repository::job::CreateEraseJobRequest {
+                    table_id: runtime.table.table_id,
+                    partition_id: Some(active_partition.partition_id),
+                    root_path: retired_root_path.clone(),
+                    now_ms: current_time_ms(),
+                },
+            )
+            .map_err(|e| format!("enqueue managed truncate erase job failed: {e}"))?;
+        txn.commit()
+            .map_err(|e| format!("commit managed truncate activate metadata failed: {e}"))?;
+        Ok::<(), String>(())
+    })() {
+        cleanup_staged_truncate(state, &staged)?;
         return Err(format!(
             "activate truncate partition failed for {}.{}: {err}",
             database_name, table_name
@@ -603,8 +708,17 @@ where
         remove_tablet_runtime(tablet.tablet_id)?;
     }
 
-    let rebuilt_snapshot = metadata_store.load_snapshot()?.managed;
-    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), rebuilt_snapshot)?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed truncate reload transaction failed: {e}"))?;
+    let rebuilt_snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("reload managed truncate metadata failed: {e}"))?;
+    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(
+        state.managed_lake_config.clone(),
+        rebuilt_snapshot,
+    )?;
     refresh_runtimes(&rebuilt)?;
     let updated_runtime = rebuilt.table(database_name, table_name)?.clone();
     *managed = rebuilt;
@@ -692,43 +806,34 @@ pub(crate) fn reclaim_dropping_table_for_reuse(
     Ok(())
 }
 
-fn find_or_create_database(
-    snapshot: &mut ManagedSnapshot,
-    database_name: &str,
-) -> StoredManagedDatabase {
-    if let Some(found) = snapshot
-        .databases
-        .iter()
-        .find(|database| database.name == database_name)
-        .cloned()
-    {
-        return found;
-    }
-    let db = StoredManagedDatabase {
-        db_id: alloc_id(&mut snapshot.global.next_db_id),
-        name: database_name.to_string(),
-    };
-    snapshot.databases.push(db.clone());
-    db
-}
-
-fn alloc_id(next_id: &mut i64) -> i64 {
-    if *next_id <= 0 {
-        *next_id = 1;
-    }
-    let id = *next_id;
-    *next_id += 1;
-    id
+fn current_time_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn cleanup_staged_truncate(
-    metadata_store: &super::store::SqliteMetadataStore,
+    state: &Arc<StandaloneState>,
     staged: &StagedManagedTruncate,
 ) -> Result<(), String> {
     for tablet_id in &staged.tablet_ids {
         let _ = remove_tablet_runtime(*tablet_id);
     }
-    metadata_store.delete_creating_partition(staged.partition_id)
+    let provider = state.metadata_provider.as_ref().ok_or_else(|| {
+        "managed standalone TRUNCATE TABLE cleanup requires metadata provider".to_string()
+    })?;
+    let mut txn = provider
+        .begin_write("cleanup managed lake truncate partition")
+        .map_err(|e| format!("open managed truncate cleanup transaction failed: {e}"))?;
+    state
+        .managed_repo
+        .delete_creating_partition(txn.as_mut(), staged.partition_id)
+        .map_err(|e| format!("delete creating truncate partition failed: {e}"))?;
+    txn.commit()
+        .map_err(|e| format!("commit managed truncate cleanup failed: {e}"))?;
+    Ok(())
 }
 
 fn bootstrap_truncated_partition(
@@ -1287,6 +1392,11 @@ mod tests {
     use crate::connector::starrocks::managed::{ManagedLakeCatalog, ManagedLakeConfig};
     use crate::engine::StandaloneState;
     use crate::engine::catalog::{DEFAULT_DATABASE, InMemoryCatalog};
+    use crate::meta::repository::{encode_json_payload, id_scopes};
+    use crate::meta::{
+        ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
+        SqliteMetaStoreProvider,
+    };
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
     use crate::sql::parser::ast::{
         ColumnAggregation, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind,
@@ -1483,6 +1593,274 @@ mod tests {
         }
     }
 
+    fn seed_repository_snapshot(
+        provider: &SqliteMetaStoreProvider,
+        snapshot: &ManagedSnapshot,
+    ) -> Result<(), String> {
+        let mut txn = provider
+            .begin_write("seed managed ddl test repositories")
+            .map_err(|e| format!("begin seed txn failed: {e}"))?;
+        for database in &snapshot.databases {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["database".to_string(), database.db_id.to_string()],
+                "managed.database",
+                serde_json::json!({"db_id": database.db_id, "name": database.name}),
+            )?;
+        }
+        for table in &snapshot.tables {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["table".to_string(), table.table_id.to_string()],
+                "managed.table",
+                serde_json::json!({
+                    "table_id": table.table_id,
+                    "db_id": table.db_id,
+                    "name": table.name,
+                    "keys_type": table.keys_type,
+                    "bucket_num": table.bucket_num,
+                    "current_schema_id": table.current_schema_id,
+                    "state": table_state(table.state),
+                    "kind": table_kind(table.kind),
+                }),
+            )?;
+        }
+        for schema in &snapshot.schemas {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["schema".to_string(), schema.schema_id.to_string()],
+                "managed.schema",
+                serde_json::json!({
+                    "schema_id": schema.schema_id,
+                    "table_id": schema.table_id,
+                    "schema_version": schema.schema_version,
+                    "tablet_schema_pb": schema.tablet_schema_pb,
+                }),
+            )?;
+        }
+        for column in &snapshot.columns {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec![
+                    "column".to_string(),
+                    column.schema_id.to_string(),
+                    column.ordinal.to_string(),
+                ],
+                "managed.column",
+                serde_json::json!({
+                    "schema_id": column.schema_id,
+                    "ordinal": column.ordinal,
+                    "column_name": column.column_name,
+                    "logical_type": column.logical_type,
+                    "nullable": column.nullable,
+                    "visible": column.visible,
+                    "is_key": column.is_key,
+                }),
+            )?;
+        }
+        for partition in &snapshot.partitions {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["partition".to_string(), partition.partition_id.to_string()],
+                "managed.partition",
+                serde_json::json!({
+                    "partition_id": partition.partition_id,
+                    "table_id": partition.table_id,
+                    "name": partition.name,
+                    "visible_version": partition.visible_version,
+                    "next_version": partition.next_version,
+                    "state": partition_state(partition.state),
+                }),
+            )?;
+        }
+        for index in &snapshot.indexes {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["index".to_string(), index.index_id.to_string()],
+                "managed.index",
+                serde_json::json!({
+                    "index_id": index.index_id,
+                    "table_id": index.table_id,
+                    "partition_id": index.partition_id,
+                    "index_type": index.index_type,
+                    "state": index_state(index.state),
+                }),
+            )?;
+        }
+        for tablet in &snapshot.tablets {
+            put_seed_record(
+                txn.as_mut(),
+                "managed",
+                vec!["tablet".to_string(), tablet.tablet_id.to_string()],
+                "managed.tablet",
+                serde_json::json!({
+                    "tablet_id": tablet.tablet_id,
+                    "partition_id": tablet.partition_id,
+                    "index_id": tablet.index_id,
+                    "bucket_seq": tablet.bucket_seq,
+                    "tablet_root_path": tablet.tablet_root_path,
+                }),
+            )?;
+        }
+        for managed_txn in &snapshot.txns {
+            put_seed_record(
+                txn.as_mut(),
+                "managed.txn",
+                vec![managed_txn.txn_id.to_string()],
+                "managed.txn",
+                serde_json::json!({
+                    "txn_id": managed_txn.txn_id,
+                    "table_id": managed_txn.table_id,
+                    "partition_id": managed_txn.partition_id,
+                    "base_version": managed_txn.base_version,
+                    "commit_version": managed_txn.commit_version,
+                    "state": txn_state(managed_txn.state),
+                    "retry_at_ms": managed_txn.retry_at_ms,
+                    "updated_at_ms": managed_txn.updated_at_ms,
+                }),
+            )?;
+        }
+        bump_id_scope(
+            txn.as_mut(),
+            id_scopes::managed_db(),
+            snapshot
+                .databases
+                .iter()
+                .map(|database| database.db_id)
+                .max()
+                .unwrap_or(0),
+        )?;
+        bump_id_scope(
+            txn.as_mut(),
+            id_scopes::managed_table(),
+            snapshot
+                .tables
+                .iter()
+                .map(|table| table.table_id)
+                .max()
+                .unwrap_or(0),
+        )?;
+        bump_id_scope(
+            txn.as_mut(),
+            id_scopes::managed_partition(),
+            snapshot
+                .partitions
+                .iter()
+                .map(|partition| partition.partition_id)
+                .max()
+                .unwrap_or(0),
+        )?;
+        bump_id_scope(
+            txn.as_mut(),
+            id_scopes::managed_index(),
+            snapshot
+                .indexes
+                .iter()
+                .map(|index| index.index_id)
+                .max()
+                .unwrap_or(0),
+        )?;
+        bump_id_scope(
+            txn.as_mut(),
+            id_scopes::managed_tablet(),
+            snapshot
+                .tablets
+                .iter()
+                .map(|tablet| tablet.tablet_id)
+                .max()
+                .unwrap_or(0),
+        )?;
+        bump_id_scope(
+            txn.as_mut(),
+            id_scopes::managed_txn(),
+            snapshot
+                .txns
+                .iter()
+                .map(|managed_txn| managed_txn.txn_id)
+                .max()
+                .unwrap_or(0),
+        )?;
+        txn.commit()
+            .map_err(|e| format!("commit seed txn failed: {e}"))?;
+        Ok(())
+    }
+
+    fn bump_id_scope(
+        txn: &mut dyn crate::meta::MetaWriteTxn,
+        scope: crate::meta::IdScope,
+        max_existing: i64,
+    ) -> Result<(), String> {
+        for _ in 0..max_existing {
+            txn.allocate_id(scope.clone()).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn put_seed_record(
+        txn: &mut dyn crate::meta::MetaWriteTxn,
+        namespace: &str,
+        path: Vec<String>,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), String> {
+        txn.put(MetaRecordPut::new(
+            MetaKey::new(namespace, path).map_err(|e| e.to_string())?,
+            MetaRecordKind::new(kind).map_err(|e| e.to_string())?,
+            ExpectedRevision::NotExists,
+            encode_json_payload(1, &payload).map_err(|e| e.to_string())?,
+        ))
+        .map_err(|e| e.to_string())
+    }
+
+    fn table_state(state: ManagedTableState) -> &'static str {
+        match state {
+            ManagedTableState::Creating => "CREATING",
+            ManagedTableState::Active => "ACTIVE",
+            ManagedTableState::Dropping => "DROPPING",
+            ManagedTableState::Failed => "FAILED",
+        }
+    }
+
+    fn table_kind(kind: ManagedTableKind) -> &'static str {
+        match kind {
+            ManagedTableKind::Table => "TABLE",
+            ManagedTableKind::MaterializedView => "MATERIALIZED_VIEW",
+        }
+    }
+
+    fn partition_state(state: ManagedPartitionState) -> &'static str {
+        match state {
+            ManagedPartitionState::Creating => "CREATING",
+            ManagedPartitionState::Active => "ACTIVE",
+            ManagedPartitionState::Retired => "RETIRED",
+            ManagedPartitionState::Failed => "FAILED",
+        }
+    }
+
+    fn index_state(state: ManagedIndexState) -> &'static str {
+        match state {
+            ManagedIndexState::Creating => "CREATING",
+            ManagedIndexState::Active => "ACTIVE",
+            ManagedIndexState::Retired => "RETIRED",
+            ManagedIndexState::Failed => "FAILED",
+        }
+    }
+
+    fn txn_state(state: ManagedTxnState) -> &'static str {
+        match state {
+            ManagedTxnState::Prepared => "PREPARED",
+            ManagedTxnState::Written => "WRITTEN",
+            ManagedTxnState::Visible => "VISIBLE",
+            ManagedTxnState::Aborted => "ABORTED",
+        }
+    }
+
     fn seeded_state() -> (tempfile::TempDir, Arc<StandaloneState>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let metadata_store =
@@ -1491,6 +1869,9 @@ mod tests {
         metadata_store
             .replace_managed_snapshot(&snapshot)
             .expect("persist managed snapshot");
+        let metadata_provider = SqliteMetaStoreProvider::open(dir.path().join("standalone.sqlite"))
+            .expect("open provider");
+        seed_repository_snapshot(&metadata_provider, &snapshot).expect("seed repositories");
 
         let managed = ManagedLakeCatalog::rebuild(Some(test_managed_config()), snapshot)
             .expect("rebuild managed catalog");
@@ -1506,6 +1887,7 @@ mod tests {
             managed_lake: RwLock::new(managed),
             managed_lake_config: Some(test_managed_config()),
             metadata_store: Some(metadata_store),
+            metadata_provider: Some(Arc::new(metadata_provider)),
             ..StandaloneState::default()
         });
         (dir, state)
@@ -1537,30 +1919,35 @@ mod tests {
         );
         drop(managed);
 
-        let persisted = state
-            .metadata_store
+        let read = state
+            .metadata_provider
             .as_ref()
-            .expect("metadata store")
-            .load_snapshot()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let persisted = state
+            .managed_repo
+            .load_snapshot(read.as_ref())
             .expect("reload snapshot");
-        assert_eq!(persisted.managed.tables.len(), 1);
+        assert_eq!(persisted.tables.len(), 1);
         assert_eq!(
-            persisted.managed.tables[0].state,
-            ManagedTableState::Dropping
+            persisted.tables[0].state,
+            crate::meta::repository::managed_lake::ManagedTableState::Dropping
         );
         assert_eq!(
-            persisted.managed.partitions[0].state,
-            ManagedPartitionState::Retired
+            persisted.partitions[0].state,
+            crate::meta::repository::managed_lake::ManagedPartitionState::Retired
         );
         assert_eq!(
-            persisted.managed.indexes[0].state,
-            ManagedIndexState::Retired
+            persisted.indexes[0].state,
+            crate::meta::repository::managed_lake::ManagedIndexState::Retired
         );
-        assert_eq!(persisted.managed.erase_jobs.len(), 1);
-        assert_eq!(
-            persisted.managed.erase_jobs[0].root_path,
-            "s3://test/warehouse/db_1/table_10"
-        );
+        let jobs = state
+            .job_repo
+            .list_runnable_erase_jobs(read.as_ref(), i64::MAX)
+            .expect("erase jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].root_path, "s3://test/warehouse/db_1/table_10");
     }
 
     #[test]
@@ -1606,25 +1993,33 @@ mod tests {
         );
         drop(managed);
 
-        let persisted = state
-            .metadata_store
+        let read = state
+            .metadata_provider
             .as_ref()
-            .expect("metadata store")
-            .load_snapshot()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let persisted = state
+            .managed_repo
+            .load_snapshot(read.as_ref())
             .expect("reload snapshot");
-        assert_eq!(persisted.managed.partitions.len(), 2);
+        assert_eq!(persisted.partitions.len(), 2);
         assert_eq!(
-            persisted.managed.partitions[0].state,
-            ManagedPartitionState::Retired
+            persisted.partitions[0].state,
+            crate::meta::repository::managed_lake::ManagedPartitionState::Retired
         );
         assert_eq!(
-            persisted.managed.partitions[1].state,
-            ManagedPartitionState::Active
+            persisted.partitions[1].state,
+            crate::meta::repository::managed_lake::ManagedPartitionState::Active
         );
-        assert_eq!(persisted.managed.erase_jobs.len(), 1);
-        assert_eq!(persisted.managed.erase_jobs[0].partition_id, Some(20));
+        let jobs = state
+            .job_repo
+            .list_runnable_erase_jobs(read.as_ref(), i64::MAX)
+            .expect("erase jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].partition_id, Some(20));
         assert_eq!(
-            persisted.managed.erase_jobs[0].root_path,
+            jobs[0].root_path,
             "s3://test/warehouse/db_1/table_10/partition_20"
         );
     }

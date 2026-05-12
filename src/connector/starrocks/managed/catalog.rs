@@ -15,10 +15,12 @@ use crate::formats::starrocks::metadata::load_tablet_snapshot;
 use crate::service::grpc_client::proto::starrocks::{ColumnPb, TabletSchemaPb};
 
 use super::store::{
-    ManagedIndexState, ManagedPartitionState, ManagedSnapshot, ManagedTableState, ManagedTxnState,
-    SqliteMetadataStore, StoredManagedColumn, StoredManagedIndex, StoredManagedPartition,
-    StoredManagedTable, StoredManagedTablet,
+    ManagedGlobalMeta, ManagedIndexState, ManagedPartitionState, ManagedSnapshot,
+    ManagedTableState, StoredManagedColumn, StoredManagedDatabase, StoredManagedIndex,
+    StoredManagedPartition, StoredManagedTable, StoredManagedTablet,
 };
+#[cfg(test)]
+use super::store::{ManagedTxnState, SqliteMetadataStore};
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
 use crate::engine::catalog::{
     ColumnDef, InMemoryCatalog, ManagedTabletRef, PhysicalTableLayout, TableDef, TableStorage,
@@ -304,6 +306,14 @@ impl ManagedLakeCatalog {
         })
     }
 
+    pub(crate) fn rebuild_from_repository(
+        config: Option<ManagedLakeConfig>,
+        snapshot: crate::meta::repository::managed_lake::ManagedLakeSnapshot,
+    ) -> Result<Self, String> {
+        let legacy_snapshot = repository_snapshot_for_runtime(config.as_ref(), snapshot);
+        Self::rebuild(config, legacy_snapshot)
+    }
+
     pub(crate) fn re_register_active_tablet_runtimes(&self) -> Result<(), String> {
         let Some(config) = self.config.as_ref() else {
             if snapshot_is_empty(&self.snapshot) {
@@ -366,6 +376,163 @@ impl ManagedLakeCatalog {
     }
 }
 
+// Temporary runtime bridge: managed-lake repository rows are the source of
+// truth for object metadata, while the in-memory catalog still stores the
+// legacy snapshot shape until the remaining MV refresh slices stop depending
+// on it.
+pub(crate) fn repository_snapshot_for_runtime(
+    config: Option<&ManagedLakeConfig>,
+    snapshot: crate::meta::repository::managed_lake::ManagedLakeSnapshot,
+) -> ManagedSnapshot {
+    ManagedSnapshot {
+        global: ManagedGlobalMeta {
+            warehouse_uri: if snapshot.databases.is_empty()
+                && snapshot.tables.is_empty()
+                && snapshot.schemas.is_empty()
+                && snapshot.columns.is_empty()
+                && snapshot.partitions.is_empty()
+                && snapshot.indexes.is_empty()
+                && snapshot.tablets.is_empty()
+            {
+                String::new()
+            } else {
+                config
+                    .map(|config| config.warehouse_uri.clone())
+                    .unwrap_or_default()
+            },
+            ..ManagedGlobalMeta::default()
+        },
+        databases: snapshot
+            .databases
+            .into_iter()
+            .map(|database| StoredManagedDatabase {
+                db_id: database.db_id,
+                name: database.name,
+            })
+            .collect(),
+        tables: snapshot
+            .tables
+            .into_iter()
+            .map(|table| StoredManagedTable {
+                table_id: table.table_id,
+                db_id: table.db_id,
+                name: table.name,
+                keys_type: table.keys_type,
+                bucket_num: table.bucket_num,
+                current_schema_id: table.current_schema_id,
+                state: match table.state {
+                    crate::meta::repository::managed_lake::ManagedTableState::Creating => {
+                        ManagedTableState::Creating
+                    }
+                    crate::meta::repository::managed_lake::ManagedTableState::Active => {
+                        ManagedTableState::Active
+                    }
+                    crate::meta::repository::managed_lake::ManagedTableState::Dropping => {
+                        ManagedTableState::Dropping
+                    }
+                    crate::meta::repository::managed_lake::ManagedTableState::Failed => {
+                        ManagedTableState::Failed
+                    }
+                },
+                kind: match table.kind {
+                    crate::meta::repository::managed_lake::ManagedTableKind::Table => {
+                        super::store::ManagedTableKind::Table
+                    }
+                    crate::meta::repository::managed_lake::ManagedTableKind::MaterializedView => {
+                        super::store::ManagedTableKind::MaterializedView
+                    }
+                },
+            })
+            .collect(),
+        schemas: snapshot
+            .schemas
+            .into_iter()
+            .map(|schema| super::store::StoredManagedSchema {
+                schema_id: schema.schema_id,
+                table_id: schema.table_id,
+                schema_version: schema.schema_version,
+                tablet_schema_pb: schema.tablet_schema_pb,
+            })
+            .collect(),
+        columns: snapshot
+            .columns
+            .into_iter()
+            .map(|column| StoredManagedColumn {
+                schema_id: column.schema_id,
+                ordinal: column.ordinal,
+                column_name: column.column_name,
+                logical_type: column.logical_type,
+                nullable: column.nullable,
+                visible: column.visible,
+                is_key: column.is_key,
+            })
+            .collect(),
+        partitions: snapshot
+            .partitions
+            .into_iter()
+            .map(|partition| StoredManagedPartition {
+                partition_id: partition.partition_id,
+                table_id: partition.table_id,
+                name: partition.name,
+                visible_version: partition.visible_version,
+                next_version: partition.next_version,
+                state: match partition.state {
+                    crate::meta::repository::managed_lake::ManagedPartitionState::Creating => {
+                        ManagedPartitionState::Creating
+                    }
+                    crate::meta::repository::managed_lake::ManagedPartitionState::Active => {
+                        ManagedPartitionState::Active
+                    }
+                    crate::meta::repository::managed_lake::ManagedPartitionState::Retired => {
+                        ManagedPartitionState::Retired
+                    }
+                    crate::meta::repository::managed_lake::ManagedPartitionState::Failed => {
+                        ManagedPartitionState::Failed
+                    }
+                },
+            })
+            .collect(),
+        indexes: snapshot
+            .indexes
+            .into_iter()
+            .map(|index| StoredManagedIndex {
+                index_id: index.index_id,
+                table_id: index.table_id,
+                partition_id: index.partition_id,
+                index_type: index.index_type,
+                state: match index.state {
+                    crate::meta::repository::managed_lake::ManagedIndexState::Creating => {
+                        ManagedIndexState::Creating
+                    }
+                    crate::meta::repository::managed_lake::ManagedIndexState::Active => {
+                        ManagedIndexState::Active
+                    }
+                    crate::meta::repository::managed_lake::ManagedIndexState::Retired => {
+                        ManagedIndexState::Retired
+                    }
+                    crate::meta::repository::managed_lake::ManagedIndexState::Failed => {
+                        ManagedIndexState::Failed
+                    }
+                },
+            })
+            .collect(),
+        tablets: snapshot
+            .tablets
+            .into_iter()
+            .map(|tablet| StoredManagedTablet {
+                tablet_id: tablet.tablet_id,
+                partition_id: tablet.partition_id,
+                index_id: tablet.index_id,
+                bucket_seq: tablet.bucket_seq,
+                tablet_root_path: tablet.tablet_root_path,
+            })
+            .collect(),
+        txns: Vec::new(),
+        erase_jobs: Vec::new(),
+        materialized_views: Vec::new(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedTableRuntime {
     pub(crate) database_name: String,
@@ -389,6 +556,7 @@ pub(crate) struct ManagedTableRuntime {
 /// * `PREPARED` txns are aborted — the rowset write never completed.
 /// * `WRITTEN` txns are replayed by `replay`, then marked `VISIBLE`. The
 ///   partition's visible/next version is also advanced.
+#[cfg(test)]
 pub(crate) fn reconcile_on_open<F>(
     store: &SqliteMetadataStore,
     snapshot: &mut ManagedSnapshot,

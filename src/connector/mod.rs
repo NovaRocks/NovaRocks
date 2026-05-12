@@ -37,13 +37,12 @@ pub(crate) use starrocks::managed::ddl::truncate_managed_table;
 pub(crate) use starrocks::managed::erase::spawn_erase_worker as spawn_managed_erase_worker;
 #[cfg(test)]
 pub(crate) use starrocks::managed::store::IcebergTableRef;
-pub(crate) use starrocks::managed::store::{MetadataSnapshot, SqliteMetadataStore};
+pub(crate) use starrocks::managed::store::SqliteMetadataStore;
 pub(crate) use starrocks::managed::txn::{
     insert_into_managed_lake_table, publish_tablets_at_version,
 };
 pub(crate) use starrocks::managed::{
-    ManagedLakeCatalog, ManagedLakeConfig, reconcile_on_open as reconcile_managed_on_open,
-    register_managed_tables_in_catalog, runtime_registered,
+    ManagedLakeCatalog, ManagedLakeConfig, register_managed_tables_in_catalog, runtime_registered,
 };
 
 use std::collections::HashMap;

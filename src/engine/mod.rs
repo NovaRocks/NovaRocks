@@ -17,9 +17,9 @@ use crate::runtime::global_async_runtime::data_block_on;
 
 use self::catalog::{DEFAULT_DATABASE, InMemoryCatalog, build_parquet_table, normalize_identifier};
 use crate::connector::{
-    IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, MetadataSnapshot,
-    SqliteMetadataStore, create_iceberg_namespace, iceberg_namespace_exists,
-    register_existing_iceberg_table, register_managed_tables_in_catalog, runtime_registered,
+    IcebergCatalogRegistry, ManagedLakeCatalog, ManagedLakeConfig, SqliteMetadataStore,
+    create_iceberg_namespace, iceberg_namespace_exists, register_existing_iceberg_table,
+    register_managed_tables_in_catalog, runtime_registered,
 };
 use crate::meta::repository::iceberg_catalog::{
     IcebergCatalogMetaRepository, IcebergCatalogProperties,
@@ -298,7 +298,7 @@ impl StandaloneNovaRocks {
         });
         register_connector_backends(&inner);
         restore_metadata_if_needed(&inner)?;
-        if inner.managed_lake_config.is_some() && inner.metadata_store.is_some() {
+        if inner.managed_lake_config.is_some() && inner.metadata_provider.is_some() {
             crate::connector::spawn_managed_erase_worker(Arc::clone(&inner));
         }
         #[cfg(not(test))]
@@ -1800,16 +1800,9 @@ fn resolve_relative_path(path: &Path, config_path: Option<&Path>) -> Result<Path
 }
 
 fn restore_metadata_if_needed(state: &Arc<StandaloneState>) -> Result<(), String> {
-    if let Some(store) = state.metadata_store.as_ref() {
-        let snapshot = store.load_snapshot()?;
-        restore_managed_lake(state, &snapshot)?;
-        restore_iceberg_catalogs(state)?;
-        crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(
-            state,
-        )?;
-    } else {
-        restore_iceberg_catalogs(state)?;
-    }
+    restore_managed_lake(state)?;
+    restore_iceberg_catalogs(state)?;
+    crate::connector::starrocks::managed::mv_refresh_iceberg::restore_iceberg_mv_targets(state)?;
     Ok(())
 }
 
@@ -1858,41 +1851,28 @@ fn restore_iceberg_catalogs(state: &Arc<StandaloneState>) -> Result<(), String> 
     Ok(())
 }
 
-fn restore_managed_lake(
-    state: &Arc<StandaloneState>,
-    snapshot: &MetadataSnapshot,
-) -> Result<(), String> {
-    let Some(store) = state.metadata_store.as_ref() else {
+fn restore_managed_lake(state: &Arc<StandaloneState>) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
         return Ok(());
     };
-    let mut managed = snapshot.managed.clone();
-    crate::connector::reconcile_managed_on_open(store, &mut managed, |snapshot, txn| {
-        let tablet_ids = snapshot
-            .tablets
-            .iter()
-            .filter(|tablet| {
-                snapshot.indexes.iter().any(|index| {
-                    index.index_id == tablet.index_id
-                        && index.table_id == txn.table_id
-                        && index.partition_id == txn.partition_id
-                })
-            })
-            .map(|tablet| tablet.tablet_id)
-            .collect::<Vec<_>>();
-        crate::connector::publish_tablets_at_version(
-            tablet_ids,
-            txn.txn_id,
-            txn.base_version,
-            txn.commit_version,
-        )
-    })?;
-    let rebuilt = ManagedLakeCatalog::rebuild(state.managed_lake_config.clone(), managed)?;
+    reconcile_managed_lake_on_open_from_repositories(state)?;
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed lake metadata read transaction failed: {e}"))?;
+    let managed_snapshot = state
+        .managed_repo
+        .load_snapshot(read.as_ref())
+        .map_err(|e| format!("load managed lake metadata failed: {e}"))?;
+    let rebuilt = ManagedLakeCatalog::rebuild_from_repository(
+        state.managed_lake_config.clone(),
+        managed_snapshot.clone(),
+    )?;
     {
         let mut catalog = state
             .catalog
             .write()
             .expect("standalone catalog write lock");
-        for database in &snapshot.managed.databases {
+        for database in &managed_snapshot.databases {
             catalog.create_database(&database.name)?;
         }
         register_managed_tables_in_catalog(&mut catalog, &rebuilt)?;
@@ -1903,6 +1883,108 @@ fn restore_managed_lake(
         .write()
         .expect("standalone managed lake write lock");
     *guard = rebuilt;
+    Ok(())
+}
+
+fn reconcile_managed_lake_on_open_from_repositories(
+    state: &Arc<StandaloneState>,
+) -> Result<(), String> {
+    let Some(provider) = state.metadata_provider.as_ref() else {
+        return Ok(());
+    };
+    {
+        let mut txn = provider
+            .begin_write("reconcile managed lake open metadata")
+            .map_err(|e| format!("open managed lake reconcile write transaction failed: {e}"))?;
+        state
+            .managed_repo
+            .fail_creating_tables(txn.as_mut())
+            .map_err(|e| format!("fail creating managed tables during open failed: {e}"))?;
+        state
+            .managed_repo
+            .delete_all_creating_partitions(txn.as_mut())
+            .map_err(|e| format!("delete creating managed partitions during open failed: {e}"))?;
+        txn.commit()
+            .map_err(|e| format!("commit managed lake open reconciliation failed: {e}"))?;
+    }
+
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open managed lake txn read transaction failed: {e}"))?;
+    let txns = state
+        .managed_txn_repo
+        .list_all(read.as_ref())
+        .map_err(|e| format!("load managed lake txns during open failed: {e}"))?;
+    drop(read);
+
+    for managed_txn in txns {
+        match managed_txn.state {
+            crate::meta::repository::managed_txn::ManagedTxnState::Prepared => {
+                let mut write = provider
+                    .begin_write("abort prepared managed lake txn on open")
+                    .map_err(|e| format!("open managed txn abort write transaction failed: {e}"))?;
+                state
+                    .managed_txn_repo
+                    .mark_aborted(write.as_mut(), managed_txn.txn_id)
+                    .map_err(|e| {
+                        format!(
+                            "abort prepared managed txn {} during open failed: {e}",
+                            managed_txn.txn_id
+                        )
+                    })?;
+                write
+                    .commit()
+                    .map_err(|e| format!("commit managed txn abort failed: {e}"))?;
+            }
+            crate::meta::repository::managed_txn::ManagedTxnState::Written => {
+                let read = provider.begin_read().map_err(|e| {
+                    format!("open managed lake replay read transaction failed: {e}")
+                })?;
+                let snapshot = state
+                    .managed_repo
+                    .load_snapshot(read.as_ref())
+                    .map_err(|e| format!("load managed lake replay snapshot failed: {e}"))?;
+                let tablet_ids = snapshot
+                    .tablets
+                    .iter()
+                    .filter(|tablet| {
+                        snapshot.indexes.iter().any(|index| {
+                            index.index_id == tablet.index_id
+                                && index.table_id == managed_txn.table_id
+                                && index.partition_id == managed_txn.partition_id
+                        })
+                    })
+                    .map(|tablet| tablet.tablet_id)
+                    .collect::<Vec<_>>();
+                drop(read);
+                crate::connector::publish_tablets_at_version(
+                    tablet_ids,
+                    managed_txn.txn_id,
+                    managed_txn.base_version,
+                    managed_txn.commit_version,
+                )?;
+                let mut write = provider
+                    .begin_write("mark replayed managed lake txn visible")
+                    .map_err(|e| {
+                        format!("open managed txn visible write transaction failed: {e}")
+                    })?;
+                state
+                    .managed_txn_repo
+                    .mark_visible(&state.managed_repo, write.as_mut(), managed_txn.txn_id)
+                    .map_err(|e| {
+                        format!(
+                            "mark replayed managed txn {} visible during open failed: {e}",
+                            managed_txn.txn_id
+                        )
+                    })?;
+                write
+                    .commit()
+                    .map_err(|e| format!("commit replayed managed txn visible failed: {e}"))?;
+            }
+            crate::meta::repository::managed_txn::ManagedTxnState::Visible
+            | crate::meta::repository::managed_txn::ManagedTxnState::Aborted => {}
+        }
+    }
     Ok(())
 }
 

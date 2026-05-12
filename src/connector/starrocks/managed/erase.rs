@@ -3,7 +3,6 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::connector::starrocks::managed::config::ManagedLakeConfig;
-use crate::connector::starrocks::managed::store::{ManagedEraseJobKind, SqliteMetadataStore};
 use crate::engine::StandaloneState;
 use crate::fs::oss::{oss_block_on, resolve_oss_operator_and_path_with_config};
 use crate::novarocks_logging::warn;
@@ -11,57 +10,107 @@ use crate::novarocks_logging::warn;
 const ERASE_RETRY_DELAY_MS: i64 = 5_000;
 const ERASE_WORKER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-pub(crate) fn run_erase_jobs_once(
-    store: &SqliteMetadataStore,
-    config: &ManagedLakeConfig,
-) -> Result<(), String> {
-    run_erase_jobs_once_with(store, config, |root_path| erase_root(root_path, config))
+pub(crate) fn run_erase_jobs_once(state: &StandaloneState) -> Result<(), String> {
+    let config = state
+        .managed_lake_config
+        .as_ref()
+        .ok_or_else(|| "managed lake erase worker requires config".to_string())?;
+    run_erase_jobs_once_with(state, |root_path| erase_root(root_path, config))
 }
 
-fn run_erase_jobs_once_with<F>(
-    store: &SqliteMetadataStore,
-    _config: &ManagedLakeConfig,
-    mut erase_root_fn: F,
-) -> Result<(), String>
+fn run_erase_jobs_once_with<F>(state: &StandaloneState, mut erase_root_fn: F) -> Result<(), String>
 where
     F: FnMut(&str) -> Result<(), String>,
 {
+    let provider = state
+        .metadata_provider
+        .as_ref()
+        .ok_or_else(|| "managed lake erase worker requires metadata provider".to_string())?;
     let now_ms = current_time_ms();
-    for job in store.list_runnable_erase_jobs(now_ms)? {
-        if !store.claim_erase_job(job.job_id)? {
+    let read = provider
+        .begin_read()
+        .map_err(|e| format!("open erase job read transaction failed: {e}"))?;
+    let jobs = state
+        .job_repo
+        .list_runnable_erase_jobs(read.as_ref(), now_ms)
+        .map_err(|e| format!("list erase jobs failed: {e}"))?;
+    drop(read);
+
+    for job in jobs {
+        let claimed = {
+            let mut txn = provider
+                .begin_write("claim managed lake erase job")
+                .map_err(|e| format!("open erase job claim transaction failed: {e}"))?;
+            let claimed = state
+                .job_repo
+                .claim_erase_job(txn.as_mut(), job.job_id, current_time_ms())
+                .map_err(|e| format!("claim erase job {} failed: {e}", job.job_id))?;
+            txn.commit()
+                .map_err(|e| format!("commit erase job claim failed: {e}"))?;
+            claimed
+        };
+        if !claimed {
             continue;
         }
 
         let result: Result<(), String> = (|| {
             erase_root_fn(&job.root_path)?;
-            match job.job_kind {
-                ManagedEraseJobKind::DropTable => {
-                    store.purge_retired_table_metadata(job.table_id)?;
+            let mut txn = provider
+                .begin_write("finish managed lake erase job")
+                .map_err(|e| format!("open erase job finish transaction failed: {e}"))?;
+            match job.partition_id {
+                None => {
+                    state
+                        .managed_txn_repo
+                        .delete_for_table(txn.as_mut(), job.table_id)
+                        .map_err(|e| format!("delete erased table txns failed: {e}"))?;
+                    state
+                        .managed_repo
+                        .purge_retired_table_metadata(txn.as_mut(), job.table_id)
+                        .map_err(|e| format!("purge erased table metadata failed: {e}"))?;
                 }
-                ManagedEraseJobKind::DropPartition => {
-                    let partition_id = job.partition_id.ok_or_else(|| {
-                        format!(
-                            "drop-partition erase job {} is missing partition_id",
-                            job.job_id
-                        )
-                    })?;
-                    store.purge_retired_partition_metadata(partition_id)?;
+                Some(partition_id) => {
+                    state
+                        .managed_txn_repo
+                        .delete_for_partition(txn.as_mut(), partition_id)
+                        .map_err(|e| format!("delete erased partition txns failed: {e}"))?;
+                    state
+                        .managed_repo
+                        .purge_retired_partition_metadata(txn.as_mut(), partition_id)
+                        .map_err(|e| format!("purge erased partition metadata failed: {e}"))?;
                 }
             }
-            store.finish_erase_job(job.job_id)?;
+            state
+                .job_repo
+                .finish_erase_job(txn.as_mut(), job.job_id, current_time_ms())
+                .map_err(|e| format!("finish erase job {} failed: {e}", job.job_id))?;
+            txn.commit()
+                .map_err(|e| format!("commit erase job finish failed: {e}"))?;
             Ok(())
         })();
 
         if let Err(err) = result {
             let retry_at_ms = current_time_ms() + ERASE_RETRY_DELAY_MS;
-            store
-                .fail_erase_job(job.job_id, &err, retry_at_ms)
+            let mut txn = provider
+                .begin_write("fail managed lake erase job")
+                .map_err(|e| format!("open erase job failure transaction failed: {e}"))?;
+            state
+                .job_repo
+                .fail_erase_job(
+                    txn.as_mut(),
+                    job.job_id,
+                    err.clone(),
+                    Some(retry_at_ms),
+                    current_time_ms(),
+                )
                 .map_err(|persist_err| {
                     format!(
                         "record erase failure for job {} failed after `{err}`: {persist_err}",
                         job.job_id
                     )
                 })?;
+            txn.commit()
+                .map_err(|e| format!("commit erase job failure failed: {e}"))?;
         }
     }
     Ok(())
@@ -77,17 +126,17 @@ fn erase_worker_loop(state: Weak<StandaloneState>) {
         let Some(strong) = state.upgrade() else {
             return;
         };
-        let Some(store) = strong.metadata_store.clone() else {
+        if strong.metadata_provider.is_none() {
             return;
-        };
-        let Some(config) = strong.managed_lake_config.clone() else {
+        }
+        if strong.managed_lake_config.is_none() {
             return;
-        };
-        drop(strong);
+        }
 
-        if let Err(err) = run_erase_jobs_once(&store, &config) {
+        if let Err(err) = run_erase_jobs_once(&strong) {
             warn!("managed lake erase worker iteration failed: {err}");
         }
+        drop(strong);
         thread::sleep(ERASE_WORKER_POLL_INTERVAL);
     }
 }
@@ -122,6 +171,8 @@ fn current_time_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::runtime::starlet_shard_registry::S3StoreConfig;
 
     use super::run_erase_jobs_once_with;
@@ -129,9 +180,15 @@ mod tests {
     use crate::connector::starrocks::managed::store::{
         ManagedEraseJobKind, ManagedEraseJobState, ManagedGlobalMeta, ManagedIndexState,
         ManagedPartitionState, ManagedSnapshot, ManagedTableKind, ManagedTableState,
-        ManagedTxnState, SqliteMetadataStore, StoredManagedDatabase, StoredManagedEraseJob,
-        StoredManagedIndex, StoredManagedPartition, StoredManagedSchema, StoredManagedTable,
-        StoredManagedTablet, StoredManagedTxn,
+        ManagedTxnState, StoredManagedDatabase, StoredManagedEraseJob, StoredManagedIndex,
+        StoredManagedPartition, StoredManagedSchema, StoredManagedTable, StoredManagedTablet,
+        StoredManagedTxn,
+    };
+    use crate::engine::StandaloneState;
+    use crate::meta::repository::encode_json_payload;
+    use crate::meta::{
+        ExpectedRevision, MetaKey, MetaRecordKind, MetaRecordPut, MetaStoreProvider,
+        SqliteMetaStoreProvider,
     };
 
     fn test_managed_config() -> ManagedLakeConfig {
@@ -150,16 +207,225 @@ mod tests {
         }
     }
 
-    fn test_store_with_snapshot(
-        snapshot: ManagedSnapshot,
-    ) -> (tempfile::TempDir, SqliteMetadataStore) {
+    fn test_state_with_snapshot(snapshot: ManagedSnapshot) -> (tempfile::TempDir, StandaloneState) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            SqliteMetadataStore::open(dir.path().join("standalone.sqlite")).expect("open store");
-        store
-            .replace_managed_snapshot(&snapshot)
-            .expect("persist snapshot");
-        (dir, store)
+        let provider = SqliteMetaStoreProvider::open(dir.path().join("standalone.sqlite"))
+            .expect("open provider");
+        {
+            let mut txn = provider
+                .begin_write("seed managed erase test")
+                .expect("txn");
+            seed_repository_snapshot(txn.as_mut(), &snapshot);
+            txn.commit().expect("commit seed");
+        }
+        (
+            dir,
+            StandaloneState {
+                managed_lake_config: Some(test_managed_config()),
+                metadata_provider: Some(Arc::new(provider)),
+                ..StandaloneState::default()
+            },
+        )
+    }
+
+    fn seed_repository_snapshot(
+        txn: &mut dyn crate::meta::MetaWriteTxn,
+        snapshot: &ManagedSnapshot,
+    ) {
+        for database in &snapshot.databases {
+            put_record(
+                txn,
+                "managed",
+                vec!["database".to_string(), database.db_id.to_string()],
+                "managed.database",
+                serde_json::json!({
+                    "db_id": database.db_id,
+                    "name": database.name,
+                }),
+            );
+        }
+        for table in &snapshot.tables {
+            put_record(
+                txn,
+                "managed",
+                vec!["table".to_string(), table.table_id.to_string()],
+                "managed.table",
+                serde_json::json!({
+                    "table_id": table.table_id,
+                    "db_id": table.db_id,
+                    "name": table.name,
+                    "keys_type": table.keys_type,
+                    "bucket_num": table.bucket_num,
+                    "current_schema_id": table.current_schema_id,
+                    "state": table_state(table.state),
+                    "kind": table_kind(table.kind),
+                }),
+            );
+        }
+        for schema in &snapshot.schemas {
+            put_record(
+                txn,
+                "managed",
+                vec!["schema".to_string(), schema.schema_id.to_string()],
+                "managed.schema",
+                serde_json::json!({
+                    "schema_id": schema.schema_id,
+                    "table_id": schema.table_id,
+                    "schema_version": schema.schema_version,
+                    "tablet_schema_pb": schema.tablet_schema_pb,
+                }),
+            );
+        }
+        for partition in &snapshot.partitions {
+            put_record(
+                txn,
+                "managed",
+                vec!["partition".to_string(), partition.partition_id.to_string()],
+                "managed.partition",
+                serde_json::json!({
+                    "partition_id": partition.partition_id,
+                    "table_id": partition.table_id,
+                    "name": partition.name,
+                    "visible_version": partition.visible_version,
+                    "next_version": partition.next_version,
+                    "state": partition_state(partition.state),
+                }),
+            );
+        }
+        for index in &snapshot.indexes {
+            put_record(
+                txn,
+                "managed",
+                vec!["index".to_string(), index.index_id.to_string()],
+                "managed.index",
+                serde_json::json!({
+                    "index_id": index.index_id,
+                    "table_id": index.table_id,
+                    "partition_id": index.partition_id,
+                    "index_type": index.index_type,
+                    "state": index_state(index.state),
+                }),
+            );
+        }
+        for tablet in &snapshot.tablets {
+            put_record(
+                txn,
+                "managed",
+                vec!["tablet".to_string(), tablet.tablet_id.to_string()],
+                "managed.tablet",
+                serde_json::json!({
+                    "tablet_id": tablet.tablet_id,
+                    "partition_id": tablet.partition_id,
+                    "index_id": tablet.index_id,
+                    "bucket_seq": tablet.bucket_seq,
+                    "tablet_root_path": tablet.tablet_root_path,
+                }),
+            );
+        }
+        for managed_txn in &snapshot.txns {
+            put_record(
+                txn,
+                "managed.txn",
+                vec![managed_txn.txn_id.to_string()],
+                "managed.txn",
+                serde_json::json!({
+                    "txn_id": managed_txn.txn_id,
+                    "table_id": managed_txn.table_id,
+                    "partition_id": managed_txn.partition_id,
+                    "base_version": managed_txn.base_version,
+                    "commit_version": managed_txn.commit_version,
+                    "state": txn_state(managed_txn.state),
+                    "retry_at_ms": managed_txn.retry_at_ms,
+                    "updated_at_ms": managed_txn.updated_at_ms,
+                }),
+            );
+        }
+        for job in &snapshot.erase_jobs {
+            put_record(
+                txn,
+                "job",
+                vec!["erase".to_string(), job.job_id.to_string()],
+                "job.erase",
+                serde_json::json!({
+                    "job_id": job.job_id,
+                    "table_id": job.table_id,
+                    "partition_id": job.partition_id,
+                    "root_path": job.root_path,
+                    "state": erase_job_state(job.state),
+                    "retry_at_ms": job.retry_at_ms,
+                    "updated_at_ms": job.updated_at_ms,
+                    "last_error": job.last_error,
+                }),
+            );
+        }
+    }
+
+    fn put_record(
+        txn: &mut dyn crate::meta::MetaWriteTxn,
+        namespace: &str,
+        path: Vec<String>,
+        kind: &str,
+        payload: serde_json::Value,
+    ) {
+        txn.put(MetaRecordPut::new(
+            MetaKey::new(namespace, path).expect("key"),
+            MetaRecordKind::new(kind).expect("kind"),
+            ExpectedRevision::NotExists,
+            encode_json_payload(1, &payload).expect("payload"),
+        ))
+        .expect("put record");
+    }
+
+    fn table_state(state: ManagedTableState) -> &'static str {
+        match state {
+            ManagedTableState::Creating => "CREATING",
+            ManagedTableState::Active => "ACTIVE",
+            ManagedTableState::Dropping => "DROPPING",
+            ManagedTableState::Failed => "FAILED",
+        }
+    }
+
+    fn table_kind(kind: ManagedTableKind) -> &'static str {
+        match kind {
+            ManagedTableKind::Table => "TABLE",
+            ManagedTableKind::MaterializedView => "MATERIALIZED_VIEW",
+        }
+    }
+
+    fn partition_state(state: ManagedPartitionState) -> &'static str {
+        match state {
+            ManagedPartitionState::Creating => "CREATING",
+            ManagedPartitionState::Active => "ACTIVE",
+            ManagedPartitionState::Retired => "RETIRED",
+            ManagedPartitionState::Failed => "FAILED",
+        }
+    }
+
+    fn index_state(state: ManagedIndexState) -> &'static str {
+        match state {
+            ManagedIndexState::Creating => "CREATING",
+            ManagedIndexState::Active => "ACTIVE",
+            ManagedIndexState::Retired => "RETIRED",
+            ManagedIndexState::Failed => "FAILED",
+        }
+    }
+
+    fn txn_state(state: ManagedTxnState) -> &'static str {
+        match state {
+            ManagedTxnState::Prepared => "PREPARED",
+            ManagedTxnState::Written => "WRITTEN",
+            ManagedTxnState::Visible => "VISIBLE",
+            ManagedTxnState::Aborted => "ABORTED",
+        }
+    }
+
+    fn erase_job_state(state: ManagedEraseJobState) -> &'static str {
+        match state {
+            ManagedEraseJobState::Pending => "PENDING",
+            ManagedEraseJobState::Running => "RUNNING",
+            ManagedEraseJobState::Failed => "FAILED",
+            ManagedEraseJobState::Finished => "FINISHED",
+        }
     }
 
     #[test]
@@ -280,25 +546,34 @@ mod tests {
             }],
             materialized_views: Vec::new(),
         };
-        let (_dir, store) = test_store_with_snapshot(snapshot);
+        let (_dir, state) = test_state_with_snapshot(snapshot);
 
-        run_erase_jobs_once_with(&store, &test_managed_config(), |_| Ok(()))
-            .expect("run erase jobs once");
+        run_erase_jobs_once_with(&state, |_| Ok(())).expect("run erase jobs once");
 
-        let loaded = store.load_snapshot().expect("load snapshot");
-        assert_eq!(loaded.managed.partitions.len(), 1);
-        assert_eq!(loaded.managed.partitions[0].partition_id, 21);
-        assert_eq!(loaded.managed.indexes.len(), 1);
-        assert_eq!(loaded.managed.indexes[0].partition_id, 21);
-        assert_eq!(loaded.managed.tablets.len(), 1);
-        assert_eq!(loaded.managed.tablets[0].partition_id, 21);
-        assert_eq!(loaded.managed.txns.len(), 1);
-        assert_eq!(loaded.managed.txns[0].partition_id, 21);
-        assert_eq!(loaded.managed.erase_jobs.len(), 1);
-        assert_eq!(
-            loaded.managed.erase_jobs[0].state,
-            ManagedEraseJobState::Finished
-        );
+        let provider = state.metadata_provider.as_ref().expect("provider");
+        let read = provider.begin_read().expect("read");
+        let loaded = state
+            .managed_repo
+            .load_snapshot(read.as_ref())
+            .expect("load snapshot");
+        assert_eq!(loaded.partitions.len(), 1);
+        assert_eq!(loaded.partitions[0].partition_id, 21);
+        assert_eq!(loaded.indexes.len(), 1);
+        assert_eq!(loaded.indexes[0].partition_id, 21);
+        assert_eq!(loaded.tablets.len(), 1);
+        assert_eq!(loaded.tablets[0].partition_id, 21);
+        let txns = state
+            .managed_txn_repo
+            .list_all(read.as_ref())
+            .expect("load txns");
+        assert_eq!(txns.len(), 1);
+        assert_eq!(txns[0].partition_id, 21);
+        let job = state
+            .job_repo
+            .load_erase_job(read.as_ref(), 1)
+            .expect("load job")
+            .expect("job");
+        assert_eq!(job.state, crate::meta::repository::job::JobState::Finished);
     }
 
     #[test]
@@ -379,25 +654,31 @@ mod tests {
             }],
             materialized_views: Vec::new(),
         };
-        let (_dir, store) = test_store_with_snapshot(snapshot);
+        let (_dir, state) = test_state_with_snapshot(snapshot);
 
-        run_erase_jobs_once_with(&store, &test_managed_config(), |_| {
-            Err("injected erase failure".to_string())
-        })
-        .expect("run erase jobs once");
+        run_erase_jobs_once_with(&state, |_| Err("injected erase failure".to_string()))
+            .expect("run erase jobs once");
 
-        let loaded = store.load_snapshot().expect("load snapshot");
-        assert_eq!(loaded.managed.tables.len(), 1);
-        assert_eq!(loaded.managed.tables[0].state, ManagedTableState::Dropping);
-        assert_eq!(loaded.managed.partitions.len(), 1);
-        assert_eq!(loaded.managed.erase_jobs.len(), 1);
+        let provider = state.metadata_provider.as_ref().expect("provider");
+        let read = provider.begin_read().expect("read");
+        let loaded = state
+            .managed_repo
+            .load_snapshot(read.as_ref())
+            .expect("load snapshot");
+        assert_eq!(loaded.tables.len(), 1);
         assert_eq!(
-            loaded.managed.erase_jobs[0].state,
-            ManagedEraseJobState::Failed
+            loaded.tables[0].state,
+            crate::meta::repository::managed_lake::ManagedTableState::Dropping
         );
+        assert_eq!(loaded.partitions.len(), 1);
+        let job = state
+            .job_repo
+            .load_erase_job(read.as_ref(), 1)
+            .expect("load job")
+            .expect("job");
+        assert_eq!(job.state, crate::meta::repository::job::JobState::Failed);
         assert!(
-            loaded.managed.erase_jobs[0]
-                .last_error
+            job.last_error
                 .as_deref()
                 .is_some_and(|msg| msg.contains("injected erase failure"))
         );

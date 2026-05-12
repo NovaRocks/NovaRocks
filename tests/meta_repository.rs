@@ -7,8 +7,9 @@ use novarocks::meta::repository::iceberg_catalog::{
 };
 use novarocks::meta::repository::job::{CreateEraseJobRequest, JobMetaRepository, JobState};
 use novarocks::meta::repository::managed_lake::{
-    CreateManagedDatabaseRequest, CreateManagedTableRequest, ManagedLakeMetaRepository,
-    ManagedPartitionState, ManagedTableKind, ManagedTableState,
+    CreateManagedColumnRequest, CreateManagedDatabaseRequest, CreateManagedTableLayoutRequest,
+    CreateManagedTableRequest, ManagedLakeMetaRepository, ManagedPartitionState, ManagedTableKind,
+    ManagedTableState, StageManagedTruncateRequest,
 };
 use novarocks::meta::repository::managed_txn::{
     ManagedLakeTxnRepository, ManagedTxnState, StoredManagedTxn,
@@ -667,6 +668,249 @@ fn managed_lake_repository_rejects_duplicate_table_name() -> Result<(), Box<dyn 
     };
 
     assert!(err.to_string().contains("already exists"));
+
+    Ok(())
+}
+
+#[test]
+fn managed_lake_repository_drops_table_and_purges_owned_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let managed_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+    let job_repo = JobMetaRepository::default();
+
+    let (table_id, _partition_id, bootstrap_txn_id) = {
+        let mut txn = provider.begin_write("create managed table layout")?;
+        let database = managed_repo.get_or_create_database(txn.as_mut(), "analytics")?;
+        let created = managed_repo.create_table_layout(
+            txn.as_mut(),
+            CreateManagedTableLayoutRequest {
+                db_id: database.db_id,
+                table_name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                kind: ManagedTableKind::Table,
+                schema_version: 0,
+                tablet_schema_pb: vec![1, 2, 3],
+                columns: vec![CreateManagedColumnRequest {
+                    column_name: "id".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                }],
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            },
+        )?;
+        let bootstrap_txn = txn_repo.record_visible_bootstrap(
+            txn.as_mut(),
+            created.table.table_id,
+            created.partition.partition_id,
+        )?;
+        txn.commit()?;
+        (
+            created.table.table_id,
+            created.partition.partition_id,
+            bootstrap_txn.txn_id,
+        )
+    };
+
+    {
+        let mut txn = provider.begin_write("drop managed table")?;
+        txn_repo.ensure_no_inflight_for_table(txn.as_ref(), table_id)?;
+        managed_repo.mark_table_dropping(txn.as_mut(), table_id)?;
+        job_repo.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id,
+                partition_id: None,
+                root_path: "s3://bucket/warehouse/db_1/table_1".to_string(),
+                now_ms: 1000,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let read = provider.begin_read()?;
+        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        assert_eq!(snapshot.tables[0].state, ManagedTableState::Dropping);
+        assert_eq!(snapshot.partitions[0].state, ManagedPartitionState::Retired);
+        assert_eq!(snapshot.indexes.len(), 1);
+        let jobs = job_repo.list_runnable_erase_jobs(read.as_ref(), 1000)?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].table_id, table_id);
+        assert_eq!(jobs[0].partition_id, None);
+    }
+
+    {
+        let mut txn = provider.begin_write("purge dropped managed table")?;
+        txn_repo.delete_for_table(txn.as_mut(), table_id)?;
+        managed_repo.purge_retired_table_metadata(txn.as_mut(), table_id)?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+    assert!(snapshot.tables.is_empty());
+    assert!(snapshot.schemas.is_empty());
+    assert!(snapshot.columns.is_empty());
+    assert!(snapshot.partitions.is_empty());
+    assert!(snapshot.indexes.is_empty());
+    assert!(snapshot.tablets.is_empty());
+    assert!(txn_repo.load(read.as_ref(), bootstrap_txn_id)?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn managed_lake_repository_stages_activates_and_purges_truncate_partition()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let managed_repo = ManagedLakeMetaRepository::default();
+    let txn_repo = ManagedLakeTxnRepository::default();
+    let job_repo = JobMetaRepository::default();
+
+    let (table_id, db_id, old_partition_id) = {
+        let mut txn = provider.begin_write("create managed table layout")?;
+        let database = managed_repo.get_or_create_database(txn.as_mut(), "analytics")?;
+        let created = managed_repo.create_table_layout(
+            txn.as_mut(),
+            CreateManagedTableLayoutRequest {
+                db_id: database.db_id,
+                table_name: "orders".to_string(),
+                keys_type: "DUP_KEYS".to_string(),
+                bucket_num: 2,
+                kind: ManagedTableKind::Table,
+                schema_version: 0,
+                tablet_schema_pb: vec![1, 2, 3],
+                columns: vec![CreateManagedColumnRequest {
+                    column_name: "id".to_string(),
+                    logical_type: "INT".to_string(),
+                    nullable: false,
+                    visible: true,
+                    is_key: true,
+                }],
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            },
+        )?;
+        txn.commit()?;
+        (
+            created.table.table_id,
+            database.db_id,
+            created.partition.partition_id,
+        )
+    };
+
+    let staged = {
+        let mut txn = provider.begin_write("stage truncate partition")?;
+        txn_repo.ensure_no_inflight_for_table(txn.as_ref(), table_id)?;
+        let staged = managed_repo.stage_truncate_partition(
+            txn.as_mut(),
+            StageManagedTruncateRequest {
+                table_id,
+                db_id,
+                bucket_num: 2,
+                partition_name: "p0".to_string(),
+                warehouse_uri: "s3://bucket/warehouse".to_string(),
+            },
+        )?;
+        txn.commit()?;
+        staged
+    };
+
+    {
+        let read = provider.begin_read()?;
+        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        assert!(snapshot.partitions.iter().any(|partition| {
+            partition.partition_id == staged.partition_id
+                && partition.state == ManagedPartitionState::Creating
+        }));
+        assert_eq!(staged.tablet_ids.len(), 2);
+        assert_eq!(
+            staged.partition_root_path,
+            format!(
+                "s3://bucket/warehouse/db_{db_id}/table_{table_id}/partition_{}",
+                staged.partition_id
+            )
+        );
+    }
+
+    {
+        let mut txn = provider.begin_write("activate truncate partition")?;
+        managed_repo.activate_truncate_partition(
+            txn.as_mut(),
+            table_id,
+            old_partition_id,
+            staged.partition_id,
+            staged.index_id,
+        )?;
+        job_repo.create_erase_job(
+            txn.as_mut(),
+            CreateEraseJobRequest {
+                table_id,
+                partition_id: Some(old_partition_id),
+                root_path: format!(
+                    "s3://bucket/warehouse/db_{db_id}/table_{table_id}/partition_{old_partition_id}"
+                ),
+                now_ms: 1100,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let read = provider.begin_read()?;
+        let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+        let old_partition = snapshot
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == old_partition_id)
+            .expect("old partition");
+        let new_partition = snapshot
+            .partitions
+            .iter()
+            .find(|partition| partition.partition_id == staged.partition_id)
+            .expect("new partition");
+        assert_eq!(old_partition.state, ManagedPartitionState::Retired);
+        assert_eq!(new_partition.state, ManagedPartitionState::Active);
+        assert_eq!(new_partition.visible_version, 1);
+        let jobs = job_repo.list_runnable_erase_jobs(read.as_ref(), 1100)?;
+        assert_eq!(jobs[0].partition_id, Some(old_partition_id));
+    }
+
+    {
+        let mut txn = provider.begin_write("purge retired truncate partition")?;
+        txn_repo.delete_for_partition(txn.as_mut(), old_partition_id)?;
+        managed_repo.purge_retired_partition_metadata(txn.as_mut(), old_partition_id)?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let snapshot = managed_repo.load_snapshot(read.as_ref())?;
+    assert!(
+        snapshot
+            .partitions
+            .iter()
+            .all(|partition| partition.partition_id != old_partition_id)
+    );
+    assert!(
+        snapshot
+            .tablets
+            .iter()
+            .all(|tablet| tablet.partition_id != old_partition_id)
+    );
+    assert!(
+        snapshot
+            .indexes
+            .iter()
+            .all(|index| index.partition_id != old_partition_id)
+    );
 
     Ok(())
 }

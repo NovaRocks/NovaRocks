@@ -195,6 +195,22 @@ impl JobMetaRepository {
             })
             .collect()
     }
+
+    pub fn delete_for_table(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        table_id: i64,
+    ) -> RepositoryResult<()> {
+        for stored in load_versioned_erase_jobs(txn)? {
+            if stored.value.table_id == table_id {
+                txn.delete(
+                    &key_erase_job(stored.value.job_id)?,
+                    ExpectedRevision::Exact(stored.record_revision),
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,6 +240,19 @@ fn load_versioned_erase_job(
             })
         })
         .transpose()
+}
+
+fn load_versioned_erase_jobs(txn: &dyn MetaReadTxn) -> RepositoryResult<Vec<VersionedEraseJob>> {
+    txn.scan(&key_prefix_erase_jobs()?, None)?
+        .into_iter()
+        .map(|record| {
+            let value = decode_record_payload(&record, ERASE_JOB_KIND, ERASE_JOB_SCHEMA_VERSION)?;
+            Ok(VersionedEraseJob {
+                record_revision: record.revision,
+                value,
+            })
+        })
+        .collect()
 }
 
 fn put_erase_job(
