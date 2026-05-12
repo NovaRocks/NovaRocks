@@ -698,7 +698,6 @@ impl<'a> AnalyzerContext<'a> {
     // Subquery analysis helpers
     // -----------------------------------------------------------------------
 
-
     /// Analyze a query with outer scope, also returning the inner scope.
     fn analyze_query_in_scope_with_inner(
         &self,

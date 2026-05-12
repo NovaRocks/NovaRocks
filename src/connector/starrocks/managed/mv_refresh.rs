@@ -3587,7 +3587,9 @@ enable_path_style_access = true
     /// with a column-count mismatch.
     #[test]
     fn build_aggregate_mv_layout_succeeds_with_analyzer_sourced_visible_types() {
-        use super::super::mv_agg_state::build_aggregate_mv_layout;
+        use super::super::mv_agg_state::{
+            AGG_RETRACTION_COUNT_STATE_COLUMN, AggregateStateRole, build_aggregate_mv_layout,
+        };
 
         let state = state_with_orders_table();
 
@@ -3615,11 +3617,12 @@ enable_path_style_access = true
             2,
             "layout must have 2 visible columns (k + a)"
         );
-        // AVG expands to 2 state columns: __agg_state_a__sum + __agg_state_a__count.
+        // AVG expands to 2 state columns, plus the hidden retraction count state
+        // needed to drop fully retracted groups when the shape has no COUNT(*).
         assert_eq!(
             layout.state_columns.len(),
-            2,
-            "AVG must expand to 2 state columns (sum + count)"
+            3,
+            "AVG must expand to 2 state columns plus hidden retraction count"
         );
         assert!(
             layout.state_columns[0].name.contains("__sum"),
@@ -3628,6 +3631,14 @@ enable_path_style_access = true
         assert!(
             layout.state_columns[1].name.contains("__count"),
             "second state column must be the count sub-state"
+        );
+        assert_eq!(
+            layout.state_columns[2].state_role,
+            AggregateStateRole::RetractionCount
+        );
+        assert_eq!(
+            layout.state_columns[2].name,
+            AGG_RETRACTION_COUNT_STATE_COLUMN
         );
     }
 }

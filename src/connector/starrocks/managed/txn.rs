@@ -1947,12 +1947,18 @@ mod mv_target_tests {
             "fully retracted aggregate group must be deleted from the PK table"
         );
 
-        let store = fixture.state.metadata_store.as_ref().expect("store");
-        let loaded = store.load_snapshot().expect("snapshot").managed;
-        let mv = loaded
-            .materialized_views
-            .iter()
-            .find(|mv| mv.mv_id == 10)
+        let read = fixture
+            .state
+            .metadata_provider
+            .as_ref()
+            .expect("provider")
+            .begin_read()
+            .expect("read");
+        let mv = fixture
+            .state
+            .mv_repo
+            .load_by_id(read.as_ref(), 10)
+            .expect("load mv")
             .expect("mv");
         assert_eq!(mv.last_refresh_rows, Some(0));
     }

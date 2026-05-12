@@ -65,17 +65,11 @@ pub(crate) fn lower_nestloop_join_node(
         plan_nodes::TJoinOp::RIGHT_OUTER_JOIN => {
             (left_in, right_in, NestedLoopJoinType::RightOuter)
         }
-        plan_nodes::TJoinOp::FULL_OUTER_JOIN => {
-            (left_in, right_in, NestedLoopJoinType::FullOuter)
-        }
+        plan_nodes::TJoinOp::FULL_OUTER_JOIN => (left_in, right_in, NestedLoopJoinType::FullOuter),
         plan_nodes::TJoinOp::LEFT_SEMI_JOIN => (left_in, right_in, NestedLoopJoinType::LeftSemi),
         plan_nodes::TJoinOp::LEFT_ANTI_JOIN => (left_in, right_in, NestedLoopJoinType::LeftAnti),
-        plan_nodes::TJoinOp::RIGHT_SEMI_JOIN => {
-            (right_in, left_in, NestedLoopJoinType::LeftSemi)
-        }
-        plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => {
-            (right_in, left_in, NestedLoopJoinType::LeftAnti)
-        }
+        plan_nodes::TJoinOp::RIGHT_SEMI_JOIN => (right_in, left_in, NestedLoopJoinType::LeftSemi),
+        plan_nodes::TJoinOp::RIGHT_ANTI_JOIN => (right_in, left_in, NestedLoopJoinType::LeftAnti),
         plan_nodes::TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN => {
             (left_in, right_in, NestedLoopJoinType::NullAwareLeftAnti)
         }

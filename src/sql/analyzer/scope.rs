@@ -50,9 +50,7 @@ impl AnalyzerScope {
     /// resolution against codegen scopes (which contain both sides' bindings)
     /// picks the correct slot.
     pub(super) fn canonical_qualifier_for(&self, name: &str) -> Option<String> {
-        self.canonical_qualifier
-            .get(&name.to_lowercase())
-            .cloned()
+        self.canonical_qualifier.get(&name.to_lowercase()).cloned()
     }
 
     /// Return a synthetic expression for an unqualified column name, if any.
@@ -237,7 +235,9 @@ impl AnalyzerScope {
         use crate::sql::analysis::{ExprKind, TypedExpr};
         for col in using_cols {
             let col_lower = col.to_lowercase();
-            let Some((dt, _)) = self.qualified.get(&(left_qual.to_lowercase(), col_lower.clone()))
+            let Some((dt, _)) = self
+                .qualified
+                .get(&(left_qual.to_lowercase(), col_lower.clone()))
             else {
                 continue;
             };
@@ -355,8 +355,7 @@ impl AnalyzerScope {
                 .map(|e| e.clone())
                 .collect::<Vec<_>>()
             {
-                self.unqualified
-                    .insert(name.to_lowercase(), (dt, nullable));
+                self.unqualified.insert(name.to_lowercase(), (dt, nullable));
             }
         }
 
