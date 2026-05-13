@@ -590,7 +590,7 @@ pub(crate) fn materialize_changes(
                 partition_key: f.partition_key.clone(),
                 first_row_id: f.first_row_id,
                 data_sequence_number: f.data_sequence_number,
-                change_op: None,
+                change_op: Some(crate::exec::change_op::CHANGE_OP_INSERT),
             })
             .collect();
         crate::engine::mv_flow::execute_query_for_mv_incremental_refresh(
@@ -609,6 +609,11 @@ pub(crate) fn materialize_changes(
         crate::engine::QueryResult::empty()
     } else {
         let factory = build_factory_for_table(base_table, object_store_config)?;
+        let base_first_row_ids = if batch.deletes.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            base_data_file_first_row_id_index(base_table)?
+        };
         let size_lookup = |path: &str| -> Option<u64> {
             // We do not currently carry the per-data-file size index across
             // this boundary; the parquet reader reads metadata by HEAD when
@@ -619,27 +624,40 @@ pub(crate) fn materialize_changes(
         let mut deleted_rows = if batch.deletes.is_empty() {
             Vec::new()
         } else {
-            crate::connector::iceberg::scan_deletes::scan_deletes_with_path_normalizer(
+            crate::connector::iceberg::scan_deletes::scan_deletes_with_base_row_id_lookup_and_path_normalizer(
                 &batch.deletes,
                 &factory,
                 base_table.file_io(),
                 size_lookup,
+                |path| base_first_row_ids.get(path).copied(),
                 |path| normalize_delete_projection_path(path, object_store_config),
             )
             .map_err(|e| e.to_string())?
         };
+        if !batch.deleted_data_files.is_empty() {
+            let deleted_data_files = deleted_data_files_with_first_row_ids_for_reverse_projection(
+                base_table,
+                batch.previous_snapshot_id,
+                &batch.deleted_data_files,
+            )?;
+            let previous_delete_visibility =
+                crate::engine::delete_flow::load_existing_delete_visibility_by_data_file_at(
+                    base_table,
+                    Some(batch.previous_snapshot_id),
+                    object_store_config,
+                )?;
+            deleted_rows.extend(scan_deleted_data_file_rows_with_visibility(
+                base_table,
+                &deleted_data_files,
+                object_store_config,
+                &previous_delete_visibility,
+            )?);
+        }
         if !batch.equality_deletes.is_empty() {
             deleted_rows.extend(scan_equality_delete_rows_for_table(
                 base_table,
                 &batch.equality_deletes,
                 &factory,
-                object_store_config,
-            )?);
-        }
-        if !batch.deleted_data_files.is_empty() {
-            deleted_rows.extend(scan_deleted_data_file_rows(
-                base_table,
-                &batch.deleted_data_files,
                 object_store_config,
             )?);
         }
@@ -682,18 +700,184 @@ pub(crate) fn scan_equality_delete_rows_for_table(
             &read_snapshot,
             &delete_file,
         ) {
-            out.extend(
-                crate::connector::iceberg::equality_delete::read_data_file_matching_equality_deletes_with_path_normalizer(
-                    &data_file.path,
-                    u64::try_from(data_file.size).ok(),
-                    &sets,
-                    factory,
-                    |path| {
-                        normalize_delete_projection_path(path, object_store_config)
-                            .map_err(|e| e.to_string())
-                    },
-                )?,
+            let first_row_id = data_file.first_row_id.ok_or_else(|| {
+                format!(
+                    "iceberg MV equality-delete reverse projection requires first_row_id for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                    data_file.path
+                )
+            })?;
+            out.extend(read_data_file_matching_equality_deletes_with_base_row_id(
+                &data_file.path,
+                u64::try_from(data_file.size).ok(),
+                &sets,
+                first_row_id,
+                factory,
+                |path| {
+                    normalize_delete_projection_path(path, object_store_config)
+                        .map_err(|e| e.to_string())
+                },
+            )?);
+        }
+    }
+    Ok(out)
+}
+
+fn read_data_file_matching_equality_deletes_with_base_row_id<N>(
+    data_file_path: &str,
+    data_file_size: Option<u64>,
+    sets: &[crate::connector::iceberg::equality_delete::EqualityDeleteSet],
+    first_row_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: N,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String>
+where
+    N: Fn(&str) -> Result<String, String>,
+{
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+    use arrow::array::BooleanArray;
+    use arrow::compute::filter_record_batch;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    if sets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let normalized_path = normalize_path(data_file_path)?;
+    let reader = factory
+        .open_with_len(&normalized_path, data_file_size)
+        .map_err(|e| {
+            format!(
+                "open iceberg data file {data_file_path} for equality-delete row-id reverse projection failed: {e}"
+            )
+        })?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let reader = ParquetRecordBatchReaderBuilder::try_new(reader)
+        .map_err(|e| {
+            format!(
+                "read iceberg data file {data_file_path} metadata for equality-delete row-id reverse projection failed: {e}"
+            )
+        })?
+        .build()
+        .map_err(|e| {
+            format!(
+                "build iceberg data reader for equality-delete row-id reverse projection {data_file_path} failed: {e}"
+            )
+        })?;
+
+    let mut out = Vec::new();
+    let mut next_position = 0_u64;
+    for batch in reader {
+        let batch = batch.map_err(|e| {
+            format!(
+                "read iceberg data file {data_file_path} batch for equality-delete row-id reverse projection failed: {e}"
+            )
+        })?;
+        let row_count = batch.num_rows();
+        let Some(keep_mask) =
+            crate::connector::iceberg::equality_delete::equality_delete_keep_mask(&batch, sets)?
+        else {
+            next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
+                format!(
+                    "row position overflow while scanning equality deletes for {data_file_path}"
+                )
+            })?;
+            continue;
+        };
+
+        let mut matched_positions = Vec::new();
+        let match_mask = BooleanArray::from(
+            keep_mask
+                .iter()
+                .enumerate()
+                .map(|(idx, keep)| {
+                    let matched = !*keep;
+                    if matched {
+                        matched_positions.push(next_position + idx as u64);
+                    }
+                    matched
+                })
+                .collect::<Vec<_>>(),
+        );
+        let filtered = filter_record_batch(&batch, &match_mask).map_err(|e| {
+            format!(
+                "filter iceberg data file {data_file_path} for equality-delete row-id reverse projection failed: {e}"
+            )
+        })?;
+        if filtered.num_rows() > 0 {
+            out.push(
+                crate::connector::iceberg::scan_deletes::append_base_row_id_column(
+                    &filtered,
+                    first_row_id,
+                    &matched_positions,
+                )
+                .map_err(|e| e.to_string())?,
             );
+        }
+        next_position = next_position.checked_add(row_count as u64).ok_or_else(|| {
+            format!("row position overflow while scanning equality deletes for {data_file_path}")
+        })?;
+    }
+    Ok(out)
+}
+
+fn base_data_file_first_row_id_index(
+    table: &iceberg::table::Table,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    let read_snapshot = crate::connector::iceberg::read::build_read_snapshot(table)?;
+    let mut out = std::collections::HashMap::new();
+    for file in read_snapshot.files {
+        let first_row_id = file.first_row_id.ok_or_else(|| {
+            format!(
+                "iceberg MV delete reverse projection requires first_row_id for data file {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                file.path
+            )
+        })?;
+        out.insert(file.path, first_row_id);
+    }
+    Ok(out)
+}
+
+fn deleted_data_files_with_first_row_ids_for_reverse_projection(
+    table: &iceberg::table::Table,
+    previous_snapshot_id: i64,
+    deleted_data_files: &[DeletedDataFileRef],
+) -> Result<Vec<DeletedDataFileRef>, String> {
+    let mut out = deleted_data_files.to_vec();
+    if out.iter().all(|file| file.first_row_id.is_some()) {
+        return Ok(out);
+    }
+
+    let previous_files =
+        crate::connector::iceberg::catalog::registry::extract_data_files_with_stats_at(
+            table,
+            previous_snapshot_id,
+        )?;
+    let first_row_ids = previous_files
+        .into_iter()
+        .map(|file| (file.path, file.first_row_id))
+        .collect::<std::collections::HashMap<_, _>>();
+    for file in &mut out {
+        if file.first_row_id.is_some() {
+            continue;
+        }
+        match first_row_ids.get(&file.path) {
+            Some(Some(first_row_id)) => file.first_row_id = Some(*first_row_id),
+            Some(None) => {
+                return Err(format!(
+                    "iceberg MV deleted-data-file reverse projection requires first_row_id for {}; previous snapshot {} does not expose Iceberg v3 row-lineage metadata",
+                    file.path, previous_snapshot_id
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "iceberg MV deleted-data-file reverse projection could not find {} in previous snapshot {}",
+                    file.path, previous_snapshot_id
+                ));
+            }
         }
     }
     Ok(out)
@@ -753,20 +937,88 @@ pub(crate) fn scan_deleted_data_file_rows(
     }
     let factory = build_factory_for_table(base_table, object_store_config)?;
 
-    let mut old_paths: std::collections::BTreeMap<String, Option<u64>> =
+    scan_deleted_data_file_rows_with_factory(deleted_data_files, &factory, |path| {
+        normalize_delete_projection_path(path, object_store_config)
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn scan_deleted_data_file_rows_with_visibility(
+    base_table: &iceberg::table::Table,
+    deleted_data_files: &[DeletedDataFileRef],
+    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    if deleted_data_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let factory = build_factory_for_table(base_table, object_store_config)?;
+    scan_deleted_data_file_rows_with_factory_and_visibility(
+        deleted_data_files,
+        &factory,
+        |path| normalize_delete_projection_path(path, object_store_config),
+        Some(existing_deletes_by_file),
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) fn scan_deleted_data_file_rows_with_factory<N>(
+    deleted_data_files: &[DeletedDataFileRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: N,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    scan_deleted_data_file_rows_with_factory_and_visibility(
+        deleted_data_files,
+        factory,
+        normalize_path,
+        None,
+    )
+}
+
+fn scan_deleted_data_file_rows_with_factory_and_visibility<N>(
+    deleted_data_files: &[DeletedDataFileRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: N,
+    existing_deletes_by_file: Option<
+        &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    >,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    let mut old_paths: std::collections::BTreeMap<String, (Option<u64>, i64)> =
         std::collections::BTreeMap::new();
     for file in deleted_data_files {
+        let first_row_id = file.first_row_id.ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg MV deleted-data-file reverse projection requires first_row_id for {}; rebuild the MV after enabling Iceberg v3 row-lineage metadata",
+                file.path
+            ))
+        })?;
         old_paths
             .entry(file.path.clone())
-            .or_insert_with(|| u64::try_from(file.size).ok());
+            .or_insert_with(|| (u64::try_from(file.size).ok(), first_row_id));
     }
 
     let mut out = Vec::new();
-    for (path, size) in old_paths {
-        let normalized = normalize_delete_projection_path(&path, object_store_config)
-            .map_err(|e| format!("normalize deleted data file `{path}`: {e}"))?;
-        let batches = read_full_data_file(&normalized, size, &factory)
-            .map_err(|e| format!("read deleted data file `{path}`: {e}"))?;
+    for (path, (size, first_row_id)) in old_paths {
+        let normalized = normalize_path(&path).map_err(|e| {
+            ChangeError::InternalInconsistency(format!("normalize deleted data file `{path}`: {e}"))
+        })?;
+        let batches = read_full_data_file_with_base_row_id_and_visibility(
+            &path,
+            &normalized,
+            size,
+            first_row_id,
+            factory,
+            existing_deletes_by_file,
+        )
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!("read deleted data file `{path}`: {e}"))
+        })?;
         out.extend(batches);
     }
     Ok(out)
@@ -799,6 +1051,75 @@ fn read_full_data_file(
         if batch.num_rows() > 0 {
             out.push(batch);
         }
+    }
+    Ok(out)
+}
+
+fn read_full_data_file_with_base_row_id_and_visibility(
+    logical_path: &str,
+    path: &str,
+    size: Option<u64>,
+    first_row_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    existing_deletes_by_file: Option<
+        &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    >,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, String> {
+    use arrow::array::BooleanArray;
+    use arrow::compute::filter_record_batch;
+
+    let batches = read_full_data_file(path, size, factory)?;
+    let mut out = Vec::with_capacity(batches.len());
+    let mut next_position = 0_u64;
+    for batch in batches {
+        let end = next_position
+            .checked_add(batch.num_rows() as u64)
+            .ok_or_else(|| format!("row position overflow while scanning deleted file {path}"))?;
+        let mut positions = Vec::with_capacity(batch.num_rows());
+        let mut keep = Vec::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let position = next_position.checked_add(row as u64).ok_or_else(|| {
+                format!("row position overflow while scanning deleted file {path}")
+            })?;
+            let visible = match existing_deletes_by_file {
+                Some(deletes) => {
+                    let row_position = i64::try_from(position).map_err(|_| {
+                        format!("row position {position} is too large for deleted file {path}")
+                    })?;
+                    crate::engine::delete_flow::data_file_row_is_visible(
+                        &batch,
+                        row,
+                        logical_path,
+                        row_position,
+                        deletes,
+                    )?
+                }
+                None => true,
+            };
+            keep.push(visible);
+            if visible {
+                positions.push(position);
+            }
+        }
+        if positions.is_empty() {
+            next_position = end;
+            continue;
+        }
+        let filtered = if positions.len() == batch.num_rows() {
+            batch
+        } else {
+            filter_record_batch(&batch, &BooleanArray::from(keep)).map_err(|e| {
+                format!("filter deleted data file {logical_path} by previous delete visibility failed: {e}")
+            })?
+        };
+        let enriched = crate::connector::iceberg::scan_deletes::append_base_row_id_column(
+            &filtered,
+            first_row_id,
+            &positions,
+        )
+        .map_err(|e| e.to_string())?;
+        out.push(enriched);
+        next_position = end;
     }
     Ok(out)
 }
@@ -1241,15 +1562,16 @@ async fn collect_added_delete_files_for_manifest_list(
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use arrow::array::Int32Array;
+    use arrow::array::{Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use arrow::record_batch::RecordBatch;
     use iceberg::spec::{Operation, Snapshot, Summary};
+    use parquet::arrow::ArrowWriter;
 
     use super::{
-        ChangeError, IcebergChangePolicySignal, LineageAction, classify_snapshot,
-        normalize_delete_projection_path, policy_signal_from_change_error,
-        validate_replace_snapshot,
+        ChangeError, DeletedDataFileRef, IcebergChangePolicySignal, LineageAction,
+        classify_snapshot, normalize_delete_projection_path, policy_signal_from_change_error,
+        scan_deleted_data_file_rows_with_factory, validate_replace_snapshot,
     };
 
     use crate::connector::iceberg::catalog::registry::{
@@ -1279,6 +1601,132 @@ mod tests {
             reason.contains("not a provably safe compaction"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn deleted_data_file_reverse_projection_appends_base_row_id_sequence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("deleted.parquet");
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("batch");
+        let file = std::fs::File::create(&data_path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let deleted = vec![DeletedDataFileRef {
+            path: "deleted.parquet".to_string(),
+            size: std::fs::metadata(&data_path).expect("metadata").len() as i64,
+            record_count: Some(3),
+            partition_spec_id: None,
+            partition_key: None,
+            first_row_id: Some(200),
+            data_sequence_number: None,
+        }];
+        let factory = crate::fs::opendal::OpendalRangeReaderFactory::from_operator(
+            crate::fs::opendal::build_fs_operator(dir.path().to_str().expect("utf8 dir"))
+                .expect("fs operator"),
+        )
+        .expect("factory");
+
+        let batches = scan_deleted_data_file_rows_with_factory(&deleted, &factory, |path: &str| {
+            Ok(path.to_string())
+        })
+        .expect("scan deleted data file");
+
+        let batch = batches.first().expect("deleted row batch");
+        let row_id = batch
+            .column(batch.schema().index_of("_row_id").expect("_row_id column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_row_id int64");
+        assert_eq!(row_id.values(), &[200, 201, 202]);
+    }
+
+    #[test]
+    fn equality_delete_reverse_projection_appends_matching_base_row_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        let data_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&data_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            ],
+        )
+        .expect("data batch");
+        let file = std::fs::File::create(&data_path).expect("create data parquet");
+        let mut writer = ArrowWriter::try_new(file, data_schema, None).expect("data writer");
+        writer.write(&data).expect("write data");
+        writer.close().expect("close data writer");
+
+        let equality_path = dir.path().join("eq.parquet");
+        let equality_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let equality = RecordBatch::try_new(
+            Arc::clone(&equality_schema),
+            vec![Arc::new(Int32Array::from(vec![2, 4]))],
+        )
+        .expect("equality batch");
+        let file = std::fs::File::create(&equality_path).expect("create equality parquet");
+        let mut writer =
+            ArrowWriter::try_new(file, equality_schema, None).expect("equality writer");
+        writer.write(&equality).expect("write equality");
+        writer.close().expect("close equality writer");
+
+        let factory = crate::fs::opendal::OpendalRangeReaderFactory::from_operator(
+            crate::fs::opendal::build_fs_operator(dir.path().to_str().expect("utf8 dir"))
+                .expect("fs operator"),
+        )
+        .expect("factory");
+        let spec = crate::connector::iceberg::position_delete::IcebergDeleteFileSpec {
+            path: "eq.parquet".to_string(),
+            file_format: crate::descriptors::THdfsFileFormat::PARQUET,
+            file_content: crate::types::TIcebergFileContent::EQUALITY_DELETES,
+            length: Some(std::fs::metadata(&equality_path).expect("metadata").len()),
+            content_offset: None,
+            content_size_in_bytes: None,
+        };
+        let sets = crate::connector::iceberg::equality_delete::load_equality_delete_sets(
+            &[spec],
+            &factory,
+        )
+        .expect("load equality delete sets");
+
+        let batches = super::read_data_file_matching_equality_deletes_with_base_row_id(
+            "data.parquet",
+            Some(std::fs::metadata(&data_path).expect("metadata").len()),
+            &sets,
+            300,
+            &factory,
+            |path| Ok(path.to_string()),
+        )
+        .expect("scan equality deleted rows");
+
+        let batch = batches.first().expect("deleted row batch");
+        let row_id = batch
+            .column(batch.schema().index_of("_row_id").expect("_row_id column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_row_id int64");
+        assert_eq!(row_id.values(), &[301, 303]);
     }
 
     #[test]

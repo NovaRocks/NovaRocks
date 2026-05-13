@@ -47,7 +47,9 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::overwrite::{
     write_added_data_manifest, write_overwrite_deletes_manifest, write_truncate_deletes_manifest,
 };
@@ -79,7 +81,7 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             }
         }
 
-        let row_lineage_first_row_id = Some(ctx.table.metadata().next_row_id());
+        let row_lineage_first_row_id = Some(effective_next_row_id(ctx.table.metadata())?);
         let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
             sum.checked_add(f.record_count)
                 .ok_or_else(|| "row-lineage added row count overflow".to_string())

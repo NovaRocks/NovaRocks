@@ -24,6 +24,8 @@ use super::registry::{
     load_table as reg_load_table, namespace_exists as reg_namespace_exists,
 };
 
+const NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY: &str = "novarocks.mv.apply-key.column";
+
 pub(crate) struct IcebergCatalogBackend {
     registry: Arc<RwLock<IcebergCatalogRegistry>>,
 }
@@ -196,6 +198,8 @@ fn build_iceberg_table_def_with_data_files(
 ) -> Result<TableDef, String> {
     let iceberg_table = Some(build_iceberg_table_info(&loaded));
     let has_data_files = !data_files.is_empty();
+    let columns =
+        hide_novarocks_mv_apply_key_columns(loaded.table.metadata(), loaded.columns.clone())?;
     let storage = if entry.is_s3() {
         let cloud_properties = entry.cloud_properties_map();
         TableStorage::S3ParquetFiles {
@@ -255,11 +259,53 @@ fn build_iceberg_table_def_with_data_files(
 
     Ok(TableDef {
         name: table_name.to_string(),
-        columns: loaded.columns,
+        columns,
         iceberg_row_lineage_metadata_columns,
         iceberg_table,
         storage,
     })
+}
+
+fn hide_novarocks_mv_apply_key_columns(
+    metadata: &iceberg::spec::TableMetadata,
+    columns: Vec<ColumnDef>,
+) -> Result<Vec<ColumnDef>, String> {
+    hide_novarocks_mv_apply_key_columns_by_property(
+        metadata
+            .properties()
+            .get(NOVAROCKS_MV_APPLY_KEY_COLUMN_PROPERTY)
+            .map(String::as_str),
+        columns,
+    )
+}
+
+fn hide_novarocks_mv_apply_key_columns_by_property(
+    apply_key_column: Option<&str>,
+    columns: Vec<ColumnDef>,
+) -> Result<Vec<ColumnDef>, String> {
+    let Some(apply_key_column) = apply_key_column else {
+        return Ok(columns);
+    };
+
+    let matching_count = columns
+        .iter()
+        .filter(|column| column.name.eq_ignore_ascii_case(apply_key_column))
+        .count();
+    if matching_count == 0 {
+        return Err(format!(
+            "Iceberg MV target schema is missing apply-key column '{apply_key_column}'"
+        ));
+    }
+    if matching_count > 1 {
+        return Err(format!(
+            "Iceberg MV target schema has {matching_count} apply-key columns named '{apply_key_column}'"
+        ));
+    }
+
+    Ok(columns
+        .into_iter()
+        .filter(|column| !column.name.eq_ignore_ascii_case(apply_key_column))
+        .collect())
 }
 
 fn data_file_with_stats_to_s3_file_info(file: super::registry::DataFileWithStats) -> S3FileInfo {
@@ -520,6 +566,63 @@ mod tests {
             data_sequence_number: Some(1),
             delete_files: vec![],
         }
+    }
+
+    fn test_column(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: false,
+            write_default: None,
+        }
+    }
+
+    #[test]
+    fn hide_apply_key_columns_returns_columns_when_property_absent() {
+        let columns = vec![test_column("id"), test_column("__nova_base_row_id")];
+
+        let hidden = hide_novarocks_mv_apply_key_columns_by_property(None, columns.clone())
+            .expect("hide columns");
+
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hide_apply_key_columns_removes_one_case_insensitive_match() {
+        let columns = vec![test_column("id"), test_column("__NOVA_BASE_ROW_ID")];
+
+        let hidden =
+            hide_novarocks_mv_apply_key_columns_by_property(Some("__nova_base_row_id"), columns)
+                .expect("hide columns");
+
+        assert_eq!(
+            hidden
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id"]
+        );
+    }
+
+    #[test]
+    fn hide_apply_key_columns_errors_when_marked_column_is_missing() {
+        let err = hide_novarocks_mv_apply_key_columns_by_property(
+            Some("__nova_base_row_id"),
+            vec![test_column("id")],
+        )
+        .expect_err("missing apply-key column should fail");
+
+        assert!(err.contains("missing apply-key column"));
+        assert!(err.contains("__nova_base_row_id"));
     }
 
     #[test]

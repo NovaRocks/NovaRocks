@@ -24,6 +24,7 @@ fn refresh_transaction_can_recover_after_external_commit_before_finalize()
             target_catalog: Some("ice".to_string()),
             target_namespace: Some("ns".to_string()),
             target_table: Some("orders_mv".to_string()),
+            target_apply_key: None,
             created_at_ms: 1,
         },
     )?;

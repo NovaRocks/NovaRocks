@@ -67,6 +67,30 @@ pub fn current_snapshot_total_records(
         .map_err(|e| format!("invalid current snapshot total-records `{value}`: {e}"))
 }
 
+/// Return the next unallocated Iceberg v3 row id.
+///
+/// Some catalog implementations do not echo the table-level `next-row-id`
+/// update after custom row-lineage commits, but they do preserve each
+/// snapshot's row-range. Treat the table-level value as a floor and derive the
+/// effective value from the maximum `first_row_id + added_rows` in snapshots.
+pub fn effective_next_row_id(metadata: &iceberg::spec::TableMetadata) -> Result<u64, String> {
+    let mut next_row_id = metadata.next_row_id();
+    for snapshot in metadata.snapshots() {
+        if let Some((first_row_id, added_rows)) = snapshot.row_range() {
+            let end = first_row_id.checked_add(added_rows).ok_or_else(|| {
+                format!(
+                    "row-range overflow while deriving next row id: snapshot_id={} first_row_id={} added_rows={}",
+                    snapshot.snapshot_id(),
+                    first_row_id,
+                    added_rows
+                )
+            })?;
+            next_row_id = next_row_id.max(end);
+        }
+    }
+    Ok(next_row_id)
+}
+
 /// Write a manifest list (avro) to `out_path` containing the supplied entries.
 /// Caller is responsible for `abort_handle.record_manifest(out_path)` before
 /// invoking this function so that a later failure can clean up.

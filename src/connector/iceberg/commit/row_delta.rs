@@ -51,7 +51,8 @@ use uuid::Uuid;
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction};
 use super::helpers::{
-    generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list, write_manifest_list,
+    effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, read_base_manifest_list,
+    write_manifest_list,
 };
 use super::types::{CommitOutcome, WrittenFile};
 
@@ -206,6 +207,11 @@ impl TransactionAction for RowDeltaTxnAction {
         entries.extend(new_delete_manifests);
 
         // 3. Write the new manifest list.
+        let row_lineage_first_row_id = if format_version == FormatVersion::V3 {
+            Some(effective_next_row_id(m).map_err(to_iceberg_unexpected)?)
+        } else {
+            None
+        };
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
             new_snapshot_id, self.commit_uuid
@@ -224,24 +230,38 @@ impl TransactionAction for RowDeltaTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
-            None,
+            row_lineage_first_row_id,
         )
         .await
         .map_err(to_iceberg_unexpected)?;
 
         // 4. Construct the new Snapshot.
-        let snapshot = Snapshot::builder()
-            .with_snapshot_id(new_snapshot_id)
-            .with_parent_snapshot_id(parent_snapshot_id)
-            .with_sequence_number(new_seq)
-            .with_timestamp_ms(now_ms())
-            .with_manifest_list(manifest_list_path)
-            .with_summary(Summary {
-                operation: Operation::Delete,
-                additional_properties: row_delta_summary(&self.written),
-            })
-            .with_schema_id(self.schema_id)
-            .build();
+        let snapshot_summary = Summary {
+            operation: Operation::Delete,
+            additional_properties: row_delta_summary(&self.written),
+        };
+        let snapshot = if let Some(first_row_id) = row_lineage_first_row_id {
+            Snapshot::builder()
+                .with_snapshot_id(new_snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(new_seq)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(snapshot_summary)
+                .with_schema_id(self.schema_id)
+                .with_row_range(first_row_id, 0)
+                .build()
+        } else {
+            Snapshot::builder()
+                .with_snapshot_id(new_snapshot_id)
+                .with_parent_snapshot_id(parent_snapshot_id)
+                .with_sequence_number(new_seq)
+                .with_timestamp_ms(now_ms())
+                .with_manifest_list(manifest_list_path)
+                .with_summary(snapshot_summary)
+                .with_schema_id(self.schema_id)
+                .build()
+        };
 
         // 5. Build TableUpdate / TableRequirement set. iceberg-rust's
         //    Transaction::do_commit packages this into a TableCommit and

@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::cache::{CacheOptions, DataCacheManager, ExternalDataCacheRangeOptions};
 use crate::common::ids::SlotId;
@@ -433,6 +433,15 @@ pub(crate) fn lower_hdfs_scan_node(
         crate::exec::row_position::is_row_source_id(name)
             || crate::exec::row_position::is_scan_range_id(name)
     });
+    let physical_hdfs_columns = hive_column_names
+        .as_ref()
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
 
     let Some(exec_params) = exec_params else {
         return Err("HDFS_SCAN_NODE requires exec_params.per_node_scan_ranges".to_string());
@@ -506,7 +515,8 @@ pub(crate) fn lower_hdfs_scan_node(
             row_id_field = Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
-        if crate::exec::row_position::is_iceberg_file_path(&name) {
+        let is_physical_hdfs_column = physical_hdfs_columns.contains(&name.to_ascii_lowercase());
+        if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_file_path(&name) {
             if primitive != types::TPrimitiveType::VARCHAR {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _file slot_id={} expects VARCHAR, got {:?}",
@@ -518,7 +528,7 @@ pub(crate) fn lower_hdfs_scan_node(
                 Some(arrow::datatypes::Field::new(name, arrow_type, nullable));
             continue;
         }
-        if crate::exec::row_position::is_iceberg_row_pos(&name) {
+        if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_row_pos(&name) {
             if primitive != types::TPrimitiveType::BIGINT {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _pos slot_id={} expects BIGINT, got {:?}",
@@ -538,7 +548,7 @@ pub(crate) fn lower_hdfs_scan_node(
         // here because constructing a valid `TPlanNode` for an iceberg scan
         // requires substantial scaffolding that the integration path already
         // covers more economically.
-        if crate::exec::row_position::is_iceberg_row_id(&name) {
+        if !is_physical_hdfs_column && crate::exec::row_position::is_iceberg_row_id(&name) {
             if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _row_id slot_id={} expects BIGINT, got {:?}",
@@ -551,7 +561,9 @@ pub(crate) fn lower_hdfs_scan_node(
             continue;
         }
 
-        if crate::exec::row_position::is_iceberg_last_updated_sequence_number(&name) {
+        if !is_physical_hdfs_column
+            && crate::exec::row_position::is_iceberg_last_updated_sequence_number(&name)
+        {
             if !matches!(arrow_type, arrow::datatypes::DataType::Int64) {
                 return Err(format!(
                     "HDFS_SCAN_NODE node_id={} _last_updated_sequence_number slot_id={} expects BIGINT, got {:?}",

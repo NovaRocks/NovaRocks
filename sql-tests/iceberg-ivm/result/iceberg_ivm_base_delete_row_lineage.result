@@ -1,0 +1,33 @@
+-- query 3
+id	amount
+1	100
+3	70
+
+-- query 6
+id	amount
+1	100
+3	70
+4	60
+
+-- query 8
+id	amount
+3	70
+4	60
+
+-- query 10
+id	amount
+3	90
+4	60
+
+-- query 12
+id	amount
+3	90
+
+-- query 14
+id	amount
+2	55
+3	90
+
+-- query 16
+id	amount
+2	55

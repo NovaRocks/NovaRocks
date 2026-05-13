@@ -53,7 +53,9 @@ use uuid::Uuid;
 
 use super::abort::AbortLog;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
-use super::helpers::{generate_snapshot_id, metadata_dir, now_ms, write_manifest_list};
+use super::helpers::{
+    effective_next_row_id, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+};
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
 
 pub struct OverwriteCommit;
@@ -72,7 +74,9 @@ impl IcebergCommitAction for OverwriteCommit {
         }
         let row_lineage_first_row_id =
             match crate::connector::iceberg::commit::classify_iceberg_write_mode(ctx.table) {
-                IcebergWriteMode::RowLineageV3 => Some(ctx.table.metadata().next_row_id()),
+                IcebergWriteMode::RowLineageV3 => {
+                    Some(effective_next_row_id(ctx.table.metadata())?)
+                }
                 IcebergWriteMode::LegacyPositionDeletes => None,
             };
         let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {

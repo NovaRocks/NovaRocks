@@ -166,6 +166,7 @@ pub(crate) fn equality_delete_keep_mask(
     Ok(Some(keep))
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_data_file_matching_equality_deletes_with_path_normalizer<N>(
     data_file_path: &str,
     data_file_size: Option<u64>,

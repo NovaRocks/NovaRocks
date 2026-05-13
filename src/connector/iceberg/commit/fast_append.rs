@@ -37,8 +37,8 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::data_file::written_file_to_iceberg_data_file;
 use super::helpers::{
-    current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms,
-    read_base_manifest_list, write_manifest_list,
+    current_snapshot_total_records, effective_next_row_id, generate_snapshot_id, metadata_dir,
+    now_ms, read_base_manifest_list, write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
 use super::types::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -125,7 +125,7 @@ async fn commit_v3_row_lineage_append(
     ctx: CommitCtx<'_>,
     written: Vec<WrittenFile>,
 ) -> Result<CommitOutcome, String> {
-    let row_lineage_first_row_id = ctx.table.metadata().next_row_id();
+    let row_lineage_first_row_id = effective_next_row_id(ctx.table.metadata())?;
     let row_lineage_added_rows = written.iter().try_fold(0u64, |sum, f| {
         sum.checked_add(f.record_count)
             .ok_or_else(|| "row-lineage added row count overflow".to_string())

@@ -96,6 +96,7 @@ fn sample_mv_definition_request(select_sql: &str) -> CreateMvDefinitionRequest {
         target_catalog: None,
         target_namespace: None,
         target_table: None,
+        target_apply_key: None,
         created_at_ms: 7,
     }
 }
@@ -1561,6 +1562,7 @@ fn mv_repository_creates_definition_and_target_lookup() -> Result<(), Box<dyn st
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -1603,6 +1605,7 @@ fn mv_repository_creates_and_drops_definition_with_explicit_id()
                 target_catalog: None,
                 target_namespace: None,
                 target_table: None,
+                target_apply_key: None,
                 created_at_ms: 7,
             },
         )?;
@@ -1687,6 +1690,7 @@ fn mv_repository_shares_id_allocator_with_managed_tables() -> Result<(), Box<dyn
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("analytics".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 7,
             },
         )?;
@@ -1746,6 +1750,7 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -1874,6 +1879,7 @@ fn mv_repository_branch_staged_refresh_lifecycle() -> Result<(), Box<dyn std::er
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("analytics".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2143,6 +2149,7 @@ fn create_named_test_iceberg_mv(
             target_catalog: Some("ice".to_string()),
             target_namespace: Some("analytics".to_string()),
             target_table: Some(target_table.to_string()),
+            target_apply_key: None,
             created_at_ms: 11,
         },
     )?;
@@ -2547,6 +2554,7 @@ fn mv_repository_rejects_second_refresh_intent() -> Result<(), Box<dyn std::erro
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2765,6 +2773,7 @@ fn iceberg_catalog_repository_deletes_table_and_related_mv_lookup()
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2823,6 +2832,7 @@ fn iceberg_catalog_repository_rejects_delete_when_target_mv_refresh_is_active()
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2881,6 +2891,7 @@ fn mv_repository_rejects_stale_target_lookup_without_deleting_wrong_definition()
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("ns".to_string()),
                 target_table: Some("other_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2940,6 +2951,7 @@ fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
                 target_catalog: Some("ice".to_string()),
                 target_namespace: Some("sales".to_string()),
                 target_table: Some("orders_mv".to_string()),
+                target_apply_key: None,
                 created_at_ms: 11,
             },
         )?;
@@ -2953,6 +2965,7 @@ fn mv_repository_lists_definitions() -> Result<(), Box<dyn std::error::Error>> {
                 target_catalog: None,
                 target_namespace: None,
                 target_table: None,
+                target_apply_key: None,
                 created_at_ms: 12,
             },
         )?;

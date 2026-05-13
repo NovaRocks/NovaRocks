@@ -3035,6 +3035,7 @@ enable_path_style_access = true
                         target_catalog: None,
                         target_namespace: None,
                         target_table: None,
+                        target_apply_key: None,
                         created_at_ms: super::super::mv_ddl::now_ms(),
                     },
                 )
@@ -3333,6 +3334,7 @@ enable_path_style_access = true
                         target_catalog: mv.target_catalog.clone(),
                         target_namespace: mv.target_namespace.clone(),
                         target_table: mv.target_table.clone(),
+                        target_apply_key: None,
                         created_at_ms: mv.created_at_ms,
                     },
                 )

@@ -39,13 +39,12 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use futures::StreamExt;
-use iceberg::Catalog;
 use iceberg::arrow::ArrowReaderBuilder;
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, PrimitiveType, Type};
 use sqlparser::ast as sqlast;
 
-use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{self, block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, IcebergCommitCollector, IcebergSqlDeleteStrategy, PositionDeleteGroup, RunInput,
     classify_sql_delete_strategy, ensure_no_variant_columns_for_row_level_mutation,
@@ -105,8 +104,7 @@ pub(crate) fn execute_delete_statement(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         registry.get(&target.catalog)?
     };
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog = build_iceberg_catalog(&entry)?;
     let table_ident = iceberg::TableIdent::new(
         iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),

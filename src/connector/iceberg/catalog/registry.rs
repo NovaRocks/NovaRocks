@@ -14,14 +14,19 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::{
-    FormatVersion, ListType, Literal as IcebergLiteral, MapType, NestedField, PrimitiveLiteral,
-    PrimitiveType, Schema, StructType, TableMetadata, Transform, Type,
+    DataFile, FormatVersion, ListType, Literal as IcebergLiteral, MapType, NestedField,
+    PrimitiveLiteral, PrimitiveType, Schema, StructType, TableMetadata, Transform, Type,
 };
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 
 use crate::runtime::global_async_runtime::data_block_on;
 
+use crate::common::types::UniqueId;
+use crate::connector::iceberg::commit::{
+    CommitCtx, CommitOpKind, FastAppendCommit, IcebergCommitAction, IcebergCommitCollector,
+    IcebergWriteMode, WrittenFile, classify_iceberg_write_mode,
+};
 use crate::connector::iceberg::data_writer::write_record_batches_as_data_files;
 use crate::engine::catalog::{ColumnDef, normalize_identifier};
 use crate::sql::{ColumnAggregation, Literal, SqlType, TableColumnDef, TableKeyDesc, TableKeyKind};
@@ -743,6 +748,11 @@ pub(crate) fn insert_rows(
     let batch = build_insert_batch(&loaded, rows)?;
 
     let catalog = build_iceberg_catalog(entry)?;
+    let table_ident = TableIdent::from_strs([
+        normalize_identifier(namespace_name)?,
+        normalize_identifier(table_name)?,
+    ])
+    .map_err(|e| format!("build iceberg table ident: {e}"))?;
 
     // For Hadoop/Memory catalogs: ensure namespace exists and register the table
     // by its metadata location so the catalog can resolve it for the commit.
@@ -750,11 +760,6 @@ pub(crate) fn insert_rows(
     if !matches!(entry.kind, IcebergCatalogKind::Rest) {
         let ns = NamespaceIdent::new(normalize_identifier(namespace_name)?);
         let _ = block_on_iceberg(async { catalog.create_namespace(&ns, HashMap::new()).await });
-        let table_ident = TableIdent::from_strs([
-            normalize_identifier(namespace_name)?,
-            normalize_identifier(table_name)?,
-        ])
-        .map_err(|e| format!("build iceberg table ident: {e}"))?;
         let metadata_location = loaded
             .table
             .metadata_location()
@@ -771,9 +776,21 @@ pub(crate) fn insert_rows(
         let data_files = write_record_batches_as_data_files(&loaded.table, [batch])
             .await
             .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
-        let tx = Transaction::new(&loaded.table);
-        let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
-        tx.commit(catalog.as_ref()).await
+        if classify_iceberg_write_mode(&loaded.table) == IcebergWriteMode::RowLineageV3 {
+            commit_v3_insert_rows_with_fast_append(
+                &loaded.table,
+                catalog.as_ref(),
+                &table_ident,
+                data_files,
+            )
+            .await
+            .map_err(|e| iceberg::Error::new(iceberg::ErrorKind::DataInvalid, e))?;
+            Ok(loaded.table.clone())
+        } else {
+            let tx = Transaction::new(&loaded.table);
+            let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
+            tx.commit(catalog.as_ref()).await
+        }
     })
     .map_err(|e| format!("insert iceberg rows runtime failed: {e}"))?
     .map_err(|e| format!("insert iceberg rows failed: {e}"))?;
@@ -781,6 +798,69 @@ pub(crate) fn insert_rows(
     entry.invalidate_table_cache(namespace_name, table_name);
 
     Ok(())
+}
+
+async fn commit_v3_insert_rows_with_fast_append(
+    table: &iceberg::table::Table,
+    catalog: &dyn Catalog,
+    table_ident: &TableIdent,
+    data_files: Vec<DataFile>,
+) -> Result<(), String> {
+    let metadata = table.metadata();
+    let collector = IcebergCommitCollector::new(
+        CommitOpKind::FastAppend,
+        table_ident.clone(),
+        metadata
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id()),
+        metadata.last_sequence_number(),
+        metadata.current_schema().clone(),
+        metadata.default_partition_spec().clone(),
+        format!(
+            "{}/data/_staging/{}",
+            metadata.location(),
+            uuid::Uuid::new_v4()
+        ),
+        UniqueId { hi: 0, lo: 0 },
+    );
+    for data_file in data_files {
+        collector.inject_written_file(data_file_to_written_file(
+            &data_file,
+            metadata.default_partition_spec_id(),
+        )?);
+    }
+    let snapshot_properties = BTreeMap::new();
+    let ctx = CommitCtx {
+        collector: &collector,
+        table,
+        catalog,
+        file_io: table.file_io(),
+        commit_uuid: uuid::Uuid::new_v4(),
+        abort_handle: collector.abort_log.clone(),
+        target_ref: "main",
+        snapshot_properties: &snapshot_properties,
+    };
+    FastAppendCommit.commit(ctx).await.map(|_| ())
+}
+
+fn data_file_to_written_file(df: &DataFile, partition_spec_id: i32) -> Result<WrittenFile, String> {
+    Ok(WrittenFile {
+        path: df.file_path().to_string(),
+        format: df.file_format(),
+        content: df.content_type(),
+        partition_values: df.partition().clone(),
+        partition_spec_id,
+        record_count: df.record_count(),
+        file_size_in_bytes: df.file_size_in_bytes(),
+        split_offsets: df.split_offsets().map(|s| s.to_vec()).unwrap_or_default(),
+        column_sizes: df.column_sizes().clone(),
+        value_counts: df.value_counts().clone(),
+        null_value_counts: df.null_value_counts().clone(),
+        key_metadata: df.key_metadata().map(|s| s.to_vec()),
+        referenced_data_file: df.referenced_data_file().map(|s| s.to_string()),
+        equality_ids: df.equality_ids(),
+        first_row_id: df.first_row_id(),
+    })
 }
 
 fn reject_unsupported_iceberg_table_semantics(loaded: &IcebergLoadedTable) -> Result<(), String> {

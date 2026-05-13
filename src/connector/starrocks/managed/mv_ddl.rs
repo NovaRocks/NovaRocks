@@ -317,6 +317,7 @@ pub(crate) fn create_mv(
                 target_catalog: None,
                 target_namespace: None,
                 target_table: None,
+                target_apply_key: None,
                 created_at_ms,
             },
         )
@@ -1772,6 +1773,7 @@ mod tests {
                     target_catalog: None,
                     target_namespace: None,
                     target_table: None,
+                    target_apply_key: None,
                     created_at_ms: now_ms(),
                 },
             )
@@ -1823,6 +1825,7 @@ mod tests {
                     target_catalog: Some(catalog.to_string()),
                     target_namespace: Some(namespace.to_string()),
                     target_table: Some(table.to_string()),
+                    target_apply_key: None,
                     created_at_ms: now_ms(),
                 },
             )

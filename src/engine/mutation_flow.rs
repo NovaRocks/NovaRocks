@@ -9,7 +9,7 @@ use futures::StreamExt;
 use iceberg::Catalog;
 use iceberg::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, CowUpdateRewriteSet, CowUpdateTouchedFile, IcebergCommitCollector,
     IcebergUpdateMode, RunInput, ensure_no_variant_columns_for_row_level_mutation,
@@ -70,8 +70,7 @@ pub(crate) fn execute_update_statement(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         registry.get(&target.catalog)?
     };
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog = build_iceberg_catalog(&entry)?;
     let table_ident = iceberg::TableIdent::new(
         iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),
@@ -460,8 +459,24 @@ fn execute_cow_update(
     entry: crate::connector::iceberg::catalog::IcebergCatalogEntry,
     target_ref: &str,
 ) -> Result<StatementResult, String> {
+    if matched.row_ids.is_empty() {
+        return Ok(StatementResult::Ok);
+    }
+    let existing_deletes_by_file =
+        crate::engine::delete_flow::load_existing_delete_visibility_by_data_file(
+            &table,
+            entry.object_store_config(),
+        )?;
+    let lineage_by_file = load_data_file_lineage(&table)?;
     let (data_files, rewrite) = block_on_iceberg(async {
-        write_cow_update_files(&table, matched, entry.object_store_config(), target_ref).await
+        write_cow_update_files(
+            &table,
+            matched,
+            existing_deletes_by_file,
+            lineage_by_file,
+            target_ref,
+        )
+        .await
     })??;
 
     if data_files.is_empty() {
@@ -684,14 +699,17 @@ fn required_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRe
 async fn write_cow_update_files(
     table: &iceberg::table::Table,
     matched: &MatchedUpdateBatch,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    existing_deletes_by_file: crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    lineage_by_file: HashMap<String, DataFileLineage>,
     target_ref: &str,
 ) -> Result<(Vec<iceberg::spec::DataFile>, CowUpdateRewriteSet), String> {
     if matched.row_ids.is_empty() {
         return Ok((Vec::new(), empty_cow_rewrite(table, target_ref)?));
     }
     validate_unique_target_row_ids(&matched.row_ids)?;
-    let rewrite_files = build_cow_rewrite_batches(table, matched, object_store_config).await?;
+    let rewrite_files =
+        build_cow_rewrite_batches(table, matched, &existing_deletes_by_file, &lineage_by_file)
+            .await?;
     let mut data_files = Vec::new();
     let mut data_files_by_old_file = Vec::with_capacity(rewrite_files.len());
     for rewrite in &rewrite_files {
@@ -735,7 +753,8 @@ struct CowRewriteAccumulator {
 async fn build_cow_rewrite_batches(
     table: &iceberg::table::Table,
     matched: &MatchedUpdateBatch,
-    object_store_config: Option<&crate::fs::object_store::ObjectStoreConfig>,
+    existing_deletes_by_file: &crate::engine::delete_flow::ExistingDeleteVisibilityByDataFile,
+    lineage_by_file: &HashMap<String, DataFileLineage>,
 ) -> Result<Vec<CowRewriteFile>, String> {
     let touched_files = matched.file_paths.iter().cloned().collect::<HashSet<_>>();
     let updated_by_row_id = matched
@@ -744,13 +763,6 @@ async fn build_cow_rewrite_batches(
         .enumerate()
         .map(|(idx, row_id)| (*row_id, idx))
         .collect::<HashMap<_, _>>();
-    let existing_deletes_by_file =
-        crate::engine::delete_flow::load_existing_delete_visibility_by_data_file(
-            table,
-            object_store_config,
-        )?;
-    let lineage_by_file = load_data_file_lineage(table)?;
-
     let user_schema = Arc::new(
         schema_to_arrow_schema(table.metadata().current_schema())
             .map_err(|e| format!("convert iceberg schema to arrow failed: {e}"))?,
@@ -1221,8 +1233,7 @@ pub(crate) fn execute_merge_statement(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         registry.get(&target.catalog)?
     };
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog = build_iceberg_catalog(&entry)?;
     let table_ident = iceberg::TableIdent::new(
         iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),

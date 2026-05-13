@@ -30,8 +30,10 @@
 //! only the deleted rows.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use arrow::array::Array;
+use arrow::array::{Array, ArrayRef, Int64Array};
+use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
@@ -42,6 +44,7 @@ use crate::connector::iceberg::changes::{ChangeError, PositionDeleteRef};
 /// Constants matching the iceberg position-delete file schema (file_path, pos).
 const FILE_PATH_COLUMN: &str = "file_path";
 const POS_COLUMN: &str = "pos";
+const ROW_ID_COLUMN: &str = "_row_id";
 
 /// Strip the `file://` URL scheme so the path can be passed to a local-FS
 /// opendal operator (which expects bare filesystem paths). Object-store and
@@ -257,6 +260,84 @@ fn positions_to_row_selection(positions: &RoaringTreemap) -> Result<RowSelection
     Ok(RowSelection::from(selectors))
 }
 
+pub(crate) fn append_base_row_id_column(
+    batch: &RecordBatch,
+    first_row_id: i64,
+    positions: &[u64],
+) -> Result<RecordBatch, ChangeError> {
+    if positions.len() != batch.num_rows() {
+        return Err(ChangeError::InternalInconsistency(format!(
+            "delete reverse projection row-id materialization expected {} positions for {} rows",
+            batch.num_rows(),
+            positions.len()
+        )));
+    }
+    let mut row_ids = Vec::with_capacity(positions.len());
+    for position in positions {
+        let position = i64::try_from(*position).map_err(|_| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg row position {position} exceeds i64 while materializing {ROW_ID_COLUMN}"
+            ))
+        })?;
+        row_ids.push(first_row_id.checked_add(position).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg {ROW_ID_COLUMN} overflow: first_row_id={first_row_id}, position={position}"
+            ))
+        })?);
+    }
+
+    if let Some((idx, _)) = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.name().eq_ignore_ascii_case(ROW_ID_COLUMN))
+    {
+        let casted = arrow::compute::cast(batch.column(idx), &arrow::datatypes::DataType::Int64)
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "cast existing {ROW_ID_COLUMN} in delete reverse projection failed: {e}"
+                ))
+            })?;
+        let existing = casted
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "existing {ROW_ID_COLUMN} is not BIGINT after cast"
+                ))
+            })?;
+        for (row, expected) in row_ids.iter().enumerate() {
+            if existing.is_null(row) || existing.value(row) != *expected {
+                let actual = if existing.is_null(row) {
+                    "NULL".to_string()
+                } else {
+                    existing.value(row).to_string()
+                };
+                return Err(ChangeError::InternalInconsistency(format!(
+                    "delete reverse projection found inconsistent {ROW_ID_COLUMN} at row {row}: expected {expected}, got {actual}"
+                )));
+            }
+        }
+        return Ok(batch.clone());
+    }
+
+    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(Field::new(
+        ROW_ID_COLUMN,
+        arrow::datatypes::DataType::Int64,
+        false,
+    )));
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(Int64Array::from(row_ids)) as ArrayRef);
+    RecordBatch::try_new(schema, columns).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "append {ROW_ID_COLUMN} to delete reverse projection batch: {e}"
+        ))
+    })
+}
+
 /// Open a single data file and project the rows at the positions
 /// listed in `positions`. Returns one `RecordBatch` per parquet
 /// `RecordBatch` boundary that contained at least one matching row.
@@ -341,6 +422,93 @@ where
     Ok(out)
 }
 
+fn read_data_file_at_positions_with_base_row_id_and_path_normalizer<N>(
+    data_file_path: &str,
+    data_file_size: Option<u64>,
+    positions: &RoaringTreemap,
+    first_row_id: i64,
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    normalize_path: &N,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    use crate::cache::CachedRangeReader;
+    use crate::formats::parquet::{ParquetCachedReader, ParquetReadCachePolicy};
+
+    if positions.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let normalized_data_file_path = normalize_path(data_file_path)?;
+    let reader = factory
+        .open_with_len(&normalized_data_file_path, data_file_size)
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "open iceberg data file {data_file_path} for delete reverse projection: {e}"
+            ))
+        })?;
+    let reader = ParquetCachedReader::new(
+        CachedRangeReader::new(reader, None),
+        ParquetReadCachePolicy::with_flags(false, false, None),
+    );
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|e| {
+        ChangeError::InternalInconsistency(format!(
+            "read iceberg data file {data_file_path} metadata for delete reverse projection: {e}"
+        ))
+    })?;
+    let row_selection = positions_to_row_selection(positions)?;
+    let reader = builder
+        .with_row_selection(row_selection)
+        .build()
+        .map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "build parquet reader for {data_file_path}: {e}"
+            ))
+        })?;
+
+    let ordered_positions: Vec<u64> = positions.iter().collect();
+    let mut position_offset = 0_usize;
+    let mut out: Vec<RecordBatch> = Vec::new();
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| {
+            ChangeError::InternalInconsistency(format!(
+                "read iceberg data file {data_file_path} batch for delete reverse projection: {e}"
+            ))
+        })?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let end = position_offset
+            .checked_add(batch.num_rows())
+            .ok_or_else(|| {
+                ChangeError::InternalInconsistency(format!(
+                    "delete reverse projection row count overflow for {data_file_path}"
+                ))
+            })?;
+        let batch_positions = ordered_positions.get(position_offset..end).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "delete reverse projection for {data_file_path} returned more rows than selected positions"
+            ))
+        })?;
+        out.push(append_base_row_id_column(
+            &batch,
+            first_row_id,
+            batch_positions,
+        )?);
+        position_offset = end;
+    }
+    if position_offset != ordered_positions.len() {
+        return Err(ChangeError::InternalInconsistency(format!(
+            "delete reverse projection for {data_file_path} returned {} rows for {} selected positions",
+            position_offset,
+            ordered_positions.len()
+        )));
+    }
+
+    Ok(out)
+}
+
 /// v3 deletion-vector counterpart of `read_delete_positions_per_data_file`.
 /// Reads each Puffin `deletion-vector-v1` blob and folds its positions into
 /// the per-data-file `RoaringTreemap`.
@@ -386,6 +554,16 @@ pub(crate) async fn read_dv_positions_per_data_file(
     Ok(out)
 }
 
+fn block_on_dv_read<F>(future: F) -> Result<F::Output, String>
+where
+    F: std::future::Future,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Ok(tokio::task::block_in_place(|| handle.block_on(future)));
+    }
+    crate::connector::iceberg::catalog::registry::block_on_iceberg(future)
+}
+
 /// Top-level: take a slice of `PositionDeleteRef`s (mixed v2 Parquet and
 /// v3 Puffin DV) and produce `Vec<RecordBatch>` containing the original
 /// deleted base rows.
@@ -402,13 +580,8 @@ pub(crate) async fn read_dv_positions_per_data_file(
 ///
 /// This function is synchronous but bridges to an async helper
 /// (`read_dv_positions_per_data_file`) on the Puffin path via
-/// `block_on_iceberg`. Callers must invoke it from a blocking thread, never
-/// directly from a tokio worker — `block_on_iceberg` would panic on a
-/// running async runtime. Production callers (the IVM refresh path via
-/// `materialize_changes`) are always synchronous; `#[tokio::test]` callers
-/// must use `tokio::task::spawn_blocking` (see the test
-/// `scan_deletes_merges_v2_parquet_and_v3_puffin_against_same_data_file`
-/// for the pattern).
+/// `block_on_dv_read`, so it can be called both outside Tokio and from a
+/// blocking section within a running Tokio runtime.
 #[cfg(test)]
 pub(crate) fn scan_deletes<F>(
     delete_files: &[PositionDeleteRef],
@@ -439,7 +612,6 @@ where
     F: Fn(&str) -> Option<u64>,
     N: Fn(&str) -> Result<String, ChangeError>,
 {
-    use crate::connector::iceberg::catalog::registry::block_on_iceberg;
     use iceberg::spec::DataFileFormat;
 
     if delete_files.is_empty() {
@@ -457,10 +629,10 @@ where
         &normalize_path,
     )?;
     if !puffin_dels.is_empty() {
-        let dv_positions = block_on_iceberg(read_dv_positions_per_data_file(&puffin_dels, file_io))
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, file_io))
             .map_err(|e| {
                 ChangeError::InternalInconsistency(format!(
-                    "scan_deletes: block_on_iceberg for Puffin DV: {e}"
+                    "scan_deletes: block_on_dv_read for Puffin DV: {e}"
                 ))
             })??;
         for (path, treemap) in dv_positions {
@@ -489,6 +661,95 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn scan_deletes_with_base_row_id_lookup<F, R>(
+    delete_files: &[PositionDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    file_io: &iceberg::io::FileIO,
+    data_file_size_lookup: F,
+    first_row_id_lookup: R,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    F: Fn(&str) -> Option<u64>,
+    R: Fn(&str) -> Option<i64>,
+{
+    scan_deletes_with_base_row_id_lookup_and_path_normalizer(
+        delete_files,
+        factory,
+        file_io,
+        data_file_size_lookup,
+        first_row_id_lookup,
+        normalize_local_fs_path_owned,
+    )
+}
+
+pub(crate) fn scan_deletes_with_base_row_id_lookup_and_path_normalizer<F, R, N>(
+    delete_files: &[PositionDeleteRef],
+    factory: &crate::fs::opendal::OpendalRangeReaderFactory,
+    file_io: &iceberg::io::FileIO,
+    data_file_size_lookup: F,
+    first_row_id_lookup: R,
+    normalize_path: N,
+) -> Result<Vec<RecordBatch>, ChangeError>
+where
+    F: Fn(&str) -> Option<u64>,
+    R: Fn(&str) -> Option<i64>,
+    N: Fn(&str) -> Result<String, ChangeError>,
+{
+    use iceberg::spec::DataFileFormat;
+
+    if delete_files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let (parquet_dels, puffin_dels): (Vec<_>, Vec<_>) = delete_files
+        .iter()
+        .cloned()
+        .partition(|r| r.file_format == DataFileFormat::Parquet);
+
+    let mut positions_per_file = read_delete_positions_per_data_file_with_path_normalizer(
+        &parquet_dels,
+        factory,
+        &normalize_path,
+    )?;
+    if !puffin_dels.is_empty() {
+        let dv_positions = block_on_dv_read(read_dv_positions_per_data_file(&puffin_dels, file_io))
+            .map_err(|e| {
+                ChangeError::InternalInconsistency(format!(
+                    "scan_deletes: block_on_dv_read for Puffin DV: {e}"
+                ))
+            })??;
+        for (path, treemap) in dv_positions {
+            *positions_per_file.entry(path).or_default() |= treemap;
+        }
+    }
+
+    let mut out: Vec<RecordBatch> = Vec::new();
+    // Sort keys for deterministic output ordering — useful for tests
+    // and downstream equality assertions.
+    let mut data_file_paths: Vec<&String> = positions_per_file.keys().collect();
+    data_file_paths.sort();
+    for data_file_path in data_file_paths {
+        let positions = &positions_per_file[data_file_path];
+        let size = data_file_size_lookup(data_file_path);
+        let first_row_id = first_row_id_lookup(data_file_path).ok_or_else(|| {
+            ChangeError::InternalInconsistency(format!(
+                "iceberg delete reverse projection missing first_row_id for data file {data_file_path}"
+            ))
+        })?;
+        let batches = read_data_file_at_positions_with_base_row_id_and_path_normalizer(
+            data_file_path,
+            size,
+            positions,
+            first_row_id,
+            factory,
+            &normalize_path,
+        )?;
+        out.extend(batches);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::sync::Arc;
@@ -503,7 +764,7 @@ mod tests {
     use super::{
         FILE_PATH_COLUMN, POS_COLUMN, positions_to_row_selection, read_data_file_at_positions,
         read_delete_positions_per_data_file, read_dv_positions_per_data_file, scan_deletes,
-        scan_deletes_with_path_normalizer,
+        scan_deletes_with_base_row_id_lookup, scan_deletes_with_path_normalizer,
     };
     use crate::connector::iceberg::changes::PositionDeleteRef;
     use crate::connector::iceberg::commit::{DeletionVector, write_single_deletion_vector_puffin};
@@ -699,6 +960,46 @@ mod tests {
         .expect("ok");
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn position_delete_reverse_projection_appends_base_row_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_path = dir.path().join("data.parquet");
+        write_data_parquet(
+            &data_path,
+            &[10, 20, 30, 40, 50],
+            &["a", "b", "c", "d", "e"],
+        );
+        let delete_path = dir.path().join("deletes.parquet");
+        let data_uri = "data.parquet";
+        write_delete_parquet(&delete_path, &[data_uri, data_uri], &[2, 4]);
+        let refs = vec![PositionDeleteRef {
+            delete_file_path: "deletes.parquet".to_string(),
+            delete_file_size: 0,
+            record_count: Some(2),
+            referenced_data_file: Some(data_uri.to_string()),
+            file_format: iceberg::spec::DataFileFormat::Parquet,
+            content_offset: None,
+            content_size_in_bytes: None,
+        }];
+
+        let batches = scan_deletes_with_base_row_id_lookup(
+            &refs,
+            &factory_for_dir(dir.path()),
+            &make_local_file_io(),
+            |_| None,
+            |path| (path == data_uri).then_some(100),
+        )
+        .expect("scan with row ids");
+
+        let batch = batches.first().expect("deleted row batch");
+        let row_id = batch
+            .column(batch.schema().index_of("_row_id").expect("_row_id column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("_row_id int64");
+        assert_eq!(row_id.values(), &[102, 104]);
     }
 
     #[test]

@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use iceberg::Catalog;
 use iceberg::spec::{FormatVersion, PrimitiveType, Type};
 
-use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_hadoop_catalog};
+use crate::connector::iceberg::catalog::registry::{block_on_iceberg, build_iceberg_catalog};
 use crate::connector::iceberg::commit::{
     CommitOpKind, EqualityDeleteColumn, IcebergCommitCollector, RunInput,
     ensure_equality_delete_single_partition_spec, ensure_no_variant_columns_for_row_level_mutation,
@@ -61,8 +61,7 @@ pub(crate) fn execute_add_equality_delete_statement(
             .map_err(|e| format!("iceberg catalog registry read lock: {e}"))?;
         registry.get(&target.catalog)?
     };
-    let hadoop_catalog = build_hadoop_catalog(&entry)?;
-    let catalog: Arc<dyn Catalog> = Arc::new(hadoop_catalog);
+    let catalog: Arc<dyn Catalog> = build_iceberg_catalog(&entry)?;
     let table_ident = iceberg::TableIdent::new(
         iceberg::NamespaceIdent::new(target.namespace.clone()),
         target.table.clone(),

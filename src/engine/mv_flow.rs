@@ -328,6 +328,55 @@ pub(crate) fn write_mv_delete_temp_parquet(
     Ok((format!("file://{}", path.display()), total_size, total_rows))
 }
 
+pub(crate) fn delete_temp_table_def_from_batch_schema(
+    table_name: &str,
+    schema: arrow::datatypes::SchemaRef,
+    path: String,
+    total_size: i64,
+    total_rows: Option<i64>,
+) -> Result<crate::sql::catalog::TableDef, String> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| crate::sql::catalog::ColumnDef {
+            name: field.name().clone(),
+            data_type: field.data_type().clone(),
+            nullable: field.is_nullable(),
+            write_default: None,
+        })
+        .collect::<Vec<_>>();
+    if !columns.iter().any(|col| col.name == "_row_id") {
+        return Err(
+            "delete-side MV temp table requires a real _row_id column in the deleted-row batch"
+                .to_string(),
+        );
+    }
+
+    Ok(crate::sql::catalog::TableDef {
+        name: table_name.to_string(),
+        columns,
+        iceberg_row_lineage_metadata_columns: vec![],
+        iceberg_table: None,
+        storage: crate::sql::catalog::TableStorage::S3ParquetFiles {
+            files: vec![crate::sql::catalog::S3FileInfo {
+                path,
+                size: total_size,
+                row_count: total_rows,
+                column_stats: None,
+                partition_spec_id: None,
+                partition_key: None,
+                first_row_id: None,
+                data_sequence_number: None,
+                ivm_change_op: None,
+                delete_files: vec![],
+                manifest_path: None,
+                partition_values: vec![],
+            }],
+            cloud_properties: Default::default(),
+        },
+    })
+}
+
 /// Run the MV's SELECT statement against a one-shot in-memory catalog
 /// where the base table's storage is a single temp parquet file
 /// containing the supplied deleted rows. Mirrors the insert-side
@@ -352,26 +401,17 @@ pub(crate) fn execute_query_for_mv_incremental_deletes(
     let sqlparser::ast::Statement::Query(query) = statement else {
         return Err("REFRESH MATERIALIZED VIEW stored SQL must be a SELECT query".to_string());
     };
-    let (catalog_name, namespace, table_name) = validate_incremental_mv_base_ref(&query, base_ref)?;
+    let (_catalog_name, namespace, table_name) =
+        validate_incremental_mv_base_ref(&query, base_ref)?;
 
     let (path, total_size, total_rows) =
         write_mv_delete_temp_parquet(&namespace, &table_name, &deleted_rows)?;
-
-    // Build a TableDef whose storage is the temp parquet file. Reuse
-    // build_iceberg_table_def_with_files's column-shape logic by giving
-    // it a one-element file list.
-    let delete_files = vec![
-        crate::engine::query_prep::delete_temp_iceberg_file_for_query(
-            path, total_size, total_rows, None,
-        ),
-    ];
-
-    let table_def = crate::engine::query_prep::build_iceberg_table_def_with_files(
-        state,
-        &catalog_name,
-        &namespace,
+    let table_def = delete_temp_table_def_from_batch_schema(
         &table_name,
-        delete_files,
+        deleted_rows[0].schema(),
+        path,
+        total_size,
+        total_rows,
     )?;
     let mut incremental_catalog = InMemoryCatalog::default();
     incremental_catalog.create_database(&namespace)?;
@@ -395,7 +435,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -499,6 +539,36 @@ mod tests {
                 .map(String::as_str),
             Some("7")
         );
+    }
+
+    #[test]
+    fn mv_delete_temp_table_exposes_row_id_as_internal_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("_row_id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100, 101])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+
+        let table_def = super::delete_temp_table_def_from_batch_schema(
+            "t",
+            batch.schema(),
+            "file:///tmp/delete.parquet".to_string(),
+            128,
+            Some(2),
+        )
+        .expect("table def");
+
+        assert!(table_def.columns.iter().any(|col| {
+            col.name == "_row_id" && col.data_type == DataType::Int64 && !col.nullable
+        }));
+        assert!(table_def.iceberg_row_lineage_metadata_columns.is_empty());
     }
 
     /// Regression: the returned `total_size` must equal the on-disk parquet

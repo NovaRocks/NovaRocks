@@ -22,6 +22,19 @@ const MV_REFRESH_SCHEMA_VERSION: i32 = 1;
 pub struct MvMetaRepository;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvTargetApplyKey {
+    pub column_name: String,
+    pub field_id: i32,
+    pub source: MvTargetApplyKeySource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MvTargetApplyKeySource {
+    BaseRowId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMvDefinition {
     pub mv_id: i64,
     pub select_sql: String,
@@ -31,6 +44,8 @@ pub struct StoredMvDefinition {
     pub target_catalog: Option<String>,
     pub target_namespace: Option<String>,
     pub target_table: Option<String>,
+    #[serde(default)]
+    pub target_apply_key: Option<MvTargetApplyKey>,
     pub last_refresh_ms: Option<i64>,
     pub last_refresh_rows: Option<i64>,
     pub last_refresh_snapshots: BTreeMap<String, i64>,
@@ -58,6 +73,7 @@ pub struct CreateMvDefinitionRequest {
     pub target_catalog: Option<String>,
     pub target_namespace: Option<String>,
     pub target_table: Option<String>,
+    pub target_apply_key: Option<MvTargetApplyKey>,
     pub created_at_ms: i64,
 }
 
@@ -238,6 +254,7 @@ impl MvMetaRepository {
             target_catalog: req.target_catalog,
             target_namespace: req.target_namespace,
             target_table: req.target_table,
+            target_apply_key: req.target_apply_key,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: BTreeMap::new(),
@@ -986,4 +1003,66 @@ fn key_refresh(refresh_id: i64) -> RepositoryResult<MetaKey> {
         NS_MV,
         ["refresh".to_string(), refresh_id.to_string()],
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_mv_definition(target_apply_key: Option<MvTargetApplyKey>) -> StoredMvDefinition {
+        StoredMvDefinition {
+            mv_id: 42,
+            select_sql: "SELECT id FROM ice.ns.orders".to_string(),
+            base_table_refs: vec!["ice.ns.orders".to_string()],
+            primary_key_columns: Vec::new(),
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("ice".to_string()),
+            target_namespace: Some("mv".to_string()),
+            target_table: Some("orders_mv".to_string()),
+            target_apply_key,
+            last_refresh_ms: None,
+            last_refresh_rows: None,
+            last_refresh_snapshots: BTreeMap::new(),
+            last_refresh_table_uuids: BTreeMap::new(),
+            last_refreshed_iceberg_snapshot_id: None,
+            refresh_in_progress: false,
+            active_refresh_id: None,
+            refresh_target_snapshots: BTreeMap::new(),
+            created_at_ms: 1234,
+        }
+    }
+
+    #[test]
+    fn mv_target_apply_key_metadata_round_trips() {
+        let apply_key = MvTargetApplyKey {
+            column_name: "__nova_base_row_id".to_string(),
+            field_id: 1001,
+            source: MvTargetApplyKeySource::BaseRowId,
+        };
+        let definition = stored_mv_definition(Some(apply_key.clone()));
+
+        let json = serde_json::to_string(&definition).expect("serialize mv definition");
+        assert!(
+            json.contains("\"source\":\"BASE_ROW_ID\""),
+            "apply-key source must use the persisted SCREAMING_SNAKE_CASE contract: {json}"
+        );
+        let decoded: StoredMvDefinition =
+            serde_json::from_str(&json).expect("deserialize mv definition");
+
+        assert_eq!(decoded.target_apply_key, Some(apply_key));
+    }
+
+    #[test]
+    fn mv_target_apply_key_defaults_to_none_for_old_records() {
+        let mut json =
+            serde_json::to_value(stored_mv_definition(None)).expect("serialize mv definition");
+        json.as_object_mut()
+            .expect("definition object")
+            .remove("target_apply_key");
+
+        let decoded: StoredMvDefinition =
+            serde_json::from_value(json).expect("deserialize old mv definition");
+
+        assert_eq!(decoded.target_apply_key, None);
+    }
 }

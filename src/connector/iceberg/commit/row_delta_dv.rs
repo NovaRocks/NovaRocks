@@ -58,9 +58,10 @@ use iceberg::{TableRequirement, TableUpdate};
 use uuid::Uuid;
 
 use super::abort::AbortLog;
-use super::action::{CommitCtx, IcebergCommitAction};
+use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
-    current_snapshot_total_records, generate_snapshot_id, metadata_dir, now_ms, write_manifest_list,
+    current_snapshot_total_records, effective_next_row_id, generate_snapshot_id, metadata_dir,
+    now_ms, write_manifest_list,
 };
 use super::position_delete_writer::PositionDeleteGroup;
 use super::puffin_dv::{
@@ -105,10 +106,11 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             file_io: ctx.file_io.clone(),
             schema: ctx.table.metadata().current_schema().clone(),
             schema_id: ctx.table.metadata().current_schema_id(),
-            row_lineage_first_row_id: ctx.table.metadata().next_row_id(),
+            row_lineage_first_row_id: effective_next_row_id(ctx.table.metadata())?,
             abort_handle: ctx.abort_handle.clone(),
             manifest_paths_out: manifest_paths_out.clone(),
             target_ref: ctx.target_ref.to_string(),
+            snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
         let tx = Transaction::new(ctx.table);
@@ -153,6 +155,7 @@ struct RowDeltaDvTxnAction {
     abort_handle: Arc<AbortLog>,
     manifest_paths_out: Arc<Mutex<Vec<String>>>,
     target_ref: String,
+    snapshot_properties: BTreeMap<String, String>,
 }
 
 #[async_trait]
@@ -349,19 +352,30 @@ impl TransactionAction for RowDeltaDvTxnAction {
                     index.replaced_delete_records
                 ))
             })?;
+        let added_data_records = self.written.iter().try_fold(0u64, |sum, file| {
+            sum.checked_add(file.record_count).ok_or_else(|| {
+                to_iceberg_unexpected("DV added data record count overflow".to_string())
+            })
+        })?;
         let total_records = dv_total_records(
             current_snapshot_total_records(m).map_err(to_iceberg_unexpected)?,
             newly_deleted_records,
+            added_data_records,
         )
         .map_err(to_iceberg_unexpected)?;
 
-        let summary_props = dv_summary(
-            &written_dvs,
-            total_records,
-            newly_deleted_records,
-            index.replaced_delete_files,
-            index.replaced_delete_records,
-        );
+        let summary_props = merge_snapshot_summary_properties(
+            dv_summary(
+                &written_dvs,
+                &self.written,
+                total_records,
+                newly_deleted_records,
+                index.replaced_delete_files,
+                index.replaced_delete_records,
+            ),
+            &self.snapshot_properties,
+        )
+        .map_err(to_iceberg_unexpected)?;
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
             .with_parent_snapshot_id(parent_snapshot_id)
@@ -769,20 +783,30 @@ fn dv_data_file(written: &WrittenPuffinDv, referenced: &LiveFile) -> Result<Data
 fn dv_total_records(
     parent_total_records: Option<u64>,
     newly_deleted_records: u64,
+    added_data_records: u64,
 ) -> Result<Option<u64>, String> {
     parent_total_records
         .map(|parent| {
-            parent.checked_sub(newly_deleted_records).ok_or_else(|| {
-                format!(
-                    "DV delete total-records underflow: parent={parent}, deleted={newly_deleted_records}"
-                )
-            })
+            parent
+                .checked_sub(newly_deleted_records)
+                .ok_or_else(|| {
+                    format!(
+                        "DV delete total-records underflow: parent={parent}, deleted={newly_deleted_records}"
+                    )
+                })?
+                .checked_add(added_data_records)
+                .ok_or_else(|| {
+                    format!(
+                        "DV delete total-records overflow: parent={parent}, deleted={newly_deleted_records}, added={added_data_records}"
+                    )
+                })
         })
         .transpose()
 }
 
 fn dv_summary(
     dvs: &[WrittenPuffinDv],
+    written_data_files: &[WrittenFile],
     total_records: Option<u64>,
     newly_deleted_records: u64,
     removed_delete_files: usize,
@@ -790,12 +814,24 @@ fn dv_summary(
 ) -> HashMap<String, String> {
     let mut p = HashMap::new();
     let added_position_deletes: u64 = dvs.iter().map(|d| d.cardinality).sum();
-    let total_size: u64 = dvs.iter().map(|d| d.file_size_in_bytes).sum();
+    let added_data_records: u64 = written_data_files.iter().map(|f| f.record_count).sum();
+    let total_size: u64 = dvs
+        .iter()
+        .map(|d| d.file_size_in_bytes)
+        .chain(written_data_files.iter().map(|f| f.file_size_in_bytes))
+        .sum();
     p.insert("added-delete-files".to_string(), dvs.len().to_string());
     p.insert(
         "added-position-deletes".to_string(),
         added_position_deletes.to_string(),
     );
+    if !written_data_files.is_empty() {
+        p.insert(
+            "added-data-files".to_string(),
+            written_data_files.len().to_string(),
+        );
+        p.insert("added-records".to_string(), added_data_records.to_string());
+    }
     if newly_deleted_records > 0 {
         p.insert(
             "deleted-records".to_string(),
@@ -936,8 +972,8 @@ mod tests {
             "file:///x/data.parquet",
             4,
         )];
-        let total_records = dv_total_records(Some(10), 4).unwrap();
-        let summary = dv_summary(&dvs, total_records, 4, 0, 0);
+        let total_records = dv_total_records(Some(10), 4, 0).unwrap();
+        let summary = dv_summary(&dvs, &[], total_records, 4, 0, 0);
 
         assert_eq!(summary["added-position-deletes"], "4");
         assert_eq!(summary["deleted-records"], "4");
@@ -951,14 +987,31 @@ mod tests {
             "file:///x/data.parquet",
             5,
         )];
-        let total_records = dv_total_records(Some(10), 2).unwrap();
-        let summary = dv_summary(&dvs, total_records, 2, 1, 3);
+        let total_records = dv_total_records(Some(10), 2, 0).unwrap();
+        let summary = dv_summary(&dvs, &[], total_records, 2, 1, 3);
 
         assert_eq!(summary["added-position-deletes"], "5");
         assert_eq!(summary["deleted-records"], "2");
         assert_eq!(summary["removed-delete-files"], "1");
         assert_eq!(summary["removed-position-deletes"], "3");
         assert_eq!(summary["total-records"], "8");
+    }
+
+    #[test]
+    fn dv_summary_adds_written_data_records_to_total_records() {
+        let dvs = vec![test_written_dv_with_cardinality(
+            "file:///x/dv-new.puffin",
+            "file:///x/data.parquet",
+            1,
+        )];
+        let written = vec![test_written_data_file("file:///x/new.parquet", 2)];
+        let total_records = dv_total_records(Some(10), 1, 2).unwrap();
+        let summary = dv_summary(&dvs, &written, total_records, 1, 0, 0);
+
+        assert_eq!(summary["deleted-records"], "1");
+        assert_eq!(summary["added-data-files"], "1");
+        assert_eq!(summary["added-records"], "2");
+        assert_eq!(summary["total-records"], "11");
     }
 
     fn test_live_file(partition_spec_id: i32) -> LiveFile {
@@ -997,6 +1050,26 @@ mod tests {
             content_offset: 4,
             content_size_in_bytes: 8,
             file_size_in_bytes: 12,
+        }
+    }
+
+    fn test_written_data_file(path: &str, record_count: u64) -> WrittenFile {
+        WrittenFile {
+            path: path.to_string(),
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: iceberg::spec::Struct::empty(),
+            partition_spec_id: 0,
+            record_count,
+            file_size_in_bytes: 20,
+            split_offsets: vec![],
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: Some(0),
         }
     }
 }

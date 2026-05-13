@@ -679,7 +679,6 @@ fn stamp_delta_table_def_change_ops(
         ));
     }
 
-    table_def.iceberg_row_lineage_metadata_columns.clear();
     let field = crate::exec::change_op::change_op_field();
     table_def
         .iceberg_row_lineage_metadata_columns
@@ -794,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_table_builder_suppresses_inherited_row_lineage_metadata() {
+    fn delta_table_builder_preserves_row_lineage_metadata_and_adds_change_op() {
         let mut table_def = TableDef {
             name: "t".to_string(),
             columns: vec![],
@@ -852,7 +851,17 @@ mod tests {
                 .iter()
                 .map(|col| (col.name.as_str(), &col.data_type, col.nullable))
                 .collect::<Vec<_>>(),
-            vec![("__change_op", &arrow::datatypes::DataType::Int8, false)]
+            vec![
+                ("_file", &arrow::datatypes::DataType::Utf8, false),
+                ("_pos", &arrow::datatypes::DataType::Int64, false),
+                ("_row_id", &arrow::datatypes::DataType::Int64, false),
+                (
+                    "_last_updated_sequence_number",
+                    &arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+                ("__change_op", &arrow::datatypes::DataType::Int8, false),
+            ]
         );
         let TableStorage::S3ParquetFiles { files, .. } = &table_def.storage else {
             panic!("expected s3 parquet storage");

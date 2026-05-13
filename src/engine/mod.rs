@@ -4942,7 +4942,8 @@ enable_path_style_access = true
             assert!(matches!(
                 session
                     .execute_in_database(
-                        "create table ice.sales.orders (id int, name string)",
+                        "create table ice.sales.orders (id int, name string) \
+                         tblproperties(\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
                         "default",
                     )
                     .expect("create base table"),
