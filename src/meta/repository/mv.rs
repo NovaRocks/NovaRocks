@@ -67,11 +67,46 @@ pub struct MvTargetLookup {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshExternalOutcome {
+    pub target_snapshot_id: Option<i64>,
+    pub commit_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshCommitMarker {
+    pub refresh_id: i64,
+    pub mv_id: i64,
+    pub token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMvRefresh {
     pub refresh_id: i64,
     pub mv_id: i64,
     pub state: MvRefreshState,
+    #[serde(default)]
+    pub target_catalog: Option<String>,
+    #[serde(default)]
+    pub target_namespace: Option<String>,
+    #[serde(default)]
+    pub target_table: Option<String>,
+    #[serde(default)]
+    pub staging_branch: Option<String>,
+    #[serde(default)]
+    pub expected_main_snapshot_id: Option<i64>,
+    #[serde(default)]
+    pub staging_snapshot_id: Option<i64>,
+    #[serde(default)]
+    pub published_snapshot_id: Option<i64>,
+    #[serde(default)]
     pub target_snapshots: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub base_table_uuids: BTreeMap<String, String>,
+    #[serde(default)]
+    pub rows: Option<i64>,
+    #[serde(default)]
+    pub marker: Option<RefreshCommitMarker>,
+    #[serde(default)]
     pub external_outcome: Option<RefreshExternalOutcome>,
 }
 
@@ -79,7 +114,9 @@ pub struct StoredMvRefresh {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MvRefreshState {
     IntentCreated,
-    ExternalCommitted,
+    StagingCommitted,
+    #[serde(alias = "EXTERNAL_COMMITTED")]
+    PublishCommitted,
     Finalized,
     AbortRequested,
     Aborted,
@@ -90,7 +127,8 @@ impl MvRefreshState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::IntentCreated => "INTENT_CREATED",
-            Self::ExternalCommitted => "EXTERNAL_COMMITTED",
+            Self::StagingCommitted => "STAGING_COMMITTED",
+            Self::PublishCommitted => "PUBLISH_COMMITTED",
             Self::Finalized => "FINALIZED",
             Self::AbortRequested => "ABORT_REQUESTED",
             Self::Aborted => "ABORTED",
@@ -99,10 +137,30 @@ impl MvRefreshState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RefreshExternalOutcome {
-    pub target_snapshot_id: Option<i64>,
-    pub commit_id: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BeginIcebergMvRefreshRequest {
+    pub mv_id: i64,
+    pub target_catalog: String,
+    pub target_namespace: String,
+    pub target_table: String,
+    pub staging_branch: String,
+    pub expected_main_snapshot_id: Option<i64>,
+    pub base_snapshots: BTreeMap<String, i64>,
+    pub marker_token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordStagingCommitRequest {
+    pub refresh_id: i64,
+    pub staging_snapshot_id: i64,
+    pub rows: i64,
+    pub base_table_uuids: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordPublishCommitRequest {
+    pub refresh_id: i64,
+    pub published_snapshot_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -382,11 +440,178 @@ impl MvMetaRepository {
             refresh_id,
             mv_id,
             state: MvRefreshState::IntentCreated,
+            target_catalog: None,
+            target_namespace: None,
+            target_table: None,
+            staging_branch: None,
+            expected_main_snapshot_id: None,
+            staging_snapshot_id: None,
+            published_snapshot_id: None,
             target_snapshots,
+            base_table_uuids: BTreeMap::new(),
+            rows: None,
+            marker: None,
             external_outcome: None,
         };
         put_refresh(txn, &refresh, ExpectedRevision::NotExists)?;
         Ok(refresh)
+    }
+
+    pub fn begin_iceberg_refresh_intent(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: BeginIcebergMvRefreshRequest,
+    ) -> RepositoryResult<StoredMvRefresh> {
+        let mut definition = self.load_versioned_by_id(txn, req.mv_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv definition {} not found", req.mv_id))
+        })?;
+        if definition.value.refresh_in_progress || definition.value.active_refresh_id.is_some() {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {} already has refresh in progress",
+                req.mv_id
+            )));
+        }
+
+        let refresh_id = txn.allocate_id(id_scopes::refresh_id())?;
+        let marker = RefreshCommitMarker {
+            refresh_id,
+            mv_id: req.mv_id,
+            token: req.marker_token,
+        };
+        definition.value.refresh_in_progress = true;
+        definition.value.active_refresh_id = Some(refresh_id);
+        definition.value.refresh_target_snapshots = req.base_snapshots.clone();
+        put_definition(
+            txn,
+            &definition,
+            ExpectedRevision::Exact(definition.record_revision.clone()),
+        )?;
+
+        let refresh = StoredMvRefresh {
+            refresh_id,
+            mv_id: req.mv_id,
+            state: MvRefreshState::IntentCreated,
+            target_catalog: Some(req.target_catalog),
+            target_namespace: Some(req.target_namespace),
+            target_table: Some(req.target_table),
+            staging_branch: Some(req.staging_branch),
+            expected_main_snapshot_id: req.expected_main_snapshot_id,
+            staging_snapshot_id: None,
+            published_snapshot_id: None,
+            target_snapshots: req.base_snapshots,
+            base_table_uuids: BTreeMap::new(),
+            rows: None,
+            marker: Some(marker),
+            external_outcome: None,
+        };
+        put_refresh(txn, &refresh, ExpectedRevision::NotExists)?;
+        Ok(refresh)
+    }
+
+    pub fn record_staging_commit(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: RecordStagingCommitRequest,
+    ) -> RepositoryResult<()> {
+        let mut refresh = load_versioned_refresh(txn, req.refresh_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv refresh {} not found", req.refresh_id))
+        })?;
+        if refresh.value.state == MvRefreshState::StagingCommitted {
+            if refresh.value.staging_snapshot_id == Some(req.staging_snapshot_id)
+                && refresh.value.rows == Some(req.rows)
+                && refresh.value.base_table_uuids == req.base_table_uuids
+            {
+                return Ok(());
+            }
+            return Err(RepositoryError::conflict(format!(
+                "mv refresh {} staging commit differs from recorded value",
+                req.refresh_id
+            )));
+        }
+        if refresh.value.state != MvRefreshState::IntentCreated {
+            return Err(RepositoryError::conflict(format!(
+                "mv refresh {} is {}, expected {}",
+                req.refresh_id,
+                refresh.value.state.as_str(),
+                MvRefreshState::IntentCreated.as_str()
+            )));
+        }
+        refresh.value.state = MvRefreshState::StagingCommitted;
+        refresh.value.staging_snapshot_id = Some(req.staging_snapshot_id);
+        refresh.value.rows = Some(req.rows);
+        refresh.value.base_table_uuids = req.base_table_uuids;
+        put_refresh(
+            txn,
+            &refresh.value,
+            ExpectedRevision::Exact(refresh.record_revision),
+        )
+    }
+
+    pub fn record_publish_commit(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        req: RecordPublishCommitRequest,
+    ) -> RepositoryResult<()> {
+        let mut refresh = load_versioned_refresh(txn, req.refresh_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv refresh {} not found", req.refresh_id))
+        })?;
+        if refresh.value.state == MvRefreshState::PublishCommitted {
+            let outcome_snapshot_id = refresh
+                .value
+                .external_outcome
+                .as_ref()
+                .and_then(|outcome| outcome.target_snapshot_id);
+            if refresh.value.published_snapshot_id == Some(req.published_snapshot_id)
+                && outcome_snapshot_id == Some(req.published_snapshot_id)
+            {
+                return Ok(());
+            }
+            return Err(RepositoryError::conflict(format!(
+                "mv refresh {} publish commit differs from recorded value",
+                req.refresh_id
+            )));
+        }
+        if refresh.value.state != MvRefreshState::StagingCommitted {
+            return Err(RepositoryError::conflict(format!(
+                "mv refresh {} is {}, expected {}",
+                req.refresh_id,
+                refresh.value.state.as_str(),
+                MvRefreshState::StagingCommitted.as_str()
+            )));
+        }
+        refresh.value.state = MvRefreshState::PublishCommitted;
+        refresh.value.published_snapshot_id = Some(req.published_snapshot_id);
+        refresh.value.external_outcome = Some(RefreshExternalOutcome {
+            target_snapshot_id: Some(req.published_snapshot_id),
+            commit_id: format!("iceberg-snapshot-{}", req.published_snapshot_id),
+        });
+        put_refresh(
+            txn,
+            &refresh.value,
+            ExpectedRevision::Exact(refresh.record_revision),
+        )
+    }
+
+    pub fn mark_refresh_commit_unknown(
+        &self,
+        txn: &mut dyn MetaWriteTxn,
+        refresh_id: i64,
+    ) -> RepositoryResult<()> {
+        let mut refresh = load_versioned_refresh(txn, refresh_id)?.ok_or_else(|| {
+            RepositoryError::not_found(format!("mv refresh {refresh_id} not found"))
+        })?;
+        if matches!(
+            refresh.value.state,
+            MvRefreshState::Finalized | MvRefreshState::Aborted
+        ) {
+            return Ok(());
+        }
+        refresh.value.state = MvRefreshState::CommitUnknown;
+        put_refresh(
+            txn,
+            &refresh.value,
+            ExpectedRevision::Exact(refresh.record_revision),
+        )
     }
 
     pub fn load_refresh(
@@ -413,7 +638,8 @@ impl MvMetaRepository {
                 MvRefreshState::IntentCreated.as_str()
             )));
         }
-        refresh.value.state = MvRefreshState::ExternalCommitted;
+        refresh.value.state = MvRefreshState::PublishCommitted;
+        refresh.value.published_snapshot_id = outcome.target_snapshot_id;
         refresh.value.external_outcome = Some(outcome);
         put_refresh(
             txn,
@@ -433,12 +659,19 @@ impl MvMetaRepository {
         if refresh.value.state == MvRefreshState::Finalized {
             return Ok(());
         }
-        if refresh.value.state != MvRefreshState::ExternalCommitted {
+        if refresh.value.state != MvRefreshState::PublishCommitted {
             return Err(RepositoryError::conflict(format!(
                 "mv refresh {} is {}, expected {}",
                 req.refresh_id,
                 refresh.value.state.as_str(),
-                MvRefreshState::ExternalCommitted.as_str()
+                MvRefreshState::PublishCommitted.as_str()
+            )));
+        }
+        let persisted_target_snapshot_id = persisted_publish_target_snapshot(&refresh.value);
+        if persisted_target_snapshot_id != req.target_snapshot_id {
+            return Err(RepositoryError::conflict(format!(
+                "mv refresh {} target snapshot is {:?}, expected published snapshot {:?}",
+                req.refresh_id, req.target_snapshot_id, persisted_target_snapshot_id
             )));
         }
 
@@ -486,6 +719,15 @@ impl MvMetaRepository {
         let Some(mut definition) = self.load_versioned_by_id(txn, req.mv_id)? else {
             return Ok(false);
         };
+        if let Some(refresh_id) = definition.value.active_refresh_id
+            && let Some(refresh) = load_versioned_refresh(txn, refresh_id)?
+            && refresh.value.state == MvRefreshState::CommitUnknown
+        {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {} active refresh {} is commit-unknown",
+                definition.value.mv_id, refresh_id
+            )));
+        }
         definition.value.last_refresh_ms = Some(req.last_refresh_ms);
         definition.value.last_refresh_rows = Some(req.last_refresh_rows);
         definition.value.last_refresh_snapshots = req.base_snapshots;
@@ -520,6 +762,15 @@ impl MvMetaRepository {
         };
         if !definition.value.refresh_in_progress && definition.value.active_refresh_id.is_none() {
             return Ok(true);
+        }
+        if let Some(refresh_id) = definition.value.active_refresh_id
+            && let Some(refresh) = load_versioned_refresh(txn, refresh_id)?
+            && refresh.value.state == MvRefreshState::CommitUnknown
+        {
+            return Err(RepositoryError::conflict(format!(
+                "mv definition {} active refresh {} is commit-unknown",
+                definition.value.mv_id, refresh_id
+            )));
         }
         if let Some(refresh_id) = definition.value.active_refresh_id.take()
             && let Some(mut refresh) = load_versioned_refresh(txn, refresh_id)?
@@ -601,6 +852,15 @@ fn put_refresh(
         encode_json_payload(MV_REFRESH_SCHEMA_VERSION, refresh)?,
     ))?;
     Ok(())
+}
+
+fn persisted_publish_target_snapshot(refresh: &StoredMvRefresh) -> Option<i64> {
+    refresh.published_snapshot_id.or_else(|| {
+        refresh
+            .external_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.target_snapshot_id)
+    })
 }
 
 fn decode_record_payload<T>(

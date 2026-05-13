@@ -18,8 +18,10 @@ use novarocks::meta::repository::managed_txn::{
     ManagedLakeTxnRepository, ManagedTxnState, StoredManagedTxn,
 };
 use novarocks::meta::repository::mv::{
-    CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, MvRefreshState,
-    MvTargetLookup, RefreshExternalOutcome,
+    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvMetaRepository,
+    MvRefreshFinalizeRequest, MvRefreshState, MvTargetLookup, RecordPublishCommitRequest,
+    RecordStagingCommitRequest, RefreshCommitMarker, RefreshExternalOutcome,
+    UpdateManagedMvRefreshSummaryRequest,
 };
 use novarocks::meta::repository::{
     RepositoryError, RepositoryErrorKind, decode_json_payload, encode_json_payload, id_scopes,
@@ -1791,7 +1793,7 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
         let refresh = repository
             .load_refresh(read.as_ref(), refresh_id)?
             .expect("refresh should exist after external commit");
-        assert_eq!(refresh.state.as_str(), "EXTERNAL_COMMITTED");
+        assert_eq!(refresh.state.as_str(), "PUBLISH_COMMITTED");
         let outcome = refresh
             .external_outcome
             .expect("external outcome should persist");
@@ -1850,6 +1852,526 @@ fn mv_repository_refresh_intent_finalizes_once() -> Result<(), Box<dyn std::erro
     assert!(!definition.refresh_in_progress);
     assert_eq!(definition.active_refresh_id, None);
     assert!(definition.refresh_target_snapshots.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_branch_staged_refresh_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+
+    let mv_id = {
+        let mut txn = provider.begin_write("create mv definition")?;
+        let definition = repository.create_definition(
+            txn.as_mut(),
+            CreateMvDefinitionRequest {
+                select_sql: "SELECT id, amount FROM iceberg.sales.orders".to_string(),
+                base_table_refs: vec!["iceberg.sales.orders".to_string()],
+                primary_key_columns: vec!["id".to_string()],
+                storage_engine: "iceberg".to_string(),
+                target_catalog: Some("ice".to_string()),
+                target_namespace: Some("analytics".to_string()),
+                target_table: Some("orders_mv".to_string()),
+                created_at_ms: 11,
+            },
+        )?;
+        txn.commit()?;
+        definition.mv_id
+    };
+
+    let marker_token = "marker-token-1001".to_string();
+
+    let refresh_id = {
+        let mut txn = provider.begin_write("begin branch staged refresh")?;
+        let mut base_snapshots = BTreeMap::new();
+        base_snapshots.insert("iceberg.sales.orders".to_string(), 50);
+        let refresh = repository.begin_iceberg_refresh_intent(
+            txn.as_mut(),
+            BeginIcebergMvRefreshRequest {
+                mv_id,
+                target_catalog: "ice".to_string(),
+                target_namespace: "analytics".to_string(),
+                target_table: "orders_mv".to_string(),
+                staging_branch: "__nova_mv_refresh_1_1001".to_string(),
+                expected_main_snapshot_id: Some(200),
+                base_snapshots,
+                marker_token: marker_token.clone(),
+            },
+        )?;
+        assert_eq!(refresh.state, MvRefreshState::IntentCreated);
+        assert_eq!(
+            refresh.staging_branch.as_deref(),
+            Some("__nova_mv_refresh_1_1001")
+        );
+        assert_eq!(refresh.expected_main_snapshot_id, Some(200));
+        txn.commit()?;
+        refresh.refresh_id
+    };
+
+    {
+        let mut txn = provider.begin_write("record staging commit")?;
+        repository.record_staging_commit(
+            txn.as_mut(),
+            RecordStagingCommitRequest {
+                refresh_id,
+                staging_snapshot_id: 300,
+                rows: 3,
+                base_table_uuids: BTreeMap::from([(
+                    "iceberg.sales.orders".to_string(),
+                    "uuid-orders".to_string(),
+                )]),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("record publish commit")?;
+        repository.record_publish_commit(
+            txn.as_mut(),
+            RecordPublishCommitRequest {
+                refresh_id,
+                published_snapshot_id: 300,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("finalize branch staged refresh")?;
+        repository.finalize_refresh(
+            txn.as_mut(),
+            MvRefreshFinalizeRequest {
+                refresh_id,
+                rows: 3,
+                base_snapshots: BTreeMap::from([("iceberg.sales.orders".to_string(), 50)]),
+                base_table_uuids: BTreeMap::from([(
+                    "iceberg.sales.orders".to_string(),
+                    "uuid-orders".to_string(),
+                )]),
+                target_snapshot_id: Some(300),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let refresh = repository
+        .load_refresh(read.as_ref(), refresh_id)?
+        .expect("refresh should persist");
+    assert_eq!(refresh.state, MvRefreshState::Finalized);
+    assert_eq!(refresh.staging_snapshot_id, Some(300));
+    assert_eq!(refresh.published_snapshot_id, Some(300));
+    assert_eq!(refresh.rows, Some(3));
+    assert_eq!(
+        refresh.marker,
+        Some(RefreshCommitMarker {
+            refresh_id,
+            mv_id,
+            token: marker_token,
+        })
+    );
+
+    let definition = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should persist");
+    assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(300));
+    assert_eq!(definition.last_refresh_rows, Some(3));
+    assert_eq!(definition.active_refresh_id, None);
+    assert!(!definition.refresh_in_progress);
+    Ok(())
+}
+
+fn create_test_iceberg_mv(
+    provider: &SqliteMetaStoreProvider,
+    repository: &MvMetaRepository,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut txn = provider.begin_write("create test iceberg mv")?;
+    let definition = repository.create_definition(
+        txn.as_mut(),
+        CreateMvDefinitionRequest {
+            select_sql: "SELECT id, amount FROM iceberg.sales.orders".to_string(),
+            base_table_refs: vec!["iceberg.sales.orders".to_string()],
+            primary_key_columns: vec!["id".to_string()],
+            storage_engine: "iceberg".to_string(),
+            target_catalog: Some("ice".to_string()),
+            target_namespace: Some("analytics".to_string()),
+            target_table: Some("orders_mv".to_string()),
+            created_at_ms: 11,
+        },
+    )?;
+    txn.commit()?;
+    Ok(definition.mv_id)
+}
+
+fn begin_test_branch_staged_refresh(
+    provider: &SqliteMetaStoreProvider,
+    repository: &MvMetaRepository,
+    mv_id: i64,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut txn = provider.begin_write("begin test branch staged refresh")?;
+    let refresh = repository.begin_iceberg_refresh_intent(
+        txn.as_mut(),
+        BeginIcebergMvRefreshRequest {
+            mv_id,
+            target_catalog: "ice".to_string(),
+            target_namespace: "analytics".to_string(),
+            target_table: "orders_mv".to_string(),
+            staging_branch: "__nova_mv_refresh_1_1001".to_string(),
+            expected_main_snapshot_id: Some(200),
+            base_snapshots: BTreeMap::from([("iceberg.sales.orders".to_string(), 50)]),
+            marker_token: "marker-token-1001".to_string(),
+        },
+    )?;
+    txn.commit()?;
+    Ok(refresh.refresh_id)
+}
+
+fn overwrite_refresh_with_legacy_external_committed_payload(
+    provider: &SqliteMetaStoreProvider,
+    refresh_id: i64,
+    mv_id: i64,
+    target_snapshot_id: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = serde_json::json!({
+        "refresh_id": refresh_id,
+        "mv_id": mv_id,
+        "state": "EXTERNAL_COMMITTED",
+        "target_snapshots": {},
+        "external_outcome": {
+            "target_snapshot_id": target_snapshot_id,
+            "commit_id": format!("legacy-snapshot-{target_snapshot_id}")
+        }
+    });
+    let mut txn = provider.begin_write("write legacy external committed refresh")?;
+    txn.put(MetaRecordPut::new(
+        MetaKey::new("mv", ["refresh".to_string(), refresh_id.to_string()])?,
+        MetaRecordKind::new("mv.refresh")?,
+        ExpectedRevision::Any,
+        encode_json_payload(1, &payload)?,
+    ))?;
+    txn.commit()?;
+    Ok(())
+}
+
+#[test]
+fn mv_repository_staging_commit_retry_is_value_checked() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+    let base_table_uuids = BTreeMap::from([(
+        "iceberg.sales.orders".to_string(),
+        "uuid-orders".to_string(),
+    )]);
+
+    {
+        let mut txn = provider.begin_write("record staging commit")?;
+        repository.record_staging_commit(
+            txn.as_mut(),
+            RecordStagingCommitRequest {
+                refresh_id,
+                staging_snapshot_id: 300,
+                rows: 3,
+                base_table_uuids: base_table_uuids.clone(),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("retry same staging commit")?;
+        repository.record_staging_commit(
+            txn.as_mut(),
+            RecordStagingCommitRequest {
+                refresh_id,
+                staging_snapshot_id: 300,
+                rows: 3,
+                base_table_uuids: base_table_uuids.clone(),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("retry different staging commit")?;
+        let err = repository
+            .record_staging_commit(
+                txn.as_mut(),
+                RecordStagingCommitRequest {
+                    refresh_id,
+                    staging_snapshot_id: 301,
+                    rows: 3,
+                    base_table_uuids,
+                },
+            )
+            .expect_err("different staging retry should conflict");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_publish_commit_retry_is_value_checked() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+
+    {
+        let mut txn = provider.begin_write("record staging commit")?;
+        repository.record_staging_commit(
+            txn.as_mut(),
+            RecordStagingCommitRequest {
+                refresh_id,
+                staging_snapshot_id: 300,
+                rows: 3,
+                base_table_uuids: BTreeMap::new(),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("record publish commit")?;
+        repository.record_publish_commit(
+            txn.as_mut(),
+            RecordPublishCommitRequest {
+                refresh_id,
+                published_snapshot_id: 300,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("retry same publish commit")?;
+        repository.record_publish_commit(
+            txn.as_mut(),
+            RecordPublishCommitRequest {
+                refresh_id,
+                published_snapshot_id: 300,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("retry different publish commit")?;
+        let err = repository
+            .record_publish_commit(
+                txn.as_mut(),
+                RecordPublishCommitRequest {
+                    refresh_id,
+                    published_snapshot_id: 301,
+                },
+            )
+            .expect_err("different publish retry should conflict");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_finalize_rejects_mismatched_published_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+
+    {
+        let mut txn = provider.begin_write("record staging commit")?;
+        repository.record_staging_commit(
+            txn.as_mut(),
+            RecordStagingCommitRequest {
+                refresh_id,
+                staging_snapshot_id: 300,
+                rows: 3,
+                base_table_uuids: BTreeMap::new(),
+            },
+        )?;
+        repository.record_publish_commit(
+            txn.as_mut(),
+            RecordPublishCommitRequest {
+                refresh_id,
+                published_snapshot_id: 300,
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("finalize with mismatched snapshot")?;
+        let err = repository
+            .finalize_refresh(
+                txn.as_mut(),
+                MvRefreshFinalizeRequest {
+                    refresh_id,
+                    rows: 3,
+                    base_snapshots: BTreeMap::new(),
+                    base_table_uuids: BTreeMap::new(),
+                    target_snapshot_id: Some(301),
+                },
+            )
+            .expect_err("mismatched final snapshot should conflict");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_finalizes_legacy_external_committed_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+    overwrite_refresh_with_legacy_external_committed_payload(&provider, refresh_id, mv_id, 300)?;
+
+    {
+        let mut txn = provider.begin_write("finalize with mismatched legacy snapshot")?;
+        let err = repository
+            .finalize_refresh(
+                txn.as_mut(),
+                MvRefreshFinalizeRequest {
+                    refresh_id,
+                    rows: 3,
+                    base_snapshots: BTreeMap::new(),
+                    base_table_uuids: BTreeMap::new(),
+                    target_snapshot_id: Some(301),
+                },
+            )
+            .expect_err("mismatched legacy snapshot should conflict");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    {
+        let mut txn = provider.begin_write("finalize with legacy snapshot")?;
+        repository.finalize_refresh(
+            txn.as_mut(),
+            MvRefreshFinalizeRequest {
+                refresh_id,
+                rows: 3,
+                base_snapshots: BTreeMap::new(),
+                base_table_uuids: BTreeMap::new(),
+                target_snapshot_id: Some(300),
+            },
+        )?;
+        txn.commit()?;
+    }
+
+    let read = provider.begin_read()?;
+    let refresh = repository
+        .load_refresh(read.as_ref(), refresh_id)?
+        .expect("refresh should persist");
+    assert_eq!(refresh.state, MvRefreshState::Finalized);
+    assert_eq!(refresh.published_snapshot_id, None);
+    assert_eq!(
+        refresh
+            .external_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.target_snapshot_id),
+        Some(300)
+    );
+    let definition = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should persist");
+    assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(300));
+    assert_eq!(definition.active_refresh_id, None);
+    assert!(!definition.refresh_in_progress);
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_managed_summary_rejects_active_commit_unknown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+
+    {
+        let mut txn = provider.begin_write("mark commit unknown")?;
+        repository.mark_refresh_commit_unknown(txn.as_mut(), refresh_id)?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("update managed summary")?;
+        let err = repository
+            .update_managed_refresh_summary_if_present(
+                txn.as_mut(),
+                UpdateManagedMvRefreshSummaryRequest {
+                    mv_id,
+                    last_refresh_ms: 20,
+                    last_refresh_rows: 3,
+                    base_snapshots: BTreeMap::new(),
+                    base_table_uuids: BTreeMap::new(),
+                },
+            )
+            .expect_err("commit-unknown refresh must not be finalized");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    let read = provider.begin_read()?;
+    let refresh = repository
+        .load_refresh(read.as_ref(), refresh_id)?
+        .expect("refresh should persist");
+    assert_eq!(refresh.state, MvRefreshState::CommitUnknown);
+    let definition = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should persist");
+    assert_eq!(definition.active_refresh_id, Some(refresh_id));
+    assert!(definition.refresh_in_progress);
+
+    Ok(())
+}
+
+#[test]
+fn mv_repository_clear_refresh_progress_rejects_active_commit_unknown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let provider = SqliteMetaStoreProvider::open(dir.path().join("meta.sqlite"))?;
+    let repository = MvMetaRepository::default();
+    let mv_id = create_test_iceberg_mv(&provider, &repository)?;
+    let refresh_id = begin_test_branch_staged_refresh(&provider, &repository, mv_id)?;
+
+    {
+        let mut txn = provider.begin_write("mark commit unknown")?;
+        repository.mark_refresh_commit_unknown(txn.as_mut(), refresh_id)?;
+        txn.commit()?;
+    }
+
+    {
+        let mut txn = provider.begin_write("clear commit unknown refresh")?;
+        let err = repository
+            .clear_refresh_progress(txn.as_mut(), mv_id)
+            .expect_err("commit-unknown refresh must not be cleared");
+        assert_eq!(err.kind(), RepositoryErrorKind::Conflict);
+    }
+
+    let read = provider.begin_read()?;
+    let refresh = repository
+        .load_refresh(read.as_ref(), refresh_id)?
+        .expect("refresh should persist");
+    assert_eq!(refresh.state, MvRefreshState::CommitUnknown);
+    let definition = repository
+        .load_by_id(read.as_ref(), mv_id)?
+        .expect("definition should persist");
+    assert_eq!(definition.active_refresh_id, Some(refresh_id));
+    assert!(definition.refresh_in_progress);
 
     Ok(())
 }

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
 use novarocks::meta::repository::mv::{
-    CreateMvDefinitionRequest, MvMetaRepository, MvRefreshFinalizeRequest, RefreshExternalOutcome,
+    BeginIcebergMvRefreshRequest, CreateMvDefinitionRequest, MvMetaRepository,
+    MvRefreshFinalizeRequest, RecordPublishCommitRequest, RecordStagingCommitRequest,
 };
 use novarocks::meta::{MetaStoreProvider, SqliteMetaStoreProvider};
 
@@ -26,16 +27,39 @@ fn refresh_transaction_can_recover_after_external_commit_before_finalize()
             created_at_ms: 1,
         },
     )?;
-    let intent = repo.begin_refresh_intent(&mut *txn, mv.mv_id, BTreeMap::new())?;
+    let intent = repo.begin_iceberg_refresh_intent(
+        &mut *txn,
+        BeginIcebergMvRefreshRequest {
+            mv_id: mv.mv_id,
+            target_catalog: "ice".to_string(),
+            target_namespace: "ns".to_string(),
+            target_table: "orders_mv".to_string(),
+            staging_branch: "__nova_mv_refresh_1_42".to_string(),
+            expected_main_snapshot_id: None,
+            base_snapshots: BTreeMap::new(),
+            marker_token: "marker-42".to_string(),
+        },
+    )?;
     txn.commit()?;
 
-    let mut txn = provider.begin_write("record external only")?;
-    repo.record_external_commit_outcome(
+    let mut txn = provider.begin_write("record staging commit")?;
+    repo.record_staging_commit(
         &mut *txn,
-        intent.refresh_id,
-        RefreshExternalOutcome {
-            target_snapshot_id: Some(42),
-            commit_id: "snapshot-42".to_string(),
+        RecordStagingCommitRequest {
+            refresh_id: intent.refresh_id,
+            staging_snapshot_id: 42,
+            rows: 10,
+            base_table_uuids: BTreeMap::new(),
+        },
+    )?;
+    txn.commit()?;
+
+    let mut txn = provider.begin_write("record publish commit")?;
+    repo.record_publish_commit(
+        &mut *txn,
+        RecordPublishCommitRequest {
+            refresh_id: intent.refresh_id,
+            published_snapshot_id: 42,
         },
     )?;
     txn.commit()?;
